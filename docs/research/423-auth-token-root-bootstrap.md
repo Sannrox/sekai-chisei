@@ -1,5 +1,8 @@
 # `SEKAI_AUTH_TOKEN` root-bootstrap retirement
 
+> Historical pre-1.0 research. Version 1.0 removed the server bootstrap and
+> uses client-side `SEKAI_CREDENTIAL` with durable principal credentials.
+
 Issue: [#423](https://github.com/Sannrox/sekai-chisei/issues/423)
 
 ## Decision

@@ -21,13 +21,12 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
-use crate::domain::{Direction, Link, ListFilter, Object, ObjectSet};
+use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::action::ActionTypeDef;
 use crate::sekai::action_approval::{ActionApproval, ApprovalStatus};
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
 use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
-use crate::sekai::capability_package::*;
 use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
 use crate::sekai::deduplication::*;
@@ -1016,13 +1015,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn coordination_snapshot(&self, now_ms: i64) -> Result<CoordinationSnapshot, String> {
-        match self {
-            Self::Sqlite(db) => db.coordination_snapshot(now_ms),
-            Self::Postgres(db) => db.coordination_snapshot(now_ms),
-        }
-    }
-
     pub fn create_action_approval(&self, approval: &ActionApproval) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.create_action_approval(approval),
@@ -1102,13 +1094,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.create_object(o),
             Self::Postgres(db) => db.create_object(o),
-        }
-    }
-
-    pub fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
-        match self {
-            Self::Sqlite(db) => db.create_object_set(set),
-            Self::Postgres(db) => db.create_object_set(set),
         }
     }
 
@@ -1193,17 +1178,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn delete_object_set_for_principals(
-        &self,
-        id: &str,
-        principals: &[&str],
-    ) -> Result<bool, String> {
-        match self {
-            Self::Sqlite(db) => db.delete_object_set_for_principals(id, principals),
-            Self::Postgres(db) => db.delete_object_set_for_principals(id, principals),
-        }
-    }
-
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.delete_object_type(kind),
@@ -1251,24 +1225,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn disable_capability_package(
-        &self,
-        namespace: &str,
-        package_name: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<PackageInstallation, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.disable_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.disable_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-        }
-    }
-
     pub fn disable_kioku_memory(
         &self,
         id: &str,
@@ -1298,24 +1254,6 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.ensure_team_namespace(namespace, principal, member_role, actor),
             Self::Postgres(db) => {
                 db.ensure_team_namespace(namespace, principal, member_role, actor)
-            }
-        }
-    }
-
-    pub fn evaluate_capability_package(
-        &self,
-        namespace: &str,
-        package_name: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.evaluate_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.evaluate_capability_package(namespace, package_name, actor, request_id, now_ms)
             }
         }
     }
@@ -1473,33 +1411,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn get_capability_package(
-        &self,
-        namespace: &str,
-        package_name: &str,
-    ) -> Result<Option<PackageInstallation>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_capability_package(namespace, package_name),
-            Self::Postgres(db) => db.get_capability_package(namespace, package_name),
-        }
-    }
-
-    pub fn get_capability_package_manifest(
-        &self,
-        namespace: &str,
-        package_name: &str,
-        version: &str,
-    ) -> Result<Option<CapabilityPackageManifest>, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.get_capability_package_manifest(namespace, package_name, version)
-            }
-            Self::Postgres(db) => {
-                db.get_capability_package_manifest(namespace, package_name, version)
-            }
-        }
-    }
-
     pub fn get_contention_scope(&self, id: &str) -> Result<Option<ContentionScope>, String> {
         match self {
             Self::Sqlite(db) => db.get_contention_scope(id),
@@ -1636,13 +1547,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_links(object_id, relation, dir),
             Self::Postgres(db) => db.get_links(object_id, relation, dir),
-        }
-    }
-
-    pub fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_object_set(id),
-            Self::Postgres(db) => db.get_object_set(id),
         }
     }
 
@@ -1806,106 +1710,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.insert_operation_receipt(receipt),
             Self::Postgres(db) => db.insert_operation_receipt(receipt),
-        }
-    }
-
-    pub fn install_capability_package(
-        &self,
-        namespace: &str,
-        manifest: &CapabilityPackageManifest,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<PackageInstallation, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.install_capability_package(namespace, manifest, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                // Trust policy enforcement is SQLite-complete; Postgres remains
-                // on the grandfather unsigned path until package-trust parity.
-                db.install_capability_package(namespace, manifest, actor, request_id, now_ms)
-            }
-        }
-    }
-
-    pub fn set_capability_package_trust_policy(
-        &self,
-        namespace: &str,
-        required_trust_level: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<crate::sekai::capability_package::PackageTrustPolicy, String> {
-        match self {
-            Self::Sqlite(db) => db.set_capability_package_trust_policy(
-                namespace,
-                required_trust_level,
-                actor,
-                request_id,
-                now_ms,
-            ),
-            Self::Postgres(_) => Err(
-                "capability package trust policy is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn get_capability_package_trust_policy(
-        &self,
-        namespace: &str,
-    ) -> Result<crate::sekai::capability_package::PackageTrustPolicy, String> {
-        match self {
-            Self::Sqlite(db) => db.get_capability_package_trust_policy(namespace),
-            // Fail closed: do not invent a soft default that looks like a
-            // configured policy while package-trust tables are unavailable.
-            Self::Postgres(_) => Err(
-                "capability package trust policy is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn put_capability_package_signer(
-        &self,
-        namespace: &str,
-        identity: &str,
-        key_id: &str,
-        public_key_b64: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<crate::sekai::capability_package::PackageSigner, String> {
-        match self {
-            Self::Sqlite(db) => db.put_capability_package_signer(
-                namespace,
-                identity,
-                key_id,
-                public_key_b64,
-                actor,
-                request_id,
-                now_ms,
-            ),
-            Self::Postgres(_) => Err(
-                "capability package signers are unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn list_capability_package_signers(
-        &self,
-        namespace: &str,
-    ) -> Result<Vec<crate::sekai::capability_package::PackageSigner>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_capability_package_signers(namespace),
-            // Fail closed: an empty list would look like "no signers configured"
-            // rather than "trust admin is unavailable on this backend".
-            Self::Postgres(_) => Err(
-                "capability package signers are unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
         }
     }
 
@@ -2312,18 +2116,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn runtime_work_pressure(
-        &self,
-        namespace: &str,
-        runtime_id: &str,
-        sampled_at_ms: i64,
-    ) -> Result<crate::sekai::action_effect::RuntimeWorkPressure, String> {
-        match self {
-            Self::Sqlite(db) => db.runtime_work_pressure(namespace, runtime_id, sampled_at_ms),
-            Self::Postgres(db) => db.runtime_work_pressure(namespace, runtime_id, sampled_at_ms),
-        }
-    }
-
     pub fn claim_action_work(
         &self,
         effect_id: &str,
@@ -2674,17 +2466,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_capability_package_events(
-        &self,
-        namespace: &str,
-        package_name: &str,
-    ) -> Result<Vec<PackageLifecycleEvent>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_capability_package_events(namespace, package_name),
-            Self::Postgres(db) => db.list_capability_package_events(namespace, package_name),
-        }
-    }
-
     pub fn list_contention_scopes(&self) -> Result<Vec<ContentionScope>, String> {
         match self {
             Self::Sqlite(db) => db.list_contention_scopes(),
@@ -2730,13 +2511,6 @@ impl RuntimeDb {
             Self::Postgres(_) => Err(
                 "authorization-built text evidence visibility is unavailable on the PostgreSQL community runtime".into(),
             ),
-        }
-    }
-
-    pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_evolve_enhancements(),
-            Self::Postgres(db) => db.list_evolve_enhancements(),
         }
     }
 
@@ -2850,16 +2624,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.list_namespace_roles_for_principal(principal),
             Self::Postgres(_) => Err("list_namespace_roles_for_principal is unavailable on the PostgreSQL community runtime".into()),
-        }
-    }
-
-    pub fn list_object_sets_for_principals(
-        &self,
-        principals: &[&str],
-    ) -> Result<Vec<ObjectSet>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_object_sets_for_principals(principals),
-            Self::Postgres(db) => db.list_object_sets_for_principals(principals),
         }
     }
 
@@ -3116,17 +2880,6 @@ impl RuntimeDb {
             Self::Postgres(_) => Err(
                 "put_delegated_permit is unavailable on the PostgreSQL community runtime".into(),
             ),
-        }
-    }
-
-    pub fn put_evolve_enhancement(
-        &self,
-        request_id: &str,
-        original_spec: &str,
-    ) -> Result<(), String> {
-        match self {
-            Self::Sqlite(db) => db.put_evolve_enhancement(request_id, original_spec),
-            Self::Postgres(db) => db.put_evolve_enhancement(request_id, original_spec),
         }
     }
 
@@ -3569,24 +3322,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn rollback_capability_package(
-        &self,
-        namespace: &str,
-        package_name: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<PackageInstallation, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.rollback_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.rollback_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-        }
-    }
-
     pub fn rotate_managed_team_credential(
         &self,
         principal: &str,
@@ -3702,24 +3437,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn uninstall_capability_package(
-        &self,
-        namespace: &str,
-        package_name: &str,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<(), String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.uninstall_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.uninstall_capability_package(namespace, package_name, actor, request_id, now_ms)
-            }
-        }
-    }
-
     pub fn update_action_approval(&self, approval: &ActionApproval) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.update_action_approval(approval),
@@ -3762,24 +3479,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn upgrade_capability_package(
-        &self,
-        namespace: &str,
-        manifest: &CapabilityPackageManifest,
-        actor: &str,
-        request_id: &str,
-        now_ms: i64,
-    ) -> Result<PackageInstallation, String> {
-        match self {
-            Self::Sqlite(db) => {
-                db.upgrade_capability_package(namespace, manifest, actor, request_id, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.upgrade_capability_package(namespace, manifest, actor, request_id, now_ms)
-            }
-        }
-    }
-
     pub fn upsert_action_policy(&self, policy: &ActionPolicy) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.upsert_action_policy(policy),
@@ -3816,75 +3515,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.upsert_object_type(object_type),
             Self::Postgres(db) => db.upsert_object_type(object_type),
-        }
-    }
-
-    pub fn propose_ontology_definitions_from_evidence(
-        &self,
-        request: &crate::sekai::ontology_proposal::ProposeOntologyDefinitionsRequest,
-    ) -> Result<crate::sekai::ontology_proposal::ProposeOntologyDefinitionsResult, String> {
-        match self {
-            Self::Sqlite(db) => db.propose_ontology_definitions_from_evidence(request),
-            Self::Postgres(_) => Err(
-                "propose_ontology_definitions_from_evidence is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn get_ontology_definition_proposal(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> Result<Option<crate::sekai::ontology_proposal::OntologyDefinitionProposal>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_ontology_definition_proposal(id, version),
-            Self::Postgres(_) => Err(
-                "get_ontology_definition_proposal is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn list_ontology_definition_proposals(
-        &self,
-        filter: &crate::sekai::ontology_proposal::ProposalFilter,
-    ) -> Result<Vec<crate::sekai::ontology_proposal::OntologyDefinitionProposal>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_ontology_definition_proposals(filter),
-            Self::Postgres(_) => Err(
-                "list_ontology_definition_proposals is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn list_ontology_definition_proposal_events(
-        &self,
-        id: &str,
-        version: u32,
-    ) -> Result<Vec<crate::sekai::ontology_proposal::ProposalLifecycleEvent>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_ontology_definition_proposal_events(id, version),
-            Self::Postgres(_) => Err(
-                "list_ontology_definition_proposal_events is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
-        }
-    }
-
-    pub fn review_ontology_definition_proposal(
-        &self,
-        id: &str,
-        version: u32,
-        review: crate::sekai::ontology_proposal::OntologyProposalReview,
-    ) -> Result<crate::sekai::ontology_proposal::OntologyDefinitionProposal, String> {
-        match self {
-            Self::Sqlite(db) => db.review_ontology_definition_proposal(id, version, review),
-            Self::Postgres(_) => Err(
-                "review_ontology_definition_proposal is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
         }
     }
 

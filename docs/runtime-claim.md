@@ -5,8 +5,9 @@ Issues: [#399](https://github.com/Sannrox/sekai-chisei/issues/399),
 Effects: [governed-action-effects.md](governed-action-effects.md).  
 Research freeze: [research/395-action-effect-mapping.md](research/395-action-effect-mapping.md).
 
-External worker-pool managers may consume the separate read-only
-[claim-pressure contract](runtime-claim-pressure.md) (`#489`).
+External capacity management is outside the public Sekai claim surface. Use
+bounded `ListClaimableActionWork` reads together with the worker-host lifecycle
+owned by the runtime manager.
 
 ## Purpose
 
@@ -19,11 +20,9 @@ ack terminal outcomes. The plane never spawns processes or holds model tools.
 | RPC | Role |
 | --- | --- |
 | `ListClaimableActionWork` | Ready or lease-expired `runtime_dispatch` for a namespace (optional runtime filter); intentionally parked work is excluded |
-| `GetRuntimeWorkPressure` | Versioned aggregate pressure for exactly one namespace/runtime scope; returns counts and oldest claimable age, never task payloads |
 | `ClaimActionWork` | Exclusive claim with generation + fencing token + lease TTL; resolved claims include immutable continuation and park snapshots |
 | `HeartbeatActionClaim` | Extend lease under matching fence |
 | `AckActionWork` | `completed` / `failed`, or a durably idempotent intentional park under the matching fence |
-| `SubmitParkedWorkResolutionAction` | Submit bounded continuation input to the governed `resolve_parked_work/v1` Action |
 | `ReportActionClaimEvent` | Append a fenced, idempotent resume/fallback event without checkpoint content |
 
 ## Lease rules (v1)

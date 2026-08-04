@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Honors `GRPC_PORT` (default 50051), `SEKAI_SOCKET` for UDS, and
-//! `SEKAI_AUTH_TOKEN`. Uses `SEKAI_PRINCIPAL` for identity (default:
+//! `SEKAI_CREDENTIAL`. Uses `SEKAI_PRINCIPAL` for identity (default:
 //! `tool-demo`); in `SEKAI_INSECURE=1` mode the `local` principal is an admin.
 
 use std::collections::HashMap;
@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         format!("http://127.0.0.1:{port}")
     });
     let auth = DemoAuth {
-        token: std::env::var("SEKAI_AUTH_TOKEN").ok(),
+        token: std::env::var("SEKAI_CREDENTIAL").ok(),
         principal: principal.clone(),
     };
 

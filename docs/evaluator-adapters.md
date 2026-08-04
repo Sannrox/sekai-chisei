@@ -94,7 +94,7 @@ oversized authenticated responses produce a closed execution error.
   definition or change its availability.
 - The definition's exact digest and endpoint are immutable for that version;
   publish a new version to change either one.
-- `SetEvaluatorAvailability` remains the resolution policy authority. Disabling
+- `PutEvaluatorDefinition` lifecycle transitions remain the resolution policy authority. Disabling
   or superseding a definition blocks new plans and manifests but preserves
   historical references and receipts.
 - Adapter registrations are keyed by the immutable `(namespace,

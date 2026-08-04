@@ -35,7 +35,6 @@ Unknown kinds are rejected at type registry time (#396) and at materialization.
 | --- | --- |
 | (implicit) | Materialized on successful `SubmitActionInstance` |
 | `GetActionEffect` | Read one effect |
-| `ListActionEffects` | By `instance_id`, or pending `runtime_dispatch` by namespace |
 
 ## Notify failure
 

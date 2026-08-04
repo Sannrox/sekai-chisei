@@ -17,7 +17,7 @@ SEKAI_INSECURE=1 cargo run --example capability_reference_host
 
 Set `CAPABILITY_APPROVAL=approve` or `deny` to demonstrate operator handling when
 policy holds the discovered action. Production deployments use
-`SEKAI_AUTH_TOKEN` and a scoped `SEKAI_PRINCIPAL`; insecure mode is local-only.
+`SEKAI_CREDENTIAL` and a scoped `SEKAI_PRINCIPAL`; insecure mode is local-only.
 
 Runnable examples for the `sekai-chisei` control plane. Each one is a standalone
 binary that links the library crate and talks to a running gRPC server.
@@ -103,7 +103,7 @@ cargo run --example demo_client
 **chisei · execute (live LLM call)**
 
 - Calls `PlanExecution` to build a budget- and policy-resolved execution plan
-- Calls `ExecutePlan`, which actually invokes the model and prints its reply
+- Calls `ExecutePlanStream`, which actually invokes the model and prints its reply
 - Defaults to a **local Ollama** model (`ollama/llama3.2:latest`)
 
 This is the only part of the demo that makes a real model call. It needs a
@@ -155,7 +155,7 @@ The example honors the same environment variables as the server:
 | --- | --- | --- |
 | `GRPC_PORT` | `50051` | Port to connect to |
 | `SEKAI_SOCKET` | unset | Unix socket path to connect to instead of TCP |
-| `SEKAI_AUTH_TOKEN` | unset | When set, attaches `authorization: Bearer <token>` to every request (deprecated fallback to principal `root`; prefer per-principal tokens from `sekaictl admin access credential ...`) |
+| `SEKAI_CREDENTIAL` | unset | Client-side bearer attached as `authorization: Bearer <token>`; create a principal-scoped value with `sekaictl admin access credential ...` |
 | `SEKAI_PRINCIPAL` | `demo-client` | Caller identity (`x-principal`) sent in request metadata |
 | `DEMO_MODEL` | `ollama/llama3.2:latest` | Model used for the live execute step |
 

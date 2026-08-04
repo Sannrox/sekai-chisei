@@ -1,24 +1,25 @@
 # Evaluation plans and evaluator definitions
 
-Evaluation plans are Chisei's production evaluation-selection contract. They
+Evaluation plans are an experimental Chisei evaluation-selection contract in
+1.0. They
 are separate from `EvalSuite`: suites remain reusable test cases, while plans
 bind exact governed invariants to trusted deterministic implementations or
 explicitly bounded stochastic model evaluators.
 
-The v1 API adds:
+The v1 API exposes:
 
-- `Put`, `Get`, and `ListEvaluatorDefinition`;
-- `SetEvaluatorAvailability`; and
-- `Put`, `Get`, and `ListEvaluationPlan`.
+- `PutEvaluatorDefinition` for immutable publication and lifecycle transitions;
+- evaluator lifecycle transitions through `PutEvaluatorDefinition`; and
+- `PutEvaluationPlan` for immutable publication.
 
 `ResolveEvaluationPlan` is the separate authorized pre-execution boundary that
 freezes an exact plan and its situation-specific inputs. See
 [Resolved evaluation manifests](evaluation-manifests.md).
 
 All resources are namespace scoped. Definition and plan mutations require a
-control-plane administrator with namespace write access. Reads require
-namespace access. A plan is hidden rather than partially returned when the
-caller cannot read one of its exact governed-invariant reference closures.
+control-plane administrator with namespace write access. Resolve and execute
+are the read paths for exact published resources and fail closed when the
+caller cannot read a referenced governed-invariant closure.
 
 ## Immutable version identities
 
@@ -135,14 +136,15 @@ expressions or an open-ended schema engine.
 
 Definitions are immutable. Availability is a separate mutable, audited record
 keyed by the exact definition identity and implementation digest.
-`SetEvaluatorAvailability` accepts `enabled`, `disabled`, or `superseded`.
+`PutEvaluatorDefinition` accepts lifecycle transitions to `enabled`, `disabled`, or `superseded`
+when the immutable definition body is omitted.
 Superseding requires the exact successor definition ID in the same namespace.
 Each transition requires a request ID; replaying the same canonical request is
 idempotent, while reusing it for different content fails.
 
 Disabled or superseded definitions cannot be selected by a new plan. Existing
-plans remain readable because the transition does not rewrite their exact
-references. Later manifest resolution and re-execution must check current
+plans remain durable because the transition does not rewrite their exact
+references. Later manifest resolution and re-execution check current
 availability.
 
 ## Backup, restore, retention, and rollback

@@ -8,26 +8,27 @@ use sekai_chisei::runtime_backend::COMMUNITY_REQUIRED_SURFACES;
 #[test]
 fn chisei_inventory_covers_every_proto_rpc() {
     let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-    assert_eq!(inventory.entries.len(), 93);
+    assert_eq!(inventory.entries.len(), 30);
     assert!(inventory.entry("EvaluateGovernedSubject").is_some());
     assert!(inventory.entry("ExportGovernedSubjectProvenance").is_some());
     assert!(
         inventory
             .entry("GetGovernedSubjectProvenanceTrustRoot")
-            .is_some()
+            .is_none()
     );
-    assert!(inventory.entry("EvaluateGovernedSubjectWithPlan").is_some());
     assert!(inventory.entry("GetOperationReceipt").is_some());
-    assert!(inventory.entry("ReserveGatewayRequestAlias").is_some());
+    assert!(inventory.entry("GetEvalSuite").is_some());
+    assert!(inventory.entry("GetEvalRun").is_some());
+    assert!(inventory.entry("GetSampleObservation").is_some());
+    assert!(inventory.entry("ClaimGatewayDispatch").is_some());
     assert!(inventory.entry("DecideGatewayExecution").is_some());
     assert!(inventory.entry("PutEvaluationPlan").is_some());
     assert!(inventory.entry("ResolveEvaluationPlan").is_some());
     assert!(inventory.entry("ExecuteEvaluationManifest").is_some());
-    assert!(inventory.entry("GetEvaluationExecution").is_some());
+    assert!(inventory.entry("GetEvaluationExecution").is_none());
     assert!(inventory.entry("CancelEvaluationExecution").is_some());
     assert!(inventory.entry("PutEvaluatorDefinition").is_some());
-    assert!(inventory.entry("Chat").is_some());
-    assert!(inventory.entry("GetSampleObservation").is_some());
+    assert!(inventory.entry("Chat").is_none());
     assert!(inventory.remaining_surfaces.is_empty());
     for surface in [
         "chisei.budget",

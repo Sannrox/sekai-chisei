@@ -10,7 +10,14 @@ owns durable facts and the decisions that constrain an operation.
 OpenAI / Anthropic clients        Native integrations
             |                            |
             v                            v
-     chisei-gateway             PlanExecution / ExecutePlan
+     chisei-gateway              Gunshi fleet allocation
+            |                            |
+            |                            v
+            |                   PlanExecution
+            |                   (Kioku enrichment)
+            |                            |
+            |                            v
+            |                   ExecutePlanStream
             |                            |
             +-------------+--------------+
                           v
@@ -51,7 +58,7 @@ identity capabilities.
 Reusable coordination leases use a dedicated namespace-scoped API. Every
 acquisition receives a monotonically increasing generation and unique fencing
 token; stale generations cannot refresh, release, or take over current state.
-Lease-guarded create, update, and delete RPCs validate the active generation and
+Object mutations with a lease precondition validate the active generation and
 commit the graph mutation, object audit, and idempotency record in the same
 backend transaction. Shared SQLite/PostgreSQL conformance covers this
 cross-table contract; partial storage interfaces that cannot provide it fail
@@ -85,6 +92,16 @@ and records normalized usage and audit evidence.
 
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
+
+For fleet-managed native work, Gunshi is the outer allocation stage before
+`PlanExecution`. The request binds an exact, durably issued allocation;
+planning rejects modified allocations, stale policy revisions, conflicting
+operation or tool scopes, and any live route that differs from the allocation.
+Kioku remains inside `PlanExecution` as per-operation context enrichment.
+Execution receipts retain both the native plan id and Gunshi's logical
+operation and allocation provenance. Direct native planning remains available
+when no fleet capacity envelope exists. See
+[ADR 0015](decisions/0015-gunshi-allocation-precedes-native-planning.md).
 
 For native Anthropic execution, provider profiles publish the versioned prompt-
 cache contract and Chisei may opt into explicit upstream breakpoints only when
@@ -157,26 +174,6 @@ Native runtimes can use the namespace-scoped
 bounded retrieval surfaces, and governed actions before invocation. Catalog
 visibility is filtered for the authenticated authorization context and never
 acts as an authorization token; invocation always rechecks live controls.
-
-`SearchText` exposes an authorization-built SQLite FTS5 text representation and
-the shared `HybridCandidate` envelope (issue #497). Scores use
-`text.authorized_bm25/v1` and never mint durable identities; hidden rows are
-excluded before ranking. The older global FTS projection is internal. See
-[text-fts.md](text-fts.md).
-
-`HybridRetrieve` late-fuses explicit adapters (`graph.retrieve_context`,
-`text.authorized`) under a versioned fusion profile (`late_fusion.rrf/v1`,
-`late_fusion.graph_priority/v1`) and returns mixed `HybridCandidate` rows with
-per-adapter status (`ok | truncated | denied_empty | error`). Callers must name
-representations; pure graph remains on `RetrieveContext`. See
-[hybrid-retrieval.md](hybrid-retrieval.md) (issue #361).
-
-`ExecutePatternPlan` / `ExplainPatternPlan` expose the versioned multi-hop
-pattern plan IR (`pattern_plan/v1`): match_node / expand_edge / bind steps with
-explicit variables, hard bounds, plan-time name visibility, hop-time ACL
-re-check, and deterministic EXPLAIN of plan shape only. Asserted graph only in
-v1; `Traverse` and `RetrieveContext` stay unchanged. See
-[pattern-plan.md](pattern-plan.md) (issue #375 / research #145).
 
 `RetrieveContext` is asserted-only by default. Callers may opt into the fixed
 query-time entailment profile for class inheritance/equivalence and explicitly
@@ -310,12 +307,12 @@ surface with backend-neutral contracts and shared SQLite/PostgreSQL
 conformance for dual-backend inventory paths: core graph and authorization,
 object-change and decision audit, datasets and virtual tables, action
 definitions, function definitions, generation-fenced leases and guarded object
-mutations, capability-package lifecycle, team-namespace bootstrap, principal
-credentials, coordination and work admission, external evidence admission and
+mutations, team-namespace bootstrap, principal credentials, coordination and
+work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Known community Postgres fail-closed exceptions include public
-audited ontology mutation RPCs (`upsert_*_with_audit` and definition
-proposals), FTS text search, federation peer tables, and (on the Chisei side)
+audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,
+federation peer tables, and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
@@ -397,17 +394,12 @@ manifest-to-receipt index and query projections are reconstructed from receipt
 events. Evaluator output content is hashed and discarded. See
 [Evaluation execution](evaluation-execution.md).
 
-`GetEvidenceSubmissionContent` is the governed, single-record read path for an
-admitted envelope. It resolves the submission's projected `external_evidence`
-object and rechecks that object's live ACL before returning the immutable
-content and provenance. Missing and unauthorized submissions are deliberately
-indistinguishable to callers, retained content is verified against its
-canonical digest before disclosure, and metadata listing never includes
-payloads. Available, superseded, stale, and retracted records remain readable
-as retained source evidence; rejected, quarantined, and incomplete admission
-states fail closed. Evidence classification is enforced through the projected
-object ACL in the current contract; there is no separate caller-clearance
-model.
+`GetEvidenceSubmission` is the governed, single-record inspection path for an
+admitted envelope. It returns bounded metadata and lifecycle history; retained
+content remains inside the evidence projection and pipeline rather than gaining
+a second public payload endpoint. Missing and unauthorized submissions remain
+indistinguishable to callers, and rejected, quarantined, or incomplete
+admission states fail closed.
 
 ### Governed context handoffs
 
@@ -468,8 +460,8 @@ Ontology relations opt into graph enforcement by setting `mapped_relation`.
 New links and object updates that would violate the relation's effective domain
 or range are rejected after endpoint authorization, including when class
 membership is inherited or equivalent. Existing links are never rewritten;
-operators can call `ReportOntologyLinkViolations` for an authorized,
-read-only inventory before enabling or remediating a constraint.
+operators must inspect the affected graph objects before enabling or remediating
+a constraint.
 
 ## Design constraints
 

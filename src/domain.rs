@@ -8,7 +8,7 @@ pub type ObjectKind = String;
 // Kinds the chisei routing logic matches on. Not a closed taxonomy — objects
 // may use any kind; these just name the strings the code uses, in one
 // place. `model`/`component` drive model selection in chisei::affinity (live
-// via the GetAffinity RPC). `learning` is matched only in the learning/pipeline
+// as an internal routing affinity signal). `learning` is matched only in the learning/pipeline
 // graph helpers, which are not yet wired to an RPC.
 pub const KIND_MODEL: &str = "model";
 pub const KIND_COMPONENT: &str = "component";
@@ -118,17 +118,6 @@ pub struct ListFilter {
     pub offset: i32,
     pub order_by: String,
     pub descending: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ObjectSet {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub filter: ListFilter,
-    pub owner_principal: String,
-    pub created: i64,
 }
 
 #[cfg(test)]

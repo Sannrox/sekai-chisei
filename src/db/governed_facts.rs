@@ -101,13 +101,6 @@ impl SekaiDb {
             &transaction,
             &object_diff_changes(actor, None, Some(object), now),
         )?;
-        crate::sekai::temporal::retain_object_history_in_tx(
-            &transaction,
-            None,
-            Some(object),
-            actor,
-            now,
-        )?;
         transaction.commit().map_err(|error| error.to_string())
     }
 }

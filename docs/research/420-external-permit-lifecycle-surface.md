@@ -1,5 +1,10 @@
 # External-action permit lifecycle surface
 
+> Historical design record. The 1.0 surface supersedes the per-transition RPC
+> table below with `AuthorizeExternalAction`, `TransitionExternalAction`,
+> `RedeemExternalActionPermit`, and `SetExternalActionPolicy`; see
+> [external-action-execution.md](../external-action-execution.md).
+
 Issue: [#420](https://github.com/Sannrox/sekai-chisei/issues/420)
 
 ## Decision

@@ -26,9 +26,7 @@ use sekai_chisei::domain::Object;
 use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::chisei_service_server::ChiseiServiceServer;
-use sekai_chisei::grpc::pb::chisei::{
-    ExecutePlanRequest, ExecutionInput, PlanExecutionRequest, ResolvePolicyRequest,
-};
+use sekai_chisei::grpc::pb::chisei::{ExecutePlanRequest, ExecutionInput, PlanExecutionRequest};
 use tokio::time::sleep;
 use tonic::transport::Server;
 
@@ -57,7 +55,6 @@ fn ollama_config(db_path: String) -> Config {
         openai_api_key: None,
         ollama_url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
         native_llm_url: None,
-        auth_token: None,
         sample_rate: 0.05,
         sample_risk_threshold: 0.7,
         scoring_enabled: false,
@@ -232,7 +229,6 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         openai_api_key: None,
         ollama_url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
         native_llm_url: None,
-        auth_token: None,
         sample_rate: 0.05,
         sample_risk_threshold: 0.7,
         scoring_enabled: false,
@@ -273,27 +269,6 @@ async fn grpc_chat_round_trip_with_local_ollama() {
 
     let mut client = connect_with_retry(addr).await;
 
-    let policy = client
-        .resolve_policy(ResolvePolicyRequest {
-            namespace: "default".into(),
-            preferred_runtime: String::new(),
-            preferred_model: model.clone(),
-            subject: String::new(),
-            project: "default".into(),
-            agent: "ollama-e2e".into(),
-            key_id: String::new(),
-            task_class: String::new(),
-            user_id: String::new(),
-            expected_calls: 1,
-            budget_route_bias: String::new(),
-            route_override: String::new(),
-            capability_requirements_json: Vec::new(),
-        })
-        .await
-        .expect("resolve policy")
-        .into_inner();
-    assert!(policy.resolution.unwrap().model.starts_with("ollama/"));
-
     let plan = client
         .plan_execution(PlanExecutionRequest {
             input: Some(ExecutionInput {
@@ -313,18 +288,23 @@ async fn grpc_chat_round_trip_with_local_ollama() {
                 task_class: String::new(),
                 ..Default::default()
             }),
+            gunshi_allocation: None,
         })
         .await
         .expect("plan execution")
         .into_inner();
-    let response = client
-        .execute_plan(ExecutePlanRequest { plan: plan.plan })
+    let mut stream = client
+        .execute_plan_stream(ExecutePlanRequest { plan: plan.plan })
         .await
         .expect("execute plan")
         .into_inner();
-    let response = response
-        .response
-        .expect("plan execution response should include content");
+    let mut response = None;
+    while let Some(event) = stream.message().await.expect("execute plan stream") {
+        if event.response.is_some() {
+            response = event.response;
+        }
+    }
+    let response = response.expect("plan execution response should include content");
 
     assert!(
         !response.content.trim().is_empty(),
@@ -357,7 +337,6 @@ async fn delegation_chain_keeps_private_context_local() {
         openai_api_key: None,
         ollama_url: std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into()),
         native_llm_url: None,
-        auth_token: None,
         sample_rate: 0.05,
         sample_risk_threshold: 0.7,
         scoring_enabled: false,
@@ -434,6 +413,7 @@ async fn delegation_chain_keeps_private_context_local() {
                 task_class: String::new(),
                 ..Default::default()
             }),
+            gunshi_allocation: None,
         })
         .await
         .expect("local private plan")
@@ -441,15 +421,20 @@ async fn delegation_chain_keeps_private_context_local() {
         .plan
         .expect("local plan");
     assert!(local_plan.resolved_model.starts_with("ollama/"));
-    let local_response = client
-        .execute_plan(ExecutePlanRequest {
+    let mut stream = client
+        .execute_plan_stream(ExecutePlanRequest {
             plan: Some(local_plan),
         })
         .await
         .expect("local private execute")
-        .into_inner()
-        .response
-        .expect("local response");
+        .into_inner();
+    let mut local_response = None;
+    while let Some(event) = stream.message().await.expect("local private stream") {
+        if event.response.is_some() {
+            local_response = event.response;
+        }
+    }
+    let local_response = local_response.expect("local response");
     assert!(!local_response.content.trim().is_empty());
 
     if std::env::var("ANTHROPIC_API_KEY").is_err() {
@@ -476,6 +461,7 @@ async fn delegation_chain_keeps_private_context_local() {
                 task_class: "template_only".into(),
                 ..Default::default()
             }),
+            gunshi_allocation: None,
         })
         .await
         .expect("frontier template plan")

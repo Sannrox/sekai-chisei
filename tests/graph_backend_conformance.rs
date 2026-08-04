@@ -1,7 +1,7 @@
 use sekai_chisei::db::graph::GraphBackend;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::domain::{Direction, Link, ListFilter, Object, ObjectSet, PropertyFilter};
+use sekai_chisei::domain::{Direction, Link, ListFilter, Object, PropertyFilter};
 use sekai_chisei::sekai::schema::{InterfaceDef, ObjectType};
 use sekai_chisei::sekai::security::{Grant, Role};
 use std::collections::HashMap;
@@ -156,26 +156,6 @@ fn exercise_graph_backend(db: &dyn GraphBackend, prefix: &str) {
         1
     );
     assert_eq!(db.lineage(&root.id, 10).unwrap().nodes.len(), 2);
-
-    let set = ObjectSet {
-        id: format!("{prefix}-set"),
-        name: "core".into(),
-        description: "core objects".into(),
-        filter: ListFilter {
-            namespace: Some(namespace.clone()),
-            ..Default::default()
-        },
-        owner_principal: format!("{prefix}-owner"),
-        created: 12,
-    };
-    db.create_object_set(&set).unwrap();
-    assert_eq!(
-        db.list_object_sets_for_principals(&[&set.owner_principal])
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(db.get_object_set(&set.id).unwrap().is_some());
 
     let viewer = format!("{prefix}-viewer");
     db.create_grant(&Grant {

@@ -4,12 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use chrono::Utc;
-use futures_util::{StreamExt, stream};
 use tonic::Request as GrpcRequest;
 
-use crate::client::{GatewayClient, connect_sekai};
-use sekai_proto::chisei::CheckBudgetRequest;
-use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+use crate::client::connect_sekai;
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_proto::sekai::{QueryRowsRequest, Row, RowFilter, RowQuery};
 
@@ -148,8 +145,6 @@ pub struct GatewayReportRow {
     pub models: BTreeMap<String, i64>,
     pub profile_versions: BTreeMap<String, i64>,
     pub capability_snapshots: BTreeMap<String, i64>,
-    pub budget_used: i64,
-    pub budget_limit: i64,
 }
 
 pub async fn run_report(
@@ -210,10 +205,7 @@ pub async fn run_report(
         std::fs::write(path, html)?;
         println!("wrote chisei gateway dashboard: {}", path.display());
     } else {
-        let mut rows = summarize_rows(resp.rows.clone(), config.group_by);
-        if config.group_by == ReportGroupBy::WorkUnit {
-            attach_work_unit_budgets(&mut rows, &resp.rows, channel).await;
-        }
+        let rows = summarize_rows(resp.rows.clone(), config.group_by);
         print_report(config.group_by, &rows);
     }
     Ok(())
@@ -385,81 +377,6 @@ pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayRep
     summaries
 }
 
-async fn attach_work_unit_budgets(
-    summaries: &mut [GatewayReportRow],
-    source_rows: &[Row],
-    channel: GatewayClient,
-) {
-    let mut contexts = BTreeMap::new();
-    for row in source_rows {
-        let Some(work_unit) = row
-            .values
-            .get("work_unit_id")
-            .filter(|work_unit| !work_unit.is_empty())
-        else {
-            continue;
-        };
-        contexts.entry(work_unit.clone()).or_insert_with(|| {
-            (
-                row.values.get("project").cloned().unwrap_or_default(),
-                row.values.get("agent").cloned().unwrap_or_default(),
-            )
-        });
-    }
-    let requests = summaries
-        .iter()
-        .filter(|row| row.group != "(unknown)")
-        .map(|summary| {
-            let (project, agent) = contexts.get(&summary.group).cloned().unwrap_or_default();
-            (summary.group.clone(), project, agent)
-        })
-        .collect::<Vec<_>>();
-    let usages = stream::iter(requests)
-        .map(|(work_unit, project, agent)| {
-            let mut chisei = ChiseiServiceClient::new(channel.clone());
-            async move {
-                let result = chisei
-                    .check_budget(gateway_request(CheckBudgetRequest {
-                        subject: String::new(),
-                        estimated_tokens: 0,
-                        project,
-                        agent,
-                        key_id: String::new(),
-                        work_unit: work_unit.clone(),
-                        user_id: String::new(),
-                        metric: "tokens".to_string(),
-                        task_class: String::new(),
-                        mid_task: false,
-                        local_free_available: false,
-                    }))
-                    .await
-                    .map(|response| response.into_inner().usage);
-                (work_unit, result)
-            }
-        })
-        .buffer_unordered(16)
-        .collect::<Vec<_>>()
-        .await;
-    let mut by_work_unit = summaries
-        .iter_mut()
-        .map(|summary| (summary.group.clone(), summary))
-        .collect::<BTreeMap<_, _>>();
-    for (work_unit, result) in usages {
-        match result {
-            Ok(Some(usage)) => {
-                if let Some(summary) = by_work_unit.get_mut(&work_unit) {
-                    summary.budget_used = i64::from(usage.tokens_used);
-                    summary.budget_limit = i64::from(usage.max_tokens);
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(%work_unit, %error, "could not load work-unit budget usage");
-            }
-        }
-    }
-}
-
 fn report_group(row: &Row, group_by: ReportGroupBy) -> String {
     let value = match group_by {
         ReportGroupBy::Project => row.values.get("project"),
@@ -595,7 +512,7 @@ fn print_report(group_by: ReportGroupBy, rows: &[GatewayReportRow]) {
 
 fn print_work_unit_report(rows: &[GatewayReportRow]) {
     println!(
-        "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>8} {:>8} {:>9}  models",
+        "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>8} {:>8}  models",
         "work_unit",
         "calls",
         "refusals",
@@ -605,19 +522,10 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
         "warm",
         "misses",
         "hit_rate",
-        "cached",
-        "budget"
+        "cached"
     );
-    println!("{}", "-".repeat(144));
+    println!("{}", "-".repeat(132));
     for row in rows {
-        let budget = if row.budget_limit > 0 {
-            format!(
-                "{}%",
-                (row.budget_used.saturating_mul(100) / row.budget_limit).clamp(0, 999)
-            )
-        } else {
-            "unlimited".to_string()
-        };
         let models = row
             .models
             .iter()
@@ -625,7 +533,7 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
             .collect::<Vec<_>>()
             .join(", ");
         println!(
-            "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>7}% {:>7}% {:>9}  {}",
+            "{:<24} {:>7} {:>9} {:>9} {:>12} {:>8} {:>8} {:>7} {:>7}% {:>7}%  {}",
             truncate(&row.group, 24),
             row.calls,
             row.refusals,
@@ -636,7 +544,6 @@ fn print_work_unit_report(rows: &[GatewayReportRow]) {
             row.cache_misses,
             cache_hit_rate(row),
             effective_cached_share(row),
-            budget,
             models
         );
     }

@@ -1,5 +1,110 @@
 # Changelog
 
+## 1.0.0
+
+### Stable contract
+
+- Freeze the ontology-first SQLite product loop, principal-scoped credentials,
+  `sekaictl`, receipts, and core gRPC capability inventory as the 1.x contract.
+- Return only core capabilities from unfiltered discovery. Callers must request
+  `all`, `advanced`, or `experimental` to opt into broader catalogs.
+- Keep PostgreSQL as a partial community backend with explicit runtime
+  capability discovery and fail-closed unsupported paths.
+- Integrate Gunshi as the outer fleet-allocation stage for native execution.
+  `PlanExecution` can bind an exact issued allocation before its existing
+  Kioku enrichment and records the allocation provenance in the plan and
+  operation receipt without adding an RPC endpoint.
+
+### Removed
+
+- Remove the server-side `SEKAI_AUTH_TOKEN` root bootstrap. Clients use
+  `SEKAI_CREDENTIAL` with a durable principal-scoped credential.
+- Remove the unused capability-package and trust vertical: seven package
+  lifecycle/trust RPCs, package persistence, and package migrations are gone.
+- Remove the experimental scenario-overlay vertical: `EvaluateScenario`, its
+  request/response types, capability catalog entry, and in-memory evaluator.
+- Remove the experimental text/hybrid retrieval vertical: `SearchText`,
+  `HybridRetrieve`, their candidate/fusion wire types, and SQLite FTS index
+  maintenance. Core retrieval remains `RetrieveContext`.
+- Remove the experimental pattern-plan vertical: `ExecutePatternPlan`,
+  `ExplainPatternPlan`, their IR wire types, and the standalone plan module.
+- Remove the experimental temporal-history vertical: three historical query
+  RPCs, temporal assertion wire types, storage/migration code, and graph
+  mutation hooks. Current graph state, audit, and lineage remain supported.
+- Remove the experimental assurance-export pair: `VerifyAuditLedger` and
+  `ExportAssurance`. Internal ledger and attestation verification remain
+  available to retention, provenance, and administrative tooling.
+- Remove the advanced evidence-driven ontology-proposal vertical: four proposal
+  RPCs, proposal persistence/migrations, and the standalone review workflow.
+  Ontology classes and relations remain directly authorable through the core
+  authenticated mutation APIs.
+- Remove the advanced object-set vertical: four saved-filter RPCs, object-set
+  persistence in SQLite/PostgreSQL, graph backend methods, and retention cleanup.
+  Callers use the core inline object-list filters instead.
+- Remove 21 unserved or non-essential Sekai RPCs, including the public semantic
+  resolver, governed-fact/waiver writers, graph function/action authoring,
+  runtime-pressure and parked-resolution facades, reservation/coordination
+  snapshots, and evidence lifecycle/content facades. The orphaned runtime
+  pressure storage/migration/fixture vertical is gone too; claim, lease, park,
+  and evidence primitives remain where active execution depends on them. Drop
+  the now-unreferenced tenant, coordination-snapshot, function-result, and
+  ontology-violation wire messages as well.
+- Remove the unserved `LlmService` and message-only `llm.proto` package.
+  Provider execution uses internal request types inside governed Chisei and
+  gateway flows.
+- Remove `ListPipelineRuns`, which never persisted or returned pipeline runs.
+  Native planning state is observed through execution plans and operation
+  receipts.
+- Remove the eight experimental `Evolve*` RPCs and their dedicated enhancement
+  storage. Evolution remains an internal learning primitive for capability
+  promotion instead of a second public analytics API.
+- Remove secondary Chisei RPCs for namespace worker policy, portfolio
+  authoring/allocation, model affinity, evidence-gate inspection, and legacy
+  eval authoring/listing/analytics. These signals remain internal to routing,
+  execution, evaluation, and gateway enforcement.
+- Remove the standalone `RunPipeline` RPC and the optional
+  `CHISEI_GATEWAY_RUN_PIPELINE` mode. Native callers use `PlanExecution`; the
+  gateway receives its sampling decision through the canonical governed
+  preflight.
+- Collapse the external-action lifecycle from 10 RPCs to four:
+  `AuthorizeExternalAction` returns a permit when immediately allowed,
+  `TransitionExternalAction` owns approval/cancellation/revocation/delegation,
+  `RedeemExternalActionPermit` consumes authority, and
+  `SetExternalActionPolicy` owns policy and kill-switch changes.
+- Collapse Gunshi from 11 RPCs to three. Recommendation issuance now returns
+  aligned auto-dispatch decisions, policy and feedback mutations share
+  `SetGunshiAllocationPolicy`, and status includes the advisory scorecard.
+- Collapse gateway coordination from five RPCs to three. One
+  `ClaimGatewayDispatch` atomically reserves and claims an alias, while
+  canonical receipts persist through trusted `RecordUsage` accounting and
+  generic audit events use Sekai decisions. The final public Chisei contract
+  contains 30 RPCs (133 total with Sekai's 103). The four bounded eval/sample
+  read projections retained for active Tenkai and Aldunis consumers are not a
+  return of the removed eval authoring or analytics verticals.
+- Remove the public unary `ExecutePlan` alias; native execution is streaming-only
+  through `ExecutePlanStream`.
+- Remove evaluation read/analytics facades, the plan-backed governed-subject
+  facade, `CheckBudget`, standalone `ResolvePolicy`, and
+  `QueryOperationStatistics`. Gateway admission is owned by
+  `DecideGatewayExecution`; historical policy dry-run remains an operator-console
+  projection rather than a public RPC.
+- Remove the guarded object-mutation RPC aliases. Use `CreateObject`,
+  `UpdateObject`, and `DeleteObject` with optional `lease_precondition`.
+- Remove public interface-registry CRUD and schema-to-ontology projection RPCs.
+  Use ontology-first authoring; the interface registry remains an internal
+  schema-validation substrate.
+- Remove legacy gateway usage-recovery configuration names, status aliases,
+  and provider-registry initialization override.
+- Remove the cross-repository Homebrew tap publication job.
+
+### Migration
+
+Version 1.0 is a clean break from pre-1.0 releases. There is no in-place public
+API, configuration, or state compatibility promise. Export any data that must
+be retained, deploy a fresh 1.0 database, create principal credentials through
+`sekaictl admin access credential create`, and update clients to the 1.0 proto
+and environment names before importing supported domain data.
+
 ## 0.2.1
 
 ### Security

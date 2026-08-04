@@ -13,13 +13,6 @@ CREATE TABLE IF NOT EXISTS sekai_links (
 CREATE INDEX IF NOT EXISTS idx_links_from ON sekai_links(from_id, relation);
 CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);
 
-CREATE TABLE IF NOT EXISTS sekai_object_sets (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL,
-    filter TEXT NOT NULL, owner_principal TEXT NOT NULL, created BIGINT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_object_sets_owner_name
-    ON sekai_object_sets(owner_principal, name);
-
 CREATE TABLE IF NOT EXISTS sekai_principal_credentials (
     id TEXT PRIMARY KEY, principal TEXT NOT NULL, token_hash TEXT NOT NULL,
     status TEXT NOT NULL, created BIGINT NOT NULL, rotated_at BIGINT NOT NULL DEFAULT 0,
@@ -190,9 +183,6 @@ CREATE INDEX IF NOT EXISTS idx_chisei_eval_iterations_suite
 CREATE INDEX IF NOT EXISTS idx_chisei_eval_iterations_file
     ON chisei_eval_iterations(changed_file, created);
 CREATE TABLE IF NOT EXISTS chisei_evolve_tasks (id TEXT PRIMARY KEY, task_json TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS chisei_evolve_enhancements (
-    request_id TEXT PRIMARY KEY, original_spec TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS chisei_sample_observations (
     request_id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT '', spec TEXT NOT NULL DEFAULT '',
     resolved_model TEXT NOT NULL DEFAULT '', output_content TEXT NOT NULL DEFAULT '',

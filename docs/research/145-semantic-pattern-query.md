@@ -1,11 +1,11 @@
 # Research: semantic pattern-query surface
 
-Issue: [#145](https://github.com/Sannrox/sekai-chisei/issues/145)  
+Issue: [#145](https://github.com/Sannrox/sekai-chisei/issues/145)
 Related: #141 (closed), #144 (closed), #151 (open), #152 (open),
-implementation [#375](https://github.com/Sannrox/sekai-chisei/issues/375)
-([pattern-plan.md](../pattern-plan.md), plan version `pattern_plan/v1`)  
+implementation [#375](https://github.com/Sannrox/sekai-chisei/issues/375),
+retired from the 1.0 runtime surface
 Date: 2026-07-27  
-Status: **recommendation complete** (IR vertical: #375)
+Status: **retired from the 1.0 runtime surface; retained as design history**
 
 ## Decision question
 
@@ -31,7 +31,7 @@ Example: `Alice —works_for→ Company —owns→ Project —uses→ Dataset`
 | **Structured pattern/join protobuf** | Natural: steps as messages with variable bindings | Can re-check ACL at each hop; deny non-disclosing | Explicit plan schema version | Low; no parser surface |
 | Small core DSL | Same after compile | Same if compile→same plan | Grammar + plan version | Medium; parser/security bugs |
 | SPARQL/Cypher adapter | High expressiveness | Risk of planner leaks; must sandbox | External dialect drift | High; dependency + partial semantics |
-| **No new syntax; compose #151** | Encode pattern as sequenced catalog capabilities | Best fit for governance | Capability package version | Lowest core cost |
+| **No new syntax; compose #151** | Encode pattern as sequenced catalog capabilities | Best fit for governance | Catalog contract version | Lowest core cost |
 
 ### Why not SPARQL/Cypher in core
 
@@ -69,9 +69,9 @@ agent runtimes.
 
 ### Implementation issue (single vertical)
 
-When #151 is shaped or immediately if maintainer prioritizes IR first:
+When #151 is shaped or if a future maintainer reopens the IR work:
 
-> **feat(sekai): structured multi-hop pattern plan IR and bounded executor**  
+> **feat(sekai): structured multi-hop pattern plan IR and bounded executor** (historical; retired for 1.0)
 > Deliver protobuf/plan types + SQLite executor for the Alice path with ACL
 > re-check, EXPLAIN, and fixture suite. No textual syntax.
 

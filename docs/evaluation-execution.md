@@ -1,12 +1,12 @@
 # Evaluation execution
 
-`ExecuteEvaluationManifest` executes one exact
+`ExecuteEvaluationManifest` is an experimental 1.0 capability that executes one exact
 `chisei.resolved-evaluation-manifest/v1` through the
 established `chisei.deterministic-evaluation-executor/v1` request protocol.
 The frozen node execution class selects a separate deterministic or stochastic
 registry and execution path; the request identifier is retained for persisted
 execution and client compatibility. The manifest digest is the
-idempotency identity. `GetEvaluationExecution` returns the receipt-derived
+idempotency identity. `GetOperationReceipt` returns the authoritative
 projection, and `CancelEvaluationExecution` durably requests cancellation.
 
 This is situation-specific evaluation, not a generic workflow engine. A plan

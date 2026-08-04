@@ -64,51 +64,6 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "GuardedCreateObject",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.guarded-mutations",
-        "sekai.leases",
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/guarded_mutation_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GuardedUpdateObject",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.guarded-mutations",
-        "sekai.leases",
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/guarded_mutation_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GuardedDeleteObject",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.guarded-mutations",
-        "sekai.leases",
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/guarded_mutation_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
       "rpc": "CreateObject",
       "kind": "persistent",
       "surfaces": [
@@ -167,54 +122,6 @@
       ],
       "durable_dependencies": [],
       "product_tier": "core"
-    },
-    {
-      "rpc": "CreateObjectSet",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListObjectSets",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "DeleteObjectSet",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ResolveObjectSet",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
     },
     {
       "rpc": "FindByExternalId",
@@ -315,97 +222,6 @@
       "product_tier": "core"
     },
     {
-      "rpc": "SearchText",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/hybrid.rs",
-        "src/sekai/text_fts.rs",
-        "docs/text-fts.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization",
-        "sekai.evidence"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "HybridRetrieve",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/hybrid.rs",
-        "src/sekai/retrieval.rs",
-        "src/sekai/text_fts.rs",
-        "docs/hybrid-retrieval.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization",
-        "sekai.ontology-definitions",
-        "sekai.evidence"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ExecutePatternPlan",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/pattern_plan.rs",
-        "docs/pattern-plan.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ExplainPatternPlan",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/pattern_plan.rs",
-        "docs/pattern-plan.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvaluateScenario",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/scenario.rs",
-        "docs/scenario-overlay.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ResolveSemanticRef",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/grpc/sekai_service.rs",
-        "src/sekai/retrieval.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.authorization",
-        "sekai.ontology-definitions"
-      ],
-      "product_tier": "core"
-    },
-    {
       "rpc": "ExpandRelations",
       "kind": "computed",
       "surfaces": [],
@@ -449,219 +265,7 @@
       "product_tier": "core"
     },
     {
-      "rpc": "InstallCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "TransitionCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs",
-        "tests/capability_package_lifecycle.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "EvaluateCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "UpgradeCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "RollbackCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "DisableCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "UninstallCapabilityPackage",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/capability_package_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "SetCapabilityPackageTrustPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "src/sekai/capability_package.rs",
-        "docs/capability-package-trust.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetCapabilityPackageTrustPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "src/sekai/capability_package.rs",
-        "docs/capability-package-trust.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "PutCapabilityPackageSigner",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "src/sekai/capability_package.rs",
-        "docs/capability-package-trust.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListCapabilityPackageSigners",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.capability-packages",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "src/sekai/capability_package.rs",
-        "docs/capability-package-trust.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ApplyGovernedFactProfile",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/governed_fact_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "PutGovernedFactVersion",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/governed_fact_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "GetGovernedFactVersion",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/governed_fact_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "PutGovernedWaiverVersion",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/governed_fact_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetGovernedWaiverVersion",
       "kind": "persistent",
       "surfaces": [
         "sekai.graph"
@@ -708,54 +312,6 @@
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
-    },
-    {
-      "rpc": "DeleteSchemaType",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/definition_lifecycle_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListInterfaces",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/definition_lifecycle_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "CreateInterface",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/definition_lifecycle_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "DeleteInterface",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.graph"
-      ],
-      "evidence": [
-        "tests/definition_lifecycle_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
     },
     {
       "rpc": "ListOntologyClasses",
@@ -854,80 +410,6 @@
       "product_tier": "core"
     },
     {
-      "rpc": "ProjectSchemaToOntology",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/ontology.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.ontology-definitions"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ReportOntologyLinkViolations",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/ontology.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.graph",
-        "sekai.ontology-definitions"
-      ],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ProposeOntologyDefinitions",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.ontology-definitions"
-      ],
-      "evidence": [
-        "src/sekai/ontology_proposal.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListOntologyDefinitionProposals",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.ontology-definitions"
-      ],
-      "evidence": [
-        "src/sekai/ontology_proposal.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetOntologyDefinitionProposal",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.ontology-definitions"
-      ],
-      "evidence": [
-        "src/sekai/ontology_proposal.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ReviewOntologyDefinitionProposal",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.ontology-definitions"
-      ],
-      "evidence": [
-        "src/sekai/ontology_proposal.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "CreateFunction",
       "kind": "persistent",
       "surfaces": [
@@ -949,21 +431,6 @@
         "tests/definition_lifecycle_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ExecuteFunction",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/function.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.function-definitions",
-        "sekai.graph",
-        "sekai.datasets",
-        "sekai.authorization"
-      ],
       "product_tier": "advanced"
     },
     {
@@ -1151,18 +618,6 @@
       "product_tier": "core"
     },
     {
-      "rpc": "VerifyAuditLedger",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/ledger.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.audit"
-      ],
-      "product_tier": "experimental"
-    },
-    {
       "rpc": "GetAttestation",
       "kind": "persistent",
       "surfaces": [
@@ -1197,32 +652,6 @@
       ],
       "evidence": [
         "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ExportAssurance",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/shomei.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.audit",
-        "sekai.attestations",
-        "sekai.evidence"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "CreateActionType",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions"
-      ],
-      "evidence": [
-        "tests/reusable_sekai_backend_conformance.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1354,6 +783,7 @@
         "sekai.audit"
       ],
       "evidence": [
+        "src/grpc/sekai_service.rs",
         "src/sekai/action_effect.rs"
       ],
       "durable_dependencies": [],
@@ -1403,32 +833,6 @@
       ],
       "evidence": [
         "src/sekai/action_effect.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetRuntimeWorkPressure",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/action_effect.rs",
-        "src/grpc/sekai_service.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.audit"
-      ],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "SubmitParkedWorkResolutionAction",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.audit"
-      ],
-      "evidence": [
-        "src/sekai/action_effect.rs",
-        "src/db/postgres_action_effect.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
@@ -1697,18 +1101,6 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "ReleaseReservation",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.coordination"
-      ],
-      "evidence": [
-        "tests/coordination_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "ListReservations",
       "kind": "persistent",
       "surfaces": [
@@ -1734,18 +1126,6 @@
     },
     {
       "rpc": "ReconcileWorkUnits",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.coordination"
-      ],
-      "evidence": [
-        "tests/coordination_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetCoordinationSnapshot",
       "kind": "persistent",
       "surfaces": [
         "sekai.coordination"
@@ -1819,18 +1199,6 @@
       "product_tier": "core"
     },
     {
-      "rpc": "RegisterEvidenceProducer",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "RegisterEvidenceSchema",
       "kind": "persistent",
       "surfaces": [
@@ -1844,18 +1212,6 @@
     },
     {
       "rpc": "SubmitEvidence",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "SubmitEvidenceBatch",
       "kind": "persistent",
       "surfaces": [
         "sekai.evidence"
@@ -1891,67 +1247,7 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "ReplayEvidenceSubmission",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "RetractEvidence",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "MarkEvidenceStale",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetEvidenceSubmissionContent",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.evidence"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "CreateHandoff",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.handoffs"
-      ],
-      "evidence": [
-        "tests/evidence_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ResolveHandoff",
       "kind": "persistent",
       "surfaces": [
         "sekai.handoffs"
@@ -1973,45 +1269,6 @@
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
-    },
-    {
-      "rpc": "DiscoverTemporalSurfaces",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/temporal.rs",
-        "docs/temporal-history-storage.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "QueryTemporalAsOf",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/temporal.rs",
-        "docs/temporal-history-storage.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "DiffTemporalHistory",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/temporal.rs",
-        "docs/temporal-history-storage.md"
-      ],
-      "durable_dependencies": [
-        "sekai.graph"
-      ],
-      "product_tier": "experimental"
     }
   ],
   "complete_sekai_surfaces": [
@@ -2019,7 +1276,6 @@
     "sekai.attestations",
     "sekai.audit",
     "sekai.authorization",
-    "sekai.capability-packages",
     "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",
@@ -2049,7 +1305,6 @@
   ],
   "evidence_harnesses": [
     "tests/action_governance_backend_conformance.rs",
-    "tests/capability_package_backend_conformance.rs",
     "tests/coordination_backend_conformance.rs",
     "tests/decision_backend_conformance.rs",
     "tests/definition_lifecycle_backend_conformance.rs",

@@ -5,7 +5,3 @@ pub mod sekai {
 pub mod chisei {
     tonic::include_proto!("chisei");
 }
-
-pub mod llm {
-    tonic::include_proto!("llm");
-}

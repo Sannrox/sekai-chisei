@@ -41,7 +41,7 @@ env resolution is process-local by definition.
 
 ## Gateway / Chisei consumption
 
-`PlanExecution`, `ExecutePlan`, and `ExecutePlanStream` carry the trusted
+`PlanExecution` and `ExecutePlanStream` carry the trusted
 authenticated context through the native Chisei path. For tenant-scoped
 execution, Chisei resolves the provider credential from the enterprise
 extension after policy selects the provider and immediately before constructing

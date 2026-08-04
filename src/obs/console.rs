@@ -3,7 +3,7 @@
 //! Hybrid public-API model from research #283:
 //! - shell is served from the control-plane ops HTTP listener;
 //! - session credentials match gRPC principal tokens (Bearer / principal
-//!   credentials, plus deprecated `SEKAI_AUTH_TOKEN` when configured);
+//!   credentials);
 //! - all data routes fail closed when unauthenticated or when the principal
 //!   cannot access the requested namespace;
 //! - raw tokens are never stored in browser-readable storage (HttpOnly
@@ -194,9 +194,6 @@ fn clear_session_cookie() -> HeaderValue {
 }
 
 fn credential_still_active(db: &RuntimeDb, session: &ConsoleSession) -> bool {
-    if session.credential_id == "legacy-root" {
-        return true;
-    }
     match db.get_principal_credential(&session.token_hash) {
         Ok(Some(credential)) => {
             credential.status == "active"
@@ -1322,14 +1319,14 @@ mod tests {
         )))
     }
 
-    fn test_state(db: Arc<RuntimeDb>, legacy: Option<&str>) -> ConsoleState {
+    fn test_state(db: Arc<RuntimeDb>) -> ConsoleState {
         let store = Arc::new(PrincipalCredentialStore::new());
         if let Ok(credentials) = db.list_active_credentials() {
             store.load(&credentials);
         }
         ConsoleState {
             db: db.clone(),
-            auth: TokenAuthInterceptor::new(store, db, legacy.map(str::to_string)),
+            auth: TokenAuthInterceptor::new(store, db),
             sessions: Arc::new(SessionStore::new()),
             session_ttl: Duration::from_secs(3600),
         }
@@ -1419,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn unauthenticated_data_routes_fail_closed() {
         let db = test_db();
-        let app = router(test_state(db, None));
+        let app = router(test_state(db));
 
         let home = app
             .clone()
@@ -1471,7 +1468,7 @@ mod tests {
         seed_namespace_grant(&db, "alpha", "alice", Role::Admin);
         seed_namespace_grant(&db, "beta", "bob", Role::Admin);
 
-        let app = router(test_state(db, None));
+        let app = router(test_state(db));
         let (status, sid) = login(&app, token).await;
         assert!(
             status.is_redirection(),
@@ -1538,34 +1535,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_token_is_rejected() {
         let db = test_db();
-        let app = router(test_state(db, None));
+        let app = router(test_state(db));
         let (status, cookie) = login(&app, "not-a-real-token").await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(cookie.is_none());
-    }
-
-    #[tokio::test]
-    async fn legacy_root_token_can_open_any_namespace() {
-        let db = test_db();
-        let app = router(test_state(db, Some("legacy-root-secret")));
-        let (status, sid) = login(&app, "legacy-root-secret").await;
-        assert!(status.is_redirection());
-        let cookie = format!("{SESSION_COOKIE}={}", sid.expect("sid"));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/console/n/any-ns/pressure")
-                    .header(header::COOKIE, cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("Governance pressure"));
-        assert!(body.contains("any-ns"));
     }
 
     #[tokio::test]
@@ -1574,7 +1547,7 @@ mod tests {
         let token = "logout-token";
         db.create_principal_credential("carol", &hash_gateway_key(token), 1)
             .unwrap();
-        let app = router(test_state(db, None));
+        let app = router(test_state(db));
         let (_, sid) = login(&app, token).await;
         let sid = sid.expect("sid");
         let cookie = format!("{SESSION_COOKIE}={sid}");

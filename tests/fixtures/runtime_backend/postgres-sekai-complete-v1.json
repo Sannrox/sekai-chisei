@@ -6,7 +6,6 @@
     "sekai.attestations",
     "sekai.audit",
     "sekai.authorization",
-    "sekai.capability-packages",
     "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",

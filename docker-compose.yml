@@ -38,13 +38,11 @@ services:
       # On gateway:
       #   CHISEI_GRPC_URL: http://server:50051
       #   SEKAI_SOCKET: ""
-      # On server (required auth):
-      #   SEKAI_AUTH_TOKEN: ${SEKAI_AUTH_TOKEN:?}
+      #   SEKAI_CREDENTIAL: ${SEKAI_CREDENTIAL:?}
+      # On server (requires a principal credential already stored in DB_PATH):
       #   GRPC_PORT: 50051
       # Public 0.0.0.0 TCP also requires TLS certs/key, or SEKAI_ALLOW_PLAINTEXT=1
       # for an explicit trusted plaintext deployment, or SEKAI_BIND=127.0.0.1.
-      # On gateway:
-      #   SEKAI_AUTH_TOKEN: ${SEKAI_AUTH_TOKEN:?}
       #   GATEWAY_BIND: 0.0.0.0:8080
       # Expose server gRPC:
       #   ports:

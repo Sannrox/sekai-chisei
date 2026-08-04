@@ -131,27 +131,6 @@ pub struct ReconcileSummary {
     pub details: Vec<ReconciliationRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct CoordinationSnapshot {
-    pub pending_count: i32,
-    pub running_count: i32,
-    pub stale_count: i32,
-    pub active_reservation_count: i32,
-    pub oldest_pending_age_ms: i64,
-    pub oldest_running_age_ms: i64,
-    pub stale_reservation_count: i32,
-    pub blocked_scopes: Vec<ScopeBlockage>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScopeBlockage {
-    pub scope_id: String,
-    pub scope_name: String,
-    pub reason: String,
-    pub pending_count: i32,
-    pub active_count: i32,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileFilter {
     pub dry_run: bool,
@@ -1147,102 +1126,6 @@ impl SekaiDb {
             summary.work_units_reconciled += 1;
         }
         Ok(summary)
-    }
-
-    pub fn coordination_snapshot(&self, now_ms: i64) -> Result<CoordinationSnapshot, String> {
-        let work_units = self.list_work_units(&WorkUnitFilter::default())?;
-        let reservations = self.list_reservations(&ReservationFilter::default())?;
-        let scopes = self.list_contention_scopes()?;
-        let pending: Vec<&WorkUnit> = work_units
-            .iter()
-            .filter(|work_unit| work_unit.status == WORK_UNIT_STATUS_PENDING)
-            .collect();
-        let running_count = work_units
-            .iter()
-            .filter(|work_unit| work_unit.status == WORK_UNIT_STATUS_RUNNING)
-            .count() as i32;
-        let stale_count = work_units
-            .iter()
-            .filter(|work_unit| {
-                work_unit.status == WORK_UNIT_STATUS_STALE
-                    || work_unit.status == WORK_UNIT_STATUS_TIMED_OUT
-            })
-            .count() as i32;
-        let oldest_running_age_ms = work_units
-            .iter()
-            .filter(|work_unit| work_unit.status == WORK_UNIT_STATUS_RUNNING)
-            .map(|work_unit| now_ms.saturating_sub(work_unit.started_at.max(work_unit.created_at)))
-            .max()
-            .unwrap_or(0);
-        let stale_reservation_count = reservations
-            .iter()
-            .filter(|reservation| {
-                reservation.status == RESERVATION_STATUS_ACTIVE
-                    && reservation.released_at == 0
-                    && reservation.expires_at <= now_ms
-            })
-            .count() as i32;
-        let active_reservation_count = reservations
-            .iter()
-            .filter(|reservation| {
-                reservation.status == RESERVATION_STATUS_ACTIVE
-                    && reservation.released_at == 0
-                    && reservation.expires_at > now_ms
-            })
-            .count() as i32;
-        let oldest_pending_age_ms = pending
-            .iter()
-            .map(|work_unit| now_ms.saturating_sub(work_unit.created_at))
-            .max()
-            .unwrap_or(0);
-        let scope_names: HashMap<String, String> = scopes
-            .iter()
-            .map(|scope| (scope.id.clone(), scope.name.clone()))
-            .collect();
-        let mut blocked_scopes = Vec::new();
-        for scope in &scopes {
-            let pending_count = pending
-                .iter()
-                .filter(|work_unit| work_unit.scope_id == scope.id)
-                .count() as i32;
-            if pending_count == 0 {
-                continue;
-            }
-            let active_count = reservations
-                .iter()
-                .filter(|reservation| {
-                    reservation.scope_id == scope.id
-                        && reservation.status == RESERVATION_STATUS_ACTIVE
-                        && reservation.released_at == 0
-                        && reservation.expires_at > now_ms
-                })
-                .count() as i32;
-            let reason = if active_count >= scope.max_concurrency {
-                format!("scope {} is saturated", scope.name)
-            } else {
-                "older pending work unit holds queue precedence".into()
-            };
-            blocked_scopes.push(ScopeBlockage {
-                scope_id: scope.id.clone(),
-                scope_name: scope_names
-                    .get(&scope.id)
-                    .cloned()
-                    .unwrap_or_else(|| scope.id.clone()),
-                reason,
-                pending_count,
-                active_count,
-            });
-        }
-        Ok(CoordinationSnapshot {
-            pending_count: pending.len() as i32,
-            running_count,
-            stale_count,
-            active_reservation_count,
-            oldest_pending_age_ms,
-            oldest_running_age_ms,
-            stale_reservation_count,
-            blocked_scopes,
-        })
     }
 
     fn finish_work_unit(

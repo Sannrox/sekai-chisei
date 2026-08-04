@@ -8,9 +8,9 @@ reference pages.
 
 | Topic | Status or current documentation |
 | --- | --- |
-| [Semantic pattern-query surface](145-semantic-pattern-query.md) | Recommendation complete; see [Pattern plan](../pattern-plan.md) |
-| [Governed what-if simulation](148-what-if-simulation.md) | Shipped as [Scenario overlay](../scenario-overlay.md) |
-| [Governed hybrid retrieval](152-hybrid-retrieval.md) | Shipped as [SQLite FTS](../text-fts.md) and [Hybrid retrieval](../hybrid-retrieval.md) |
+| [Semantic pattern-query surface](145-semantic-pattern-query.md) | Retired from the 1.0 runtime surface; retained as design history |
+| [Governed what-if simulation](148-what-if-simulation.md) | Retired from the 1.0 runtime surface; retained as design history |
+| [Governed hybrid retrieval](152-hybrid-retrieval.md) | Retired from the 1.0 runtime surface; retained as design history |
 | [Gateway PEP fat-decide](163-gateway-pep-fat-decide.md) | Design freeze; see [Gateway and clients](../gateway.md) |
 | [Lookup versus model call](175-lookup-vs-model-call.md) | Recommendation complete; see [Capability catalog](../capability-catalog.md) |
 | [Gunshi auto-allocation envelope](279-gunshi-auto-allocation-envelope.md) | See [Gunshi auto-allocation](../gunshi-auto-allocation.md) |
@@ -23,7 +23,7 @@ reference pages.
 | [Parked-work resolution](410-parked-work-resolution.md) | Design for durable continuation input and fenced resumption |
 | [External-action permit lifecycle surface](420-external-permit-lifecycle-surface.md) | Retain explicit lifecycle RPCs; consolidation would widen trust boundaries without removing implementation paths |
 | [Gateway administration single-source boundary](421-gateway-administration-single-source.md) | Extract shared setup and reporting into a leaf administration-client crate after façade cleanup |
-| [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Retain through 0.2.0; earliest removal is 0.3.0 after reviewed TCP administrator bootstrap/recovery and a distinct client token input |
+| [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Superseded by the 1.0 clean break: server bootstrap removed; clients use `SEKAI_CREDENTIAL` with durable principal credentials |
 | [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Recommend core commands at the root and grouped expert operations under `admin`; implementation requires a Design Discussion |
 | [Kernel and extension boundary](443-kernel-extension-boundary.md) | Keep one published governance product, narrow its public facade, and extract only acyclic leaf libraries with a measured independent-consumer dividend |
 | [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |

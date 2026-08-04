@@ -40,8 +40,9 @@ binds require `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless the operator explicitl
 sets `SEKAI_ALLOW_PLAINTEXT=1`. Set `SEKAI_BIND` when the inferred address is not
 appropriate.
 
-`SEKAI_AUTH_TOKEN` is a deprecated compatibility path that maps all callers to
-the fixed `root` principal. Do not use it as the long-term credential model.
+The server has no environment-token bootstrap. `SEKAI_CREDENTIAL` is read only
+by clients such as `sekaictl` and the gateway after a durable principal-scoped
+credential has been created.
 
 The community runtime issues only unbound control-plane credentials. Legacy
 credential `tenant_id` fields remain wire-compatible but are ignored; caller
@@ -105,8 +106,7 @@ readinessProbe:
 
 The gateway has separate `/healthz`, `/readyz`, and `/statusz` endpoints.
 `/statusz` exposes live/degraded posture and aggregate circuit and usage
-recovery state. The old budget-reconciliation field names remain temporary
-compatibility aliases for the equivalent usage-recovery values.
+recovery state.
 
 ## Persistence and backups
 

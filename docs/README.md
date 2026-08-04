@@ -42,8 +42,6 @@ If you want to deploy or operate the control plane:
   retrieval, and actions.
 - [Governed actions](governed-action-types.md) — start of the action type,
   instance, effect, runtime claim, and evidence lifecycle.
-- [Runtime claim pressure](runtime-claim-pressure.md) — bounded, read-only
-  capacity signals for an external worker-pool manager.
 - [External-action execution](external-action-execution.md) — permits,
   execution observations, and reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free
@@ -65,7 +63,7 @@ If you want to deploy or operate the control plane:
 - [Epistemic descriptor](epistemic-descriptor.md) — additive, bounded
   origin/evidence/lifecycle metadata on existing context references.
 - [Epistemic metadata conformance](epistemic-metadata-conformance.md) —
-  black-box non-disclosure evidence across graph, scenario, receipt, and
+  black-box non-disclosure evidence across graph, receipt, and
   descriptor projections.
 - [Context admission policy](context-admission-policy.md) — opt-in,
   versioned rules for using or holding out epistemically qualified context.
@@ -100,7 +98,7 @@ If you want to deploy or operate the control plane:
 - `.env.example` is the primary local template. The configuration guide
   explains stable operator-facing settings; experimental settings may remain
   documented next to the implementation until they stabilize.
-- The protocol files and implementation are authoritative when an early-stage
+- The protocol files and implementation are authoritative when an experimental
   API and prose documentation disagree. Please report drift as a bug.
 - Pages under `docs/research/` are design history. Follow their linked current
   guides for shipped behavior.

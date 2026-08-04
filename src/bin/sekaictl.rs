@@ -122,14 +122,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("created {}", output.display());
                 Ok(())
             }
-            Some("respond") => {
-                let config =
-                    sekai_chisei::gunshi_cli::FeedbackConfig::from_args(args.into_iter().skip(2))
-                        .map_err(std::io::Error::other)?;
-                let feedback = sekai_chisei::gunshi_cli::record_response(config).await?;
-                println!("{}", serde_json::to_string_pretty(&feedback)?);
-                Ok(())
-            }
             Some("scorecard") => {
                 let namespace = sekai_chisei::gunshi_cli::scorecard_namespace(&args[2..])
                     .map_err(std::io::Error::other)?;
@@ -223,46 +215,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let status =
                     sekai_chisei::gunshi_cli::set_kill_switch(namespace, !clear, reason).await?;
                 println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("authorize-auto") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let plan = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--plan")
-                    .map_err(std::io::Error::other)?;
-                let operation = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--operation")
-                    .map_err(std::io::Error::other)?;
-                let capacity = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--capacity")
-                    .map_err(std::io::Error::other)?;
-                let result = sekai_chisei::gunshi_cli::authorize_auto(
-                    namespace,
-                    plan.into(),
-                    operation.into(),
-                    capacity.into(),
-                )
-                .await?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
-                Ok(())
-            }
-            Some("promote-feedback") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let suite_id = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--suite-id")
-                    .map_err(std::io::Error::other)?;
-                let issuance_id =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--issuance-id")
-                        .map_err(std::io::Error::other)?;
-                let allocation_id =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--allocation-id")
-                        .map_err(std::io::Error::other)?;
-                let result = sekai_chisei::gunshi_cli::promote_feedback(
-                    namespace,
-                    suite_id,
-                    issuance_id,
-                    allocation_id,
-                )
-                .await?;
-                println!("{}", serde_json::to_string_pretty(&result)?);
                 Ok(())
             }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),

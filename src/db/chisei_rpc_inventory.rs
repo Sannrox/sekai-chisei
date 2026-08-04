@@ -1,4 +1,4 @@
-//! Checked-in inventory of ChiseiService and LlmService RPCs for PostgreSQL parity.
+//! Checked-in inventory of ChiseiService RPCs for PostgreSQL parity.
 //!
 //! PostgreSQL may advertise complete reusable Chisei surfaces only when this
 //! inventory is complete and every listed evidence path exists. Partial
@@ -15,7 +15,6 @@ pub const CHISEI_RPC_INVENTORY_VERSION: &str = "chisei.rpc-inventory/v1";
 pub const CHISEI_RPC_INVENTORY_JSON: &str =
     include_str!("../../tests/fixtures/chisei_rpc_inventory/v1.json");
 pub const CHISEI_SERVICE_PROTO: &str = include_str!("../../proto/chisei.proto");
-pub const LLM_SERVICE_PROTO: &str = include_str!("../../proto/llm.proto");
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,13 +79,13 @@ impl ChiseiRpcInventory {
                 self.version
             ));
         }
-        if self.service != "ChiseiService+LlmService" {
+        if self.service != "ChiseiService" {
             return Err(format!(
-                "inventory service must be ChiseiService+LlmService, got {}",
+                "inventory service must be ChiseiService, got {}",
                 self.service
             ));
         }
-        let expected_proto = ["proto/chisei.proto", "proto/llm.proto"];
+        let expected_proto = ["proto/chisei.proto"];
         if self.proto != expected_proto {
             return Err(format!(
                 "inventory proto paths must be {expected_proto:?}, got {:?}",
@@ -94,8 +93,7 @@ impl ChiseiRpcInventory {
             ));
         }
 
-        let mut proto_rpcs = parse_service_rpcs(CHISEI_SERVICE_PROTO, "ChiseiService")?;
-        proto_rpcs.extend(parse_service_rpcs(LLM_SERVICE_PROTO, "LlmService")?);
+        let proto_rpcs = parse_service_rpcs(CHISEI_SERVICE_PROTO, "ChiseiService")?;
 
         let mut seen = BTreeSet::new();
         for entry in &self.entries {
@@ -158,7 +156,7 @@ impl ChiseiRpcInventory {
             .collect::<Vec<_>>();
         if !missing.is_empty() || !stale.is_empty() {
             return Err(format!(
-                "inventory does not match ChiseiService+LlmService RPCs; missing={missing:?} stale={stale:?}"
+                "inventory does not match ChiseiService RPCs; missing={missing:?} stale={stale:?}"
             ));
         }
 
@@ -339,37 +337,40 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 93);
+        assert_eq!(inventory.entries.len(), 30);
         assert!(inventory.entry("EvaluateGovernedSubject").is_some());
         assert!(inventory.entry("ExportGovernedSubjectProvenance").is_some());
         assert!(
             inventory
                 .entry("GetGovernedSubjectProvenanceTrustRoot")
-                .is_some()
+                .is_none()
         );
-        assert!(inventory.entry("EvaluateGovernedSubjectWithPlan").is_some());
-        assert!(inventory.by_kind()["persistent"] >= 30);
+        assert_eq!(inventory.by_kind()["persistent"], 21);
         assert!(inventory.entry("GetOperationReceipt").is_some());
-        assert!(inventory.entry("ReserveGatewayRequestAlias").is_some());
+        assert!(inventory.entry("GetEvalSuite").is_some());
+        assert!(inventory.entry("GetEvalRun").is_some());
+        assert!(inventory.entry("GetSampleObservation").is_some());
+        assert!(inventory.entry("ClaimGatewayDispatch").is_some());
         assert!(inventory.entry("ResolveEvaluationPlan").is_some());
         assert!(inventory.entry("ExecuteEvaluationManifest").is_some());
-        assert!(inventory.entry("GetEvaluationExecution").is_some());
+        assert!(inventory.entry("GetEvaluationExecution").is_none());
         assert!(inventory.entry("CancelEvaluationExecution").is_some());
-        assert!(inventory.entry("Chat").is_some());
-        assert_eq!(
-            inventory.entry("ResolvePolicy").unwrap().kind,
-            RpcPersistenceKind::Computed
-        );
+        assert!(inventory.entry("Chat").is_none());
+        assert!(inventory.entry("ResolvePolicy").is_none());
         assert_eq!(
             inventory.entry("PlanExecution").unwrap().product_tier,
             ProductTier::Core
         );
-        assert_eq!(
-            inventory.entry("EvolveSuggest").unwrap().product_tier,
-            ProductTier::Experimental
-        );
+        assert!(inventory.entry("EvolveSuggest").is_none());
+        assert!(inventory.entry("SetNamespaceWorkerPolicy").is_none());
+        assert!(inventory.entry("RecordPortfolioObservation").is_none());
+        assert!(inventory.entry("CreateEvalSuite").is_none());
+        assert!(inventory.entry("RunPipeline").is_none());
+        assert!(inventory.entry("RecordGatewayAudit").is_none());
+        assert!(inventory.entry("IssueExternalActionPermit").is_none());
+        assert!(inventory.entry("RecordGunshiFeedback").is_none());
         let tiers = inventory.by_product_tier();
-        assert!(tiers["core"] >= 15, "core chisei pack small: {tiers:?}");
+        assert_eq!(tiers["core"], 9, "unexpected core chisei pack: {tiers:?}");
         assert_eq!(
             inventory.entries_for_tier(ProductTier::Core).count(),
             tiers["core"]

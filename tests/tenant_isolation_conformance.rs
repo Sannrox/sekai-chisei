@@ -229,7 +229,6 @@ fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     let protocols = [
         include_str!("../proto/sekai.proto"),
         include_str!("../proto/chisei.proto"),
-        include_str!("../proto/llm.proto"),
     ];
     let methods = protocols
         .iter()

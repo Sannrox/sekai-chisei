@@ -16,17 +16,10 @@ idempotency?
 Keep the existing `ActionEffect` and `operation_id` as the stable work and
 receipt identities. Change `parked` from immediately claimable to a durable
 `awaiting_continuation` lifecycle state (retaining `parked` as the v1 wire
-value during migration). Resolve it by submitting a governed
-`resolve_parked_work` **Action transition**, subject to policy, approval,
-authorization, idempotency, and audit before it can make the same effect ready
-to resume.
-
-A dedicated RPC may remain the typed wire command, but it is not an
-administrative side channel. It submits and returns a durable resolution
-Action. If policy permits immediate execution, admission records the Action,
-appends the immutable continuation, and moves the effect to `pending` in one
-transaction. If approval is required, the Action remains pending approval and
-the effect remains parked until the approved Action is invoked.
+value during migration). The earlier recommendation was to resolve it by
+submitting a governed `resolve_parked_work` **Action transition**, subject to
+policy, approval, authorization, idempotency, and audit. That transition
+remains an internal design option; 1.0 exposes no public resolution command.
 
 The next claim returns that immutable continuation record. Its claim generation
 is still the disposable runner attempt and remains the fence for heartbeat,
@@ -201,27 +194,11 @@ Only when no replay exists does the server validate the live fence, increment
 changes the effect to `parked`. A resolver references the record; it cannot
 reassert or replace host-produced checkpoint metadata.
 
-Add an immutable, access-controlled resolution input at governed Action
-submission:
-
-```proto
-message ParkedWorkResolutionInput {
-  string resolution_input_id = 1;
-  string effect_id = 2;
-  uint64 park_generation = 3;
-  string input_json = 4;
-  string input_digest = 5;
-  string reason = 6;
-  string submitted_by = 7;
-  int64 submitted_at_ms = 8;
-}
-```
-
-The validated canonical payload is retained so an approval-delayed invocation
-does not depend on the submitting process or attempt to reconstruct content
-from a digest. Reads require live namespace authorization and apply
-classification, retention, and redaction rules. Audit, approval summaries, and
-logs contain only the record id, digest, and bounded non-sensitive metadata.
+The earlier draft also proposed a separate wire record for an immutable,
+access-controlled resolution input. That record is not part of the 1.0
+protocol: parked-work state and any continuation input remain internal to the
+governed Action pipeline. If a future public surface is needed, it must be
+shaped as a new bounded contract rather than reviving this draft message.
 
 Add an immutable continuation child created at invocation:
 
@@ -250,96 +227,13 @@ classification, retention, audit, and disclosure rules as other potentially
 sensitive governed input. `decided_by` comes only from authenticated context;
 the request cannot assert it.
 
-### Governed resolution Action
+### Governed resolution (design history)
 
-Define a built-in, versioned `resolve_parked_work/v1` Action transition. Its
-input schema is:
-
-```proto
-message SubmitParkedWorkResolutionActionRequest {
-  string effect_id = 1;
-  uint64 expected_park_generation = 2;
-  string input_json = 3;
-  string reason = 4;
-  string request_id = 5;
-}
-
-message ParkedWorkResolutionAction {
-  string resolution_action_id = 1;
-  string effect_id = 2;
-  string namespace = 3;
-  uint64 expected_park_generation = 4;
-  // denied | pending_approval | rejected | invoked | cancelled | stale
-  string status = 5;
-  string policy_version = 6;
-  string approval_id = 7;
-  string decided_by = 8;
-  int64 created_at_ms = 9;
-  int64 invoked_at_ms = 10;
-  string resolution_input_id = 11;
-}
-
-message SubmitParkedWorkResolutionActionResponse {
-  ParkedWorkResolutionAction action = 1;
-  ActionEffect effect = 2;
-  ActionWorkContinuation continuation = 3;
-  ActionWorkPark park = 4;
-  bool replay = 5;
-}
-```
-
-The command reuses the project’s governed-Action policy and approval ownership
-rather than inventing permission rules inside the claim store. The built-in
-transition is namespace-scoped and may be invoked only by the authenticated
-principal captured on the Action or by the existing approval-resumption path.
-An approval decision authorizes invocation; it does not itself mutate the
-effect.
-
-Submission has two transactional branches after common validation:
-
-1. authenticates the principal and checks namespace write authority;
-2. loads the effect-derived namespace, validates the bounded request, and
-   canonically hashes the request including `expected_park_generation`;
-3. checks the durable idempotency record before requiring the current effect
-   state: an identical key and digest returns the original resolution Action
-   with `replay = true`, while a digest mismatch fails;
-4. locks the effect and verifies `status == parked`;
-5. compares `expected_park_generation` and loads its immutable park record;
-6. stores the immutable resolution input and resolves policy;
-7. if policy denies, records a durable `denied` Action plus policy,
-   idempotency, and audit evidence, creates no continuation, leaves the effect
-   awaiting continuation, and commits that fail-closed result atomically;
-8. if approval is required, records `pending_approval` and commits input,
-   Action, policy evidence, approval linkage, idempotency, and audit atomically
-   without changing parked state; or
-9. if policy permits immediate execution, performs every invocation guard and
-   commits input, an `invoked` Action, continuation, ready effect, receipt,
-   idempotency, and audit in this same transaction.
-
-Delayed invocation after approval:
-
-1. locks the resolution Action, effect, and park record;
-2. verifies the Action is invokable, the effect is still parked, and its park
-   generation still matches;
-3. verifies no other resolution Action was invoked for the tuple;
-4. loads the Action-bound immutable resolution input and inserts the immutable
-   continuation and intervention evidence;
-5. marks the resolution Action `invoked`;
-6. sets `active_resolution_id`, changes lifecycle state to `ready`, and projects
-   legacy status as `pending`; and
-7. commits Action, continuation, effect, receipt, and audit changes atomically.
-
-There is no committed intermediate “immediately invokable” state. Immediate
-execution either commits the complete transition or rolls back the entire
-submission. Only approval-required Actions wait between transactions, and
-their durable `pending_approval` state plus immutable input supports later
-invocation.
-
-`ClaimActionWorkResponse` gains the referenced continuation. Once claimed, the
-continuation and park snapshots are immutable input for that claim generation.
-A later park must increment `park_generation`, append its own park record, and
-clear `active_resolution_id` in the same transaction; old park and continuation
-rows remain retained provenance.
+The earlier design proposed a public resolution command for parked work. The
+1.0 surface does not expose that command or a second resolution lifecycle.
+Parked-work state and any future continuation remain internal to the governed
+Action pipeline; the public claim surface is limited to claiming, heartbeats,
+acknowledgements, and fenced claim events.
 
 ### Fenced claim events
 

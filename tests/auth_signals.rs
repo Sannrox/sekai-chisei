@@ -20,7 +20,7 @@ fn interceptor() -> TokenAuthInterceptor {
         SekaiDb::new(":memory:").expect("open in-memory database"),
     )));
     let store = Arc::new(PrincipalCredentialStore::new());
-    TokenAuthInterceptor::new(store, db, None)
+    TokenAuthInterceptor::new(store, db)
 }
 
 fn rejected_unauthorized_count(rendered: &str) -> Option<u64> {

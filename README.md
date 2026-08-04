@@ -12,9 +12,10 @@ Operators use `sekaictl`; agents and SDKs use the same core gRPC and capability
 catalog interfaces. The control plane owns durable facts and the decisions that
 constrain an operation. It does not replace the agent runtime.
 
-> **Project status:** early-stage (`v0.2.1`). The core server, local graph,
-> ontology-first product loop, policy pipeline, receipts, and native execution
-> APIs work today. Public APIs may change before v1.0.
+> **Project status:** `v1.0.0`. The ontology-first loop, SQLite persistence,
+> principal credentials, policy pipeline, receipts, `sekaictl`, and core gRPC
+> catalog form the stable 1.x contract. Advanced and experimental capabilities
+> remain explicitly classified and require opt-in discovery.
 
 ## What it gives you
 
@@ -24,9 +25,9 @@ constrain an operation. It does not replace the agent runtime.
   egress, routing, evaluation, and approvals around plan and execution.
 - **Inspectable outcomes:** retain decisions, normalized usage, lineage,
   verification, action outcomes, and provenance under a durable operation.
-- **Local-first authority:** keep the graph and governance state in SQLite, or
-  use the supported PostgreSQL community surface where shared durability is
-  required.
+- **Local-first authority:** keep the stable 1.x graph and governance state in
+  SQLite. PostgreSQL is a partial community backend whose supported surfaces
+  are advertised at runtime and fail closed elsewhere.
 
 The core product loop is deliberately small:
 
@@ -46,10 +47,10 @@ define ontology
 - **Product interfaces** expose the same core loop to operators through
   `sekaictl` and to agents through gRPC and the capability catalog.
 
-Provider adapters, the OpenAI- and Anthropic-compatible gateway, advanced
-retrieval, federation administration, and automated allocation extend the
-platform. They are useful integration or operational capabilities, not the
-product definition.
+Provider adapters, the OpenAI- and Anthropic-compatible gateway, evaluation
+plans, advanced retrieval, federation administration, and automated allocation
+extend the platform. They are advanced or experimental capabilities, not the
+stable product definition.
 
 ## Quick start
 
@@ -169,7 +170,9 @@ usage.
 - usage receipts, Prometheus metrics, health probes, and gateway reports; and
 - external evidence adapters with retained source attribution.
 
-Core contracts are namespace-first and domain-neutral: namespaces, actors,
+The capability catalog returns only `core` entries by default; request
+`product_tier_filter=all`, `advanced`, or `experimental` explicitly to expand
+it. Core contracts are namespace-first and domain-neutral: namespaces, actors,
 operations, attempts, actions, artifacts, verification, and outcomes. Domain
 objects such as repositories, incidents, campaigns, or support tickets belong
 in schemas and adapters rather than the core ontology.

@@ -1,16 +1,10 @@
-use crate::chisei::gunshi::{
-    AdvisoryScorecard, BaselineAllocation, ObservedOutcome, OperatorChoice, recommend_advisory,
-};
+use crate::chisei::gunshi::{AdvisoryScorecard, BaselineAllocation, recommend_advisory};
 pub use crate::chisei::gunshi::{RECOMMENDATION_INPUT_VERSION, RecommendationInput};
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
-    AuthorizeGunshiAutoDispatchRequest, GetGunshiAllocationStatusRequest,
-    GetGunshiScorecardRequest, InstallGunshiAllocationBaselineRequest,
-    IssueGunshiRecommendationsRequest, PromoteGunshiAllocationPolicyRequest,
-    PromoteGunshiFeedbackToEvalRequest, RecordGunshiFeedbackRequest,
-    RollbackGunshiAllocationPolicyRequest, SetGunshiAllocationKillSwitchRequest,
-    SetGunshiAutoOptInRequest,
+    GetGunshiAllocationStatusRequest, IssueGunshiRecommendationsRequest,
+    SetGunshiAllocationPolicyRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,7 +19,7 @@ pub const RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v1
 pub const ISSUED_RECOMMENDATION_BUNDLE_VERSION: &str = "gunshi.recommendation-bundle/v2";
 
 pub fn usage() -> &'static str {
-    "sekaictl admin governance gunshi recommend <input.json> --output <recommendations.json>\n  sekaictl admin governance gunshi issue <input.json> --output <recommendations.json>\n  sekaictl admin governance gunshi respond <recommendations.json> <choice.json> --operation <id> [--outcome <outcome.json>]\n  sekaictl admin governance gunshi scorecard --namespace <name>\n  sekaictl admin governance gunshi allocation-status --namespace <name>\n  sekaictl admin governance gunshi install-baseline --namespace <name> --snapshot <snapshot.json> --gate <gate.json>\n  sekaictl admin governance gunshi promote --namespace <name> --candidate <candidate.json> --baseline-eval <eval.json> --candidate-eval <eval.json> --expected-revision <id>\n  sekaictl admin governance gunshi rollback --namespace <name> --expected-revision <id> --reason <text>\n  sekaictl admin governance gunshi auto-opt-in --namespace <name> --expected-revision <id> [--off]\n  sekaictl admin governance gunshi kill-switch --namespace <name> --reason <text> [--clear]\n  sekaictl admin governance gunshi authorize-auto --namespace <name> --plan <plan.json> --operation <op.json> --capacity <capacity.json>\n  sekaictl admin governance gunshi promote-feedback --namespace <name> --suite-id <feedback-...> --issuance-id <id> --allocation-id <id>"
+    "sekaictl admin governance gunshi recommend <input.json> --output <recommendations.json>\n  sekaictl admin governance gunshi issue <input.json> --output <recommendations.json>\n  sekaictl admin governance gunshi scorecard --namespace <name>\n  sekaictl admin governance gunshi allocation-status --namespace <name>\n  sekaictl admin governance gunshi install-baseline --namespace <name> --snapshot <snapshot.json> --gate <gate.json>\n  sekaictl admin governance gunshi promote --namespace <name> --candidate <candidate.json> --baseline-eval <eval.json> --candidate-eval <eval.json> --expected-revision <id>\n  sekaictl admin governance gunshi rollback --namespace <name> --expected-revision <id> --reason <text>\n  sekaictl admin governance gunshi auto-opt-in --namespace <name> --expected-revision <id> [--off]\n  sekaictl admin governance gunshi kill-switch --namespace <name> --reason <text> [--clear]"
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,48 +37,6 @@ pub struct RecommendationBundle {
 pub struct RecommendConfig {
     pub input: PathBuf,
     pub output: PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeedbackConfig {
-    pub recommendations: PathBuf,
-    pub choice: PathBuf,
-    pub operation_id: String,
-    pub outcome: Option<PathBuf>,
-}
-
-impl FeedbackConfig {
-    pub fn from_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let args = args.into_iter().collect::<Vec<_>>();
-        let mut paths = Vec::new();
-        let mut operation_id = None;
-        let mut outcome = None;
-        let mut index = 0;
-        while index < args.len() {
-            match args[index].as_str() {
-                "--operation" => {
-                    index += 1;
-                    operation_id = Some(required_arg(&args, index, "--operation")?);
-                }
-                "--outcome" => {
-                    index += 1;
-                    outcome = Some(PathBuf::from(required_arg(&args, index, "--outcome")?));
-                }
-                flag if flag.starts_with('-') => return Err(format!("unknown option {flag:?}")),
-                path => paths.push(PathBuf::from(path)),
-            }
-            index += 1;
-        }
-        if paths.len() != 2 {
-            return Err("respond requires recommendation and choice paths".into());
-        }
-        Ok(Self {
-            recommendations: paths.remove(0),
-            choice: paths.remove(0),
-            operation_id: operation_id.ok_or_else(|| "--operation is required".to_string())?,
-            outcome,
-        })
-    }
 }
 
 impl RecommendConfig {
@@ -181,57 +133,12 @@ pub async fn issue_recommendations(
     Ok(bundle)
 }
 
-pub async fn record_response(config: FeedbackConfig) -> Result<serde_json::Value, BoxErr> {
-    let bundle: RecommendationBundle =
-        serde_json::from_slice(&std::fs::read(&config.recommendations)?)?;
-    if bundle.contract_version != ISSUED_RECOMMENDATION_BUNDLE_VERSION || !bundle.advisory {
-        return Err(
-            std::io::Error::other("unsupported or non-advisory recommendation bundle").into(),
-        );
-    }
-    let plans = bundle
-        .allocation
-        .plans
-        .iter()
-        .filter(|plan| plan.operation_id == config.operation_id)
-        .collect::<Vec<_>>();
-    let [plan] = plans.as_slice() else {
-        return Err(std::io::Error::other(format!(
-            "recommendation bundle must contain exactly one plan for operation {}",
-            config.operation_id
-        ))
-        .into());
-    };
-    let choice: OperatorChoice = serde_json::from_slice(&std::fs::read(&config.choice)?)?;
-    let outcome: Option<ObservedOutcome> = config
-        .outcome
-        .as_ref()
-        .map(|path| -> Result<_, BoxErr> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
-        .transpose()?;
-    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .record_gunshi_feedback(RecordGunshiFeedbackRequest {
-            plan_json: serde_json::to_string(plan)?,
-            choice_json: serde_json::to_string(&choice)?,
-            outcome_json: outcome
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()?
-                .unwrap_or_default(),
-            issuance_id: bundle.issuance_id.ok_or_else(|| {
-                std::io::Error::other("recommendation bundle has no governed issuance identity")
-            })?,
-        })
-        .await?
-        .into_inner();
-    Ok(serde_json::from_str(&response.feedback_json)?)
-}
-
 pub async fn get_scorecard(namespace: String) -> Result<AdvisoryScorecard, BoxErr> {
     if namespace.trim().is_empty() || namespace.trim() != namespace {
         return Err(std::io::Error::other("namespace must be non-empty and canonical").into());
     }
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .get_gunshi_scorecard(GetGunshiScorecardRequest { namespace })
+        .get_gunshi_allocation_status(GetGunshiAllocationStatusRequest { namespace })
         .await?
         .into_inner();
     Ok(serde_json::from_str(&response.scorecard_json)?)
@@ -253,10 +160,12 @@ pub async fn install_baseline(
 ) -> Result<serde_json::Value, BoxErr> {
     require_namespace(&namespace)?;
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .install_gunshi_allocation_baseline(InstallGunshiAllocationBaselineRequest {
+        .set_gunshi_allocation_policy(SetGunshiAllocationPolicyRequest {
             namespace,
+            operation: "install".into(),
             snapshot_json: std::fs::read_to_string(snapshot_path)?,
             gate_json: std::fs::read_to_string(gate_path)?,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -272,12 +181,14 @@ pub async fn promote_policy(
 ) -> Result<serde_json::Value, BoxErr> {
     require_namespace(&namespace)?;
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .promote_gunshi_allocation_policy(PromoteGunshiAllocationPolicyRequest {
+        .set_gunshi_allocation_policy(SetGunshiAllocationPolicyRequest {
             namespace,
+            operation: "promote".into(),
             candidate_json: std::fs::read_to_string(candidate_path)?,
             baseline_evaluation_json: std::fs::read_to_string(baseline_eval_path)?,
             candidate_evaluation_json: std::fs::read_to_string(candidate_eval_path)?,
             expected_revision,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -291,10 +202,12 @@ pub async fn rollback_policy(
 ) -> Result<serde_json::Value, BoxErr> {
     require_namespace(&namespace)?;
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .rollback_gunshi_allocation_policy(RollbackGunshiAllocationPolicyRequest {
+        .set_gunshi_allocation_policy(SetGunshiAllocationPolicyRequest {
             namespace,
+            operation: "rollback".into(),
             expected_revision,
             reason,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -308,10 +221,12 @@ pub async fn set_auto_opt_in(
 ) -> Result<serde_json::Value, BoxErr> {
     require_namespace(&namespace)?;
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .set_gunshi_auto_opt_in(SetGunshiAutoOptInRequest {
+        .set_gunshi_allocation_policy(SetGunshiAllocationPolicyRequest {
             namespace,
-            opt_in,
+            operation: "auto_opt_in".into(),
+            enabled: opt_in,
             expected_revision,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -325,55 +240,16 @@ pub async fn set_kill_switch(
 ) -> Result<serde_json::Value, BoxErr> {
     require_namespace(&namespace)?;
     let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .set_gunshi_allocation_kill_switch(SetGunshiAllocationKillSwitchRequest {
+        .set_gunshi_allocation_policy(SetGunshiAllocationPolicyRequest {
             namespace,
+            operation: "kill_switch".into(),
             enabled,
             reason,
+            ..Default::default()
         })
         .await?
         .into_inner();
     Ok(serde_json::from_str(&response.status_json)?)
-}
-
-pub async fn authorize_auto(
-    namespace: String,
-    plan_path: PathBuf,
-    operation_path: PathBuf,
-    capacity_path: PathBuf,
-) -> Result<serde_json::Value, BoxErr> {
-    require_namespace(&namespace)?;
-    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .authorize_gunshi_auto_dispatch(AuthorizeGunshiAutoDispatchRequest {
-            namespace,
-            plan_json: std::fs::read_to_string(plan_path)?,
-            operation_json: std::fs::read_to_string(operation_path)?,
-            capacity_json: std::fs::read_to_string(capacity_path)?,
-        })
-        .await?
-        .into_inner();
-    Ok(serde_json::json!({
-        "authorization": serde_json::from_str::<serde_json::Value>(&response.authorization_json)?,
-        "receipt_attributes": serde_json::from_str::<serde_json::Value>(&response.receipt_attributes_json)?,
-    }))
-}
-
-pub async fn promote_feedback(
-    namespace: String,
-    suite_id: String,
-    issuance_id: String,
-    allocation_id: String,
-) -> Result<serde_json::Value, BoxErr> {
-    require_namespace(&namespace)?;
-    let response = ChiseiServiceClient::new(connect_sekai(&gunshi_target()).await?)
-        .promote_gunshi_feedback_to_eval(PromoteGunshiFeedbackToEvalRequest {
-            namespace,
-            suite_id,
-            issuance_id,
-            allocation_id,
-        })
-        .await?
-        .into_inner();
-    Ok(serde_json::from_str(&response.result_json)?)
 }
 
 pub fn scorecard_namespace(args: &[String]) -> Result<String, String> {
@@ -557,25 +433,6 @@ mod tests {
                 "input.json".into(),
             ])
             .is_err()
-        );
-    }
-
-    #[test]
-    fn feedback_parser_requires_two_inputs_and_an_operation() {
-        let config = FeedbackConfig::from_args([
-            "recommendations.json".into(),
-            "choice.json".into(),
-            "--operation".into(),
-            "op-1".into(),
-            "--outcome".into(),
-            "outcome.json".into(),
-        ])
-        .unwrap();
-        assert_eq!(config.operation_id, "op-1");
-        assert_eq!(config.outcome, Some(PathBuf::from("outcome.json")));
-        assert!(
-            FeedbackConfig::from_args(["recommendations.json".into(), "choice.json".into(),])
-                .is_err()
         );
     }
 

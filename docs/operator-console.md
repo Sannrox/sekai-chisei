@@ -9,8 +9,9 @@ The shell ships in-process on the **ops HTTP listener** (`OPS_BIND` /
 `OPS_PORT`). Process health and metrics stay unauthenticated; every `/console`
 route fails closed without a valid session.
 
-V1 console surfaces are complete: shell (#284), Operations (#285), Pressure
-(#286), and Policy (#287).
+The read-only shell is an operator convenience surface. Console mutations
+(kill switch, dry-run audit, promote, and rollback) are experimental in 1.0;
+`sekaictl` remains the canonical stable automation interface.
 
 ## Local development
 
@@ -18,11 +19,9 @@ V1 console surfaces are complete: shell (#284), Operations (#285), Pressure
 
    ```bash
    SEKAI_INSECURE=1 cargo run
-   # or authenticated local:
-   # SEKAI_AUTH_TOKEN=dev-token cargo run
    ```
 
-2. Create a principal credential when not using the deprecated root token:
+2. Create a principal credential for authenticated access:
 
    ```bash
    cargo run --bin sekaictl -- admin access credential create alice
@@ -55,7 +54,7 @@ foreign data.
 | Bind | Keep `OPS_BIND=127.0.0.1` unless an orchestrator or reverse proxy must reach the process. |
 | TLS | Prefer terminating TLS on a reverse proxy in front of the ops port, or run the control plane with `SEKAI_TLS_*` for gRPC and proxy HTTPS to loopback ops. |
 | Cookie Secure | The process issues console cookies without the `Secure` flag so loopback HTTP works. When serving the console only over HTTPS, set `Secure` at the proxy (or restrict the console to HTTPS-only hosts). |
-| Credentials | Prefer per-principal tokens over `SEKAI_AUTH_TOKEN`. Sessions re-check durable credential status on every request; revocation ends the session. |
+| Credentials | Use principal-scoped tokens. Sessions re-check durable credential status on every request; revocation ends the session. |
 | Multi-replica | Sessions are **process-local**. Pin console traffic to one instance or accept re-login after failover. |
 | Metrics exposure | `/metrics`, `/healthz`, and `/readyz` remain unauthenticated process endpoints. Do not expose the ops port on an untrusted network solely to serve the console. |
 
@@ -90,11 +89,11 @@ server {
 | `GET /console/api/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Authorized report + causal stages JSON |
 | `GET /console/n/{ns}/pressure` | session + ns | Governance pressure tiles |
 | `GET /console/api/n/{ns}/pressure` | session + ns | Pressure snapshot JSON |
-| `POST /console/n/{ns}/pressure/kill-switch` | session + ns write | Gunshi kill switch with confirm |
+| `POST /console/n/{ns}/pressure/kill-switch` | session + ns write | Experimental Gunshi kill switch with confirm |
 | `GET /console/n/{ns}/policy` | session + ns | Policy workspace |
-| `POST /console/n/{ns}/policy/dry-run` | session + ns | Historical dry-run (audited) |
-| `POST /console/n/{ns}/policy/promote` | session + ns write | Eval-gated promote with confirm |
-| `POST /console/n/{ns}/policy/rollback` | session + ns write | Rollback with confirm + reason |
+| `POST /console/n/{ns}/policy/dry-run` | session + ns | Experimental historical dry-run (audited) |
+| `POST /console/n/{ns}/policy/promote` | session + ns write | Experimental eval-gated promote with confirm |
+| `POST /console/n/{ns}/policy/rollback` | session + ns write | Experimental rollback with confirm + reason |
 | `GET /console/api/session` | session | JSON session summary |
 | `GET /console/api/namespaces` | session | JSON memberships for the principal |
 
@@ -133,7 +132,7 @@ Deep link: `/console/n/{namespace}/policy`.
 
 - Effective summary: routing policy from durable namespace policy objects,
   budget limit count, action policy presence, Gunshi allocation status.
-- Historical dry-run: same pure engine as `DryRunNamespacePolicy` / docs
+- Historical dry-run: same pure engine as [the policy dry-run design](policy-dry-run.md)
   [policy-dry-run.md](policy-dry-run.md); records `policy.dry_run` audit.
 - Promote/rollback: write principals only; explicit confirm; promote requires
   candidate + evaluation JSON (same contract as
@@ -142,7 +141,7 @@ Deep link: `/console/n/{namespace}/policy`.
   auto-dispatch policy is installed.
 
 Namespace URL segments must be short ASCII tokens (`[A-Za-z0-9._-]+`). Bootstrap
-principals `root` and `local` (legacy root token / local socket principal) may
+principals `root` and `local` (administrative principal / local socket principal) may
 open any canonical namespace; other principals require an explicit namespace
 membership grant.
 

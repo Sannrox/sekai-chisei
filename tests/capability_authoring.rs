@@ -23,7 +23,6 @@ fn observation(
             status: status.to_string(),
             namespace: "acme".to_string(),
             tokens_used: 100,
-            original_spec: None,
             created,
         },
         task_class: "code review".to_string(),

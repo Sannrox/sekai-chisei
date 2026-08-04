@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         format!("http://127.0.0.1:{port}")
     });
     let auth = HostAuth {
-        token: std::env::var("SEKAI_AUTH_TOKEN").ok(),
+        token: std::env::var("SEKAI_CREDENTIAL").ok(),
         principal: principal.clone(),
     };
     let channel = connect_sekai(&endpoint).await?;

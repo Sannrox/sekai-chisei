@@ -221,10 +221,6 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "UpdateObject"
                 | "DeleteObject"
                 | "ListObjects"
-                | "CreateObjectSet"
-                | "ListObjectSets"
-                | "DeleteObjectSet"
-                | "ResolveObjectSet"
                 | "FindByExternalId"
                 | "FindByProperty"
                 | "CreateLink"
@@ -232,16 +228,11 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "GetLinks"
                 | "GetLinkedObjects"
                 | "Traverse"
-                | "ApplyGovernedFactProfile"
-                | "PutGovernedFactVersion"
                 | "GetGovernedFactVersion"
-                | "PutGovernedWaiverVersion"
-                | "GetGovernedWaiverVersion"
                 | "ResolveInvariantSet"
                 | "ListSchemaTypes"
                 | "CreateFunction"
                 | "ListFunctions"
-                | "ExecuteFunction"
                 | "CreateDataset"
                 | "UpdateDataset"
                 | "ListDatasets"
@@ -270,66 +261,29 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "CompleteWorkUnit"
                 | "FailWorkUnit"
                 | "CancelWorkUnit"
-                | "ReleaseReservation"
                 | "ListReservations"
                 | "ListRunEvents"
                 | "ReconcileWorkUnits"
-                | "GetCoordinationSnapshot"
-                | "GetRuntimeWorkPressure"
         ),
         "chisei.ChiseiService" => matches!(
             method,
-            "CheckBudget"
-                | "RecordUsage"
+            "RecordUsage"
                 | "SetBudgetLimit"
                 | "SetNamespacePolicy"
-                | "ResolvePolicy"
-                | "CheckEgress"
-                | "RunPipeline"
-                | "ListPipelineRuns"
-                | "RecordSampleObservation"
-                | "GetSampleObservation"
-                | "RecordGatewayAudit"
                 | "PlanExecution"
-                | "ExecutePlan"
                 | "ExecutePlanStream"
                 | "ReportOperationEvent"
-                | "AuthorizeOperationReporter"
                 | "GetOperationReceipt"
-                | "ReserveGatewayRequestAlias"
-                | "ClaimGatewayRequestAliasDispatch"
-                | "GetAffinity"
+                | "GetSampleObservation"
+                | "ClaimGatewayDispatch"
                 | "PutEvaluatorDefinition"
-                | "GetEvaluatorDefinition"
-                | "ListEvaluatorDefinitions"
-                | "SetEvaluatorAvailability"
                 | "PutEvaluationPlan"
-                | "GetEvaluationPlan"
-                | "ListEvaluationPlans"
                 | "ResolveEvaluationPlan"
-                | "ExecuteEvaluationManifest"
-                | "GetEvaluationExecution"
-                | "CancelEvaluationExecution"
-                | "CreateEvalSuite"
-                | "ListEvalSuites"
                 | "GetEvalSuite"
-                | "CreateEvalRun"
                 | "GetEvalRun"
                 | "ListEvalRuns"
-                | "TrackEvalIteration"
-                | "GetLatestEvalIteration"
-                | "ListEvalIterations"
-                | "CompareRuns"
-                | "EvalVariance"
-                | "EvalModelCompare"
-                | "EvolveSuggest"
-                | "EvolveEnhance"
-                | "EvolveRecommend"
-                | "EvolveReport"
-                | "EvolvePatterns"
-                | "EvolveVariance"
-                | "EvolveAbResults"
-                | "EvolveTemplates"
+                | "ExecuteEvaluationManifest"
+                | "CancelEvaluationExecution"
         ),
         "grpc.health.v1.Health" => matches!(method, "Check" | "Watch"),
         _ => false,
@@ -432,10 +386,8 @@ mod tests {
     fn recognizes_operation_receipt_rpc_paths() {
         for method in [
             "ReportOperationEvent",
-            "AuthorizeOperationReporter",
             "GetOperationReceipt",
-            "ReserveGatewayRequestAlias",
-            "ClaimGatewayRequestAliasDispatch",
+            "ClaimGatewayDispatch",
         ] {
             assert_eq!(
                 parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
@@ -446,27 +398,12 @@ mod tests {
 
     #[test]
     fn recognizes_governed_fact_rpc_paths() {
-        for method in [
-            "ApplyGovernedFactProfile",
-            "PutGovernedFactVersion",
-            "GetGovernedFactVersion",
-            "PutGovernedWaiverVersion",
-            "GetGovernedWaiverVersion",
-            "ResolveInvariantSet",
-        ] {
+        for method in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert_eq!(
                 parse_grpc_path(&format!("/sekai.SekaiService/{method}")),
                 ("sekai.SekaiService".into(), method.into())
             );
         }
-    }
-
-    #[test]
-    fn recognizes_runtime_work_pressure_rpc_path() {
-        assert_eq!(
-            parse_grpc_path("/sekai.SekaiService/GetRuntimeWorkPressure"),
-            ("sekai.SekaiService".into(), "GetRuntimeWorkPressure".into())
-        );
     }
 }
 

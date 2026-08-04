@@ -15,7 +15,6 @@ pub struct Config {
     pub openai_api_key: Option<String>,
     pub ollama_url: String,
     pub native_llm_url: Option<String>,
-    pub auth_token: Option<String>,
     pub sample_rate: f64,
     pub sample_risk_threshold: f64,
     pub scoring_enabled: bool,
@@ -73,9 +72,6 @@ impl Config {
             openai_api_key: env::var("OPENAI_API_KEY").ok(),
             ollama_url: env("OLLAMA_URL", "http://localhost:11434"),
             native_llm_url: env::var("NATIVE_LLM_URL").ok(),
-            auth_token: env::var("SEKAI_AUTH_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
             sample_rate: env("SAMPLE_RATE", "0.05").parse().unwrap_or(0.05),
             sample_risk_threshold: env("SAMPLE_RISK_THRESHOLD", "0.7").parse().unwrap_or(0.7),
             scoring_enabled: env("SCORING_ENABLED", "false").parse().unwrap_or(false),
@@ -127,7 +123,7 @@ impl Config {
     }
 
     pub fn grpc_tcp_mode(&self, active_credentials: bool) -> GrpcTcpMode {
-        let auth_configured = self.auth_token.is_some() || active_credentials;
+        let auth_configured = active_credentials;
         let token_auth_mode = auth_configured && !self.insecure;
         let inferred_bind_addr = if token_auth_mode {
             "0.0.0.0"
@@ -268,7 +264,6 @@ mod tests {
     fn test_config() -> Config {
         let mut config = Config::from_env();
         config.sekai_bind = None;
-        config.auth_token = None;
         config.insecure = false;
         config
     }
@@ -301,7 +296,6 @@ mod tests {
     #[test]
     fn grpc_tcp_mode_insecure_disables_token_auth_and_keeps_local_bind() {
         let mut config = test_config();
-        config.auth_token = Some("legacy-token".to_string());
         config.insecure = true;
 
         let mode = config.grpc_tcp_mode(true);

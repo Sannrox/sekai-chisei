@@ -13,13 +13,6 @@ The default-CI black-box suite is
 - denied neighbors do not change candidates, links, descriptors, source refs,
   counts, ordering, truncation, or errors;
 - a denied root and a missing root have the same public retrieval shape;
-- native `ExpandRelations` and graph-only `HybridRetrieve` preserve the same
-  non-disclosing projection;
-- the text projection omits ACL-denied hits and keeps public denial/scanned
-  aggregates independent of hidden rows (the representation-specific BM25
-  score remains corpus metadata, not an epistemic confidence value);
-- scenario seeds and deltas for hidden objects do not produce hypothesis rows,
-  explanations, or payloads;
 - receipt attributes remain bounded structural summaries and contain neither
   hidden identities nor descriptor payload; and
 - deterministic malformed-descriptor cases cover source-list limits, row
@@ -45,11 +38,10 @@ tests rather than recreating every source fixture:
   ceilings, object-property redaction, Kioku applicability, and bounded
   egress records.
 - `src/grpc/sekai_service.rs` covers evidence submission lifecycle and
-  content authorization, ontology ACL filtering, scenario authorization,
-  semantic catalog binding, and hybrid text authz re-checks.
+  content authorization, ontology ACL filtering, and semantic catalog binding.
 - `src/grpc/chisei_service.rs` covers native pipeline planning/execution,
-  gateway-compatible execution through the same `RunPipeline` path, receipt
-  descriptor aggregates, and egress-audit projections.
+  gateway sampling through the canonical decision preflight, receipt descriptor
+  aggregates, and egress-audit projections.
 
 Asserted graph retrieval is reusable on SQLite and PostgreSQL. Query-time
 ontology entailment remains SQLite-only; PostgreSQL returns an explicit

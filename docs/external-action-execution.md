@@ -5,6 +5,23 @@ verification, and downstream outcomes are separate facts. A permit authorizes a
 bounded action. Redemption consumes that authority. Neither proves that the host
 started, completed, or successfully affected a resource.
 
+## Control-plane API
+
+The 1.0 contract exposes four lifecycle surfaces:
+
+- `AuthorizeExternalAction` evaluates a request and returns the signed permit
+  directly when the action is allowed. Pending requests await an explicit
+  transition.
+- `TransitionExternalAction` approves, denies, cancels, revokes, or delegates
+  an existing authorization or permit.
+- `RedeemExternalActionPermit` verifies the signed envelope and atomically
+  consumes online authority (or reconciles one offline invocation).
+- `SetExternalActionPolicy` updates permit policy or the emergency kill switch.
+
+Permit verification is part of redemption and executor-side conformance; a
+separate read-only verification RPC would create a race and is not an execution
+authorization.
+
 Hosts submit lifecycle observations through the normal Sekai evidence funnel
 using evidence type `external_action_execution`, schema id and version
 `external-action.execution-evidence/v1`, the authenticated evidence producer as

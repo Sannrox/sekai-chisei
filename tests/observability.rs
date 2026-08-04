@@ -76,7 +76,6 @@ async fn ops_routes_report_health_readiness_and_metrics() {
         db,
         registry_path.clone(),
         std::sync::Arc::new(sekai_chisei::sekai::credentials::PrincipalCredentialStore::new()),
-        None,
     );
 
     let health = app

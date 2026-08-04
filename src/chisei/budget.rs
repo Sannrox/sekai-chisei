@@ -187,7 +187,7 @@ fn now_ms() -> i64 {
 /// `project:p/agent:a/work_unit:w`, whose ancestors (`global`, `project:p`,
 /// `project:p/agent:a`) are all checked and deducted together atomically.
 ///
-/// Gateway preflight (`CheckBudget`), fat-decide budget admission, and
+/// Gateway preflight, fat-decide budget admission, and
 /// auto-allocation paths that share this tracker all hit the **same** store
 /// APIs — there is no process-local or region-shadow ledger for durable spend.
 pub struct BudgetTracker {

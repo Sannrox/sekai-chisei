@@ -4,24 +4,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-use super::evaluation_execution::{DEFAULT_TOTAL_DURATION_MS, MAX_TOTAL_DURATION_MS};
-
 pub const ENVELOPE_VERSION: &str = "chisei.governed-subject/v1";
 pub const RESULT_VERSION: &str = "chisei.governed-subject-result/v1";
 pub const RECEIPT_SCHEMA_VERSION: &str = "chisei.governed-subject-receipt/v1";
-pub const PLAN_BACKED_REQUEST_VERSION: &str = "chisei.plan-backed-governed-subject-evaluation/v1";
-pub const PLAN_BACKED_RESULT_VERSION: &str = "chisei.plan-backed-governed-subject-decision/v1";
-pub const PLAN_BACKED_RECEIPT_SCHEMA_VERSION: &str =
-    "chisei.plan-backed-governed-subject-receipt/v1";
-pub const PLAN_BACKED_OPERATION_CLASS: &str = "plan_backed_governed_subject_evaluation";
 pub const MAX_REFERENCES: usize = 16;
 pub const MAX_FIELD_BYTES: usize = 256;
 pub const MAX_REFERENCE_BYTES: usize = 512;
-pub const MAX_PLAN_EVIDENCE: usize = 1_024;
 pub const MAX_EVIDENCE_AGE_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub const SOFTWARE_RELEASE_PROFILE: &str = "example.software-release-candidate/v1";
-pub const SOFTWARE_RELEASE_PLAN_PROFILE: &str = "example.software-release-candidate/v2";
 pub const POLICY_BUNDLE_PROFILE: &str = "example.policy-bundle/v1";
 
 pub const ALLOW_PROFILE: &str = "chisei.subject-evaluation/allow/v1";
@@ -60,123 +51,6 @@ pub struct GovernedSubjectResult {
     pub fresh: bool,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
-}
-
-/// A deliberately situation-specific entry contract for software release
-/// candidates. Other subject families add their own profile adapter rather
-/// than inheriting implicit evaluator or evidence semantics from this one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanBackedSubjectEvaluationRequest {
-    pub contract_version: String,
-    pub namespace: String,
-    pub request_id: String,
-    pub subject_profile: String,
-    pub subject_identity: String,
-    pub subject_content_digest: String,
-    pub plan_version_id: String,
-    pub evidence_object_ids: Vec<String>,
-    pub evaluation_time_ms: i64,
-    pub max_total_duration_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreparedPlanBackedSubjectEvaluation {
-    pub request: PlanBackedSubjectEvaluationRequest,
-    pub actor: String,
-    pub binding_digest: String,
-    pub operation_id: String,
-    pub resolution_request_id: String,
-}
-
-pub fn prepare_plan_backed_evaluation(
-    mut request: PlanBackedSubjectEvaluationRequest,
-    actor: &str,
-) -> Result<PreparedPlanBackedSubjectEvaluation, String> {
-    if request.contract_version != PLAN_BACKED_REQUEST_VERSION {
-        return Err("unsupported plan-backed governed-subject contract".into());
-    }
-    for (name, value) in [
-        ("namespace", request.namespace.as_str()),
-        ("request_id", request.request_id.as_str()),
-        ("subject_profile", request.subject_profile.as_str()),
-        ("subject_identity", request.subject_identity.as_str()),
-        ("plan_version_id", request.plan_version_id.as_str()),
-        ("actor", actor),
-    ] {
-        validate_bounded(name, value, MAX_REFERENCE_BYTES)?;
-    }
-    if request.subject_profile != SOFTWARE_RELEASE_PLAN_PROFILE {
-        return Err("unsupported plan-backed governed-subject profile".into());
-    }
-    if request.subject_identity.contains("://")
-        || request.subject_identity.starts_with('/')
-        || request.subject_identity.contains("../")
-    {
-        return Err("subject_identity must be opaque, not a URL or path".into());
-    }
-    validate_digest("subject_content_digest", &request.subject_content_digest)?;
-    if request.evaluation_time_ms <= 0 {
-        return Err("evaluation_time_ms must be positive".into());
-    }
-    if request.max_total_duration_ms == 0 {
-        request.max_total_duration_ms = DEFAULT_TOTAL_DURATION_MS;
-    }
-    if request.max_total_duration_ms > MAX_TOTAL_DURATION_MS {
-        return Err(format!(
-            "max_total_duration_ms exceeds {MAX_TOTAL_DURATION_MS}"
-        ));
-    }
-    if request.evidence_object_ids.len() > MAX_PLAN_EVIDENCE {
-        return Err(format!(
-            "evidence_object_ids exceeds the limit of {MAX_PLAN_EVIDENCE}"
-        ));
-    }
-    for evidence_id in &request.evidence_object_ids {
-        validate_bounded("evidence_object_id", evidence_id, MAX_REFERENCE_BYTES)?;
-    }
-    request.evidence_object_ids.sort();
-    if request
-        .evidence_object_ids
-        .windows(2)
-        .any(|pair| pair[0] == pair[1])
-    {
-        return Err("evidence_object_ids contains duplicates".into());
-    }
-    let binding_bytes = serde_json::to_vec(&(
-        actor,
-        request.contract_version.as_str(),
-        request.namespace.as_str(),
-        request.request_id.as_str(),
-        request.subject_profile.as_str(),
-        request.subject_identity.as_str(),
-        request.subject_content_digest.as_str(),
-        request.plan_version_id.as_str(),
-        request.evidence_object_ids.as_slice(),
-        request.evaluation_time_ms,
-        request.max_total_duration_ms,
-    ))
-    .map_err(|error| error.to_string())?;
-    let binding_digest = format!("sha256:{:x}", Sha256::digest(binding_bytes));
-    let operation_digest = Sha256::digest(format!(
-        "{}\0{}\0{}",
-        request.namespace, actor, request.request_id
-    ));
-    let operation_id = format!("governed-subject-plan-{operation_digest:x}");
-    let resolution_request_id = format!("{operation_id}:resolution");
-    Ok(PreparedPlanBackedSubjectEvaluation {
-        request,
-        actor: actor.into(),
-        binding_digest,
-        operation_id,
-        resolution_request_id,
-    })
-}
-
-pub fn plan_backed_caller_scope(namespace: &str, actor: &str) -> String {
-    format!(
-        "governed-subject-plan:{}:{namespace}:{actor}",
-        namespace.len()
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,58 +304,6 @@ mod tests {
         ] {
             assert_ne!(changed.canonical_identity().unwrap(), golden);
         }
-    }
-
-    #[test]
-    fn plan_backed_request_is_profile_specific_canonical_and_actor_bound() {
-        let request = PlanBackedSubjectEvaluationRequest {
-            contract_version: PLAN_BACKED_REQUEST_VERSION.into(),
-            namespace: "release".into(),
-            request_id: "candidate-42".into(),
-            subject_profile: SOFTWARE_RELEASE_PLAN_PROFILE.into(),
-            subject_identity: "release-candidate:42".into(),
-            subject_content_digest: digest('a'),
-            plan_version_id: "evaluation-plan:release:1".into(),
-            evidence_object_ids: vec!["evidence:z".into(), "evidence:a".into()],
-            evaluation_time_ms: 42,
-            max_total_duration_ms: 1_000,
-        };
-        let prepared = prepare_plan_backed_evaluation(request.clone(), "release-bot").unwrap();
-        assert_eq!(
-            prepared.request.evidence_object_ids,
-            vec!["evidence:a", "evidence:z"]
-        );
-        assert!(prepared.operation_id.starts_with("governed-subject-plan-"));
-        assert_eq!(
-            prepare_plan_backed_evaluation(request.clone(), "release-bot")
-                .unwrap()
-                .binding_digest,
-            prepared.binding_digest
-        );
-        assert_ne!(
-            prepare_plan_backed_evaluation(request.clone(), "other-bot")
-                .unwrap()
-                .binding_digest,
-            prepared.binding_digest
-        );
-        let mut defaulted_budget = request.clone();
-        defaulted_budget.max_total_duration_ms = 0;
-        let mut explicit_budget = request.clone();
-        explicit_budget.max_total_duration_ms = DEFAULT_TOTAL_DURATION_MS;
-        let defaulted = prepare_plan_backed_evaluation(defaulted_budget, "release-bot").unwrap();
-        let explicit = prepare_plan_backed_evaluation(explicit_budget, "release-bot").unwrap();
-        assert_eq!(
-            defaulted.request.max_total_duration_ms,
-            DEFAULT_TOTAL_DURATION_MS
-        );
-        assert_eq!(defaulted.binding_digest, explicit.binding_digest);
-
-        let mut old_profile = request.clone();
-        old_profile.subject_profile = SOFTWARE_RELEASE_PROFILE.into();
-        assert!(prepare_plan_backed_evaluation(old_profile, "release-bot").is_err());
-        let mut duplicate = request;
-        duplicate.evidence_object_ids = vec!["evidence:a".into(), "evidence:a".into()];
-        assert!(prepare_plan_backed_evaluation(duplicate, "release-bot").is_err());
     }
 
     #[test]

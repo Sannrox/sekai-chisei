@@ -36,10 +36,10 @@ types in the plane).
 
 | Existing term | What it is today | Service |
 | --- | --- | --- |
-| **Graph Action** (`ExecuteAction`, `CreateActionType`, …) | In-process **graph mutation DSL** (ops: `set_property`, `create_object`, …) with policy/approval | Sekai |
-| **Operation** (`PlanExecution` / `ExecutePlan`, `ReportOperationEvent`, `GetOperationReceipt`) | **Correlation spine** for a governed run: plan → execute → events → receipt | Chisei |
+| **Graph Action** (`ExecuteAction`, `ListActionTypes`, …) | In-process **graph mutation DSL** (ops: `set_property`, `create_object`, …) with policy/approval | Sekai |
+| **Operation** (`PlanExecution` / `ExecutePlanStream`, `ReportOperationEvent`, `GetOperationReceipt`) | **Correlation spine** for a governed run: plan → execute → events → receipt | Chisei |
 | **Work unit** (`CreateWorkUnit`, `TryAdmitWorkUnit`, heartbeat/complete/fail) | **Capacity / contention** primitive (scopes, FIFO admission, leases on reservations) | Sekai |
-| **Evidence** (`SubmitEvidence*`, producers/schemas, retract/stale) | **Observation funnel** for admitted external facts | Sekai |
+| **Evidence** (`SubmitEvidence`, schemas, lifecycle projection) | **Observation funnel** for admitted external facts | Sekai |
 | **External-action permit** (`AuthorizeExternalAction` → issue/verify/redeem) | **Bounded host mutation authority**; separate from “did it run” evidence | Chisei |
 | **External-action execution evidence** | Host lifecycle observations via evidence type `external_action_execution` | Docs + evidence funnel |
 
@@ -54,7 +54,7 @@ product phrase **governed action instance**). Graph Action stays as graph DSL.
 
 - Work units: create/get/list, try-admit, heartbeat, complete, fail, cancel,
   reconcile
-- Reservations: release/list
+- Reservations: list and reconciliation
 - Leases: acquire/get/refresh/release/takeover (generation fencing; object-bound
   keys)
 
@@ -69,8 +69,8 @@ product phrase **governed action instance**). Graph Action stays as graph DSL.
 
 **Chisei — operation spine**
 
-- `PlanExecution`, `ExecutePlan` / stream, `ReportOperationEvent`,
-  `AuthorizeOperationReporter`, `GetOperationReceipt`, statistics
+- `PlanExecution`, `ExecutePlanStream`, `ReportOperationEvent`,
+  namespace grants, `GetOperationReceipt`, statistics
 
 **Chisei — external mutation**
 
@@ -87,7 +87,7 @@ product phrase **governed action instance**). Graph Action stays as graph DSL.
 Today’s governed agent path is effectively **host-initiated**:
 
 ```text
-client/host → PlanExecution → ExecutePlan → tools/authz → ReportOperationEvent / harvest
+client/host → PlanExecution → ExecutePlanStream → tools/authz → ReportOperationEvent / harvest
 ```
 
 What is **not** first-class:
@@ -139,7 +139,7 @@ Introduce an **`ActionInstance`** as a **thin durable admission envelope** that
 
 ```text
 (a) Observation-only
-  adapter → RegisterEvidence* / SubmitEvidence → admitted evidence
+  adapter → SubmitEvidence → admitted evidence
   (no ActionInstance unless a later submit references those submissions)
 
 (b) Admitted work

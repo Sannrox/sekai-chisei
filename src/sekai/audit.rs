@@ -860,7 +860,6 @@ impl SekaiDb {
         let now = chrono::Utc::now().timestamp_millis();
         let changes = object_diff_changes(actor, None, Some(object), now);
         insert_object_changes(&tx, &changes)?;
-        crate::sekai::temporal::retain_object_history_in_tx(&tx, None, Some(object), actor, now)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -910,13 +909,6 @@ impl SekaiDb {
         let now = chrono::Utc::now().timestamp_millis();
         let changes = object_diff_changes(actor, Some(&before_object), Some(object), now);
         insert_object_changes(&tx, &changes)?;
-        crate::sekai::temporal::retain_object_history_in_tx(
-            &tx,
-            Some(&before_object),
-            Some(object),
-            actor,
-            now,
-        )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(Some(before_object))
     }
@@ -946,13 +938,6 @@ impl SekaiDb {
         if let Some(before) = &before {
             let now = chrono::Utc::now().timestamp_millis();
             insert_object_changes(&tx, &object_diff_changes(actor, Some(before), None, now))?;
-            crate::sekai::temporal::retain_object_history_in_tx(
-                &tx,
-                Some(before),
-                None,
-                actor,
-                now,
-            )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(before)

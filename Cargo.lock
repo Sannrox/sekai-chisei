@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "chisei-gateway"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-admin-client"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2465,7 +2465,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-chisei"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-ontology"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-proto"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-provider"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "async-stream",
  "async-trait",

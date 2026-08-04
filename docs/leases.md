@@ -20,13 +20,9 @@ See [region-pins.md](region-pins.md).
 ## Product mutation path (#388)
 
 `CreateObject` / `UpdateObject` / `DeleteObject` accept an optional
-`lease_precondition`. When set, they run the same generation-fenced semantics as
-`GuardedCreateObject` / `GuardedUpdateObject` / `GuardedDeleteObject`. When
-unset, they keep the historical unguarded path.
-
-Prefer the single product family with optional `lease_precondition`. The
-`Guarded*` RPCs remain as shims (product_tier **experimental**) and require a
-precondition.
+`lease_precondition`. When set, they use generation-fenced mutation semantics.
+When unset, they use the ordinary mutation path. These three RPCs are the sole
+public object-mutation family.
 
 ## Object-bound lease keys
 
@@ -79,16 +75,14 @@ Acquire, refresh, release, and takeover are committed atomically with their
 transition audit entry. Both SQLite and PostgreSQL implement the lease API with
 shared dual-backend conformance (see [postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
-## Lease-guarded object mutations
+## Lease-preconditioned object mutations
 
-Prefer `CreateObject` / `UpdateObject` / `DeleteObject` with
-`lease_precondition` set (see **Product mutation path** above). The
-`GuardedCreateObject` / `GuardedUpdateObject` / `GuardedDeleteObject` RPCs remain
-as experimental shims with the same semantics. Each request includes a
-`LeasePrecondition` containing the lease namespace, logical key, opaque fencing
-token, and a unique `request_id`. The caller must have write access to both the
-target object namespace and the referenced lease namespace; possession of a
-fencing token does not grant authorization.
+Set `lease_precondition` on `CreateObject` / `UpdateObject` / `DeleteObject`
+(see **Product mutation path** above). The precondition contains the lease
+namespace, logical key, opaque fencing token, and a unique `request_id`. The
+caller must have write access to both the target object namespace and the
+referenced lease namespace; possession of a fencing token does not grant
+authorization.
 
 Sekai validates that the token identifies the active, unexpired generation and
 commits that validation, the object mutation, normal object-change audit, and

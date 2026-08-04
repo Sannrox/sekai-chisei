@@ -12,7 +12,7 @@
 - `cargo build --release` builds an optimized binary.
 - `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
-Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_AUTH_TOKEN`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
+Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 
 GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
 
@@ -63,4 +63,4 @@ immediately after the correction.
 
 ## Security & Configuration Tips
 
-Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. Prefer that path over the deprecated single-principal `SEKAI_AUTH_TOKEN` bootstrap. Report vulnerabilities through `SECURITY.md`.
+Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. `SEKAI_CREDENTIAL` is a client-side bearer input and never bootstraps server authority. Report vulnerabilities through `SECURITY.md`.

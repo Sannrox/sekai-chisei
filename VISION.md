@@ -16,10 +16,10 @@ The product has two layers:
 - `chisei` owns decisions: policy, context, routing, budgets, approvals,
   evaluation, and learning rules
 
-`LlmService` executes provider calls but is not the policy boundary. Existing
-OpenAI- and Anthropic-compatible clients enter through the gateway; native
-integrations use `PlanExecution` and `ExecutePlan`. Both paths are governed by
-the same control plane.
+Provider adapters remain internal execution machinery, not a public policy
+boundary. Existing OpenAI- and Anthropic-compatible clients enter through the
+gateway; native integrations use `PlanExecution` and `ExecutePlan`. Both paths
+are governed by the same control plane.
 
 ## Problem
 

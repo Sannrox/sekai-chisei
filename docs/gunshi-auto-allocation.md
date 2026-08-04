@@ -19,10 +19,44 @@ Envelope research: [279-gunshi-auto-allocation-envelope.md](research/279-gunshi-
 2. Collect advisory outcomes and suite evaluations with attributable evidence.
 3. **Promote** a candidate revision when the gate passes (CAS on `expected_revision`).
 4. **Opt in** the namespace to live auto-dispatch.
-5. Call **AuthorizeGunshiAutoDispatch** (or `sekaictl admin governance gunshi authorize-auto`) before dispatching; attach returned receipt attributes.
+5. Read the aligned auto-dispatch decision and receipt attributes returned by
+   **IssueGunshiRecommendations** before dispatching.
 6. **Kill switch** or **rollback** to return to advisory / prior revision.
 
 Promotion enforces a 60s cooldown per namespace to reduce thrash.
+
+## Native planning integration
+
+Gunshi is the outer allocation stage for fleet-managed native operations. It
+does not replace Chisei planning or execute provider calls:
+
+```text
+IssueGunshiRecommendations
+  -> allocation plans + aligned dispatch decisions and receipt attributes
+  -> bind one issued AllocationPlan to PlanExecution
+  -> Kioku and the remaining per-operation planning steps
+  -> ExecutePlanStream
+  -> operation receipt and Gunshi feedback
+```
+
+Send the issuance id and the exact issued `AllocationPlan` JSON in
+`PlanExecutionRequest.gunshi_allocation`. Chisei reloads the durable issuance
+and rejects changed JSON, stale policy versions, namespace or operation
+conflicts, mismatched priorities or tools, caller route conflicts, and live
+runtime/model resolution that no longer matches the allocation.
+
+The resulting plan and receipt retain Gunshi's allocation id, agent, policy
+version, input fingerprint, budget ceiling, maximum attempts, and human-review
+requirement. The native plan id remains the receipt id; the allocated operation
+is recorded as `logical_operation_id` and is used to validate later outcome
+feedback.
+
+Kioku participates at two distinct scopes: Gunshi may consult governed outcome
+evidence while choosing fleet resources, and `PlanExecution` still runs Kioku
+as per-operation context enrichment after allocation. Automatic dispatch is
+evaluated during issuance against the durable allocation policy, calibration
+scorecard, capacity envelope, and residency policy. See
+[ADR 0015](decisions/0015-gunshi-allocation-precedes-native-planning.md).
 
 ## Receipt attributes (auto path)
 
@@ -55,8 +89,6 @@ sekaictl admin governance gunshi auto-opt-in --namespace <ns> --expected-revisio
 sekaictl admin governance gunshi kill-switch --namespace <ns> --reason <text>
 sekaictl admin governance gunshi rollback --namespace <ns> --expected-revision <id> --reason <text>
 sekaictl admin governance gunshi allocation-status --namespace <ns>
-sekaictl admin governance gunshi authorize-auto --namespace <ns> --plan <json> --operation <json> --capacity <json>
-sekaictl admin governance gunshi promote-feedback --namespace <ns> --suite-id feedback-<ns>:<class> --issuance-id <id> --allocation-id <id>
 ```
 
 ## Feedback → eval suites (#300)
@@ -64,7 +96,10 @@ sekaictl admin governance gunshi promote-feedback --namespace <ns> --suite-id fe
 Authorized operator choices can be promoted into append-only suites whose ids
 start with `feedback-`. Case ids are deterministic from
 `(issuance_id, allocation_id)` so promotion is idempotent. Operator rationale is
-redacted in the stored case spec; promotion is audited.
+redacted in the stored case spec; promotion is audited. API clients submit
+feedback and promote it through the `feedback` and `promote_feedback`
+operations of `SetGunshiAllocationPolicy`; these lifecycle mutations do not
+need dedicated RPCs.
 
 ## Persistence
 

@@ -18,17 +18,6 @@ pub const CAPABILITY_RESOLVE_REF: &str = "sekai.semantic.resolve_ref";
 pub const CAPABILITY_EXPAND_RELATIONS: &str = "sekai.semantic.expand_relations";
 pub const CAPABILITY_RETRIEVE_CONTEXT: &str = "sekai.context.retrieve";
 pub const CAPABILITY_EXPLAIN_DERIVATION: &str = "sekai.semantic.explain_derivation";
-/// Lexical FTS5 text search returning HybridCandidate rows (#360 / research #152).
-pub const CAPABILITY_SEARCH_TEXT: &str = "sekai.text.search";
-/// Late-fusion hybrid retrieval plan over explicit representations (#361).
-pub const CAPABILITY_HYBRID_RETRIEVE: &str = "sekai.hybrid.retrieve";
-/// Multi-hop pattern plan execute (#375 / research #145).
-pub const CAPABILITY_EXECUTE_PATTERN_PLAN: &str = "sekai.pattern.execute";
-/// Multi-hop pattern plan EXPLAIN (#375 / research #145).
-pub const CAPABILITY_EXPLAIN_PATTERN_PLAN: &str = "sekai.pattern.explain";
-/// Non-authoritative scenario overlay evaluation (#362 / research #148).
-pub const CAPABILITY_EVALUATE_SCENARIO: &str = "sekai.scenario.evaluate";
-
 pub const REF_KIND_OBJECT: &str = "object";
 pub const REF_KIND_ONTOLOGY_CLASS: &str = "ontology_class";
 pub const REF_KIND_ONTOLOGY_RELATION: &str = "ontology_relation";

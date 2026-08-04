@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Honors the same env vars as the server: `GRPC_PORT` (default 50051),
-//! `SEKAI_SOCKET` for UDS, and `SEKAI_AUTH_TOKEN` (attaches
+//! `SEKAI_SOCKET` for UDS, and `SEKAI_CREDENTIAL` (attaches
 //! `authorization: Bearer <token>` when set).
 //!
 //! Use `SEKAI_PRINCIPAL` to set the caller identity (default: `demo-client`).
@@ -33,8 +33,7 @@ use tonic::{Request, Status};
 use sekai_chisei::grpc::client::{GatewayClient, connect_sekai};
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
-    ChatMessage, CheckBudgetRequest, ExecutePlanRequest, ExecutionInput, PipelineRequest,
-    PlanExecutionRequest, RecordUsageRequest, ResolvePolicyRequest, RunPipelineRequest,
+    ChatMessage, ExecutePlanRequest, ExecutionInput, PlanExecutionRequest, RecordUsageRequest,
     SetBudgetLimitRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
@@ -105,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         format!("http://127.0.0.1:{port}")
     });
     let auth = DemoAuth {
-        token: std::env::var("SEKAI_AUTH_TOKEN").ok(),
+        token: std::env::var("SEKAI_CREDENTIAL").ok(),
         principal,
     };
 
@@ -289,33 +288,6 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
     }
 
     match chisei
-        .check_budget(CheckBudgetRequest {
-            user_id: user.to_string(),
-            estimated_tokens: 5_000,
-            subject: String::new(),
-            project: String::new(),
-            agent: String::new(),
-            key_id: String::new(),
-            metric: String::new(),
-            work_unit: String::new(),
-            task_class: String::new(),
-            mid_task: false,
-            local_free_available: false,
-        })
-        .await
-    {
-        Ok(resp) => {
-            let r = resp.into_inner();
-            let used = r.usage.as_ref().map(|u| u.tokens_used).unwrap_or(0);
-            ok(format!(
-                "check budget (est 5000): allowed={} used={used}",
-                r.allowed
-            ));
-        }
-        Err(e) => warn("check budget", &e),
-    }
-
-    match chisei
         .record_usage(RecordUsageRequest {
             user_id: user.to_string(),
             tokens_used: 5_000,
@@ -326,6 +298,8 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
             metric: String::new(),
             work_unit: String::new(),
             idempotency_key: "demo-client-usage".into(),
+            operation_receipt_json: String::new(),
+            sample_observation: None,
         })
         .await
     {
@@ -335,84 +309,12 @@ async fn chisei_demo(chisei: &mut Chisei, _namespace_id: &str) {
         }
         Err(e) => warn("record usage", &e),
     }
-
-    // ResolvePolicy may reach for a live model list; tolerate failure offline.
-    match chisei
-        .resolve_policy(ResolvePolicyRequest {
-            namespace: "demo".to_string(),
-            preferred_runtime: String::new(),
-            preferred_model: String::new(),
-            subject: String::new(),
-            project: "demo".to_string(),
-            agent: "demo-client".to_string(),
-            key_id: String::new(),
-            task_class: String::new(),
-            user_id: String::new(),
-            expected_calls: 1,
-            budget_route_bias: String::new(),
-            route_override: String::new(),
-            capability_requirements_json: Vec::new(),
-        })
-        .await
-    {
-        Ok(resp) => {
-            if let Some(p) = resp.into_inner().resolution {
-                ok(format!(
-                    "resolved policy: runtime={} model={}",
-                    p.runtime, p.model
-                ));
-            }
-        }
-        Err(e) => warn("resolve policy (needs a configured model)", &e),
-    }
-
-    // The centerpiece: run the decision pipeline over a task spec.
-    section("chisei · pipeline decisions");
-    let request_id = format!("req-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    match chisei
-        .run_pipeline(RunPipelineRequest {
-            request: Some(PipelineRequest {
-                request_id: request_id.clone(),
-                namespace: "demo".to_string(),
-                spec: "Add rate limiting to the billing-api login endpoint".to_string(),
-                model: String::new(),
-                runtime: String::new(),
-                task_type: "feature".to_string(),
-                priority: 5,
-                task_class: String::new(),
-            }),
-        })
-        .await
-    {
-        Ok(resp) => {
-            if let Some(result) = resp.into_inner().result {
-                ok(format!(
-                    "pipeline {} produced {} decision step(s):",
-                    request_id,
-                    result.steps.len()
-                ));
-                for s in &result.steps {
-                    println!(
-                        "      [{:<14}] {:<10} (conf {:.2})  {}",
-                        s.step, s.action, s.confidence, s.reasoning
-                    );
-                    if !s.suggestion.is_empty() {
-                        println!("                       ↳ suggestion: {}", s.suggestion);
-                    }
-                }
-                if !result.prepared_spec.is_empty() {
-                    println!("      prepared spec: {}", result.prepared_spec);
-                }
-            }
-        }
-        Err(e) => warn("run pipeline", &e),
-    }
 }
 
 /// Plans an execution and runs it through a local Ollama model.
 ///
 /// `PlanExecution` resolves policy/budget and caches a server-side plan;
-/// `ExecutePlan` then actually calls the model. The model defaults to
+/// `ExecutePlanStream` then actually calls the model. The model defaults to
 /// `ollama/llama3.2:latest` and can be overridden with `DEMO_MODEL`.
 async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
     section("chisei · execute (live LLM call)");
@@ -448,7 +350,10 @@ async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
 
     // Step 1: plan the execution (budget + policy + enrichment, no model call yet).
     let plan = match chisei
-        .plan_execution(PlanExecutionRequest { input: Some(input) })
+        .plan_execution(PlanExecutionRequest {
+            input: Some(input),
+            gunshi_allocation: None,
+        })
         .await
     {
         Ok(resp) => match resp.into_inner().plan {
@@ -488,12 +393,18 @@ async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
     // Step 2: execute the plan — this is the actual call to Ollama.
     println!("  calling model (this may take a few seconds)...");
     match chisei
-        .execute_plan(ExecutePlanRequest { plan: Some(plan) })
+        .execute_plan_stream(ExecutePlanRequest { plan: Some(plan) })
         .await
     {
         Ok(resp) => {
-            let r = resp.into_inner();
-            if let Some(chat) = r.response {
+            let mut stream = resp.into_inner();
+            let mut chat = None;
+            while let Ok(Some(event)) = stream.message().await {
+                if event.response.is_some() {
+                    chat = event.response;
+                }
+            }
+            if let Some(chat) = chat {
                 ok(format!(
                     "response from {} ({} in / {} out tokens, stop: {})",
                     chat.provider, chat.input_tokens, chat.output_tokens, chat.stop_reason

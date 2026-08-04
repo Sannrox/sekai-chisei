@@ -76,7 +76,7 @@ require TLS; the optional CA path only extends trust for a private test CA.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SEKAI_AUTH_TOKEN` | unset | Enables token auth for gRPC clients. With authenticated mode and unset `SEKAI_BIND`, TCP binds `0.0.0.0:50051` and requires TLS (`SEKAI_TLS_CERT`/`SEKAI_TLS_KEY`) or explicit `SEKAI_ALLOW_PLAINTEXT=1` |
+| `SEKAI_CREDENTIAL` | unset | Client-side bearer used by the gateway for TCP gRPC; create it as a durable principal credential before switching transports |
 | `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` |
 | `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume. File databases use SQLite WAL mode, so volume backups must include `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
 | `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
@@ -96,11 +96,14 @@ The default setup uses:
 
 No server gRPC port is published in this mode.
 
-For TCP transport, set `SEKAI_AUTH_TOKEN` on server and gateway, point the gateway at
-`CHISEI_GRPC_URL=http://server:50051`, and publish `50051` in compose (see comments in
-`docker-compose.yml`). Public `0.0.0.0` TCP also requires `SEKAI_TLS_CERT` and
-`SEKAI_TLS_KEY`, or an explicit `SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext
-deployment, or an explicit loopback `SEKAI_BIND`.
+For TCP transport, first create a durable principal credential while the shared
+UDS is available. Set that value as `SEKAI_CREDENTIAL` on the gateway, point it
+at `CHISEI_GRPC_URL=http://server:50051`, and publish `50051` in compose (see
+comments in `docker-compose.yml`). The server detects active credentials in its
+database and enables authenticated TCP. Public `0.0.0.0` TCP also requires
+`SEKAI_TLS_CERT` and `SEKAI_TLS_KEY`, or an explicit
+`SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext deployment, or an explicit
+loopback `SEKAI_BIND`.
 
 ## Container tasks on shared state
 

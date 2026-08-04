@@ -13,8 +13,8 @@ how routes and allow/deny outcomes would have changed.
 - **No side effects**: does not call providers, redeem permits, mutate policy,
   or execute host tools.
 - **Candidate only**: the supplied policy is never activated.
-- **Namespace authorized**: gRPC always requires namespace grant access
-  (authenticated actor must hold a grant on the namespace boundary).
+- **Namespace authorized**: the operator console requires namespace grant
+  access (authenticated actor must hold a grant on the namespace boundary).
 - **Audited**: each dry-run records a `policy.dry_run` decision with counts and
   the candidate policy version (RPC fails if audit persistence fails).
 - **Bounded**: at most 5,000 receipts; sample operation IDs capped per delta
@@ -47,17 +47,18 @@ counted as `insufficient_history`.
 | `would_allow` | Historical deny would become allow under the candidate |
 | `insufficient_history` | Receipt lacks enough route/policy metadata |
 
-## gRPC
+## Operator console
 
 ```text
-DryRunNamespacePolicy
+The policy workspace invokes the bounded dry-run engine with
   namespace, start_timestamp_ms, end_timestamp_ms
   allowed_runtimes, allowed_models, default_runtime, default_model, data_class
   request_id (optional)
 ```
 
-Response includes aggregate counts, bounded samples per delta class, and a
-capped per-receipt result list.
+The rendered workspace includes aggregate counts, bounded samples per delta
+class, and a capped per-receipt result list. The 1.0 public Chisei RPC surface
+does not expose a separate dry-run endpoint.
 
 ## Non-goals
 

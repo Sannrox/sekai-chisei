@@ -13,9 +13,9 @@ Each descriptor keeps three closed dimensions independent:
 
 | Dimension | Values | v1 authority |
 | --- | --- | --- |
-| `origin_class` | `asserted`, `derived`, `hypothesis`, `unknown` | An admitted external evidence envelope or asserted graph fact is `asserted`; an authorization-filtered ontology entailment is `derived`; a scenario impact is `hypothesis`; Kioku is `derived` only for the explicit `verified_binary_outcomes/v1` derivation contract. Other producer labels remain `unknown`. |
-| `evidence_status` | `supported`, `contested`, `insufficient`, `unknown` | Kioku supporting/contradicting link stances. Graph facts, ontology derivations, scenarios, and external evidence do not encode an authorized polarity in this projection and remain `unknown`. |
-| `lifecycle_status` | `current`, `stale`, `retracted`, `superseded`, `unknown` | The authoritative source lifecycle. An active Kioku memory and an asserted graph fact are `current`; a rejected Kioku memory is `retracted`; and available, stale, retracted, or superseded evidence rows preserve their source state. Scenario projections have no durable lifecycle and remain `unknown`. |
+| `origin_class` | `asserted`, `derived`, `hypothesis`, `unknown` | An admitted external evidence envelope or asserted graph fact is `asserted`; an authorization-filtered ontology entailment is `derived`; Kioku is `derived` only for the explicit `verified_binary_outcomes/v1` derivation contract. Other producer labels remain `unknown`. |
+| `evidence_status` | `supported`, `contested`, `insufficient`, `unknown` | Kioku supporting/contradicting link stances. Graph facts, ontology derivations, and external evidence do not encode an authorized polarity in this projection and remain `unknown`. |
+| `lifecycle_status` | `current`, `stale`, `retracted`, `superseded`, `unknown` | The authoritative source lifecycle. An active Kioku memory and an asserted graph fact are `current`; a rejected Kioku memory is `retracted`; and available, stale, retracted, or superseded evidence rows preserve their source state. |
 
 Missing or non-authoritative information is explicit `unknown` or omitted; it
 is never guessed. `producer_confidence_bps` is carried as an upstream input
@@ -54,12 +54,6 @@ the existing explanation fields. The descriptor's source list is only a
 bounded summary; it never replaces the exact explanation. `ExplainDerivation`
 returns the same projection when a path is found.
 
-`EvaluateScenario` attaches a descriptor to each impact row. Its origin is
-always `hypothesis`, evidence status is `unknown`, and its lifecycle is
-`unknown`; completion, delta evaluation, or a confidence-like input cannot
-promote it to an assertion or supported evidence. Hidden seeds, endpoints,
-links, and deltas are rejected before a row or descriptor is built.
-
 Admitted evidence submission records and retained content responses attach the
 external-evidence projection. Lifecycle transitions remain source-authoritative
 and source identities are never reconciled or collapsed. Existing content and
@@ -69,21 +63,20 @@ The graph retrieval path is reusable on SQLite and PostgreSQL for asserted
 mode. Query-time ontology entailment depends on the authorization-filtered
 ontology snapshot, which is currently a SQLite-only reusable surface; the
 PostgreSQL runtime fails closed with an explicit unavailable capability rather
-than returning a partial or unbounded projection. Scenario graph reads and
-evidence submission metadata use the backend-neutral reusable surfaces; an
-unsupported backend-specific content projection continues to fail closed.
+than returning a partial or unbounded projection. Evidence submission metadata
+uses the backend-neutral reusable surfaces; an unsupported backend-specific
+content projection continues to fail closed.
 
-`PipelineRunResult`, `ExecutionPlan.evidence_references`, and
-`ExecutionPlan.memory_references` carry the descriptor additively. The run
-result also returns the contract version so a caller can negotiate projection
-semantics without a new endpoint. The gateway invokes the same `RunPipeline`
-path and therefore receives the identical descriptor projection; it does not
-interpret or reconstruct the metadata.
+`ExecutionPlan.evidence_references` and `ExecutionPlan.memory_references` carry
+the descriptor. Gateway sampling runs inside the canonical
+`DecideGatewayExecution` preflight and returns only the sampling outcome and
+governed prepared spec needed for a sampled observation; descriptor content
+stays inside the control plane.
 
 Receipt context metadata records the descriptor version and bounded aggregate
 counts (descriptor, source rows, source refs, source digests, and truncation).
 Receipts never store descriptor payload or raw context. The project ontology
 records the read-only descriptor boundary and its source-to-projection
-relations for Chisei references, Sekai graph facts, admitted evidence,
-ontology derivations, and scenario hypotheses. These are provenance statements
-about existing projections, not durable epistemic authority.
+relations for Chisei references, Sekai graph facts, admitted evidence, and
+ontology derivations. These are provenance statements about existing
+projections, not durable epistemic authority.

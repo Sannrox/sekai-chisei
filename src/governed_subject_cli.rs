@@ -7,8 +7,7 @@ use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     EvaluateGovernedSubjectRequest, ExportGovernedSubjectProvenanceRequest,
-    GetGovernedSubjectProvenanceTrustRootRequest, GovernedSubjectEnvelope,
-    GovernedSubjectProvenanceEnvelope, GovernedSubjectReference,
+    GovernedSubjectEnvelope, GovernedSubjectProvenanceEnvelope, GovernedSubjectReference,
 };
 use std::path::PathBuf;
 
@@ -17,8 +16,7 @@ type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 pub fn usage() -> &'static str {
     "Usage:\n\
      sekaictl admin governance subject software-release <candidate.json> --namespace <name> --request-id <id> [--evaluation-profile <profile>] [--target <url-or-socket>]\n\
-     sekaictl admin governance subject provenance export <candidate.json> --operation-id <id> --receipt-digest <sha256:...> --export-id <id> [--output <path>] [--target <url-or-socket>]\n\
-     sekaictl admin governance subject provenance trust-root --export-id <id> [--output <path>] [--target <url-or-socket>]"
+     sekaictl admin governance subject provenance export <candidate.json> --operation-id <id> --receipt-digest <sha256:...> --export-id <id> [--output <path>] [--trust-root-output <path>] [--target <url-or-socket>]"
 }
 
 pub async fn run(args: Vec<String>) -> Result<(), BoxErr> {
@@ -125,7 +123,6 @@ async fn run_software_release(args: Vec<String>) -> Result<(), BoxErr> {
 async fn run_provenance(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
         Some("export") => run_provenance_export(args).await,
-        Some("trust-root") => run_provenance_trust_root(args).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -142,6 +139,7 @@ async fn run_provenance_export(args: Vec<String>) -> Result<(), BoxErr> {
         flag(&args, "--receipt-digest").ok_or_else(|| std::io::Error::other(usage()))?;
     let export_id = flag(&args, "--export-id").ok_or_else(|| std::io::Error::other(usage()))?;
     let output = flag(&args, "--output").map(PathBuf::from);
+    let trust_root_output = flag(&args, "--trust-root-output").map(PathBuf::from);
     let target = target(&args);
     let candidate: SoftwareReleaseCandidate = serde_json::from_slice(&std::fs::read(path)?)?;
     let subject_identity = candidate
@@ -166,26 +164,17 @@ async fn run_provenance_export(args: Vec<String>) -> Result<(), BoxErr> {
     let envelope = response
         .envelope
         .ok_or_else(|| std::io::Error::other("provenance export omitted its envelope"))?;
+    if let Some(path) = trust_root_output {
+        let root = response
+            .trust_root
+            .ok_or_else(|| std::io::Error::other("provenance export omitted its trust root"))?;
+        write_or_print(
+            Some(path),
+            trust_root_toml(root.version, &root.key_id, &root.identity, &root.public_key)
+                .as_bytes(),
+        )?;
+    }
     let bytes = serde_json::to_vec_pretty(&provenance_envelope_json(envelope))?;
-    write_or_print(output, &bytes)?;
-    Ok(())
-}
-
-async fn run_provenance_trust_root(args: Vec<String>) -> Result<(), BoxErr> {
-    let export_id = flag(&args, "--export-id").ok_or_else(|| std::io::Error::other(usage()))?;
-    let output = flag(&args, "--output").map(PathBuf::from);
-    let target = target(&args);
-    let mut client = ChiseiServiceClient::new(connect_sekai(&target).await?);
-    let root = client
-        .get_governed_subject_provenance_trust_root(GetGovernedSubjectProvenanceTrustRootRequest {
-            export_id,
-        })
-        .await?
-        .into_inner()
-        .trust_root
-        .ok_or_else(|| std::io::Error::other("provenance trust-root response omitted its root"))?;
-    let bytes =
-        trust_root_toml(root.version, &root.key_id, &root.identity, &root.public_key).into_bytes();
     write_or_print(output, &bytes)?;
     Ok(())
 }

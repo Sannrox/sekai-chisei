@@ -59,6 +59,8 @@ pub async fn run_memory_command(args: Vec<String>) -> Result<(), BoxErr> {
                     memory_version,
                     action: args[3].clone(),
                     rationale,
+                    reassessment_key: String::new(),
+                    evidence_basis_json: Vec::new(),
                 })
                 .await?
                 .into_inner();

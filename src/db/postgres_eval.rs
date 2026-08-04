@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::chisei::{eval, evolve};
 use crate::db::postgres::PostgresDb;
 
@@ -297,36 +295,6 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_evolve_enhancement(
-        &self,
-        request_id: &str,
-        original_spec: &str,
-    ) -> Result<(), String> {
-        self.connection()?
-            .execute(
-                "INSERT INTO chisei_evolve_enhancements (request_id, original_spec)
-                 VALUES ($1, $2)
-                 ON CONFLICT(request_id) DO UPDATE SET original_spec = excluded.original_spec",
-                &[&request_id, &original_spec],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
-        self.connection()?
-            .query(
-                "SELECT request_id, original_spec FROM chisei_evolve_enhancements",
-                &[],
-            )
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| (row.get(0), row.get(1)))
-                    .collect()
-            })
-            .map_err(|error| error.to_string())
-    }
-
     pub fn put_sample_observation(
         &self,
         observation: &crate::chisei::scoring::SampleObservation,
@@ -360,8 +328,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    /// Read one observation admission record for an authorized bounded
-    /// projection. Callers must hash and redact the payload before returning it.
+    /// Read one observation for an authorized, bounded telemetry projection.
     pub fn get_sample_observation(
         &self,
         request_id: &str,
@@ -382,9 +349,7 @@ impl PostgresDb {
         row.map(row_to_sample_observation).transpose()
     }
 
-    /// Read one observation only when both its request identity and namespace
-    /// match. The namespace predicate keeps unauthorized rows out of the
-    /// backend result before payload deserialization.
+    /// Read one observation only when its request identity and namespace match.
     pub fn get_sample_observation_in_namespace(
         &self,
         request_id: &str,

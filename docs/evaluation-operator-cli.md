@@ -1,16 +1,16 @@
 # Evaluation-plan operator CLI
 
-`sekaictl admin evaluation plan` is the operator surface for authoring,
-publishing, inspecting, and dry-running situation-specific evaluation plans.
+`sekaictl admin evaluation plan` is the experimental operator surface for authoring,
+publishing and running situation-specific evaluation plans.
 It uses the existing Chisei plan, manifest, and bounded-execution APIs;
 it does not introduce a generic evaluator or workflow language.
 
 The authority boundaries are explicit:
 
 1. `validate` reads and canonicalizes a local document. By default it also
-   performs authorized, read-only checks of the exact evaluator definitions
-   and governed invariant versions. `--offline` limits the command to
-   structural validation.
+   performs authorized, read-only checks of exact governed invariant versions.
+   `apply` performs the authoritative evaluator checks. `--offline` limits the
+   command to structural validation.
 2. `apply` publishes one immutable plan version. An identical replay is
    idempotent. Reusing its namespace, plan ID, and version for different
    canonical content is rejected.
@@ -44,38 +44,24 @@ Live validation checks:
 
 - graph bounds, unique nodes and bindings, dependencies, cycles, and required
   invariant coverage;
-- exact content-addressed evaluator and invariant references rather than
-  aliases;
-- evaluator namespace and current availability;
-- explicit gate eligibility when a required node selects a stochastic
-  definition;
-- closed evaluator parameter schemas and supported input schemas; and
-- invariant status, profile-wide applicability, verification contract, and
-  typed evaluator compatibility.
+- exact content-addressed invariant references rather than aliases; and
+- invariant status, profile-wide applicability, and verification contract.
 
 Use `--offline` when the server is unavailable. Offline validation still
 computes the exact plan version ID, content digest, parameter digests, and
 coverage, but publication remains the authoritative check for live reference
 visibility and evidence-classification closure.
 
-Publish and inspect:
+Publish:
 
 ```bash
 sekaictl admin evaluation plan apply \
   tests/fixtures/evaluation/plan-v1.json \
   --target ./data/sekai.sock
 
-sekaictl admin evaluation plan list \
-  --namespace acme \
-  --plan-id software-release \
-  --target ./data/sekai.sock
-
-sekaictl admin evaluation plan inspect \
-  evaluation-plan:<64-lowercase-hex> \
-  --target ./data/sekai.sock
 ```
 
-`validate`, `apply`, and `inspect` show canonical plan and parameter digests,
+`validate` and `apply` show canonical plan and parameter digests,
 exact evaluator bindings, and invariant coverage. Human output omits raw
 parameters and source references.
 
@@ -132,7 +118,7 @@ must still inspect the process exit status.
 
 | Exit | Meaning |
 | ---: | --- |
-| `0` | validation, storage, read, resolved manifest, or allow succeeded |
+| `0` | validation, storage, resolved manifest, or allow succeeded |
 | `2` | local or server validation/conflict failure |
 | `3` | resource absent or not authorized; intentionally indistinguishable |
 | `4` | resolution or execution is unknown |

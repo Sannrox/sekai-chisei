@@ -650,7 +650,6 @@ mod tests {
                 status: "done".into(),
                 namespace: "acme".into(),
                 tokens_used: 100,
-                original_spec: None,
                 created: 1,
             },
             TaskRecord {
@@ -659,7 +658,6 @@ mod tests {
                 status: "done".into(),
                 namespace: "acme".into(),
                 tokens_used: 100,
-                original_spec: None,
                 created: 2,
             },
         ];
@@ -681,7 +679,6 @@ mod tests {
                 status: "done".into(),
                 namespace: "acme".into(),
                 tokens_used: 100,
-                original_spec: None,
                 created: 1,
             },
             TaskRecord {
@@ -690,7 +687,6 @@ mod tests {
                 status: "done".into(),
                 namespace: "acme".into(),
                 tokens_used: 100,
-                original_spec: None,
                 created: 2,
             },
         ];
