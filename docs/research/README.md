@@ -13,6 +13,7 @@ reference pages.
 | [Governed hybrid retrieval](152-hybrid-retrieval.md) | Retired from the 1.0 runtime surface; retained as design history |
 | [Gateway PEP fat-decide](163-gateway-pep-fat-decide.md) | Design freeze; see [Gateway and clients](../gateway.md) |
 | [Lookup versus model call](175-lookup-vs-model-call.md) | Recommendation complete; see [Capability catalog](../capability-catalog.md) |
+| [Cheap-default routing signals](527-cheap-default-routing.md) | Recommendation accepted; follow-up #529 is lookup-vs-golden only |
 | [Gunshi auto-allocation envelope](279-gunshi-auto-allocation-envelope.md) | See [Gunshi auto-allocation](../gunshi-auto-allocation.md) |
 | [Operator console information architecture](283-operator-console-ia.md) | See [Operator console](../operator-console.md) |
 | [Federation and residency architecture](288-federation-residency-architecture.md) | See [Provider residency](../residency-policy.md) and [Federation profile](../federation-profile.md) |
