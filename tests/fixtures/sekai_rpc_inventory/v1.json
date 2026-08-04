@@ -657,6 +657,18 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "CreateActionType",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.action-definitions"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ListActionTypes",
       "kind": "persistent",
       "surfaces": [

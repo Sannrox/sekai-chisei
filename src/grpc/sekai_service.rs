@@ -3,7 +3,7 @@
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
@@ -50,6 +50,7 @@ const REDACTED_VALUE: &str = "[redacted]";
 pub struct SekaiServiceImpl {
     db: Arc<RuntimeDb>,
     actions: Arc<RwLock<ActionExecutor>>,
+    action_type_mutation: Arc<Mutex<()>>,
     security: Arc<SecurityChecker>,
     schema: Arc<RwLock<SchemaRegistry>>,
     schema_unavailable_error: Arc<RwLock<Option<String>>>,
@@ -471,6 +472,7 @@ impl SekaiServiceImpl {
         Self {
             db,
             actions: Arc::new(RwLock::new(actions)),
+            action_type_mutation: Arc::new(Mutex::new(())),
             security,
             schema,
             schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
@@ -505,6 +507,24 @@ impl SekaiServiceImpl {
     pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
         self.site_id = site_id.into();
         self
+    }
+
+    /// Reload the graph-action registry from durable storage before a request
+    /// uses it. Action definitions are shared across service instances, so a
+    /// process-local registration update cannot be the source of truth.
+    fn refresh_action_registry(&self) -> Result<(), Status> {
+        let _mutation = self
+            .action_type_mutation
+            .lock()
+            .map_err(|_| Status::internal("action registry mutation unavailable"))?;
+        let action_types = self.db.list_action_types().map_err(Status::internal)?;
+        let refreshed = ActionExecutor::from_action_types(action_types)
+            .map_err(|error| Status::internal(format!("action registry unavailable: {error}")))?;
+        *self
+            .actions
+            .write()
+            .map_err(|_| Status::internal("action registry unavailable"))? = refreshed;
+        Ok(())
     }
 
     fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
@@ -864,6 +884,7 @@ impl SekaiServiceImpl {
         namespace: &str,
         principals: &[String],
     ) -> Result<Vec<CapabilityEntry>, Status> {
+        self.refresh_action_registry()?;
         check_team_namespace(&self.db, principals, namespace, false)
             .map_err(|_| Status::permission_denied("capability discovery denied"))?;
         let can_write_namespace =
@@ -1001,6 +1022,7 @@ impl SekaiServiceImpl {
                 "enterprise action resumption requires a durable approval identity contract",
             ));
         }
+        self.refresh_action_registry()?;
         let tenant_context: Option<RequestEnterpriseContext> = None;
         let actions = self
             .actions
@@ -3497,6 +3519,44 @@ fn to_proto_action_type(action_type: &action::ActionTypeDef) -> ActionTypeDef {
         target_kind: action_type.target_kind.clone(),
         created: action_type.created,
         required_purpose: action_type.required_purpose.clone(),
+    }
+}
+
+fn from_proto_action_type(action_type: &ActionTypeDef) -> Result<action::ActionTypeDef, Status> {
+    let params = action_type
+        .params
+        .iter()
+        .map(from_proto_action_param)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(action::ActionTypeDef {
+        name: action_type.name.clone(),
+        description: action_type.description.clone(),
+        params,
+        ops: action_type.ops.iter().map(from_proto_action_op).collect(),
+        target_kind: action_type.target_kind.clone(),
+        created: action_type.created,
+        required_purpose: action_type.required_purpose.trim().to_string(),
+    })
+}
+
+fn from_proto_action_param(param: &ActionParamDef) -> Result<action::ActionParamDef, Status> {
+    let param_type = schema::PropertyType::parse(&param.r#type).ok_or_else(|| {
+        Status::invalid_argument(format!("unknown action param type: {}", param.r#type))
+    })?;
+    Ok(action::ActionParamDef {
+        name: param.name.clone(),
+        param_type,
+        required: param.required,
+        enum_values: param.enum_values.clone(),
+    })
+}
+
+fn from_proto_action_op(op: &ActionOp) -> action::ActionOp {
+    action::ActionOp {
+        op: op.op.clone(),
+        property: op.property.clone(),
+        value_from: op.value_from.clone(),
+        relation: op.relation.clone(),
     }
 }
 
@@ -7281,12 +7341,62 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(DeleteOntologyRelationResponse {}))
     }
 
+    async fn create_action_type(
+        &self,
+        req: Request<CreateActionTypeRequest>,
+    ) -> Result<Response<CreateActionTypeResponse>, Status> {
+        // This is intentionally a compatibility path for the legacy graph
+        // mutation DSL. It must not map ActionTypeDef into GovernedActionType:
+        // the two registries have different execution semantics.
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let action_type = req
+            .into_inner()
+            .action_type
+            .ok_or(Status::invalid_argument("action_type required"))?;
+        let parsed = from_proto_action_type(&action_type)?;
+        check_action_admin(&self.security, &parsed.name, &principals)?;
+        {
+            action::validate_action_type_definition(
+                &parsed,
+                ActionExecutor::new().has_action(&parsed.name),
+            )
+            .map_err(Status::invalid_argument)?;
+            let schema = self
+                .schema
+                .read()
+                .map_err(|_| Status::internal("schema registry unavailable"))?;
+            action::validate_action_type_against_schema(&parsed, &schema)
+                .map_err(Status::invalid_argument)?;
+        }
+        let stored = {
+            let _mutation = self
+                .action_type_mutation
+                .lock()
+                .map_err(|_| Status::internal("action registry mutation unavailable"))?;
+            let stored = self
+                .db
+                .upsert_action_type(&parsed)
+                .map_err(Status::internal)?;
+            self.actions
+                .write()
+                .map_err(|_| Status::internal("action registry unavailable"))?
+                .register_action_type(stored.clone())
+                .map_err(Status::invalid_argument)?;
+            stored
+        };
+        Ok(Response::new(CreateActionTypeResponse {
+            action_type: Some(to_proto_action_type(&stored)),
+        }))
+    }
+
     async fn list_action_types(
         &self,
         req: Request<ListActionTypesRequest>,
     ) -> Result<Response<ListActionTypesResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        self.refresh_action_registry()?;
         let action_types = self
             .actions
             .read()
@@ -7317,6 +7427,10 @@ impl SekaiService for SekaiServiceImpl {
             return Err(Status::invalid_argument("name required"));
         }
         check_action_admin(&self.security, &name, &principals)?;
+        let _mutation = self
+            .action_type_mutation
+            .lock()
+            .map_err(|_| Status::internal("action registry mutation unavailable"))?;
         if self
             .actions
             .read()
@@ -8342,6 +8456,7 @@ impl SekaiService for SekaiServiceImpl {
         let r = inner
             .request
             .ok_or(Status::invalid_argument("request required"))?;
+        self.refresh_action_registry()?;
         let invocation_namespace = catalog_namespace.as_deref().unwrap_or_else(|| {
             r.params
                 .get("namespace")
@@ -14597,6 +14712,195 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn create_action_type_compatibility_preserves_execute_action_semantics() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        grant_action_admin(&svc);
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(widget_schema_type()),
+        }))
+        .await
+        .unwrap();
+
+        let action = ActionTypeDef {
+            name: "set_widget_color".into(),
+            description: "Set a widget color through the graph action DSL.".into(),
+            params: vec![ActionParamDef {
+                name: "color".into(),
+                r#type: "enum".into(),
+                required: true,
+                enum_values: vec!["red".into(), "blue".into()],
+            }],
+            ops: vec![ActionOp {
+                op: "set_property".into(),
+                property: "color".into(),
+                value_from: "color".into(),
+                relation: String::new(),
+            }],
+            target_kind: "widget".into(),
+            created: 0,
+            required_purpose: String::new(),
+        };
+        let created = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(action.clone()),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .action_type
+            .unwrap();
+        let mut expected = action;
+        expected.created = created.created;
+        assert_eq!(created, expected);
+
+        let mut replay = created.clone();
+        replay.created = 0;
+        let replayed = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(replay),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .action_type
+            .unwrap();
+        assert_eq!(replayed.created, created.created);
+
+        let mut replay_with_changed_timestamp = created.clone();
+        replay_with_changed_timestamp.created = created.created + 999;
+        let replayed_with_changed_timestamp = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(replay_with_changed_timestamp),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .action_type
+            .unwrap();
+        assert_eq!(replayed_with_changed_timestamp.created, created.created);
+
+        svc.db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-compat",
+                HashMap::from([("name".into(), "compat".into())]),
+            )))
+            .unwrap();
+        grant_object_role(&svc, "widget-compat", "tester", security::Role::Editor);
+
+        svc.execute_action(with_principal(ExecuteActionRequest {
+            request: Some(ActionRequest {
+                action: "set_widget_color".into(),
+                params: HashMap::from([
+                    ("id".into(), "widget-compat".into()),
+                    ("color".into(), "blue".into()),
+                ]),
+                actor: "tester".into(),
+            }),
+            dry_run: false,
+        }))
+        .await
+        .unwrap();
+
+        let object = svc.db.get_object("widget-compat").unwrap().unwrap();
+        assert_eq!(object.properties.get("color"), Some(&"blue".into()));
+    }
+
+    #[tokio::test]
+    async fn create_action_type_compatibility_requires_action_admin() {
+        let svc = service();
+        let err = svc
+            .create_action_type(with_principal(CreateActionTypeRequest {
+                action_type: Some(ActionTypeDef {
+                    name: "untrusted_action".into(),
+                    description: String::new(),
+                    params: vec![],
+                    ops: vec![],
+                    target_kind: "widget".into(),
+                    created: 0,
+                    required_purpose: String::new(),
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn execute_action_refreshes_definitions_from_shared_storage() {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let writer = SekaiServiceImpl::new(db.clone());
+        writer
+            .create_schema_type(with_named_principal(
+                CreateSchemaTypeRequest {
+                    r#type: Some(widget_schema_type()),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        let reader = SekaiServiceImpl::new(db.clone());
+        let action = ActionTypeDef {
+            name: "set_widget_color_shared".into(),
+            description: "Set a widget color from another service instance.".into(),
+            params: vec![ActionParamDef {
+                name: "color".into(),
+                r#type: "string".into(),
+                required: true,
+                enum_values: vec![],
+            }],
+            ops: vec![ActionOp {
+                op: "set_property".into(),
+                property: "color".into(),
+                value_from: "color".into(),
+                relation: String::new(),
+            }],
+            target_kind: "widget".into(),
+            created: 0,
+            required_purpose: String::new(),
+        };
+        writer
+            .create_action_type(with_named_principal(
+                CreateActionTypeRequest {
+                    action_type: Some(action),
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+        writer
+            .db
+            .create_object(&from_proto_obj(&widget_object(
+                "widget-shared",
+                HashMap::from([("name".into(), "shared".into())]),
+            )))
+            .unwrap();
+
+        reader
+            .execute_action(with_named_principal(
+                ExecuteActionRequest {
+                    request: Some(ActionRequest {
+                        action: "set_widget_color_shared".into(),
+                        params: HashMap::from([
+                            ("id".into(), "widget-shared".into()),
+                            ("color".into(), "blue".into()),
+                        ]),
+                        actor: "local".into(),
+                    }),
+                    dry_run: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap();
+
+        let object = reader.db.get_object("widget-shared").unwrap().unwrap();
+        assert_eq!(object.properties.get("color"), Some(&"blue".into()));
     }
 
     #[tokio::test]

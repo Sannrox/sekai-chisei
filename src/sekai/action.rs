@@ -919,13 +919,23 @@ impl SekaiDb {
 
     pub fn upsert_action_type(&self, action_type: &ActionTypeDef) -> Result<ActionTypeDef, String> {
         self.migrate_action_types()?;
+        let conn = self.conn();
         let mut stored = action_type.clone();
-        if stored.created <= 0 {
+        let existing_created = conn
+            .query_row(
+                "SELECT created FROM sekai_action_types WHERE name = ?1",
+                params![stored.name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(created) = existing_created {
+            stored.created = created;
+        } else if stored.created <= 0 {
             stored.created = chrono::Utc::now().timestamp_millis();
         }
         let updated = chrono::Utc::now().timestamp_millis();
         let body_json = serde_json::to_string(&stored).map_err(|error| error.to_string())?;
-        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_action_types (name, description, target_kind, body_json, created, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
