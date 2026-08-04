@@ -12,6 +12,9 @@ sekai --db knowledge.db export
 sekai --db knowledge.db validate
 sekai --db knowledge.db --json explain Api
 sekai --db knowledge.db --json query Api --direction outbound --depth 2
+sekai --db knowledge.db --json find interface
+sekai --db knowledge.db --json ask "What does Api depend on?"
+sekai --json diff before.json after.json
 sekai --db knowledge.db --json entity list
 sekai --db knowledge.db --json relation list
 ```
@@ -71,11 +74,49 @@ The JSON envelope's `data` contains `start`, the effective `options`, `classes`,
 and `relations`. A missing start exits 3; a valid start with no matching edge
 succeeds with empty lists. Invalid directions and depths above 32 exit 2.
 
+## Deterministic discovery
+
+`find <text>` searches class and relation names, descriptions, properties, and
+relation endpoints. Results are ranked deterministically and include the fields
+that matched. An empty result is successful and returns an empty `matches` list
+in JSON mode.
+
+```bash
+sekai --db knowledge.db --json find interface
+```
+
+`diff <before> <after>` compares two raw ontology JSON documents, two
+`export --json` envelopes, or two SQLite ontology databases. It reports added,
+removed, and semantically changed classes, relations, and provenance records;
+ordering-only changes are ignored.
+
+```bash
+sekai --json diff before.json after.json
+```
+
+## Read-only natural-language queries
+
+`ask <question>` is a conservative Natural Language frontend over the existing
+typed operations. It does not call a model, access the network, or mutate the
+database. Supported forms compile to one bounded `explain` or `query` plan:
+
+```bash
+sekai --db knowledge.db ask "What is Api?"
+sekai --db knowledge.db ask "What does Api depend on?"
+sekai --db knowledge.db ask "What depends on Database?"
+sekai --db knowledge.db ask "What is related to Api?"
+```
+
+The JSON response always exposes the interpretation and typed plan before the
+answer. Ambiguous or unsupported questions return candidates without executing
+a plan and exit 2. Mutations such as `import` remain explicit commands.
+
 ## Process contract
 
-`export --json`, `explain --json`, `query --json`, and `validate --json` return an envelope with
-`schema_version`, `command`, and `data`. Structured results are written to
-stdout and diagnostics to stderr.
+`export --json`, `explain --json`, `query --json`, `find --json`, `diff --json`,
+`ask --json`, and `validate --json` return an envelope with `schema_version`,
+`command`, and `data`. Structured results are written to stdout and diagnostics
+to stderr.
 
 | Exit | Meaning |
 | --- | --- |
@@ -84,6 +125,10 @@ stdout and diagnostics to stderr.
 | 3 | Named class not found |
 | 4 | Database cannot be opened or read |
 | 5 | Ontology validation failed |
+
+`ask` also uses exit 2 for an ambiguous or unsupported question. A successful
+`find` with no matches and a `diff` with changes both exit 0; inspect their JSON
+data rather than using a failure exit code as a change indicator.
 
 The JSON contract is version 1. New optional fields may be added within version
 1; incompatible changes require a new schema version.
