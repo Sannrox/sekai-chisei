@@ -1,0 +1,80 @@
+{
+  "version": "sekai.sdk-core-loop/v1",
+  "principal": "sdk-fixture",
+  "token": "fixture-token",
+  "namespace": "demo",
+  "catalog_version": "catalog-v1",
+  "operation_id": "operation-1",
+  "request_id": "request-1",
+  "schema": {
+    "kind": "service",
+    "description": "A service in the SDK conformance graph",
+    "properties": []
+  },
+  "objects": [
+    {
+      "id": "service-1",
+      "kind": "service",
+      "name": "billing-api",
+      "namespace": "demo",
+      "properties": {
+        "tier": "prod"
+      }
+    },
+    {
+      "id": "incident-1",
+      "kind": "incident",
+      "name": "elevated latency",
+      "namespace": "demo"
+    }
+  ],
+  "links": [
+    {
+      "id": "link-1",
+      "from_id": "incident-1",
+      "to_id": "service-1",
+      "relation": "affects"
+    }
+  ],
+  "execution": {
+    "request_id": "request-1",
+    "namespace": "demo",
+    "spec": "summarize the incident",
+    "task_type": "fixture",
+    "max_tokens": 32,
+    "logical_operation_id": "operation-1"
+  },
+  "plan": {
+    "plan_id": "plan-1",
+    "input": {
+      "request_id": "request-1",
+      "namespace": "demo",
+      "logical_operation_id": "operation-1"
+    },
+    "resolved_model": "fixture/model",
+    "executable": true
+  },
+  "stream_events": [
+    {
+      "content_delta": "incident ",
+      "done": false
+    },
+    {
+      "content_delta": "summary",
+      "done": true
+    }
+  ],
+  "receipt": {
+    "receipt_json": "{\"operation_id\":\"plan-1\",\"complete\":true}",
+    "complete": true,
+    "missing_surfaces": []
+  },
+  "expected_base_metadata": {
+    "authorization": "Bearer fixture-token",
+    "x-principal": "sdk-fixture",
+    "x-sekai-namespace": "demo",
+    "x-sekai-operation-id": "operation-1",
+    "x-chisei-work-unit": "operation-1",
+    "x-sekai-catalog-version": "catalog-v1"
+  }
+}

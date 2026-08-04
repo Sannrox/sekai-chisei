@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sekai-chisei-sdk"
+version = "0.1.0"
+description = "Typed server-side Python facade for the Sekai/Chisei gRPC contracts"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+grpc = [
+  "grpcio>=1.60,<2",
+  "grpcio-tools>=1.60,<2",
+  "protobuf>=5,<7",
+]
+
+[tool.setuptools]
+py-modules = ["sekai_client", "sekai_capability", "sekai_grpc"]
