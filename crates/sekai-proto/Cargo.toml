@@ -1,8 +1,8 @@
 [package]
 name = "sekai-proto"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "Apache-2.0 OR AGPL-3.0-only"
 description = "Generated gRPC contracts for Sekai Chisei."
 
 [dependencies]
