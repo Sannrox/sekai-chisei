@@ -1,12 +1,17 @@
 [package]
 name = "sekai-client"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 readme = "README.md"
 description = "Thin, versioned Rust core-loop client for Sekai Chisei."
 repository = "https://github.com/Sannrox/sekai-chisei"
+
+[features]
+default = ["tls-webpki-roots"]
+tls-native-roots = ["tonic/tls-native-roots"]
+tls-webpki-roots = ["tonic/tls-webpki-roots"]
 
 [dependencies]
 async-stream = "0.3"
@@ -19,7 +24,7 @@ prost = "0.14"
 sekai-proto = { version = "1.0.1", path = "../sekai-proto" }
 tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
 tokio-util = "0.7"
-tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }

@@ -47,6 +47,13 @@ clients by replacing connection, metadata, timeout, error, and stream plumbing
 with `CoreLoopClient` calls. Unsupported RPCs can remain on `client.raw()`
 until a typed helper is justified.
 
+HTTPS uses the bundled Mozilla WebPKI roots by default, so public-CA
+connections do not depend on an operating-system CA bundle. Hosts that need
+the platform certificate store can use `--no-default-features --features
+tls-native-roots`; enabling both root features is also supported. A configured
+PEM CA certificate is added to the selected roots through
+`ClientConfig::with_tls_ca_certificate`.
+
 For registry publication, release a compatible `sekai-proto` version before
 `sekai-client`; workspace builds resolve the local path, while registry
 consumers resolve the canonical protocol crate independently.

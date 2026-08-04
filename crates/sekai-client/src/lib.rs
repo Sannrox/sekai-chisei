@@ -654,7 +654,7 @@ impl GrpcTransport {
             .map_err(|_| SdkError::invalid_argument())?
             .connect_timeout(config.default_timeout);
         if scheme == "https" {
-            let mut tls = ClientTlsConfig::new().with_native_roots();
+            let mut tls = tls_config_with_enabled_roots();
             if let Some(certificate) = config.tls_ca_certificate.as_ref() {
                 tls = tls.ca_certificate(Certificate::from_pem(certificate.clone()));
             }
@@ -702,6 +702,15 @@ impl GrpcTransport {
         grpc.server_streaming(request, path, tonic_prost::ProstCodec::default())
             .await
     }
+}
+
+fn tls_config_with_enabled_roots() -> ClientTlsConfig {
+    let tls = ClientTlsConfig::new();
+    #[cfg(feature = "tls-native-roots")]
+    let tls = tls.with_native_roots();
+    #[cfg(feature = "tls-webpki-roots")]
+    let tls = tls.with_webpki_roots();
+    tls
 }
 
 #[async_trait]
