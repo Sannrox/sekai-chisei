@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-proto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "prost",
  "prost-types",
