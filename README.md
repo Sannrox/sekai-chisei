@@ -147,6 +147,9 @@ sekai import definitions.json       # import classes and relations
 sekai validate                      # check structural integrity
 sekai --json explain SomeClass      # definition, closure, provenance
 sekai --json query SomeClass --direction outbound --depth 2
+sekai --json find interface        # deterministic vocabulary discovery
+sekai --json ask "What does Api depend on?"  # read-only typed query frontend
+sekai --json diff before.json after.json
 ```
 
 Do not use the control-plane database (`data/sekai.db`) as a portable ontology

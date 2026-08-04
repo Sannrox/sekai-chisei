@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "SekaiOntology",
+      "description": "The sekai-ontology crate: portable ontology library and CLI tool with deterministic discovery, semantic diffing, and a read-only natural-language frontend.",
+      "superclasses": ["Crate"]
+    },
+    {
+      "name": "OntologySearch",
+      "description": "A deterministic vocabulary search over portable ontology class and relation definitions.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "OntologyDiff",
+      "description": "A semantic comparison of two portable ontology documents or databases.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "OntologyAsk",
+      "description": "A read-only natural-language interpreter that compiles supported questions into bounded ontology explain or query plans.",
+      "superclasses": ["Component"]
+    }
+  ],
+  "relations": [
+    {
+      "name": "provides_search",
+      "description": "The portable ontology CLI provides deterministic definition discovery.",
+      "domain": "SekaiOntology",
+      "range": "OntologySearch"
+    },
+    {
+      "name": "provides_diff",
+      "description": "The portable ontology CLI provides semantic definition comparison.",
+      "domain": "SekaiOntology",
+      "range": "OntologyDiff"
+    },
+    {
+      "name": "provides_read_only_ask",
+      "description": "The portable ontology CLI provides a read-only natural-language frontend over typed plans.",
+      "domain": "SekaiOntology",
+      "range": "OntologyAsk"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "SekaiOntology",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "find/diff/ask commands",
+      "confidence": 1.0
+    },
+    {
+      "subject": "OntologySearch",
+      "source": "crates/sekai-ontology/src/lib.rs",
+      "locator": "SearchResult",
+      "confidence": 1.0
+    },
+    {
+      "subject": "OntologyDiff",
+      "source": "crates/sekai-ontology/src/lib.rs",
+      "locator": "OntologyDiff",
+      "confidence": 1.0
+    },
+    {
+      "subject": "OntologyAsk",
+      "source": "crates/sekai-ontology/src/lib.rs",
+      "locator": "AskInterpretation",
+      "confidence": 1.0
+    },
+    {
+      "subject": "provides_search",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "run_find",
+      "confidence": 1.0
+    },
+    {
+      "subject": "provides_diff",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "run_diff",
+      "confidence": 1.0
+    },
+    {
+      "subject": "provides_read_only_ask",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "run_ask",
+      "confidence": 1.0
+    }
+  ]
+}

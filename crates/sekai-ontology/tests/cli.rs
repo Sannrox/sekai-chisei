@@ -47,6 +47,94 @@ fn fresh_file_workflow_has_stable_machine_output() {
 }
 
 #[test]
+fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("knowledge.db");
+    let database = database_path.to_str().unwrap();
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codebase.json");
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "import", fixture])
+            .status
+            .success()
+    );
+
+    let find = sekai(&["--db", database, "--json", "find", "language"]);
+    assert!(find.status.success());
+    let find: Value = serde_json::from_slice(&find.stdout).unwrap();
+    assert_eq!(find["command"], "find");
+    assert_eq!(find["data"]["matches"][0]["name"], "Api");
+    assert_eq!(
+        find["data"]["matches"][0]["matched_fields"],
+        serde_json::json!(["properties"])
+    );
+
+    let before = SqliteOntology::open_read_only(database)
+        .unwrap()
+        .export()
+        .unwrap();
+    let before_path = directory.path().join("before.json");
+    fs::write(&before_path, serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+    let mut after = before.clone();
+    after
+        .classes
+        .iter_mut()
+        .find(|class| class.name == "Api")
+        .unwrap()
+        .description = "Changed interface".into();
+    let after_path = directory.path().join("after.json");
+    fs::write(&after_path, serde_json::to_vec_pretty(&after).unwrap()).unwrap();
+
+    let diff = sekai(&[
+        "--json",
+        "diff",
+        before_path.to_str().unwrap(),
+        after_path.to_str().unwrap(),
+    ]);
+    assert!(diff.status.success());
+    let diff: Value = serde_json::from_slice(&diff.stdout).unwrap();
+    assert_eq!(diff["command"], "diff");
+    assert_eq!(diff["data"]["changed"], true);
+    assert_eq!(diff["data"]["classes"]["changed"][0]["name"], "Api");
+
+    let ask = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "ask",
+        "What does Api depend on?",
+    ]);
+    assert!(ask.status.success());
+    let ask: Value = serde_json::from_slice(&ask.stdout).unwrap();
+    assert_eq!(ask["command"], "ask");
+    assert_eq!(ask["data"]["interpretation"]["status"], "ready");
+    assert_eq!(
+        ask["data"]["interpretation"]["plan"]["options"]["relation"],
+        "depends_on"
+    );
+    assert_eq!(ask["data"]["answer"]["kind"], "query");
+    assert_eq!(
+        ask["data"]["answer"]["data"]["classes"][0]["name"],
+        "Database"
+    );
+
+    let unsupported = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "ask",
+        "Summarize the whole system",
+    ]);
+    assert_eq!(unsupported.status.code(), Some(2));
+    let unsupported: Value = serde_json::from_slice(&unsupported.stdout).unwrap();
+    assert_eq!(
+        unsupported["data"]["interpretation"]["status"],
+        "unsupported"
+    );
+    assert!(unsupported["data"]["answer"].is_null());
+}
+
+#[test]
 fn export_is_deterministic_read_only_and_round_trips() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("source.db");
@@ -158,7 +246,8 @@ fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
     let help = String::from_utf8(help.stdout).unwrap();
     for command in [
-        "export", "explain", "query", "validate", "import", "entity", "relation",
+        "export", "explain", "query", "find", "diff", "ask", "validate", "import", "entity",
+        "relation",
     ] {
         assert!(help.contains(command), "help is missing {command}");
         assert!(

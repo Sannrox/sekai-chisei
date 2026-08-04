@@ -1,8 +1,10 @@
 use sekai_ontology::{
-    EMBEDDED_SKILL, Error, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology,
-    TraversalDirection, ValidationIssue,
+    AskInterpretation, AskOperation, AskStatus, DefinitionKind, EMBEDDED_SKILL, Error,
+    ExportDocument, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology, TraversalDirection,
+    ValidationIssue, diff_documents, interpret_question,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -29,6 +31,20 @@ struct Envelope<T> {
 struct ValidationResult {
     valid: bool,
     issues: Vec<ValidationIssue>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "data")]
+#[serde(rename_all = "snake_case")]
+enum AskAnswer {
+    Explain(sekai_ontology::ExplainResult),
+    Query(sekai_ontology::QueryResult),
+}
+
+#[derive(Serialize)]
+struct AskResponse {
+    interpretation: AskInterpretation,
+    answer: Option<AskAnswer>,
 }
 
 struct Arguments {
@@ -185,6 +201,9 @@ fn run() -> Result<ExitCode, Error> {
                 }
             }
         }
+        "find" => run_find(&arguments)?,
+        "diff" => run_diff(&arguments)?,
+        "ask" => return run_ask(&arguments),
         "entity" => run_entity(&arguments)?,
         "relation" => run_relation(&arguments)?,
         "skill" => return run_skill(&arguments),
@@ -197,6 +216,190 @@ fn run() -> Result<ExitCode, Error> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_find(arguments: &Arguments) -> Result<(), Error> {
+    expect_operands(arguments, 1, "find <text>")?;
+    let result =
+        SqliteOntology::open_read_only(&arguments.database)?.find(&arguments.operands[0])?;
+    if arguments.json {
+        print_json("find", result)?;
+    } else if result.matches.is_empty() {
+        println!("no definitions matched '{}'", result.query);
+    } else {
+        for matched in result.matches {
+            println!(
+                "{} {} (score {}; matched {})",
+                definition_kind_name(matched.kind),
+                matched.name,
+                matched.score,
+                matched.matched_fields.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_diff(arguments: &Arguments) -> Result<(), Error> {
+    expect_operands(arguments, 2, "diff <before> <after>")?;
+    let before = load_document(&arguments.operands[0])?;
+    let after = load_document(&arguments.operands[1])?;
+    let diff = diff_documents(&before, &after);
+    if arguments.json {
+        print_json("diff", diff)?;
+    } else {
+        println!("changed: {}", diff.changed);
+        if diff.schema_changed {
+            println!(
+                "schema_version: {} -> {}",
+                diff.before_schema_version, diff.after_schema_version
+            );
+        }
+        print_diff_summary("classes", &diff.classes);
+        print_diff_summary("relations", &diff.relations);
+        print_diff_summary("provenance", &diff.provenance);
+    }
+    Ok(())
+}
+
+fn run_ask(arguments: &Arguments) -> Result<ExitCode, Error> {
+    expect_operands(arguments, 1, "ask <question>")?;
+    let ontology = SqliteOntology::open_read_only(&arguments.database)?;
+    let document = ontology.export()?;
+    let interpretation = interpret_question(&document, &arguments.operands[0])?;
+    let mut answer = None;
+    if let Some(plan) = &interpretation.plan {
+        answer = Some(match plan.operation {
+            AskOperation::Explain => AskAnswer::Explain(ontology.explain(&plan.name)?),
+            AskOperation::Query => {
+                let options = plan.options.clone().ok_or_else(|| {
+                    Error::Input("ask query interpretation did not include options".into())
+                })?;
+                AskAnswer::Query(ontology.query(&plan.name, options)?)
+            }
+        });
+    }
+    let status = interpretation.status;
+    let response = AskResponse {
+        interpretation,
+        answer,
+    };
+    if arguments.json {
+        print_json("ask", response)?;
+    } else {
+        print_ask_human(&response);
+    }
+    if status == AskStatus::Ready {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(EXIT_USAGE_OR_INPUT))
+    }
+}
+
+fn load_document(path: &str) -> Result<ExportDocument, Error> {
+    let bytes =
+        fs::read(path).map_err(|error| Error::Input(format!("cannot read '{path}': {error}")))?;
+    let first = bytes
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .copied();
+    let is_json = first == Some(b'{') || first == Some(b'[') || path.ends_with(".json");
+    if is_json {
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            Error::Input(format!("invalid ontology document '{path}': {error}"))
+        })?;
+        let value = if let Some(command) = value.get("command").and_then(Value::as_str) {
+            if command != "export" {
+                return Err(Error::Input(format!(
+                    "JSON input '{path}' has command '{command}', expected 'export'"
+                )));
+            }
+            value
+                .get("data")
+                .cloned()
+                .ok_or_else(|| Error::Input(format!("JSON export '{path}' has no data field")))?
+        } else {
+            value
+        };
+        return serde_json::from_value(value)
+            .map_err(|error| Error::Input(format!("invalid ontology document '{path}': {error}")));
+    }
+    SqliteOntology::open_read_only(path)?.export()
+}
+
+fn definition_kind_name(kind: DefinitionKind) -> &'static str {
+    match kind {
+        DefinitionKind::Class => "class",
+        DefinitionKind::Relation => "relation",
+    }
+}
+
+fn print_diff_summary(name: &str, summary: &sekai_ontology::DiffSummary) {
+    for item in &summary.added {
+        println!("  {name} added: {item}");
+    }
+    for item in &summary.removed {
+        println!("  {name} removed: {item}");
+    }
+    for item in &summary.changed {
+        println!(
+            "  {name} changed: {} ({})",
+            item.name,
+            item.fields.join(", ")
+        );
+    }
+}
+
+fn print_ask_human(response: &AskResponse) {
+    let interpretation = &response.interpretation;
+    println!(
+        "status: {}",
+        match interpretation.status {
+            AskStatus::Ready => "ready",
+            AskStatus::Ambiguous => "ambiguous",
+            AskStatus::Unsupported => "unsupported",
+        }
+    );
+    println!("interpreted as: {}", interpretation.interpretation);
+    if !interpretation.candidates.is_empty() {
+        println!("candidates:");
+        for candidate in &interpretation.candidates {
+            println!(
+                "  {} {} (score {}; matched {})",
+                definition_kind_name(candidate.kind),
+                candidate.name,
+                candidate.score,
+                candidate.matched_fields.join(", ")
+            );
+        }
+    }
+    match &response.answer {
+        Some(AskAnswer::Explain(explanation)) => {
+            println!("{}", explanation.class.name);
+            if !explanation.superclass_closure.is_empty() {
+                println!("  is_a: {}", explanation.superclass_closure.join(", "));
+            }
+            for relation in &explanation.outbound_relations {
+                println!("  {} -> {}", relation.name, relation.range);
+            }
+            for relation in &explanation.inbound_relations {
+                println!("  {} <- {}", relation.name, relation.domain);
+            }
+        }
+        Some(AskAnswer::Query(query)) => {
+            println!("{}", query.start);
+            for relation in &query.relations {
+                println!(
+                    "  {}: {} -> {}",
+                    relation.name, relation.domain, relation.range
+                );
+            }
+            for class in &query.classes {
+                println!("  reached: {}", class.name);
+            }
+        }
+        None => {}
+    }
 }
 
 fn run_entity(arguments: &Arguments) -> Result<(), Error> {
@@ -765,7 +968,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  4. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. SEKAI_SKILL_PATH selects the skill directory."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  4. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain/query plans.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {

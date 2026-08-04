@@ -163,6 +163,90 @@ pub struct QueryResult {
     pub relations: Vec<Relation>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionKind {
+    Class,
+    Relation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchMatch {
+    pub kind: DefinitionKind,
+    pub name: String,
+    pub score: u32,
+    pub matched_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchResult {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangedDefinition {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct DiffSummary {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<ChangedDefinition>,
+}
+
+impl DiffSummary {
+    fn is_changed(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OntologyDiff {
+    pub before_schema_version: u32,
+    pub after_schema_version: u32,
+    pub schema_changed: bool,
+    pub classes: DiffSummary,
+    pub relations: DiffSummary,
+    pub provenance: DiffSummary,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskStatus {
+    Ready,
+    Ambiguous,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskOperation {
+    Explain,
+    Query,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AskPlan {
+    pub operation: AskOperation,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<QueryOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AskInterpretation {
+    pub question: String,
+    pub status: AskStatus,
+    pub interpretation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<AskPlan>,
+    pub candidates: Vec<SearchMatch>,
+}
+
 pub trait Ontology {
     fn class(&self, name: &str) -> Result<Option<Class>, Error>;
     fn relations(&self, name: &str) -> Result<Vec<Relation>, Error>;
@@ -303,8 +387,692 @@ impl SqliteOntology {
         })
     }
 
+    pub fn find(&self, query: &str) -> Result<SearchResult, Error> {
+        self.check_schema_version()?;
+        search_document(&self.export()?, query)
+    }
+
     fn check_schema_version(&self) -> Result<(), Error> {
         check_schema_version(&self.connection)
+    }
+}
+
+pub fn search_document(document: &ExportDocument, query: &str) -> Result<SearchResult, Error> {
+    if normalize_text(query).is_empty() {
+        return Err(Error::Input("find query must not be empty".into()));
+    }
+
+    let mut matches = Vec::new();
+    for class in &document.classes {
+        let mut fields = vec![
+            ("name".to_string(), class.name.clone()),
+            ("description".to_string(), class.description.clone()),
+            ("superclasses".to_string(), class.superclasses.join(" ")),
+        ];
+        for property in &class.properties {
+            fields.push(("properties".to_string(), property.name.clone()));
+            fields.push(("property_types".to_string(), property.value_type.clone()));
+            fields.push((
+                "property_descriptions".to_string(),
+                property.description.clone(),
+            ));
+        }
+        let field_refs = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        if let Some((score, matched_fields)) = score_fields(query, &field_refs) {
+            matches.push(SearchMatch {
+                kind: DefinitionKind::Class,
+                name: class.name.clone(),
+                score,
+                matched_fields,
+            });
+        }
+    }
+    for relation in &document.relations {
+        let fields = [
+            ("name", relation.name.as_str()),
+            ("description", relation.description.as_str()),
+            ("domain", relation.domain.as_str()),
+            ("range", relation.range.as_str()),
+        ];
+        if let Some((score, matched_fields)) = score_fields(query, &fields) {
+            matches.push(SearchMatch {
+                kind: DefinitionKind::Relation,
+                name: relation.name.clone(),
+                score,
+                matched_fields,
+            });
+        }
+    }
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    Ok(SearchResult {
+        query: query.to_string(),
+        matches,
+    })
+}
+
+pub fn diff_documents(before: &ExportDocument, after: &ExportDocument) -> OntologyDiff {
+    let classes = diff_classes(before, after);
+    let relations = diff_relations(before, after);
+    let provenance = diff_provenance(before, after);
+    let schema_changed = before.schema_version != after.schema_version;
+    let changed =
+        schema_changed || classes.is_changed() || relations.is_changed() || provenance.is_changed();
+    OntologyDiff {
+        before_schema_version: before.schema_version,
+        after_schema_version: after.schema_version,
+        schema_changed,
+        classes,
+        relations,
+        provenance,
+        changed,
+    }
+}
+
+pub fn interpret_question(
+    document: &ExportDocument,
+    question: &str,
+) -> Result<AskInterpretation, Error> {
+    let normalized = normalize_text(question);
+    if normalized.is_empty() {
+        return Err(Error::Input("ask question must not be empty".into()));
+    }
+
+    let class_resolution = resolve_class(document, &normalized);
+    let relation_resolution = resolve_relation(document, &normalized);
+
+    for prefix in [
+        "what is related to ",
+        "what is connected to ",
+        "what is linked to ",
+        "what is associated with ",
+        "which classes are related to ",
+    ] {
+        if normalized.starts_with(prefix) {
+            return query_interpretation(
+                question,
+                class_resolution,
+                None,
+                TraversalDirection::Both,
+                "a bounded bidirectional relation query",
+            );
+        }
+    }
+
+    for prefix in ["explain ", "describe ", "what is ", "tell me about "] {
+        if normalized.starts_with(prefix) {
+            return explain_interpretation(question, class_resolution);
+        }
+    }
+
+    if normalized.starts_with("what does ")
+        || normalized.starts_with("which relations does ")
+        || normalized.starts_with("what relations does ")
+    {
+        let relation = match relation_resolution {
+            RelationResolution::Unique(relation) => Some(relation),
+            RelationResolution::Missing => None,
+            RelationResolution::Ambiguous(candidates) => {
+                return Ok(ambiguous_interpretation(
+                    question,
+                    "more than one relation matches the question",
+                    candidates,
+                ));
+            }
+        };
+        if relation.is_none()
+            && !contains_any_phrase(
+                &normalized,
+                &[
+                    "connect to",
+                    "relate to",
+                    "link to",
+                    "associate with",
+                    "have",
+                ],
+            )
+        {
+            return Ok(unsupported_interpretation(
+                question,
+                "the question does not name a known relation or supported generic relation phrase",
+                search_document(document, question)?.matches,
+            ));
+        }
+        return query_interpretation(
+            question,
+            class_resolution,
+            relation,
+            TraversalDirection::Outbound,
+            "a bounded outbound relation query",
+        );
+    }
+
+    if normalized.starts_with("what ") || normalized.starts_with("which classes ") {
+        let relation = match relation_resolution {
+            RelationResolution::Unique(relation) => Some(relation),
+            RelationResolution::Missing => None,
+            RelationResolution::Ambiguous(candidates) => {
+                return Ok(ambiguous_interpretation(
+                    question,
+                    "more than one relation matches the question",
+                    candidates,
+                ));
+            }
+        };
+        if relation.is_none() {
+            return Ok(unsupported_interpretation(
+                question,
+                "the question does not name a known relation",
+                search_document(document, question)?.matches,
+            ));
+        }
+        return query_interpretation(
+            question,
+            class_resolution,
+            relation,
+            TraversalDirection::Inbound,
+            "a bounded inbound relation query",
+        );
+    }
+
+    Ok(unsupported_interpretation(
+        question,
+        "supported forms are explain/describe, what is related to, what does, and which classes",
+        search_document(document, question)?.matches,
+    ))
+}
+
+#[derive(Debug)]
+enum NameResolution {
+    Unique(String),
+    Missing(Vec<SearchMatch>),
+    Ambiguous(Vec<SearchMatch>),
+}
+
+#[derive(Debug)]
+enum RelationResolution {
+    Unique(String),
+    Missing,
+    Ambiguous(Vec<SearchMatch>),
+}
+
+fn score_fields(query: &str, fields: &[(&str, &str)]) -> Option<(u32, Vec<String>)> {
+    let normalized_query = normalize_text(query);
+    let query_tokens = normalized_query.split_whitespace().collect::<Vec<_>>();
+    if query_tokens.is_empty() {
+        return None;
+    }
+
+    let mut score = 0;
+    let mut matched_fields = BTreeSet::new();
+    for (field_name, value) in fields {
+        let normalized_value = normalize_text(value);
+        let field_score = field_match_score(&normalized_query, &query_tokens, &normalized_value);
+        if field_score > 0 {
+            score = score.max(field_score);
+            matched_fields.insert((*field_name).to_string());
+        }
+    }
+    (score > 0).then(|| (score, matched_fields.into_iter().collect()))
+}
+
+fn field_match_score(query: &str, query_tokens: &[&str], value: &str) -> u32 {
+    if value.is_empty() {
+        return 0;
+    }
+    if value == query {
+        return 1000;
+    }
+    if value.starts_with(query) {
+        return 850;
+    }
+    if value.contains(query) {
+        return 700;
+    }
+
+    let value_tokens = value.split_whitespace().collect::<Vec<_>>();
+    let hits = query_tokens
+        .iter()
+        .filter(|token| value_tokens.iter().any(|value| value == *token))
+        .count();
+    if hits == query_tokens.len() {
+        500 + hits as u32 * 10
+    } else if hits > 0 {
+        100 + hits as u32 * 10
+    } else {
+        0
+    }
+}
+
+fn normalize_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_alphanumeric() {
+            for lowercase in character.to_lowercase() {
+                normalized.push(lowercase);
+            }
+        } else {
+            normalized.push(' ');
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn contains_phrase(text: &str, phrase: &str) -> bool {
+    let text_tokens = text.split_whitespace().collect::<Vec<_>>();
+    let phrase_tokens = phrase.split_whitespace().collect::<Vec<_>>();
+    !phrase_tokens.is_empty()
+        && text_tokens
+            .windows(phrase_tokens.len())
+            .any(|window| window == phrase_tokens.as_slice())
+}
+
+fn contains_any_phrase(text: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .map(|phrase| normalize_text(phrase))
+        .any(|phrase| contains_phrase(text, &phrase))
+}
+
+fn singularize(token: &str) -> String {
+    if token.len() > 3 && token.ends_with('s') && !token.ends_with("ss") {
+        token[..token.len() - 1].to_string()
+    } else {
+        token.to_string()
+    }
+}
+
+fn relation_variants(name: &str) -> Vec<String> {
+    let base = normalize_text(name);
+    let singular = base
+        .split_whitespace()
+        .map(singularize)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if base == singular {
+        vec![base]
+    } else {
+        vec![base, singular]
+    }
+}
+
+fn resolve_class(document: &ExportDocument, question: &str) -> NameResolution {
+    let mut matches = document
+        .classes
+        .iter()
+        .filter_map(|class| {
+            let name = normalize_text(&class.name);
+            contains_phrase(question, &name).then(|| (name.len(), class.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    if matches.is_empty() {
+        let suggestions = document
+            .classes
+            .iter()
+            .filter_map(|class| {
+                let fields = [
+                    ("name", class.name.as_str()),
+                    ("description", class.description.as_str()),
+                ];
+                score_fields(question, &fields).map(|(score, matched_fields)| SearchMatch {
+                    kind: DefinitionKind::Class,
+                    name: class.name.clone(),
+                    score,
+                    matched_fields,
+                })
+            })
+            .collect::<Vec<_>>();
+        return NameResolution::Missing(limit_search_matches(suggestions));
+    }
+    let longest = matches[0].0;
+    let candidates = matches
+        .into_iter()
+        .filter(|(length, _)| *length == longest)
+        .map(|(_, name)| SearchMatch {
+            kind: DefinitionKind::Class,
+            name,
+            score: 1000,
+            matched_fields: vec!["name".into()],
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        NameResolution::Unique(candidates[0].name.clone())
+    } else {
+        NameResolution::Ambiguous(candidates)
+    }
+}
+
+fn resolve_relation(document: &ExportDocument, question: &str) -> RelationResolution {
+    let mut matches = document
+        .relations
+        .iter()
+        .filter_map(|relation| {
+            let variants = relation_variants(&relation.name);
+            variants
+                .iter()
+                .find(|variant| contains_phrase(question, variant))
+                .map(|variant| {
+                    (
+                        if variant == &variants[0] { 1000 } else { 900 },
+                        relation.name.clone(),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    if matches.is_empty() {
+        return RelationResolution::Missing;
+    }
+    let best_score = matches[0].0;
+    let candidates = matches
+        .into_iter()
+        .filter(|(score, _)| *score == best_score)
+        .map(|(score, name)| SearchMatch {
+            kind: DefinitionKind::Relation,
+            name,
+            score,
+            matched_fields: vec!["name".into()],
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        RelationResolution::Unique(candidates[0].name.clone())
+    } else {
+        RelationResolution::Ambiguous(candidates)
+    }
+}
+
+fn limit_search_matches(mut matches: Vec<SearchMatch>) -> Vec<SearchMatch> {
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    matches.truncate(5);
+    matches
+}
+
+fn query_interpretation(
+    question: &str,
+    class_resolution: NameResolution,
+    relation: Option<String>,
+    direction: TraversalDirection,
+    description: &str,
+) -> Result<AskInterpretation, Error> {
+    let name = match class_resolution {
+        NameResolution::Unique(name) => name,
+        NameResolution::Missing(candidates) => {
+            return Ok(unsupported_interpretation(
+                question,
+                "could not identify one class in the question",
+                candidates,
+            ));
+        }
+        NameResolution::Ambiguous(candidates) => {
+            return Ok(ambiguous_interpretation(
+                question,
+                "more than one class matches the question",
+                candidates,
+            ));
+        }
+    };
+    let relation_description = relation
+        .as_deref()
+        .map(|relation| format!(" via relation '{relation}'"))
+        .unwrap_or_default();
+    Ok(AskInterpretation {
+        question: question.to_string(),
+        status: AskStatus::Ready,
+        interpretation: format!("{description}{relation_description} from class '{name}'"),
+        plan: Some(AskPlan {
+            operation: AskOperation::Query,
+            name,
+            options: Some(QueryOptions {
+                direction,
+                relation,
+                depth: 1,
+            }),
+        }),
+        candidates: Vec::new(),
+    })
+}
+
+fn explain_interpretation(
+    question: &str,
+    class_resolution: NameResolution,
+) -> Result<AskInterpretation, Error> {
+    match class_resolution {
+        NameResolution::Unique(name) => Ok(AskInterpretation {
+            question: question.to_string(),
+            status: AskStatus::Ready,
+            interpretation: format!("an explanation of class '{name}'"),
+            plan: Some(AskPlan {
+                operation: AskOperation::Explain,
+                name,
+                options: None,
+            }),
+            candidates: Vec::new(),
+        }),
+        NameResolution::Missing(candidates) => Ok(unsupported_interpretation(
+            question,
+            "could not identify one class to explain",
+            candidates,
+        )),
+        NameResolution::Ambiguous(candidates) => Ok(ambiguous_interpretation(
+            question,
+            "more than one class matches the question",
+            candidates,
+        )),
+    }
+}
+
+fn ambiguous_interpretation(
+    question: &str,
+    message: &str,
+    candidates: Vec<SearchMatch>,
+) -> AskInterpretation {
+    AskInterpretation {
+        question: question.to_string(),
+        status: AskStatus::Ambiguous,
+        interpretation: message.into(),
+        plan: None,
+        candidates,
+    }
+}
+
+fn unsupported_interpretation(
+    question: &str,
+    message: &str,
+    candidates: Vec<SearchMatch>,
+) -> AskInterpretation {
+    AskInterpretation {
+        question: question.to_string(),
+        status: AskStatus::Unsupported,
+        interpretation: message.into(),
+        plan: None,
+        candidates: limit_search_matches(candidates),
+    }
+}
+
+fn diff_classes(before: &ExportDocument, after: &ExportDocument) -> DiffSummary {
+    let before = before
+        .classes
+        .iter()
+        .map(|class| (class.name.clone(), class))
+        .collect::<BTreeMap<_, _>>();
+    let after = after
+        .classes
+        .iter()
+        .map(|class| (class.name.clone(), class))
+        .collect::<BTreeMap<_, _>>();
+    let names = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut summary = DiffSummary::default();
+    for name in names {
+        match (before.get(&name), after.get(&name)) {
+            (None, Some(_)) => summary.added.push(name),
+            (Some(_), None) => summary.removed.push(name),
+            (Some(before), Some(after)) => {
+                let mut fields = Vec::new();
+                if before.description != after.description {
+                    fields.push("description".into());
+                }
+                if before.superclasses.iter().collect::<BTreeSet<_>>()
+                    != after.superclasses.iter().collect::<BTreeSet<_>>()
+                {
+                    fields.push("superclasses".into());
+                }
+                let before_properties = before
+                    .properties
+                    .iter()
+                    .map(|property| (property.name.clone(), property))
+                    .collect::<BTreeMap<_, _>>();
+                let after_properties = after
+                    .properties
+                    .iter()
+                    .map(|property| (property.name.clone(), property))
+                    .collect::<BTreeMap<_, _>>();
+                for property_name in before_properties
+                    .keys()
+                    .chain(after_properties.keys())
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                {
+                    if before_properties.get(&property_name) != after_properties.get(&property_name)
+                    {
+                        fields.push(format!("property:{property_name}"));
+                    }
+                }
+                if !fields.is_empty() {
+                    summary.changed.push(ChangedDefinition { name, fields });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    summary
+}
+
+fn diff_relations(before: &ExportDocument, after: &ExportDocument) -> DiffSummary {
+    let before = before
+        .relations
+        .iter()
+        .map(|relation| (relation.name.clone(), relation))
+        .collect::<BTreeMap<_, _>>();
+    let after = after
+        .relations
+        .iter()
+        .map(|relation| (relation.name.clone(), relation))
+        .collect::<BTreeMap<_, _>>();
+    let names = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut summary = DiffSummary::default();
+    for name in names {
+        match (before.get(&name), after.get(&name)) {
+            (None, Some(_)) => summary.added.push(name),
+            (Some(_), None) => summary.removed.push(name),
+            (Some(before), Some(after)) => {
+                let mut fields = Vec::new();
+                if before.description != after.description {
+                    fields.push("description".into());
+                }
+                if before.domain != after.domain {
+                    fields.push("domain".into());
+                }
+                if before.range != after.range {
+                    fields.push("range".into());
+                }
+                if before.cardinality != after.cardinality {
+                    fields.push("cardinality".into());
+                }
+                if before.transitive != after.transitive {
+                    fields.push("transitive".into());
+                }
+                if !fields.is_empty() {
+                    summary.changed.push(ChangedDefinition { name, fields });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    summary
+}
+
+fn diff_provenance(before: &ExportDocument, after: &ExportDocument) -> DiffSummary {
+    let before = before
+        .provenance
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record.subject.clone(),
+                    record.source.clone(),
+                    record.locator.clone(),
+                ),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let after = after
+        .provenance
+        .iter()
+        .map(|record| {
+            (
+                (
+                    record.subject.clone(),
+                    record.source.clone(),
+                    record.locator.clone(),
+                ),
+                record,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let keys = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut summary = DiffSummary::default();
+    for key in keys {
+        let label = provenance_label(&key.0, &key.1, &key.2);
+        match (before.get(&key), after.get(&key)) {
+            (None, Some(_)) => summary.added.push(label),
+            (Some(_), None) => summary.removed.push(label),
+            (Some(before), Some(after)) => {
+                if before.confidence != after.confidence {
+                    summary.changed.push(ChangedDefinition {
+                        name: label,
+                        fields: vec!["confidence".into()],
+                    });
+                }
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+    summary
+}
+
+fn provenance_label(subject: &str, source: &str, locator: &str) -> String {
+    if locator.is_empty() {
+        format!("{subject} @ {source}")
+    } else {
+        format!("{subject} @ {source}#{locator}")
     }
 }
 
@@ -953,6 +1721,77 @@ mod tests {
             ontology.query("Missing", QueryOptions::default()),
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn search_matches_names_and_definition_fields_deterministically() {
+        let document = document();
+        let exact = search_document(&document, "Api").unwrap();
+        assert_eq!(exact.matches[0].kind, DefinitionKind::Class);
+        assert_eq!(exact.matches[0].name, "Api");
+        assert_eq!(exact.matches[0].score, 1000);
+        assert!(
+            exact.matches[0]
+                .matched_fields
+                .contains(&"name".to_string())
+        );
+
+        let field = search_document(&document, "language").unwrap();
+        assert_eq!(field.matches[0].name, "Api");
+        assert_eq!(field.matches[0].matched_fields, ["properties"]);
+    }
+
+    #[test]
+    fn semantic_diff_reports_changes_but_ignores_order_only_changes() {
+        let mut before = document();
+        before.classes[2].superclasses = vec!["Service".into(), "Component".into()];
+        let mut after = before.clone();
+        after.classes[2].superclasses.reverse();
+        assert!(!diff_documents(&before, &after).changed);
+
+        after.classes[2].description = "A changed interface".into();
+        after.relations[0].transitive = true;
+        after.provenance[0].confidence = 0.5;
+        let diff = diff_documents(&before, &after);
+        assert!(diff.changed);
+        assert_eq!(diff.classes.changed[0].name, "Api");
+        assert_eq!(diff.classes.changed[0].fields, ["description"]);
+        assert_eq!(diff.relations.changed[0].fields, ["transitive"]);
+        assert_eq!(diff.provenance.changed[0].fields, ["confidence"]);
+    }
+
+    #[test]
+    fn ask_interpreter_only_emits_bounded_typed_plans() {
+        let document = document();
+
+        let outbound = interpret_question(&document, "What does Api depend on?").unwrap();
+        assert_eq!(outbound.status, AskStatus::Ready);
+        let plan = outbound.plan.unwrap();
+        assert_eq!(plan.operation, AskOperation::Query);
+        assert_eq!(plan.name, "Api");
+        assert_eq!(
+            plan.options,
+            Some(QueryOptions {
+                direction: TraversalDirection::Outbound,
+                relation: Some("depends_on".into()),
+                depth: 1,
+            })
+        );
+
+        let inbound = interpret_question(&document, "What depends on Database?").unwrap();
+        assert_eq!(inbound.status, AskStatus::Ready);
+        assert_eq!(
+            inbound.plan.unwrap().options.unwrap().direction,
+            TraversalDirection::Inbound
+        );
+
+        let explanation = interpret_question(&document, "What is Api?").unwrap();
+        assert_eq!(explanation.status, AskStatus::Ready);
+        assert_eq!(explanation.plan.unwrap().operation, AskOperation::Explain);
+
+        let unsupported = interpret_question(&document, "Summarize the whole system").unwrap();
+        assert_eq!(unsupported.status, AskStatus::Unsupported);
+        assert!(unsupported.plan.is_none());
     }
 
     #[test]
