@@ -1,4 +1,5 @@
 use crate::chisei::{eval, evolve};
+use crate::db::chisei_eval_backend::{decode_eval_gate_cases, decode_eval_gate_run};
 use crate::db::postgres::PostgresDb;
 
 const ITERATION_COLUMNS: &str = "id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created";
@@ -46,6 +47,28 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?
             .map(row_to_eval_suite)
+            .transpose()
+    }
+
+    pub fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = $1",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let cases_json: String = row.get(3);
+                Ok(eval::Suite {
+                    id,
+                    name: row.get(1),
+                    description: row.get(2),
+                    cases: decode_eval_gate_cases(&cases_json)?,
+                })
+            })
+            .next()
             .transpose()
     }
 
@@ -107,6 +130,36 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?
             .map(row_to_eval_run)
+            .transpose()
+    }
+
+    pub fn get_latest_eval_run_record_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<eval::Run>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT id, suite_id, config_ref, results_json, timestamp
+                 FROM chisei_eval_runs
+                 WHERE suite_id = $1 AND config_ref = $2
+                   AND timestamp > 0 AND timestamp <= $3
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                &[&suite_id, &config_ref, &max_timestamp_ms],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let suite_id: String = row.get(1);
+                let config_ref: String = row.get(2);
+                let results_json: String = row.get(3);
+                let timestamp: i64 = row.get(4);
+                decode_eval_gate_run(id, suite_id, config_ref, &results_json, timestamp)
+            })
+            .next()
             .transpose()
     }
 

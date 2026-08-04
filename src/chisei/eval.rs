@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::db::chisei_eval_backend::{EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
@@ -267,6 +268,65 @@ impl EvalStore {
             .filter(|r| r.suite_id == suite_id)
             .cloned()
             .collect()
+    }
+
+    /// Read one suite without converting storage failures or malformed payloads
+    /// into an empty result. Gate projections must distinguish an absent suite
+    /// from an unavailable evaluation plane.
+    pub fn read_suite_for_gate(&self, suite_id: &str) -> Result<Option<Suite>, String> {
+        if let Some(db) = &self.db {
+            return db.get_eval_suite_record_for_gate(suite_id);
+        }
+        let suite = self.suites.lock().unwrap().get(suite_id).cloned();
+        if suite
+            .as_ref()
+            .is_some_and(|suite| suite.cases.len() > EVAL_GATE_MAX_CASES)
+        {
+            return Err(format!(
+                "eval suite contains more than {EVAL_GATE_MAX_CASES} gate cases"
+            ));
+        }
+        Ok(suite)
+    }
+
+    /// Read only the latest matching run for a gate binding. The shared
+    /// backends perform this selection in SQL and decode the bounded payload
+    /// strictly; the in-memory store mirrors those limits.
+    pub fn read_latest_run_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<Run>, String> {
+        if let Some(db) = &self.db {
+            return db.get_latest_eval_run_record_for_gate(suite_id, config_ref, max_timestamp_ms);
+        }
+        let run = self
+            .runs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|run| {
+                run.suite_id == suite_id
+                    && run.config_ref == config_ref
+                    && run.timestamp > 0
+                    && run.timestamp <= max_timestamp_ms
+            })
+            .max_by(|left, right| {
+                left.timestamp
+                    .cmp(&right.timestamp)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .cloned();
+        if run
+            .as_ref()
+            .is_some_and(|run| run.results.len() > EVAL_GATE_MAX_RESULTS)
+        {
+            return Err(format!(
+                "eval run contains more than {EVAL_GATE_MAX_RESULTS} gate results"
+            ));
+        }
+        Ok(run)
     }
 
     pub fn create_iteration(&self, iteration: Iteration) {

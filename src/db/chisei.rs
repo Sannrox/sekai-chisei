@@ -7,6 +7,9 @@ use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind},
 };
+use crate::db::chisei_eval_backend::{
+    EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
+};
 use crate::db::chisei_receipt::validate_evaluation_receipt_event_order;
 
 fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, bool)>, String> {
@@ -1142,6 +1145,33 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
+    pub fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+        let conn = self.conn();
+        let row: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(id, name, description, cases_json)| {
+            let cases = decode_eval_gate_cases(&cases_json)?;
+            if cases.len() > EVAL_GATE_MAX_CASES {
+                return Err(format!(
+                    "eval suite contains more than {EVAL_GATE_MAX_CASES} gate cases"
+                ));
+            }
+            Ok(eval::Suite {
+                id,
+                name,
+                description,
+                cases,
+            })
+        })
+        .transpose()
+    }
+
     pub fn list_eval_suite_records(&self) -> Result<Vec<eval::Suite>, String> {
         let conn = self.conn();
         let mut stmt = conn
@@ -1213,6 +1243,46 @@ impl SekaiDb {
         )
         .optional()
         .map_err(|e| e.to_string())
+    }
+
+    pub fn get_latest_eval_run_record_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<eval::Run>, String> {
+        let conn = self.conn();
+        let row: Option<(String, String, String, String, i64)> = conn
+            .query_row(
+                "SELECT id, suite_id, config_ref, results_json, timestamp
+                 FROM chisei_eval_runs
+                 WHERE suite_id = ?1 AND config_ref = ?2
+                   AND timestamp > 0 AND timestamp <= ?3
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                params![suite_id, config_ref, max_timestamp_ms],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(id, suite_id, config_ref, results_json, timestamp)| {
+            let run = decode_eval_gate_run(id, suite_id, config_ref, &results_json, timestamp)?;
+            if run.results.len() > EVAL_GATE_MAX_RESULTS {
+                return Err(format!(
+                    "eval run contains more than {EVAL_GATE_MAX_RESULTS} gate results"
+                ));
+            }
+            Ok(run)
+        })
+        .transpose()
     }
 
     pub fn list_eval_run_records(&self, suite_id: &str) -> Result<Vec<eval::Run>, String> {
@@ -2109,6 +2179,65 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn gate_reads_fail_closed_on_malformed_suite_or_run_payloads() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let suite = eval::Suite {
+            id: "gate-suite".into(),
+            name: "gate".into(),
+            description: String::new(),
+            cases: vec![eval::Case {
+                id: "case".into(),
+                name: "case".into(),
+                namespace: "namespace".into(),
+                spec: "spec".into(),
+                assertions: vec![],
+            }],
+        };
+        db.put_eval_suite(&suite).unwrap();
+        db.put_eval_run(&eval::Run {
+            id: "run".into(),
+            suite_id: suite.id.clone(),
+            config_ref: "config".into(),
+            results: vec![eval::CaseResult {
+                case_id: "case".into(),
+                passed: true,
+                status: "passed".into(),
+                result: String::new(),
+                score: 1,
+                reason: String::new(),
+                elapsed: 1,
+            }],
+            timestamp: 100,
+        })
+        .unwrap();
+
+        db.conn()
+            .execute(
+                "UPDATE chisei_eval_suites SET cases_json = '{malformed' WHERE id = 'gate-suite'",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_eval_suite_record_for_gate("gate-suite").is_err());
+
+        db.conn()
+            .execute(
+                "UPDATE chisei_eval_suites SET cases_json = '[]' WHERE id = 'gate-suite'",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE chisei_eval_runs SET results_json = '{malformed' WHERE id = 'run'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.get_latest_eval_run_record_for_gate("gate-suite", "config", 200)
+                .is_err()
+        );
     }
 }
 
