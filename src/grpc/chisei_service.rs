@@ -10308,29 +10308,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 .ok_or(Status::not_found("execution plan not found"))?;
         }
         let namespace_hint = input.namespace.trim().to_string();
-        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
-        let effective_policy = self.policy.effective_policy(&input.namespace);
-        let data_class = self.data_class(effective_policy.as_ref());
-        if let Err(error) = self.policy.enforce_residency(
-            &input.namespace,
-            &provider,
-            &plan.resolved_model,
-            data_class.as_str(),
-        ) {
-            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
-                .map_err(Status::internal)?;
-            return Err(Status::permission_denied(error));
-        }
-        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
-        if crate::chisei::egress::is_external_provider(&provider)
-            && plan.egress_decisions.is_empty()
-        {
-            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "external execution plan missing egress decisions",
-            ));
-        }
+        let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
+
         if let Some(signal) = self
             .eval
             .namespace_regression_signal(&namespace_hint)
@@ -10345,42 +10324,29 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::internal)?;
             return Err(Status::failed_precondition(signal.reason));
         }
-        let normalized_user_id = if input.user_id.is_empty() {
-            "default".to_string()
-        } else {
-            input.user_id.clone()
-        };
-        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
-        self.record_egress_audit(
-            "execute_context",
-            &input.request_id,
-            &provider,
-            &plan.resolved_model,
-            &plan.egress_decisions,
-        );
-        let llm_req = ProviderExecutionRequest {
-            model: plan.resolved_model.clone(),
-            system: plan.prepared_system.clone(),
-            messages: plan.prepared_messages.clone(),
-            tools: plan.tools.clone(),
-            max_tokens: plan.max_tokens,
-            user_id: Some(normalized_user_id),
-        };
-        let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
-        self.invalidate_ineligible_execution_memory_holdouts(
-            &plan.plan_id,
-            &actor,
-            &plan.memory_holdouts,
-        )?;
-        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
 
-        // Lookup-first short-circuit for stream execute (#281 S1).
+        // Lookup-first short-circuit for stream execute (#281 S2). This is
+        // deliberately after namespace authorization and plan ownership
+        // checks and the live evaluation-regression gate, but before provider
+        // selection, residency, egress, or model payload preparation. A
+        // complete structured hit must not enter the provider-routing path at
+        // all.
         let lookup_refusal = match evaluate_execute_lookup_first(&self.db, &input, &actor) {
             ExecuteLookupFirst::Hit {
                 response,
                 capability,
                 provenance,
             } => {
+                self.invalidate_ineligible_execution_memory_holdouts(
+                    &plan.plan_id,
+                    &actor,
+                    &plan.memory_holdouts,
+                )?;
+                self.record_execution_memory_injections(
+                    &plan.plan_id,
+                    &actor,
+                    &plan.memory_references,
+                )?;
                 if let Err(error) = self.record_evolve_task(
                     &input.request_id,
                     &namespace_hint,
@@ -10422,6 +10388,57 @@ impl ChiseiService for ChiseiServiceImpl {
             }
             ExecuteLookupFirst::ModelPath { lookup_refusal } => lookup_refusal,
         };
+
+        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
+        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let data_class = self.data_class(effective_policy.as_ref());
+        if let Err(error) = self.policy.enforce_residency(
+            &input.namespace,
+            &provider,
+            &plan.resolved_model,
+            data_class.as_str(),
+        ) {
+            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
+                .map_err(Status::internal)?;
+            return Err(Status::permission_denied(error));
+        }
+        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
+        if crate::chisei::egress::is_external_provider(&provider)
+            && plan.egress_decisions.is_empty()
+        {
+            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
+                .map_err(Status::internal)?;
+            return Err(Status::failed_precondition(
+                "external execution plan missing egress decisions",
+            ));
+        }
+        let normalized_user_id = if input.user_id.is_empty() {
+            "default".to_string()
+        } else {
+            input.user_id.clone()
+        };
+        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
+        self.record_egress_audit(
+            "execute_context",
+            &input.request_id,
+            &provider,
+            &plan.resolved_model,
+            &plan.egress_decisions,
+        );
+        let llm_req = ProviderExecutionRequest {
+            model: plan.resolved_model.clone(),
+            system: plan.prepared_system.clone(),
+            messages: plan.prepared_messages.clone(),
+            tools: plan.tools.clone(),
+            max_tokens: plan.max_tokens,
+            user_id: Some(normalized_user_id),
+        };
+        self.invalidate_ineligible_execution_memory_holdouts(
+            &plan.plan_id,
+            &actor,
+            &plan.memory_holdouts,
+        )?;
+        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
 
         let cacheable_message_count =
             native_cacheable_message_count(&input, &plan.prepared_messages);
@@ -20528,7 +20545,9 @@ mod tests {
         svc.record_planned_operation(&plan, "local").unwrap();
         svc.cache_plan(plan.clone());
 
-        let mut request = Request::new(ExecutePlanRequest { plan: Some(plan) });
+        let mut request = Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        });
         request
             .metadata_mut()
             .insert("x-principal", "local".parse().unwrap());
@@ -20581,6 +20600,51 @@ mod tests {
                 .any(|event| event.kind == ReceiptEventKind::ModelCalled),
             "lookup hit must not record a model call"
         );
+
+        create_suite(&svc, "acme");
+        seed_eval_run(
+            &svc,
+            eval_run("lookup-regression-baseline", "suite-1", 95, 100),
+            "acme",
+            "lookup-regression-baseline",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("lookup-regression-candidate", "suite-1", 50, 200),
+            "acme",
+            "lookup-regression-candidate",
+        );
+        assert!(
+            svc.eval
+                .namespace_regression_signal("acme")
+                .expect("regression signal")
+                .regressed
+        );
+
+        let mut regressed_plan = plan.clone();
+        regressed_plan.plan_id = "lookup-regressed-plan".into();
+        regressed_plan
+            .input
+            .as_mut()
+            .expect("plan input")
+            .request_id = "lookup-regressed-req".into();
+        svc.record_planned_operation(&regressed_plan, "local")
+            .unwrap();
+        svc.cache_plan(regressed_plan.clone());
+
+        let mut regressed_request = Request::new(ExecutePlanRequest {
+            plan: Some(regressed_plan),
+        });
+        regressed_request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let error = svc.execute_plan(regressed_request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("latest eval iteration regressed for namespace acme")
+        );
     }
 
     #[tokio::test]
@@ -20618,6 +20682,47 @@ mod tests {
                 lookup_refusal: Some(reason),
             } => assert_eq!(reason, "cross_namespace"),
             other => panic!("expected cross_namespace model path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
+        use crate::chisei::lookup_first;
+        use crate::sekai::semantic;
+
+        let db = RuntimeDb::memory();
+        lookup_first::seed_s1_fixture_graph(&db).expect("seed lookup fixtures");
+        for (capability, spec) in [
+            (
+                semantic::CAPABILITY_EXPAND_RELATIONS,
+                r#"{"root":{"object_id":"lookup-root"},"direction":"outgoing","max_depth":1}"#,
+            ),
+            (
+                semantic::CAPABILITY_RETRIEVE_CONTEXT,
+                r#"{"roots":[{"object_id":"lookup-root"}],"direction":"outgoing","max_depth":1}"#,
+            ),
+            (
+                semantic::CAPABILITY_EXPLAIN_DERIVATION,
+                r#"{"from":{"object_id":"lookup-root"},"to":{"object_id":"lookup-child"},"direction":"outgoing","max_depth":1}"#,
+            ),
+        ] {
+            let input = ExecutionInput {
+                namespace: "acme".into(),
+                spec: spec.into(),
+                task_type: capability.into(),
+                ..Default::default()
+            };
+            match evaluate_execute_lookup_first(&db, &input, "alice") {
+                ExecuteLookupFirst::Hit { response, .. } => {
+                    assert_eq!(response.provider, lookup_first::LOOKUP_PROVIDER);
+                    assert_eq!(response.input_tokens, 0);
+                    assert_eq!(response.output_tokens, 0);
+                    assert_eq!(response.cache_read_input_tokens, 0);
+                    assert_eq!(response.cache_creation_input_tokens, 0);
+                    assert!(!response.content.is_empty());
+                }
+                other => panic!("expected {capability} lookup hit, got {other:?}"),
+            }
         }
     }
 }
