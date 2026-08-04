@@ -279,9 +279,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "PutEvaluatorDefinition"
                 | "PutEvaluationPlan"
                 | "ResolveEvaluationPlan"
-                | "GetEvalSuite"
-                | "GetEvalRun"
-                | "ListEvalRuns"
+                | "GetEvaluationGateEvidence"
                 | "ExecuteEvaluationManifest"
                 | "CancelEvaluationExecution"
         ),

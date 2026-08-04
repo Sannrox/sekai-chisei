@@ -137,25 +137,13 @@
       "product_tier": "core"
     },
     {
-      "rpc": "GetEvalRun",
+      "rpc": "GetEvaluationGateEvidence",
       "kind": "query",
       "surfaces": [],
       "evidence": [
         "src/grpc/chisei_service.rs",
-        "src/chisei/eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetEvalSuite",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/grpc/chisei_service.rs",
-        "src/chisei/eval.rs"
+        "src/chisei/eval.rs",
+        "docs/evaluation-gate-evidence.md"
       ],
       "durable_dependencies": [
         "chisei.evaluation"
@@ -172,19 +160,6 @@
       ],
       "durable_dependencies": [
         "chisei.learning"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListEvalRuns",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/grpc/chisei_service.rs",
-        "src/chisei/eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
       ],
       "product_tier": "experimental"
     },

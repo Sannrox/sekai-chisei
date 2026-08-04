@@ -3805,10 +3805,33 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_latest_eval_run_record_for_gate(
+        &self,
+        suite_id: &str,
+        config_ref: &str,
+        max_timestamp_ms: i64,
+    ) -> Result<Option<eval::Run>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.get_latest_eval_run_record_for_gate(suite_id, config_ref, max_timestamp_ms)
+            }
+            Self::Postgres(db) => {
+                db.get_latest_eval_run_record_for_gate(suite_id, config_ref, max_timestamp_ms)
+            }
+        }
+    }
+
     pub fn get_eval_suite_record(&self, id: &str) -> Result<Option<eval::Suite>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_suite_record(id),
             Self::Postgres(db) => db.get_eval_suite_record(id),
+        }
+    }
+
+    pub fn get_eval_suite_record_for_gate(&self, id: &str) -> Result<Option<eval::Suite>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_eval_suite_record_for_gate(id),
+            Self::Postgres(db) => db.get_eval_suite_record_for_gate(id),
         }
     }
 

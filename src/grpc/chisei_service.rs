@@ -10,6 +10,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use prost::Message as _;
 use sha2::Digest;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
@@ -103,6 +104,90 @@ const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
 const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
 const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
 const CHISEI_EXECUTE_SCOPE: &str = "chisei.execute";
+const EVALUATION_GATE_STATUS_FOUND: &str = "found";
+const EVALUATION_GATE_STATUS_SUITE_NOT_FOUND: &str = "suite_not_found";
+const EVALUATION_GATE_STATUS_NO_MATCHING_RUN: &str = "no_matching_run";
+const MAX_EVALUATION_GATE_CASES: usize = 4096;
+const MAX_EVALUATION_GATE_RESULTS: usize = 4096;
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct EvaluationGateSuiteSnapshot {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    description: String,
+    #[prost(message, repeated, tag = "4")]
+    cases: Vec<EvaluationGateCaseSnapshot>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct EvaluationGateCaseSnapshot {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    namespace: String,
+    #[prost(string, tag = "4")]
+    spec: String,
+    #[prost(message, repeated, tag = "5")]
+    assertions: Vec<EvaluationGateAssertionSnapshot>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct EvaluationGateAssertionSnapshot {
+    #[prost(string, tag = "1")]
+    assert_type: String,
+    #[prost(string, tag = "2")]
+    value: String,
+}
+
+fn evaluation_gate_suite_digest(suite: &crate::chisei::eval::Suite) -> String {
+    let snapshot = EvaluationGateSuiteSnapshot {
+        id: suite.id.clone(),
+        name: suite.name.clone(),
+        description: suite.description.clone(),
+        cases: suite
+            .cases
+            .iter()
+            .map(|case| EvaluationGateCaseSnapshot {
+                id: case.id.clone(),
+                name: case.name.clone(),
+                namespace: case.namespace.clone(),
+                spec: case.spec.clone(),
+                assertions: case
+                    .assertions
+                    .iter()
+                    .map(|assertion| EvaluationGateAssertionSnapshot {
+                        assert_type: assertion.assert_type.clone(),
+                        value: assertion.value.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    format!("{:x}", sha2::Sha256::digest(snapshot.encode_to_vec()))
+}
+
+fn evaluation_gate_config_ref(
+    release_digest: &str,
+    artifact_digest: &str,
+    suite_digest: &str,
+) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for value in [
+        b"tenkai-gate-v1".as_slice(),
+        release_digest.as_bytes(),
+        artifact_digest.as_bytes(),
+        suite_digest.as_bytes(),
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    format!("tenkai:{:x}", hasher.finalize())
+}
 
 fn record_reported_memory_outcomes(
     db: &RuntimeDb,
@@ -11901,91 +11986,120 @@ impl ChiseiService for ChiseiServiceImpl {
         Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
     }
 
-    async fn get_eval_suite(
+    async fn get_evaluation_gate_evidence(
         &self,
-        req: Request<GetEvalSuiteRequest>,
-    ) -> Result<Response<GetEvalSuiteResponse>, Status> {
+        req: Request<GetEvaluationGateEvidenceRequest>,
+    ) -> Result<Response<GetEvaluationGateEvidenceResponse>, Status> {
         require_eval_reader(&req, &self.config)?;
-        let suite = self
-            .eval
-            .get_suite(&req.into_inner().id)
-            .ok_or(Status::not_found("eval suite not found"))?;
-        Ok(Response::new(GetEvalSuiteResponse {
-            suite: Some(EvalSuite {
-                id: suite.id,
-                name: suite.name,
-                description: suite.description,
-                cases: suite
-                    .cases
-                    .into_iter()
-                    .map(|case| EvalCase {
-                        id: case.id,
-                        name: case.name,
-                        namespace: case.namespace,
-                        spec: case.spec,
-                        assertions: case
-                            .assertions
-                            .into_iter()
-                            .map(|assertion| EvalAssertion {
-                                r#type: assertion.assert_type,
-                                value: assertion.value,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
-        }))
-    }
+        let request = req.into_inner();
+        let suite_id = request.suite_id.trim();
+        let release_digest = request.release_digest.trim();
+        let artifact_digest = request.artifact_digest.trim();
+        if suite_id.is_empty() {
+            return Err(Status::invalid_argument("suite_id is required"));
+        }
+        if release_digest.is_empty() {
+            return Err(Status::invalid_argument("release_digest is required"));
+        }
+        if artifact_digest.is_empty() {
+            return Err(Status::invalid_argument("artifact_digest is required"));
+        }
+        if request.max_timestamp_ms <= 0 {
+            return Err(Status::invalid_argument(
+                "max_timestamp_ms must be positive",
+            ));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if request.max_timestamp_ms > now_ms.saturating_add(60_000) {
+            return Err(Status::invalid_argument(
+                "max_timestamp_ms is too far in the future",
+            ));
+        }
 
-    async fn get_eval_run(
-        &self,
-        req: Request<GetEvalRunRequest>,
-    ) -> Result<Response<GetEvalRunResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
+        let suite = self.eval.read_suite_for_gate(suite_id).map_err(|error| {
+            Status::unavailable(format!("evaluation gate evidence unavailable: {error}"))
+        })?;
+        let Some(suite) = suite else {
+            return Ok(Response::new(GetEvaluationGateEvidenceResponse {
+                status: EVALUATION_GATE_STATUS_SUITE_NOT_FOUND.into(),
+                evidence: None,
+            }));
+        };
+        if suite.cases.len() > MAX_EVALUATION_GATE_CASES {
+            return Err(Status::resource_exhausted(
+                "evaluation suite exceeds the gate evidence case limit",
+            ));
+        }
+        let expected_case_ids = suite
+            .cases
+            .iter()
+            .map(|case| case.id.clone())
+            .collect::<Vec<_>>();
+        let mut seen_case_ids = BTreeSet::new();
+        if expected_case_ids
+            .iter()
+            .any(|case_id| case_id.trim().is_empty() || !seen_case_ids.insert(case_id.clone()))
+        {
+            return Err(Status::failed_precondition(
+                "evaluation suite has empty or duplicate case ids",
+            ));
+        }
+
+        let suite_digest = evaluation_gate_suite_digest(&suite);
+        let expected_config_ref =
+            evaluation_gate_config_ref(release_digest, artifact_digest, &suite_digest);
         let run = self
             .eval
-            .get_run(&req.into_inner().id)
-            .ok_or(Status::not_found("eval run not found"))?;
-        Ok(Response::new(GetEvalRunResponse {
-            run: Some(EvalRun {
-                id: run.id,
-                suite_id: run.suite_id,
-                config_ref: run.config_ref,
+            .read_latest_run_for_gate(suite_id, &expected_config_ref, request.max_timestamp_ms)
+            .map_err(|error| {
+                Status::unavailable(format!("evaluation gate evidence unavailable: {error}"))
+            })?;
+        let Some(run) = run else {
+            return Ok(Response::new(GetEvaluationGateEvidenceResponse {
+                status: EVALUATION_GATE_STATUS_NO_MATCHING_RUN.into(),
+                evidence: None,
+            }));
+        };
+        if run.results.len() > MAX_EVALUATION_GATE_RESULTS {
+            return Err(Status::resource_exhausted(
+                "evaluation run exceeds the gate evidence result limit",
+            ));
+        }
+        let actual_case_ids = run
+            .results
+            .iter()
+            .map(|result| result.case_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_case_ids_set = expected_case_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if actual_case_ids.len() != run.results.len() || actual_case_ids != expected_case_ids_set {
+            return Err(Status::failed_precondition(
+                "selected evaluation run does not contain exactly one result for every suite case",
+            ));
+        }
+
+        Ok(Response::new(GetEvaluationGateEvidenceResponse {
+            status: EVALUATION_GATE_STATUS_FOUND.into(),
+            evidence: Some(EvaluationGateEvidence {
+                suite_id: suite.id,
+                release_digest: release_digest.into(),
+                artifact_digest: artifact_digest.into(),
+                suite_digest,
+                config_ref: expected_config_ref,
+                run_id: run.id,
+                run_timestamp: run.timestamp,
+                expected_case_ids,
                 results: run
                     .results
                     .into_iter()
-                    .map(|result| CaseResult {
+                    .map(|result| EvaluationGateCaseResult {
                         case_id: result.case_id,
                         passed: result.passed,
-                        status: result.status,
-                        result: result.result,
-                        score: result.score,
-                        reason: result.reason,
-                        elapsed: result.elapsed,
                     })
                     .collect(),
-                timestamp: run.timestamp,
             }),
-        }))
-    }
-
-    async fn list_eval_runs(
-        &self,
-        req: Request<ListEvalRunsRequest>,
-    ) -> Result<Response<ListEvalRunsResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let runs = self.eval.list_runs(&req.into_inner().suite_id);
-        Ok(Response::new(ListEvalRunsResponse {
-            runs: runs
-                .into_iter()
-                .map(|run| EvalRun {
-                    id: run.id,
-                    suite_id: run.suite_id,
-                    config_ref: run.config_ref,
-                    results: Vec::new(),
-                    timestamp: run.timestamp,
-                })
-                .collect(),
         }))
     }
 
@@ -16684,7 +16798,7 @@ mod tests {
 
     fn seed_eval_run(
         svc: &ChiseiServiceImpl,
-        run: EvalRun,
+        run: crate::chisei::eval::Run,
         changed_file: impl AsRef<str>,
         diff_hash: impl AsRef<str>,
     ) {
@@ -16720,12 +16834,12 @@ mod tests {
         }
     }
 
-    fn eval_run(id: &str, suite_id: &str, score: i32, timestamp: i64) -> EvalRun {
-        EvalRun {
+    fn eval_run(id: &str, suite_id: &str, score: i32, timestamp: i64) -> crate::chisei::eval::Run {
+        crate::chisei::eval::Run {
             id: id.into(),
             suite_id: suite_id.into(),
             config_ref: "native-default".into(),
-            results: vec![CaseResult {
+            results: vec![crate::chisei::eval::CaseResult {
                 case_id: "case-1".into(),
                 passed: score >= 80,
                 status: if score >= 80 { "done" } else { "failed" }.into(),
@@ -16746,13 +16860,13 @@ mod tests {
         with_evidence: bool,
         score: i32,
         timestamp: i64,
-    ) -> EvalRun {
-        EvalRun {
+    ) -> crate::chisei::eval::Run {
+        crate::chisei::eval::Run {
             id: id.into(),
             suite_id: suite_id.into(),
             config_ref: evidence_context_config_ref(source_type, evidence_type, with_evidence),
             results: (1..=MIN_EVIDENCE_CONTEXT_EVAL_CASES)
-                .map(|case| CaseResult {
+                .map(|case| crate::chisei::eval::CaseResult {
                     case_id: format!("evidence-case-{case}"),
                     passed: score >= 80,
                     status: if score >= 80 { "done" } else { "failed" }.into(),
@@ -18131,11 +18245,14 @@ mod tests {
                 }],
             })
             .unwrap();
+        let suite = svc.eval.get_suite("suite-read").unwrap();
+        let suite_digest = evaluation_gate_suite_digest(&suite);
+        let config_ref = evaluation_gate_config_ref("release", "artifact", &suite_digest);
         svc.eval
             .put_run(crate::chisei::eval::Run {
                 id: "run-read".into(),
                 suite_id: "suite-read".into(),
-                config_ref: "config".into(),
+                config_ref,
                 results: vec![crate::chisei::eval::CaseResult {
                     case_id: "case-1".into(),
                     passed: true,
@@ -18149,39 +18266,270 @@ mod tests {
             })
             .unwrap();
 
-        let mut suite_request = Request::new(GetEvalSuiteRequest {
-            id: "suite-read".into(),
-        });
-        suite_request
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        assert_eq!(
-            svc.get_eval_suite(suite_request)
-                .await
-                .unwrap()
-                .into_inner()
-                .suite
-                .unwrap()
-                .cases
-                .len(),
-            1
-        );
-
-        let mut runs_request = Request::new(ListEvalRunsRequest {
+        let mut gate_request = Request::new(GetEvaluationGateEvidenceRequest {
             suite_id: "suite-read".into(),
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: 101,
         });
-        runs_request
+        gate_request
             .metadata_mut()
             .insert("x-principal", "local".parse().unwrap());
+        let evidence = svc
+            .get_evaluation_gate_evidence(gate_request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(evidence.status, EVALUATION_GATE_STATUS_FOUND);
+        let evidence = evidence.evidence.unwrap();
+        assert_eq!(evidence.suite_id, "suite-read");
+        assert_eq!(evidence.run_id, "run-read");
+        assert_eq!(evidence.expected_case_ids, vec!["case-1"]);
+        assert_eq!(evidence.results.len(), 1);
+        assert!(evidence.results[0].passed);
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_selects_latest_bound_run_and_redacts_details() {
+        let svc = memory_service();
+        let suite = crate::chisei::eval::Suite {
+            id: "gate-suite".into(),
+            name: "release gate".into(),
+            description: "private suite description".into(),
+            cases: vec![
+                crate::chisei::eval::Case {
+                    id: "case-a".into(),
+                    name: "private case".into(),
+                    namespace: "private".into(),
+                    spec: "private spec".into(),
+                    assertions: vec![crate::chisei::eval::Assertion {
+                        assert_type: "contains".into(),
+                        value: "private assertion".into(),
+                    }],
+                },
+                crate::chisei::eval::Case {
+                    id: "case-b".into(),
+                    name: "case b".into(),
+                    namespace: "private".into(),
+                    spec: "private spec b".into(),
+                    assertions: vec![],
+                },
+            ],
+        };
+        svc.eval.put_suite(suite.clone()).unwrap();
+        let suite_digest = evaluation_gate_suite_digest(&suite);
+        let config_ref = evaluation_gate_config_ref("release", "artifact", &suite_digest);
+        for run in [
+            crate::chisei::eval::Run {
+                id: "current-old".into(),
+                suite_id: suite.id.clone(),
+                config_ref: config_ref.clone(),
+                results: vec![crate::chisei::eval::CaseResult {
+                    case_id: "case-a".into(),
+                    passed: true,
+                    status: "passed".into(),
+                    result: "old raw result".into(),
+                    score: 99,
+                    reason: "old private reason".into(),
+                    elapsed: 10,
+                }],
+                timestamp: 100,
+            },
+            crate::chisei::eval::Run {
+                id: "current-new".into(),
+                suite_id: suite.id.clone(),
+                config_ref: config_ref.clone(),
+                results: vec![
+                    crate::chisei::eval::CaseResult {
+                        case_id: "case-a".into(),
+                        passed: true,
+                        status: "passed".into(),
+                        result: "private raw result".into(),
+                        score: 100,
+                        reason: "private reason".into(),
+                        elapsed: 11,
+                    },
+                    crate::chisei::eval::CaseResult {
+                        case_id: "case-b".into(),
+                        passed: false,
+                        status: "failed".into(),
+                        result: "private failure".into(),
+                        score: 12,
+                        reason: "private failure reason".into(),
+                        elapsed: 12,
+                    },
+                ],
+                timestamp: 200,
+            },
+            crate::chisei::eval::Run {
+                id: "wrong-config".into(),
+                suite_id: suite.id.clone(),
+                config_ref: "tenkai:wrong".into(),
+                results: vec![],
+                timestamp: 300,
+            },
+        ] {
+            svc.eval.put_run(run).unwrap();
+        }
+
+        let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+            suite_id: suite.id.clone(),
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: 250,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let response = svc
+            .get_evaluation_gate_evidence(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.status, EVALUATION_GATE_STATUS_FOUND);
+        let evidence = response.evidence.unwrap();
+        assert_eq!(evidence.run_id, "current-new");
+        assert_eq!(evidence.run_timestamp, 200);
+        assert_eq!(evidence.expected_case_ids, vec!["case-a", "case-b"]);
         assert_eq!(
-            svc.list_eval_runs(runs_request)
+            evidence
+                .results
+                .iter()
+                .map(|result| (result.case_id.as_str(), result.passed))
+                .collect::<Vec<_>>(),
+            vec![("case-a", true), ("case-b", false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_distinguishes_missing_and_stale_or_mismatched() {
+        let svc = memory_service();
+        let suite = crate::chisei::eval::Suite {
+            id: "gate-status-suite".into(),
+            name: "gate".into(),
+            description: String::new(),
+            cases: vec![crate::chisei::eval::Case {
+                id: "case".into(),
+                name: "case".into(),
+                namespace: "namespace".into(),
+                spec: "spec".into(),
+                assertions: vec![],
+            }],
+        };
+        svc.eval.put_suite(suite.clone()).unwrap();
+        svc.eval
+            .put_run(crate::chisei::eval::Run {
+                id: "stale".into(),
+                suite_id: suite.id.clone(),
+                config_ref: "tenkai:not-current".into(),
+                results: vec![],
+                timestamp: 100,
+            })
+            .unwrap();
+
+        let request = |suite_id: &str, release_digest: &str| {
+            let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+                suite_id: suite_id.into(),
+                release_digest: release_digest.into(),
+                artifact_digest: "artifact".into(),
+                max_timestamp_ms: 200,
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "local".parse().unwrap());
+            request
+        };
+        assert_eq!(
+            svc.get_evaluation_gate_evidence(request("missing", "release"))
                 .await
                 .unwrap()
                 .into_inner()
-                .runs
-                .len(),
-            1
+                .status,
+            EVALUATION_GATE_STATUS_SUITE_NOT_FOUND
         );
+        assert_eq!(
+            svc.get_evaluation_gate_evidence(request(&suite.id, "release"))
+                .await
+                .unwrap()
+                .into_inner()
+                .status,
+            EVALUATION_GATE_STATUS_NO_MATCHING_RUN
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_rejects_malformed_selected_results() {
+        let svc = memory_service();
+        let suite = crate::chisei::eval::Suite {
+            id: "gate-integrity-suite".into(),
+            name: "gate".into(),
+            description: String::new(),
+            cases: vec![crate::chisei::eval::Case {
+                id: "expected".into(),
+                name: "expected".into(),
+                namespace: "namespace".into(),
+                spec: "spec".into(),
+                assertions: vec![],
+            }],
+        };
+        svc.eval.put_suite(suite.clone()).unwrap();
+        let suite_digest = evaluation_gate_suite_digest(&suite);
+        let config_ref = evaluation_gate_config_ref("release", "artifact", &suite_digest);
+        svc.eval
+            .put_run(crate::chisei::eval::Run {
+                id: "malformed".into(),
+                suite_id: suite.id.clone(),
+                config_ref,
+                results: vec![
+                    crate::chisei::eval::CaseResult {
+                        case_id: "expected".into(),
+                        passed: true,
+                        status: "passed".into(),
+                        result: String::new(),
+                        score: 1,
+                        reason: String::new(),
+                        elapsed: 1,
+                    },
+                    crate::chisei::eval::CaseResult {
+                        case_id: "unexpected".into(),
+                        passed: true,
+                        status: "passed".into(),
+                        result: String::new(),
+                        score: 1,
+                        reason: String::new(),
+                        elapsed: 1,
+                    },
+                ],
+                timestamp: 100,
+            })
+            .unwrap();
+        let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+            suite_id: suite.id,
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: 200,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let error = svc.get_evaluation_gate_evidence(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_rejects_unauthorized_readers() {
+        let svc = memory_service();
+        let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+            suite_id: "suite".into(),
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: 1,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "untrusted-agent".parse().unwrap());
+        let error = svc.get_evaluation_gate_evidence(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
