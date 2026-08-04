@@ -2,7 +2,7 @@
 name = "sekai-chisei"
 version = "1.0.0"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 readme = "README.md"
 description = "Local-first Rust control plane for governed agent operations."
 repository = "https://github.com/Sannrox/sekai-chisei"

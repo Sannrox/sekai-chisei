@@ -255,7 +255,4 @@ For usage questions, reproducible bugs, and feature proposals, follow
 
 ## License
 
-The workspace is licensed under the [GNU Affero General Public License,
-Version 3](LICENSE). The separately versioned `sekai-client` and
-`sekai-proto` crates are dual-licensed under Apache-2.0 or AGPL-3.0-only at
-the user's option.
+Licensed under the [Apache License, Version 2.0](LICENSE).

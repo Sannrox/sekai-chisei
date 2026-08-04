@@ -142,4 +142,4 @@ drops signatures. See `AGENTS.md` for the verified-push workflow.
 ## License
 
 By contributing, you agree that your contribution is licensed under the
-project's [AGPL-3.0-only license](LICENSE).
+project's [Apache-2.0 license](LICENSE).

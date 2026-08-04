@@ -59,7 +59,8 @@ In priority order:
 
 When sources disagree, resolve them in this order:
 
-1. `SECURITY.md`, the AGPL license, and responsible-disclosure obligations.
+1. `SECURITY.md`, the Apache 2.0 license, and responsible-disclosure
+   obligations.
 2. Accepted ADRs and the product boundaries in `VISION.md`.
 3. Public contracts in `proto/`, stable configuration documentation, and
    migration guarantees.

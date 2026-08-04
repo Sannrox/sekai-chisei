@@ -1,8 +1,6 @@
 # sekai-client
 
-This crate is dual-licensed under [Apache-2.0](../../LICENSE-APACHE) or the
-repository's [GNU Affero General Public License, Version 3](../../LICENSE),
-at the user's option.
+This crate is licensed under [Apache-2.0](../../LICENSE).
 
 `sekai-client` is the separately versioned Rust facade for the native Sekai
 and Chisei core loop. It is intentionally a leaf client crate: the canonical
