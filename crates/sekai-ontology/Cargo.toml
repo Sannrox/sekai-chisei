@@ -2,7 +2,7 @@
 name = "sekai-ontology"
 version = "1.0.0"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "Apache-2.0"
 description = "Portable SQLite ontology library and the sekai command-line tool."
 
 [lib]

@@ -2,7 +2,7 @@
 name = "sekai-proto"
 version = "1.0.1"
 edition = "2024"
-license = "Apache-2.0 OR AGPL-3.0-only"
+license = "Apache-2.0"
 description = "Generated gRPC contracts for Sekai Chisei."
 
 [dependencies]
