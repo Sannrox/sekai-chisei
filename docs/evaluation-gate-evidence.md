@@ -12,6 +12,9 @@ suite digest, and derives the expected `tenkai-gate-v1` configuration reference
 from the three digests using length-delimited SHA-256 inputs. It selects the
 matching run with the greatest timestamp and then run ID, provided its
 timestamp is positive and no later than the requested bound.
+Chisei accepts a requested bound no more than 120 seconds ahead of its server
+clock: Tenkai uses a 60-second local future window, and the remaining 60
+seconds is the explicit inter-host clock-skew allowance.
 
 The response is bounded to the suite ID, the bound digests, the suite digest,
 the selected run binding, the expected case IDs, and each result's case ID and
