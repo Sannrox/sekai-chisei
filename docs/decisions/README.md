@@ -36,3 +36,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0012: Bound stochastic evaluation by situation](0012-bound-stochastic-evaluation-by-situation.md)
 - [ADR 0013: Govern external evaluator adapters outside the Chisei process](0013-governed-external-evaluator-adapters.md)
 - [ADR 0015: Apply Gunshi allocation before native execution planning](0015-gunshi-allocation-precedes-native-planning.md)
+- [ADR 0016: Publish a dedicated versioned Rust core-loop client](0016-versioned-rust-core-loop-client.md)

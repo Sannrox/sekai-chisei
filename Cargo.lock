@@ -2520,6 +2520,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sekai-client"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "http",
+ "hyper-util",
+ "prost",
+ "sekai-proto",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "sekai-ontology"
 version = "1.0.0"
 dependencies = [

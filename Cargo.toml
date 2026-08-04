@@ -15,6 +15,7 @@ categories = ["development-tools", "web-programming"]
 members = [
     "crates/chisei-gateway",
     "crates/sekai-admin-client",
+    "crates/sekai-client",
     "crates/sekai-ontology",
     "crates/sekai-proto",
     "crates/sekai-provider",
