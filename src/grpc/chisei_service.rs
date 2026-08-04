@@ -107,6 +107,9 @@ const CHISEI_EXECUTE_SCOPE: &str = "chisei.execute";
 const EVALUATION_GATE_STATUS_FOUND: &str = "found";
 const EVALUATION_GATE_STATUS_SUITE_NOT_FOUND: &str = "suite_not_found";
 const EVALUATION_GATE_STATUS_NO_MATCHING_RUN: &str = "no_matching_run";
+// Tenkai sends its local 60-second gate window; the additional 60 seconds
+// allows bounded clock skew between the Tenkai and Chisei hosts.
+const EVALUATION_GATE_MAX_FUTURE_SKEW_MS: i64 = 120_000;
 const MAX_EVALUATION_GATE_CASES: usize = 4096;
 const MAX_EVALUATION_GATE_RESULTS: usize = 4096;
 
@@ -12010,7 +12013,7 @@ impl ChiseiService for ChiseiServiceImpl {
             ));
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if request.max_timestamp_ms > now_ms.saturating_add(60_000) {
+        if request.max_timestamp_ms > now_ms.saturating_add(EVALUATION_GATE_MAX_FUTURE_SKEW_MS) {
             return Err(Status::invalid_argument(
                 "max_timestamp_ms is too far in the future",
             ));
@@ -18530,6 +18533,46 @@ mod tests {
             .insert("x-principal", "untrusted-agent".parse().unwrap());
         let error = svc.get_evaluation_gate_evidence(request).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_rejects_timestamps_beyond_clock_skew_bound() {
+        let svc = memory_service();
+        let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+            suite_id: "suite".into(),
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(EVALUATION_GATE_MAX_FUTURE_SKEW_MS + 60_000),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let error = svc.get_evaluation_gate_evidence(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "max_timestamp_ms is too far in the future");
+    }
+
+    #[tokio::test]
+    async fn evaluation_gate_evidence_accepts_bound_within_clock_skew_window() {
+        let svc = memory_service();
+        let mut request = Request::new(GetEvaluationGateEvidenceRequest {
+            suite_id: "missing-suite".into(),
+            release_digest: "release".into(),
+            artifact_digest: "artifact".into(),
+            max_timestamp_ms: chrono::Utc::now().timestamp_millis().saturating_add(90_000),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+
+        let response = svc
+            .get_evaluation_gate_evidence(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.status, EVALUATION_GATE_STATUS_SUITE_NOT_FOUND);
     }
 
     #[tokio::test]
