@@ -149,3 +149,19 @@ The shared core-loop fixture is
 `tests/fixtures/sdk_core_loop/v1.json`. It checks metadata, capability scope,
 operation correlation, call ordering, streaming, receipt lookup, retries, and
 stable error mapping without requiring a live service or credentials.
+
+## Rust
+
+The native Rust facade is published as the separately versioned workspace crate
+[`sekai-client`](../crates/sekai-client/). It consumes the generated
+[`sekai-proto`](../crates/sekai-proto/) package, supports injected transports
+for offline hosts and tests, and provides tonic setup for HTTPS, loopback HTTP,
+and Unix sockets. See the crate README and
+[ADR 0016](../docs/decisions/0016-versioned-rust-core-loop-client.md) for the
+compatibility and migration policy.
+
+Run its credential-free core-loop fixture with:
+
+```bash
+cargo run -p sekai-client --example core_loop_fixture
+```
