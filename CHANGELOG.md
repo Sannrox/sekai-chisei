@@ -97,6 +97,13 @@
   and provider-registry initialization override.
 - Remove the cross-repository Homebrew tap publication job.
 
+### Compatibility
+
+- Restore the authenticated `CreateActionType` compatibility RPC for clients
+  that still execute the legacy graph mutation DSL. It preserves the existing
+  `ActionTypeDef` registry and does not map graph actions into governed action
+  types; new integrations should use `PutGovernedActionType`.
+
 ### Migration
 
 Version 1.0 is a clean break from pre-1.0 releases. There is no in-place public

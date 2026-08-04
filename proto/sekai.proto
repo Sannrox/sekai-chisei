@@ -698,6 +698,11 @@ message VerifyAttestationResponse {
   bool decision_linked = 6;    // linked audit decision binds this attestation back
   string error = 7;
 }
+// Compatibility authoring path for clients that still invoke the legacy graph
+// mutation DSL through ExecuteAction. This deliberately preserves the
+// ActionTypeDef registry and is not a governed ActionType admission operation.
+message CreateActionTypeRequest { ActionTypeDef action_type = 1; }
+message CreateActionTypeResponse { ActionTypeDef action_type = 1; }
 message ListActionTypesRequest {}
 message ListActionTypesResponse { repeated ActionTypeDef action_types = 1; }
 message DeleteActionTypeRequest { string name = 1; }
@@ -1413,6 +1418,9 @@ service SekaiService {
   rpc ListAttestations(ListAttestationsRequest) returns (ListAttestationsResponse);
   rpc VerifyAttestation(VerifyAttestationRequest) returns (VerifyAttestationResponse);
 
+  // Compatibility RPC for legacy graph ExecuteAction clients. Governed action
+  // types use PutGovernedActionType and remain a distinct registry.
+  rpc CreateActionType(CreateActionTypeRequest) returns (CreateActionTypeResponse);
   rpc ListActionTypes(ListActionTypesRequest) returns (ListActionTypesResponse);
   rpc DeleteActionType(DeleteActionTypeRequest) returns (DeleteActionTypeResponse);
   // Governed Action type registry (#396).

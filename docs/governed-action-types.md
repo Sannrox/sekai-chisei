@@ -44,6 +44,15 @@ team namespace membership, and action-admin on `governed_action:{namespace}`.
 - Domain webhook / GitHub type packs in core
 - Replacing graph `ExecuteAction`
 
+## Legacy graph-action compatibility
+
+Clients that still execute the legacy graph mutation DSL may use the
+authenticated, action-admin-gated `CreateActionType` compatibility RPC. It
+persists and activates an `ActionTypeDef` for `ExecuteAction` without mapping
+it into this governed registry. New integrations should use
+`PutGovernedActionType` and `SubmitActionInstance`; the two registries remain
+semantically distinct.
+
 ## Dual-backend
 
 SQLite and PostgreSQL both persist the registry (migration
