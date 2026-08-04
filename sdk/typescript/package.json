@@ -1,0 +1,39 @@
+{
+  "name": "@sannrox/sekai-chisei-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "types": "./dist/client.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./grpc": {
+      "types": "./dist/grpc.d.ts",
+      "import": "./dist/grpc.js"
+    },
+    "./capability": {
+      "types": "./dist/capability.d.ts",
+      "import": "./dist/capability.js"
+    }
+  },
+  "peerDependencies": {
+    "@grpc/grpc-js": ">=1.10 <2",
+    "@grpc/proto-loader": ">=0.7 <1"
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "^1.14.0",
+    "@grpc/proto-loader": "^0.8.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
