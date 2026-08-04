@@ -31,7 +31,7 @@ the adapter's evidence type, namespace, target kind, classification, and
 Common environment variables:
 
 - `SEKAI_TARGET` (defaults to `http://127.0.0.1:50051`)
-- `SEKAI_AUTH_TOKEN` when the control plane requires bearer authentication
+- `SEKAI_CREDENTIAL` when the control plane requires bearer authentication
 - `EVIDENCE_PRODUCER_IDENTITY`
 - `EVIDENCE_SOURCE_INSTANCE`
 - `EVIDENCE_NAMESPACE`
@@ -69,17 +69,11 @@ cargo run --example evidence_ontology_concept_catalog \
 Conformance fixtures live in `adapters/fixtures/` and run without network access
 through `cargo test --test evidence_adapters`.
 
-Authorized consumers can retrieve one retained admitted envelope by submission
-ID through `GetEvidenceSubmissionContent`. Access follows the live ACL copied to
-the projected `external_evidence` object from its target; discovering a
-submission does not grant access. The response includes the generic validated
-`content_json` and provenance rather than adapter-specific fields, and the
-server verifies the content digest before returning it. Available, superseded,
-stale, and retracted source records remain readable for historical provenance;
-rejected, quarantined, and incomplete admission states do not expose content.
-`ListEvidenceSubmissions` remains metadata-only and bounded. This additive RPC
-does not change existing client behavior, although clients using the new method
-must regenerate their protobuf bindings.
+Authorized consumers can inspect one admitted submission by ID through
+`GetEvidenceSubmission`. The response is bounded metadata and lifecycle
+history; payload content remains inside the governed evidence projection and is
+not exposed through a second public read endpoint. `ListEvidenceSubmissions`
+remains metadata-only and bounded.
 
 `batch_responses_harness.rs` is a headless batch-evaluation integration. It uses
 an independent Responses SSE decoder against the complete canonical harness

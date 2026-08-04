@@ -644,7 +644,6 @@ mod tests {
             openai_api_key: Some("openai".into()),
             ollama_url: "http://localhost:11434".into(),
             native_llm_url: Some("http://localhost:1234".into()),
-            auth_token: None,
             sample_rate: 0.05,
             sample_risk_threshold: 0.7,
             scoring_enabled: false,

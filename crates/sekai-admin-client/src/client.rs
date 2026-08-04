@@ -25,7 +25,7 @@ impl tonic::service::Interceptor for GatewayAuthInterceptor {
         };
         let header = format!("Bearer {token}");
         let header = tonic::metadata::MetadataValue::from_str(&header)
-            .map_err(|_| Status::internal("invalid SEKAI_AUTH_TOKEN metadata"))?;
+            .map_err(|_| Status::internal("invalid SEKAI_CREDENTIAL metadata"))?;
         request.metadata_mut().insert("authorization", header);
         Ok(request)
     }
@@ -42,7 +42,7 @@ pub async fn connect_sekai_with_timeout(
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let auth_token = if target.starts_with("http://") || target.starts_with("https://") {
-        std::env::var("SEKAI_AUTH_TOKEN")
+        std::env::var("SEKAI_CREDENTIAL")
             .ok()
             .filter(|value| !value.trim().is_empty())
     } else {
@@ -62,7 +62,7 @@ pub async fn connect_sekai_as_gateway_with_timeout(
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let environment_token = || {
-        std::env::var("SEKAI_AUTH_TOKEN")
+        std::env::var("SEKAI_CREDENTIAL")
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty())

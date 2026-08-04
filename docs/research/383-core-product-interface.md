@@ -27,31 +27,36 @@ defining the product by default?
 
 | Service | RPCs |
 | --- | ---: |
-| `SekaiService` (`proto/sekai.proto`) | 137 |
-| `ChiseiService` (`proto/chisei.proto`) | 73 |
-| `LlmService` (`proto/llm.proto`) | 3 |
-| **Total** | **213** |
+| `SekaiService` (`proto/sekai.proto`) | 103 |
+| `ChiseiService` (`proto/chisei.proto`) | 30 |
+| `LlmService` | 0 (removed) |
+| **Total** | **133** |
 
 Backend inventories map evidence, not product tier:
 
-- `tests/fixtures/sekai_rpc_inventory/v1.json` — 137 entries; fields `rpc`,
+- `tests/fixtures/sekai_rpc_inventory/v1.json` — 103 entries; fields `rpc`,
   `kind`, `surfaces`, `evidence`, `durable_dependencies` (no product tier).
-- `tests/fixtures/chisei_rpc_inventory/v1.json` — 76 entries; same shape.
+- `tests/fixtures/chisei_rpc_inventory/v1.json` — 30 entries; same shape.
 - `complete_*_surfaces` lists dual-backend **storage** claims (#252 family), not
   “product complete.”
+
+The 1.0 counts retain `ListActionEffects` for the Aldunis Code projection and
+`GetSampleObservation` plus the three bounded eval-read projections for active
+Tenkai gates; these are compatibility restorations, not a return of the removed
+authoring or execution verticals.
 
 ### Clustering (product usefulness, not storage)
 
 | Bucket | Count (approx.) | Meaning |
 | --- | ---: | --- |
 | **Product spine** | ~55–65 | Ontology, facts, grants, policy/budget, plan/execute, receipt, default retrieval, credentials, capability discovery |
-| **Platform machinery** | ~95–110 | Leases, guarded mutations, datasets, evidence pipeline, capability packages, external permits, work units, schema/interface registry, pattern IR |
-| **Research / secondary lab** | ~45–55 | Evolve\*, deep eval matrix, portfolio, Gunshi auto, hybrid/FTS, temporal admin, gateway-internal decide/alias, scenario overlay, assurance export |
+| **Platform machinery** | ~95–110 | Leases, guarded mutations, datasets, evidence pipeline, external permits, work units, schema/interface registry, pattern IR |
+| **Research / secondary lab** | ~45–55 | Deep eval matrix, portfolio, Gunshi auto, hybrid/FTS, retired temporal admin, gateway-internal decide/alias, scenario overlay, retired assurance export |
 
 Exact membership of borderline RPCs (e.g. `ListObjects`, external-action
 issue/redeem, basic eval suite CRUD) is less important than the **ratio**:
 roughly **one quarter spine**, **half platform**, **one quarter lab**. Learning
-213 methods is not a product onboarding path.
+128 methods is not a product onboarding path.
 
 ### Operator surface today (`sekaictl`)
 
@@ -76,16 +81,15 @@ Documented discoverable semantic capabilities
 
 | Capability | RPC | Product role |
 | --- | --- | --- |
-| `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | **Core** |
 | `sekai.semantic.expand_relations` | `ExpandRelations` | **Core** |
 | `sekai.context.retrieve` | `RetrieveContext` | **Core** (default retrieve) |
 | `sekai.semantic.explain_derivation` | `ExplainDerivation` | **Core** |
-| `sekai.text.search` | `SearchText` | Advanced |
-| `sekai.hybrid.retrieve` | `HybridRetrieve` | Advanced |
-| `sekai.pattern.execute` / `.explain` | pattern plan | Advanced (post-#375) |
-| `sekai.scenario.evaluate` | `EvaluateScenario` | Experimental / lab |
+| `sekai.text.search` | `SearchText` | Removed for 1.0; design history only |
+| `sekai.hybrid.retrieve` | `HybridRetrieve` | Removed for 1.0; design history only |
+| `sekai.pattern.execute` / `.explain` | pattern plan | Removed for 1.0; design history only |
+| `sekai.scenario.evaluate` | `EvaluateScenario` | Removed for 1.0; design history only |
 
-Governed entry for execution remains `PlanExecution` / `ExecutePlan` (and
+Governed entry for execution remains `PlanExecution` / `ExecutePlanStream` (and
 gateway HTTP). Catalog does not yet present a **short core pack**; agents see
 the full discoverable set plus the rest of the wire.
 
@@ -97,9 +101,9 @@ From [ontology.md](../ontology.md) and proto RPCs:
 | --- | --- | --- |
 | **Schema types** (`CreateSchemaType`, …) | Authoritative **object kind validation** | Required to store typed objects; invisible in “ontology first” story |
 | **Interfaces** (`CreateInterface`, …) | Separate registry projected with types | Third authoring model; rarely needed for first domain |
-| **Ontology classes/relations** | Semantic meaning, ACL’d definitions, proposals | Intended product “define the world” surface |
+| **Ontology classes/relations** | Semantic meaning, ACL’d definitions; proposal workflow retired for 1.0 | Intended product “define the world” surface |
 | **`ProjectSchemaToOntology`** | Schema → ontology bridge | Schema-first migration, not first-run default |
-| **Proposals** | Evidence-driven / review workflow | Advanced governance, not day-0 |
+| **Proposals** | Evidence-driven / review workflow (retired for 1.0) | Historical design only |
 
 A new user cannot complete “define ontology → create facts” with ontology RPCs
 alone: object create still needs a **kind** backed by the schema registry.
@@ -117,8 +121,8 @@ RPC triples teach the wrong default.
 ### Retrieval dual path
 
 Default product retrieve: **`RetrieveContext`** (+ semantic resolve/expand).  
-Advanced: `SearchText`, `HybridRetrieve`, `ExecutePatternPlan`,
-`EvaluateScenario`, raw `Traverse`.
+Advanced: raw `Traverse`; text/hybrid retrieval, pattern plans, and the former
+scenario overlay are design history only.
 
 ### Related closed research (constraints)
 
@@ -170,31 +174,30 @@ optional polish.
 | 8 | Link | same seed **(gap)** | `CreateLink` / `DeleteLink` / `GetLinks` / `GetLinkedObjects` | |
 | 9 | Grant | `sekaictl` grant **(gap)** or team | `CreateGrant` / `DeleteGrant` / `ListGrants` / `CheckAccess` | |
 | 10 | Ontology inspect | `sekaictl ontology inspect` | list class/relation RPCs + trace | ADR 0003 artifact |
-| 11 | Policy | *gap* or existing ops | `SetNamespacePolicy` / `ResolvePolicy` / `GetEffectivePolicySummary` | Dry-run advanced |
-| 12 | Budget | *gap* | `CheckBudget` / `SetBudgetLimit` / `RecordUsage` | |
-| 13 | Models available | `sekaictl models` | `ListAvailableModels` | |
+| 11 | Policy | *gap* or existing ops | `SetNamespacePolicy` / `GetEffectivePolicySummary` | Fat-decide is the admission path |
+| 12 | Budget | *gap* | `SetBudgetLimit` / `RecordUsage` / `DecideGatewayExecution` | |
+| 13 | Models available | `sekaictl models` | `GetEffectivePolicySummary` | |
 | 14 | Plan | *gap* | `PlanExecution` | Native entry |
-| 15 | Execute | *gap* | `ExecutePlan` / `ExecutePlanStream` | |
+| 15 | Execute | *gap* | `ExecutePlanStream` | Streaming-only execution |
 | 16 | Receipt | `sekaictl receipt` | `GetOperationReceipt` | |
 | 17 | Operation report | `sekaictl report` | receipt-derived | Day-1 explainability |
-| 18 | Resolve ref | *gap* / agent | `ResolveSemanticRef` / `sekai.semantic.resolve_ref` | |
-| 19 | Expand relations | agent | `ExpandRelations` / `sekai.semantic.expand_relations` | |
-| 20 | Retrieve context | agent | `RetrieveContext` / `sekai.context.retrieve` | **Default retrieve** |
-| 21 | Explain derivation | agent | `ExplainDerivation` / `sekai.semantic.explain_derivation` | |
-| 22 | Discover capabilities | agent | `DiscoverCapabilities` | Core for agents; optional for humans |
-| 23 | Audit read | `provenance` / report | `ListDecisions` / `ListObjectChanges` / `GetLineage` | |
-| 24 | Egress check | (policy path) | `CheckEgress` | Safety default |
-| 25 | LLM raw (non-product center) | gateway | `Chat` / `ChatStream` | Compatibility; not “main product” |
+| 18 | Expand relations | agent | `ExpandRelations` / `sekai.semantic.expand_relations` | |
+| 19 | Retrieve context | agent | `RetrieveContext` / `sekai.context.retrieve` | **Default retrieve** |
+| 20 | Explain derivation | agent | `ExplainDerivation` / `sekai.semantic.explain_derivation` | |
+| 21 | Discover capabilities | agent | `DiscoverCapabilities` | Core for agents; optional for humans |
+| 22 | Audit read | `provenance` / report | `ListDecisions` / `ListObjectChanges` / `GetLineage` | |
+| 23 | Egress check | (policy path) | `PlanExecution` / `DecideGatewayExecution` | Safety default |
+| 24 | LLM raw (non-product center) | gateway | Removed from 1.0 | Not a product endpoint |
 
 **Out of core map (implemented, non-default):** leases/guarded CRUD, datasets,
-functions, evidence admission pipeline, capability packages + trust signers,
-external permit full lifecycle, work units/contention, pattern plan, hybrid/FTS,
-temporal history RPCs, eval/evolve matrix, portfolio, gunshi auto-allocation,
-federation peer admin, scenario overlay, assurance export, gateway decide/alias
+functions, evidence admission pipeline, external permit full lifecycle, work units/contention, pattern plan, hybrid/FTS,
+retired temporal history RPCs, eval/evolve matrix, portfolio, gunshi auto-allocation,
+federation peer admin, scenario overlay, retired assurance export, gateway decide/alias
 internals.
 
-Rough **supported core wire target:** on the order of **~40–50 RPCs** called out
-as core (including credential CRUD and ontology CRUD), not 213. The rest remain
+The current clean-break wire exposes **128 RPCs**, with the core pack called out
+separately (including credential CRUD and ontology CRUD). Advanced capabilities
+remain
 callable but **advanced/experimental** until shrunk or left as power API.
 
 ### 3. Tier definitions
@@ -203,7 +206,7 @@ callable but **advanced/experimental** until shrunk or left as power API.
 | --- | --- | --- |
 | **`core`** | Required for the product loop above; documented first; catalog “starter pack” | `sekaictl` help primary; catalog filter / docs default |
 | **`advanced`** | Production platform (leases, evidence, packages, hybrid, pattern, external permits) | Explicit docs section; catalog full list |
-| **`experimental`** | Lab / evolving (evolve\*, portfolio, scenario, gunshi auto, temporal admin) | Docs “lab”; may change or shrink first |
+| **`experimental`** | Lab / evolving (evolve\*, portfolio, scenario, gunshi auto) | Docs “lab”; may change or shrink first |
 
 **Where enforced (staged):**
 
@@ -226,11 +229,11 @@ not a parallel user-facing model.**
 
 | Decision | Detail |
 | --- | --- |
-| **User-facing primary** | Create/list/get/delete **ontology** classes and relations (and optional proposals as advanced governance). |
+| **User-facing primary** | Create/list/get/delete **ontology** classes and relations. |
 | **Kind materialization** | Core facade (`sekaictl ontology apply` and/or a single “ensure kind” path) **creates or updates the ObjectType** needed for instances so users do not learn `CreateSchemaType` on day 0. |
 | **Interfaces** | **Demote to advanced/experimental.** Stop featuring in product docs and first-run. Prefer ontology + object kinds; phase toward deprecation of public interface CRUD if unused outside projection. |
 | **`ProjectSchemaToOntology`** | **Advanced** schema-first migration bridge; not the default onboarding direction (default is ontology-first → ensure kind). |
-| **Proposals** | **Advanced** (review workflow); core path may apply definitions directly under ontology admin grants. |
+| **Proposals** | Retired for 1.0; core path applies definitions directly under ontology admin grants. |
 | **No silent domain builtins** | Domain classes remain user-defined; reduction is about *which registry users touch*, not baking domain into core. |
 
 This satisfies “reduce” without claiming validation can be deleted in one PR.
@@ -246,10 +249,10 @@ Severity: **H** = public break / rename; **M** = merge with compat shim window;
 | S2 | Inventory + catalog `product_tier` | L | Machine-readable tiers; agent default core pack |
 | S3 | Interface registry demotion | M/H | Docs demote immediately; deprecate `Create/List/DeleteInterface` after usage audit; projection may keep reading legacy rows |
 | S4 | Guarded vs unguarded object mutations | H | Prefer **one** object mutation family with optional lease/generation fields; shim guarded RPCs as aliases then remove |
-| S5 | Capability package transitions | M | Merge evaluate/upgrade/rollback/disable/uninstall into one transition RPC + enum; keep get/install/trust separate if needed |
-| S6 | External permit lifecycle | M | Collapse issue/verify/redeem/revoke/delegate where request shape allows; keep kill-switch distinct |
-| S7 | Eval / Evolve surface | L then M | Tier all `Evolve*` + deep compare/variance as **experimental**; optional later move or drop from default builds only if packaging justifies (not required for ASAP) |
-| S8 | Gateway-internal RPCs | L | `DecideGatewayExecution`, alias reserve/claim, `RecordGatewayAudit` documented as **gateway implementation**, not product API |
+| S5 | Capability package lifecycle | H | **Completed for 1.0:** remove the unused package and trust vertical; no runtime consumer depended on installed package components. |
+| S6 | External permit lifecycle | M | **Reduced for 1.0:** authorize, transition, redeem, and policy are the four public lifecycle surfaces; immediate authorization returns its signed permit. |
+| S7 | Eval / Evolve surface | L then M | **Completed for 1.0:** remove the public `Evolve*` family and legacy eval authoring/variance/model-comparison RPCs while retaining internal learning/evaluation primitives and the three narrow read projections still used by Tenkai; issue [Sannrox/tenkai#207](https://github.com/Sannrox/tenkai/issues/207) tracks their replacement. |
+| S8 | Gateway-internal RPCs | L | **Reduced for 1.0:** gateway coordination is `DecideGatewayExecution`, `RecordUsage`, and atomic `ClaimGatewayDispatch`. Canonical receipts use trusted accounting and generic audit facts use Sekai decisions. |
 | S9 | Retrieval peers | L | Docs: single default `RetrieveContext`; hybrid/FTS/pattern advanced — no delete required ASAP |
 | S10 | Service split | — | **Not recommended** in this freeze |
 
@@ -277,10 +280,9 @@ Pre-1.0 + ASAP allow shrink **with** labeled Issues; still no silent renames.
 | **B** | `feat(grpc): product_tier on RPC inventories and core catalog pack` | feature | this freeze |
 | **C** | `refactor(sekai): demote interface registry; ontology-first kind ensure` | feature/refactor | A or parallel design |
 | **D** | `refactor(sekai): unify guarded and unguarded object mutations` | refactor | B optional; Design Discussion if no shim |
-| **E** | `refactor(sekai): capability-package transition RPC enum` | refactor | B |
 
 **A and B** are the ASAP critical path (facade + agent tiers). Shrink verticals
-**C–E** follow without waiting for lab cleanup.
+**C–D** follow without waiting for lab cleanup.
 
 ### 8. Explicit non-changes this cycle
 

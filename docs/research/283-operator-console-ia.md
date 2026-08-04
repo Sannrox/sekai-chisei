@@ -97,7 +97,7 @@ artifacts** reachable from the console, not the console itself.
 | **S1 Operations home** | Recent operations for the active namespace; deep link to S2 | Receipt list / statistics query; report summary inputs | Read |
 | **S2 Causal operation workspace** | One operation: receipt events, policy/budget/route, permits, outcome, Gunshi links | `GetOperationReceipt`, report projection, decisions/list as authorized, Gunshi scorecard by allocation id when present | Read; export write to file only |
 | **S3 Governance pressure** | Budget burn, denials, approval queue depth, auto-dispatch live/kill/revision | Budget RPCs, gunshi `GetGunshiAllocationStatus` / scorecard, approval list surfaces | Read; **kill switch** write with confirm |
-| **S4 Policy workspace** | Effective policy summary, dry-run candidate, promote/rollback allocation | `GetEffectivePolicySummary`, `DryRunNamespacePolicy`, Gunshi install/promote/rollback/opt-in | Read + confirmed write |
+| **S4 Policy workspace** | Effective policy summary, dry-run candidate, promote/rollback allocation | `GetEffectivePolicySummary`, internal dry-run engine, Gunshi install/promote/rollback/opt-in | Read + confirmed write |
 
 Delivery mapping to Issues:
 

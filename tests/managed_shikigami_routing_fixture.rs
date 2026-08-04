@@ -57,7 +57,7 @@ fn evidence_source(path: &str) -> &'static str {
             include_str!("../crates/sekai-provider/src/llm/openai.rs")
         }
         "src/grpc/chisei_service.rs" => include_str!("../src/grpc/chisei_service.rs"),
-        "src/grpc/llm_service.rs" => include_str!("../src/grpc/llm_service.rs"),
+        "src/grpc/provider_execution.rs" => include_str!("../src/grpc/provider_execution.rs"),
         "src/grpc/mod.rs" => include_str!("../src/grpc/mod.rs"),
         "src/provider_credentials.rs" => include_str!("../src/provider_credentials.rs"),
         other => panic!("fixture references unsupported evidence source {other:?}"),

@@ -37,7 +37,7 @@ Follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 ## Support expectations
 
-`sekai-chisei` is an early-stage, maintainer-led open-source project. Support is
-best effort; there is no guaranteed response time or service-level agreement.
+`sekai-chisei` is a maintainer-led open-source project. Support is best effort;
+there is no guaranteed response time or service-level agreement.
 Maintainers may convert a support request into an Issue when it identifies a
 reproducible defect or a scoped change.

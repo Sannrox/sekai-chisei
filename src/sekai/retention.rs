@@ -216,7 +216,6 @@ pub struct SubjectErasureResult {
     pub work_unit_text_tombstoned: i32,
     pub grants_deleted: i32,
     pub credentials_deleted: i32,
-    pub object_sets_deleted: i32,
     pub contention_scopes_tombstoned: i32,
     pub coordination_references_tombstoned: i32,
     pub coordination_text_tombstoned: i32,
@@ -1611,59 +1610,6 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())? as i32;
         }
 
-        let matching_object_sets = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT rowid, id, name, description, filter, owner_principal
-                     FROM sekai_object_sets",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|(rowid, id, name, description, filter, owner)| {
-                let text_matches = [id, name, description].iter().any(|value| {
-                    contains_subject_reference(value, &request.subject_kind, &request.subject)
-                        || subject_object_ids
-                            .iter()
-                            .any(|object_id| contains_identifier(value, object_id))
-                });
-                let filter_matches = serde_json::from_str::<serde_json::Value>(&filter)
-                    .ok()
-                    .is_some_and(|json| {
-                        json_matches_subject(&json, &request.subject_kind, &request.subject)
-                            || subject_object_ids.iter().any(|object_id| {
-                                json_matches_subject(&json, &request.subject_kind, object_id)
-                            })
-                    });
-                ((matches!(request.subject_kind.as_str(), "agent" | "user")
-                    && principal_matches_subject(&owner, &request.subject_kind, &request.subject))
-                    || text_matches
-                    || filter_matches)
-                    .then_some(rowid)
-            })
-            .collect::<Vec<_>>()
-        };
-        for rowid in matching_object_sets {
-            result.object_sets_deleted += tx
-                .execute(
-                    "DELETE FROM sekai_object_sets WHERE rowid=?1",
-                    params![rowid],
-                )
-                .map_err(|e| e.to_string())? as i32;
-        }
-
         if matches!(request.subject_kind.as_str(), "user" | "agent") {
             for (table, column) in [
                 ("sekai_coordination_requests", "principal"),
@@ -2317,10 +2263,6 @@ impl SekaiDb {
             (
                 "credentials_deleted".to_string(),
                 result.credentials_deleted.to_string(),
-            ),
-            (
-                "object_sets_deleted".to_string(),
-                result.object_sets_deleted.to_string(),
             ),
             (
                 "contention_scopes_tombstoned".to_string(),
@@ -5040,9 +4982,7 @@ mod tests {
                  INSERT INTO sekai_coordination_requests
                    (request_id,operation,work_unit_id,created_at)
                  VALUES ('request','create','wu-1',1);
-                 INSERT INTO sekai_object_sets
-                   (id,name,description,filter,owner_principal,created)
-                 VALUES ('unrelated-set','saved','saved','{}','wu-1',1);",
+                 ",
             )
             .unwrap();
 
@@ -5072,31 +5012,17 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table}");
         }
-        let object_sets: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sekai_object_sets", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(object_sets, 1);
     }
 
     #[test]
     fn user_erasure_removes_grants_and_credentials() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
-        db.as_sqlite().expect("sqlite").conn()
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
             .execute_batch(
                 "INSERT INTO sekai_grants (id,object_id,principal,role,created)
                  VALUES ('grant','object','user:alice','reader',1);
-                 INSERT INTO sekai_object_sets
-                   (id,name,description,filter,owner_principal,created)
-                 VALUES
-                   ('set','private','private','{}','alice',1),
-                   ('admin-set','review','review',
-                    '{\"property_filters\":[{\"key\":\"owner\",\"value\":\"alice\"}]}',
-                    'privacy-admin',1),
-                   ('admin-in-set','review-in','review',
-                    '{\"property_filters\":[{\"key\":\"owner\",\"op\":\"in\",\"value\":\"bob,alice\"}]}',
-                    'privacy-admin',1);
                  INSERT INTO sekai_contention_scopes
                    (id,name,max_concurrency,owner_principal,created,updated)
                  VALUES ('scope','private',1,'user:alice',1,1);",
@@ -5135,7 +5061,6 @@ mod tests {
 
         assert_eq!(result.grants_deleted, 1);
         assert_eq!(result.credentials_deleted, 1);
-        assert_eq!(result.object_sets_deleted, 3);
         assert_eq!(result.contention_scopes_tombstoned, 1);
         assert_eq!(result.audit_tombstoned, 1);
         assert!(store.maybe_reload(&db));
@@ -5152,12 +5077,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!((grants, active_credentials), (0, 0));
-        let object_sets: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sekai_object_sets", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(object_sets, 0);
         let scope_owner: String = conn
             .query_row(
                 "SELECT owner_principal FROM sekai_contention_scopes WHERE id='scope'",

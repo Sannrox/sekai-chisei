@@ -1,9 +1,9 @@
 # Epistemic context operations report
 
-`QueryOperationStatistics` includes a bounded `epistemic` projection for
-operators who need to understand context use and measured outcome impact. The
-projection is namespace-authorized by the same check as the rest of the
-statistics response.
+The operator console can include a bounded `epistemic` projection for
+understanding context use and measured outcome impact. It is an internal
+projection, not a separate public Chisei RPC; the canonical public surface
+keeps operation receipts and Sekai decisions as the query authority.
 
 The report is deliberately aggregate-only. It never returns prompts, claims,
 evidence references or digests, actors, credentials, or labels derived from

@@ -19,7 +19,7 @@ sekaictl models list --json
 `CHISEI_GRPC_URL` or `SEKAI_SOCKET` selects the control-plane endpoint. The
 equivalent explicit options are `--namespace` and `--target`.
 
-Native clients call `ChiseiService.ListAvailableModels` with a namespace and an
+Native clients call `ChiseiService.GetEffectivePolicySummary` with a namespace and an
 optional provider. The RPC requires an authenticated principal with read access
 to the namespace.
 

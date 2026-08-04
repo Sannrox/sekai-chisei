@@ -6,7 +6,7 @@
 
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
-use crate::domain::{Direction, Link, ListFilter, Object, ObjectSet};
+use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::audit::ObjectChange;
 use crate::sekai::lineage::LineageResult;
 use crate::sekai::schema::{InterfaceDef, ObjectType};
@@ -47,18 +47,6 @@ pub trait GraphBackend: Send + Sync {
         filter: &ListFilter,
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String>;
-
-    fn create_object_set(&self, set: &ObjectSet) -> Result<(), String>;
-    fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String>;
-    fn list_object_sets_for_principals(
-        &self,
-        principals: &[&str],
-    ) -> Result<Vec<ObjectSet>, String>;
-    fn delete_object_set_for_principals(
-        &self,
-        id: &str,
-        principals: &[&str],
-    ) -> Result<bool, String>;
 
     fn create_link(&self, link: &Link) -> Result<bool, String>;
     fn delete_link(&self, id: &str) -> Result<(), String>;
@@ -120,25 +108,6 @@ impl GraphBackend for SekaiDb {
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
         self.list_objects_with_total_for_principals(filter, principals, &[])
-    }
-    fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
-        self.create_object_set(set)
-    }
-    fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
-        self.get_object_set(id)
-    }
-    fn list_object_sets_for_principals(
-        &self,
-        principals: &[&str],
-    ) -> Result<Vec<ObjectSet>, String> {
-        self.list_object_sets_for_principals(principals)
-    }
-    fn delete_object_set_for_principals(
-        &self,
-        id: &str,
-        principals: &[&str],
-    ) -> Result<bool, String> {
-        self.delete_object_set_for_principals(id, principals)
     }
     fn create_link(&self, link: &Link) -> Result<bool, String> {
         self.create_link_once(link)
@@ -321,13 +290,6 @@ fn sqlite_update_object(
         &transaction,
         &crate::sekai::audit::object_diff_changes(actor, Some(&before), Some(object), now),
     )?;
-    crate::sekai::temporal::retain_object_history_in_tx(
-        &transaction,
-        Some(&before),
-        Some(object),
-        actor,
-        now,
-    )?;
     transaction.commit().map_err(|error| error.to_string())?;
     Ok(Some(before))
 }
@@ -359,25 +321,6 @@ impl GraphBackend for PostgresDb {
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
         self.list_objects_with_total_for_principals(filter, principals)
-    }
-    fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
-        self.create_object_set(set)
-    }
-    fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
-        self.get_object_set(id)
-    }
-    fn list_object_sets_for_principals(
-        &self,
-        principals: &[&str],
-    ) -> Result<Vec<ObjectSet>, String> {
-        self.list_object_sets_for_principals(principals)
-    }
-    fn delete_object_set_for_principals(
-        &self,
-        id: &str,
-        principals: &[&str],
-    ) -> Result<bool, String> {
-        self.delete_object_set_for_principals(id, principals)
     }
     fn create_link(&self, link: &Link) -> Result<bool, String> {
         self.create_link_once(link)

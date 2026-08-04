@@ -7,7 +7,7 @@ Research freeze: [research/395-action-effect-mapping.md](research/395-action-eff
 
 Operators register **namespace-scoped, versioned decision types** that the plane
 may admit later as `ActionInstance` records (#397). This is **not** the graph
-mutation DSL (`CreateActionType` / `ExecuteAction`).
+mutation DSL exposed by `ExecuteAction`.
 
 ## Wire names
 
@@ -34,9 +34,8 @@ row for history.
 
 ## Authz
 
-Mutations require namespace write + action-admin (same shape as capability-package
-admin). Reads require authentication, team namespace membership, and action-admin
-on `governed_action:{namespace}`.
+Mutations require namespace write + action-admin. Reads require authentication,
+team namespace membership, and action-admin on `governed_action:{namespace}`.
 
 ## Non-goals
 

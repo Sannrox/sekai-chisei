@@ -140,7 +140,15 @@ pub fn record_feedback(
         let receipt = db
             .get_operation_receipt(&outcome.receipt_reference)?
             .ok_or_else(|| "observed outcome receipt is not governed by Sekai".to_string())?;
-        if receipt.operation_id != plan.operation_id
+        let logical_operation_id = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .and_then(|event| event.attributes.get("logical_operation_id"))
+            .map(String::as_str);
+        let operation_matches = receipt.operation_id == plan.operation_id
+            || logical_operation_id == Some(plan.operation_id.as_str());
+        if !operation_matches
             || receipt.namespace != plan.namespace
             || receipt.operation_class != plan.operation_class
         {
@@ -208,7 +216,7 @@ fn feedback_decisions_equivalent(existing: &Decision, requested: &Decision) -> b
     existing_record == requested_record
 }
 
-fn require_issued_plan(
+pub fn require_issued_plan(
     db: &RuntimeDb,
     issuance_id: &str,
     plan: &AllocationPlan,
@@ -549,6 +557,15 @@ mod tests {
     }
 
     fn persist_receipt(db: &RuntimeDb, plan: &AllocationPlan) {
+        persist_receipt_as(db, plan, &plan.operation_id, false);
+    }
+
+    fn persist_receipt_as(
+        db: &RuntimeDb,
+        plan: &AllocationPlan,
+        receipt_operation_id: &str,
+        include_logical_operation_id: bool,
+    ) {
         use crate::chisei::receipt::{
             OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
         };
@@ -565,7 +582,7 @@ mod tests {
             .enumerate()
             .map(|(index, kind)| OperationReceiptEvent {
                 event_id: format!("event-{index}"),
-                operation_id: plan.operation_id.clone(),
+                operation_id: receipt_operation_id.into(),
                 parent_event_id: (index > 0).then(|| format!("event-{}", index - 1)),
                 timestamp_ms: index as i64 + 1,
                 kind,
@@ -575,6 +592,11 @@ mod tests {
                 attributes: Default::default(),
             })
             .collect::<Vec<_>>();
+        if include_logical_operation_id {
+            events[0]
+                .attributes
+                .insert("logical_operation_id".into(), plan.operation_id.clone());
+        }
         let terminal = events.last_mut().unwrap();
         terminal.attributes.insert("passed".into(), "true".into());
         terminal.attributes.insert("score".into(), "90".into());
@@ -584,7 +606,7 @@ mod tests {
         terminal.attributes.insert("latency_ms".into(), "18".into());
         db.put_operation_receipt(&OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
-            operation_id: plan.operation_id.clone(),
+            operation_id: receipt_operation_id.into(),
             parent_operation_id: None,
             namespace: plan.namespace.clone(),
             operation_class: plan.operation_class.clone(),
@@ -598,6 +620,49 @@ mod tests {
             reporter_grants: Vec::new(),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn outcome_feedback_accepts_a_native_receipt_bound_by_logical_operation_id() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let plan = plan();
+        let choice = choice(&plan);
+        record_issued_recommendations(
+            &db,
+            "alice",
+            "issuance-native",
+            "request-native",
+            std::slice::from_ref(&plan),
+            1,
+            1,
+        )
+        .unwrap();
+        persist_receipt_as(&db, &plan, "native-plan-id", true);
+        let outcome = ObservedOutcome {
+            operation_id: plan.operation_id.clone(),
+            receipt_reference: "native-plan-id".into(),
+            accepted: true,
+            quality: 0.9,
+            cost_usd_micros: 9,
+            latency_ms: 18,
+            attempts: 1,
+            completed_at_ms: 20,
+        };
+
+        let feedback = record_feedback(
+            &db,
+            "alice",
+            "issuance-native",
+            &plan,
+            &choice,
+            Some(&outcome),
+        )
+        .unwrap();
+
+        assert_eq!(
+            feedback.comparison.outcome_receipt_reference.as_deref(),
+            Some("native-plan-id")
+        );
     }
 
     #[test]

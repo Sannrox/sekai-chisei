@@ -130,7 +130,6 @@ fn exercise(db: &dyn CoordinationBackend, prefix: &str) {
         )
         .unwrap();
     assert_eq!(summary.work_units_reconciled, 1);
-    assert_eq!(db.coordination_snapshot(2402).unwrap().stale_count, 1);
 }
 
 #[test]

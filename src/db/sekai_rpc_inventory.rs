@@ -360,15 +360,8 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 160);
-        for rpc in [
-            "ApplyGovernedFactProfile",
-            "PutGovernedFactVersion",
-            "GetGovernedFactVersion",
-            "PutGovernedWaiverVersion",
-            "GetGovernedWaiverVersion",
-            "ResolveInvariantSet",
-        ] {
+        assert_eq!(inventory.entries.len(), 103);
+        for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
         assert!(inventory.entry("PutGovernedActionType").is_some());
@@ -378,54 +371,18 @@ mod tests {
         assert!(inventory.entry("GetActionEffect").is_some());
         assert!(inventory.entry("ListActionEffects").is_some());
         assert!(inventory.entry("ClaimActionWork").is_some());
-        assert!(
-            inventory
-                .entry("SubmitParkedWorkResolutionAction")
-                .is_some()
-        );
         assert!(inventory.entry("ReportActionClaimEvent").is_some());
         assert!(inventory.entry("ListClaimableActionWork").is_some());
-        assert!(inventory.entry("GetRuntimeWorkPressure").is_some());
         assert!(inventory.entry("HeartbeatActionClaim").is_some());
         assert!(inventory.entry("AckActionWork").is_some());
-        assert!(inventory.entry("TransitionCapabilityPackage").is_some());
-        assert_eq!(
-            inventory
-                .entry("TransitionCapabilityPackage")
-                .unwrap()
-                .product_tier,
-            ProductTier::Advanced
-        );
-        assert_eq!(
-            inventory
-                .entry("UpgradeCapabilityPackage")
-                .unwrap()
-                .product_tier,
-            ProductTier::Experimental
-        );
-        assert!(inventory.entry("ResolveSemanticRef").is_some());
         assert!(inventory.entry("ExpandRelations").is_some());
         assert!(inventory.entry("ExplainDerivation").is_some());
-        assert!(inventory.entry("SearchText").is_some());
-        assert!(inventory.entry("HybridRetrieve").is_some());
-        assert!(inventory.entry("ExecutePatternPlan").is_some());
-        assert!(inventory.entry("ExplainPatternPlan").is_some());
-        assert!(inventory.entry("EvaluateScenario").is_some());
-        assert!(inventory.by_kind()["persistent"] >= 100);
+        assert!(inventory.by_kind()["persistent"] >= 90);
         assert!(inventory.by_kind()["computed"] >= 1);
         assert!(inventory.entry("CreateObject").is_some());
-        assert!(inventory.entry("ExecuteFunction").is_some());
-        assert_eq!(
-            inventory.entry("ExecuteFunction").unwrap().kind,
-            RpcPersistenceKind::Computed
-        );
         assert_eq!(
             inventory.entry("CreateObject").unwrap().product_tier,
             ProductTier::Core
-        );
-        assert_eq!(
-            inventory.entry("HybridRetrieve").unwrap().product_tier,
-            ProductTier::Experimental
         );
         let tiers = inventory.by_product_tier();
         assert!(

@@ -8,7 +8,8 @@ Related: [#143](https://github.com/Sannrox/sekai-chisei/issues/143) (closed → 
 [#362](https://github.com/Sannrox/sekai-chisei/issues/362) (shipped scenario overlay)
 Date: 2026-07-27
 Status: **recommendation complete — shipped via #362**
-Operator guide: [scenario-overlay.md](../scenario-overlay.md)
+The scenario-overlay operator guide was retired with the 1.0 runtime removal;
+this document remains design history.
 
 ## Decision question
 
@@ -58,7 +59,7 @@ twin, DES engine, or workflow simulator is out of product boundary.
 | `RetrieveContext` | `src/sekai/retrieval.rs` | Asserted/entailment modes; ACL deny non-disclosure; hard bounds | Read-only over canonical + ontology; no hypotheticals |
 | Temporal as-of / diff | `src/sekai/temporal.rs`, historical RPCs | Bitemporal coordinates; `outcome=not_retained` non-synthesis | History is truth-at-time, not counterfactual |
 | Lineage | `src/sekai/lineage.rs` | Explicit `derived_from` / revision edges | Time order is not causality (ADR 0004 constraint) |
-| Capability catalog | #106/#107, #151 | Governed invocation composition | `sekai.scenario.evaluate` shipped (#362); see [scenario-overlay.md](../scenario-overlay.md) |
+| Capability catalog | #106/#107, #151 | Governed invocation composition | `sekai.scenario.evaluate` was retired for 1.0; see the historical design below |
 
 ### Hard bounds already proven in retrieval (reuse, do not invent a second budget model)
 
@@ -252,4 +253,4 @@ Acceptance sketch:
 option 2 as optional durability, option 3 as adapter composition) and **reject
 a core twin engine or adapter-only terminal exit**. Close research #148 with
 this freeze; **#362** shipped the operator surface
-([scenario-overlay.md](../scenario-overlay.md), `EvaluateScenario`).
+(`EvaluateScenario`, retired from the 1.0 runtime surface).

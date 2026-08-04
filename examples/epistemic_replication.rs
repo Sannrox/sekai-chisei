@@ -1373,6 +1373,7 @@ fn install_evaluation_plan(
                 created_at_ms: 0,
                 stochastic_policy: None,
             }),
+            ..Default::default()
         }),
     ))?
     .map_err(|error| error.to_string())?;

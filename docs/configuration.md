@@ -20,7 +20,7 @@ template.
 | `OPS_BIND` | `127.0.0.1` | Health, metrics, and operator console bind address |
 | `OPS_PORT` | `9464` | Health, metrics, and console port; set empty to disable |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
-| `SEKAI_AUTH_TOKEN` | unset | Deprecated single-principal bootstrap token |
+| `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, and the gateway; never bootstraps server authority |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
@@ -131,13 +131,7 @@ value to stdout.
 | `CHISEI_GATEWAY_RECOVERY_SPOOL_PATH` | `data/chisei-gateway-recovery.jsonl` | Durable receipt, usage, and refusal recovery file (process CWD-relative unless absolute) |
 | `CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES` | `67108864` | Hard recovery-spool capacity; new records are refused after the file reaches this size until replay or operator cleanup frees space |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
-| `CHISEI_GATEWAY_RUN_PIPELINE` | unset | Set `1` to sample completed calls through Chisei |
 | `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table; class rates must be supplied to price provider cache-write premiums |
-
-For upgrades, the gateway still reads the former usage-journal and spool
-environment variables when the new names are unset. It also resumes existing
-legacy default files before selecting the new defaults. After the old files
-drain, set the new paths explicitly; the compatibility names are deprecated.
 
 The pricing format is
 `model=input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]`, with every
@@ -171,7 +165,8 @@ See [the gateway guide](gateway.md) for authentication and routing semantics.
 ## Configuration hygiene
 
 - Never commit `.env` or provider credentials.
-- Prefer per-principal credentials over `SEKAI_AUTH_TOKEN`.
+- Create principal-scoped credentials and expose them to clients through
+  `SEKAI_CREDENTIAL`; never place the bearer in server configuration.
 - Keep the ops listener on loopback unless an orchestrator must reach it.
 - Raise request or context limits deliberately; do not remove safety caps.
 - Treat `.env.example` and the implementation as the source of truth for

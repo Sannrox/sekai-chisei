@@ -1,9 +1,8 @@
 {
   "version": "chisei.rpc-inventory/v1",
-  "service": "ChiseiService+LlmService",
+  "service": "ChiseiService",
   "proto": [
-    "proto/chisei.proto",
-    "proto/llm.proto"
+    "proto/chisei.proto"
   ],
   "entries": [
     {
@@ -22,152 +21,32 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "ResolveExternalActionApproval",
+      "rpc": "CancelEvaluationExecution",
       "kind": "persistent",
       "surfaces": [
-        "chisei.approvals"
+        "chisei.evaluation"
       ],
       "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "tests/chisei_evaluation_execution_backend_conformance.rs",
+        "src/db/postgres_evaluation_execution.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
+      "product_tier": "experimental"
     },
     {
-      "rpc": "CancelExternalActionAuthorization",
+      "rpc": "ClaimGatewayDispatch",
       "kind": "persistent",
       "surfaces": [
-        "chisei.approvals"
+        "gateway.governance",
+        "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_gateway_audit_backend_conformance.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "IssueExternalActionPermit",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "VerifyExternalActionPermit",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "RedeemExternalActionPermit",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "RevokeExternalActionPermit",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "SetExternalActionKillSwitch",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "SetExternalPermitPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "DelegateExternalActionPermit",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.approvals"
-      ],
-      "evidence": [
-        "tests/chisei_external_action_backend_conformance.rs",
-        "tests/chisei_external_permit_backend_conformance.rs",
-        "src/db/postgres_external_action.rs",
-        "src/db/postgres_external_permit.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "CheckBudget",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.budget"
-      ],
-      "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
+      "product_tier": "experimental"
     },
     {
       "rpc": "DecideGatewayExecution",
@@ -187,122 +66,62 @@
       "product_tier": "experimental"
     },
     {
-      "rpc": "RecordUsage",
+      "rpc": "EvaluateGovernedSubject",
       "kind": "persistent",
       "surfaces": [
-        "chisei.budget"
+        "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
+        "src/chisei/governed_subject.rs",
+        "src/grpc/chisei_service.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "docs/governed-subjects.md"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
-      "rpc": "SetBudgetLimit",
+      "rpc": "ExecuteEvaluationManifest",
       "kind": "persistent",
       "surfaces": [
-        "chisei.budget"
+        "chisei.evaluation"
       ],
       "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "RecordPortfolioObservation",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.portfolio"
-      ],
-      "evidence": [
-        "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs"
+        "tests/chisei_evaluation_execution_backend_conformance.rs",
+        "src/db/postgres_evaluation_execution.rs",
+        "src/chisei/evaluation_execution.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
     },
     {
-      "rpc": "GetPortfolioFrontier",
+      "rpc": "ExecutePlanStream",
       "kind": "persistent",
       "surfaces": [
-        "chisei.portfolio"
+        "chisei.execution"
       ],
       "evidence": [
-        "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "SetPortfolioObjective",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.portfolio"
-      ],
-      "evidence": [
-        "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "AllocatePortfolio",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.portfolio"
-      ],
-      "evidence": [
-        "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "SetNamespacePolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.policy"
-      ],
-      "evidence": [
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
-      "rpc": "ResolvePolicy",
-      "kind": "computed",
-      "surfaces": [],
+      "rpc": "ExportGovernedSubjectProvenance",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
       "evidence": [
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
+        "src/chisei/governed_subject_provenance.rs",
+        "src/grpc/chisei_service.rs",
+        "tests/chisei_governed_subject_provenance_backend_conformance.rs",
+        "src/db/governed_subject_provenance.rs",
+        "src/db/postgres_governed_subject_provenance.rs"
       ],
-      "durable_dependencies": [
-        "chisei.policy"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "DryRunNamespacePolicy",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/chisei/policy_dry_run.rs",
-        "docs/policy-dry-run.md"
-      ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.receipts"
-      ],
-      "product_tier": "core"
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     },
     {
       "rpc": "GetEffectivePolicySummary",
@@ -318,88 +137,69 @@
       "product_tier": "core"
     },
     {
-      "rpc": "ListAvailableModels",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.policy"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "SetNamespaceWorkerPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.policy"
-      ],
-      "evidence": [
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "CheckEgress",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.policy"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "RunPipeline",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.execution",
-        "chisei.policy",
-        "chisei.budget"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListPipelineRuns",
+      "rpc": "GetEvalRun",
       "kind": "query",
       "surfaces": [],
+      "evidence": [
+        "src/grpc/chisei_service.rs",
+        "src/chisei/eval.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetEvalSuite",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/chisei_service.rs",
+        "src/chisei/eval.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetGunshiAllocationStatus",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.learning"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEvalRuns",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/chisei_service.rs",
+        "src/chisei/eval.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetOperationReceipt",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
       "evidence": [
         "tests/chisei_execution_backend_conformance.rs",
         "src/db/postgres_chisei_receipts.rs"
       ],
-      "durable_dependencies": [
-        "chisei.execution"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "RecordSampleObservation",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.observations"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
       "durable_dependencies": [],
-      "product_tier": "experimental"
+      "product_tier": "core"
     },
     {
       "rpc": "GetSampleObservation",
@@ -407,8 +207,8 @@
       "surfaces": [],
       "evidence": [
         "src/grpc/chisei_service.rs",
-        "src/db/postgres_eval.rs",
-        "docs/sample-observation-readback.md"
+        "src/db/chisei.rs",
+        "src/db/postgres_eval.rs"
       ],
       "durable_dependencies": [
         "chisei.observations"
@@ -416,14 +216,30 @@
       "product_tier": "experimental"
     },
     {
-      "rpc": "RecordGatewayAudit",
+      "rpc": "IssueGunshiRecommendations",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.learning",
+        "chisei.execution"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListKiokuCandidates",
       "kind": "persistent",
       "surfaces": [
-        "gateway.governance"
+        "chisei.learning"
       ],
       "evidence": [
-        "tests/chisei_gateway_audit_backend_conformance.rs",
-        "tests/chisei_execution_backend_conformance.rs"
+        "tests/chisei_kioku_backend_conformance.rs",
+        "src/db/postgres_kioku.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -448,30 +264,60 @@
       "product_tier": "core"
     },
     {
-      "rpc": "ExecutePlan",
+      "rpc": "PutEvaluationPlan",
       "kind": "persistent",
       "surfaces": [
-        "chisei.execution"
+        "chisei.evaluation"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs",
+        "src/chisei/evaluation_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutEvaluatorDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/db/postgres_evaluation_plan.rs",
+        "src/chisei/evaluation_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RecordUsage",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.budget"
+      ],
+      "evidence": [
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
-      "rpc": "ExecutePlanStream",
+      "rpc": "RedeemExternalActionPermit",
       "kind": "persistent",
       "surfaces": [
-        "chisei.execution"
+        "chisei.approvals"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
       "durable_dependencies": [],
-      "product_tier": "core"
+      "product_tier": "advanced"
     },
     {
       "rpc": "ReportOperationEvent",
@@ -487,118 +333,15 @@
       "product_tier": "core"
     },
     {
-      "rpc": "AuthorizeOperationReporter",
+      "rpc": "ResolveEvaluationPlan",
       "kind": "persistent",
       "surfaces": [
-        "chisei.execution"
+        "chisei.evaluation"
       ],
       "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "GetOperationReceipt",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.execution"
-      ],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "EvaluateGovernedSubject",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.execution"
-      ],
-      "evidence": [
-        "src/chisei/governed_subject.rs",
-        "src/grpc/chisei_service.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "docs/governed-subjects.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ExportGovernedSubjectProvenance",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.execution"
-      ],
-      "evidence": [
-        "src/chisei/governed_subject_provenance.rs",
-        "src/grpc/chisei_service.rs",
-        "tests/chisei_governed_subject_provenance_backend_conformance.rs",
-        "src/db/governed_subject_provenance.rs",
-        "src/db/postgres_governed_subject_provenance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "GetGovernedSubjectProvenanceTrustRoot",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/chisei/governed_subject_provenance.rs",
-        "src/grpc/chisei_service.rs",
-        "tests/chisei_governed_subject_provenance_backend_conformance.rs",
-        "src/db/governed_subject_provenance.rs",
-        "src/db/postgres_governed_subject_provenance.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.execution"
-      ],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "EvaluateGovernedSubjectWithPlan",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation",
-        "chisei.execution"
-      ],
-      "evidence": [
-        "src/chisei/governed_subject.rs",
-        "src/grpc/chisei_service.rs",
         "tests/chisei_evaluation_manifest_backend_conformance.rs",
-        "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "docs/governed-subjects.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "QueryOperationStatistics",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.execution"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ListKiokuCandidates",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
+        "src/db/postgres_evaluation_manifest.rs",
+        "src/chisei/evaluation_manifest.rs"
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
@@ -617,695 +360,73 @@
       "product_tier": "experimental"
     },
     {
-      "rpc": "ReassessKiokuMemory",
+      "rpc": "SetBudgetLimit",
       "kind": "persistent",
       "surfaces": [
-        "chisei.learning"
+        "chisei.budget"
       ],
-      "evidence": [
-        "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/chisei_kioku.rs",
-        "src/db/postgres_kioku.rs",
-        "docs/kioku-evidence-reassessment.md"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "IssueGunshiRecommendations",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.learning",
-        "chisei.execution"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "RecordGunshiFeedback",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetGunshiScorecard",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_kioku_backend_conformance.rs",
-        "src/db/postgres_kioku.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.learning",
-        "chisei.execution"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "InstallGunshiAllocationBaseline",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "PromoteGunshiAllocationPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/chisei/gunshi_policy.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "RollbackGunshiAllocationPolicy",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "SetGunshiAutoOptIn",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "SetGunshiAllocationKillSwitch",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetGunshiAllocationStatus",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.learning"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "AuthorizeGunshiAutoDispatch",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/chisei/gunshi_auto.rs",
-        "src/chisei/gunshi_dispatch.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.learning",
-        "chisei.execution"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "PromoteGunshiFeedbackToEval",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.learning",
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "src/chisei/gunshi_feedback_eval.rs",
-        "src/db/chisei.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ReserveGatewayRequestAlias",
-      "kind": "persistent",
-      "surfaces": [
-        "gateway.governance",
-        "chisei.execution"
-      ],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_gateway_audit_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ClaimGatewayRequestAliasDispatch",
-      "kind": "persistent",
-      "surfaces": [
-        "gateway.governance",
-        "chisei.execution"
-      ],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_gateway_audit_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetAffinity",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_portfolio_backend_conformance.rs",
-        "src/db/postgres_portfolio.rs",
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.portfolio"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "PutEvaluatorDefinition",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs",
-        "src/chisei/evaluation_plan.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "GetEvaluatorDefinition",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ListEvaluatorDefinitions",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "SetEvaluatorAvailability",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "PutEvaluationPlan",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs",
-        "src/chisei/evaluation_plan.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "GetEvaluationPlan",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ListEvaluationPlans",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_evaluation_plan_backend_conformance.rs",
-        "src/db/postgres_evaluation_plan.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ResolveEvaluationPlan",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_manifest_backend_conformance.rs",
-        "src/db/postgres_evaluation_manifest.rs",
-        "src/chisei/evaluation_manifest.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "ExecuteEvaluationManifest",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_evaluation_execution.rs",
-        "src/chisei/evaluation_execution.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "GetEvaluationExecution",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_evaluation_execution.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "CancelEvaluationExecution",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_evaluation_execution_backend_conformance.rs",
-        "src/db/postgres_evaluation_execution.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "core"
-    },
-    {
-      "rpc": "CreateEvalSuite",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListEvalSuites",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetEvalSuite",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "CreateEvalRun",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetEvalRun",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListEvalRuns",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "TrackEvalIteration",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetLatestEvalIteration",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "ListEvalIterations",
-      "kind": "query",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "CompareRuns",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "GetEvidenceContextGate",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvalVariance",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvalModelCompare",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveSuggest",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveEnhance",
-      "kind": "persistent",
-      "surfaces": [
-        "chisei.evaluation"
-      ],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveRecommend",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveReport",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolvePatterns",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveVariance",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveAbResults",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "EvolveTemplates",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_eval_backend_conformance.rs",
-        "src/db/postgres_eval.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.evaluation"
-      ],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "Chat",
-      "kind": "computed",
-      "surfaces": [],
       "evidence": [
         "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
+        "src/db/postgres_budget.rs"
       ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.budget",
-        "chisei.execution"
-      ],
+      "durable_dependencies": [],
       "product_tier": "core"
     },
     {
-      "rpc": "ChatStream",
-      "kind": "computed",
-      "surfaces": [],
+      "rpc": "SetExternalActionPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
       "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SetGunshiAllocationPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.learning"
+      ],
+      "evidence": [
+        "src/chisei/gunshi_auto.rs",
+        "src/db/chisei.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "SetNamespacePolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
         "tests/chisei_policy_backend_conformance.rs",
         "tests/graph_backend_conformance.rs"
       ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.budget",
-        "chisei.execution"
-      ],
+      "durable_dependencies": [],
       "product_tier": "core"
     },
     {
-      "rpc": "ResolveProvider",
-      "kind": "computed",
-      "surfaces": [],
+      "rpc": "TransitionExternalAction",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.approvals"
+      ],
       "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "src/db/postgres_budget.rs",
-        "tests/chisei_execution_backend_conformance.rs",
-        "src/db/postgres_chisei_receipts.rs",
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs"
+        "tests/chisei_external_action_backend_conformance.rs",
+        "tests/chisei_external_permit_backend_conformance.rs",
+        "src/db/postgres_external_action.rs",
+        "src/db/postgres_external_permit.rs"
       ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.budget",
-        "chisei.execution"
-      ],
-      "product_tier": "core"
+      "durable_dependencies": [],
+      "product_tier": "advanced"
     }
   ],
   "complete_chisei_surfaces": [

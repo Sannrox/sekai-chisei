@@ -1,8 +1,9 @@
 # Contributing
 
-Thanks for helping improve `sekai-chisei`. The project is pre-1.0, so focused
-changes with clear behavior, tests, and migration impact are easier to review
-than broad rewrites.
+Thanks for helping improve `sekai-chisei`. The 1.x core contract is stable, so
+focused changes with clear behavior, tests, and migration impact are easier to
+review than broad rewrites. Experimental surfaces must remain explicitly
+classified and opt-in.
 
 All participation is governed by the [code of conduct](CODE_OF_CONDUCT.md).
 For usage questions that do not yet require a code change, use the channels in
@@ -85,7 +86,7 @@ For a public gRPC change:
 
 - update the relevant file under `proto/`;
 - update the service implementation and client/example call sites;
-- add backward-compatibility or migration notes when behavior changes; and
+- add compatibility or migration notes when behavior changes; and
 - test authorization, validation, and error semantics, not only the happy path.
 
 For a database change:

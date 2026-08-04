@@ -22,7 +22,9 @@ fn main() {
     }
 
     println!();
-    println!("Run these with PlanExecution/ExecutePlan in order against a configured server.");
+    println!(
+        "Run these with PlanExecution/ExecutePlanStream in order against a configured server."
+    );
     println!(
         "Private steps use Ollama. Frontier steps use task_class=template_only and are leak checked."
     );
@@ -48,6 +50,7 @@ fn local_private_plan() -> PlanExecutionRequest {
             task_class: String::new(),
             ..Default::default()
         }),
+        gunshi_allocation: None,
     }
 }
 
@@ -70,6 +73,7 @@ fn frontier_template_request() -> PlanExecutionRequest {
             task_class: "template_only".into(),
             ..Default::default()
         }),
+        gunshi_allocation: None,
     }
 }
 
@@ -97,6 +101,7 @@ fn local_private_compose_request(template: &str) -> PlanExecutionRequest {
             task_class: String::new(),
             ..Default::default()
         }),
+        gunshi_allocation: None,
     }
 }
 
@@ -124,5 +129,6 @@ fn frontier_polish_request(scrubbed_draft: &str) -> PlanExecutionRequest {
             task_class: "template_only".into(),
             ..Default::default()
         }),
+        gunshi_allocation: None,
     }
 }

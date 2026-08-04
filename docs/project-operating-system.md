@@ -8,7 +8,7 @@ repository holds only knowledge that must remain true after the work closes.
 The model borrows OpenClaw's useful instincts—focus maintainers on small,
 coherent changes, keep the core narrow, prefer extension mechanisms, make AI
 assistance transparent, and automate repeatable work—but adapts them to a
-pre-1.0 Rust control plane with a small contributor base. There are no PR
+Rust control plane with a small contributor base. There are no PR
 quotas, blanket bans on refactoring, or process layers that need a dedicated
 program manager.
 

@@ -4,10 +4,9 @@ use futures_util::StreamExt;
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status};
+use tonic::Status;
 
-use super::pb::llm::llm_service_server::LlmService;
-use super::pb::llm::*;
+use super::pb::chisei::{ChatMessage, ToolCall as ChiseiToolCall, ToolDef};
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
@@ -15,57 +14,27 @@ use crate::llm;
 use crate::obs::correlation::Stage;
 use tracing::{Instrument, info_span};
 
-pub struct LlmServiceImpl {
-    config: Config,
-    budget: Arc<BudgetTracker>,
+#[derive(Clone, Debug, Default)]
+pub(super) struct ProviderExecutionRequest {
+    pub(super) model: String,
+    pub(super) system: String,
+    pub(super) messages: Vec<ChatMessage>,
+    pub(super) tools: Vec<ToolDef>,
+    pub(super) max_tokens: i32,
+    pub(super) user_id: Option<String>,
 }
 
-impl LlmServiceImpl {
-    #[allow(dead_code)]
-    pub fn new(config: Config, db: Arc<RuntimeDb>) -> Self {
-        Self {
-            budget: Arc::new(BudgetTracker::new(db)),
-            config,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_budget(config: Config, budget: Arc<BudgetTracker>) -> Self {
-        Self { budget, config }
-    }
-}
-
-pub async fn execute_chat_request(
-    config: &Config,
-    budget: Arc<BudgetTracker>,
-    r: ChatRequest,
-) -> Result<ChatResponse, Status> {
-    execute_chat_request_with_cache(config, budget, r, llm::PromptCacheIntent::default(), None)
-        .await
-}
-
-pub async fn execute_native_chat_request(
-    config: &Config,
-    budget: Arc<BudgetTracker>,
-    db: &RuntimeDb,
-    authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
-    r: ChatRequest,
-    cacheable_message_count: usize,
-) -> Result<ChatResponse, Status> {
-    execute_chat_request_with_cache(
-        config,
-        budget,
-        r,
-        llm::PromptCacheIntent {
-            enabled: true,
-            cacheable_message_count,
-        },
-        Some(ExecutionAuthentication {
-            db,
-            context: authenticated_context,
-        }),
-    )
-    .await
+#[derive(Clone, Debug, Default)]
+pub(super) struct ProviderExecutionChunk {
+    pub(super) content_delta: String,
+    pub(super) content: String,
+    pub(super) tool_calls: Vec<ChiseiToolCall>,
+    pub(super) input_tokens: i32,
+    pub(super) output_tokens: i32,
+    pub(super) stop_reason: String,
+    pub(super) done: bool,
+    pub(super) cache_read_input_tokens: i32,
+    pub(super) cache_creation_input_tokens: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -74,146 +43,18 @@ struct ExecutionAuthentication<'a> {
     context: Option<&'a crate::enterprise::AuthenticatedContext>,
 }
 
-async fn execute_chat_request_with_cache(
-    config: &Config,
-    budget: Arc<BudgetTracker>,
-    r: ChatRequest,
-    prompt_cache: llm::PromptCacheIntent,
-    execution_authentication: Option<ExecutionAuthentication<'_>>,
-) -> Result<ChatResponse, Status> {
-    let registry = refresh_provider_registry(config).await?;
-    let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
-    let provider_name = registry
-        .resolve_model(&r.model)
-        .map(|resolved| resolved.provider)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let registry_state_path =
-        crate::provider_profile::provider_registry_state_path(&config.db_path);
-    let user_id = r.user_id.as_deref().unwrap_or("default");
-    let estimated = estimate_chat_request(&r);
-    let provider_credential =
-        execution_provider_credential(execution_authentication, &registry, &r.model)?;
-    budget
-        .check_and_reserve(user_id, estimated)
-        .map_err(Status::resource_exhausted)?;
-    let provider = match llm::resolve_with_registry_and_provider_credential(
-        &r.model,
-        &registry,
-        Some(&registry_state_path),
-        config.anthropic_api_key.as_deref(),
-        config.openai_api_key.as_deref(),
-        &config.ollama_url,
-        config.native_llm_url.as_deref(),
-        provider_credential
-            .as_ref()
-            .map(|credential| credential.secret.expose()),
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            budget.adjust(user_id, estimated, 0);
-            return Err(Status::failed_precondition(e));
-        }
-    };
-    let chat_req = llm::ChatRequest {
-        model: r.model,
-        system: r.system,
-        messages: r
-            .messages
-            .iter()
-            .map(|m| llm::Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-                tool_call_id: m.tool_call_id.clone(),
-                tool_calls: m
-                    .tool_calls
-                    .iter()
-                    .map(|tc| llm::ToolCall {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        args: serde_json::from_str(&tc.args_json).unwrap_or(serde_json::json!({})),
-                    })
-                    .collect(),
-            })
-            .collect(),
-        tools: r
-            .tools
-            .iter()
-            .map(|t| llm::ToolDef {
-                name: t.name.clone(),
-                description: t.description.clone(),
-                input_schema: serde_json::from_str(&t.input_schema_json)
-                    .unwrap_or(serde_json::json!({})),
-            })
-            .collect(),
-        max_tokens: r.max_tokens,
-        prompt_cache,
-    };
-    let provider_span = info_span!(
-        "stage",
-        stage = Stage::ProviderRequest.as_str(),
-        provider = %provider_name,
-        streaming = false,
-        otel.kind = "client",
-    );
-    let resp = match provider.chat(&chat_req).instrument(provider_span).await {
-        Ok(r) => r,
-        Err(e) => {
-            budget.adjust(user_id, estimated, 0);
-            return Err(provider_error_status(e));
-        }
-    };
-    let actual_tokens = resp
-        .input_tokens
-        .saturating_add(resp.output_tokens)
-        .saturating_add(resp.cache_read_input_tokens)
-        .saturating_add(resp.cache_creation_input_tokens);
-    budget.adjust(user_id, estimated, actual_tokens);
-    let tool_calls = resp
-        .tool_calls
-        .iter()
-        .map(|tc| ToolCall {
-            id: tc.id.clone(),
-            name: tc.name.clone(),
-            args_json: tc.args.to_string(),
-        })
-        .collect();
-    Ok(ChatResponse {
-        content: resp.content,
-        tool_calls,
-        input_tokens: resp.input_tokens,
-        output_tokens: resp.output_tokens,
-        stop_reason: resp.stop_reason,
-        cache_read_input_tokens: resp.cache_read_input_tokens,
-        cache_creation_input_tokens: resp.cache_creation_input_tokens,
-    })
-}
-
-pub type ChatStreamResponse =
-    Pin<Box<dyn futures_util::Stream<Item = Result<ChatStreamChunk, Status>> + Send + 'static>>;
-
-pub async fn execute_chat_request_stream(
-    config: &Config,
-    budget: Arc<BudgetTracker>,
-    r: ChatRequest,
-) -> Result<ChatStreamResponse, Status> {
-    execute_chat_request_stream_with_cache(
-        config,
-        budget,
-        r,
-        llm::PromptCacheIntent::default(),
-        None,
-    )
-    .await
-}
+pub type ProviderExecutionStream = Pin<
+    Box<dyn futures_util::Stream<Item = Result<ProviderExecutionChunk, Status>> + Send + 'static>,
+>;
 
 pub async fn execute_native_chat_request_stream(
     config: &Config,
     budget: Arc<BudgetTracker>,
     db: &RuntimeDb,
     authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
-    r: ChatRequest,
+    r: ProviderExecutionRequest,
     cacheable_message_count: usize,
-) -> Result<ChatStreamResponse, Status> {
+) -> Result<ProviderExecutionStream, Status> {
     execute_chat_request_stream_with_cache(
         config,
         budget,
@@ -233,10 +74,10 @@ pub async fn execute_native_chat_request_stream(
 async fn execute_chat_request_stream_with_cache(
     config: &Config,
     budget: Arc<BudgetTracker>,
-    r: ChatRequest,
+    r: ProviderExecutionRequest,
     prompt_cache: llm::PromptCacheIntent,
     execution_authentication: Option<ExecutionAuthentication<'_>>,
-) -> Result<ChatStreamResponse, Status> {
+) -> Result<ProviderExecutionStream, Status> {
     let registry = refresh_provider_registry(config).await?;
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
     let provider_name = registry
@@ -270,7 +111,7 @@ async fn execute_chat_request_stream_with_cache(
             return Err(Status::failed_precondition(e));
         }
     };
-    let chat_req = pb_chat_to_domain(r, prompt_cache);
+    let chat_req = provider_request_to_domain(r, prompt_cache);
     let provider_span = info_span!(
         "stage",
         stage = Stage::ProviderRequest.as_str(),
@@ -290,7 +131,7 @@ async fn execute_chat_request_stream_with_cache(
         }
     };
     let budget_for_stream = budget.clone();
-    let (tx, rx) = mpsc::channel::<Result<ChatStreamChunk, Status>>(16);
+    let (tx, rx) = mpsc::channel::<Result<ProviderExecutionChunk, Status>>(16);
     let user_id_for_stream = user_id.clone();
     let stream_span = info_span!(
         "stage",
@@ -317,8 +158,8 @@ async fn execute_chat_request_stream_with_cache(
                             last_tokens = actual_tokens;
                         }
                         let done = chunk.done;
-                        let pb_chunk = domain_chunk_to_pb(chunk);
-                        if tx.send(Ok(pb_chunk)).await.is_err() {
+                        let execution_chunk = domain_chunk_to_execution(chunk);
+                        if tx.send(Ok(execution_chunk)).await.is_err() {
                             continue;
                         }
                         if done {
@@ -389,7 +230,10 @@ fn provider_error_status(error: String) -> Status {
     }
 }
 
-fn pb_chat_to_domain(r: ChatRequest, prompt_cache: llm::PromptCacheIntent) -> llm::ChatRequest {
+fn provider_request_to_domain(
+    r: ProviderExecutionRequest,
+    prompt_cache: llm::PromptCacheIntent,
+) -> llm::ChatRequest {
     llm::ChatRequest {
         model: r.model,
         system: r.system,
@@ -428,7 +272,7 @@ fn pb_chat_to_domain(r: ChatRequest, prompt_cache: llm::PromptCacheIntent) -> ll
 
 fn eligible_prompt_cache_intent(
     registry: &crate::provider_profile::ProviderRegistry,
-    request: &ChatRequest,
+    request: &ProviderExecutionRequest,
     requested: llm::PromptCacheIntent,
 ) -> Result<llm::PromptCacheIntent, Status> {
     use crate::chisei::cache_policy::{
@@ -507,14 +351,14 @@ fn eligible_prompt_cache_intent(
     }
 }
 
-fn domain_chunk_to_pb(chunk: llm::ChatStreamChunk) -> ChatStreamChunk {
-    ChatStreamChunk {
+fn domain_chunk_to_execution(chunk: llm::ChatStreamChunk) -> ProviderExecutionChunk {
+    ProviderExecutionChunk {
         content_delta: chunk.content_delta,
         content: chunk.content,
         tool_calls: chunk
             .tool_calls
             .into_iter()
-            .map(|tc| ToolCall {
+            .map(|tc| ChiseiToolCall {
                 id: tc.id,
                 name: tc.name,
                 args_json: tc.args.to_string(),
@@ -529,7 +373,7 @@ fn domain_chunk_to_pb(chunk: llm::ChatStreamChunk) -> ChatStreamChunk {
     }
 }
 
-pub fn estimate_chat_request(r: &ChatRequest) -> i32 {
+pub fn estimate_chat_request(r: &ProviderExecutionRequest) -> i32 {
     let system_tokens = r.system.len() as i32 / 4;
     let message_tokens = r
         .messages
@@ -549,39 +393,6 @@ pub fn estimate_chat_request(r: &ChatRequest) -> i32 {
         .map(|t| ((t.name.len() + t.description.len() + t.input_schema_json.len()) as i32) / 4)
         .sum::<i32>();
     system_tokens + message_tokens + tool_defs_tokens + r.max_tokens
-}
-
-#[tonic::async_trait]
-impl LlmService for LlmServiceImpl {
-    type ChatStreamStream = ChatStreamResponse;
-
-    async fn chat(&self, req: Request<ChatRequest>) -> Result<Response<ChatResponse>, Status> {
-        let resp =
-            execute_chat_request(&self.config, self.budget.clone(), req.into_inner()).await?;
-        Ok(Response::new(resp))
-    }
-
-    async fn chat_stream(
-        &self,
-        req: Request<ChatRequest>,
-    ) -> Result<Response<Self::ChatStreamStream>, Status> {
-        let resp = execute_chat_request_stream(&self.config, self.budget.clone(), req.into_inner())
-            .await?;
-        Ok(Response::new(resp))
-    }
-
-    async fn resolve_provider(
-        &self,
-        req: Request<ResolveProviderRequest>,
-    ) -> Result<Response<ResolveProviderResponse>, Status> {
-        let registry = refresh_provider_registry(&self.config).await?;
-        let model = req.into_inner().model;
-        let provider = registry
-            .resolve_model(&model)
-            .map_err(Status::failed_precondition)?
-            .provider;
-        Ok(Response::new(ResolveProviderResponse { provider }))
-    }
 }
 
 async fn refresh_provider_registry(
@@ -813,7 +624,7 @@ mod tests {
             enabled: true,
             cacheable_message_count: 0,
         };
-        let mut request = ChatRequest {
+        let mut request = ProviderExecutionRequest {
             model: "anthropic/claude-sonnet-4-8".into(),
             system: "short".into(),
             ..Default::default()
@@ -839,7 +650,7 @@ mod tests {
     #[test]
     fn invalid_native_cache_controls_fail_before_provider_contact() {
         let registry = crate::provider_profile::ProviderRegistry::built_in();
-        let request = ChatRequest {
+        let request = ProviderExecutionRequest {
             model: "anthropic/claude-sonnet-4-8".into(),
             system: "s".repeat(4 * 4_096),
             ..Default::default()

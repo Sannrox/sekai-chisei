@@ -34,8 +34,7 @@
       "evidence_tests": [
         "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
         "src/grpc/chisei_service.rs#managed_cached_plan_is_bound_to_authenticated_tenant",
-        "src/grpc/mod.rs#token_auth_interceptor_overwrites_client_principal",
-        "src/grpc/mod.rs#token_auth_interceptor_derives_tenant_from_credential_and_overwrites_forgery"
+        "src/grpc/mod.rs#token_auth_interceptor_overwrites_client_principal"
       ]
     },
     {
@@ -61,7 +60,7 @@
       "class": "negative",
       "summary": "Provider credentials resolve from authenticated context and never appear in requests, events, errors, receipts, or diagnostics.",
       "evidence_tests": [
-        "src/grpc/llm_service.rs#execution_provider_credentials_are_selected_by_authenticated_tenant",
+        "src/grpc/provider_execution.rs#execution_provider_credentials_are_selected_by_authenticated_tenant",
         "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },

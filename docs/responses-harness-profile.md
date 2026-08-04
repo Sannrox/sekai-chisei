@@ -100,15 +100,11 @@ credential or endpoint. Meta's public-preview profile requires both
 lifecycle. Provider-owned search and code tools remain disabled until separately
 admitted as governed capabilities.
 
-An operator with the separately configured gateway admin credential may change a
-provider, profile version, model, or capability lifecycle through
-`PUT /_chisei/admin/provider-lifecycle`. Changes require a non-empty reason, are
-versioned, and become effective only after the gateway persists an audit event.
-Disabled provider, profile, and model targets fail during registry resolution;
+Provider, profile, model, and capability lifecycle is loaded from the validated
+provider registry snapshot. Disabled targets fail during registry resolution;
 disabled capabilities disappear from the effective capability matrix. Discovery
-exposes the current registry state version and lifecycle override history with
-operator-supplied reasons redacted so credentials or incident details cannot
-leak through discovery.
+exposes the current registry state version without exposing credentials or
+operator-only registry storage.
 
 ## Stream contract
 

@@ -2,8 +2,8 @@
 
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 use crate::sekai::coordination::{
-    AdmissionResult, ContentionScope, CoordinationSnapshot, ReconcileFilter, ReconcileSummary,
-    RequestDedup, Reservation, ReservationFilter, RunEvent, WorkUnit, WorkUnitFilter,
+    AdmissionResult, ContentionScope, ReconcileFilter, ReconcileSummary, RequestDedup, Reservation,
+    ReservationFilter, RunEvent, WorkUnit, WorkUnitFilter,
 };
 
 pub trait CoordinationBackend: Send + Sync {
@@ -43,7 +43,6 @@ pub trait CoordinationBackend: Send + Sync {
         now_ms: i64,
         filter: &ReconcileFilter,
     ) -> Result<ReconcileSummary, String>;
-    fn coordination_snapshot(&self, now_ms: i64) -> Result<CoordinationSnapshot, String>;
 }
 
 macro_rules! forward {
@@ -115,9 +114,6 @@ macro_rules! forward {
             v: &ReconcileFilter,
         ) -> Result<ReconcileSummary, String> {
             <$target>::reconcile_work_units(self, now, v)
-        }
-        fn coordination_snapshot(&self, now: i64) -> Result<CoordinationSnapshot, String> {
-            <$target>::coordination_snapshot(self, now)
         }
     };
 }

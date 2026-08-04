@@ -60,7 +60,7 @@ fn auth_interceptor_rechecks_durable_state_and_refuses_revoked_token() {
 
     let store = Arc::new(PrincipalCredentialStore::new());
     store.maybe_reload(&pair.a);
-    let mut interceptor = TokenAuthInterceptor::new(store.clone(), Arc::clone(&pair.b), None);
+    let mut interceptor = TokenAuthInterceptor::new(store.clone(), Arc::clone(&pair.b));
 
     let mut request = Request::new(());
     request

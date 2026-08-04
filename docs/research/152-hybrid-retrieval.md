@@ -12,9 +12,9 @@ coordinate, do not block), [#175](https://github.com/Sannrox/sekai-chisei/issues
 (shipped FTS), [#361](https://github.com/Sannrox/sekai-chisei/issues/361)
 (shipped hybrid plan)
 Date: 2026-07-27
-Status: **recommendation complete — Phase A/B shipped (#360 / #361)**
-Operator guides: [text-fts.md](../text-fts.md),
-[hybrid-retrieval.md](../hybrid-retrieval.md)
+Status: **retired from the 1.0 runtime surface; retained as design history**
+The former operator guides were retired with `SearchText` and
+`HybridRetrieve`; this document records the design rationale only.
 
 ## Decision question
 
@@ -55,8 +55,8 @@ remain representation-independent?
 | Lineage | `src/sekai/lineage.rs`, `GetLineage` | Provenance link walk | Truncation by depth | Relation-kind filter on lineage edges |
 | Capability catalog (#106/#107) | `DiscoverCapabilities`, `docs/capability-catalog.md` | Discovery metadata over existing RPCs | N/A | Visibility ≠ grant; invoke rechecks authz |
 | Pattern / multi-hop IR (#145) | Research only | Future structured join plan | N/A | Separate from score fusion |
-| Full-text (FTS) text representation | **Shipped (#360)** — `SearchText`, `src/sekai/text_fts.rs`, [text-fts.md](../text-fts.md) | `text.fts5` / `HybridCandidate` | `text.fts5_bm25/v1` (higher is better as `-bm25`) | Authz re-check; SQLite complete; no embedding store |
-| Hybrid late-fusion plan | **Shipped (#361)** — `HybridRetrieve`, `src/sekai/hybrid.rs`, [hybrid-retrieval.md](../hybrid-retrieval.md) | Explicit multi-adapter plan | Named fusion profiles only (`late_fusion.rrf/v1`, `graph_priority/v1`, `identity/v1`) | Partial-failure metadata; pure graph stays on `RetrieveContext` |
+| Full-text (FTS) text representation | **Retired for 1.0** — former `SearchText` / `src/sekai/text_fts.rs` | `text.fts5` / `HybridCandidate` | `text.fts5_bm25/v1` (higher is better as `-bm25`) | Historical design only |
+| Hybrid late-fusion plan | **Retired for 1.0** — former `HybridRetrieve` / `src/sekai/hybrid.rs` | Explicit multi-adapter plan | Named fusion profiles only (`late_fusion.rrf/v1`, `graph_priority/v1`, `identity/v1`) | Historical design only; pure graph stays on `RetrieveContext` |
 | Vector / embedding index | **Absent** | — | — | No embedding store; out of scope for first verticals |
 
 ### What already matches a hybrid candidate shape
@@ -214,14 +214,14 @@ unrelated text fields. Pure graph callers keep `RetrieveContext` unchanged.
 
 Opened two focused verticals (implementation; not research):
 
-1. [#360](https://github.com/Sannrox/sekai-chisei/issues/360) — **shipped** —
+1. [#360](https://github.com/Sannrox/sekai-chisei/issues/360) — **retired for 1.0** —
    **feat(sekai): SQLite FTS text representation and HybridCandidate contract**
    Candidate envelope + FTS5 projection + authz re-check + rebuild story.
-   Operator guide: [../text-fts.md](../text-fts.md).
-2. [#361](https://github.com/Sannrox/sekai-chisei/issues/361) — **shipped** —
+   The former operator guide was retired with the runtime vertical.
+2. [#361](https://github.com/Sannrox/sekai-chisei/issues/361) — **retired for 1.0** —
    **feat(sekai): late-fusion hybrid retrieval plan (graph + FTS)**
    Explicit multi-representation plan, fusion profile v1, partial failure.
-   Operator guide: [../hybrid-retrieval.md](../hybrid-retrieval.md).
+   The former operator guide was retired with the runtime vertical.
 
 ## Impact on related work
 

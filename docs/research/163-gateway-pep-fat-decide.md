@@ -15,7 +15,7 @@ edge remains a pure policy-enforcement point (PEP)?
 | Option | Shape | Fit | Main risk |
 | --- | --- | --- | --- |
 | **A. Fat decide RPC** | New `DecideGatewayExecution` (name bikeshed OK) returns model route, capability admit, policy/egress, and budget grant in one response | Best match to “one round-trip” | Requires careful response versioning and fail-closed semantics |
-| **B. Reuse PlanExecution / ExecutePlan** | Gateway builds a plan and executes it via existing native RPCs | Reuses native client path | Plan/execute is richer than the gateway’s HTTP mapping needs; risk of over-coupling and multi-call sequences |
+| **B. Reuse PlanExecution / ExecutePlanStream** | Gateway builds a plan and executes it via existing native RPCs | Reuses native client path | Plan/execute is richer than the gateway’s HTTP mapping needs; risk of over-coupling and multi-call sequences |
 | **C. Hybrid + local cache** | Fat decide + short-TTL decision cache at the edge | Latency optimization later | Cache correctness/revocation; not day-one |
 
 ## Recommendation (freeze)
@@ -24,7 +24,7 @@ edge remains a pure policy-enforcement point (PEP)?
 
 ### Why not PlanExecution first
 
-- Native `PlanExecution` / `ExecutePlan` already serve **agent-native** clients
+- Native `PlanExecution` / `ExecutePlanStream` already serve **agent-native** clients
   with operation graphs, receipts, and multi-step governance.
 - The gateway’s job is **HTTP route mapping + enforce + stream**, not to become
   a second plan builder. Reusing PlanExecution would force the gateway to
@@ -55,7 +55,7 @@ Minimum fields (names illustrative; exact proto in implementation PR):
 - `namespace` / caller principal identity (from virtual key / credential)
 - requested model / provider hints (as the HTTP client presented them)
 - operation class / capability requirements derived from the route
-- estimated budget dimensions already used by `CheckBudget`
+- estimated budget dimensions already used by the legacy budget preflight
 - request correlation ids (operation / attempt)
 
 ### Response (control plane → gateway)
@@ -102,7 +102,8 @@ Single decision object:
    RPC + pure compose helpers; deterministic unit tests for admit/deny composition.
 3. **Gateway dual-path** (landed, later retired by Issue #418) —
    fail-closed `DecideGatewayExecution`.
-   **Deny** refuses upstream; **admit** replaces CheckBudget + ResolvePolicy
+   **Deny** refuses upstream; **admit** replaces the legacy budget/policy
+   preflight
    with the PDP response (context egress and health fallback still run at the
    edge). The temporary soft-unavailable fallback was removed by Issue #418.
 4. **Canonical path** (landed) — configured gateways always use

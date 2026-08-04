@@ -31,7 +31,7 @@ SEKAI_INSECURE=1 cargo run
 
 # Apply a domain document (classes + relations). Non-builtin mapped_kind values
 # are ensured as ObjectTypes before the ontology class is created.
-export SEKAI_AUTH_TOKEN='<token-if-required>'
+export SEKAI_CREDENTIAL='<token-if-required>'
 cargo run --bin sekaictl -- ontology apply \
   --file tests/fixtures/product_loop/domain-v1.json
 
@@ -61,8 +61,8 @@ cargo run --bin sekaictl -- receipt <request-id> --request-id
 ontology admin already implies schema admin). Builtin kinds such as `component`
 already exist. `sekaictl ontology apply` may still call `CreateSchemaType`
 proactively via `ensure_kind` for clarity; the server path is the durable
-guarantee. Interface registry CRUD (`CreateInterface` / …) and
-`ProjectSchemaToOntology` are **experimental** product-tier surfaces—prefer
+guarantee. Interface registry CRUD and schema-to-ontology projection are
+internal implementation facilities rather than public 1.0 API. Use
 ontology-first authoring.
 
 Document versions:
@@ -73,15 +73,14 @@ Document versions:
 Domain concepts stay in **your** fixtures, not in core protos. ADR 0003
 `ontology inspect` remains a separate static HTML snapshot path.
 
-## Schema projection
+## Schema and interface boundaries
 
-`ProjectSchemaToOntology` projects the current `ObjectType` and interface
-registry into ontology classes (**experimental** product tier). `mapped_kind`
-records the source object kind. The schema registry remains authoritative for
-object validation: changing an ontology class does not change an `ObjectType`,
-and callers refresh the projection after schema changes. Projection does not
-rewrite graph objects. For **product onboarding**, prefer ontology-first apply
-(above) rather than schema-first projection or interface registry CRUD.
+The schema registry remains authoritative for object validation, and its
+interface registry remains an internal validation substrate for built-in and
+stored schema definitions. The public 1.0 API does not expose interface CRUD or
+schema-to-ontology projection. Changing an ontology class does not change an
+`ObjectType`, and ontology authoring never rewrites graph objects. For product
+onboarding, use ontology-first apply (above).
 
 Domain concepts such as customers, incidents, repositories, or invoices stay
 in schemas and adapters rather than becoming built-in ontology concepts.
@@ -122,7 +121,7 @@ Generate a browser-readable snapshot through the same authenticated gRPC path:
 
 ```bash
 # Default target is ./data/sekai.sock (or CHISEI_GRPC_URL / SEKAI_SOCKET).
-export SEKAI_AUTH_TOKEN='<operator token>'
+export SEKAI_CREDENTIAL='<operator token>'
 cargo run --bin sekaictl -- ontology inspect \
   --root <object-id> \
   --authorization-context '<non-secret access-scope label>' \
@@ -165,45 +164,9 @@ general administration console. See
 [ADR 0003](decisions/0003-authenticated-static-ontology-inspection.md) for the
 trust-boundary decision.
 
-## Definition proposals from external evidence
+## Evidence-driven definition proposals
 
-Issue #147 adds a governed path from **admitted** external evidence to
-ontology-definition proposals. Production connectors stay outside core: a
-reference adapter under `adapters/ontology_concept_catalog.rs` maps one
-structured concept-catalog document into `ontology.concept_catalog` evidence.
-The core extractor `concept_catalog_v1` is deterministic and rule-based.
-
-Lifecycle:
-
-1. Admit evidence through the normal evidence funnel (capability, schema,
-   validation, projection).
-2. Call `ProposeOntologyDefinitions` with one or more admitted submission ids.
-   Set `dry_run=true` to generate proposals without writing the proposal store
-   or mutating definitions.
-3. Human review via `ReviewOntologyDefinitionProposal` with `accept`, `reject`,
-   or `supersede`. Review is authenticated, audited, and idempotent for the same
-   terminal action.
-4. **Accept** re-checks that every cited source submission is still usable and
-   digest-stable, validates the proposed class/relation/property through the
-   normal definition validators, then applies the change with the audited
-   ontology mutation path from #141. Invalid or stale proposals fail closed.
-5. **Reject** and dry-run never mutate ontology classes, relations, or graph
-   objects.
-
-Proposals store bounded source citations (`submission_id`, `content_digest`,
-source identity) plus extractor/model configuration keys, confidence, and an
-authorization-context label. Raw evidence content is not copied into proposal
-rows, lifecycle events, or audit evidence. Do not put credentials in
-`authorization_context` or review rationales.
-
-Example (after admitting the reference catalog fixture):
-
-```bash
-# dry-run first
-# ProposeOntologyDefinitions(submission_ids=[...], dry_run=true,
-#   authorization_context="ontology-review:team-alpha")
-# then persist and review accept/reject/supersede as an ontology admin
-```
-
-Instance-fact extraction remains an evidence-projection concern and is out of
-scope here.
+The evidence-driven proposal workflow was retired from the 1.0 runtime
+contract. Define and review ontology classes and relations directly through
+the authenticated ontology mutation APIs; evidence projection remains
+available for instance facts.

@@ -29,8 +29,6 @@ const RETENTION_DEDUPLICATION_PARITY_SCHEMA: &str =
     include_str!("postgres/0013_retention_deduplication_parity.sql");
 const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
     include_str!("postgres/0014_action_governance_parity.sql");
-const CAPABILITY_PACKAGE_PARITY_SCHEMA: &str =
-    include_str!("postgres/0015_capability_package_parity.sql");
 const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_namespace_parity.sql");
 const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
     include_str!("postgres/0017_chisei_execution_parity.sql");
@@ -47,8 +45,6 @@ const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation
 const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluation_executions.sql");
 const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0027_governed_subject_provenance.sql");
-const ACTION_EFFECT_PRESSURE_SCHEMA: &str =
-    include_str!("postgres/0028_action_effect_pressure.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -130,73 +126,63 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 15,
-        name: "capability_package_parity",
-        sql: CAPABILITY_PACKAGE_PARITY_SCHEMA,
-    },
-    Migration {
-        version: 16,
         name: "team_namespace_parity",
         sql: TEAM_NAMESPACE_PARITY_SCHEMA,
     },
     Migration {
-        version: 17,
+        version: 16,
         name: "chisei_execution_parity",
         sql: CHISEI_EXECUTION_PARITY_SCHEMA,
     },
     Migration {
-        version: 18,
+        version: 17,
         name: "budget_topology",
         sql: BUDGET_TOPOLOGY_SCHEMA,
     },
     Migration {
-        version: 19,
+        version: 18,
         name: "lease_site_id",
         sql: LEASE_SITE_ID_SCHEMA,
     },
     Migration {
-        version: 20,
+        version: 19,
         name: "governed_action_types",
         sql: GOVERNED_ACTION_TYPES_SCHEMA,
     },
     Migration {
-        version: 21,
+        version: 20,
         name: "governed_action_instances",
         sql: GOVERNED_ACTION_INSTANCES_SCHEMA,
     },
     Migration {
-        version: 22,
+        version: 21,
         name: "action_effects",
         sql: ACTION_EFFECTS_SCHEMA,
     },
     Migration {
-        version: 23,
+        version: 22,
         name: "parked_work_continuation",
         sql: PARKED_WORK_CONTINUATION_SCHEMA,
     },
     Migration {
-        version: 24,
+        version: 23,
         name: "evaluation_plans",
         sql: EVALUATION_PLANS_SCHEMA,
     },
     Migration {
-        version: 25,
+        version: 24,
         name: "evaluation_manifests",
         sql: EVALUATION_MANIFESTS_SCHEMA,
     },
     Migration {
-        version: 26,
+        version: 25,
         name: "evaluation_executions",
         sql: EVALUATION_EXECUTIONS_SCHEMA,
     },
     Migration {
-        version: 27,
+        version: 26,
         name: "governed_subject_provenance",
         sql: GOVERNED_SUBJECT_PROVENANCE_SCHEMA,
-    },
-    Migration {
-        version: 28,
-        name: "action_effect_pressure",
-        sql: ACTION_EFFECT_PRESSURE_SCHEMA,
     },
 ];
 
@@ -689,19 +675,6 @@ mod tests {
         for excluded in ["tenant", "oauth", "oidc"] {
             assert!(!ACTION_GOVERNANCE_PARITY_SCHEMA.contains(excluded));
         }
-        for table in [
-            "sekai_capability_package_versions",
-            "sekai_capability_package_installations",
-            "sekai_capability_package_events",
-        ] {
-            assert!(
-                CAPABILITY_PACKAGE_PARITY_SCHEMA
-                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}"))
-            );
-        }
-        for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
-            assert!(!CAPABILITY_PACKAGE_PARITY_SCHEMA.contains(excluded));
-        }
         assert!(
             TEAM_NAMESPACE_PARITY_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_team_principals")
@@ -740,14 +713,6 @@ mod tests {
         for excluded in ["tenant", "oauth", "oidc"] {
             assert!(!BUDGET_TOPOLOGY_SCHEMA.contains(excluded));
         }
-        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("pressure_runtime"));
-        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("pressure_jsonb_compatible"));
-        assert!(
-            ACTION_EFFECT_PRESSURE_SCHEMA
-                .contains("CREATE TRIGGER trg_action_effects_pressure_metadata")
-        );
-        assert!(ACTION_EFFECT_PRESSURE_SCHEMA.contains("chr(11)"));
-        assert!(!ACTION_EFFECT_PRESSURE_SCHEMA.contains("LIKE '%\\\\u0000%'"));
     }
 
     #[test]

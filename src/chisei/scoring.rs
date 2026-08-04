@@ -4,7 +4,7 @@
 //! records a judge-able payload (spec + model output) in `chisei_sample_observations`. This
 //! background job consumes that dataset, scores each observation with a hybrid of
 //! state-of-the-art LLM-as-judge grading and the existing deterministic [`eval::check_assertions`]
-//! gate, and emits one [`eval::Run`] per namespace via the same persistence path the `CreateEvalRun`
+//! gate, and emits one [`eval::Run`] per namespace through the internal eval store
 //! RPC uses. The resulting iterations feed [`EvalStore::namespace_regression_signal`], which already
 //! drives adaptive sampling (`reason = "eval_regressed"`) — closing the learning loop.
 //!

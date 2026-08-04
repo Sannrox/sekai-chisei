@@ -22,12 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sekai_chisei::provider_profile::refresh_provider_registry(&provider_registry_state_path)
         .map_err(std::io::Error::other)?;
 
-    if config.auth_token.is_some() {
-        tracing::warn!(
-            "SEKAI_AUTH_TOKEN is deprecated and maps to fixed principal `root`; use sekaictl admin access credential create instead"
-        );
-    }
-
     let backend_config =
         RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
     let backend =

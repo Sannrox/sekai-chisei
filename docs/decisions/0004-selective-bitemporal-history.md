@@ -1,13 +1,17 @@
 # ADR 0004: Add selective bitemporal history to the current graph
 
-- Status: accepted
+- Status: retired for 1.0
 - Date: 2026-07-22
 - Owners: @Sannrox
 - Source: [Issue #146](https://github.com/Sannrox/sekai-chisei/issues/146)
 - Discussion: accepted via [PR #223](https://github.com/Sannrox/sekai-chisei/pull/223);
   storage implementation begins at Issue #225
 - Supersedes: none
-- Superseded by: none
+- Superseded by: 1.0 clean-break scope reduction
+
+> This ADR is retained as design history. The temporal storage and RPC
+> experiment was removed from the 1.0 runtime contract; current graph state,
+> audit, and lineage remain the supported history surfaces.
 
 ## Context
 

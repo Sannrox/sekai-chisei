@@ -16,11 +16,21 @@ preflights policy, budget, and egress decisions, resolves the provider/model,
 streams the response, and records normalized usage and audit evidence. By
 default, budget/policy preflight uses the control-plane
 `DecideGatewayExecution` RPC using `gateway.decide/v2` (Issues #163 and #418).
+The same decision also runs the internal sampling pipeline when request text is
+available; there is no separate pipeline RPC or gateway sampling mode.
 A configured gateway has no legacy
 multi-RPC fallback: denial or control-plane unavailability stops the request
 before provider contact. The control plane owns policy, budget, lifecycle,
 evaluation, capability, and route decisions; the gateway translates supported
 wire formats and enforces the returned decision.
+
+Gateway coordination has three Chisei RPCs: `DecideGatewayExecution`,
+`RecordUsage`, and `ClaimGatewayDispatch`. Sample observations are folded into
+trusted usage recording. The claim call combines
+alias reservation and dispatch-token claiming into one atomic operation.
+Normalized usage and the complete canonical operation receipt are persisted in
+one trusted `RecordUsage` accounting call; generic gateway audit facts use the
+Sekai decision log rather than a gateway-specific audit RPC.
 
 The v2 contract is a coordinated gateway/control-plane upgrade. Mixed v1/v2
 deployments reject admission rather than silently reconstructing missing policy
@@ -82,7 +92,7 @@ To pin one governed request to an exact discovered route, set
 cheap/capable selection only; lifecycle admission, sensitive-data provider
 safety, and budget admission still apply. An unavailable or inadmissible target
 is rejected without fallback. Native clients use `ExecutionInput.route_override`
-for the equivalent `PlanExecution`/`ExecutePlan` flow. Receipts record the
+for the equivalent `PlanExecution`/`ExecutePlanStream` flow. Receipts record the
 override target and `bias_bypassed=true` on the routing event.
 
 Passthrough credentials form a narrow in-memory trust boundary. They are used

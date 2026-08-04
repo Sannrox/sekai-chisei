@@ -14,17 +14,15 @@ use crate::chisei::evaluation_manifest::{
     prepare_resolution_request,
 };
 use crate::chisei::evaluation_plan::{
-    AVAILABILITY_ENABLED, EvaluationInputBinding as DomainInputBinding,
-    EvaluationPlan as DomainPlan, EvaluationPlanNode as DomainPlanNode, NODE_REQUIRED,
-    STOCHASTIC_EXECUTION_CLASS, prepare_plan, validate_parameters,
+    EvaluationInputBinding as DomainInputBinding, EvaluationPlan as DomainPlan,
+    EvaluationPlanNode as DomainPlanNode, prepare_plan,
 };
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     EvaluationExecutionProjection, EvaluationExecutionRequest, EvaluationInputBinding,
     EvaluationPlan, EvaluationPlanNode, EvaluationResolutionRequest,
-    ExecuteEvaluationManifestRequest, GetEvaluationPlanRequest, GetEvaluatorDefinitionRequest,
-    ListEvaluationPlansRequest, PutEvaluationPlanRequest, ResolveEvaluationPlanRequest,
+    ExecuteEvaluationManifestRequest, PutEvaluationPlanRequest, ResolveEvaluationPlanRequest,
     ResolvedEvaluationManifest,
 };
 use crate::grpc::pb::sekai::GetGovernedFactVersionRequest;
@@ -52,13 +50,12 @@ pub fn usage() -> &'static str {
      Commands:\n\
        validate <plan.json> [--offline] [--target <url-or-socket>] [--json]\n\
        apply <plan.json> [--target <url-or-socket>] [--json]\n\
-       list --namespace <name> [--plan-id <id>] [--target <url-or-socket>] [--json]\n\
-       inspect <plan-version-id> [--target <url-or-socket>] [--json]\n\
        resolve <resolution.json> [--target <url-or-socket>] [--json]\n\
        execute <namespace> <manifest-digest> --yes [--max-duration-ms <ms>] [--target <url-or-socket>] [--json]\n\
      \n\
-     validate is read-only. It checks exact live evaluator and invariant versions\n\
-     unless --offline is supplied. resolve never executes evaluators. execute\n\
+     validate is read-only. It checks exact live invariant versions unless\n\
+     --offline is supplied; apply performs authoritative evaluator validation.\n\
+     resolve never executes evaluators. execute\n\
      accepts only an already resolved manifest digest and requires --yes."
 }
 
@@ -270,8 +267,6 @@ pub async fn run(args: Vec<String>) -> Result<(), EvaluationCliError> {
     match command {
         "validate" => validate_command(parsed).await,
         "apply" => apply_command(parsed).await,
-        "list" => list_command(parsed).await,
-        "inspect" => inspect_command(parsed).await,
         "resolve" => resolve_command(parsed).await,
         "execute" => execute_command(parsed).await,
         _ => Err(EvaluationCliError::validation(usage())),
@@ -311,83 +306,6 @@ async fn apply_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
         "apply",
         "stored",
         &from_proto_plan(response),
-        None,
-        args.json(),
-    )
-}
-
-async fn list_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
-    args.validate_options(&["--target", "--namespace", "--plan-id"], &["--json"])?;
-    if !args.positionals.is_empty() {
-        return Err(EvaluationCliError::validation(
-            "list accepts no positional arguments",
-        ));
-    }
-    let namespace = args
-        .values
-        .get("--namespace")
-        .ok_or_else(|| EvaluationCliError::validation("list requires --namespace"))?;
-    let channel = connect_sekai(&args.target())
-        .await
-        .map_err(|error| transport_error("connect to evaluation service", error))?;
-    let plans = ChiseiServiceClient::new(channel)
-        .list_evaluation_plans(ListEvaluationPlansRequest {
-            namespace: namespace.clone(),
-            plan_id: args.values.get("--plan-id").cloned().unwrap_or_default(),
-        })
-        .await
-        .map_err(|status| rpc_error("list evaluation plans", status))?
-        .into_inner()
-        .plans
-        .into_iter()
-        .map(from_proto_plan)
-        .collect::<Vec<_>>();
-    if args.json() {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema_version": OUTPUT_SCHEMA,
-                "command": "list",
-                "status": "ok",
-                "plans": plans.iter().map(plan_summary).collect::<Vec<_>>(),
-            }))
-            .map_err(json_error)?
-        );
-    } else if plans.is_empty() {
-        println!("No authorized evaluation plans found.");
-    } else {
-        for plan in &plans {
-            println!(
-                "{}  {}  {}@{}  {} nodes",
-                plan.plan_version_id,
-                plan.content_digest,
-                plan.plan_id,
-                plan.version,
-                plan.nodes.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn inspect_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
-    args.validate_options(&["--target"], &["--json"])?;
-    let plan_version_id = one_positional(&args.positionals, "inspect", "<plan-version-id>")?;
-    validate_exact_id("plan_version_id", &plan_version_id, "evaluation-plan:")?;
-    let channel = connect_sekai(&args.target())
-        .await
-        .map_err(|error| transport_error("connect to evaluation service", error))?;
-    let plan = ChiseiServiceClient::new(channel)
-        .get_evaluation_plan(GetEvaluationPlanRequest { plan_version_id })
-        .await
-        .map_err(|status| rpc_error("inspect evaluation plan", status))?
-        .into_inner()
-        .plan
-        .ok_or_else(|| compatibility_error("inspect response omitted evaluation plan"))?;
-    print_plan_output(
-        "inspect",
-        "found",
-        &from_proto_plan(plan),
         None,
         args.json(),
     )
@@ -673,78 +591,10 @@ async fn validate_live_references(
     let channel = connect_sekai(target)
         .await
         .map_err(|error| transport_error("connect for live validation", error))?;
-    let mut chisei = ChiseiServiceClient::new(channel.clone());
     let mut sekai = SekaiServiceClient::new(channel);
-    let mut definitions = BTreeMap::new();
     let mut invariants = BTreeMap::new();
 
     for node in &plan.nodes {
-        if !definitions.contains_key(&node.evaluator_definition_id) {
-            let record = chisei
-                .get_evaluator_definition(GetEvaluatorDefinitionRequest {
-                    definition_id: node.evaluator_definition_id.clone(),
-                })
-                .await
-                .map_err(|status| rpc_error("validate evaluator definition", status))?
-                .into_inner()
-                .record
-                .ok_or_else(|| {
-                    compatibility_error("evaluator response omitted definition record")
-                })?;
-            let definition = record.definition.ok_or_else(|| {
-                compatibility_error("evaluator record omitted immutable definition")
-            })?;
-            let availability = record
-                .availability
-                .ok_or_else(|| compatibility_error("evaluator record omitted availability"))?;
-            if definition.namespace != plan.namespace {
-                return Err(EvaluationCliError::validation(format!(
-                    "node {:?} selects an evaluator from another namespace",
-                    node.node_id
-                )));
-            }
-            if availability.state != AVAILABILITY_ENABLED {
-                return Err(EvaluationCliError::validation(format!(
-                    "node {:?} selects evaluator {} in state {}",
-                    node.node_id, node.evaluator_definition_id, availability.state
-                )));
-            }
-            definitions.insert(node.evaluator_definition_id.clone(), definition);
-        }
-        let definition = definitions
-            .get(&node.evaluator_definition_id)
-            .expect("definition inserted");
-        if node.classification == NODE_REQUIRED
-            && definition.execution_class == STOCHASTIC_EXECUTION_CLASS
-            && !definition
-                .stochastic_policy
-                .as_ref()
-                .is_some_and(|policy| policy.gate_eligible)
-        {
-            return Err(EvaluationCliError::validation(format!(
-                "node {:?} requires a stochastic evaluator without explicit gate eligibility",
-                node.node_id
-            )));
-        }
-        validate_parameters(&definition.parameter_schema_json, &node.parameters_json).map_err(
-            |error| {
-                EvaluationCliError::validation(format!(
-                    "node {:?} parameters do not match evaluator schema: {error}",
-                    node.node_id
-                ))
-            },
-        )?;
-        for binding in &node.input_bindings {
-            if !definition
-                .supported_input_schemas
-                .contains(&binding.schema_id)
-            {
-                return Err(EvaluationCliError::validation(format!(
-                    "node {:?} binds unsupported input schema {:?}",
-                    node.node_id, binding.schema_id
-                )));
-            }
-        }
         for invariant_id in &node.invariant_version_ids {
             if !invariants.contains_key(invariant_id) {
                 let fact = sekai
@@ -794,21 +644,6 @@ async fn validate_live_references(
                     "invariant {invariant_id} omits its verification contract"
                 ))
             })?;
-            if !definition
-                .supported_predicate_kinds
-                .contains(&verification.predicate_kind)
-                || !definition
-                    .supported_input_schemas
-                    .contains(&verification.input_schema)
-                || !definition
-                    .supported_result_schemas
-                    .contains(&verification.result_schema)
-            {
-                return Err(EvaluationCliError::validation(format!(
-                    "node {:?} evaluator is incompatible with invariant {invariant_id}",
-                    node.node_id
-                )));
-            }
             if !node.input_bindings.iter().any(|binding| {
                 binding.source_kind == "invariant" && binding.schema_id == verification.input_schema
             }) {

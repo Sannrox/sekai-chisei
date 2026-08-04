@@ -13,25 +13,19 @@ This is not an evaluator API. Invariants describe normative meaning,
 applicability, and a verification contract. Chisei evaluation plans select the
 approved evaluator implementations that can satisfy those contracts.
 
-## Apply the fixed profile
+## Public read surface
 
-An authenticated namespace writer calls `ApplyGovernedFactProfile` once:
+The 1.0 wire is intentionally read-oriented. Profile and immutable fact
+versions are established by the governed-data bootstrap and pipeline paths;
+there is no public CRUD endpoint for authoring them. The profile and every fact
+use the existing graph and object-change audit surface rather than a separate
+requirements database.
 
-```text
-namespace = acme
-contract_version = sekai.governed-facts/v1
-```
+`GetGovernedFactVersion` reads one authorized immutable fact version by object
+ID. `ResolveInvariantSet` is the bounded evaluation-facing projection described
+below.
 
-The operation creates one reserved graph object with a fixed definition digest.
-Identical application is idempotent. Callers cannot submit a custom profile,
-schema, executable predicate, or lifecycle rule.
-
-The profile and every fact use the existing graph and object-change audit
-surface. There is no separate requirements database or new persistence table.
-
-## Publish immutable versions
-
-`PutGovernedFactVersion` accepts `fact_type = requirement | invariant`.
+Each version binds:
 
 Every version binds:
 
@@ -50,10 +44,9 @@ Requirements cannot carry invariant verification fields. Invariants may not
 embed code, expressions, provider configuration, or an evaluator selection.
 
 The first version has no predecessor. Every later version of the same logical
-fact must name the exact current version in `supersedes_object_id`. The original
-object remains readable through `GetGovernedFactVersion`; generic object CRUD,
-listing, traversal, update, and deletion hide or reject these reserved objects.
-Conflicting replay and branching histories fail closed.
+fact names the exact current version in `supersedes_object_id`. Generic object
+CRUD, listing, traversal, update, and deletion hide or reject these reserved
+objects. Conflicting replay and branching histories fail closed.
 
 An `active` version participates in set resolution. A `retired` successor
 supersedes the prior version but is not returned as an applicable normative
@@ -63,22 +56,6 @@ Evidence references are exact IDs of projected `external_evidence` graph
 objects, not external URLs, payloads, or credentials. The writer must be
 authorized to read every referenced requirement, predecessor, and evidence
 object.
-
-## Governed waivers
-
-`PutGovernedWaiverVersion` stores an independently versioned exception fact.
-A waiver binds:
-
-- exact invariant-version IDs;
-- subject-profile and optional exact-subject applicability;
-- an explicit validity interval;
-- bounded rationale and provenance;
-- exact evidence references; and
-- optional exact supersession.
-
-Expired waivers remain historically readable but are not included in a set
-resolved outside their validity interval. A waiver is evidence for later
-evaluation-plan resolution; it does not itself grant an allow decision.
 
 ## Resolve an authorized invariant set
 

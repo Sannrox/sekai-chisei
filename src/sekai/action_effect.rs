@@ -44,12 +44,6 @@ pub const ACK_OUTCOME_COMPLETED: &str = "completed";
 pub const ACK_OUTCOME_FAILED: &str = "failed";
 pub const ACK_OUTCOME_PARKED: &str = "parked";
 
-/// Versioned, read-only pressure projection for external worker-pool managers.
-pub const RUNTIME_WORK_PRESSURE_CONTRACT_VERSION: &str = "sekai.runtime-work-pressure/v1";
-pub const RUNTIME_WORK_PRESSURE_STATUS_CURRENT: &str = "current";
-pub const RUNTIME_WORK_PRESSURE_STATUS_DEGRADED: &str = "degraded";
-pub const RUNTIME_WORK_PRESSURE_STATUS_UNKNOWN: &str = "unknown";
-
 const MAX_CLAIM_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_CLAIM_TTL_MS: i64 = 60_000;
 
@@ -105,114 +99,6 @@ pub struct ActionEffect {
     pub max_lease_expiries: u32,
     #[serde(default)]
     pub max_park_cycles: u32,
-}
-
-/// Bounded, payload-free pressure for one namespace/runtime scope.
-///
-/// The projection is intentionally separate from [`ActionEffect`]. It contains
-/// no effect, operation, or task identifiers and is computed by the storage
-/// backend with aggregate queries so large queues are never materialized in
-/// the control-plane process.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeWorkPressure {
-    pub contract_version: String,
-    pub schema_version: u32,
-    pub namespace: String,
-    pub runtime_id: String,
-    pub sampled_at_ms: i64,
-    /// current | degraded | unknown
-    pub sample_status: String,
-    /// Fixed machine-readable reason when the sample is not authoritative.
-    pub degraded_reason: String,
-    pub authoritative: bool,
-    pub approximate: bool,
-    pub claimable_count: u64,
-    pub oldest_claimable_age_ms: u64,
-    pub active_claim_count: u64,
-    pub expired_claim_count: u64,
-    pub parked_count: u64,
-    pub failed_count: u64,
-    pub dead_lettered_count: u64,
-}
-
-impl RuntimeWorkPressure {
-    pub fn validate_scope(namespace: &str, runtime_id: &str) -> Result<(), String> {
-        validate_no_nul("namespace", namespace)?;
-        validate_no_nul("runtime_id", runtime_id)?;
-        if namespace.trim().is_empty() {
-            return Err("namespace required".into());
-        }
-        if runtime_id_is_blank(runtime_id) {
-            return Err("runtime_id required".into());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn from_aggregate(
-        namespace: &str,
-        runtime_id: &str,
-        sampled_at_ms: i64,
-        aggregate: RuntimeWorkPressureAggregate,
-    ) -> Self {
-        let oldest_claimable_age_ms = aggregate
-            .oldest_claimable_created_at_ms
-            .map(|created_at_ms| sampled_at_ms.saturating_sub(created_at_ms).max(0) as u64)
-            .unwrap_or(0);
-        Self {
-            contract_version: RUNTIME_WORK_PRESSURE_CONTRACT_VERSION.into(),
-            schema_version: 1,
-            namespace: namespace.into(),
-            runtime_id: runtime_id.into(),
-            sampled_at_ms,
-            sample_status: RUNTIME_WORK_PRESSURE_STATUS_CURRENT.into(),
-            degraded_reason: String::new(),
-            authoritative: true,
-            approximate: false,
-            claimable_count: aggregate.claimable_count,
-            oldest_claimable_age_ms,
-            active_claim_count: aggregate.active_claim_count,
-            expired_claim_count: aggregate.expired_claim_count,
-            parked_count: aggregate.parked_count,
-            failed_count: aggregate.failed_count,
-            dead_lettered_count: aggregate.dead_lettered_count,
-        }
-    }
-
-    pub fn unknown(namespace: &str, runtime_id: &str, sampled_at_ms: i64, reason: &str) -> Self {
-        Self {
-            contract_version: RUNTIME_WORK_PRESSURE_CONTRACT_VERSION.into(),
-            schema_version: 1,
-            namespace: namespace.into(),
-            runtime_id: runtime_id.into(),
-            sampled_at_ms,
-            sample_status: RUNTIME_WORK_PRESSURE_STATUS_UNKNOWN.into(),
-            degraded_reason: reason.into(),
-            authoritative: false,
-            approximate: false,
-            claimable_count: 0,
-            oldest_claimable_age_ms: 0,
-            active_claim_count: 0,
-            expired_claim_count: 0,
-            parked_count: 0,
-            failed_count: 0,
-            dead_lettered_count: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RuntimeWorkPressureAggregate {
-    pub(crate) claimable_count: u64,
-    pub(crate) oldest_claimable_created_at_ms: Option<i64>,
-    pub(crate) active_claim_count: u64,
-    pub(crate) expired_claim_count: u64,
-    pub(crate) parked_count: u64,
-    pub(crate) failed_count: u64,
-    pub(crate) dead_lettered_count: u64,
-}
-
-pub(crate) fn aggregate_count(value: i64) -> u64 {
-    value.max(0) as u64
 }
 
 fn json_value_contains_nul(value: &serde_json::Value) -> bool {
@@ -636,15 +522,15 @@ impl ActionEffect {
     /// Validate an effect loaded from the durable store before a lifecycle
     /// transition. Legacy rows may contain NUL-bearing JSON strings; keeping
     /// this path permissive lets claim/heartbeat/ack advance them while the
-    /// PostgreSQL compatibility marker remains false and pressure stays
-    /// fail-closed.
+    /// Legacy rows may still contain NUL-bearing JSON strings; lifecycle
+    /// updates keep the existing fence checks while preserving those values.
     pub(crate) fn validate_for_lifecycle_update(&self) -> Result<(), String> {
         self.validate_structure(false).map(|_| ())
     }
 
     /// Permit a lifecycle call to finish a claim that was created before the
     /// NUL boundary was enforced. The exact owner/fence pair is still required
-    /// and the effect remains pressure-incompatible until a clean rewrite.
+    /// and the effect remains marked as a legacy payload until a clean rewrite.
     pub(crate) fn legacy_claim_fence_matches(&self, runtime_id: &str, fencing_token: &str) -> bool {
         self.legacy_claim_identity_matches(runtime_id, fencing_token)
             && self.status == EFFECT_STATUS_CLAIMED
@@ -1019,22 +905,6 @@ impl SekaiDb {
                 ON sekai_action_effects(kind, status);
             CREATE INDEX IF NOT EXISTS idx_action_effects_ns
                 ON sekai_action_effects(namespace, created_at_ms DESC);
-            CREATE INDEX IF NOT EXISTS idx_action_effects_pressure_runtime_prefix
-                ON sekai_action_effects(
-                    namespace,
-                    kind,
-                    substr(
-                        CASE
-                            WHEN json_type(payload_json, '$.runtime') = 'text'
-                            AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
-                            THEN json_extract(payload_json, '$.runtime')
-                            ELSE 'default'
-                        END,
-                        1,
-                        128
-                    ),
-                    created_at_ms
-                );
             CREATE TABLE IF NOT EXISTS sekai_action_work_parks (
                 park_id TEXT PRIMARY KEY,
                 effect_id TEXT NOT NULL,
@@ -1321,90 +1191,6 @@ impl SekaiDb {
             }
         }
         Ok(out)
-    }
-
-    /// Aggregate pressure for one namespace/runtime without loading effect
-    /// bodies or task payloads into the process.
-    pub fn runtime_work_pressure(
-        &self,
-        namespace: &str,
-        runtime_id: &str,
-        sampled_at_ms: i64,
-    ) -> Result<RuntimeWorkPressure, String> {
-        RuntimeWorkPressure::validate_scope(namespace, runtime_id)?;
-        self.migrate_action_effects()?;
-        let conn = self.conn();
-        let aggregate = conn
-            .query_row(
-                "SELECT
-                    COALESCE(SUM(CASE
-                        WHEN status = 'pending'
-                          OR (status = 'claimed'
-                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
-                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4)
-                        THEN 1 ELSE 0 END), 0),
-                    MIN(CASE
-                        WHEN status = 'pending'
-                          OR (status = 'claimed'
-                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
-                              AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4)
-                        THEN created_at_ms END),
-                    COALESCE(SUM(CASE
-                        WHEN status = 'claimed'
-                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > ?4
-                        THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE
-                        WHEN status = 'claimed'
-                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) > 0
-                         AND COALESCE(CAST(json_extract(body_json, '$.claim_expires_at_ms') AS INTEGER), 0) <= ?4
-                        THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status = 'parked' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN status = 'dead_lettered' THEN 1 ELSE 0 END), 0)
-                 FROM sekai_action_effects
-                 WHERE namespace = ?1
-                   AND kind = ?2
-                   AND substr(
-                         CASE
-                             WHEN json_type(payload_json, '$.runtime') = 'text'
-                              AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
-                             THEN json_extract(payload_json, '$.runtime')
-                             ELSE 'default'
-                         END,
-                         1,
-                         128
-                       ) = substr(?3, 1, 128)
-                   AND CASE
-                         WHEN json_type(payload_json, '$.runtime') = 'text'
-                          AND trim(json_extract(payload_json, '$.runtime'), char(9) || char(10) || char(11) || char(12) || char(13) || char(32)) <> ''
-                         THEN json_extract(payload_json, '$.runtime')
-                         ELSE 'default'
-                       END = ?3",
-                params![
-                    namespace,
-                    EFFECT_KIND_RUNTIME_DISPATCH,
-                    runtime_id,
-                    sampled_at_ms,
-                ],
-                |row| {
-                    Ok(RuntimeWorkPressureAggregate {
-                        claimable_count: aggregate_count(row.get::<_, i64>(0)?),
-                        oldest_claimable_created_at_ms: row.get(1)?,
-                        active_claim_count: aggregate_count(row.get::<_, i64>(2)?),
-                        expired_claim_count: aggregate_count(row.get::<_, i64>(3)?),
-                        parked_count: aggregate_count(row.get::<_, i64>(4)?),
-                        failed_count: aggregate_count(row.get::<_, i64>(5)?),
-                        dead_lettered_count: aggregate_count(row.get::<_, i64>(6)?),
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(RuntimeWorkPressure::from_aggregate(
-            namespace,
-            runtime_id,
-            sampled_at_ms,
-            aggregate,
-        ))
     }
 
     pub fn claim_action_work(
@@ -2616,168 +2402,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_work_pressure_is_runtime_scoped_and_aggregate_only() {
-        let db = SekaiDb::new(":memory:").unwrap();
-        let ready = plan_effects_for_admit(
-            "ai-ready",
-            "acme",
-            "op-ready",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            100,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let other_runtime = plan_effects_for_admit(
-            "ai-other",
-            "acme",
-            "op-other",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"other"}"#,
-            50,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut active = plan_effects_for_admit(
-            "ai-active",
-            "acme",
-            "op-active",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            200,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut expired = plan_effects_for_admit(
-            "ai-expired",
-            "acme",
-            "op-expired",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            300,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut unleased = plan_effects_for_admit(
-            "ai-unleased",
-            "acme",
-            "op-unleased",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            320,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut parked = plan_effects_for_admit(
-            "ai-parked",
-            "acme",
-            "op-parked",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            350,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut failed = plan_effects_for_admit(
-            "ai-failed",
-            "acme",
-            "op-failed",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            360,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-        let mut dead_lettered = plan_effects_for_admit(
-            "ai-dead",
-            "acme",
-            "op-dead",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"shikigami"}"#,
-            370,
-            false,
-        )
-        .unwrap()
-        .remove(0);
-
-        active.claim_owner = "shikigami".into();
-        active.claim_generation = 1;
-        active.claim_fencing_token = "active-fence".into();
-        active.claim_expires_at_ms = 1_000;
-        active.status = EFFECT_STATUS_CLAIMED.into();
-        active.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
-        expired.claim_owner = "shikigami".into();
-        expired.claim_generation = 1;
-        expired.claim_fencing_token = "expired-fence".into();
-        expired.claim_expires_at_ms = 400;
-        expired.status = EFFECT_STATUS_CLAIMED.into();
-        expired.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
-        unleased.status = EFFECT_STATUS_CLAIMED.into();
-        unleased.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
-        parked.status = EFFECT_STATUS_PARKED.into();
-        parked.lifecycle_state = EFFECT_LIFECYCLE_AWAITING_CONTINUATION.into();
-        failed.status = EFFECT_STATUS_FAILED.into();
-        failed.lifecycle_state = EFFECT_LIFECYCLE_FAILED.into();
-        dead_lettered.status = EFFECT_STATUS_DEAD_LETTERED.into();
-        dead_lettered.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
-
-        db.put_action_effects(&[
-            ready.clone(),
-            other_runtime,
-            active.clone(),
-            expired.clone(),
-            unleased,
-            parked.clone(),
-            failed.clone(),
-            dead_lettered.clone(),
-        ])
-        .unwrap();
-
-        let pressure = db.runtime_work_pressure("acme", "shikigami", 500).unwrap();
-        assert_eq!(
-            pressure.contract_version,
-            RUNTIME_WORK_PRESSURE_CONTRACT_VERSION
-        );
-        assert_eq!(pressure.schema_version, 1);
-        assert_eq!(pressure.sample_status, RUNTIME_WORK_PRESSURE_STATUS_CURRENT);
-        assert!(pressure.authoritative);
-        assert!(!pressure.approximate);
-        assert_eq!(pressure.claimable_count, 2);
-        assert_eq!(pressure.oldest_claimable_age_ms, 400);
-        assert_eq!(pressure.active_claim_count, 1);
-        assert_eq!(pressure.expired_claim_count, 1);
-        assert_eq!(pressure.parked_count, 1);
-        assert_eq!(pressure.failed_count, 1);
-        assert_eq!(pressure.dead_lettered_count, 1);
-
-        let other_pressure = db.runtime_work_pressure("acme", "other", 500).unwrap();
-        assert_eq!(other_pressure.claimable_count, 1);
-        assert_eq!(other_pressure.oldest_claimable_age_ms, 450);
-        assert_eq!(other_pressure.active_claim_count, 0);
-        assert_eq!(other_pressure.parked_count, 0);
-    }
-
-    #[test]
-    fn runtime_work_pressure_rejects_unscoped_runtime() {
-        assert!(RuntimeWorkPressure::validate_scope("acme", "").is_err());
-        assert!(RuntimeWorkPressure::validate_scope("acme", "\t").is_err());
-        assert!(RuntimeWorkPressure::validate_scope("acme", "\u{000b}").is_err());
-        assert!(RuntimeWorkPressure::validate_scope("acme", "\0").is_err());
-        // Runtime selectors preserve the identifiers accepted by the existing
-        // list/claim APIs, including spaces and long deployment-generated ids.
-        assert!(RuntimeWorkPressure::validate_scope("acme", "runtime id").is_ok());
-        assert!(RuntimeWorkPressure::validate_scope("acme", &"r".repeat(512)).is_ok());
-        assert!(RuntimeWorkPressure::validate_scope("acme", "\u{2003}").is_ok());
-    }
-
-    #[test]
     fn unicode_runtime_filter_is_not_a_wildcard() {
         let db = SekaiDb::new(":memory:").unwrap();
         let unicode_runtime = "\u{2003}";
@@ -3044,49 +2668,6 @@ mod tests {
                 .contains("\"large\":9007199254740993.0")
         );
         assert!(!json_contains_duplicate_keys(&migrated.payload_json).unwrap());
-    }
-
-    #[test]
-    fn blank_runtime_targets_default_pressure_scope() {
-        let effects = plan_effects_for_admit(
-            "blank-runtime",
-            "acme",
-            "op-blank-runtime",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            r#"{"runtime":"\t\n"}"#,
-            10,
-            false,
-        )
-        .unwrap();
-        let payload: serde_json::Value = serde_json::from_str(&effects[0].payload_json).unwrap();
-        assert_eq!(payload["runtime"], "default");
-
-        let db = SekaiDb::new(":memory:").unwrap();
-        let mut legacy_effect = effects[0].clone();
-        legacy_effect.payload_json = r#"{"runtime":"\t\n"}"#.into();
-        db.put_action_effects(&[legacy_effect]).unwrap();
-        let pressure = db.runtime_work_pressure("acme", "default", 100).unwrap();
-        assert_eq!(pressure.claimable_count, 1);
-    }
-
-    #[test]
-    fn long_runtime_ids_remain_pressure_addressable() {
-        let runtime = "r".repeat(4_096);
-        let parameters = serde_json::json!({"runtime": runtime}).to_string();
-        let effects = plan_effects_for_admit(
-            "long-runtime",
-            "acme",
-            "op-long-runtime",
-            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            &parameters,
-            10,
-            false,
-        )
-        .unwrap();
-        let db = SekaiDb::new(":memory:").unwrap();
-        db.put_action_effects(&effects).unwrap();
-        let pressure = db.runtime_work_pressure("acme", &runtime, 100).unwrap();
-        assert_eq!(pressure.claimable_count, 1);
     }
 
     #[test]

@@ -14,11 +14,11 @@ use sha2::Digest;
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
-use super::llm_service::{
-    estimate_chat_request, execute_native_chat_request, execute_native_chat_request_stream,
-};
 use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
+use super::provider_execution::{
+    ProviderExecutionRequest, estimate_chat_request, execute_native_chat_request_stream,
+};
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;
 use crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION;
@@ -32,9 +32,7 @@ use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{ContextAdmissionAction, Policy, PolicyResolver};
-use crate::chisei::portfolio::{
-    Objective, ObjectiveMode, Observation, PortfolioStore, TaskDemand as PortfolioDemand,
-};
+use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::chisei::promotion::CandidateStore;
 use crate::chisei::receipt::{
@@ -63,7 +61,6 @@ pub struct ChiseiServiceImpl {
     portfolio: Arc<PortfolioStore>,
     planned_executions: Arc<Mutex<HashMap<String, CachedExecutionPlan>>>,
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
-    evolve_enhancements: Arc<Mutex<HashMap<String, String>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
@@ -81,6 +78,11 @@ struct CachedExecutionPlan {
     enterprise_authority: Option<String>,
 }
 
+struct BoundGunshiAllocation {
+    issuance_id: String,
+    plan: crate::chisei::gunshi::AllocationPlan,
+}
+
 struct EvaluationExecutionRuntime<'a> {
     deterministic_registry: &'a evaluation_execution_domain::DeterministicEvaluatorRegistry,
     stochastic_registry: &'a evaluation_execution_domain::StochasticEvaluatorRegistry,
@@ -91,7 +93,6 @@ struct EvaluationExecutionRuntime<'a> {
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
-const WORKER_POLICY_KIND: &str = "worker_policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
@@ -524,49 +525,6 @@ fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
     }
 }
 
-fn authorize_statistics_namespaces(
-    db: &RuntimeDb,
-    actor: &str,
-    namespaces: &[String],
-) -> Result<(), Status> {
-    if matches!(actor, "root" | "local") {
-        return Ok(());
-    }
-    for namespace in namespaces {
-        let mut targets = Vec::new();
-        for prefix in ["namespace", "project", "policy"] {
-            if let Some(target) = db
-                .find_by_external_id(&format!("{prefix}:{namespace}"))
-                .map_err(Status::internal)?
-            {
-                targets.push(target);
-            }
-        }
-        if targets.is_empty() {
-            return Err(Status::permission_denied(
-                "namespace statistics access is not authorized",
-            ));
-        }
-        let mut explicitly_authorized = false;
-        for target in targets {
-            let grants = db.list_grants(&target.id).map_err(Status::internal)?;
-            let actor_has_grant = grants.iter().any(|grant| grant.principal == actor);
-            if !grants.is_empty() && !actor_has_grant {
-                return Err(Status::permission_denied(
-                    "namespace statistics access is not authorized",
-                ));
-            }
-            explicitly_authorized |= actor_has_grant;
-        }
-        if !explicitly_authorized {
-            return Err(Status::permission_denied(
-                "namespace statistics access is not authorized",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> Result<(), Status> {
     let actor = authenticated_actor(request);
     if matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
@@ -579,32 +537,6 @@ fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> Result<(), S
     } else {
         Err(Status::permission_denied(
             "evaluation reads require an authorized service principal",
-        ))
-    }
-}
-
-fn require_control_plane_admin<T>(request: &Request<T>, mutation: &str) -> Result<(), Status> {
-    if matches!(authenticated_actor(request).as_str(), "root" | "local") {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(format!(
-            "{mutation} requires control-plane administration"
-        )))
-    }
-}
-
-fn require_telemetry_writer<T>(request: &Request<T>, config: &Config) -> Result<String, Status> {
-    let actor = authenticated_actor(request);
-    let allowed = matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-        || config
-            .gateway_receipt_principals
-            .iter()
-            .any(|principal| principal == &actor);
-    if allowed {
-        Ok(actor)
-    } else {
-        Err(Status::permission_denied(
-            "telemetry ingestion requires an authorized service principal",
         ))
     }
 }
@@ -622,6 +554,16 @@ fn require_telemetry_reader<T>(request: &Request<T>, config: &Config) -> Result<
         Err(Status::permission_denied(
             "telemetry readback requires an authorized service principal",
         ))
+    }
+}
+
+fn require_control_plane_admin<T>(request: &Request<T>, mutation: &str) -> Result<(), Status> {
+    if matches!(authenticated_actor(request).as_str(), "root" | "local") {
+        Ok(())
+    } else {
+        Err(Status::permission_denied(format!(
+            "{mutation} requires control-plane administration"
+        )))
     }
 }
 
@@ -931,6 +873,174 @@ fn external_budget_scope(request: &external::ExternalActionRequest) -> String {
         "project:{}/agent:{}/external-action:{}",
         request.namespace, request.actor, request.risk_class
     )
+}
+
+fn issue_external_permit(
+    service: &ChiseiServiceImpl,
+    authorization: &external::AuthorizationRecord,
+    actor: &str,
+    idempotency_key: &str,
+    offline: bool,
+) -> Result<permit::Permit, Status> {
+    if idempotency_key.trim().is_empty() {
+        return Err(Status::invalid_argument("idempotency_key required"));
+    }
+    if actor != authorization.request.actor && !matches!(actor, "root" | "local") {
+        return Err(Status::permission_denied("permit issuance denied"));
+    }
+    require_namespace_write_access(&service.db, actor, &authorization.request.namespace)?;
+    if let Some(value) = service
+        .db
+        .replay_permit(&authorization.decision.authorization_id, idempotency_key)
+        .map_err(|error| {
+            if error.contains("different idempotency") {
+                Status::already_exists(error)
+            } else {
+                Status::internal(error)
+            }
+        })?
+    {
+        let requested_mode = if offline {
+            permit::OFFLINE_REDEMPTION_MODE
+        } else {
+            permit::REDEMPTION_MODE
+        };
+        if value.redemption_mode != requested_mode {
+            return Err(Status::already_exists(
+                "authorization already issued with a different redemption mode",
+            ));
+        }
+        return Ok(value);
+    }
+    let key = permit_signing_key(&service.config)?;
+    let approvals = if authorization.approval_status == "approved" {
+        vec![authorization.decision_actor.clone()]
+    } else {
+        Vec::new()
+    };
+    let issuance = permit::Issuance {
+        approval_identities: approvals,
+        issuer: &service.config.permit_issuer,
+        key_id: &service.config.permit_key_id,
+        permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
+        nonce: uuid::Uuid::new_v4().simple().to_string(),
+        now_ms: chrono::Utc::now().timestamp_millis(),
+        site_id: &service.config.site_id,
+    };
+    let value = if offline {
+        let policy = service
+            .db
+            .get_external_permit_policy(&authorization.decision.policy_scope)
+            .map_err(Status::internal)?;
+        permit::issue_offline(authorization, &policy, &key, issuance)
+    } else {
+        permit::issue(authorization, &key, issuance)
+    }
+    .map_err(Status::failed_precondition)?;
+    service
+        .db
+        .put_permit(&value, idempotency_key, actor)
+        .map_err(|error| {
+            if error.contains("different idempotency") {
+                Status::already_exists(error)
+            } else {
+                Status::internal(error)
+            }
+        })
+}
+
+fn persist_gateway_operation_receipt(
+    service: &ChiseiServiceImpl,
+    receipt_json: &str,
+    authenticated_principal: &str,
+) -> Result<(), Status> {
+    let receipt: OperationReceipt = serde_json::from_str(receipt_json)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let completeness = receipt.completeness();
+    if !completeness.complete {
+        return Err(Status::invalid_argument(format!(
+            "gateway receipt is incomplete: missing={:?} errors={:?}",
+            completeness.missing_surfaces, completeness.errors
+        )));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let has_kioku_context = receipt.events.iter().any(|receipt_event| {
+        receipt_event.kind == ReceiptEventKind::ContextGoverned
+            && receipt_event
+                .references
+                .iter()
+                .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
+    }) || !service
+        .db
+        .list_kioku_outcome_assignments(&receipt.operation_id)
+        .map_err(Status::internal)?
+        .is_empty();
+    let existing = service
+        .db
+        .get_operation_receipt(&receipt.operation_id)
+        .map_err(Status::internal)?;
+    if existing
+        .as_ref()
+        .is_some_and(|existing| existing != &receipt)
+    {
+        return Err(Status::already_exists(
+            "operation receipt already exists with different evidence",
+        ));
+    }
+    if existing.is_none() && has_kioku_context {
+        record_reported_memory_outcomes(
+            &service.db,
+            &receipt,
+            authenticated_principal,
+            now,
+            false,
+            None,
+            true,
+        )
+        .map_err(|error| {
+            Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
+        })?;
+    }
+    service
+        .db
+        .put_operation_receipt(&receipt)
+        .map_err(Status::internal)?;
+    if existing.is_none()
+        && has_kioku_context
+        && let Err(error) = record_reported_memory_outcomes(
+            &service.db,
+            &receipt,
+            authenticated_principal,
+            now,
+            false,
+            None,
+            false,
+        )
+    {
+        let _ = service.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now,
+            actor: "chisei.kioku".into(),
+            action: "kioku.outcome_attribution".into(),
+            reason: error,
+            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
+            target_id: receipt.operation_id.clone(),
+            outcome: "failed".into(),
+        });
+    }
+    service
+        .db
+        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+            id: format!("{}:gateway-receipt", receipt.operation_id),
+            timestamp: now,
+            actor: authenticated_principal.into(),
+            action: GATEWAY_RECEIPT_ACTION.into(),
+            reason: "gateway operation completed".into(),
+            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
+            target_id: receipt.operation_id,
+            outcome: "recorded".into(),
+        }])
+        .map_err(Status::internal)
 }
 
 fn release_external_reservations(
@@ -1349,19 +1459,6 @@ fn estimate_context_tokens(system: &str, messages: &[ChatMessage]) -> u64 {
     context_bytes(system, messages).div_ceil(4)
 }
 
-fn epistemic_statistics_values(
-    values: BTreeMap<String, i64>,
-    label: &str,
-) -> Vec<OperationStatisticValue> {
-    values
-        .into_iter()
-        .map(|(bucket, value)| OperationStatisticValue {
-            labels: HashMap::from([(label.to_string(), bucket)]),
-            value,
-        })
-        .collect()
-}
-
 fn memory_lifecycle_allows_execution(
     state: crate::chisei::kioku::MemoryLifecycleState,
     expires_at_ms: Option<i64>,
@@ -1561,26 +1658,6 @@ fn receipt_event(
         references: Vec::new(),
         attributes,
     }
-}
-
-fn record_completed_operation_on(
-    db: &RuntimeDb,
-    plan: &ExecutionPlan,
-    actor: &str,
-    response: &PlannedChatResponse,
-    attempt_started_at_ms: i64,
-    completed_at_ms: i64,
-) -> Result<(), String> {
-    record_completed_operation_on_with_path(
-        db,
-        plan,
-        actor,
-        response,
-        attempt_started_at_ms,
-        completed_at_ms,
-        None,
-        None,
-    )
 }
 
 /// Complete an operation that was fully answered by structured lookup (#281).
@@ -1824,7 +1901,7 @@ fn record_completed_operation_on_with_path(
     Ok(())
 }
 
-/// Result of the post-authz lookup-first attempt on ExecutePlan.
+/// Result of the post-authz lookup-first attempt on ExecutePlanStream.
 #[derive(Debug)]
 enum ExecuteLookupFirst {
     /// Full structured answer; caller must return without a provider call.
@@ -2010,13 +2087,28 @@ struct EvidenceClassGate {
     effective_allowed: bool,
 }
 
+struct GatewayPipelineInput<'a> {
+    actor: &'a str,
+    delegated_principal: Option<&'a str>,
+    request_id: &'a str,
+    namespace: &'a str,
+    spec: &'a str,
+    model: &'a str,
+    runtime: &'a str,
+    task_class: &'a str,
+}
+
+struct GatewayPipelineDecision {
+    run: pipe::RunResult,
+    sampling: crate::chisei::sampling::SamplingDecision,
+}
+
 struct FinishStreamedExecution<'a> {
     db: &'a RuntimeDb,
     evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     request_id: &'a str,
     namespace: &'a str,
     enriched_spec: &'a str,
-    original_spec: Option<&'a str>,
     resolved_model: &'a str,
     sampled: bool,
     sample_rate: f64,
@@ -2030,7 +2122,6 @@ struct EvolveTaskRecord<'a> {
     request_id: &'a str,
     namespace: &'a str,
     spec: &'a str,
-    original_spec: Option<&'a str>,
     status: &'a str,
     tokens_used: i32,
 }
@@ -2052,14 +2143,12 @@ fn record_evolve_task_on(
             status: task.status.to_string(),
             namespace: task.namespace.to_string(),
             tokens_used: task.tokens_used,
-            original_spec: task.original_spec.map(ToOwned::to_owned),
             created: chrono::Utc::now().timestamp(),
         });
     entry.namespace = task.namespace.to_string();
     entry.spec = task.spec.to_string();
     entry.status = task.status.to_string();
     entry.tokens_used = task.tokens_used;
-    entry.original_spec = task.original_spec.map(ToOwned::to_owned);
     db.put_evolve_task(entry)?;
     Ok(())
 }
@@ -2071,7 +2160,6 @@ fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), 
             request_id: execution.request_id,
             namespace: execution.namespace,
             spec: execution.enriched_spec,
-            original_spec: execution.original_spec,
             status: "done",
             tokens_used: execution.response.input_tokens + execution.response.output_tokens,
         },
@@ -2151,35 +2239,6 @@ fn persist_namespace_policy(
             kind: POLICY_KIND.to_string(),
             name: namespace.to_string(),
             namespace: namespace.to_string(),
-            external_id,
-            properties,
-            created: now,
-            updated: now,
-        })
-    }
-}
-
-fn persist_namespace_worker_policy(
-    db: &RuntimeDb,
-    namespace: &str,
-    contention_scope_id: &str,
-) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp_millis();
-    let external_id = format!("{WORKER_POLICY_KIND}:{namespace}");
-    let properties = HashMap::from([
-        ("namespace".into(), namespace.into()),
-        ("contention_scope_id".into(), contention_scope_id.into()),
-    ]);
-    if let Some(mut existing) = db.find_by_external_id(&external_id)? {
-        existing.properties = properties;
-        existing.updated = now;
-        db.update_object(&existing)
-    } else {
-        db.create_object(&Object {
-            id: format!("{WORKER_POLICY_KIND}-{namespace}"),
-            kind: WORKER_POLICY_KIND.into(),
-            name: namespace.into(),
-            namespace: namespace.into(),
             external_id,
             properties,
             created: now,
@@ -3936,7 +3995,43 @@ fn resolve_evaluation_manifest_live(
     Ok(evaluation_manifest_domain::resolved_outcome(manifest))
 }
 
+/// Complete result used by local embedding/test callers of the streaming path.
+/// This is intentionally not part of the public gRPC contract.
+#[derive(Debug)]
+pub struct LocalExecutionResponse {
+    pub response: Option<PlannedChatResponse>,
+    pub executed_at: i64,
+}
+
 impl ChiseiServiceImpl {
+    /// Internal test/embedding adapter for the streaming-only execution path.
+    /// The public gRPC contract exposes `ExecutePlanStream`; this helper is not
+    /// a service method and exists only for local callers that need a complete
+    /// response in one future.
+    pub async fn execute_plan(
+        &self,
+        req: Request<ExecutePlanRequest>,
+    ) -> Result<Response<LocalExecutionResponse>, Status> {
+        let mut stream = <Self as ChiseiService>::execute_plan_stream(self, req)
+            .await?
+            .into_inner();
+        let mut response = None;
+        let mut executed_at = 0;
+        while let Some(event) = stream.next().await {
+            let event = event?;
+            executed_at = event.executed_at;
+            if event.response.is_some() {
+                response = event.response;
+            }
+        }
+        let response =
+            response.ok_or_else(|| Status::internal("execution stream omitted response"))?;
+        Ok(Response::new(LocalExecutionResponse {
+            response: Some(response),
+            executed_at,
+        }))
+    }
+
     pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
         Self::new_with_evaluator_registries(
             db,
@@ -3987,9 +4082,6 @@ impl ChiseiServiceImpl {
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
-        let evolve_enhancements = Arc::new(Mutex::new(
-            db.list_evolve_enhancements().unwrap_or_default(),
-        ));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         Self {
@@ -4000,7 +4092,6 @@ impl ChiseiServiceImpl {
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
-            evolve_enhancements,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
             evaluator_registry,
@@ -4962,6 +5053,88 @@ impl ChiseiServiceImpl {
             .map_err(Status::internal)
     }
 
+    fn gateway_pipeline_decision(
+        &self,
+        input: GatewayPipelineInput<'_>,
+    ) -> Result<GatewayPipelineDecision, Status> {
+        let context_actor = execution_context_actor(
+            &self.db,
+            &self.config,
+            input.actor,
+            input.delegated_principal,
+            input.namespace,
+        )?;
+        let context_admission_policy = self
+            .policy
+            .context_admission_policy(input.namespace)
+            .map_err(Status::failed_precondition)?;
+        let mut request = pipe::PipelineRequest {
+            request_id: input.request_id.to_string(),
+            namespace: input.namespace.to_string(),
+            spec: input.spec.to_string(),
+            model: input.model.to_string(),
+            runtime: input.runtime.to_string(),
+            task_type: "gateway_llm_call".into(),
+            priority: 0,
+            risk_score: 0.0,
+            budget_pressure: self.budget.namespace_pressure(input.namespace),
+            review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
+            template_only: TaskClass::parse(input.task_class) == TaskClass::TemplateOnly,
+            expanded_context_items: 0,
+            evidence_references: vec![],
+            memory_references: vec![],
+            memory_holdouts: vec![],
+            memory_actor: context_actor,
+            memory_assignment_id: String::new(),
+            memory_token_budget: 512,
+            allowed_evidence_classes: HashSet::new(),
+            context_admission_policy,
+            context_admission: pipe::ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
+        };
+        let context_expansion_gate = self.pipeline_context_expansion_gate(input.namespace);
+        let evidence_context_gates =
+            self.applicable_evidence_context_gates(&request, context_expansion_gate.allowed)?;
+        let allowed_evidence_classes = evidence_context_gates
+            .iter()
+            .filter(|class_gate| class_gate.effective_allowed)
+            .map(|class_gate| pipe::EvidenceContextClass {
+                source_type: class_gate.source_type.clone(),
+                evidence_type: class_gate.evidence_type.clone(),
+            })
+            .collect::<HashSet<_>>();
+        let run = self.pipeline.run_with_context_admission(
+            &mut request,
+            &self.db,
+            context_expansion_gate.allowed,
+            allowed_evidence_classes,
+        );
+        self.record_context_expansion_gate(
+            input.request_id,
+            input.namespace,
+            &context_expansion_gate,
+            run.expanded_context_items,
+        )?;
+        self.record_evidence_context_gates(
+            input.request_id,
+            input.namespace,
+            &evidence_context_gates,
+            &run.evidence_references,
+        )?;
+        let sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
+            crate::chisei::sampling::SamplingDecision {
+                sampled: false,
+                effective_rate: self.config.sample_rate,
+                reason: "not_sampled".into(),
+            },
+        );
+        Ok(GatewayPipelineDecision { run, sampling })
+    }
+
     /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
     /// and config — so emitted runs are visible to live regression checks immediately.
     pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
@@ -5042,9 +5215,6 @@ impl ChiseiServiceImpl {
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
-        let evolve_enhancements = Arc::new(Mutex::new(
-            db.list_evolve_enhancements().unwrap_or_default(),
-        ));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
         Self {
@@ -5055,7 +5225,6 @@ impl ChiseiServiceImpl {
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
-            evolve_enhancements,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
             evaluator_registry: Arc::new(
@@ -5073,6 +5242,126 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
         }
+    }
+
+    fn bind_gunshi_allocation(
+        &self,
+        mut input: ExecutionInput,
+        binding: GunshiAllocationBinding,
+    ) -> Result<(ExecutionInput, BoundGunshiAllocation), Status> {
+        let issuance_id = binding.issuance_id.trim();
+        if issuance_id.is_empty()
+            || issuance_id.len() > 128
+            || issuance_id != binding.issuance_id
+            || !issuance_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
+        {
+            return Err(Status::invalid_argument(
+                "Gunshi issuance_id must be a canonical identifier of at most 128 characters",
+            ));
+        }
+        if binding.allocation_json.len() > 256 * 1024 {
+            return Err(Status::invalid_argument(
+                "Gunshi allocation exceeds the size limit",
+            ));
+        }
+        let allocation: crate::chisei::gunshi::AllocationPlan =
+            serde_json::from_str(&binding.allocation_json).map_err(|error| {
+                Status::invalid_argument(format!("invalid Gunshi allocation: {error}"))
+            })?;
+        allocation.validate().map_err(Status::invalid_argument)?;
+        crate::chisei::gunshi_feedback::require_issued_plan(&self.db, issuance_id, &allocation)
+            .map_err(Status::failed_precondition)?;
+
+        if input.namespace.trim() != allocation.namespace {
+            return Err(Status::failed_precondition(
+                "Gunshi allocation namespace does not match execution input",
+            ));
+        }
+        let current_policy_version = self
+            .policy
+            .effective_policy(&allocation.namespace)
+            .map(|policy| policy.version())
+            .unwrap_or_else(|| "implicit-allow/v1".into());
+        if allocation.policy_version != current_policy_version {
+            return Err(Status::failed_precondition(
+                "Gunshi allocation policy version is no longer current",
+            ));
+        }
+        if !input.logical_operation_id.trim().is_empty()
+            && input.logical_operation_id.trim() != allocation.operation_id
+        {
+            return Err(Status::failed_precondition(
+                "Gunshi allocation operation does not match execution input",
+            ));
+        }
+        if !input.task_class.trim().is_empty()
+            && input.task_class.trim() != allocation.operation_class
+        {
+            return Err(Status::failed_precondition(
+                "Gunshi allocation operation class does not match execution input",
+            ));
+        }
+        let allocation_priority = i32::from(allocation.priority);
+        if input.priority != 0 && input.priority != allocation_priority {
+            return Err(Status::failed_precondition(
+                "Gunshi allocation priority does not match execution input",
+            ));
+        }
+        for (name, requested, allocated) in [
+            (
+                "preferred runtime",
+                input.preferred_runtime.trim(),
+                allocation.selection.runtime.as_str(),
+            ),
+            (
+                "preferred model",
+                input.preferred_model.trim(),
+                allocation.selection.model.as_str(),
+            ),
+            (
+                "route override",
+                input.route_override.trim(),
+                allocation.selection.model.as_str(),
+            ),
+        ] {
+            if !requested.is_empty() && requested != "auto" && requested != allocated {
+                return Err(Status::failed_precondition(format!(
+                    "execution {name} conflicts with the Gunshi allocation"
+                )));
+            }
+        }
+        let requested_tools = input
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let allocated_tools = allocation
+            .selection
+            .tools
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if requested_tools.len() != input.tools.len() || requested_tools != allocated_tools {
+            return Err(Status::failed_precondition(
+                "execution tools must exactly match the Gunshi allocation",
+            ));
+        }
+
+        input.logical_operation_id = allocation.operation_id.clone();
+        input.task_class = allocation.operation_class.clone();
+        input.priority = allocation_priority;
+        input.preferred_runtime = allocation.selection.runtime.clone();
+        input.preferred_model = allocation.selection.model.clone();
+        input.route_override.clear();
+        Ok((
+            input,
+            BoundGunshiAllocation {
+                issuance_id: issuance_id.into(),
+                plan: allocation,
+            },
+        ))
     }
 
     async fn plan_from_input(
@@ -5270,35 +5559,11 @@ impl ChiseiServiceImpl {
         let egress_decisions =
             build_egress_decisions(&run.egress_records, &provider, provider_is_external);
         let prepared_messages = build_prepared_messages(&input, &run.prepared_spec);
-        let estimate_req = super::pb::llm::ChatRequest {
+        let estimate_req = ProviderExecutionRequest {
             model: resolved_model.clone(),
             system: input.system.clone(),
-            messages: prepared_messages
-                .iter()
-                .map(|m| super::pb::llm::Message {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                    tool_call_id: m.tool_call_id.clone(),
-                    tool_calls: m
-                        .tool_calls
-                        .iter()
-                        .map(|tc| super::pb::llm::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            args_json: tc.args_json.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            tools: input
-                .tools
-                .iter()
-                .map(|t| super::pb::llm::ToolDef {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema_json: t.input_schema_json.clone(),
-                })
-                .collect(),
+            messages: prepared_messages.clone(),
+            tools: input.tools.clone(),
             max_tokens: input.max_tokens,
             user_id: Some(normalized_user_id.clone()),
         };
@@ -5579,6 +5844,14 @@ impl ChiseiServiceImpl {
             context_tokens,
             context_projection_latency_ms,
             context_truncated,
+            gunshi_issuance_id: String::new(),
+            gunshi_allocation_id: String::new(),
+            gunshi_agent_id: String::new(),
+            gunshi_policy_version: String::new(),
+            gunshi_input_fingerprint: String::new(),
+            gunshi_budget_ceiling_usd_micros: 0,
+            gunshi_max_attempts: 0,
+            gunshi_human_review_required: false,
         })
     }
 
@@ -5751,6 +6024,24 @@ impl ChiseiServiceImpl {
                     if !input.attempt_id.trim().is_empty() {
                         attributes.insert("attempt_id".into(), input.attempt_id.trim().into());
                     }
+                    if !plan.gunshi_allocation_id.is_empty() {
+                        attributes.extend([
+                            ("gunshi_issuance_id".into(), plan.gunshi_issuance_id.clone()),
+                            (
+                                "gunshi_allocation_id".into(),
+                                plan.gunshi_allocation_id.clone(),
+                            ),
+                            ("gunshi_agent_id".into(), plan.gunshi_agent_id.clone()),
+                            (
+                                "gunshi_policy_version".into(),
+                                plan.gunshi_policy_version.clone(),
+                            ),
+                            (
+                                "gunshi_input_fingerprint".into(),
+                                plan.gunshi_input_fingerprint.clone(),
+                            ),
+                        ]);
+                    }
                     attributes
                 },
             ),
@@ -5832,25 +6123,35 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::RouteSelected,
                 "chisei.routing",
-                BTreeMap::from([
-                    ("runtime".into(), plan.resolved_runtime.clone()),
-                    ("model".into(), plan.resolved_model.clone()),
-                    // Effective pre-policy preference (also on Intent) for dry-run.
-                    ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                    ("preferred_model".into(), input.preferred_model.clone()),
-                    (
-                        "route_override".into(),
-                        if input.route_override.trim().is_empty() {
-                            String::new()
-                        } else {
-                            input.route_override.trim().into()
-                        },
-                    ),
-                    (
-                        "bias_bypassed".into(),
-                        (!input.route_override.trim().is_empty()).to_string(),
-                    ),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        ("runtime".into(), plan.resolved_runtime.clone()),
+                        ("model".into(), plan.resolved_model.clone()),
+                        // Effective pre-policy preference (also on Intent) for dry-run.
+                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
+                        ("preferred_model".into(), input.preferred_model.clone()),
+                        (
+                            "route_override".into(),
+                            if input.route_override.trim().is_empty() {
+                                String::new()
+                            } else {
+                                input.route_override.trim().into()
+                            },
+                        ),
+                        (
+                            "bias_bypassed".into(),
+                            (!input.route_override.trim().is_empty()).to_string(),
+                        ),
+                    ]);
+                    if !plan.gunshi_allocation_id.is_empty() {
+                        attributes.insert(
+                            "gunshi_allocation_id".into(),
+                            plan.gunshi_allocation_id.clone(),
+                        );
+                        attributes.insert("gunshi_agent_id".into(), plan.gunshi_agent_id.clone());
+                    }
+                    attributes
+                },
             ),
             receipt_event(
                 &operation_id,
@@ -5859,19 +6160,36 @@ impl ChiseiServiceImpl {
                 started,
                 ReceiptEventKind::BudgetDecided,
                 "chisei.budget",
-                BTreeMap::from([
-                    (
-                        "allowed".into(),
-                        plan.budget
-                            .as_ref()
-                            .is_some_and(|budget| budget.allowed)
-                            .to_string(),
-                    ),
-                    (
-                        "estimated_tokens".into(),
-                        input.estimated_tokens.to_string(),
-                    ),
-                ]),
+                {
+                    let mut attributes = BTreeMap::from([
+                        (
+                            "allowed".into(),
+                            plan.budget
+                                .as_ref()
+                                .is_some_and(|budget| budget.allowed)
+                                .to_string(),
+                        ),
+                        (
+                            "estimated_tokens".into(),
+                            input.estimated_tokens.to_string(),
+                        ),
+                    ]);
+                    if !plan.gunshi_allocation_id.is_empty() {
+                        attributes.insert(
+                            "gunshi_budget_ceiling_usd_micros".into(),
+                            plan.gunshi_budget_ceiling_usd_micros.to_string(),
+                        );
+                        attributes.insert(
+                            "gunshi_max_attempts".into(),
+                            plan.gunshi_max_attempts.to_string(),
+                        );
+                        attributes.insert(
+                            "gunshi_human_review_required".into(),
+                            plan.gunshi_human_review_required.to_string(),
+                        );
+                    }
+                    attributes
+                },
             ),
         ];
         let mut context = GovernedReference {
@@ -6008,24 +6326,6 @@ impl ChiseiServiceImpl {
         self.db
             .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
         Ok(())
-    }
-
-    fn record_completed_operation(
-        &self,
-        plan: &ExecutionPlan,
-        actor: &str,
-        response: &PlannedChatResponse,
-        attempt_started_at_ms: i64,
-        completed_at_ms: i64,
-    ) -> Result<(), String> {
-        record_completed_operation_on(
-            &self.db,
-            plan,
-            actor,
-            response,
-            attempt_started_at_ms,
-            completed_at_ms,
-        )
     }
 
     /// Resolve runtime/model and return the effective pre-policy preference
@@ -6591,32 +6891,11 @@ impl ChiseiServiceImpl {
             .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
     }
 
-    fn evolve_tasks(&self) -> Vec<crate::chisei::evolve::TaskRecord> {
-        let mut tasks: Vec<_> = self
-            .evolve_history
-            .lock()
-            .expect("evolve history poisoned")
-            .values()
-            .cloned()
-            .collect();
-        tasks.sort_by(|a, b| a.id.cmp(&b.id));
-        tasks
-    }
-
-    fn evolve_task(&self, request_id: &str) -> Option<crate::chisei::evolve::TaskRecord> {
-        self.evolve_history
-            .lock()
-            .expect("evolve history poisoned")
-            .get(request_id)
-            .cloned()
-    }
-
     fn record_evolve_task(
         &self,
         request_id: &str,
         namespace: &str,
         spec: &str,
-        original_spec: Option<&str>,
         status: &str,
         tokens_used: i32,
     ) -> Result<(), String> {
@@ -6627,27 +6906,10 @@ impl ChiseiServiceImpl {
                 request_id,
                 namespace,
                 spec,
-                original_spec,
                 status,
                 tokens_used,
             },
         )
-    }
-
-    fn tracked_original_spec(
-        &self,
-        request_id: &str,
-        submitted_spec: &str,
-        prepared_spec: &str,
-    ) -> Option<String> {
-        if prepared_spec != submitted_spec {
-            return Some(submitted_spec.to_string());
-        }
-        self.evolve_enhancements
-            .lock()
-            .expect("evolve enhancements poisoned")
-            .get(request_id)
-            .cloned()
     }
 }
 
@@ -6699,7 +6961,7 @@ fn budget_metric(metric: &str) -> Result<&'static str, Status> {
 /// caller that wants a flat, non-nested scope) and chains only through the
 /// unset `global` root. Otherwise the scope is built from whichever of
 /// project/agent/work_unit are present, in that nesting order, so that
-/// `CheckBudget`/`RecordUsage` walk and deduct the whole ancestor chain
+/// Canonical gateway decisions and `RecordUsage` walk and deduct the whole ancestor chain
 /// (project -> agent -> work_unit) atomically — see `db::chisei_budget`.
 fn budget_subject(
     subject: &str,
@@ -6764,6 +7026,31 @@ fn active_continuation_allocation(
                     .any(|identity| *identity == reservation.lease_owner)
         })
     })
+}
+
+/// Internal policy-resolution request used by the canonical fat-decide path.
+/// It deliberately is not a public protobuf message or RPC.
+#[derive(Clone, Debug, Default)]
+struct ResolvePolicyRequest {
+    namespace: String,
+    preferred_runtime: String,
+    preferred_model: String,
+    subject: String,
+    project: String,
+    agent: String,
+    key_id: String,
+    task_class: String,
+    #[allow(dead_code)]
+    user_id: String,
+    expected_calls: i64,
+    budget_route_bias: String,
+    route_override: String,
+    capability_requirements_json: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResolvePolicyResponse {
+    resolution: Option<PolicyResolution>,
 }
 
 fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
@@ -7421,44 +7708,6 @@ fn native_cacheable_message_count(input: &ExecutionInput, prepared: &[ChatMessag
     }
 }
 
-fn eval_iteration_pb(iteration: crate::chisei::eval::Iteration) -> EvalIteration {
-    EvalIteration {
-        id: iteration.id,
-        run_id: iteration.run_id,
-        suite_id: iteration.suite_id,
-        changed_file: iteration.changed_file,
-        diff_hash: iteration.diff_hash,
-        parent_iteration_id: iteration.parent_iteration_id,
-        baseline_run_id: iteration.baseline_run_id,
-        candidate_run_id: iteration.candidate_run_id,
-        delta: iteration.delta,
-        regressed: iteration.regressed,
-        created: iteration.created,
-    }
-}
-
-fn portfolio_point_pb(point: crate::chisei::portfolio::FrontierPoint) -> PortfolioPoint {
-    PortfolioPoint {
-        model: point.model,
-        prompt_variant: point.prompt_variant,
-        quality_score: point.quality_score,
-        cost_usd_micros: point.cost_usd_micros,
-        sample_count: point.sample_count,
-        updated_at: point.updated_at,
-    }
-}
-
-fn portfolio_objective_pb(objective: &Objective) -> PortfolioObjective {
-    PortfolioObjective {
-        namespace: objective.namespace.clone(),
-        mode: objective.mode.as_str().into(),
-        budget_usd_micros: objective.budget_usd_micros,
-        quality_bar: objective.quality_bar,
-        min_samples: objective.min_samples,
-        updated_at: objective.updated_at,
-    }
-}
-
 fn subject_reference_from_proto(
     value: GovernedSubjectReference,
 ) -> subject::GovernedSubjectReference {
@@ -7573,6 +7822,12 @@ fn subject_provenance_response(
         envelope: Some(subject_provenance_envelope_to_proto(&record.envelope)),
         envelope_digest: record.envelope.digest().map_err(Status::data_loss)?,
         replayed,
+        trust_root: Some(GovernedSubjectProvenanceTrustRoot {
+            version: subject_provenance::TRUST_ROOT_VERSION,
+            key_id: record.envelope.issuer_key_id.clone(),
+            identity: subject_provenance::ISSUER.into(),
+            public_key: record.public_key.clone(),
+        }),
     })
 }
 
@@ -7665,2380 +7920,7 @@ fn reconcile_subject_provenance_receipt(
     Ok((receipt.namespace.clone(), content_digest))
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PlanBackedDecisionEvidence {
-    decision: String,
-    failure_code: String,
-    plan_version_id: String,
-    plan_digest: String,
-    manifest_id: String,
-    manifest_digest: String,
-    invariant_set_id: String,
-    invariant_set_digest: String,
-    execution_operation_id: String,
-    gate_decision_digest: String,
-    covered_invariant_version_ids: Vec<String>,
-    waived_invariant_version_ids: Vec<String>,
-    uncovered_invariant_version_ids: Vec<String>,
-    step_receipt_digests: Vec<String>,
-}
-
-fn plan_backed_decision_from_receipt(
-    receipt: &OperationReceipt,
-) -> Result<PlanBackedGovernedSubjectDecision, Status> {
-    if receipt.operation_class != subject::PLAN_BACKED_OPERATION_CLASS
-        || receipt.schema_version != subject::PLAN_BACKED_RECEIPT_SCHEMA_VERSION
-    {
-        return Err(Status::data_loss(
-            "plan-backed governed-subject receipt has an invalid binding",
-        ));
-    }
-    let outcome = receipt
-        .events
-        .iter()
-        .find(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
-        .ok_or_else(|| Status::data_loss("governed-subject decision outcome is missing"))?;
-    let evidence = outcome
-        .attributes
-        .get("plan_backed_decision")
-        .ok_or_else(|| Status::data_loss("governed-subject decision evidence is missing"))
-        .and_then(|json| {
-            serde_json::from_str::<PlanBackedDecisionEvidence>(json)
-                .map_err(|_| Status::data_loss("governed-subject decision evidence is invalid"))
-        })?;
-    let receipt_bytes =
-        serde_json::to_vec(receipt).map_err(|error| Status::internal(error.to_string()))?;
-    Ok(PlanBackedGovernedSubjectDecision {
-        contract_version: subject::PLAN_BACKED_RESULT_VERSION.into(),
-        decision: evidence.decision,
-        operation_id: receipt.operation_id.clone(),
-        receipt_schema: receipt.schema_version.clone(),
-        receipt_digest: format!("sha256:{:x}", sha2::Sha256::digest(receipt_bytes)),
-        plan_version_id: evidence.plan_version_id,
-        plan_digest: evidence.plan_digest,
-        manifest_id: evidence.manifest_id,
-        manifest_digest: evidence.manifest_digest,
-        invariant_set_id: evidence.invariant_set_id,
-        invariant_set_digest: evidence.invariant_set_digest,
-        execution_operation_id: evidence.execution_operation_id,
-        gate_decision_digest: evidence.gate_decision_digest,
-        covered_invariant_version_ids: evidence.covered_invariant_version_ids,
-        waived_invariant_version_ids: evidence.waived_invariant_version_ids,
-        uncovered_invariant_version_ids: evidence.uncovered_invariant_version_ids,
-        step_receipt_digests: evidence.step_receipt_digests,
-        failure_code: evidence.failure_code,
-    })
-}
-
-struct PlanBackedDecisionReceiptInput<'a> {
-    prepared: &'a subject::PreparedPlanBackedSubjectEvaluation,
-    plan_digest: &'a str,
-    manifest: Option<&'a evaluation_manifest_domain::ResolvedEvaluationManifest>,
-    execution: Option<&'a evaluation_execution_domain::EvaluationExecutionProjection>,
-    unresolved_invariant_version_ids: &'a [String],
-    decision: &'a str,
-    failure_code: &'a str,
-    started_at_ms: i64,
-    completed_at_ms: i64,
-}
-
-fn plan_backed_decision_receipt(
-    input: PlanBackedDecisionReceiptInput<'_>,
-) -> Result<OperationReceipt, Status> {
-    let PlanBackedDecisionReceiptInput {
-        prepared,
-        plan_digest,
-        manifest,
-        execution,
-        unresolved_invariant_version_ids,
-        decision,
-        failure_code,
-        started_at_ms,
-        completed_at_ms,
-    } = input;
-    let gate = execution.and_then(|execution| execution.decision.as_ref());
-    let mut covered = BTreeSet::new();
-    let mut waived = BTreeSet::new();
-    let uncovered = unresolved_invariant_version_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if let Some(manifest) = manifest {
-        for node in &manifest.nodes {
-            for invariant in &node.invariants {
-                covered.insert(invariant.invariant_version_id.clone());
-            }
-        }
-        for waiver in &manifest.waivers {
-            for invariant_version_id in &waiver.invariant_version_ids {
-                waived.insert(invariant_version_id.clone());
-            }
-        }
-    }
-    let evidence = PlanBackedDecisionEvidence {
-        decision: decision.into(),
-        failure_code: failure_code.into(),
-        plan_version_id: prepared.request.plan_version_id.clone(),
-        plan_digest: plan_digest.into(),
-        manifest_id: manifest
-            .map(|manifest| manifest.manifest_id.clone())
-            .unwrap_or_default(),
-        manifest_digest: manifest
-            .map(|manifest| manifest.manifest_digest.clone())
-            .unwrap_or_default(),
-        invariant_set_id: manifest
-            .map(|manifest| manifest.invariant_set_id.clone())
-            .unwrap_or_default(),
-        invariant_set_digest: manifest
-            .map(|manifest| manifest.invariant_set_digest.clone())
-            .unwrap_or_default(),
-        execution_operation_id: execution
-            .map(|execution| execution.operation_id.clone())
-            .unwrap_or_default(),
-        gate_decision_digest: gate
-            .map(|gate| gate.decision_digest.clone())
-            .unwrap_or_default(),
-        covered_invariant_version_ids: covered.into_iter().collect(),
-        waived_invariant_version_ids: waived.into_iter().collect(),
-        uncovered_invariant_version_ids: uncovered.into_iter().collect(),
-        step_receipt_digests: execution
-            .map(|execution| {
-                execution
-                    .steps
-                    .iter()
-                    .map(|step| step.step_receipt_digest.clone())
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-    let decision_json =
-        serde_json::to_string(&evidence).map_err(|error| Status::internal(error.to_string()))?;
-    let operation_id = &prepared.operation_id;
-    let event = |suffix: &str,
-                 parent: Option<&str>,
-                 kind: ReceiptEventKind,
-                 attributes: BTreeMap<String, String>,
-                 references: Vec<GovernedReference>| {
-        OperationReceiptEvent {
-            event_id: format!("{operation_id}:{suffix}"),
-            operation_id: operation_id.clone(),
-            parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
-            timestamp_ms: completed_at_ms,
-            kind,
-            surface: kind.surface(),
-            actor: prepared.actor.clone(),
-            references,
-            attributes,
-        }
-    };
-    let mut policy_references = vec![GovernedReference {
-        kind: "evaluation_plan".into(),
-        reference: prepared.request.plan_version_id.clone(),
-        content_hash: (!plan_digest.is_empty()).then(|| plan_digest.into()),
-        disclosed_fields: Vec::new(),
-        omitted: false,
-        omission_reason: None,
-    }];
-    if let Some(manifest) = manifest {
-        policy_references.extend([
-            GovernedReference {
-                kind: "resolved_invariant_set".into(),
-                reference: manifest.invariant_set_id.clone(),
-                content_hash: Some(manifest.invariant_set_digest.clone()),
-                disclosed_fields: Vec::new(),
-                omitted: false,
-                omission_reason: None,
-            },
-            GovernedReference {
-                kind: "resolved_evaluation_manifest".into(),
-                reference: manifest.manifest_id.clone(),
-                content_hash: Some(manifest.manifest_digest.clone()),
-                disclosed_fields: Vec::new(),
-                omitted: false,
-                omission_reason: None,
-            },
-        ]);
-    }
-    let mut outcome_references = Vec::new();
-    if let Some(execution) = execution {
-        outcome_references.push(GovernedReference {
-            kind: "evaluation_execution".into(),
-            reference: execution.operation_id.clone(),
-            content_hash: gate.map(|gate| gate.decision_digest.clone()),
-            disclosed_fields: Vec::new(),
-            omitted: false,
-            omission_reason: None,
-        });
-        outcome_references.extend(execution.steps.iter().map(|step| GovernedReference {
-            kind: "evaluation_step_receipt".into(),
-            reference: step.node_id.clone(),
-            content_hash: Some(step.step_receipt_digest.clone()),
-            disclosed_fields: Vec::new(),
-            omitted: false,
-            omission_reason: None,
-        }));
-    }
-    Ok(OperationReceipt {
-        version: OPERATION_RECEIPT_VERSION.into(),
-        operation_id: operation_id.clone(),
-        parent_operation_id: execution.map(|execution| execution.operation_id.clone()),
-        namespace: prepared.request.namespace.clone(),
-        operation_class: subject::PLAN_BACKED_OPERATION_CLASS.into(),
-        initiating_actor: prepared.actor.clone(),
-        schema_version: subject::PLAN_BACKED_RECEIPT_SCHEMA_VERSION.into(),
-        policy_version: prepared.request.subject_profile.clone(),
-        started_at_ms,
-        completed_at_ms: Some(completed_at_ms),
-        events: vec![
-            event(
-                "intent",
-                None,
-                ReceiptEventKind::IntentRecorded,
-                BTreeMap::from([
-                    ("request_id".into(), operation_id.clone()),
-                    (
-                        "lookup_request_id".into(),
-                        prepared.request.request_id.clone(),
-                    ),
-                    (
-                        "caller_scope".into(),
-                        subject::plan_backed_caller_scope(
-                            &prepared.request.namespace,
-                            &prepared.actor,
-                        ),
-                    ),
-                    ("binding_digest".into(), prepared.binding_digest.clone()),
-                    (
-                        "subject_profile".into(),
-                        prepared.request.subject_profile.clone(),
-                    ),
-                    (
-                        "subject_identity".into(),
-                        prepared.request.subject_identity.clone(),
-                    ),
-                    (
-                        "subject_content_digest".into(),
-                        prepared.request.subject_content_digest.clone(),
-                    ),
-                ]),
-                vec![GovernedReference {
-                    kind: "governed_subject".into(),
-                    reference: prepared.request.subject_identity.clone(),
-                    content_hash: Some(prepared.request.subject_content_digest.clone()),
-                    disclosed_fields: Vec::new(),
-                    omitted: true,
-                    omission_reason: Some("subject payload remains externally owned".into()),
-                }],
-            ),
-            event(
-                "policy",
-                Some("intent"),
-                ReceiptEventKind::PolicyDecided,
-                BTreeMap::from([
-                    ("decision".into(), decision.into()),
-                    (
-                        "resolution_request_id".into(),
-                        prepared.resolution_request_id.clone(),
-                    ),
-                ]),
-                policy_references,
-            ),
-            event(
-                "route",
-                Some("policy"),
-                ReceiptEventKind::RouteSelected,
-                BTreeMap::from([(
-                    "route".into(),
-                    if manifest.is_some() {
-                        "exact_plan_deterministic_execution".into()
-                    } else {
-                        "resolution_failed_closed".into()
-                    },
-                )]),
-                Vec::new(),
-            ),
-            event(
-                "budget",
-                Some("route"),
-                ReceiptEventKind::BudgetDecided,
-                BTreeMap::from([(
-                    "max_total_duration_ms".into(),
-                    prepared.request.max_total_duration_ms.to_string(),
-                )]),
-                Vec::new(),
-            ),
-            event(
-                "outcome",
-                Some("budget"),
-                ReceiptEventKind::OutcomeRecorded,
-                BTreeMap::from([
-                    ("decision".into(), decision.into()),
-                    ("failure_code".into(), failure_code.into()),
-                    ("plan_backed_decision".into(), decision_json),
-                ]),
-                outcome_references,
-            ),
-        ],
-        uncovered_surfaces: Vec::new(),
-        reporter_grants: Vec::new(),
-    })
-}
-
-#[tonic::async_trait]
-impl ChiseiService for ChiseiServiceImpl {
-    type ExecutePlanStreamStream =
-        Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
-
-    async fn evaluate_governed_subject(
-        &self,
-        req: Request<EvaluateGovernedSubjectRequest>,
-    ) -> Result<Response<EvaluateGovernedSubjectResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let value = req
-            .into_inner()
-            .subject
-            .ok_or_else(|| Status::invalid_argument("subject required"))?;
-        let envelope = subject::GovernedSubjectEnvelope {
-            version: value.version,
-            namespace: value.namespace,
-            request_id: value.request_id,
-            subject_profile: value.subject_profile,
-            subject_identity: value.subject_identity,
-            content_digest: value.content_digest,
-            references: value
-                .references
-                .into_iter()
-                .map(subject_reference_from_proto)
-                .collect(),
-            evaluation_profile: value.evaluation_profile,
-        };
-        require_namespace_write_access(&self.db, &actor, &envelope.namespace)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let fresh = subject::validate_envelope(&envelope, &actor, now_ms)
-            .map_err(Status::invalid_argument)?;
-        if !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "governed-subject conformance evaluation requires control-plane administration",
-            ));
-        }
-        let binding_digest = subject::binding_digest(&envelope, &actor);
-        let operation_id = subject::operation_id(&envelope.namespace, &actor, &envelope.request_id);
-        if let Some(existing) = self
-            .db
-            .get_operation_receipt(&operation_id)
-            .map_err(Status::internal)?
-        {
-            let existing_binding = existing
-                .events
-                .iter()
-                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
-                .and_then(|event| event.attributes.get("binding_digest"));
-            if existing_binding != Some(&binding_digest) {
-                return Err(Status::already_exists(
-                    "request_id is already bound to different governed-subject evidence",
-                ));
-            }
-            return Ok(Response::new(EvaluateGovernedSubjectResponse {
-                result: Some(governed_subject_result_from_receipt(&existing)?),
-            }));
-        }
-
-        let (decision, failure_code) = subject::evaluation(&envelope.evaluation_profile, fresh);
-        let governed_references = envelope
-            .references
-            .iter()
-            .map(|reference| GovernedReference {
-                kind: reference.kind.clone(),
-                reference: reference.reference.clone(),
-                content_hash: Some(reference.content_digest.clone()),
-                disclosed_fields: Vec::new(),
-                omitted: true,
-                omission_reason: Some("subject payload remains externally owned".into()),
-            })
-            .collect::<Vec<_>>();
-        let event = |suffix: &str,
-                     parent: Option<&str>,
-                     kind: ReceiptEventKind,
-                     attributes: BTreeMap<String, String>,
-                     references: Vec<GovernedReference>| {
-            OperationReceiptEvent {
-                event_id: format!("{operation_id}:{suffix}"),
-                operation_id: operation_id.clone(),
-                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
-                timestamp_ms: now_ms,
-                kind,
-                surface: kind.surface(),
-                actor: actor.clone(),
-                references,
-                attributes,
-            }
-        };
-        let mut intent_attributes = BTreeMap::from([
-            ("request_id".into(), operation_id.clone()),
-            ("lookup_request_id".into(), envelope.request_id.clone()),
-            (
-                "caller_scope".into(),
-                subject::caller_scope(&envelope.namespace, &actor),
-            ),
-            ("binding_digest".into(), binding_digest),
-            ("subject_profile".into(), envelope.subject_profile.clone()),
-            ("subject_identity".into(), envelope.subject_identity.clone()),
-            ("content_digest".into(), envelope.content_digest.clone()),
-            (
-                "evaluation_profile".into(),
-                envelope.evaluation_profile.clone(),
-            ),
-        ]);
-        intent_attributes.insert(
-            "reference_count".into(),
-            envelope.references.len().to_string(),
-        );
-        for reference in &envelope.references {
-            intent_attributes.insert(
-                format!("reference_observed_at_ms.{}", reference.kind),
-                reference.observed_at_ms.to_string(),
-            );
-        }
-        let policy_attributes = BTreeMap::from([
-            ("decision".into(), decision.into()),
-            (
-                "profile_registry".into(),
-                "chisei.governed-subject-registry/v1".into(),
-            ),
-        ]);
-        let mut outcome_attributes = BTreeMap::from([
-            ("decision".into(), decision.into()),
-            ("fresh".into(), fresh.to_string()),
-        ]);
-        if let Some(code) = failure_code {
-            outcome_attributes.insert("failure_code".into(), code.into());
-            outcome_attributes.insert(
-                "failure_message".into(),
-                match code {
-                    "stale_evidence" => "governed evidence is stale",
-                    "evaluation_unavailable" => "governed evaluation is unavailable",
-                    "evaluation_timeout" => "governed evaluation timed out",
-                    _ => "governed evaluation failed",
-                }
-                .into(),
-            );
-        }
-        let receipt = OperationReceipt {
-            version: OPERATION_RECEIPT_VERSION.into(),
-            operation_id: operation_id.clone(),
-            parent_operation_id: None,
-            namespace: envelope.namespace.clone(),
-            operation_class: "governed_subject_evaluation".into(),
-            initiating_actor: actor.clone(),
-            schema_version: subject::RECEIPT_SCHEMA_VERSION.into(),
-            policy_version: envelope.evaluation_profile.clone(),
-            started_at_ms: now_ms,
-            completed_at_ms: Some(now_ms),
-            events: vec![
-                event(
-                    "intent",
-                    None,
-                    ReceiptEventKind::IntentRecorded,
-                    intent_attributes,
-                    governed_references,
-                ),
-                event(
-                    "policy",
-                    Some("intent"),
-                    ReceiptEventKind::PolicyDecided,
-                    policy_attributes,
-                    Vec::new(),
-                ),
-                event(
-                    "route",
-                    Some("policy"),
-                    ReceiptEventKind::RouteSelected,
-                    BTreeMap::from([("route".into(), "registered_profile".into())]),
-                    Vec::new(),
-                ),
-                event(
-                    "budget",
-                    Some("route"),
-                    ReceiptEventKind::BudgetDecided,
-                    BTreeMap::from([("budget_effect".into(), "none".into())]),
-                    Vec::new(),
-                ),
-                event(
-                    "outcome",
-                    Some("budget"),
-                    ReceiptEventKind::OutcomeRecorded,
-                    outcome_attributes,
-                    Vec::new(),
-                ),
-            ],
-            uncovered_surfaces: Vec::new(),
-            reporter_grants: Vec::new(),
-        };
-        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
-            if let Some(existing) = self
-                .db
-                .get_operation_receipt(&operation_id)
-                .map_err(Status::internal)?
-            {
-                let same_binding = existing
-                    .events
-                    .iter()
-                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
-                    .and_then(|event| event.attributes.get("binding_digest"))
-                    == receipt.events[0].attributes.get("binding_digest");
-                if same_binding {
-                    return Ok(Response::new(EvaluateGovernedSubjectResponse {
-                        result: Some(governed_subject_result_from_receipt(&existing)?),
-                    }));
-                }
-                return Err(Status::already_exists(
-                    "request_id is already bound to different governed-subject evidence",
-                ));
-            }
-            return Err(Status::aborted(format!(
-                "governed-subject receipt could not be committed: {error}"
-            )));
-        }
-        Ok(Response::new(EvaluateGovernedSubjectResponse {
-            result: Some(governed_subject_result_from_receipt(&receipt)?),
-        }))
-    }
-
-    async fn export_governed_subject_provenance(
-        &self,
-        req: Request<ExportGovernedSubjectProvenanceRequest>,
-    ) -> Result<Response<ExportGovernedSubjectProvenanceResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let request = req.into_inner();
-        let binding = subject_provenance::ExportRequestBinding {
-            actor: actor.clone(),
-            export_id: request.export_id,
-            operation_id: request.operation_id,
-            expected_subject_identity: request.expected_subject_identity,
-            expected_subject_content_digest: request.expected_subject_content_digest,
-            expected_manifest_digest: request.expected_manifest_digest,
-            expected_artifact_digest: request.expected_artifact_digest,
-            expected_receipt_digest: request.expected_receipt_digest,
-        };
-        let binding_digest =
-            subject_provenance::binding_digest(&binding).map_err(Status::invalid_argument)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Some(existing) =
-            load_subject_provenance_record(&self.db, &binding.actor, &binding.export_id)?
-        {
-            if existing.binding_digest != binding_digest {
-                return Err(Status::already_exists(
-                    "export_id is already bound to different governed-subject evidence",
-                ));
-            }
-            require_namespace_access(&self.db, &actor, &existing.namespace)?;
-            return Ok(Response::new(subject_provenance_response(
-                &existing, true, now_ms,
-            )?));
-        }
-
-        let receipt = self
-            .db
-            .get_operation_receipt(&binding.operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
-        require_namespace_write_access(&self.db, &actor, &receipt.namespace)?;
-        let (namespace, content_digest) =
-            reconcile_subject_provenance_receipt(&receipt, &binding, now_ms)?;
-        let key_hex = self
-            .config
-            .governed_subject_provenance_signing_key
-            .as_deref()
-            .ok_or_else(|| {
-                Status::failed_precondition("governed-subject provenance signing is not configured")
-            })?;
-        let signing_key = subject_provenance::signing_key_from_hex(key_hex)
-            .map_err(Status::failed_precondition)?;
-        if now_ms < self.config.governed_subject_provenance_key_not_before_ms
-            || now_ms >= self.config.governed_subject_provenance_key_expires_at_ms
-        {
-            return Err(Status::failed_precondition(
-                "governed-subject provenance signing key is not active",
-            ));
-        }
-        let ttl_ms = self.config.governed_subject_provenance_ttl_ms;
-        if ttl_ms <= 0 || ttl_ms > subject_provenance::MAX_ENVELOPE_TTL_MS {
-            return Err(Status::failed_precondition(
-                "governed-subject provenance TTL is invalid",
-            ));
-        }
-        let expires_at_ms = now_ms
-            .checked_add(ttl_ms)
-            .unwrap_or(i64::MAX)
-            .min(self.config.governed_subject_provenance_key_expires_at_ms);
-        if expires_at_ms <= now_ms {
-            return Err(Status::failed_precondition(
-                "governed-subject provenance signing key expires too soon",
-            ));
-        }
-        let envelope = subject_provenance::ProvenanceEnvelope::issue(
-            &signing_key,
-            binding.expected_subject_identity.clone(),
-            content_digest,
-            binding.expected_receipt_digest.clone(),
-            binding.operation_id.clone(),
-            now_ms,
-            expires_at_ms,
-        )
-        .map_err(Status::internal)?;
-        envelope
-            .verify(&signing_key.verifying_key().to_bytes(), now_ms)
-            .map_err(Status::internal)?;
-        let record = subject_provenance::ExportRecord {
-            binding_digest,
-            namespace,
-            envelope,
-            public_key: base64::engine::general_purpose::STANDARD
-                .encode(signing_key.verifying_key().to_bytes()),
-            created_at_ms: now_ms,
-        };
-        let (stored, inserted) = self
-            .db
-            .put_governed_subject_provenance_export(
-                &binding.actor,
-                &binding.export_id,
-                &record,
-            )
-            .map_err(|error| {
-                if error.contains("already bound") {
-                    Status::already_exists(
-                        "export_id is already bound to different governed-subject evidence",
-                    )
-                } else {
-                    tracing::warn!(error = %error, "governed-subject provenance export persistence failed");
-                    Status::aborted(
-                        "governed-subject provenance export could not be committed",
-                    )
-                }
-            })?;
-        Ok(Response::new(subject_provenance_response(
-            &stored, !inserted, now_ms,
-        )?))
-    }
-
-    async fn get_governed_subject_provenance_trust_root(
-        &self,
-        req: Request<GetGovernedSubjectProvenanceTrustRootRequest>,
-    ) -> Result<Response<GetGovernedSubjectProvenanceTrustRootResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let request = req.into_inner();
-        subject_provenance::validate_export_id(&request.export_id)
-            .map_err(Status::invalid_argument)?;
-        let record = load_subject_provenance_record(&self.db, &actor, &request.export_id)?
-            .ok_or_else(|| Status::not_found("governed-subject provenance export not found"))?;
-        require_namespace_access(&self.db, &actor, &record.namespace)?;
-        Ok(Response::new(
-            GetGovernedSubjectProvenanceTrustRootResponse {
-                trust_root: Some(GovernedSubjectProvenanceTrustRoot {
-                    version: subject_provenance::TRUST_ROOT_VERSION,
-                    key_id: record.envelope.issuer_key_id,
-                    identity: subject_provenance::ISSUER.into(),
-                    public_key: record.public_key,
-                }),
-            },
-        ))
-    }
-
-    async fn evaluate_governed_subject_with_plan(
-        &self,
-        req: Request<EvaluateGovernedSubjectWithPlanRequest>,
-    ) -> Result<Response<EvaluateGovernedSubjectWithPlanResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let value = req
-            .into_inner()
-            .evaluation
-            .ok_or_else(|| Status::invalid_argument("plan-backed evaluation required"))?;
-        let prepared = subject::prepare_plan_backed_evaluation(
-            subject::PlanBackedSubjectEvaluationRequest {
-                contract_version: value.contract_version,
-                namespace: value.namespace,
-                request_id: value.request_id,
-                subject_profile: value.subject_profile,
-                subject_identity: value.subject_identity,
-                subject_content_digest: value.subject_content_digest,
-                plan_version_id: value.plan_version_id,
-                evidence_object_ids: value.evidence_object_ids,
-                evaluation_time_ms: value.evaluation_time_ms,
-                max_total_duration_ms: value.max_total_duration_ms,
-            },
-            &actor,
-        )
-        .map_err(Status::invalid_argument)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if prepared.request.evaluation_time_ms > now_ms {
-            return Err(Status::invalid_argument(
-                "evaluation_time_ms cannot be in the future",
-            ));
-        }
-        require_namespace_write_access(&self.db, &actor, &prepared.request.namespace)?;
-        if let Some(existing) = self
-            .db
-            .get_operation_receipt(&prepared.operation_id)
-            .map_err(Status::internal)?
-        {
-            let existing_binding = existing
-                .events
-                .iter()
-                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
-                .and_then(|event| event.attributes.get("binding_digest"));
-            if existing_binding != Some(&prepared.binding_digest) {
-                return Err(Status::already_exists(
-                    "request_id is already bound to a different plan-backed evaluation",
-                ));
-            }
-            return Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
-                decision: Some(plan_backed_decision_from_receipt(&existing)?),
-            }));
-        }
-        let Some(plan) = self
-            .db
-            .get_evaluation_plan(&prepared.request.plan_version_id)
-            .map_err(Status::internal)?
-        else {
-            return Err(Status::not_found("evaluation plan not found"));
-        };
-        if plan.namespace != prepared.request.namespace
-            || !evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)?
-        {
-            return Err(Status::not_found("evaluation plan not found"));
-        }
-        let resolution = evaluation_manifest_domain::prepare_resolution_request(
-            evaluation_manifest_domain::EvaluationResolutionRequest {
-                contract_version: evaluation_manifest_domain::RESOLUTION_REQUEST_CONTRACT.into(),
-                resolver_version: evaluation_manifest_domain::RESOLVER_VERSION.into(),
-                namespace: prepared.request.namespace.clone(),
-                request_id: prepared.resolution_request_id.clone(),
-                plan_version_id: prepared.request.plan_version_id.clone(),
-                subject_profile: prepared.request.subject_profile.clone(),
-                subject_identity: prepared.request.subject_identity.clone(),
-                subject_content_digest: prepared.request.subject_content_digest.clone(),
-                evidence_object_ids: prepared.request.evidence_object_ids.clone(),
-                evaluation_time_ms: prepared.request.evaluation_time_ms,
-            },
-            &actor,
-        )
-        .map_err(map_evaluation_resource_error)?;
-        let outcome = self.resolve_evaluation_plan_internal(&resolution)?;
-        let unresolved_invariant_version_ids = outcome
-            .findings
-            .iter()
-            .filter(|finding| !finding.invariant_version_id.is_empty())
-            .map(|finding| finding.invariant_version_id.clone())
-            .collect::<Vec<_>>();
-        let (manifest, execution, decision, failure_code) = if let Some(manifest) = outcome.manifest
-        {
-            let execution = self
-                .execute_evaluation_manifest_internal(
-                    &manifest,
-                    &actor,
-                    prepared.request.max_total_duration_ms,
-                )
-                .await?;
-            let gate = execution
-                .decision
-                .as_ref()
-                .ok_or_else(|| Status::data_loss("evaluation gate decision is missing"))?;
-            let decision = gate.verdict.clone();
-            let failure_code = if decision != evaluation_execution_domain::VERDICT_ALLOW {
-                gate.reason_code.clone()
-            } else {
-                String::new()
-            };
-            (Some(manifest), Some(execution), decision, failure_code)
-        } else {
-            let decision = match outcome.status.as_str() {
-                evaluation_manifest_domain::RESOLUTION_UNAVAILABLE => {
-                    evaluation_execution_domain::VERDICT_UNAVAILABLE
-                }
-                _ => evaluation_execution_domain::VERDICT_UNKNOWN,
-            };
-            let failure_code = outcome
-                .findings
-                .first()
-                .map(|finding| finding.code.clone())
-                .unwrap_or_else(|| "evaluation_resolution_incomplete".into());
-            (None, None, decision.into(), failure_code)
-        };
-        let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        let receipt = plan_backed_decision_receipt(PlanBackedDecisionReceiptInput {
-            prepared: &prepared,
-            plan_digest: &plan.content_digest,
-            manifest: manifest.as_ref(),
-            execution: execution.as_ref(),
-            unresolved_invariant_version_ids: &unresolved_invariant_version_ids,
-            decision: &decision,
-            failure_code: &failure_code,
-            started_at_ms: now_ms,
-            completed_at_ms,
-        })?;
-        let completeness = receipt.completeness();
-        if !completeness.complete {
-            return Err(Status::internal(format!(
-                "plan-backed governed-subject receipt is incomplete: {:?}",
-                completeness.errors
-            )));
-        }
-        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
-            if let Some(existing) = self
-                .db
-                .get_operation_receipt(&prepared.operation_id)
-                .map_err(Status::internal)?
-            {
-                let same_binding = existing
-                    .events
-                    .iter()
-                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
-                    .and_then(|event| event.attributes.get("binding_digest"))
-                    == Some(&prepared.binding_digest);
-                if same_binding {
-                    return Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
-                        decision: Some(plan_backed_decision_from_receipt(&existing)?),
-                    }));
-                }
-                return Err(Status::already_exists(
-                    "request_id is already bound to a different plan-backed evaluation",
-                ));
-            }
-            return Err(Status::aborted(format!(
-                "plan-backed governed-subject receipt could not be committed: {error}"
-            )));
-        }
-        Ok(Response::new(EvaluateGovernedSubjectWithPlanResponse {
-            decision: Some(plan_backed_decision_from_receipt(&receipt)?),
-        }))
-    }
-
-    async fn authorize_external_action(
-        &self,
-        req: Request<AuthorizeExternalActionRequest>,
-    ) -> Result<Response<AuthorizeExternalActionResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let request = req
-            .into_inner()
-            .request
-            .ok_or_else(|| Status::invalid_argument("request required"))?;
-        let request = external_request_from_proto(request);
-        request.validate().map_err(Status::invalid_argument)?;
-        if request.actor != actor {
-            return Err(Status::permission_denied(
-                "external-action actor must match authenticated principal",
-            ));
-        }
-        require_namespace_write_access(&self.db, &actor, &request.namespace)?;
-        require_external_project_access(
-            &self.db,
-            &actor,
-            &request.namespace,
-            &request.policy_project,
-        )?;
-        let now = chrono::Utc::now().timestamp_millis();
-        reclaim_expired_external_action_reservations(&self.db, &self.budget, now)?;
-        let request_digest = request
-            .canonical_digest()
-            .map_err(Status::invalid_argument)?;
-        let mut authorization_id = format!("external-auth-{}", uuid::Uuid::new_v4().simple());
-        match self
-            .db
-            .claim_external_action_authorization(&request, &request_digest, &authorization_id, now)
-            .map_err(Status::internal)?
-        {
-            external::AuthorizationClaim::Claimed(claimed_id) => {
-                authorization_id = claimed_id;
-            }
-            external::AuthorizationClaim::Existing(existing) => {
-                ensure_external_action_audit(&self.db, &existing)?;
-                return Ok(Response::new(AuthorizeExternalActionResponse {
-                    decision: Some(external_decision_to_proto(&existing.decision)),
-                }));
-            }
-            external::AuthorizationClaim::Conflict => {
-                return Err(Status::already_exists(
-                    "idempotency key was reused with a different canonical request digest",
-                ));
-            }
-            external::AuthorizationClaim::InProgress => {
-                return Err(Status::unavailable(
-                    "external-action authorization decision is in progress",
-                ));
-            }
-        }
-
-        let risk = RiskClass::parse(
-            request
-                .authoritative_risk_class()
-                .map_err(Status::invalid_argument)?,
-        )
-        .ok_or_else(|| Status::invalid_argument("invalid risk_class"))?;
-        let policy =
-            match self
-                .db
-                .resolve_action_policy(&actor, &request.namespace, &request.policy_project)
-            {
-                Ok(policy) => policy,
-                Err(error) => {
-                    let _ = self
-                        .db
-                        .abandon_external_action_claim(&request, &request_digest);
-                    return Err(Status::internal(error));
-                }
-            };
-        let policy_scope = policy
-            .as_ref()
-            .map(|policy| policy.scope.clone())
-            .unwrap_or_default();
-        let policy_version = external_policy_version(policy.as_ref());
-        let external_action_name = format!("external_action/{}", request.action_type);
-        let mut policy_decision = policy
-            .as_ref()
-            .map(|policy| policy.decide(&external_action_name, risk))
-            .unwrap_or(ActionDecision::Allow);
-        let mut reason = "external action satisfies current policy".to_string();
-
-        if request.deadline_ms <= now {
-            policy_decision = ActionDecision::Deny;
-            reason = "external-action request expired".into();
-        }
-        let approval_id = if policy_decision == ActionDecision::RequireApproval {
-            format!("external-approval-{}", uuid::Uuid::new_v4().simple())
-        } else {
-            String::new()
-        };
-        let mut record = external::AuthorizationRecord {
-            request: request.clone(),
-            decision: external::ExternalActionDecision {
-                version: external::DECISION_VERSION.into(),
-                authorization_id: authorization_id.clone(),
-                request_digest: request_digest.clone(),
-                decision: String::new(),
-                reason,
-                approval_id,
-                policy_scope,
-                policy_version,
-                created_at_ms: now,
-                expires_at_ms: request.deadline_ms,
-                cancelled_at_ms: 0,
-                assurance: external::AssuranceDeclaration::default(),
-            },
-            approval_status: if policy_decision == ActionDecision::RequireApproval {
-                "pending".into()
-            } else {
-                String::new()
-            },
-            budget_reserved: false,
-            blast_radius_reserved: false,
-            decision_actor: actor.clone(),
-            decision_updated_at_ms: now,
-        };
-        if policy_decision != ActionDecision::Deny {
-            let max_mutations = policy
-                .as_ref()
-                .and_then(|policy| policy.max_mutations_per_work_unit);
-            let max_deletes = (risk == RiskClass::Destructive)
-                .then(|| {
-                    policy
-                        .as_ref()
-                        .and_then(|policy| policy.max_deletes_per_work_unit)
-                })
-                .flatten();
-            if max_mutations.is_some() || max_deletes.is_some() {
-                match self.db.reserve_external_action_blast_radius(
-                    &authorization_id,
-                    &request,
-                    max_mutations,
-                    max_deletes,
-                ) {
-                    Ok(()) => record.blast_radius_reserved = true,
-                    Err(_) => {
-                        policy_decision = ActionDecision::Deny;
-                        record.decision.reason =
-                            "external-action cumulative blast-radius cap exceeded".into();
-                    }
-                }
-            }
-        }
-        if policy_decision != ActionDecision::Deny {
-            let requested_units =
-                i32::try_from(request.requested_invocation_count).unwrap_or(i32::MAX);
-            if self
-                .budget
-                .check_and_reserve_idempotent(
-                    &external_budget_scope(&request),
-                    requested_units,
-                    &format!("external-action-reserve:{authorization_id}"),
-                )
-                .is_ok()
-            {
-                record.budget_reserved = true;
-            } else {
-                policy_decision = ActionDecision::Deny;
-                record.decision.reason = "external-action budget exhausted".into();
-                release_external_reservations(&self.db, &self.budget, &mut record)?;
-            }
-        }
-        record.decision.decision = match policy_decision {
-            ActionDecision::Allow => "permit",
-            ActionDecision::Deny => "deny",
-            ActionDecision::RequireApproval => "require_approval",
-        }
-        .into();
-        if policy_decision == ActionDecision::Deny {
-            record.decision.approval_id.clear();
-            record.approval_status.clear();
-        }
-        if let Err(error) = self.db.put_external_action_authorization(&record) {
-            let _ = self
-                .db
-                .abandon_external_action_claim(&request, &request_digest);
-            release_external_reservations(&self.db, &self.budget, &mut record)?;
-            return Err(Status::internal(error));
-        }
-        ensure_external_action_audit(&self.db, &record)?;
-        Ok(Response::new(AuthorizeExternalActionResponse {
-            decision: Some(external_decision_to_proto(&record.decision)),
-        }))
-    }
-
-    async fn resolve_external_action_approval(
-        &self,
-        req: Request<ResolveExternalActionApprovalRequest>,
-    ) -> Result<Response<ResolveExternalActionApprovalResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        if !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "external-action approval requires control-plane administration",
-            ));
-        }
-        let input = req.into_inner();
-        let mut record = self
-            .db
-            .get_external_action_authorization_by_id(&input.authorization_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
-        if record.approval_status != "pending" || record.decision.decision != "require_approval" {
-            if record.decision.decision == "deny"
-                && (record.budget_reserved || record.blast_radius_reserved)
-            {
-                let reserved = record.clone();
-                release_external_reservations(&self.db, &self.budget, &mut record)?;
-                persist_released_external_flags(&self.db, &reserved, &record)?;
-            }
-            ensure_external_action_audit(&self.db, &record)?;
-            return Err(Status::failed_precondition(
-                "external-action approval is not pending",
-            ));
-        }
-        let expected = record.clone();
-        let now = chrono::Utc::now().timestamp_millis();
-        let current_policy = self
-            .db
-            .resolve_action_policy(
-                &record.request.actor,
-                &record.request.namespace,
-                &record.request.policy_project,
-            )
-            .map_err(Status::internal)?;
-        let namespace_access_revoked = require_namespace_write_access(
-            &self.db,
-            &record.request.actor,
-            &record.request.namespace,
-        )
-        .and_then(|_| {
-            require_external_project_access(
-                &self.db,
-                &record.request.actor,
-                &record.request.namespace,
-                &record.request.policy_project,
-            )
-        })
-        .is_err();
-        if namespace_access_revoked {
-            record.decision.decision = "deny".into();
-            record.decision.reason =
-                "external-action requester no longer has namespace access".into();
-            record.approval_status = "revoked".into();
-        } else if now >= record.decision.expires_at_ms {
-            record.decision.decision = "deny".into();
-            record.decision.reason = "external-action approval expired".into();
-            record.approval_status = "expired".into();
-        } else if external_policy_version(current_policy.as_ref()) != record.decision.policy_version
-        {
-            record.decision.decision = "deny".into();
-            record.decision.reason = "external-action approval is stale after policy change".into();
-            record.approval_status = "stale".into();
-        } else if input.approve {
-            record.decision.decision = "permit".into();
-            record.decision.reason = "external action approved for permit issuance".into();
-            record.approval_status = "approved".into();
-        } else {
-            record.decision.decision = "deny".into();
-            record.decision.reason = if input.reason.trim().is_empty() {
-                "external action denied by approver".into()
-            } else {
-                input.reason
-            };
-            record.approval_status = "denied".into();
-        }
-        record.decision_actor = actor;
-        record.decision_updated_at_ms = now;
-        if !self
-            .db
-            .compare_and_swap_external_action_authorization(&expected, &record)
-            .map_err(Status::internal)?
-        {
-            return Err(Status::aborted(
-                "external-action authorization changed concurrently",
-            ));
-        }
-        if record.decision.decision != "permit" {
-            let reserved = record.clone();
-            release_external_reservations(&self.db, &self.budget, &mut record)?;
-            persist_released_external_flags(&self.db, &reserved, &record)?;
-        }
-        ensure_external_action_audit(&self.db, &record)?;
-        Ok(Response::new(ResolveExternalActionApprovalResponse {
-            decision: Some(external_decision_to_proto(&record.decision)),
-        }))
-    }
-
-    async fn cancel_external_action_authorization(
-        &self,
-        req: Request<CancelExternalActionAuthorizationRequest>,
-    ) -> Result<Response<CancelExternalActionAuthorizationResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let input = req.into_inner();
-        let mut record = self
-            .db
-            .get_external_action_authorization_by_id(&input.authorization_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
-        if actor != record.request.actor && !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "external-action cancellation denied",
-            ));
-        }
-        if record.decision.cancelled_at_ms != 0 {
-            if record.budget_reserved || record.blast_radius_reserved {
-                let reserved = record.clone();
-                release_external_reservations(&self.db, &self.budget, &mut record)?;
-                persist_released_external_flags(&self.db, &reserved, &record)?;
-            }
-            ensure_external_action_audit(&self.db, &record)?;
-            return Ok(Response::new(CancelExternalActionAuthorizationResponse {
-                decision: Some(external_decision_to_proto(&record.decision)),
-            }));
-        }
-        let expected = record.clone();
-        let now = chrono::Utc::now().timestamp_millis();
-        record.decision.cancelled_at_ms = now;
-        record.decision.decision = "deny".into();
-        record.decision.reason = if input.reason.trim().is_empty() {
-            "external-action authorization cancelled".into()
-        } else {
-            input.reason
-        };
-        record.approval_status = "cancelled".into();
-        record.decision_actor = actor;
-        record.decision_updated_at_ms = now;
-        if !self
-            .db
-            .compare_and_swap_external_action_authorization(&expected, &record)
-            .map_err(Status::internal)?
-        {
-            return Err(Status::aborted(
-                "external-action authorization changed concurrently",
-            ));
-        }
-        let reserved = record.clone();
-        release_external_reservations(&self.db, &self.budget, &mut record)?;
-        persist_released_external_flags(&self.db, &reserved, &record)?;
-        ensure_external_action_audit(&self.db, &record)?;
-        Ok(Response::new(CancelExternalActionAuthorizationResponse {
-            decision: Some(external_decision_to_proto(&record.decision)),
-        }))
-    }
-
-    async fn issue_external_action_permit(
-        &self,
-        req: Request<IssueExternalActionPermitRequest>,
-    ) -> Result<Response<IssueExternalActionPermitResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let input = req.into_inner();
-        if input.idempotency_key.trim().is_empty() {
-            return Err(Status::invalid_argument("idempotency_key required"));
-        }
-        let authorization = self
-            .db
-            .get_external_action_authorization_by_id(&input.authorization_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
-        if actor != authorization.request.actor && !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied("permit issuance denied"));
-        }
-        require_namespace_write_access(&self.db, &actor, &authorization.request.namespace)?;
-        if let Some(value) = self
-            .db
-            .replay_permit(
-                &authorization.decision.authorization_id,
-                &input.idempotency_key,
-            )
-            .map_err(|error| {
-                if error.contains("different idempotency") {
-                    Status::already_exists(error)
-                } else {
-                    Status::internal(error)
-                }
-            })?
-        {
-            let requested_mode = if input.offline {
-                permit::OFFLINE_REDEMPTION_MODE
-            } else {
-                permit::REDEMPTION_MODE
-            };
-            if value.redemption_mode != requested_mode {
-                return Err(Status::already_exists(
-                    "authorization already issued with a different redemption mode",
-                ));
-            }
-            return Ok(Response::new(IssueExternalActionPermitResponse {
-                permit: Some(external_permit_to_proto(&value)),
-            }));
-        }
-        let key = permit_signing_key(&self.config)?;
-        let approvals = if authorization.approval_status == "approved" {
-            vec![authorization.decision_actor.clone()]
-        } else {
-            Vec::new()
-        };
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let issuance = permit::Issuance {
-            approval_identities: approvals,
-            issuer: &self.config.permit_issuer,
-            key_id: &self.config.permit_key_id,
-            permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
-            nonce: uuid::Uuid::new_v4().simple().to_string(),
-            now_ms,
-            site_id: &self.config.site_id,
-        };
-        let value = if input.offline {
-            let policy = self
-                .db
-                .get_external_permit_policy(&authorization.decision.policy_scope)
-                .map_err(Status::internal)?;
-            permit::issue_offline(&authorization, &policy, &key, issuance)
-        } else {
-            permit::issue(&authorization, &key, issuance)
-        }
-        .map_err(Status::failed_precondition)?;
-        let value = self
-            .db
-            .put_permit(&value, &input.idempotency_key, &actor)
-            .map_err(|error| {
-                if error.contains("different idempotency") {
-                    Status::already_exists(error)
-                } else {
-                    Status::internal(error)
-                }
-            })?;
-        Ok(Response::new(IssueExternalActionPermitResponse {
-            permit: Some(external_permit_to_proto(&value)),
-        }))
-    }
-
-    async fn verify_external_action_permit(
-        &self,
-        req: Request<VerifyExternalActionPermitRequest>,
-    ) -> Result<Response<VerifyExternalActionPermitResponse>, Status> {
-        let _actor = required_authenticated_actor(&req)?;
-        let input = req.into_inner();
-        let value = external_permit_from_proto(
-            input
-                .permit
-                .ok_or_else(|| Status::invalid_argument("permit required"))?,
-        );
-        let context = external_host_context(
-            input.executor,
-            input.requesting_harness,
-            input.canonical_arguments_digest,
-            input.target_selectors,
-            input.observed_preconditions,
-            input.host_capabilities,
-        );
-        let key = permit_signing_key(&self.config)?.verifying_key();
-        let now = chrono::Utc::now().timestamp_millis();
-        let result = value
-            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
-            .and_then(|_| value.verify_signature(&key))
-            .and_then(|_| value.verify_host_context(&context, now))
-            .and_then(|_| self.db.validate_permit_state(&value));
-        Ok(Response::new(VerifyExternalActionPermitResponse {
-            valid: result.is_ok(),
-            reason: result.err().unwrap_or_default(),
-        }))
-    }
-
-    async fn redeem_external_action_permit(
-        &self,
-        req: Request<RedeemExternalActionPermitRequest>,
-    ) -> Result<Response<RedeemExternalActionPermitResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let input = req.into_inner();
-        if input.idempotency_key.trim().is_empty() || input.execution_id.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "idempotency_key and execution_id required",
-            ));
-        }
-        let value = external_permit_from_proto(
-            input
-                .permit
-                .ok_or_else(|| Status::invalid_argument("permit required"))?,
-        );
-        if actor != value.executor && !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "permit redemption requires the bound executor",
-            ));
-        }
-        if let Some(redemption) = self
-            .db
-            .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
-            .map_err(Status::failed_precondition)?
-        {
-            return Ok(Response::new(RedeemExternalActionPermitResponse {
-                redemption: Some(ExternalActionRedemption {
-                    version: redemption.version,
-                    permit_id: redemption.permit_id,
-                    redemption_id: redemption.redemption_id,
-                    executor: redemption.executor,
-                    redeemed_at_ms: redemption.redeemed_at_ms,
-                    invocation_ordinal: redemption.invocation_ordinal,
-                    evidence_due_at_ms: redemption.evidence_due_at_ms,
-                    site_id: redemption.site_id,
-                }),
-            }));
-        }
-        let context = external_host_context(
-            input.executor,
-            input.requesting_harness,
-            input.canonical_arguments_digest,
-            input.target_selectors,
-            input.observed_preconditions,
-            input.host_capabilities,
-        );
-        let key = permit_signing_key(&self.config)?.verifying_key();
-        value
-            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
-            .map_err(Status::failed_precondition)?;
-        let redemption = self
-            .db
-            .redeem_or_reconcile_permit(
-                &value,
-                &context,
-                &key,
-                &input.idempotency_key,
-                &input.execution_id,
-                &self.config.site_id,
-                crate::chisei::external_permit::RedemptionTiming {
-                    invoked_at_ms: input.invoked_at_ms,
-                    reconciled_at_ms: chrono::Utc::now().timestamp_millis(),
-                },
-            )
-            .map_err(Status::failed_precondition)?;
-        Ok(Response::new(RedeemExternalActionPermitResponse {
-            redemption: Some(ExternalActionRedemption {
-                version: redemption.version,
-                permit_id: redemption.permit_id,
-                redemption_id: redemption.redemption_id,
-                executor: redemption.executor,
-                redeemed_at_ms: redemption.redeemed_at_ms,
-                invocation_ordinal: redemption.invocation_ordinal,
-                evidence_due_at_ms: redemption.evidence_due_at_ms,
-                site_id: redemption.site_id,
-            }),
-        }))
-    }
-
-    async fn revoke_external_action_permit(
-        &self,
-        req: Request<RevokeExternalActionPermitRequest>,
-    ) -> Result<Response<RevokeExternalActionPermitResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        if !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "permit revocation requires control-plane administration",
-            ));
-        }
-        let input = req.into_inner();
-        if input.revocation_handle.trim().is_empty() || input.reason.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "revocation_handle and reason required",
-            ));
-        }
-        let now = chrono::Utc::now().timestamp_millis();
-        let changed = self
-            .db
-            .revoke_permit(&input.revocation_handle, &input.reason, now)
-            .map_err(Status::internal)?;
-        if changed {
-            self.db
-                .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-                    id: format!("{}:audit:revoked", input.revocation_handle),
-                    timestamp: now,
-                    actor,
-                    action: "external_action_permit/revoke".into(),
-                    reason: input.reason,
-                    evidence: HashMap::from([(
-                        "revocation_handle".into(),
-                        input.revocation_handle.clone(),
-                    )]),
-                    target_id: input.revocation_handle,
-                    outcome: "revoked".into(),
-                }])
-                .map_err(Status::internal)?;
-        }
-        Ok(Response::new(RevokeExternalActionPermitResponse {
-            revoked: changed,
-        }))
-    }
-
-    async fn set_external_permit_policy(
-        &self,
-        req: Request<SetExternalPermitPolicyRequest>,
-    ) -> Result<Response<SetExternalPermitPolicyResponse>, Status> {
-        require_control_plane_admin(&req, "external permit policy mutation")?;
-        let input = req
-            .into_inner()
-            .policy
-            .ok_or_else(|| Status::invalid_argument("policy required"))?;
-        let policy = permit::ExternalPermitPolicy {
-            scope: input.scope,
-            offline_action_types: input.offline_action_types,
-            offline_max_duration_ms: input.offline_max_duration_ms,
-            offline_max_invocations: input.offline_max_invocations,
-            permitted_delegators: input.permitted_delegators,
-            max_delegation_depth: input.max_delegation_depth,
-        };
-        self.db
-            .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
-            .map_err(Status::invalid_argument)?;
-        Ok(Response::new(SetExternalPermitPolicyResponse {
-            policy: Some(external_permit_policy_to_proto(&policy)),
-        }))
-    }
-
-    async fn delegate_external_action_permit(
-        &self,
-        req: Request<DelegateExternalActionPermitRequest>,
-    ) -> Result<Response<DelegateExternalActionPermitResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let input = req.into_inner();
-        let parent = external_permit_from_proto(
-            input
-                .parent
-                .ok_or_else(|| Status::invalid_argument("parent permit required"))?,
-        );
-        if actor != parent.subject_actor {
-            return Err(Status::permission_denied(
-                "delegation requires the current permit subject",
-            ));
-        }
-        require_namespace_write_access(&self.db, &actor, &parent.namespace)?;
-        let key = permit_signing_key(&self.config)?;
-        parent
-            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
-            .and_then(|_| parent.verify_signature(&key.verifying_key()))
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .validate_permit_for_delegation(&parent)
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .validate_delegation_chain(&parent)
-            .map_err(Status::failed_precondition)?;
-        let policy = self
-            .db
-            .get_external_permit_policy(&parent.policy_scope)
-            .map_err(Status::internal)?;
-        let child = permit::delegate(
-            &parent,
-            &policy,
-            &key,
-            permit::Delegation {
-                delegator: &actor,
-                subject_actor: &input.subject_actor,
-                permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
-                nonce: uuid::Uuid::new_v4().simple().to_string(),
-                now_ms: chrono::Utc::now().timestamp_millis(),
-                expires_at_ms: input.expires_at_ms,
-                target_selectors: input.target_selectors,
-                allowed_effects: input.allowed_effects,
-                budget_micros: input.budget_micros,
-                volume_limit: input.volume_limit,
-                blast_radius_limit: input.blast_radius_limit,
-                max_invocations: input.max_invocations,
-                risk_class: &input.risk_class,
-            },
-        )
-        .map_err(Status::failed_precondition)?;
-        let child = self
-            .db
-            .put_delegated_permit(&child, &actor)
-            .map_err(Status::failed_precondition)?;
-        Ok(Response::new(DelegateExternalActionPermitResponse {
-            permit: Some(external_permit_to_proto(&child)),
-        }))
-    }
-
-    async fn set_external_action_kill_switch(
-        &self,
-        req: Request<SetExternalActionKillSwitchRequest>,
-    ) -> Result<Response<SetExternalActionKillSwitchResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        if !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "kill-switch changes require control-plane administration",
-            ));
-        }
-        let input = req.into_inner();
-        if input.scope_value.trim().is_empty() || input.reason.trim().is_empty() {
-            return Err(Status::invalid_argument("scope_value and reason required"));
-        }
-        let now = chrono::Utc::now().timestamp_millis();
-        let changed = self
-            .db
-            .set_permit_kill_switch(
-                &input.scope_kind,
-                &input.scope_value,
-                input.enabled,
-                &input.reason,
-                now,
-            )
-            .map_err(Status::invalid_argument)?;
-        self.db
-            .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-                id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
-                timestamp: now,
-                actor,
-                action: "external_action_permit/kill_switch".into(),
-                reason: input.reason,
-                evidence: HashMap::from([
-                    ("scope_kind".into(), input.scope_kind.clone()),
-                    ("scope_value".into(), input.scope_value.clone()),
-                ]),
-                target_id: input.scope_value,
-                outcome: if input.enabled {
-                    "enabled".into()
-                } else {
-                    "disabled".into()
-                },
-            }])
-            .map_err(Status::internal)?;
-        Ok(Response::new(SetExternalActionKillSwitchResponse {
-            changed,
-        }))
-    }
-
-    async fn decide_gateway_execution(
-        &self,
-        req: Request<DecideGatewayExecutionRequest>,
-    ) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
-        use crate::chisei::gateway_decide::{
-            GATEWAY_DECIDE_CONTRACT_VERSION, GatewayDecideDenyReason, GatewayDecideInputs,
-            GatewayDecideOutcome, GatewayDecideRequest, budget_grant_id, compose_gateway_decide,
-        };
-
-        let actor = authenticated_actor(&req);
-        let r = req.into_inner();
-        let namespace = r.namespace.trim();
-        if namespace.is_empty() {
-            return Ok(Response::new(DecideGatewayExecutionResponse {
-                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                admitted: false,
-                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
-                deny_message: "namespace is required".into(),
-                ..Default::default()
-            }));
-        }
-        if let Err(status) =
-            require_execution_namespace_access(&self.db, &self.config, &actor, namespace)
-        {
-            let reason = if status.code() == tonic::Code::PermissionDenied {
-                GatewayDecideDenyReason::Unauthorized
-            } else {
-                GatewayDecideDenyReason::InvalidRequest
-            };
-            return Ok(Response::new(DecideGatewayExecutionResponse {
-                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                admitted: false,
-                deny_reason: reason.as_str().into(),
-                deny_message: status.message().to_string(),
-                ..Default::default()
-            }));
-        }
-
-        let domain_request = GatewayDecideRequest {
-            contract_version: r.contract_version.clone(),
-            namespace: namespace.into(),
-            principal: actor.clone(),
-            requested_model: r.requested_model.trim().to_string(),
-            operation_class: r.operation_class.trim().to_string(),
-            estimated_cost_usd_micros: r.estimated_cost_usd_micros,
-            correlation_operation_id: r.correlation_operation_id.trim().to_string(),
-            correlation_attempt: r.correlation_attempt,
-        };
-        if let Err(message) = domain_request.validate() {
-            return Ok(Response::new(DecideGatewayExecutionResponse {
-                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                admitted: false,
-                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
-                deny_message: message,
-                ..Default::default()
-            }));
-        }
-        let context_admission_policy = match self.policy.context_admission_policy(namespace) {
-            Ok(policy) => policy,
-            Err(_error) => {
-                return Ok(Response::new(DecideGatewayExecutionResponse {
-                    contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                    admitted: false,
-                    deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
-                    deny_message: "context admission policy unavailable".into(),
-                    context_admission_reasons: vec!["context_admission:unavailable".into()],
-                    ..Default::default()
-                }));
-            }
-        };
-        let context_admission_policy_version = context_admission_policy
-            .as_ref()
-            .map(crate::chisei::policy::ContextAdmissionPolicy::version)
-            .unwrap_or_default();
-        let context_admission_descriptor_version =
-            crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION.to_string();
-        let operation_risk =
-            crate::chisei::policy::OperationRisk::from_labels(&r.operation_class, &r.task_class);
-        let operation_context_gate = context_admission_policy
-            .as_ref()
-            .map(|policy| policy.operation_gate(operation_risk))
-            .transpose()
-            .map_err(Status::failed_precondition)?
-            .flatten();
-        if let Some(gate) = operation_context_gate
-            .as_ref()
-            .filter(|gate| gate.blocks_provider())
-        {
-            return Ok(Response::new(DecideGatewayExecutionResponse {
-                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                admitted: false,
-                deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
-                deny_message: "context admission policy requires review or verification".into(),
-                context_admission_policy_version: gate.policy_version.clone(),
-                context_admission_descriptor_version: gate.descriptor_version.clone(),
-                context_admission_decision: gate.action.as_str().into(),
-                context_admission_reasons: vec![gate.reason_code.clone()],
-                ..Default::default()
-            }));
-        }
-
-        let project = if r.project.trim().is_empty() {
-            namespace
-        } else {
-            r.project.trim()
-        };
-        let trusted_gateway = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
-        if project != namespace
-            || (!trusted_gateway
-                && ((!r.agent.trim().is_empty() && r.agent.trim() != actor)
-                    || (!r.user_id.trim().is_empty() && r.user_id.trim() != actor)
-                    || !r.key_id.trim().is_empty()))
-        {
-            return Ok(Response::new(DecideGatewayExecutionResponse {
-                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                admitted: false,
-                deny_reason: GatewayDecideDenyReason::Unauthorized.as_str().into(),
-                deny_message: "gateway decision scopes are not authorized for the caller".into(),
-                ..Default::default()
-            }));
-        }
-        let budget_subject = budget_subject(
-            "",
-            project,
-            r.agent.trim(),
-            r.key_id.trim(),
-            r.work_unit.trim(),
-            "",
-        )
-        .unwrap_or_else(|_| format!("project:{project}"));
-        let estimated_tokens = r.estimated_tokens.max(0);
-        let metric = crate::db::chisei_budget::METRIC_TOKENS;
-        let token_budget_check =
-            self.budget
-                .check_with_metric(&budget_subject, estimated_tokens, metric);
-        let request_budget_check = self.budget.check_with_metric(
-            &budget_subject,
-            i32::try_from(r.expected_calls.max(1)).unwrap_or(i32::MAX),
-            crate::db::chisei_budget::METRIC_REQUESTS,
-        );
-        let within_cap = token_budget_check.is_ok() && request_budget_check.is_ok();
-        let decision_budget_scope = request_budget_check
-            .as_ref()
-            .err()
-            .or_else(|| token_budget_check.as_ref().err())
-            .as_ref()
-            .and_then(|error| {
-                error
-                    .strip_prefix("budget exceeded at ")
-                    .and_then(|rest| rest.split_once(": used"))
-                    .map(|(scope, _)| scope.to_string())
-            })
-            .unwrap_or_else(|| budget_subject.clone());
-        let mut route_bias = self
-            .budget
-            .route_bias(
-                &budget_subject,
-                estimated_tokens,
-                metric,
-                r.task_class.trim(),
-            )
-            .as_str()
-            .to_string();
-        let continuation_started = !r.work_unit.trim().is_empty()
-            && active_continuation_allocation(
-                &self.db,
-                r.work_unit.trim(),
-                &[
-                    actor.as_str(),
-                    r.agent.as_str(),
-                    r.key_id.as_str(),
-                    r.user_id.as_str(),
-                ],
-                chrono::Utc::now().timestamp_millis(),
-            )
-            && self
-                .budget
-                .get_usage_with_metric(&budget_subject, metric)
-                .tokens_used
-                > 0;
-        let (budget_allowed, degradation_level, budget_warning) = if within_cap {
-            (
-                true,
-                if route_bias == "cheap" {
-                    "cheap_cloud"
-                } else {
-                    "capable"
-                },
-                false,
-            )
-        } else if request_budget_check.is_ok() && continuation_started {
-            (true, "warn", true)
-        } else if request_budget_check.is_ok()
-            && r.local_free_available
-            && crate::chisei::model_routing::is_cheap_eligible_task_class(r.task_class.trim())
-        {
-            route_bias = "local_free".to_string();
-            // The canonical decision may admit only after policy resolution
-            // proves that this recommendation resolves to a local-free model.
-            // The gateway independently rejects any non-local result.
-            (true, "local_free", true)
-        } else {
-            (false, "hard_cap", true)
-        };
-
-        // Keep the gateway decision on the same policy-resolution path as
-        // direct ResolvePolicy clients. The retired edge fallback previously
-        // supplied scoped policies, eval regressions, lifecycle checks, and
-        // canonical live-model resolution; the canonical PDP must preserve
-        // those semantics itself.
-        let mut policy_request = Request::new(ResolvePolicyRequest {
-            namespace: namespace.to_string(),
-            preferred_runtime: r.preferred_runtime.trim().to_string(),
-            preferred_model: r.requested_model.trim().to_string(),
-            subject: String::new(),
-            project: project.to_string(),
-            agent: r.agent.trim().to_string(),
-            key_id: r.key_id.trim().to_string(),
-            task_class: r.task_class.trim().to_string(),
-            user_id: r.user_id.trim().to_string(),
-            expected_calls: r.expected_calls.max(1),
-            budget_route_bias: route_bias.clone(),
-            route_override: r.route_override.trim().to_string(),
-            capability_requirements_json: r.capability_requirements_json.clone(),
-        });
-        if let Ok(principal) = actor.parse() {
-            policy_request
-                .metadata_mut()
-                .insert("x-principal", principal);
-        }
-        let (route, policy_resolution) = match self.resolve_policy(policy_request).await {
-            Ok(response) => match response.into_inner().resolution {
-                Some(resolution) => {
-                    if !resolution.route_bias.trim().is_empty() {
-                        route_bias = resolution.route_bias.clone();
-                    }
-                    (
-                        Ok((
-                            resolution.runtime.clone(),
-                            resolution.model.clone(),
-                            resolution.policy_version.clone(),
-                        )),
-                        Some(resolution),
-                    )
-                }
-                None => (
-                    Err((
-                        GatewayDecideDenyReason::PolicyDenied,
-                        "policy resolution returned no decision".into(),
-                    )),
-                    None,
-                ),
-            },
-            Err(status) => {
-                let reason = match status.code() {
-                    tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
-                    tonic::Code::FailedPrecondition => {
-                        GatewayDecideDenyReason::CapabilityUnsupported
-                    }
-                    tonic::Code::PermissionDenied => GatewayDecideDenyReason::ResidencyDenied,
-                    tonic::Code::InvalidArgument => GatewayDecideDenyReason::PolicyDenied,
-                    _ => GatewayDecideDenyReason::PolicyDenied,
-                };
-                (Err((reason, status.message().to_string())), None)
-            }
-        };
-
-        let grant = budget_grant_id(
-            &budget_subject,
-            &domain_request.correlation_operation_id,
-            domain_request.correlation_attempt,
-        );
-        let composed = compose_gateway_decide(GatewayDecideInputs {
-            request: domain_request.clone(),
-            route,
-            budget_allowed,
-            budget_scope: decision_budget_scope.clone(),
-            budget_grant_id: grant.clone(),
-            route_bias: route_bias.clone(),
-            degradation_level: degradation_level.into(),
-            budget_warning,
-        });
-
-        let mut response = DecideGatewayExecutionResponse {
-            contract_version: composed.contract_version.clone(),
-            admitted: composed.allows_upstream(),
-            deny_reason: String::new(),
-            deny_message: String::new(),
-            resolved_runtime: String::new(),
-            resolved_model: String::new(),
-            policy_version: String::new(),
-            budget_scope: decision_budget_scope.clone(),
-            budget_grant_id: grant,
-            route_bias,
-            degradation_level: degradation_level.into(),
-            budget_warning,
-            policy_scope: policy_resolution
-                .as_ref()
-                .map(|resolution| resolution.policy_scope.clone())
-                .unwrap_or_default(),
-            data_class: policy_resolution
-                .as_ref()
-                .map(|resolution| resolution.data_class.clone())
-                .unwrap_or_default(),
-            fallback_models: policy_resolution
-                .as_ref()
-                .map(|resolution| resolution.fallback_models.clone())
-                .unwrap_or_default(),
-            eval_regressed: policy_resolution
-                .as_ref()
-                .is_some_and(|resolution| resolution.eval_regressed),
-            eval_regression_reason: policy_resolution
-                .as_ref()
-                .map(|resolution| resolution.eval_regression_reason.clone())
-                .unwrap_or_default(),
-            context_admission_policy_version: context_admission_policy_version.clone(),
-            context_admission_descriptor_version: context_admission_descriptor_version.clone(),
-            context_admission_decision: operation_context_gate
-                .as_ref()
-                .map(|gate| gate.action.as_str().to_string())
-                .unwrap_or_else(|| {
-                    context_admission_policy
-                        .as_ref()
-                        .map(|_| ContextAdmissionAction::Include.as_str().to_string())
-                        .unwrap_or_default()
-                }),
-            context_admission_reasons: operation_context_gate
-                .as_ref()
-                .map(|gate| vec![gate.reason_code.clone()])
-                .unwrap_or_default(),
-        };
-        match &composed.outcome {
-            GatewayDecideOutcome::Admit(admit) => {
-                response.resolved_runtime = admit.resolved_runtime.clone();
-                response.resolved_model = admit.resolved_model.clone();
-                response.policy_version = admit.policy_version.clone();
-                response.budget_grant_id = admit.budget_grant_id.clone();
-            }
-            GatewayDecideOutcome::Deny(deny) => {
-                response.deny_reason = deny.reason.as_str().into();
-                response.deny_message = deny.message.clone();
-            }
-        }
-
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: format!(
-                "gateway-decide:{}:{}:{}",
-                namespace,
-                domain_request.correlation_operation_id,
-                domain_request.correlation_attempt
-            ),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor,
-            action: "gateway.decide".into(),
-            reason: if response.admitted {
-                "gateway fat-decide admitted".into()
-            } else {
-                response.deny_message.clone()
-            },
-            evidence: std::collections::HashMap::from([
-                ("namespace".into(), namespace.into()),
-                (
-                    "correlation_operation_id".into(),
-                    domain_request.correlation_operation_id.clone(),
-                ),
-                ("admitted".into(), response.admitted.to_string()),
-                ("deny_reason".into(), response.deny_reason.clone()),
-                ("resolved_model".into(), response.resolved_model.clone()),
-                ("budget_scope".into(), response.budget_scope.clone()),
-                (
-                    "contract_version".into(),
-                    GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                ),
-            ]),
-            target_id: domain_request.correlation_operation_id,
-            outcome: if response.admitted {
-                "admitted".into()
-            } else {
-                "denied".into()
-            },
-        });
-
-        Ok(Response::new(response))
-    }
-
-    async fn check_budget(
-        &self,
-        req: Request<CheckBudgetRequest>,
-    ) -> Result<Response<CheckBudgetResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let r = req.into_inner();
-        let metric = budget_metric(&r.metric)?;
-        let managed_team_principal = self
-            .db
-            .is_team_principal(&actor)
-            .map_err(Status::internal)?;
-        let budget_subject = if managed_team_principal {
-            require_namespace_access(&self.db, &actor, &r.project)?;
-            if !r.subject.trim().is_empty()
-                || !r.key_id.trim().is_empty()
-                || !r.user_id.trim().is_empty()
-                || (!r.agent.trim().is_empty() && r.agent.trim() != actor)
-            {
-                return Err(Status::permission_denied(
-                    "team budget scope is derived from the authenticated principal",
-                ));
-            }
-            let mut subject = format!("project:{}/agent:{}", r.project, actor);
-            if !r.work_unit.trim().is_empty() {
-                let work_unit = self
-                    .db
-                    .get_work_unit(r.work_unit.trim())
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                if work_unit.owner_principal != actor && work_unit.creator_principal != actor {
-                    return Err(Status::permission_denied("work unit access denied"));
-                }
-                let target = self
-                    .db
-                    .get_object(&work_unit.target_object_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::permission_denied("work unit target unavailable"))?;
-                if target.namespace != r.project {
-                    return Err(Status::permission_denied("work unit namespace denied"));
-                }
-                subject.push_str(&format!("/work_unit:{}", r.work_unit.trim()));
-            }
-            subject
-        } else {
-            budget_subject(
-                &r.subject,
-                &r.project,
-                &r.agent,
-                &r.key_id,
-                &r.work_unit,
-                &r.user_id,
-            )?
-        };
-        let within_cap = self
-            .budget
-            .check_with_metric(&budget_subject, r.estimated_tokens, metric)
-            .is_ok();
-        let pressure = self
-            .budget
-            .projected_pressure_percent(&budget_subject, r.estimated_tokens, metric)
-            .unwrap_or(0);
-        let mut route_bias = self
-            .budget
-            .route_bias(&budget_subject, r.estimated_tokens, metric, &r.task_class)
-            .as_str()
-            .to_string();
-        // Continuation authority is derived entirely from durable server-side
-        // coordination state. `mid_task` is compatibility metadata only and
-        // must never authorize a hard-cap exception.
-        let continuation_started = !r.work_unit.trim().is_empty()
-            && active_continuation_allocation(
-                &self.db,
-                &r.work_unit,
-                &[
-                    actor.as_str(),
-                    r.agent.as_str(),
-                    r.key_id.as_str(),
-                    r.user_id.as_str(),
-                ],
-                chrono::Utc::now().timestamp_millis(),
-            )
-            && self
-                .budget
-                .get_usage_with_metric(&budget_subject, metric)
-                .tokens_used
-                > 0;
-        let (allowed, degradation_level, warning) = if within_cap {
-            if continuation_started || pressure >= 90 {
-                (
-                    true,
-                    if route_bias == "cheap" {
-                        "cheap_cloud"
-                    } else {
-                        "warn"
-                    },
-                    true,
-                )
-            } else if route_bias == "cheap" {
-                (true, "cheap_cloud", false)
-            } else {
-                (true, "capable", false)
-            }
-        } else if metric == crate::db::chisei_budget::METRIC_TOKENS && continuation_started {
-            (true, "warn", true)
-        } else if metric == crate::db::chisei_budget::METRIC_TOKENS
-            && r.local_free_available
-            && crate::chisei::model_routing::is_cheap_eligible_task_class(&r.task_class)
-        {
-            route_bias = "local_free".to_string();
-            // This is a provisional route recommendation, not permission to
-            // exceed the cap. The gateway must resolve it to a verified local
-            // model before execution; direct CheckBudget consumers still see
-            // the hard enforcement decision in `allowed`.
-            (false, "local_free", true)
-        } else {
-            (false, "hard_cap", true)
-        };
-        let u = self
-            .budget
-            .most_constrained_usage_with_metric(&budget_subject, metric);
-        Ok(Response::new(CheckBudgetResponse {
-            allowed,
-            usage: Some(BudgetUsage {
-                user_id: u.user_id,
-                tokens_used: u.tokens_used,
-                max_tokens: u.max_tokens,
-                period_type: u.period_type.as_str().into(),
-                period_start: u.period_start,
-            }),
-            route_bias,
-            degradation_level: degradation_level.to_string(),
-            warning,
-        }))
-    }
-
-    async fn record_usage(
-        &self,
-        req: Request<RecordUsageRequest>,
-    ) -> Result<Response<RecordUsageResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let trusted_accounting_principal =
-            matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-                || self
-                    .config
-                    .gateway_receipt_principals
-                    .iter()
-                    .any(|principal| principal == &actor);
-        if !trusted_accounting_principal {
-            return Err(Status::permission_denied(
-                "usage recording requires an authorized accounting principal",
-            ));
-        }
-        let r = req.into_inner();
-        if r.tokens_used < 0 && !matches!(actor.as_str(), "root" | "local") {
-            return Err(Status::permission_denied(
-                "negative usage adjustments require control-plane administration",
-            ));
-        }
-        let metric = budget_metric(&r.metric)?;
-        let budget_subject = budget_subject(
-            &r.subject,
-            &r.project,
-            &r.agent,
-            &r.key_id,
-            &r.work_unit,
-            &r.user_id,
-        )?;
-        self.budget
-            .record_idempotent_with_metric(
-                &budget_subject,
-                r.tokens_used,
-                metric,
-                &r.idempotency_key,
-            )
-            .map_err(Status::internal)?;
-        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
-        Ok(Response::new(RecordUsageResponse {
-            usage: Some(BudgetUsage {
-                user_id: u.user_id,
-                tokens_used: u.tokens_used,
-                max_tokens: u.max_tokens,
-                period_type: u.period_type.as_str().into(),
-                period_start: u.period_start,
-            }),
-        }))
-    }
-
-    async fn set_budget_limit(
-        &self,
-        req: Request<SetBudgetLimitRequest>,
-    ) -> Result<Response<SetBudgetLimitResponse>, Status> {
-        require_control_plane_admin(&req, "budget mutation")?;
-        let r = req.into_inner();
-        let metric = budget_metric(&r.metric)?;
-        let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
-            .map_err(Status::invalid_argument)?;
-        let budget_subject = budget_subject(
-            &r.subject,
-            &r.project,
-            &r.agent,
-            &r.key_id,
-            &r.work_unit,
-            &r.user_id,
-        )?;
-        self.budget
-            .set_limit_with_metric(&budget_subject, metric, r.max_tokens, period)
-            .map_err(Status::internal)?;
-        Ok(Response::new(SetBudgetLimitResponse {}))
-    }
-
-    async fn record_portfolio_observation(
-        &self,
-        req: Request<RecordPortfolioObservationRequest>,
-    ) -> Result<Response<RecordPortfolioObservationResponse>, Status> {
-        require_telemetry_writer(&req, &self.config)?;
-        let r = req.into_inner();
-        let updated_at = if r.updated_at > 0 {
-            r.updated_at
-        } else {
-            chrono::Utc::now().timestamp_millis()
-        };
-        self.portfolio
-            .record(&Observation {
-                namespace: r.namespace.clone(),
-                task_class: r.task_class.clone(),
-                model: r.model,
-                prompt_variant: r.prompt_variant,
-                quality_score: r.quality_score,
-                cost_usd_micros: r.cost_usd_micros,
-                sample_count: r.sample_count,
-                updated_at,
-            })
-            .map_err(Status::invalid_argument)?;
-        let frontier = self
-            .portfolio
-            .frontier(&r.namespace, &r.task_class)
-            .map_err(Status::internal)?
-            .into_iter()
-            .map(portfolio_point_pb)
-            .collect();
-        Ok(Response::new(RecordPortfolioObservationResponse {
-            frontier,
-        }))
-    }
-
-    async fn get_portfolio_frontier(
-        &self,
-        req: Request<GetPortfolioFrontierRequest>,
-    ) -> Result<Response<GetPortfolioFrontierResponse>, Status> {
-        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
-        let r = req.into_inner();
-        if r.namespace.trim().is_empty() {
-            return Err(Status::invalid_argument("portfolio namespace required"));
-        }
-        let frontier = self
-            .portfolio
-            .frontier(&r.namespace, &r.task_class)
-            .map_err(Status::internal)?
-            .into_iter()
-            .map(portfolio_point_pb)
-            .collect();
-        Ok(Response::new(GetPortfolioFrontierResponse { frontier }))
-    }
-
-    async fn set_portfolio_objective(
-        &self,
-        req: Request<SetPortfolioObjectiveRequest>,
-    ) -> Result<Response<SetPortfolioObjectiveResponse>, Status> {
-        require_control_plane_admin(&req, "portfolio objective mutation")?;
-        let r = req
-            .into_inner()
-            .objective
-            .ok_or_else(|| Status::invalid_argument("portfolio objective required"))?;
-        let objective = Objective {
-            namespace: r.namespace.trim().to_string(),
-            mode: ObjectiveMode::parse(&r.mode).map_err(Status::invalid_argument)?,
-            budget_usd_micros: r.budget_usd_micros,
-            quality_bar: r.quality_bar,
-            min_samples: r.min_samples,
-            updated_at: if r.updated_at > 0 {
-                r.updated_at
-            } else {
-                chrono::Utc::now().timestamp_millis()
-            },
-        };
-        self.portfolio
-            .set_objective(&objective)
-            .map_err(Status::invalid_argument)?;
-        Ok(Response::new(SetPortfolioObjectiveResponse {
-            objective: Some(portfolio_objective_pb(&objective)),
-        }))
-    }
-
-    async fn allocate_portfolio(
-        &self,
-        req: Request<AllocatePortfolioRequest>,
-    ) -> Result<Response<AllocatePortfolioResponse>, Status> {
-        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
-        let r = req.into_inner();
-        let objective = self
-            .portfolio
-            .objective(&r.namespace)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::failed_precondition("portfolio objective not configured"))?;
-        let demands: Vec<_> = r
-            .demands
-            .into_iter()
-            .map(|demand| PortfolioDemand {
-                task_class: demand.task_class,
-                expected_calls: demand.expected_calls,
-                quality_bar: demand.has_quality_bar.then_some(demand.quality_bar),
-            })
-            .collect();
-        let plan = self
-            .portfolio
-            .allocate(&objective, &demands)
-            .map_err(Status::failed_precondition)?;
-        Ok(Response::new(AllocatePortfolioResponse {
-            objective: Some(portfolio_objective_pb(&objective)),
-            allocations: plan
-                .allocations
-                .into_iter()
-                .map(|allocation| PortfolioAllocation {
-                    task_class: allocation.task_class,
-                    model: allocation.model,
-                    prompt_variant: allocation.prompt_variant,
-                    quality_score: allocation.quality_score,
-                    cost_per_call_usd_micros: allocation.cost_per_call_usd_micros,
-                    expected_calls: allocation.expected_calls,
-                })
-                .collect(),
-            total_cost_usd_micros: plan.total_cost_usd_micros,
-            total_value: plan.total_value,
-        }))
-    }
-
-    async fn set_namespace_policy(
-        &self,
-        req: Request<SetNamespacePolicyRequest>,
-    ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
-        require_control_plane_admin(&req, "namespace policy mutation")?;
-        let registry = self.refresh_provider_registry_for_resolution().await?;
-        let validated_registry_version = registry.state_version;
-        crate::provider_profile::with_provider_registry_snapshot(registry, async {
-            let r = req.into_inner();
-            if r.namespace.trim().is_empty() {
-                return Err(Status::invalid_argument("namespace required"));
-            }
-            let policy = normalize_legacy_policy_provider_pairs(policy_from_request(&r));
-            validate_policy_provider_pairs(&policy).map_err(Status::invalid_argument)?;
-            let context_admission_policy = if r.context_admission_policy_json.trim().is_empty() {
-                self.policy
-                    .context_admission_policy(&r.namespace)
-                    .map_err(Status::failed_precondition)?
-            } else if r.context_admission_policy_json.trim() == "null" {
-                None
-            } else {
-                let context_policy = serde_json::from_str::<
-                    crate::chisei::policy::ContextAdmissionPolicy,
-                >(&r.context_admission_policy_json)
-                .map_err(|error| {
-                    Status::invalid_argument(format!("invalid context admission policy: {error}"))
-                })?;
-                context_policy
-                    .validate()
-                    .map_err(Status::invalid_argument)?;
-                Some(context_policy)
-            };
-            let policy_data_class = policy.data_class.clone();
-            let policy_version = policy.version();
-            let current_registry = self.refresh_provider_registry_for_resolution().await?;
-            if current_registry.state_version != validated_registry_version {
-                return Err(Status::aborted(
-                    "provider registry changed while validating namespace policy",
-                ));
-            }
-            persist_namespace_policy(
-                &self.db,
-                &r.namespace,
-                &policy,
-                context_admission_policy.as_ref(),
-            )
-            .map_err(Status::internal)?;
-            let default_runtime = policy.default_runtime.clone();
-            let default_model = policy.default_model.clone();
-            self.policy.set_namespace_policy(&r.namespace, policy);
-            if let Some(context_policy) = context_admission_policy {
-                self.policy
-                    .set_context_admission_policy(&r.namespace, context_policy)
-                    .map_err(Status::invalid_argument)?;
-            } else {
-                self.policy.clear_context_admission_policy(&r.namespace);
-            }
-            let (runtime, model) = self
-                .policy
-                .resolve(&r.namespace, &default_runtime, &default_model)
-                .map_err(Status::invalid_argument)?;
-            Ok(Response::new(SetNamespacePolicyResponse {
-                resolution: Some(PolicyResolution {
-                    runtime,
-                    model,
-                    data_class: policy_data_class,
-                    eval_regressed: false,
-                    eval_regression_reason: String::new(),
-                    route_bias: String::new(),
-                    policy_scope: r.namespace,
-                    policy_version,
-                    fallback_models: Vec::new(),
-                }),
-            }))
-        })
-        .await
-    }
-
+impl ChiseiServiceImpl {
     async fn resolve_policy(
         &self,
         req: Request<ResolvePolicyRequest>,
@@ -10463,190 +8345,1581 @@ impl ChiseiService for ChiseiServiceImpl {
         })
         .await
     }
+}
 
-    async fn dry_run_namespace_policy(
+#[tonic::async_trait]
+impl ChiseiService for ChiseiServiceImpl {
+    type ExecutePlanStreamStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
+
+    async fn evaluate_governed_subject(
         &self,
-        req: Request<DryRunNamespacePolicyRequest>,
-    ) -> Result<Response<DryRunNamespacePolicyResponse>, Status> {
-        // Historical receipts are sensitive; always enforce namespace grants
-        // (not only team-managed namespaces).
+        req: Request<EvaluateGovernedSubjectRequest>,
+    ) -> Result<Response<EvaluateGovernedSubjectResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let value = req
+            .into_inner()
+            .subject
+            .ok_or_else(|| Status::invalid_argument("subject required"))?;
+        let envelope = subject::GovernedSubjectEnvelope {
+            version: value.version,
+            namespace: value.namespace,
+            request_id: value.request_id,
+            subject_profile: value.subject_profile,
+            subject_identity: value.subject_identity,
+            content_digest: value.content_digest,
+            references: value
+                .references
+                .into_iter()
+                .map(subject_reference_from_proto)
+                .collect(),
+            evaluation_profile: value.evaluation_profile,
+        };
+        require_namespace_write_access(&self.db, &actor, &envelope.namespace)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let fresh = subject::validate_envelope(&envelope, &actor, now_ms)
+            .map_err(Status::invalid_argument)?;
+        if !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "governed-subject conformance evaluation requires control-plane administration",
+            ));
+        }
+        let binding_digest = subject::binding_digest(&envelope, &actor);
+        let operation_id = subject::operation_id(&envelope.namespace, &actor, &envelope.request_id);
+        if let Some(existing) = self
+            .db
+            .get_operation_receipt(&operation_id)
+            .map_err(Status::internal)?
+        {
+            let existing_binding = existing
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                .and_then(|event| event.attributes.get("binding_digest"));
+            if existing_binding != Some(&binding_digest) {
+                return Err(Status::already_exists(
+                    "request_id is already bound to different governed-subject evidence",
+                ));
+            }
+            return Ok(Response::new(EvaluateGovernedSubjectResponse {
+                result: Some(governed_subject_result_from_receipt(&existing)?),
+            }));
+        }
+
+        let (decision, failure_code) = subject::evaluation(&envelope.evaluation_profile, fresh);
+        let governed_references = envelope
+            .references
+            .iter()
+            .map(|reference| GovernedReference {
+                kind: reference.kind.clone(),
+                reference: reference.reference.clone(),
+                content_hash: Some(reference.content_digest.clone()),
+                disclosed_fields: Vec::new(),
+                omitted: true,
+                omission_reason: Some("subject payload remains externally owned".into()),
+            })
+            .collect::<Vec<_>>();
+        let event = |suffix: &str,
+                     parent: Option<&str>,
+                     kind: ReceiptEventKind,
+                     attributes: BTreeMap<String, String>,
+                     references: Vec<GovernedReference>| {
+            OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.clone(),
+                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
+                timestamp_ms: now_ms,
+                kind,
+                surface: kind.surface(),
+                actor: actor.clone(),
+                references,
+                attributes,
+            }
+        };
+        let mut intent_attributes = BTreeMap::from([
+            ("request_id".into(), operation_id.clone()),
+            ("lookup_request_id".into(), envelope.request_id.clone()),
+            (
+                "caller_scope".into(),
+                subject::caller_scope(&envelope.namespace, &actor),
+            ),
+            ("binding_digest".into(), binding_digest),
+            ("subject_profile".into(), envelope.subject_profile.clone()),
+            ("subject_identity".into(), envelope.subject_identity.clone()),
+            ("content_digest".into(), envelope.content_digest.clone()),
+            (
+                "evaluation_profile".into(),
+                envelope.evaluation_profile.clone(),
+            ),
+        ]);
+        intent_attributes.insert(
+            "reference_count".into(),
+            envelope.references.len().to_string(),
+        );
+        for reference in &envelope.references {
+            intent_attributes.insert(
+                format!("reference_observed_at_ms.{}", reference.kind),
+                reference.observed_at_ms.to_string(),
+            );
+        }
+        let policy_attributes = BTreeMap::from([
+            ("decision".into(), decision.into()),
+            (
+                "profile_registry".into(),
+                "chisei.governed-subject-registry/v1".into(),
+            ),
+        ]);
+        let mut outcome_attributes = BTreeMap::from([
+            ("decision".into(), decision.into()),
+            ("fresh".into(), fresh.to_string()),
+        ]);
+        if let Some(code) = failure_code {
+            outcome_attributes.insert("failure_code".into(), code.into());
+            outcome_attributes.insert(
+                "failure_message".into(),
+                match code {
+                    "stale_evidence" => "governed evidence is stale",
+                    "evaluation_unavailable" => "governed evaluation is unavailable",
+                    "evaluation_timeout" => "governed evaluation timed out",
+                    _ => "governed evaluation failed",
+                }
+                .into(),
+            );
+        }
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.clone(),
+            parent_operation_id: None,
+            namespace: envelope.namespace.clone(),
+            operation_class: "governed_subject_evaluation".into(),
+            initiating_actor: actor.clone(),
+            schema_version: subject::RECEIPT_SCHEMA_VERSION.into(),
+            policy_version: envelope.evaluation_profile.clone(),
+            started_at_ms: now_ms,
+            completed_at_ms: Some(now_ms),
+            events: vec![
+                event(
+                    "intent",
+                    None,
+                    ReceiptEventKind::IntentRecorded,
+                    intent_attributes,
+                    governed_references,
+                ),
+                event(
+                    "policy",
+                    Some("intent"),
+                    ReceiptEventKind::PolicyDecided,
+                    policy_attributes,
+                    Vec::new(),
+                ),
+                event(
+                    "route",
+                    Some("policy"),
+                    ReceiptEventKind::RouteSelected,
+                    BTreeMap::from([("route".into(), "registered_profile".into())]),
+                    Vec::new(),
+                ),
+                event(
+                    "budget",
+                    Some("route"),
+                    ReceiptEventKind::BudgetDecided,
+                    BTreeMap::from([("budget_effect".into(), "none".into())]),
+                    Vec::new(),
+                ),
+                event(
+                    "outcome",
+                    Some("budget"),
+                    ReceiptEventKind::OutcomeRecorded,
+                    outcome_attributes,
+                    Vec::new(),
+                ),
+            ],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+        };
+        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
+            if let Some(existing) = self
+                .db
+                .get_operation_receipt(&operation_id)
+                .map_err(Status::internal)?
+            {
+                let same_binding = existing
+                    .events
+                    .iter()
+                    .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+                    .and_then(|event| event.attributes.get("binding_digest"))
+                    == receipt.events[0].attributes.get("binding_digest");
+                if same_binding {
+                    return Ok(Response::new(EvaluateGovernedSubjectResponse {
+                        result: Some(governed_subject_result_from_receipt(&existing)?),
+                    }));
+                }
+                return Err(Status::already_exists(
+                    "request_id is already bound to different governed-subject evidence",
+                ));
+            }
+            return Err(Status::aborted(format!(
+                "governed-subject receipt could not be committed: {error}"
+            )));
+        }
+        Ok(Response::new(EvaluateGovernedSubjectResponse {
+            result: Some(governed_subject_result_from_receipt(&receipt)?),
+        }))
+    }
+
+    async fn export_governed_subject_provenance(
+        &self,
+        req: Request<ExportGovernedSubjectProvenanceRequest>,
+    ) -> Result<Response<ExportGovernedSubjectProvenanceResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let request = req.into_inner();
+        let binding = subject_provenance::ExportRequestBinding {
+            actor: actor.clone(),
+            export_id: request.export_id,
+            operation_id: request.operation_id,
+            expected_subject_identity: request.expected_subject_identity,
+            expected_subject_content_digest: request.expected_subject_content_digest,
+            expected_manifest_digest: request.expected_manifest_digest,
+            expected_artifact_digest: request.expected_artifact_digest,
+            expected_receipt_digest: request.expected_receipt_digest,
+        };
+        let binding_digest =
+            subject_provenance::binding_digest(&binding).map_err(Status::invalid_argument)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(existing) =
+            load_subject_provenance_record(&self.db, &binding.actor, &binding.export_id)?
+        {
+            if existing.binding_digest != binding_digest {
+                return Err(Status::already_exists(
+                    "export_id is already bound to different governed-subject evidence",
+                ));
+            }
+            require_namespace_access(&self.db, &actor, &existing.namespace)?;
+            return Ok(Response::new(subject_provenance_response(
+                &existing, true, now_ms,
+            )?));
+        }
+
+        let receipt = self
+            .db
+            .get_operation_receipt(&binding.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
+        require_namespace_write_access(&self.db, &actor, &receipt.namespace)?;
+        let (namespace, content_digest) =
+            reconcile_subject_provenance_receipt(&receipt, &binding, now_ms)?;
+        let key_hex = self
+            .config
+            .governed_subject_provenance_signing_key
+            .as_deref()
+            .ok_or_else(|| {
+                Status::failed_precondition("governed-subject provenance signing is not configured")
+            })?;
+        let signing_key = subject_provenance::signing_key_from_hex(key_hex)
+            .map_err(Status::failed_precondition)?;
+        if now_ms < self.config.governed_subject_provenance_key_not_before_ms
+            || now_ms >= self.config.governed_subject_provenance_key_expires_at_ms
+        {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance signing key is not active",
+            ));
+        }
+        let ttl_ms = self.config.governed_subject_provenance_ttl_ms;
+        if ttl_ms <= 0 || ttl_ms > subject_provenance::MAX_ENVELOPE_TTL_MS {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance TTL is invalid",
+            ));
+        }
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .unwrap_or(i64::MAX)
+            .min(self.config.governed_subject_provenance_key_expires_at_ms);
+        if expires_at_ms <= now_ms {
+            return Err(Status::failed_precondition(
+                "governed-subject provenance signing key expires too soon",
+            ));
+        }
+        let envelope = subject_provenance::ProvenanceEnvelope::issue(
+            &signing_key,
+            binding.expected_subject_identity.clone(),
+            content_digest,
+            binding.expected_receipt_digest.clone(),
+            binding.operation_id.clone(),
+            now_ms,
+            expires_at_ms,
+        )
+        .map_err(Status::internal)?;
+        envelope
+            .verify(&signing_key.verifying_key().to_bytes(), now_ms)
+            .map_err(Status::internal)?;
+        let record = subject_provenance::ExportRecord {
+            binding_digest,
+            namespace,
+            envelope,
+            public_key: base64::engine::general_purpose::STANDARD
+                .encode(signing_key.verifying_key().to_bytes()),
+            created_at_ms: now_ms,
+        };
+        let (stored, inserted) = self
+            .db
+            .put_governed_subject_provenance_export(
+                &binding.actor,
+                &binding.export_id,
+                &record,
+            )
+            .map_err(|error| {
+                if error.contains("already bound") {
+                    Status::already_exists(
+                        "export_id is already bound to different governed-subject evidence",
+                    )
+                } else {
+                    tracing::warn!(error = %error, "governed-subject provenance export persistence failed");
+                    Status::aborted(
+                        "governed-subject provenance export could not be committed",
+                    )
+                }
+            })?;
+        Ok(Response::new(subject_provenance_response(
+            &stored, !inserted, now_ms,
+        )?))
+    }
+
+    async fn authorize_external_action(
+        &self,
+        req: Request<AuthorizeExternalActionRequest>,
+    ) -> Result<Response<AuthorizeExternalActionResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        let offline = input.offline;
+        let request = input
+            .request
+            .ok_or_else(|| Status::invalid_argument("request required"))?;
+        let request = external_request_from_proto(request);
+        request.validate().map_err(Status::invalid_argument)?;
+        if request.actor != actor {
+            return Err(Status::permission_denied(
+                "external-action actor must match authenticated principal",
+            ));
+        }
+        require_namespace_write_access(&self.db, &actor, &request.namespace)?;
+        require_external_project_access(
+            &self.db,
+            &actor,
+            &request.namespace,
+            &request.policy_project,
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        reclaim_expired_external_action_reservations(&self.db, &self.budget, now)?;
+        let request_digest = request
+            .canonical_digest()
+            .map_err(Status::invalid_argument)?;
+        let mut authorization_id = format!("external-auth-{}", uuid::Uuid::new_v4().simple());
+        match self
+            .db
+            .claim_external_action_authorization(&request, &request_digest, &authorization_id, now)
+            .map_err(Status::internal)?
+        {
+            external::AuthorizationClaim::Claimed(claimed_id) => {
+                authorization_id = claimed_id;
+            }
+            external::AuthorizationClaim::Existing(existing) => {
+                ensure_external_action_audit(&self.db, &existing)?;
+                let permit = (existing.decision.decision == "permit")
+                    .then(|| {
+                        issue_external_permit(
+                            self,
+                            &existing,
+                            &actor,
+                            &existing.request.idempotency_key,
+                            offline,
+                        )
+                    })
+                    .transpose()?
+                    .map(|permit| external_permit_to_proto(&permit));
+                return Ok(Response::new(AuthorizeExternalActionResponse {
+                    decision: Some(external_decision_to_proto(&existing.decision)),
+                    permit,
+                }));
+            }
+            external::AuthorizationClaim::Conflict => {
+                return Err(Status::already_exists(
+                    "idempotency key was reused with a different canonical request digest",
+                ));
+            }
+            external::AuthorizationClaim::InProgress => {
+                return Err(Status::unavailable(
+                    "external-action authorization decision is in progress",
+                ));
+            }
+        }
+
+        let risk = RiskClass::parse(
+            request
+                .authoritative_risk_class()
+                .map_err(Status::invalid_argument)?,
+        )
+        .ok_or_else(|| Status::invalid_argument("invalid risk_class"))?;
+        let policy =
+            match self
+                .db
+                .resolve_action_policy(&actor, &request.namespace, &request.policy_project)
+            {
+                Ok(policy) => policy,
+                Err(error) => {
+                    let _ = self
+                        .db
+                        .abandon_external_action_claim(&request, &request_digest);
+                    return Err(Status::internal(error));
+                }
+            };
+        let policy_scope = policy
+            .as_ref()
+            .map(|policy| policy.scope.clone())
+            .unwrap_or_default();
+        let policy_version = external_policy_version(policy.as_ref());
+        let external_action_name = format!("external_action/{}", request.action_type);
+        let mut policy_decision = policy
+            .as_ref()
+            .map(|policy| policy.decide(&external_action_name, risk))
+            .unwrap_or(ActionDecision::Allow);
+        let mut reason = "external action satisfies current policy".to_string();
+
+        if request.deadline_ms <= now {
+            policy_decision = ActionDecision::Deny;
+            reason = "external-action request expired".into();
+        }
+        let approval_id = if policy_decision == ActionDecision::RequireApproval {
+            format!("external-approval-{}", uuid::Uuid::new_v4().simple())
+        } else {
+            String::new()
+        };
+        let mut record = external::AuthorizationRecord {
+            request: request.clone(),
+            decision: external::ExternalActionDecision {
+                version: external::DECISION_VERSION.into(),
+                authorization_id: authorization_id.clone(),
+                request_digest: request_digest.clone(),
+                decision: String::new(),
+                reason,
+                approval_id,
+                policy_scope,
+                policy_version,
+                created_at_ms: now,
+                expires_at_ms: request.deadline_ms,
+                cancelled_at_ms: 0,
+                assurance: external::AssuranceDeclaration::default(),
+            },
+            approval_status: if policy_decision == ActionDecision::RequireApproval {
+                "pending".into()
+            } else {
+                String::new()
+            },
+            budget_reserved: false,
+            blast_radius_reserved: false,
+            decision_actor: actor.clone(),
+            decision_updated_at_ms: now,
+        };
+        if policy_decision != ActionDecision::Deny {
+            let max_mutations = policy
+                .as_ref()
+                .and_then(|policy| policy.max_mutations_per_work_unit);
+            let max_deletes = (risk == RiskClass::Destructive)
+                .then(|| {
+                    policy
+                        .as_ref()
+                        .and_then(|policy| policy.max_deletes_per_work_unit)
+                })
+                .flatten();
+            if max_mutations.is_some() || max_deletes.is_some() {
+                match self.db.reserve_external_action_blast_radius(
+                    &authorization_id,
+                    &request,
+                    max_mutations,
+                    max_deletes,
+                ) {
+                    Ok(()) => record.blast_radius_reserved = true,
+                    Err(_) => {
+                        policy_decision = ActionDecision::Deny;
+                        record.decision.reason =
+                            "external-action cumulative blast-radius cap exceeded".into();
+                    }
+                }
+            }
+        }
+        if policy_decision != ActionDecision::Deny {
+            let requested_units =
+                i32::try_from(request.requested_invocation_count).unwrap_or(i32::MAX);
+            if self
+                .budget
+                .check_and_reserve_idempotent(
+                    &external_budget_scope(&request),
+                    requested_units,
+                    &format!("external-action-reserve:{authorization_id}"),
+                )
+                .is_ok()
+            {
+                record.budget_reserved = true;
+            } else {
+                policy_decision = ActionDecision::Deny;
+                record.decision.reason = "external-action budget exhausted".into();
+                release_external_reservations(&self.db, &self.budget, &mut record)?;
+            }
+        }
+        record.decision.decision = match policy_decision {
+            ActionDecision::Allow => "permit",
+            ActionDecision::Deny => "deny",
+            ActionDecision::RequireApproval => "require_approval",
+        }
+        .into();
+        if policy_decision == ActionDecision::Deny {
+            record.decision.approval_id.clear();
+            record.approval_status.clear();
+        }
+        if let Err(error) = self.db.put_external_action_authorization(&record) {
+            let _ = self
+                .db
+                .abandon_external_action_claim(&request, &request_digest);
+            release_external_reservations(&self.db, &self.budget, &mut record)?;
+            return Err(Status::internal(error));
+        }
+        ensure_external_action_audit(&self.db, &record)?;
+        let permit = (record.decision.decision == "permit")
+            .then(|| {
+                issue_external_permit(
+                    self,
+                    &record,
+                    &actor,
+                    &record.request.idempotency_key,
+                    offline,
+                )
+            })
+            .transpose()?
+            .map(|permit| external_permit_to_proto(&permit));
+        Ok(Response::new(AuthorizeExternalActionResponse {
+            decision: Some(external_decision_to_proto(&record.decision)),
+            permit,
+        }))
+    }
+
+    async fn transition_external_action(
+        &self,
+        req: Request<TransitionExternalActionRequest>,
+    ) -> Result<Response<TransitionExternalActionResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        match input.transition.as_str() {
+            "approve" | "deny" => {
+                if !matches!(actor.as_str(), "root" | "local") {
+                    return Err(Status::permission_denied(
+                        "external-action approval requires control-plane administration",
+                    ));
+                }
+                let mut record = self
+                    .db
+                    .get_external_action_authorization_by_id(&input.authorization_id)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
+                if record.approval_status != "pending"
+                    || record.decision.decision != "require_approval"
+                {
+                    return Err(Status::failed_precondition(
+                        "external-action approval is not pending",
+                    ));
+                }
+                let expected = record.clone();
+                let now = chrono::Utc::now().timestamp_millis();
+                let current_policy = self
+                    .db
+                    .resolve_action_policy(
+                        &record.request.actor,
+                        &record.request.namespace,
+                        &record.request.policy_project,
+                    )
+                    .map_err(Status::internal)?;
+                let access_revoked = require_namespace_write_access(
+                    &self.db,
+                    &record.request.actor,
+                    &record.request.namespace,
+                )
+                .and_then(|_| {
+                    require_external_project_access(
+                        &self.db,
+                        &record.request.actor,
+                        &record.request.namespace,
+                        &record.request.policy_project,
+                    )
+                })
+                .is_err();
+                if access_revoked {
+                    record.decision.decision = "deny".into();
+                    record.decision.reason =
+                        "external-action requester no longer has namespace access".into();
+                    record.approval_status = "revoked".into();
+                } else if now >= record.decision.expires_at_ms {
+                    record.decision.decision = "deny".into();
+                    record.decision.reason = "external-action approval expired".into();
+                    record.approval_status = "expired".into();
+                } else if external_policy_version(current_policy.as_ref())
+                    != record.decision.policy_version
+                {
+                    record.decision.decision = "deny".into();
+                    record.decision.reason =
+                        "external-action approval is stale after policy change".into();
+                    record.approval_status = "stale".into();
+                } else if input.transition == "approve" {
+                    record.decision.decision = "permit".into();
+                    record.decision.reason = "external action approved".into();
+                    record.approval_status = "approved".into();
+                } else {
+                    record.decision.decision = "deny".into();
+                    record.decision.reason = if input.reason.trim().is_empty() {
+                        "external action denied by approver".into()
+                    } else {
+                        input.reason.clone()
+                    };
+                    record.approval_status = "denied".into();
+                }
+                record.decision_actor = actor.clone();
+                record.decision_updated_at_ms = now;
+                if !self
+                    .db
+                    .compare_and_swap_external_action_authorization(&expected, &record)
+                    .map_err(Status::internal)?
+                {
+                    return Err(Status::aborted(
+                        "external-action authorization changed concurrently",
+                    ));
+                }
+                if record.decision.decision != "permit" {
+                    let reserved = record.clone();
+                    release_external_reservations(&self.db, &self.budget, &mut record)?;
+                    persist_released_external_flags(&self.db, &reserved, &record)?;
+                }
+                ensure_external_action_audit(&self.db, &record)?;
+                let permit = (record.decision.decision == "permit")
+                    .then(|| {
+                        issue_external_permit(
+                            self,
+                            &record,
+                            &record.request.actor,
+                            &record.request.idempotency_key,
+                            input.offline,
+                        )
+                    })
+                    .transpose()?
+                    .map(|permit| external_permit_to_proto(&permit));
+                Ok(Response::new(TransitionExternalActionResponse {
+                    decision: Some(external_decision_to_proto(&record.decision)),
+                    permit,
+                    changed: true,
+                }))
+            }
+            "cancel" => {
+                let mut record = self
+                    .db
+                    .get_external_action_authorization_by_id(&input.authorization_id)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
+                if actor != record.request.actor && !matches!(actor.as_str(), "root" | "local") {
+                    return Err(Status::permission_denied(
+                        "external-action cancellation denied",
+                    ));
+                }
+                let changed = record.decision.cancelled_at_ms == 0;
+                if changed {
+                    let expected = record.clone();
+                    let now = chrono::Utc::now().timestamp_millis();
+                    record.decision.cancelled_at_ms = now;
+                    record.decision.decision = "deny".into();
+                    record.decision.reason = if input.reason.trim().is_empty() {
+                        "external-action authorization cancelled".into()
+                    } else {
+                        input.reason
+                    };
+                    record.approval_status = "cancelled".into();
+                    record.decision_actor = actor;
+                    record.decision_updated_at_ms = now;
+                    if !self
+                        .db
+                        .compare_and_swap_external_action_authorization(&expected, &record)
+                        .map_err(Status::internal)?
+                    {
+                        return Err(Status::aborted(
+                            "external-action authorization changed concurrently",
+                        ));
+                    }
+                }
+                let reserved = record.clone();
+                release_external_reservations(&self.db, &self.budget, &mut record)?;
+                persist_released_external_flags(&self.db, &reserved, &record)?;
+                ensure_external_action_audit(&self.db, &record)?;
+                Ok(Response::new(TransitionExternalActionResponse {
+                    decision: Some(external_decision_to_proto(&record.decision)),
+                    permit: None,
+                    changed,
+                }))
+            }
+            "revoke" => {
+                if !matches!(actor.as_str(), "root" | "local") {
+                    return Err(Status::permission_denied(
+                        "permit revocation requires control-plane administration",
+                    ));
+                }
+                if input.revocation_handle.trim().is_empty() || input.reason.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "revocation_handle and reason required",
+                    ));
+                }
+                let now = chrono::Utc::now().timestamp_millis();
+                let changed = self
+                    .db
+                    .revoke_permit(&input.revocation_handle, &input.reason, now)
+                    .map_err(Status::internal)?;
+                if changed {
+                    self.db
+                        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+                            id: format!("{}:audit:revoked", input.revocation_handle),
+                            timestamp: now,
+                            actor,
+                            action: "external_action_permit/revoke".into(),
+                            reason: input.reason,
+                            evidence: HashMap::from([(
+                                "revocation_handle".into(),
+                                input.revocation_handle.clone(),
+                            )]),
+                            target_id: input.revocation_handle,
+                            outcome: "revoked".into(),
+                        }])
+                        .map_err(Status::internal)?;
+                }
+                Ok(Response::new(TransitionExternalActionResponse {
+                    decision: None,
+                    permit: None,
+                    changed,
+                }))
+            }
+            "delegate" => {
+                let parent = external_permit_from_proto(
+                    input
+                        .parent
+                        .ok_or_else(|| Status::invalid_argument("parent permit required"))?,
+                );
+                if actor != parent.subject_actor {
+                    return Err(Status::permission_denied(
+                        "delegation requires the current permit subject",
+                    ));
+                }
+                require_namespace_write_access(&self.db, &actor, &parent.namespace)?;
+                let key = permit_signing_key(&self.config)?;
+                parent
+                    .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
+                    .and_then(|_| parent.verify_signature(&key.verifying_key()))
+                    .map_err(Status::failed_precondition)?;
+                self.db
+                    .validate_permit_for_delegation(&parent)
+                    .and_then(|_| self.db.validate_delegation_chain(&parent))
+                    .map_err(Status::failed_precondition)?;
+                let policy = self
+                    .db
+                    .get_external_permit_policy(&parent.policy_scope)
+                    .map_err(Status::internal)?;
+                let child = permit::delegate(
+                    &parent,
+                    &policy,
+                    &key,
+                    permit::Delegation {
+                        delegator: &actor,
+                        subject_actor: &input.subject_actor,
+                        permit_id: format!("permit-{}", uuid::Uuid::new_v4().simple()),
+                        nonce: uuid::Uuid::new_v4().simple().to_string(),
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                        expires_at_ms: input.expires_at_ms,
+                        target_selectors: input.target_selectors,
+                        allowed_effects: input.allowed_effects,
+                        budget_micros: input.budget_micros,
+                        volume_limit: input.volume_limit,
+                        blast_radius_limit: input.blast_radius_limit,
+                        max_invocations: input.max_invocations,
+                        risk_class: &input.risk_class,
+                    },
+                )
+                .map_err(Status::failed_precondition)?;
+                let child = self
+                    .db
+                    .put_delegated_permit(&child, &actor)
+                    .map_err(Status::failed_precondition)?;
+                Ok(Response::new(TransitionExternalActionResponse {
+                    decision: None,
+                    permit: Some(external_permit_to_proto(&child)),
+                    changed: true,
+                }))
+            }
+            _ => Err(Status::invalid_argument(
+                "transition must be approve, deny, cancel, revoke, or delegate",
+            )),
+        }
+    }
+
+    async fn redeem_external_action_permit(
+        &self,
+        req: Request<RedeemExternalActionPermitRequest>,
+    ) -> Result<Response<RedeemExternalActionPermitResponse>, Status> {
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        if input.idempotency_key.trim().is_empty() || input.execution_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "idempotency_key and execution_id required",
+            ));
+        }
+        let value = external_permit_from_proto(
+            input
+                .permit
+                .ok_or_else(|| Status::invalid_argument("permit required"))?,
+        );
+        if actor != value.executor && !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "permit redemption requires the bound executor",
+            ));
+        }
+        if let Some(redemption) = self
+            .db
+            .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
+            .map_err(Status::failed_precondition)?
+        {
+            return Ok(Response::new(RedeemExternalActionPermitResponse {
+                redemption: Some(ExternalActionRedemption {
+                    version: redemption.version,
+                    permit_id: redemption.permit_id,
+                    redemption_id: redemption.redemption_id,
+                    executor: redemption.executor,
+                    redeemed_at_ms: redemption.redeemed_at_ms,
+                    invocation_ordinal: redemption.invocation_ordinal,
+                    evidence_due_at_ms: redemption.evidence_due_at_ms,
+                    site_id: redemption.site_id,
+                }),
+            }));
+        }
+        let context = external_host_context(
+            input.executor,
+            input.requesting_harness,
+            input.canonical_arguments_digest,
+            input.target_selectors,
+            input.observed_preconditions,
+            input.host_capabilities,
+        );
+        let key = permit_signing_key(&self.config)?.verifying_key();
+        value
+            .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
+            .map_err(Status::failed_precondition)?;
+        let redemption = self
+            .db
+            .redeem_or_reconcile_permit(
+                &value,
+                &context,
+                &key,
+                &input.idempotency_key,
+                &input.execution_id,
+                &self.config.site_id,
+                crate::chisei::external_permit::RedemptionTiming {
+                    invoked_at_ms: input.invoked_at_ms,
+                    reconciled_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(RedeemExternalActionPermitResponse {
+            redemption: Some(ExternalActionRedemption {
+                version: redemption.version,
+                permit_id: redemption.permit_id,
+                redemption_id: redemption.redemption_id,
+                executor: redemption.executor,
+                redeemed_at_ms: redemption.redeemed_at_ms,
+                invocation_ordinal: redemption.invocation_ordinal,
+                evidence_due_at_ms: redemption.evidence_due_at_ms,
+                site_id: redemption.site_id,
+            }),
+        }))
+    }
+
+    async fn set_external_action_policy(
+        &self,
+        req: Request<SetExternalActionPolicyRequest>,
+    ) -> Result<Response<SetExternalActionPolicyResponse>, Status> {
+        require_control_plane_admin(&req, "external action policy mutation")?;
+        let actor = required_authenticated_actor(&req)?;
+        let input = req.into_inner();
+        match input.operation.as_str() {
+            "set_policy" => {
+                let input_policy = input
+                    .policy
+                    .ok_or_else(|| Status::invalid_argument("policy required"))?;
+                let policy = permit::ExternalPermitPolicy {
+                    scope: input_policy.scope,
+                    offline_action_types: input_policy.offline_action_types,
+                    offline_max_duration_ms: input_policy.offline_max_duration_ms,
+                    offline_max_invocations: input_policy.offline_max_invocations,
+                    permitted_delegators: input_policy.permitted_delegators,
+                    max_delegation_depth: input_policy.max_delegation_depth,
+                };
+                self.db
+                    .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
+                    .map_err(Status::invalid_argument)?;
+                Ok(Response::new(SetExternalActionPolicyResponse {
+                    policy: Some(external_permit_policy_to_proto(&policy)),
+                    changed: true,
+                }))
+            }
+            "kill_switch" => {
+                if input.scope_value.trim().is_empty() || input.reason.trim().is_empty() {
+                    return Err(Status::invalid_argument("scope_value and reason required"));
+                }
+                let now = chrono::Utc::now().timestamp_millis();
+                let changed = self
+                    .db
+                    .set_permit_kill_switch(
+                        &input.scope_kind,
+                        &input.scope_value,
+                        input.enabled,
+                        &input.reason,
+                        now,
+                    )
+                    .map_err(Status::invalid_argument)?;
+                self.db
+                    .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+                        id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
+                        timestamp: now,
+                        actor,
+                        action: "external_action_permit/kill_switch".into(),
+                        reason: input.reason,
+                        evidence: HashMap::from([
+                            ("scope_kind".into(), input.scope_kind.clone()),
+                            ("scope_value".into(), input.scope_value.clone()),
+                        ]),
+                        target_id: input.scope_value,
+                        outcome: if input.enabled {
+                            "enabled".into()
+                        } else {
+                            "disabled".into()
+                        },
+                    }])
+                    .map_err(Status::internal)?;
+                Ok(Response::new(SetExternalActionPolicyResponse {
+                    policy: None,
+                    changed,
+                }))
+            }
+            _ => Err(Status::invalid_argument(
+                "operation must be set_policy or kill_switch",
+            )),
+        }
+    }
+
+    async fn decide_gateway_execution(
+        &self,
+        req: Request<DecideGatewayExecutionRequest>,
+    ) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
+        use crate::chisei::gateway_decide::{
+            GATEWAY_DECIDE_CONTRACT_VERSION, GatewayDecideDenyReason, GatewayDecideInputs,
+            GatewayDecideOutcome, GatewayDecideRequest, budget_grant_id, compose_gateway_decide,
+        };
+
         let actor = authenticated_actor(&req);
-        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
+        let delegated_principal = req
+            .metadata()
+            .get(DELEGATED_PRINCIPAL_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let r = req.into_inner();
+        let namespace = r.namespace.trim();
+        if namespace.is_empty() {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
+                deny_message: "namespace is required".into(),
+                ..Default::default()
+            }));
+        }
+        if let Err(status) =
+            require_execution_namespace_access(&self.db, &self.config, &actor, namespace)
+        {
+            let reason = if status.code() == tonic::Code::PermissionDenied {
+                GatewayDecideDenyReason::Unauthorized
+            } else {
+                GatewayDecideDenyReason::InvalidRequest
+            };
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: reason.as_str().into(),
+                deny_message: status.message().to_string(),
+                ..Default::default()
+            }));
+        }
+
+        let domain_request = GatewayDecideRequest {
+            contract_version: r.contract_version.clone(),
+            namespace: namespace.into(),
+            principal: actor.clone(),
+            requested_model: r.requested_model.trim().to_string(),
+            operation_class: r.operation_class.trim().to_string(),
+            estimated_cost_usd_micros: r.estimated_cost_usd_micros,
+            correlation_operation_id: r.correlation_operation_id.trim().to_string(),
+            correlation_attempt: r.correlation_attempt,
+        };
+        if let Err(message) = domain_request.validate() {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::InvalidRequest.as_str().into(),
+                deny_message: message,
+                ..Default::default()
+            }));
+        }
+        let context_admission_policy = match self.policy.context_admission_policy(namespace) {
+            Ok(policy) => policy,
+            Err(_error) => {
+                return Ok(Response::new(DecideGatewayExecutionResponse {
+                    contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                    admitted: false,
+                    deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
+                    deny_message: "context admission policy unavailable".into(),
+                    context_admission_reasons: vec!["context_admission:unavailable".into()],
+                    ..Default::default()
+                }));
+            }
+        };
+        let context_admission_policy_version = context_admission_policy
+            .as_ref()
+            .map(crate::chisei::policy::ContextAdmissionPolicy::version)
+            .unwrap_or_default();
+        let context_admission_descriptor_version =
+            crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION.to_string();
+        let operation_risk =
+            crate::chisei::policy::OperationRisk::from_labels(&r.operation_class, &r.task_class);
+        let operation_context_gate = context_admission_policy
+            .as_ref()
+            .map(|policy| policy.operation_gate(operation_risk))
+            .transpose()
+            .map_err(Status::failed_precondition)?
+            .flatten();
+        if let Some(gate) = operation_context_gate
+            .as_ref()
+            .filter(|gate| gate.blocks_provider())
+        {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
+                deny_message: "context admission policy requires review or verification".into(),
+                context_admission_policy_version: gate.policy_version.clone(),
+                context_admission_descriptor_version: gate.descriptor_version.clone(),
+                context_admission_decision: gate.action.as_str().into(),
+                context_admission_reasons: vec![gate.reason_code.clone()],
+                ..Default::default()
+            }));
+        }
+
+        let project = if r.project.trim().is_empty() {
+            namespace
+        } else {
+            r.project.trim()
+        };
+        let trusted_gateway = matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
+        if project != namespace
+            || (!trusted_gateway
+                && ((!r.agent.trim().is_empty() && r.agent.trim() != actor)
+                    || (!r.user_id.trim().is_empty() && r.user_id.trim() != actor)
+                    || !r.key_id.trim().is_empty()))
+        {
+            return Ok(Response::new(DecideGatewayExecutionResponse {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                admitted: false,
+                deny_reason: GatewayDecideDenyReason::Unauthorized.as_str().into(),
+                deny_message: "gateway decision scopes are not authorized for the caller".into(),
+                ..Default::default()
+            }));
+        }
+        let budget_subject = budget_subject(
+            "",
+            project,
+            r.agent.trim(),
+            r.key_id.trim(),
+            r.work_unit.trim(),
+            "",
+        )
+        .unwrap_or_else(|_| format!("project:{project}"));
+        let estimated_tokens = r.estimated_tokens.max(0);
+        let metric = crate::db::chisei_budget::METRIC_TOKENS;
+        let token_budget_check =
+            self.budget
+                .check_with_metric(&budget_subject, estimated_tokens, metric);
+        let request_budget_check = self.budget.check_with_metric(
+            &budget_subject,
+            i32::try_from(r.expected_calls.max(1)).unwrap_or(i32::MAX),
+            crate::db::chisei_budget::METRIC_REQUESTS,
+        );
+        let within_cap = token_budget_check.is_ok() && request_budget_check.is_ok();
+        let decision_budget_scope = request_budget_check
+            .as_ref()
+            .err()
+            .or_else(|| token_budget_check.as_ref().err())
+            .as_ref()
+            .and_then(|error| {
+                error
+                    .strip_prefix("budget exceeded at ")
+                    .and_then(|rest| rest.split_once(": used"))
+                    .map(|(scope, _)| scope.to_string())
+            })
+            .unwrap_or_else(|| budget_subject.clone());
+        let mut route_bias = self
+            .budget
+            .route_bias(
+                &budget_subject,
+                estimated_tokens,
+                metric,
+                r.task_class.trim(),
+            )
+            .as_str()
+            .to_string();
+        let continuation_started = !r.work_unit.trim().is_empty()
+            && active_continuation_allocation(
+                &self.db,
+                r.work_unit.trim(),
+                &[
+                    actor.as_str(),
+                    r.agent.as_str(),
+                    r.key_id.as_str(),
+                    r.user_id.as_str(),
+                ],
+                chrono::Utc::now().timestamp_millis(),
+            )
+            && self
+                .budget
+                .get_usage_with_metric(&budget_subject, metric)
+                .tokens_used
+                > 0;
+        let (budget_allowed, degradation_level, budget_warning) = if within_cap {
+            (
+                true,
+                if route_bias == "cheap" {
+                    "cheap_cloud"
+                } else {
+                    "capable"
+                },
+                false,
+            )
+        } else if request_budget_check.is_ok() && continuation_started {
+            (true, "warn", true)
+        } else if request_budget_check.is_ok()
+            && r.local_free_available
+            && crate::chisei::model_routing::is_cheap_eligible_task_class(r.task_class.trim())
+        {
+            route_bias = "local_free".to_string();
+            // The canonical decision may admit only after policy resolution
+            // proves that this recommendation resolves to a local-free model.
+            // The gateway independently rejects any non-local result.
+            (true, "local_free", true)
+        } else {
+            (false, "hard_cap", true)
+        };
+
+        // Keep the gateway decision on the same policy-resolution path as
+        // the internal policy resolver. The retired edge fallback previously
+        // supplied scoped policies, eval regressions, lifecycle checks, and
+        // canonical live-model resolution; the canonical PDP must preserve
+        // those semantics itself.
+        let mut policy_request = Request::new(ResolvePolicyRequest {
+            namespace: namespace.to_string(),
+            preferred_runtime: r.preferred_runtime.trim().to_string(),
+            preferred_model: r.requested_model.trim().to_string(),
+            subject: String::new(),
+            project: project.to_string(),
+            agent: r.agent.trim().to_string(),
+            key_id: r.key_id.trim().to_string(),
+            task_class: r.task_class.trim().to_string(),
+            user_id: r.user_id.trim().to_string(),
+            expected_calls: r.expected_calls.max(1),
+            budget_route_bias: route_bias.clone(),
+            route_override: r.route_override.trim().to_string(),
+            capability_requirements_json: r.capability_requirements_json.clone(),
+        });
+        if let Ok(principal) = actor.parse() {
+            policy_request
+                .metadata_mut()
+                .insert("x-principal", principal);
+        }
+        let (route, policy_resolution) = match self.resolve_policy(policy_request).await {
+            Ok(response) => match response.into_inner().resolution {
+                Some(resolution) => {
+                    if !resolution.route_bias.trim().is_empty() {
+                        route_bias = resolution.route_bias.clone();
+                    }
+                    (
+                        Ok((
+                            resolution.runtime.clone(),
+                            resolution.model.clone(),
+                            resolution.policy_version.clone(),
+                        )),
+                        Some(resolution),
+                    )
+                }
+                None => (
+                    Err((
+                        GatewayDecideDenyReason::PolicyDenied,
+                        "policy resolution returned no decision".into(),
+                    )),
+                    None,
+                ),
+            },
+            Err(status) => {
+                let reason = match status.code() {
+                    tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
+                    tonic::Code::FailedPrecondition => {
+                        GatewayDecideDenyReason::CapabilityUnsupported
+                    }
+                    tonic::Code::PermissionDenied => GatewayDecideDenyReason::ResidencyDenied,
+                    tonic::Code::InvalidArgument => GatewayDecideDenyReason::PolicyDenied,
+                    _ => GatewayDecideDenyReason::PolicyDenied,
+                };
+                (Err((reason, status.message().to_string())), None)
+            }
+        };
+
+        let grant = budget_grant_id(
+            &budget_subject,
+            &domain_request.correlation_operation_id,
+            domain_request.correlation_attempt,
+        );
+        let composed = compose_gateway_decide(GatewayDecideInputs {
+            request: domain_request.clone(),
+            route,
+            budget_allowed,
+            budget_scope: decision_budget_scope.clone(),
+            budget_grant_id: grant.clone(),
+            route_bias: route_bias.clone(),
+            degradation_level: degradation_level.into(),
+            budget_warning,
+        });
+
+        let mut response = DecideGatewayExecutionResponse {
+            contract_version: composed.contract_version.clone(),
+            admitted: composed.allows_upstream(),
+            deny_reason: String::new(),
+            deny_message: String::new(),
+            resolved_runtime: String::new(),
+            resolved_model: String::new(),
+            policy_version: String::new(),
+            budget_scope: decision_budget_scope.clone(),
+            budget_grant_id: grant,
+            route_bias,
+            degradation_level: degradation_level.into(),
+            budget_warning,
+            policy_scope: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.policy_scope.clone())
+                .unwrap_or_default(),
+            data_class: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.data_class.clone())
+                .unwrap_or_default(),
+            fallback_models: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.fallback_models.clone())
+                .unwrap_or_default(),
+            eval_regressed: policy_resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.eval_regressed),
+            eval_regression_reason: policy_resolution
+                .as_ref()
+                .map(|resolution| resolution.eval_regression_reason.clone())
+                .unwrap_or_default(),
+            context_admission_policy_version: context_admission_policy_version.clone(),
+            context_admission_descriptor_version: context_admission_descriptor_version.clone(),
+            context_admission_decision: operation_context_gate
+                .as_ref()
+                .map(|gate| gate.action.as_str().to_string())
+                .unwrap_or_else(|| {
+                    context_admission_policy
+                        .as_ref()
+                        .map(|_| ContextAdmissionAction::Include.as_str().to_string())
+                        .unwrap_or_default()
+                }),
+            context_admission_reasons: operation_context_gate
+                .as_ref()
+                .map(|gate| vec![gate.reason_code.clone()])
+                .unwrap_or_default(),
+            sampling_evaluated: false,
+            sampled: false,
+            sample_rate: 0.0,
+            sample_reason: String::new(),
+            prepared_spec: String::new(),
+        };
+        match &composed.outcome {
+            GatewayDecideOutcome::Admit(admit) => {
+                response.resolved_runtime = admit.resolved_runtime.clone();
+                response.resolved_model = admit.resolved_model.clone();
+                response.policy_version = admit.policy_version.clone();
+                response.budget_grant_id = admit.budget_grant_id.clone();
+            }
+            GatewayDecideOutcome::Deny(deny) => {
+                response.deny_reason = deny.reason.as_str().into();
+                response.deny_message = deny.message.clone();
+            }
+        }
+        if response.admitted && !r.pipeline_spec.trim().is_empty() {
+            match self.gateway_pipeline_decision(GatewayPipelineInput {
+                actor: &actor,
+                delegated_principal: delegated_principal.as_deref(),
+                request_id: &domain_request.correlation_operation_id,
+                namespace,
+                spec: &r.pipeline_spec,
+                model: &response.resolved_model,
+                runtime: &response.resolved_runtime,
+                task_class: &r.task_class,
+            }) {
+                Ok(decision) => {
+                    response.sampling_evaluated = true;
+                    response.sampled = decision.sampling.sampled;
+                    response.sample_rate = decision.sampling.effective_rate;
+                    response.sample_reason = decision.sampling.reason;
+                    response.prepared_spec = decision.run.prepared_spec;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "gateway sampling decision unavailable");
+                }
+            }
+        }
+
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: format!(
+                "gateway-decide:{}:{}:{}",
+                namespace,
+                domain_request.correlation_operation_id,
+                domain_request.correlation_attempt
+            ),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor,
+            action: "gateway.decide".into(),
+            reason: if response.admitted {
+                "gateway fat-decide admitted".into()
+            } else {
+                response.deny_message.clone()
+            },
+            evidence: std::collections::HashMap::from([
+                ("namespace".into(), namespace.into()),
+                (
+                    "correlation_operation_id".into(),
+                    domain_request.correlation_operation_id.clone(),
+                ),
+                ("admitted".into(), response.admitted.to_string()),
+                ("deny_reason".into(), response.deny_reason.clone()),
+                ("resolved_model".into(), response.resolved_model.clone()),
+                ("budget_scope".into(), response.budget_scope.clone()),
+                (
+                    "contract_version".into(),
+                    GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                ),
+            ]),
+            target_id: domain_request.correlation_operation_id,
+            outcome: if response.admitted {
+                "admitted".into()
+            } else {
+                "denied".into()
+            },
+        });
+
+        Ok(Response::new(response))
+    }
+
+    async fn record_usage(
+        &self,
+        req: Request<RecordUsageRequest>,
+    ) -> Result<Response<RecordUsageResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let trusted_accounting_principal =
+            matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+                || self
+                    .config
+                    .gateway_receipt_principals
+                    .iter()
+                    .any(|principal| principal == &actor);
+        if !trusted_accounting_principal {
+            return Err(Status::permission_denied(
+                "usage recording requires an authorized accounting principal",
+            ));
+        }
+        let r = req.into_inner();
+        if r.tokens_used < 0 && !matches!(actor.as_str(), "root" | "local") {
+            return Err(Status::permission_denied(
+                "negative usage adjustments require control-plane administration",
+            ));
+        }
+        let metric = budget_metric(&r.metric)?;
+        let budget_subject = budget_subject(
+            &r.subject,
+            &r.project,
+            &r.agent,
+            &r.key_id,
+            &r.work_unit,
+            &r.user_id,
+        )?;
+        self.budget
+            .record_idempotent_with_metric(
+                &budget_subject,
+                r.tokens_used,
+                metric,
+                &r.idempotency_key,
+            )
+            .map_err(Status::internal)?;
+        if !r.operation_receipt_json.trim().is_empty() {
+            persist_gateway_operation_receipt(self, &r.operation_receipt_json, &actor)?;
+        }
+        let sample_recorded = if let Some(observation) = r.sample_observation {
+            if observation.request_id.trim().is_empty()
+                || observation.namespace.trim().is_empty()
+                || observation.spec.trim().is_empty()
+                || observation.output_content.trim().is_empty()
+            {
+                return Err(Status::invalid_argument(
+                    "sample observation requires request_id, namespace, spec, and output_content",
+                ));
+            }
+            if self.config.scoring_enabled {
+                self.db
+                    .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                        request_id: observation.request_id,
+                        namespace: observation.namespace,
+                        spec: observation.spec,
+                        resolved_model: observation.resolved_model,
+                        output_content: observation.output_content,
+                        sample_reason: observation.sample_reason,
+                        input_tokens: observation.input_tokens,
+                        output_tokens: observation.output_tokens,
+                        stop_reason: observation.stop_reason,
+                        timestamp: observation.timestamp,
+                        scored: false,
+                        task_class: crate::chisei::scoring::normalize_task_class(
+                            &observation.task_class,
+                        ),
+                        cost_usd_micros: observation.cost_usd_micros,
+                    })
+                    .map_err(Status::internal)?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
+        Ok(Response::new(RecordUsageResponse {
+            usage: Some(BudgetUsage {
+                user_id: u.user_id,
+                tokens_used: u.tokens_used,
+                max_tokens: u.max_tokens,
+                period_type: u.period_type.as_str().into(),
+                period_start: u.period_start,
+            }),
+            sample_recorded,
+        }))
+    }
+
+    async fn set_budget_limit(
+        &self,
+        req: Request<SetBudgetLimitRequest>,
+    ) -> Result<Response<SetBudgetLimitResponse>, Status> {
+        require_control_plane_admin(&req, "budget mutation")?;
+        let r = req.into_inner();
+        let metric = budget_metric(&r.metric)?;
+        let period = crate::chisei::budget::PeriodType::parse_strict(&r.period_type)
+            .map_err(Status::invalid_argument)?;
+        let budget_subject = budget_subject(
+            &r.subject,
+            &r.project,
+            &r.agent,
+            &r.key_id,
+            &r.work_unit,
+            &r.user_id,
+        )?;
+        self.budget
+            .set_limit_with_metric(&budget_subject, metric, r.max_tokens, period)
+            .map_err(Status::internal)?;
+        Ok(Response::new(SetBudgetLimitResponse {}))
+    }
+
+    async fn set_namespace_policy(
+        &self,
+        req: Request<SetNamespacePolicyRequest>,
+    ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
+        require_control_plane_admin(&req, "namespace policy mutation")?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
+        let validated_registry_version = registry.state_version;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
             let r = req.into_inner();
             if r.namespace.trim().is_empty() {
                 return Err(Status::invalid_argument("namespace required"));
             }
-            if r.end_timestamp_ms <= r.start_timestamp_ms {
-                return Err(Status::invalid_argument(
-                    "end_timestamp_ms must be greater than start_timestamp_ms",
+            let policy = normalize_legacy_policy_provider_pairs(policy_from_request(&r));
+            validate_policy_provider_pairs(&policy).map_err(Status::invalid_argument)?;
+            let context_admission_policy = if r.context_admission_policy_json.trim().is_empty() {
+                self.policy
+                    .context_admission_policy(&r.namespace)
+                    .map_err(Status::failed_precondition)?
+            } else if r.context_admission_policy_json.trim() == "null" {
+                None
+            } else {
+                let context_policy = serde_json::from_str::<
+                    crate::chisei::policy::ContextAdmissionPolicy,
+                >(&r.context_admission_policy_json)
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid context admission policy: {error}"))
+                })?;
+                context_policy
+                    .validate()
+                    .map_err(Status::invalid_argument)?;
+                Some(context_policy)
+            };
+            let policy_data_class = policy.data_class.clone();
+            let policy_version = policy.version();
+            let current_registry = self.refresh_provider_registry_for_resolution().await?;
+            if current_registry.state_version != validated_registry_version {
+                return Err(Status::aborted(
+                    "provider registry changed while validating namespace policy",
                 ));
             }
-            let candidate = normalize_legacy_policy_provider_pairs(Policy {
-                allowed_runtimes: r.allowed_runtimes,
-                allowed_models: r.allowed_models,
-                default_runtime: r.default_runtime,
-                default_model: r.default_model,
-                data_class: DataClass::parse(&r.data_class).as_str().into(),
-            });
-            validate_policy_provider_pairs(&candidate).map_err(Status::invalid_argument)?;
-
-            // Probe limit+1 so truncation is never silent.
-            let receipts = self
-                .db
-                .list_operation_receipts_in_window(
-                    &r.namespace,
-                    r.start_timestamp_ms,
-                    r.end_timestamp_ms,
-                    crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS.saturating_add(1),
-                )
-                .map_err(Status::internal)?;
-            if receipts.len() > crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS {
-                return Err(Status::resource_exhausted(format!(
-                    "policy dry-run receipt limit exceeded ({})",
-                    crate::chisei::policy_dry_run::MAX_DRY_RUN_RECEIPTS
-                )));
-            }
-
-            let report = crate::chisei::policy_dry_run::dry_run_policy_over_receipts(
+            persist_namespace_policy(
+                &self.db,
                 &r.namespace,
-                r.start_timestamp_ms,
-                r.end_timestamp_ms,
-                &candidate,
-                &receipts,
+                &policy,
+                context_admission_policy.as_ref(),
             )
-            .map_err(Status::failed_precondition)?;
-
-            let request_id = if r.request_id.trim().is_empty() {
-                format!("policy-dry-run-{}", chrono::Utc::now().timestamp_millis())
+            .map_err(Status::internal)?;
+            let default_runtime = policy.default_runtime.clone();
+            let default_model = policy.default_model.clone();
+            self.policy.set_namespace_policy(&r.namespace, policy);
+            if let Some(context_policy) = context_admission_policy {
+                self.policy
+                    .set_context_admission_policy(&r.namespace, context_policy)
+                    .map_err(Status::invalid_argument)?;
             } else {
-                r.request_id
-            };
-            let evidence = HashMap::from([
-                ("namespace".into(), report.namespace.clone()),
-                (
-                    "start_timestamp_ms".into(),
-                    report.start_timestamp_ms.to_string(),
-                ),
-                (
-                    "end_timestamp_ms".into(),
-                    report.end_timestamp_ms.to_string(),
-                ),
-                (
-                    "candidate_policy_version".into(),
-                    report.candidate_policy_version.clone(),
-                ),
-                ("evaluated".into(), report.counts.evaluated.to_string()),
-                ("would_deny".into(), report.counts.would_deny.to_string()),
-                ("would_allow".into(), report.counts.would_allow.to_string()),
-                ("re_routed".into(), report.counts.re_routed.to_string()),
-                ("request_id".into(), request_id.clone()),
-            ]);
-            let decision_id = {
-                use sha2::{Digest, Sha256};
-                format!(
-                    "policy-dry-run:{:x}",
-                    Sha256::digest(format!(
-                        "{}\0{}\0{}\0{}\0{}\0{}",
-                        report.namespace,
-                        actor,
-                        request_id,
-                        report.candidate_policy_version,
-                        report.start_timestamp_ms,
-                        report.end_timestamp_ms
-                    ))
-                )
-            };
-            self.db
-                .record_decision(&crate::sekai::audit::Decision {
-                    id: decision_id,
-                    timestamp: chrono::Utc::now().timestamp_millis(),
-                    actor: actor.clone(),
-                    action: "policy.dry_run".into(),
-                    reason: "historical policy dry-run over operation receipts".into(),
-                    evidence,
-                    target_id: format!("policy-dry-run:{}", report.namespace),
-                    outcome: "succeeded".into(),
-                })
-                .map_err(Status::internal)?;
-
-            let samples = report
-                .samples
-                .into_iter()
-                .map(|(delta_class, operation_ids)| DryRunNamespacePolicySample {
-                    delta_class,
-                    operation_ids,
-                })
-                .collect();
-            let results = report
-                .results
-                .into_iter()
-                .take(128)
-                .map(|result| DryRunNamespacePolicyResult {
-                    operation_id: result.operation_id,
-                    delta_class: match result.delta {
-                        crate::chisei::policy_dry_run::DryRunDeltaClass::Unchanged => {
-                            "unchanged".into()
-                        }
-                        crate::chisei::policy_dry_run::DryRunDeltaClass::ReRouted => {
-                            "re_routed".into()
-                        }
-                        crate::chisei::policy_dry_run::DryRunDeltaClass::WouldDeny => {
-                            "would_deny".into()
-                        }
-                        crate::chisei::policy_dry_run::DryRunDeltaClass::WouldAllow => {
-                            "would_allow".into()
-                        }
-                        crate::chisei::policy_dry_run::DryRunDeltaClass::InsufficientHistory => {
-                            "insufficient_history".into()
-                        }
-                    },
-                    historical_outcome: match result.historical_outcome {
-                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Allowed => {
-                            "allowed".into()
-                        }
-                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Denied => {
-                            "denied".into()
-                        }
-                        crate::chisei::policy_dry_run::HistoricalOutcomeClass::Unknown => {
-                            "unknown".into()
-                        }
-                    },
-                    candidate_outcome: result
-                        .candidate_outcome
-                        .map(|outcome| match outcome {
-                            crate::chisei::policy_dry_run::CandidateOutcomeClass::Allow => {
-                                "allow".into()
-                            }
-                            crate::chisei::policy_dry_run::CandidateOutcomeClass::Deny => {
-                                "deny".into()
-                            }
-                        })
-                        .unwrap_or_default(),
-                    historical_runtime: result.historical_runtime,
-                    historical_model: result.historical_model,
-                    candidate_runtime: result.candidate_runtime,
-                    candidate_model: result.candidate_model,
-                    detail: result.detail,
-                })
-                .collect();
-
-            Ok(Response::new(DryRunNamespacePolicyResponse {
-                namespace: report.namespace,
-                start_timestamp_ms: report.start_timestamp_ms,
-                end_timestamp_ms: report.end_timestamp_ms,
-                candidate_policy_version: report.candidate_policy_version,
-                counts: Some(DryRunNamespacePolicyCounts {
-                    evaluated: report.counts.evaluated,
-                    unchanged: report.counts.unchanged,
-                    re_routed: report.counts.re_routed,
-                    would_deny: report.counts.would_deny,
-                    would_allow: report.counts.would_allow,
-                    insufficient_history: report.counts.insufficient_history,
+                self.policy.clear_context_admission_policy(&r.namespace);
+            }
+            let (runtime, model) = self
+                .policy
+                .resolve(&r.namespace, &default_runtime, &default_model)
+                .map_err(Status::invalid_argument)?;
+            Ok(Response::new(SetNamespacePolicyResponse {
+                resolution: Some(PolicyResolution {
+                    runtime,
+                    model,
+                    data_class: policy_data_class,
+                    eval_regressed: false,
+                    eval_regression_reason: String::new(),
+                    route_bias: String::new(),
+                    policy_scope: r.namespace,
+                    policy_version,
+                    fallback_models: Vec::new(),
                 }),
-                samples,
-                results,
             }))
         })
         .await
@@ -10656,7 +9929,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<GetEffectivePolicySummaryRequest>,
     ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
-        let actor = authenticated_actor(&req);
+        let actor = required_authenticated_actor(&req)?;
         let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
         require_namespace_access(&self.db, &actor, &namespace)?;
 
@@ -10753,64 +10026,6 @@ impl ChiseiService for ChiseiServiceImpl {
             },
         );
 
-        let worker_policy = self
-            .db
-            .find_by_external_id(&format!("{WORKER_POLICY_KIND}:{namespace}"))
-            .map_err(Status::internal)?;
-        let worker_scope_id = worker_policy.as_ref().and_then(|policy| {
-            policy
-                .properties
-                .get("contention_scope_id")
-                .map(String::as_str)
-                .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-        });
-        let worker_scope = if let Some(scope_id) = worker_scope_id {
-            self.db
-                .contention_scope_chain(scope_id)
-                .map_err(Status::internal)?
-                .into_iter()
-                .min_by_key(|scope| scope.max_concurrency)
-        } else {
-            None
-        };
-        let worker_concurrency = worker_scope.map_or_else(
-            || EffectiveWorkerConcurrencySummary {
-                configured: false,
-                status: "unconfigured".into(),
-                ..Default::default()
-            },
-            |scope| EffectiveWorkerConcurrencySummary {
-                configured: true,
-                status: "configured".into(),
-                max_concurrency: scope.max_concurrency,
-                policy_scope: scope.id.clone(),
-                policy_version: content_version(&(
-                    scope.id,
-                    scope.parent_scope_id,
-                    scope.max_concurrency,
-                    scope.admission_policy,
-                    scope.updated,
-                )),
-            },
-        );
-
-        Ok(Response::new(GetEffectivePolicySummaryResponse {
-            namespace,
-            routing: Some(routing),
-            budgets: Some(budgets),
-            actions: Some(actions),
-            worker_concurrency: Some(worker_concurrency),
-        }))
-    }
-
-    async fn list_available_models(
-        &self,
-        req: Request<ListAvailableModelsRequest>,
-    ) -> Result<Response<ListAvailableModelsResponse>, Status> {
-        let actor = required_authenticated_actor(&req)?;
-        let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
-        require_namespace_access(&self.db, &actor, &namespace)?;
         let provider = req.get_ref().provider.trim();
         let discovery = crate::chisei::model_availability::ModelDiscoveryConfig {
             openai_base_url: std::env::var("CHISEI_OPENAI_BASE_URL")
@@ -10856,473 +10071,14 @@ impl ChiseiService for ChiseiServiceImpl {
                 }),
             })
             .collect();
-        Ok(Response::new(ListAvailableModelsResponse {
-            version: view.version,
+
+        Ok(Response::new(GetEffectivePolicySummaryResponse {
             namespace,
+            routing: Some(routing),
+            budgets: Some(budgets),
+            actions: Some(actions),
+            available_models_version: view.version,
             models,
-        }))
-    }
-
-    async fn set_namespace_worker_policy(
-        &self,
-        req: Request<SetNamespaceWorkerPolicyRequest>,
-    ) -> Result<Response<SetNamespaceWorkerPolicyResponse>, Status> {
-        require_control_plane_admin(&req, "namespace worker policy mutation")?;
-        let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
-        let scope_id = req.get_ref().contention_scope_id.trim().to_string();
-        if scope_id.is_empty() {
-            return Err(Status::invalid_argument("contention scope required"));
-        }
-        if self
-            .db
-            .get_contention_scope(&scope_id)
-            .map_err(Status::internal)?
-            .is_none()
-        {
-            return Err(Status::invalid_argument(
-                "worker contention scope does not exist",
-            ));
-        }
-        persist_namespace_worker_policy(&self.db, &namespace, &scope_id)
-            .map_err(Status::internal)?;
-        Ok(Response::new(SetNamespaceWorkerPolicyResponse {}))
-    }
-
-    async fn check_egress(
-        &self,
-        req: Request<CheckEgressRequest>,
-    ) -> Result<Response<CheckEgressResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
-        let r = req.into_inner();
-        let effective_policy = self.policy.effective_policy(&r.namespace);
-        let policy_version = effective_policy
-            .as_ref()
-            .map(|policy| policy.version())
-            .unwrap_or_default();
-        let data_class = self.data_class(effective_policy.as_ref());
-        let provider_is_external = crate::chisei::egress::is_external_provider(&r.provider);
-        let task_class = TaskClass::parse(&r.task_class);
-        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
-        let mut findings = Vec::new();
-        if !crate::chisei::privacy::external_allowed(data_class, task_class)
-            && !crate::chisei::privacy::provider_safe_to_send(&r.provider, &safe_providers)
-        {
-            findings.push(EgressDecision {
-                provider: r.provider.clone(),
-                external: provider_is_external,
-                included: vec![],
-                redacted: vec![],
-                reasons: vec![crate::chisei::privacy::gate_reason(
-                    data_class,
-                    task_class,
-                    &r.provider,
-                )],
-            });
-            return Ok(Response::new(CheckEgressResponse {
-                allowed: false,
-                findings,
-                policy_version,
-            }));
-        }
-        let findings =
-            self.leak_findings_for_payload(&r.namespace, &r.provider, data_class, &r.payload);
-        let allowed = !findings
-            .iter()
-            .any(|finding| finding.action == LeakAction::Block);
-        Ok(Response::new(CheckEgressResponse {
-            allowed,
-            findings: leak_findings_to_decisions(&r.provider, provider_is_external, &findings),
-            policy_version,
-        }))
-    }
-
-    async fn run_pipeline(
-        &self,
-        req: Request<RunPipelineRequest>,
-    ) -> Result<Response<RunPipelineResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let delegated_principal = req
-            .metadata()
-            .get(DELEGATED_PRINCIPAL_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let r = req
-            .into_inner()
-            .request
-            .ok_or(Status::invalid_argument("request required"))?;
-        require_execution_namespace_access(&self.db, &self.config, &actor, &r.namespace)?;
-        let context_actor = execution_context_actor(
-            &self.db,
-            &self.config,
-            &actor,
-            delegated_principal.as_deref(),
-            &r.namespace,
-        )?;
-        let context_admission_policy = self
-            .policy
-            .context_admission_policy(&r.namespace)
-            .map_err(Status::failed_precondition)?;
-        let mut pr = pipe::PipelineRequest {
-            request_id: r.request_id,
-            namespace: r.namespace,
-            spec: r.spec,
-            model: r.model,
-            runtime: r.runtime,
-            task_type: r.task_type,
-            priority: r.priority,
-            risk_score: 0.0,
-            budget_pressure: self.budget.namespace_pressure(""),
-            review_model: String::new(),
-            egress_records: vec![],
-            external_egress: true,
-            template_only: TaskClass::parse(&r.task_class) == TaskClass::TemplateOnly,
-            expanded_context_items: 0,
-            evidence_references: vec![],
-            memory_references: vec![],
-            memory_holdouts: vec![],
-            memory_actor: context_actor,
-            memory_assignment_id: String::new(),
-            memory_token_budget: 512,
-            allowed_evidence_classes: std::collections::HashSet::new(),
-            context_admission_policy,
-            context_admission: pipe::ContextAdmissionSummary::default(),
-            risk_score_ready: false,
-            risk_signals: vec![],
-            operation_risk_override: None,
-        };
-        let context_expansion_gate = self.pipeline_context_expansion_gate(&pr.namespace);
-        let evidence_context_gates =
-            self.applicable_evidence_context_gates(&pr, context_expansion_gate.allowed)?;
-        let allowed_evidence_classes = evidence_context_gates
-            .iter()
-            .filter(|class_gate| class_gate.effective_allowed)
-            .map(|class_gate| pipe::EvidenceContextClass {
-                source_type: class_gate.source_type.clone(),
-                evidence_type: class_gate.evidence_type.clone(),
-            })
-            .collect::<HashSet<_>>();
-        let result = self.pipeline.run_with_context_admission(
-            &mut pr,
-            &self.db,
-            context_expansion_gate.allowed,
-            allowed_evidence_classes,
-        );
-        self.record_context_expansion_gate(
-            &pr.request_id,
-            &pr.namespace,
-            &context_expansion_gate,
-            result.expanded_context_items,
-        )?;
-        self.record_evidence_context_gates(
-            &pr.request_id,
-            &pr.namespace,
-            &evidence_context_gates,
-            &result.evidence_references,
-        )?;
-        let steps = result
-            .steps
-            .iter()
-            .map(|s| StepDecision {
-                step: s.step.clone(),
-                action: s.action.clone(),
-                reasoning: s.reasoning.clone(),
-                confidence: s.confidence,
-                suggestion: s.suggestion.clone(),
-                value: s.value.clone(),
-            })
-            .collect();
-        Ok(Response::new(RunPipelineResponse {
-            result: Some(PipelineRunResult {
-                request_id: result.request_id,
-                steps,
-                timestamp: result.timestamp,
-                prepared_spec: result.prepared_spec,
-                evidence_references: result
-                    .evidence_references
-                    .iter()
-                    .map(context_evidence_reference)
-                    .collect(),
-                memory_references: result
-                    .memory_references
-                    .iter()
-                    .map(memory_context_reference)
-                    .collect(),
-                epistemic_descriptor_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
-                context_admission_policy_version: result.context_admission.policy_version,
-                context_admission_descriptor_version: result.context_admission.descriptor_version,
-                context_admission_decision: result.context_admission.decision,
-                context_admission_reasons: result.context_admission.reason_codes,
-                context_admission_requires_review: result.context_admission.requires_review,
-                context_admission_requires_verification: result
-                    .context_admission
-                    .requires_verification,
-            }),
-        }))
-    }
-
-    async fn list_pipeline_runs(
-        &self,
-        _r: Request<ListPipelineRunsRequest>,
-    ) -> Result<Response<ListPipelineRunsResponse>, Status> {
-        Ok(Response::new(ListPipelineRunsResponse { runs: vec![] }))
-    }
-
-    async fn record_sample_observation(
-        &self,
-        req: Request<RecordSampleObservationRequest>,
-    ) -> Result<Response<RecordSampleObservationResponse>, Status> {
-        require_telemetry_writer(&req, &self.config)?;
-        let observation = req
-            .into_inner()
-            .observation
-            .ok_or(Status::invalid_argument("observation required"))?;
-        if observation.request_id.trim().is_empty() {
-            return Err(Status::invalid_argument("request_id required"));
-        }
-        if observation.namespace.trim().is_empty() {
-            return Err(Status::invalid_argument("namespace required"));
-        }
-        if observation.spec.trim().is_empty() {
-            return Err(Status::invalid_argument("spec required"));
-        }
-        if observation.output_content.trim().is_empty() {
-            return Err(Status::invalid_argument("output_content required"));
-        }
-        if !self.config.scoring_enabled {
-            return Ok(Response::new(RecordSampleObservationResponse {
-                recorded: false,
-            }));
-        }
-        self.db
-            .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                request_id: observation.request_id,
-                namespace: observation.namespace,
-                spec: observation.spec,
-                resolved_model: observation.resolved_model,
-                output_content: observation.output_content,
-                sample_reason: observation.sample_reason,
-                input_tokens: observation.input_tokens,
-                output_tokens: observation.output_tokens,
-                stop_reason: observation.stop_reason,
-                timestamp: observation.timestamp,
-                scored: false,
-                task_class: crate::chisei::scoring::normalize_task_class(&observation.task_class),
-                cost_usd_micros: observation.cost_usd_micros,
-            })
-            .map_err(Status::internal)?;
-        Ok(Response::new(RecordSampleObservationResponse {
-            recorded: true,
-        }))
-    }
-
-    async fn get_sample_observation(
-        &self,
-        req: Request<GetSampleObservationRequest>,
-    ) -> Result<Response<GetSampleObservationResponse>, Status> {
-        let actor = require_telemetry_reader(&req, &self.config)?;
-        let request = req.into_inner();
-        let request_id = request.request_id.as_str();
-        let namespace = request.namespace.as_str();
-        if request_id.trim().is_empty() {
-            return Err(Status::invalid_argument("request_id required"));
-        }
-        if namespace.trim().is_empty() {
-            return Err(Status::invalid_argument("namespace required"));
-        }
-        if !matches!(actor.as_str(), "root" | "local") {
-            // Admission preserves exact v1 namespace identity, including
-            // legacy padding. Authorize the canonical namespace boundary but
-            // keep the original value for the exact row lookup below.
-            require_namespace_access(&self.db, &actor, namespace.trim())?;
-        }
-        let observation = self
-            .db
-            .get_sample_observation_in_namespace(request_id, namespace)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("sample observation not found"))?;
-        let state = "recorded";
-        let observation_digest = sample_observation_readback_digest(
-            &observation.request_id,
-            &observation.namespace,
-            state,
-            observation.timestamp,
-        );
-        Ok(Response::new(GetSampleObservationResponse {
-            observation: Some(SampleObservationReadback {
-                request_id: observation.request_id,
-                namespace: observation.namespace,
-                observation_digest,
-                state: state.into(),
-                observed_at: observation.timestamp,
-                read_at: chrono::Utc::now().timestamp_millis(),
-            }),
-        }))
-    }
-
-    async fn record_gateway_audit(
-        &self,
-        req: Request<RecordGatewayAuditRequest>,
-    ) -> Result<Response<RecordGatewayAuditResponse>, Status> {
-        let authenticated_principal = require_telemetry_writer(&req, &self.config)?;
-        let auth_source = auth_source(&req);
-        let mut event = req
-            .into_inner()
-            .event
-            .ok_or(Status::invalid_argument("event required"))?;
-        if event.actor.trim().is_empty() {
-            return Err(Status::invalid_argument("actor required"));
-        }
-        if event.action.trim().is_empty() {
-            return Err(Status::invalid_argument("action required"));
-        }
-        if event.outcome.trim().is_empty() {
-            return Err(Status::invalid_argument("outcome required"));
-        }
-        if event.id.trim().is_empty() {
-            event.id = uuid::Uuid::new_v4().to_string();
-        }
-        // Clamp to server time: a future timestamp would pin the purgeable
-        // prefix of the hash-chained ledger and silently stop retention.
-        let now = chrono::Utc::now().timestamp_millis();
-        if event.timestamp <= 0 || event.timestamp > now {
-            event.timestamp = now;
-        }
-        // Reserved keys: only the server-side attestation binding may claim
-        // one, otherwise a caller could dress up an arbitrary audit event as
-        // policy-attested.
-        event
-            .evidence
-            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_ID);
-        event
-            .evidence
-            .remove(crate::sekai::attestation::EVIDENCE_ATTESTATION_HASH);
-        if event.target_id.trim().is_empty() {
-            event.target_id = "llm_calls".to_string();
-        }
-        if event.action == GATEWAY_RECEIPT_ACTION {
-            let configured_gateway = self
-                .config
-                .gateway_receipt_principals
-                .iter()
-                .any(|principal| principal == &authenticated_principal);
-            let local_insecure_gateway = self.config.insecure
-                && auth_source.as_deref() == Some("local")
-                && authenticated_principal == "chisei-gateway";
-            if !local_insecure_gateway
-                && (auth_source.as_deref() != Some("token")
-                    || (!configured_gateway
-                        && !matches!(authenticated_principal.as_str(), "chisei-gateway" | "root")))
-            {
-                return Err(Status::permission_denied(
-                    "operation receipt writes require an authorized gateway service principal",
-                ));
-            }
-            let receipt_json = event
-                .evidence
-                .get("receipt_json")
-                .ok_or(Status::invalid_argument("receipt_json required"))?;
-            let receipt: OperationReceipt = serde_json::from_str(receipt_json)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            if receipt.initiating_actor != event.actor {
-                return Err(Status::invalid_argument(
-                    "receipt initiating actor must match gateway audit actor",
-                ));
-            }
-            if event.target_id != receipt.operation_id {
-                return Err(Status::invalid_argument(
-                    "gateway audit target must match receipt operation id",
-                ));
-            }
-            let completeness = receipt.completeness();
-            if !completeness.complete {
-                return Err(Status::invalid_argument(format!(
-                    "gateway receipt is incomplete: missing={:?} errors={:?}",
-                    completeness.missing_surfaces, completeness.errors
-                )));
-            }
-            let has_kioku_context = receipt.events.iter().any(|receipt_event| {
-                receipt_event.kind == ReceiptEventKind::ContextGoverned
-                    && receipt_event
-                        .references
-                        .iter()
-                        .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
-            }) || !self
-                .db
-                .list_kioku_outcome_assignments(&receipt.operation_id)
-                .map_err(Status::internal)?
-                .is_empty();
-            let existing = self
-                .db
-                .get_operation_receipt(&receipt.operation_id)
-                .map_err(Status::internal)?;
-            if existing
-                .as_ref()
-                .is_some_and(|existing| existing != &receipt)
-            {
-                return Err(Status::already_exists(
-                    "operation receipt already exists with different evidence",
-                ));
-            }
-            if existing.is_none() && has_kioku_context {
-                record_reported_memory_outcomes(
-                    &self.db,
-                    &receipt,
-                    &authenticated_principal,
-                    now,
-                    false,
-                    None,
-                    true,
-                )
-                .map_err(|error| {
-                    Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
-                })?;
-            }
-            self.db
-                .put_operation_receipt(&receipt)
-                .map_err(Status::internal)?;
-            if has_kioku_context
-                && let Err(error) = record_reported_memory_outcomes(
-                    &self.db,
-                    &receipt,
-                    &authenticated_principal,
-                    now,
-                    false,
-                    None,
-                    false,
-                )
-            {
-                let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now,
-                    actor: "chisei.kioku".into(),
-                    action: "kioku.outcome_attribution".into(),
-                    reason: error,
-                    evidence: std::collections::HashMap::from([
-                        ("operation_id".into(), receipt.operation_id.clone()),
-                        ("gateway_audit_event_id".into(), event.id.clone()),
-                    ]),
-                    target_id: receipt.operation_id.clone(),
-                    outcome: "failed".into(),
-                });
-            }
-        } else {
-            event.actor = authenticated_principal;
-        }
-        self.db
-            .record_decision(&crate::sekai::audit::Decision {
-                id: event.id.clone(),
-                timestamp: event.timestamp,
-                actor: event.actor.clone(),
-                action: event.action.clone(),
-                reason: event.reason.clone(),
-                evidence: event.evidence.clone(),
-                target_id: event.target_id.clone(),
-                outcome: event.outcome.clone(),
-            })
-            .map_err(Status::internal)?;
-        Ok(Response::new(RecordGatewayAuditResponse {
-            event: Some(event),
         }))
     }
 
@@ -11334,13 +10090,15 @@ impl ChiseiService for ChiseiServiceImpl {
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
             let actor = authenticated_actor(&req);
             let context = enterprise_authenticated_context(&req)?.cloned();
-            let input = req
-                .into_inner()
+            let request = req.into_inner();
+            let mut input = request
                 .input
                 .ok_or(Status::invalid_argument("input required"))?;
-            if context.is_some() && !input.route_override.trim().is_empty() {
+            if context.is_some()
+                && (!input.route_override.trim().is_empty() || request.gunshi_allocation.is_some())
+            {
                 return Err(Status::permission_denied(
-                    "enterprise execution route override denied",
+                    "enterprise execution route override or Gunshi allocation binding denied",
                 ));
             }
             require_execution_namespace_access_with_context(
@@ -11350,19 +10108,48 @@ impl ChiseiService for ChiseiServiceImpl {
                 context.as_ref(),
                 &input.namespace,
             )?;
-            let plan = self.plan_from_input(input, &actor).await?;
+            let bound_allocation = if let Some(binding) = request.gunshi_allocation {
+                let (bound_input, allocation) = self.bind_gunshi_allocation(input, binding)?;
+                input = bound_input;
+                Some(allocation)
+            } else {
+                None
+            };
+            let mut plan = self.plan_from_input(input, &actor).await?;
+            if let Some(allocation) = bound_allocation {
+                let live_policy_version = self
+                    .policy
+                    .effective_policy(&allocation.plan.namespace)
+                    .map(|policy| policy.version())
+                    .unwrap_or_else(|| "implicit-allow/v1".into());
+                if live_policy_version != allocation.plan.policy_version {
+                    return Err(Status::failed_precondition(
+                        "Gunshi allocation policy changed while planning",
+                    ));
+                }
+                if plan.resolved_runtime != allocation.plan.selection.runtime
+                    || plan.resolved_model != allocation.plan.selection.model
+                {
+                    return Err(Status::failed_precondition(
+                        "live policy or provider state no longer permits the Gunshi allocation",
+                    ));
+                }
+                plan.gunshi_issuance_id = allocation.issuance_id;
+                plan.gunshi_allocation_id = allocation.plan.allocation_id;
+                plan.gunshi_agent_id = allocation.plan.selection.agent_id;
+                plan.gunshi_policy_version = allocation.plan.policy_version;
+                plan.gunshi_input_fingerprint = allocation.plan.input_fingerprint;
+                plan.gunshi_budget_ceiling_usd_micros = allocation.plan.budget_ceiling_usd_micros;
+                plan.gunshi_max_attempts = allocation.plan.attempts.max_attempts;
+                plan.gunshi_human_review_required =
+                    allocation.plan.verification.human_review_required;
+            }
             if let Some(plan_input) = &plan.input {
                 let namespace_hint = plan_input.namespace.trim().to_string();
                 self.record_evolve_task(
                     &plan_input.request_id,
                     &namespace_hint,
                     &plan.enriched_spec,
-                    self.tracked_original_spec(
-                        &plan_input.request_id,
-                        &plan_input.spec,
-                        &plan.enriched_spec,
-                    )
-                    .as_deref(),
                     if plan.executable { "planned" } else { "failed" },
                     plan_input.estimated_tokens,
                 )
@@ -11377,326 +10164,6 @@ impl ChiseiService for ChiseiServiceImpl {
             Ok(Response::new(PlanExecutionResponse { plan: Some(plan) }))
         })
         .await
-    }
-
-    async fn execute_plan(
-        &self,
-        req: Request<ExecutePlanRequest>,
-    ) -> Result<Response<ExecutePlanResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let context = enterprise_authenticated_context(&req)?.cloned();
-        let requested_plan = req
-            .into_inner()
-            .plan
-            .ok_or(Status::invalid_argument("plan required"))?;
-        let plan = {
-            let mut plans = self
-                .planned_executions
-                .lock()
-                .expect("planned executions poisoned");
-            prune_cached_plans(&mut plans);
-            let cached = plans
-                .get(&requested_plan.plan_id)
-                .ok_or(Status::not_found("execution plan not found"))?;
-            if cached.plan.planning_actor != actor
-                || cached.enterprise_authority != enterprise_execution_authority(context.as_ref())
-            {
-                return Err(Status::permission_denied(
-                    "execution plan belongs to a different planning principal",
-                ));
-            }
-            cached.plan.clone()
-        };
-        if !plan.executable {
-            return Err(Status::failed_precondition(
-                "execution plan is not executable",
-            ));
-        }
-        let input = plan
-            .input
-            .clone()
-            .ok_or(Status::invalid_argument("plan input required"))?;
-        require_execution_namespace_access_with_context(
-            &self.db,
-            &self.config,
-            &actor,
-            context.as_ref(),
-            &input.namespace,
-        )?;
-        {
-            let mut plans = self
-                .planned_executions
-                .lock()
-                .expect("planned executions poisoned");
-            plans
-                .remove(&requested_plan.plan_id)
-                .ok_or(Status::not_found("execution plan not found"))?;
-        }
-        let namespace_hint = input.namespace.trim().to_string();
-        let provider = crate::llm::provider_name(&plan.resolved_model).to_string();
-        let effective_policy = self.policy.effective_policy(&input.namespace);
-        let data_class = self.data_class(effective_policy.as_ref());
-        // Re-check residency on execute so cached plans cannot outrun policy.
-        if let Err(error) = self.policy.enforce_residency(
-            &input.namespace,
-            &provider,
-            &plan.resolved_model,
-            data_class.as_str(),
-        ) {
-            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
-                .map_err(Status::internal)?;
-            return Err(Status::permission_denied(error));
-        }
-        self.enforce_execution_provider_privacy(&plan, &input, &actor, &provider, data_class)?;
-        if crate::chisei::egress::is_external_provider(&provider)
-            && plan.egress_decisions.is_empty()
-        {
-            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "external execution plan missing egress decisions",
-            ));
-        }
-        if let Some(signal) = self
-            .eval
-            .namespace_regression_signal(&namespace_hint)
-            .filter(|signal| signal.regressed)
-        {
-            record_failed_operation_on(
-                &self.db,
-                &plan,
-                &actor,
-                "evaluation_regressed_after_planning",
-            )
-            .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(signal.reason));
-        }
-        let normalized_user_id = if input.user_id.is_empty() {
-            "default".to_string()
-        } else {
-            input.user_id.clone()
-        };
-        self.enforce_execution_payload_privacy(&plan, &input, &actor, &provider, data_class)?;
-        self.record_egress_audit(
-            "execute_context",
-            &input.request_id,
-            &provider,
-            &plan.resolved_model,
-            &plan.egress_decisions,
-        );
-        let llm_req = super::pb::llm::ChatRequest {
-            model: plan.resolved_model.clone(),
-            system: plan.prepared_system.clone(),
-            messages: plan
-                .prepared_messages
-                .iter()
-                .map(|m| super::pb::llm::Message {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                    tool_call_id: m.tool_call_id.clone(),
-                    tool_calls: m
-                        .tool_calls
-                        .iter()
-                        .map(|tc| super::pb::llm::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            args_json: tc.args_json.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            tools: plan
-                .tools
-                .iter()
-                .map(|t| super::pb::llm::ToolDef {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema_json: t.input_schema_json.clone(),
-                })
-                .collect(),
-            max_tokens: plan.max_tokens,
-            user_id: Some(normalized_user_id),
-        };
-        let attempt_started_at_ms = chrono::Utc::now().timestamp_millis();
-        self.invalidate_ineligible_execution_memory_holdouts(
-            &plan.plan_id,
-            &actor,
-            &plan.memory_holdouts,
-        )?;
-        self.record_execution_memory_injections(&plan.plan_id, &actor, &plan.memory_references)?;
-
-        // Lookup-first short-circuit: after authz, before provider routing (#281 S1).
-        let lookup_refusal = match evaluate_execute_lookup_first(&self.db, &input, &actor) {
-            ExecuteLookupFirst::Hit {
-                response,
-                capability,
-                provenance,
-            } => {
-                if let Err(error) = self.record_evolve_task(
-                    &input.request_id,
-                    &namespace_hint,
-                    &plan.enriched_spec,
-                    self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
-                        .as_deref(),
-                    "done",
-                    0,
-                ) {
-                    record_failed_operation_on(
-                        &self.db,
-                        &plan,
-                        &actor,
-                        "execution_bookkeeping_failed",
-                    )
-                    .map_err(Status::internal)?;
-                    return Err(Status::internal(error));
-                }
-                let completed_at_ms = chrono::Utc::now().timestamp_millis();
-                record_completed_lookup_operation_on(
-                    &self.db,
-                    &plan,
-                    &actor,
-                    &response,
-                    attempt_started_at_ms,
-                    completed_at_ms,
-                    &capability,
-                    &provenance,
-                )
-                .map_err(Status::internal)?;
-                return Ok(Response::new(ExecutePlanResponse {
-                    response: Some(response),
-                    executed_at: completed_at_ms / 1000,
-                }));
-            }
-            ExecuteLookupFirst::ModelPath { lookup_refusal } => lookup_refusal,
-        };
-
-        let cacheable_message_count =
-            native_cacheable_message_count(&input, &plan.prepared_messages);
-        let chat = match execute_native_chat_request(
-            &self.config,
-            self.budget.clone(),
-            self.db.as_ref(),
-            context.as_ref(),
-            llm_req,
-            cacheable_message_count,
-        )
-        .await
-        {
-            Ok(chat) => chat,
-            Err(status) => {
-                record_failed_operation_on(&self.db, &plan, &actor, "model_call_failed")
-                    .map_err(Status::internal)?;
-                return Err(status);
-            }
-        };
-        let response = PlannedChatResponse {
-            content: chat.content.clone(),
-            tool_calls: chat
-                .tool_calls
-                .iter()
-                .map(|tc| ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    args_json: tc.args_json.clone(),
-                })
-                .collect(),
-            input_tokens: chat.input_tokens,
-            output_tokens: chat.output_tokens,
-            stop_reason: chat.stop_reason.clone(),
-            provider: provider.clone(),
-            cache_read_input_tokens: chat.cache_read_input_tokens,
-            cache_creation_input_tokens: chat.cache_creation_input_tokens,
-        };
-        if let Err(error) = self.record_evolve_task(
-            &input.request_id,
-            &namespace_hint,
-            &plan.enriched_spec,
-            self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
-                .as_deref(),
-            "done",
-            chat.input_tokens + chat.output_tokens,
-        ) {
-            record_failed_operation_on(&self.db, &plan, &actor, "execution_bookkeeping_failed")
-                .map_err(Status::internal)?;
-            return Err(Status::internal(error));
-        }
-        let completed_at_ms = chrono::Utc::now().timestamp_millis();
-        if let Some(refusal) = lookup_refusal.as_deref() {
-            record_completed_operation_on_with_path(
-                &self.db,
-                &plan,
-                &actor,
-                &response,
-                attempt_started_at_ms,
-                completed_at_ms,
-                Some(crate::chisei::lookup_first::ANSWER_PATH_MODEL),
-                Some(refusal),
-            )
-            .map_err(Status::internal)?;
-        } else {
-            self.record_completed_operation(
-                &plan,
-                &actor,
-                &response,
-                attempt_started_at_ms,
-                completed_at_ms,
-            )
-            .map_err(Status::internal)?;
-        }
-        // Sampling consumption: a sampled request was selected for deeper
-        // observation, so capture its actual execution outcome as a durable
-        // audit record keyed to the request. Unsampled executions skip this —
-        // bounded overhead is the whole point of sampling.
-        if plan.sampled {
-            let mut evidence = std::collections::HashMap::new();
-            evidence.insert("model".to_string(), plan.resolved_model.clone());
-            evidence.insert("input_tokens".to_string(), chat.input_tokens.to_string());
-            evidence.insert("output_tokens".to_string(), chat.output_tokens.to_string());
-            evidence.insert("stop_reason".to_string(), chat.stop_reason.clone());
-            evidence.insert("sample_rate".to_string(), plan.sample_rate.to_string());
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: "chisei.sampling".into(),
-                action: "sample_observed".into(),
-                reason: plan.sample_reason.clone(),
-                evidence,
-                target_id: input.request_id.clone(),
-                outcome: "observed".into(),
-            });
-            // Durable, judge-able record (spec + output) that the scoring job consumes to
-            // produce real eval runs. Kept in its own table so large content stays out of the
-            // audit evidence JSON. Only captured when scoring is enabled — otherwise there is no
-            // consumer and the (full-content) rows would accumulate as dead data.
-            if self.config.scoring_enabled {
-                let _ =
-                    self.db
-                        .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                            request_id: input.request_id.clone(),
-                            namespace: namespace_hint.clone(),
-                            spec: plan.enriched_spec.clone(),
-                            resolved_model: plan.resolved_model.clone(),
-                            output_content: chat.content.clone(),
-                            sample_reason: plan.sample_reason.clone(),
-                            input_tokens: chat.input_tokens,
-                            output_tokens: chat.output_tokens,
-                            stop_reason: chat.stop_reason.clone(),
-                            timestamp: chrono::Utc::now().timestamp_millis(),
-                            scored: false,
-                            // NOTE: `plan.task_class` holds the *privacy* class ("private"/
-                            // "template_only" — see `plan_from_input`), not the routing/cost-tier
-                            // class; the raw caller-supplied routing class lives on `input`.
-                            task_class: crate::chisei::scoring::normalize_task_class(
-                                &input.task_class,
-                            ),
-                            cost_usd_micros: 0,
-                        });
-            }
-        }
-        Ok(Response::new(ExecutePlanResponse {
-            response: Some(response),
-            executed_at: completed_at_ms / 1000,
-        }))
     }
 
     async fn execute_plan_stream(
@@ -11803,36 +10270,11 @@ impl ChiseiService for ChiseiServiceImpl {
             &plan.resolved_model,
             &plan.egress_decisions,
         );
-        let llm_req = super::pb::llm::ChatRequest {
+        let llm_req = ProviderExecutionRequest {
             model: plan.resolved_model.clone(),
             system: plan.prepared_system.clone(),
-            messages: plan
-                .prepared_messages
-                .iter()
-                .map(|m| super::pb::llm::Message {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                    tool_call_id: m.tool_call_id.clone(),
-                    tool_calls: m
-                        .tool_calls
-                        .iter()
-                        .map(|tc| super::pb::llm::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            args_json: tc.args_json.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            tools: plan
-                .tools
-                .iter()
-                .map(|t| super::pb::llm::ToolDef {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema_json: t.input_schema_json.clone(),
-                })
-                .collect(),
+            messages: plan.prepared_messages.clone(),
+            tools: plan.tools.clone(),
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
         };
@@ -11855,8 +10297,6 @@ impl ChiseiService for ChiseiServiceImpl {
                     &input.request_id,
                     &namespace_hint,
                     &plan.enriched_spec,
-                    self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec)
-                        .as_deref(),
                     "done",
                     0,
                 ) {
@@ -11918,8 +10358,6 @@ impl ChiseiService for ChiseiServiceImpl {
         let evolve_history = self.evolve_history.clone();
         let request_id = input.request_id.clone();
         let enriched_spec = plan.enriched_spec.clone();
-        let original_spec =
-            self.tracked_original_spec(&input.request_id, &input.spec, &plan.enriched_spec);
         let resolved_model = plan.resolved_model.clone();
         let sampled = plan.sampled;
         let sample_rate = plan.sample_rate;
@@ -12006,7 +10444,6 @@ impl ChiseiService for ChiseiServiceImpl {
                         request_id: &request_id,
                         namespace: &namespace_hint,
                         enriched_spec: &enriched_spec,
-                        original_spec: original_spec.as_deref(),
                         resolved_model: &resolved_model,
                         sampled,
                         sample_rate,
@@ -12072,7 +10509,6 @@ impl ChiseiService for ChiseiServiceImpl {
                     request_id: &request_id,
                     namespace: &namespace_hint,
                     enriched_spec: &enriched_spec,
-                    original_spec: original_spec.as_deref(),
                     resolved_model: &resolved_model,
                     sampled,
                     sample_rate,
@@ -12108,69 +10544,6 @@ impl ChiseiService for ChiseiServiceImpl {
             }
         };
         Ok(Response::new(Box::pin(stream)))
-    }
-
-    async fn authorize_operation_reporter(
-        &self,
-        req: Request<AuthorizeOperationReporterRequest>,
-    ) -> Result<Response<AuthorizeOperationReporterResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        if !receipt_mutation_transport_allowed(&req, &self.config) {
-            return Err(Status::permission_denied(
-                "operation reporter authorization requires authenticated transport",
-            ));
-        }
-        let request = req.into_inner();
-        if request.operation_id.trim().is_empty() || request.principal.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "operation_id and principal are required",
-            ));
-        }
-        let receipt = self
-            .db
-            .get_operation_receipt(&request.operation_id)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("operation receipt not found"))?;
-        if matches!(
-            receipt.operation_class.as_str(),
-            evaluation_execution_domain::EXECUTION_OPERATION_CLASS
-                | subject::PLAN_BACKED_OPERATION_CLASS
-        ) {
-            return Err(Status::permission_denied(
-                "evaluation authority receipts do not accept external reporters",
-            ));
-        }
-        if actor != receipt.initiating_actor && actor != "root" {
-            return Err(Status::permission_denied(
-                "only the initiating actor or root may authorize reporters",
-            ));
-        }
-        if request.event_kinds.is_empty() {
-            return Err(Status::invalid_argument("event_kinds required"));
-        }
-        let event_kinds = request
-            .event_kinds
-            .iter()
-            .map(|kind| {
-                ReceiptEventKind::parse(kind)
-                    .filter(|kind| reportable_receipt_kind(*kind))
-                    .ok_or_else(|| {
-                        Status::invalid_argument(format!("unsupported event kind {kind:?}"))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let changed = self
-            .db
-            .authorize_operation_reporter(
-                &request.operation_id,
-                request.principal.trim(),
-                event_kinds,
-            )
-            .map_err(Status::internal)?;
-        Ok(Response::new(AuthorizeOperationReporterResponse {
-            authorized: true,
-            changed,
-        }))
     }
 
     async fn list_kioku_candidates(
@@ -12452,195 +10825,223 @@ impl ChiseiService for ChiseiServiceImpl {
             input.request.capacity.captured_at_ms,
         )
         .map_err(Status::failed_precondition)?;
+        let operations = input
+            .request
+            .operations
+            .iter()
+            .map(|operation| (operation.operation_id.as_str(), operation))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut auto_dispatch_authorization_json = Vec::with_capacity(allocation.plans.len());
+        let mut receipt_attributes_json = Vec::with_capacity(allocation.plans.len());
+        for plan in &allocation.plans {
+            let operation = operations.get(plan.operation_id.as_str()).ok_or_else(|| {
+                Status::internal("Gunshi allocation references an unknown operation")
+            })?;
+            let (mut authorization, mut attributes) =
+                crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
+                    &self.db,
+                    &plan.namespace,
+                    plan,
+                    operation,
+                    &input.request.capacity,
+                )
+                .map_err(Status::failed_precondition)?;
+            let data_class = self
+                .policy
+                .effective_policy(&plan.namespace)
+                .map(|policy| policy.data_class)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unclassified".into());
+            let provider = crate::llm::provider_name(&plan.selection.model);
+            match self.policy.enforce_residency(
+                &plan.namespace,
+                provider,
+                &plan.selection.model,
+                &data_class,
+            ) {
+                Ok(decision) => {
+                    attributes.extend(self.policy.residency_receipt_attributes(&decision));
+                }
+                Err(error) => {
+                    authorization.authorized = false;
+                    authorization.mode = crate::chisei::gunshi_dispatch::DispatchMode::AdvisoryOnly;
+                    authorization.reasons.push(error);
+                    attributes.insert("residency_allowed".into(), "false".into());
+                    attributes.insert(
+                        "residency_denial_reasons".into(),
+                        authorization.reasons.last().cloned().unwrap_or_default(),
+                    );
+                }
+            }
+            auto_dispatch_authorization_json.push(
+                serde_json::to_string(&authorization)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            );
+            receipt_attributes_json.push(
+                serde_json::to_string(&attributes)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            );
+        }
         Ok(Response::new(IssueGunshiRecommendationsResponse {
             allocation_json: serde_json::to_string(&allocation)
                 .map_err(|error| Status::internal(error.to_string()))?,
             issuance_id,
+            auto_dispatch_authorization_json,
+            receipt_attributes_json,
         }))
     }
 
-    async fn record_gunshi_feedback(
+    async fn set_gunshi_allocation_policy(
         &self,
-        req: Request<RecordGunshiFeedbackRequest>,
-    ) -> Result<Response<RecordGunshiFeedbackResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        let plan: crate::chisei::gunshi::AllocationPlan = serde_json::from_str(&input.plan_json)
-            .map_err(|error| {
-                Status::invalid_argument(format!("invalid allocation plan: {error}"))
-            })?;
-        require_namespace_write_access(&self.db, &actor, &plan.namespace)?;
-        let choice: crate::chisei::gunshi::OperatorChoice =
-            serde_json::from_str(&input.choice_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid operator choice: {error}"))
-            })?;
-        let outcome = (!input.outcome_json.trim().is_empty())
-            .then(|| {
-                serde_json::from_str::<crate::chisei::gunshi::ObservedOutcome>(&input.outcome_json)
-            })
-            .transpose()
-            .map_err(|error| {
-                Status::invalid_argument(format!("invalid observed outcome: {error}"))
-            })?;
-        let feedback = crate::chisei::gunshi_feedback::record_feedback(
-            &self.db,
-            &actor,
-            &input.issuance_id,
-            &plan,
-            &choice,
-            outcome.as_ref(),
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(RecordGunshiFeedbackResponse {
-            feedback_json: serde_json::to_string(&feedback)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn get_gunshi_scorecard(
-        &self,
-        req: Request<GetGunshiScorecardRequest>,
-    ) -> Result<Response<GetGunshiScorecardResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let namespace = req.get_ref().namespace.clone();
-        require_namespace_access(&self.db, &actor, &namespace)?;
-        let scorecard = crate::chisei::gunshi_feedback::advisory_scorecard(&self.db, &namespace)
-            .map_err(Status::internal)?;
-        Ok(Response::new(GetGunshiScorecardResponse {
-            scorecard_json: serde_json::to_string(&scorecard)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn install_gunshi_allocation_baseline(
-        &self,
-        req: Request<InstallGunshiAllocationBaselineRequest>,
-    ) -> Result<Response<InstallGunshiAllocationBaselineResponse>, Status> {
+        req: Request<SetGunshiAllocationPolicyRequest>,
+    ) -> Result<Response<SetGunshiAllocationPolicyResponse>, Status> {
         let actor = authenticated_actor(&req);
         let input = req.into_inner();
         require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let snapshot: crate::chisei::gunshi_policy::AllocationPolicySnapshot =
-            serde_json::from_str(&input.snapshot_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid allocation snapshot: {error}"))
-            })?;
-        let gate: crate::chisei::gunshi_policy::PolicyEvaluationGate =
-            serde_json::from_str(&input.gate_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid evaluation gate: {error}"))
-            })?;
-        let status = crate::chisei::gunshi_auto::install_baseline(
-            &self.db,
-            &actor,
-            &input.namespace,
-            snapshot,
-            gate,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(InstallGunshiAllocationBaselineResponse {
-            status_json: serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn promote_gunshi_allocation_policy(
-        &self,
-        req: Request<PromoteGunshiAllocationPolicyRequest>,
-    ) -> Result<Response<PromoteGunshiAllocationPolicyResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let candidate: crate::chisei::gunshi_policy::AllocationPolicySnapshot =
-            serde_json::from_str(&input.candidate_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid candidate snapshot: {error}"))
-            })?;
-        let baseline: crate::chisei::gunshi_policy::PolicyEvaluation =
-            serde_json::from_str(&input.baseline_evaluation_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid baseline evaluation: {error}"))
-            })?;
-        let candidate_evaluation: crate::chisei::gunshi_policy::PolicyEvaluation =
-            serde_json::from_str(&input.candidate_evaluation_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid candidate evaluation: {error}"))
-            })?;
-        let status = crate::chisei::gunshi_auto::promote(
-            &self.db,
-            crate::chisei::gunshi_auto::PromoteRequest {
-                actor,
-                namespace: input.namespace,
-                candidate,
-                baseline,
-                candidate_evaluation,
-                expected_revision: input.expected_revision,
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            },
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(PromoteGunshiAllocationPolicyResponse {
-            status_json: serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn rollback_gunshi_allocation_policy(
-        &self,
-        req: Request<RollbackGunshiAllocationPolicyRequest>,
-    ) -> Result<Response<RollbackGunshiAllocationPolicyResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let status = crate::chisei::gunshi_auto::rollback(
-            &self.db,
-            &actor,
-            &input.namespace,
-            &input.expected_revision,
-            &input.reason,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(RollbackGunshiAllocationPolicyResponse {
-            status_json: serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn set_gunshi_auto_opt_in(
-        &self,
-        req: Request<SetGunshiAutoOptInRequest>,
-    ) -> Result<Response<SetGunshiAutoOptInResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let status = crate::chisei::gunshi_auto::set_auto_opt_in(
-            &self.db,
-            &actor,
-            &input.namespace,
-            input.opt_in,
-            &input.expected_revision,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(SetGunshiAutoOptInResponse {
-            status_json: serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn set_gunshi_allocation_kill_switch(
-        &self,
-        req: Request<SetGunshiAllocationKillSwitchRequest>,
-    ) -> Result<Response<SetGunshiAllocationKillSwitchResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let status = crate::chisei::gunshi_auto::set_kill_switch(
-            &self.db,
-            &actor,
-            &input.namespace,
-            input.enabled,
-            &input.reason,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .map_err(Status::failed_precondition)?;
-        Ok(Response::new(SetGunshiAllocationKillSwitchResponse {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let status = match input.operation.as_str() {
+            "install" => {
+                let snapshot = serde_json::from_str(&input.snapshot_json).map_err(|error| {
+                    Status::invalid_argument(format!("invalid allocation snapshot: {error}"))
+                })?;
+                let gate = serde_json::from_str(&input.gate_json).map_err(|error| {
+                    Status::invalid_argument(format!("invalid evaluation gate: {error}"))
+                })?;
+                let status = crate::chisei::gunshi_auto::install_baseline(
+                    &self.db,
+                    &actor,
+                    &input.namespace,
+                    snapshot,
+                    gate,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?;
+                serde_json::to_value(status).map_err(|error| Status::internal(error.to_string()))?
+            }
+            "promote" => {
+                let candidate = serde_json::from_str(&input.candidate_json).map_err(|error| {
+                    Status::invalid_argument(format!("invalid candidate snapshot: {error}"))
+                })?;
+                let baseline =
+                    serde_json::from_str(&input.baseline_evaluation_json).map_err(|error| {
+                        Status::invalid_argument(format!("invalid baseline evaluation: {error}"))
+                    })?;
+                let candidate_evaluation = serde_json::from_str(&input.candidate_evaluation_json)
+                    .map_err(|error| {
+                    Status::invalid_argument(format!("invalid candidate evaluation: {error}"))
+                })?;
+                let status = crate::chisei::gunshi_auto::promote(
+                    &self.db,
+                    crate::chisei::gunshi_auto::PromoteRequest {
+                        actor,
+                        namespace: input.namespace,
+                        candidate,
+                        baseline,
+                        candidate_evaluation,
+                        expected_revision: input.expected_revision,
+                        now_ms,
+                    },
+                )
+                .map_err(Status::failed_precondition)?;
+                serde_json::to_value(status).map_err(|error| Status::internal(error.to_string()))?
+            }
+            "rollback" => serde_json::to_value(
+                crate::chisei::gunshi_auto::rollback(
+                    &self.db,
+                    &actor,
+                    &input.namespace,
+                    &input.expected_revision,
+                    &input.reason,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+            "auto_opt_in" => serde_json::to_value(
+                crate::chisei::gunshi_auto::set_auto_opt_in(
+                    &self.db,
+                    &actor,
+                    &input.namespace,
+                    input.enabled,
+                    &input.expected_revision,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+            "kill_switch" => serde_json::to_value(
+                crate::chisei::gunshi_auto::set_kill_switch(
+                    &self.db,
+                    &actor,
+                    &input.namespace,
+                    input.enabled,
+                    &input.reason,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?,
+            )
+            .map_err(|error| Status::internal(error.to_string()))?,
+            "feedback" => {
+                let plan: crate::chisei::gunshi::AllocationPlan =
+                    serde_json::from_str(&input.allocation_json).map_err(|error| {
+                        Status::invalid_argument(format!("invalid allocation plan: {error}"))
+                    })?;
+                if plan.namespace != input.namespace {
+                    return Err(Status::invalid_argument(
+                        "feedback allocation namespace does not match the policy namespace",
+                    ));
+                }
+                let choice = serde_json::from_str(&input.choice_json).map_err(|error| {
+                    Status::invalid_argument(format!("invalid operator choice: {error}"))
+                })?;
+                let outcome = (!input.outcome_json.trim().is_empty())
+                    .then(|| serde_json::from_str(&input.outcome_json))
+                    .transpose()
+                    .map_err(|error| {
+                        Status::invalid_argument(format!("invalid observed outcome: {error}"))
+                    })?;
+                serde_json::to_value(
+                    crate::chisei::gunshi_feedback::record_feedback(
+                        &self.db,
+                        &actor,
+                        &input.issuance_id,
+                        &plan,
+                        &choice,
+                        outcome.as_ref(),
+                    )
+                    .map_err(Status::failed_precondition)?,
+                )
+                .map_err(|error| Status::internal(error.to_string()))?
+            }
+            "promote_feedback" => {
+                let result = crate::chisei::gunshi_feedback_eval::promote_feedback_to_eval(
+                    &self.db,
+                    &actor,
+                    &input.suite_id,
+                    &input.issuance_id,
+                    &input.allocation_id,
+                    &input.namespace,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?;
+                if let Err(error) = self.eval.put_suite(result.suite.clone())
+                    && self.eval.get_suite(&result.suite_id).as_ref() != Some(&result.suite)
+                {
+                    tracing::warn!(
+                        %error,
+                        suite_id = %result.suite_id,
+                        "eval store sync after feedback promotion"
+                    );
+                }
+                serde_json::to_value(result).map_err(|error| Status::internal(error.to_string()))?
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "operation must be install, promote, rollback, auto_opt_in, kill_switch, feedback, or promote_feedback",
+                ));
+            }
+        };
+        Ok(Response::new(SetGunshiAllocationPolicyResponse {
             status_json: serde_json::to_string(&status)
                 .map_err(|error| Status::internal(error.to_string()))?,
         }))
@@ -12660,103 +11061,11 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map_err(|error| Status::internal(error.to_string()))?,
             None => "{}".into(),
         };
+        let scorecard = crate::chisei::gunshi_feedback::advisory_scorecard(&self.db, &namespace)
+            .map_err(Status::internal)?;
         Ok(Response::new(GetGunshiAllocationStatusResponse {
             status_json,
-        }))
-    }
-
-    async fn authorize_gunshi_auto_dispatch(
-        &self,
-        req: Request<AuthorizeGunshiAutoDispatchRequest>,
-    ) -> Result<Response<AuthorizeGunshiAutoDispatchResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_access(&self.db, &actor, &input.namespace)?;
-        let plan: crate::chisei::gunshi::AllocationPlan = serde_json::from_str(&input.plan_json)
-            .map_err(|error| {
-                Status::invalid_argument(format!("invalid allocation plan: {error}"))
-            })?;
-        let operation: crate::chisei::gunshi::PendingOperation =
-            serde_json::from_str(&input.operation_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid pending operation: {error}"))
-            })?;
-        let capacity: crate::chisei::gunshi::CapacityEnvelope =
-            serde_json::from_str(&input.capacity_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid capacity envelope: {error}"))
-            })?;
-        let (mut authorization, mut attributes) =
-            crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
-                &self.db,
-                &input.namespace,
-                &plan,
-                &operation,
-                &capacity,
-            )
-            .map_err(Status::failed_precondition)?;
-        // Residency cannot be bypassed by auto-dispatch (#289 residual wiring).
-        let data_class = self
-            .policy
-            .effective_policy(&input.namespace)
-            .map(|policy| policy.data_class)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unclassified".into());
-        let provider = crate::llm::provider_name(&plan.selection.model);
-        match self.policy.enforce_residency(
-            &input.namespace,
-            provider,
-            &plan.selection.model,
-            &data_class,
-        ) {
-            Ok(decision) => {
-                attributes.extend(self.policy.residency_receipt_attributes(&decision));
-            }
-            Err(error) => {
-                authorization.authorized = false;
-                authorization.mode = crate::chisei::gunshi_dispatch::DispatchMode::AdvisoryOnly;
-                authorization.reasons.push(error);
-                attributes.insert("residency_allowed".into(), "false".into());
-                attributes.insert(
-                    "residency_denial_reasons".into(),
-                    authorization.reasons.last().cloned().unwrap_or_default(),
-                );
-            }
-        }
-        Ok(Response::new(AuthorizeGunshiAutoDispatchResponse {
-            authorization_json: serde_json::to_string(&authorization)
-                .map_err(|error| Status::internal(error.to_string()))?,
-            receipt_attributes_json: serde_json::to_string(&attributes)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
-    }
-
-    async fn promote_gunshi_feedback_to_eval(
-        &self,
-        req: Request<PromoteGunshiFeedbackToEvalRequest>,
-    ) -> Result<Response<PromoteGunshiFeedbackToEvalResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let result = crate::chisei::gunshi_feedback_eval::promote_feedback_to_eval(
-            &self.db,
-            &actor,
-            &input.suite_id,
-            &input.issuance_id,
-            &input.allocation_id,
-            &input.namespace,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .map_err(Status::failed_precondition)?;
-        if let Err(error) = self.eval.put_suite(result.suite.clone())
-            && self.eval.get_suite(&result.suite_id).as_ref() != Some(&result.suite)
-        {
-            tracing::warn!(
-                %error,
-                suite_id = %result.suite_id,
-                "eval store sync after feedback promotion"
-            );
-        }
-        Ok(Response::new(PromoteGunshiFeedbackToEvalResponse {
-            result_json: serde_json::to_string(&result)
+            scorecard_json: serde_json::to_string(&scorecard)
                 .map_err(|error| Status::internal(error.to_string()))?,
         }))
     }
@@ -12768,13 +11077,65 @@ impl ChiseiService for ChiseiServiceImpl {
         require_eval_admin(&req)?;
         let actor = authenticated_actor(&req);
         let request = req.into_inner();
-        if request.memory_id.trim().is_empty()
-            || request.memory_version == 0
-            || request.rationale.trim().is_empty()
-        {
+        if request.memory_id.trim().is_empty() || request.memory_version == 0 {
             return Err(Status::invalid_argument(
-                "memory id, version, and rationale are required",
+                "memory id and version are required",
             ));
+        }
+        if request.action == "reassess" {
+            if request.reassessment_key.trim().is_empty()
+                || request.evidence_basis_json.is_empty()
+                || request.evidence_basis_json.len() > 128
+            {
+                return Err(Status::invalid_argument(
+                    "reassess requires a key and one to 128 evidence basis records",
+                ));
+            }
+            let evidence_basis = request
+                .evidence_basis_json
+                .iter()
+                .map(|json| {
+                    serde_json::from_str::<crate::chisei::kioku::KiokuEvidenceBasis>(json).map_err(
+                        |error| {
+                            Status::invalid_argument(format!("invalid evidence basis: {error}"))
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = self
+                .db
+                .reassess_kioku_memory(crate::chisei::kioku::KiokuEvidenceReassessmentRequest {
+                    memory_id: request.memory_id,
+                    memory_version: request.memory_version,
+                    reassessment_key: request.reassessment_key,
+                    actor,
+                    evidence_basis,
+                    now_ms: chrono::Utc::now().timestamp_millis(),
+                })
+                .map_err(Status::failed_precondition)?;
+            let lifecycle_events = self
+                .db
+                .list_kioku_lifecycle_events(&result.candidate.id, result.candidate.version)
+                .map_err(Status::internal)?;
+            return Ok(Response::new(ReviewKiokuMemoryResponse {
+                memory_json: serde_json::to_string(&result.candidate)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                lifecycle_events_json: lifecycle_events
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                evidence_json: result
+                    .evidence
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                idempotent: result.idempotent,
+            }));
+        }
+        if request.rationale.trim().is_empty() {
+            return Err(Status::invalid_argument("review rationale is required"));
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let memory = match request.action.as_str() {
@@ -12834,68 +11195,48 @@ impl ChiseiService for ChiseiServiceImpl {
                 .map(serde_json::to_string)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| Status::internal(error.to_string()))?,
+            evidence_json: Vec::new(),
+            idempotent: false,
         }))
     }
 
-    async fn reassess_kioku_memory(
+    async fn get_sample_observation(
         &self,
-        req: Request<ReassessKiokuMemoryRequest>,
-    ) -> Result<Response<ReassessKiokuMemoryResponse>, Status> {
-        require_eval_admin(&req)?;
-        let actor = authenticated_actor(&req);
+        req: Request<GetSampleObservationRequest>,
+    ) -> Result<Response<GetSampleObservationResponse>, Status> {
+        let actor = require_telemetry_reader(&req, &self.config)?;
         let request = req.into_inner();
-        if request.memory_id.trim().is_empty()
-            || request.memory_version == 0
-            || request.reassessment_key.trim().is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "memory id, version, and reassessment key are required",
-            ));
+        let request_id = request.request_id.as_str();
+        let namespace = request.namespace.as_str();
+        if request_id.trim().is_empty() {
+            return Err(Status::invalid_argument("request_id required"));
         }
-        if request.evidence_basis_json.is_empty() || request.evidence_basis_json.len() > 128 {
-            return Err(Status::invalid_argument(
-                "one to 128 evidence basis records are required",
-            ));
+        if namespace.trim().is_empty() {
+            return Err(Status::invalid_argument("namespace required"));
         }
-        let evidence_basis = request
-            .evidence_basis_json
-            .iter()
-            .map(|json| {
-                serde_json::from_str::<crate::chisei::kioku::KiokuEvidenceBasis>(json).map_err(
-                    |error| Status::invalid_argument(format!("invalid evidence basis: {error}")),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let result = self
+        if !matches!(actor.as_str(), "root" | "local") {
+            require_namespace_access(&self.db, &actor, namespace.trim())?;
+        }
+        let observation = self
             .db
-            .reassess_kioku_memory(crate::chisei::kioku::KiokuEvidenceReassessmentRequest {
-                memory_id: request.memory_id,
-                memory_version: request.memory_version,
-                reassessment_key: request.reassessment_key,
-                actor,
-                evidence_basis,
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::failed_precondition)?;
-        let lifecycle_events = self
-            .db
-            .list_kioku_lifecycle_events(&result.candidate.id, result.candidate.version)
-            .map_err(Status::internal)?;
-        Ok(Response::new(ReassessKiokuMemoryResponse {
-            memory_json: serde_json::to_string(&result.candidate)
-                .map_err(|error| Status::internal(error.to_string()))?,
-            evidence_json: result
-                .evidence
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| Status::internal(error.to_string()))?,
-            lifecycle_events_json: lifecycle_events
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| Status::internal(error.to_string()))?,
-            idempotent: result.idempotent,
+            .get_sample_observation_in_namespace(request_id, namespace)
+            .map_err(Status::internal)?
+            .ok_or(Status::not_found("sample observation not found"))?;
+        let state = "recorded";
+        Ok(Response::new(GetSampleObservationResponse {
+            observation: Some(SampleObservationReadback {
+                request_id: observation.request_id.clone(),
+                namespace: observation.namespace.clone(),
+                observation_digest: sample_observation_readback_digest(
+                    &observation.request_id,
+                    &observation.namespace,
+                    state,
+                    observation.timestamp,
+                ),
+                state: state.into(),
+                observed_at: observation.timestamp,
+                read_at: chrono::Utc::now().timestamp_millis(),
+            }),
         }))
     }
 
@@ -12932,7 +11273,6 @@ impl ChiseiService for ChiseiServiceImpl {
         if matches!(
             receipt.operation_class.as_str(),
             evaluation_execution_domain::EXECUTION_OPERATION_CLASS
-                | subject::PLAN_BACKED_OPERATION_CLASS
         ) {
             return Err(Status::permission_denied(
                 "evaluation authority receipts accept only internal events",
@@ -13024,21 +11364,19 @@ impl ChiseiService for ChiseiServiceImpl {
         } else {
             kind
         };
-        let explicitly_granted = receipt
-            .reporter_grants
-            .iter()
-            .any(|grant| grant.principal == actor && grant.event_kinds.contains(&kind));
         let trusted_kioku_outcome = kind == ReceiptEventKind::OutcomeRecorded
             && receipt_has_kioku_context
             && complete_kioku_outcome
             && trusted_outcome_reporter;
+        let namespace_writer =
+            require_namespace_write_access(&self.db, &actor, &receipt.namespace).is_ok();
         if actor != receipt.initiating_actor
             && actor != "root"
-            && !explicitly_granted
+            && !namespace_writer
             && !trusted_kioku_outcome
         {
             return Err(Status::permission_denied(
-                "operation event reporter is not authorized for this event kind",
+                "operation event reporter lacks namespace write authority",
             ));
         }
         if request.parent_event_id.trim().is_empty() {
@@ -13277,10 +11615,10 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
-    async fn reserve_gateway_request_alias(
+    async fn claim_gateway_dispatch(
         &self,
-        req: Request<ReserveGatewayRequestAliasRequest>,
-    ) -> Result<Response<ReserveGatewayRequestAliasResponse>, Status> {
+        req: Request<ClaimGatewayDispatchRequest>,
+    ) -> Result<Response<ClaimGatewayDispatchResponse>, Status> {
         let actor = authenticated_actor(&req);
         let auth_source = req
             .metadata()
@@ -13294,51 +11632,7 @@ impl ChiseiService for ChiseiServiceImpl {
             && auth_source == Some("token");
         if !configured_gateway && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
             return Err(Status::permission_denied(
-                "gateway request alias reservation requires a gateway service principal",
-            ));
-        }
-        let request = req.into_inner();
-        if request.caller_scope.trim().is_empty()
-            || request.request_alias.trim().is_empty()
-            || request.request_id.trim().is_empty()
-            || request.operation_id.trim().is_empty()
-        {
-            return Err(Status::invalid_argument(
-                "caller_scope, request_alias, request_id, and operation_id are required",
-            ));
-        }
-        let reserved = self
-            .db
-            .reserve_gateway_request_alias(
-                &request.caller_scope,
-                &request.request_alias,
-                &request.request_id,
-                &request.operation_id,
-            )
-            .map_err(Status::internal)?;
-        Ok(Response::new(ReserveGatewayRequestAliasResponse {
-            reserved,
-        }))
-    }
-
-    async fn claim_gateway_request_alias_dispatch(
-        &self,
-        req: Request<ClaimGatewayRequestAliasDispatchRequest>,
-    ) -> Result<Response<ClaimGatewayRequestAliasDispatchResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let auth_source = req
-            .metadata()
-            .get(AUTH_SOURCE_HEADER)
-            .and_then(|value| value.to_str().ok());
-        let configured_gateway = self
-            .config
-            .gateway_receipt_principals
-            .iter()
-            .any(|principal| principal == &actor)
-            && auth_source == Some("token");
-        if !configured_gateway && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
-            return Err(Status::permission_denied(
-                "gateway request alias dispatch requires a gateway service principal",
+                "gateway dispatch claim requires a gateway service principal",
             ));
         }
         let request = req.into_inner();
@@ -13352,6 +11646,20 @@ impl ChiseiService for ChiseiServiceImpl {
                 "caller_scope, request_alias, request_id, operation_id, and dispatch_token are required",
             ));
         }
+        let reserved = self
+            .db
+            .reserve_gateway_request_alias(
+                &request.caller_scope,
+                &request.request_alias,
+                &request.request_id,
+                &request.operation_id,
+            )
+            .map_err(Status::internal)?;
+        if !reserved {
+            return Ok(Response::new(ClaimGatewayDispatchResponse {
+                claimed: false,
+            }));
+        }
         let claimed = self
             .db
             .claim_gateway_request_alias_dispatch(
@@ -13362,9 +11670,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 &request.dispatch_token,
             )
             .map_err(Status::internal)?;
-        Ok(Response::new(ClaimGatewayRequestAliasDispatchResponse {
-            claimed,
-        }))
+        Ok(Response::new(ClaimGatewayDispatchResponse { claimed }))
     }
 
     async fn get_operation_receipt(
@@ -13469,199 +11775,49 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
-    async fn query_operation_statistics(
-        &self,
-        req: Request<QueryOperationStatisticsRequest>,
-    ) -> Result<Response<QueryOperationStatisticsResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let request = req.into_inner();
-        if request.namespaces.is_empty() {
-            return Err(Status::invalid_argument(
-                "at least one namespace is required",
-            ));
-        }
-        if request.start_timestamp_ms < 0 || request.end_timestamp_ms <= request.start_timestamp_ms
-        {
-            return Err(Status::invalid_argument(
-                "statistics require an inclusive start before the exclusive end",
-            ));
-        }
-        if request
-            .end_timestamp_ms
-            .saturating_sub(request.start_timestamp_ms)
-            > crate::operation_statistics::MAX_STATISTICS_WINDOW_MS
-        {
-            return Err(Status::invalid_argument(
-                "statistics window must not exceed one year",
-            ));
-        }
-        let mut namespaces = request
-            .namespaces
-            .into_iter()
-            .map(|namespace| namespace.trim().to_string())
-            .collect::<Vec<_>>();
-        if namespaces.iter().any(String::is_empty) {
-            return Err(Status::invalid_argument(
-                "namespace values must not be empty",
-            ));
-        }
-        namespaces.sort();
-        namespaces.dedup();
-        if namespaces.len() > 100 {
-            return Err(Status::invalid_argument(
-                "statistics queries support at most 100 namespaces",
-            ));
-        }
-        authorize_statistics_namespaces(&self.db, &actor, &namespaces)?;
-        let statistics = crate::operation_statistics::query_operation_statistics(
-            &self.db,
-            &namespaces,
-            request.start_timestamp_ms,
-            request.end_timestamp_ms,
-        )
-        .map_err(|error| {
-            if error.starts_with("statistics receipt limit exceeded") {
-                Status::resource_exhausted(error)
-            } else {
-                Status::internal(error)
-            }
-        })?;
-        let totals = statistics.totals;
-        let outcomes = statistics.outcomes;
-        let learning = statistics.learning;
-        let epistemic = statistics.epistemic;
-        Ok(Response::new(QueryOperationStatisticsResponse {
-            totals: Some(OperationStatisticsTotals {
-                logical_operations: totals.logical_operations,
-                receipts: totals.receipts,
-                model_calls: totals.model_calls,
-                priced_model_calls: totals.priced_model_calls,
-                unpriced_model_calls: totals.unpriced_model_calls,
-                model_calls_without_model: totals.model_calls_without_model,
-                total_cost_usd_micros: totals.total_cost_usd_micros,
-                waiting_operations: totals.waiting_operations,
-                waiting_time_ms: totals.waiting_time_ms,
-            }),
-            daily_spend: statistics
-                .daily_spend
-                .into_iter()
-                .map(|(day, value)| OperationStatisticValue {
-                    labels: HashMap::from([("date".into(), day)]),
-                    value,
-                })
-                .collect(),
-            namespace_model_spend: statistics
-                .namespace_model_spend
-                .into_iter()
-                .map(|((namespace, model), value)| OperationStatisticValue {
-                    labels: HashMap::from([
-                        ("namespace".into(), namespace),
-                        ("model".into(), model),
-                    ]),
-                    value,
-                })
-                .collect(),
-            // No namespace policy currently defines a monetary cap and period.
-            // Portfolio objectives and token budgets are intentionally not
-            // relabeled as spend caps.
-            spend_caps: Vec::new(),
-            outcomes: Some(OperationOutcomeCounts {
-                verified: outcomes.verified,
-                failed: outcomes.failed,
-                parked: outcomes.parked,
-                rejected: outcomes.rejected,
-                unverified: outcomes.unverified,
-                unknown: outcomes.unknown,
-            }),
-            learning: Some(OperationLearningCounts {
-                learnings_admitted: learning.learnings_admitted,
-                enrichments_served: learning.enrichments_served,
-                escalations_answered: learning.escalations_answered,
-            }),
-            outcome_spend: statistics
-                .outcome_spend
-                .by_outcome
-                .into_iter()
-                .map(|(outcome, value)| OperationStatisticValue {
-                    labels: HashMap::from([("outcome".into(), outcome)]),
-                    value,
-                })
-                .collect(),
-            capability_outcome_spend: statistics
-                .outcome_spend
-                .by_capability_outcome
-                .into_iter()
-                .map(|((capability, outcome), value)| OperationStatisticValue {
-                    labels: HashMap::from([
-                        ("capability".into(), capability),
-                        ("outcome".into(), outcome),
-                    ]),
-                    value,
-                })
-                .collect(),
-            cost_per_verified_usd_micros: statistics.outcome_spend.cost_per_verified_usd_micros,
-            cost_per_failed_usd_micros: statistics.outcome_spend.cost_per_failed_usd_micros,
-            epistemic: Some(EpistemicContextStatistics {
-                accounting_status: epistemic.accounting_status,
-                context_receipts: epistemic.context_receipts,
-                accounted_receipts: epistemic.accounted_receipts,
-                missing_receipts: epistemic.missing_receipts,
-                decision_counts: epistemic_statistics_values(epistemic.decision_counts, "decision"),
-                evidence_status_counts: epistemic_statistics_values(
-                    epistemic.evidence_status_counts,
-                    "status",
-                ),
-                lifecycle_status_counts: epistemic_statistics_values(
-                    epistemic.lifecycle_status_counts,
-                    "status",
-                ),
-                context_bytes_total: epistemic.context_bytes_total,
-                context_tokens_total: epistemic.context_tokens_total,
-                projection_latency_ms_total: epistemic.projection_latency_ms_total,
-                projection_observations: epistemic.projection_observations,
-                truncated_count: epistemic.truncated_count,
-                evaluation_observations: epistemic.evaluation_observations,
-                evaluation_passes: epistemic.evaluation_passes,
-                treatment_samples: epistemic.treatment_samples,
-                treatment_passes: epistemic.treatment_passes,
-                control_samples: epistemic.control_samples,
-                control_passes: epistemic.control_passes,
-                treatment_control_delta_micros: epistemic.treatment_control_delta_micros,
-                treatment_control_available: epistemic.treatment_control_available,
-                reassessment_events: epistemic.reassessment_events,
-                retirement_events: epistemic.retirement_events,
-            }),
-        }))
-    }
-
-    async fn get_affinity(
-        &self,
-        req: Request<GetAffinityRequest>,
-    ) -> Result<Response<GetAffinityResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        require_namespace_access(&self.db, &actor, &req.get_ref().namespace)?;
-        let r = req.into_inner();
-        let a = crate::chisei::affinity::get_affinity(&self.db, &r.namespace);
-        Ok(Response::new(GetAffinityResponse {
-            result: Some(AffinityResult {
-                namespaces: a.namespaces,
-                best_model: a.best_model,
-                low_success: a.low_success,
-            }),
-        }))
-    }
-
     async fn put_evaluator_definition(
         &self,
         req: Request<PutEvaluatorDefinitionRequest>,
     ) -> Result<Response<PutEvaluatorDefinitionResponse>, Status> {
         require_eval_admin(&req)?;
         let actor = authenticated_actor(&req);
-        let definition = from_proto_evaluator_definition(
-            req.into_inner()
-                .definition
-                .ok_or_else(|| Status::invalid_argument("evaluator definition required"))?,
-        )?;
+        let request = req.into_inner();
+        if request.definition.is_none() {
+            let definition = self
+                .db
+                .get_evaluator_definition(&request.definition_id)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
+            require_namespace_write_access(&self.db, &actor, &definition.namespace)?;
+            let availability = self
+                .db
+                .set_evaluator_availability(
+                    &request.definition_id,
+                    &request.availability_state,
+                    &request.superseded_by_definition_id,
+                    &request.reason,
+                    &request.request_id,
+                    &actor,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .map_err(map_evaluation_resource_error)?;
+            let (implementation_executable, implementation_status) =
+                self.evaluator_capability(&definition);
+            return Ok(Response::new(PutEvaluatorDefinitionResponse {
+                record: Some(evaluator_record_with_availability(
+                    &definition,
+                    &availability,
+                    implementation_executable,
+                    &implementation_status,
+                )),
+            }));
+        }
+        if !request.availability_state.is_empty() {
+            return Err(Status::invalid_argument(
+                "definition publication and availability transition are separate writes",
+            ));
+        }
+        let definition = from_proto_evaluator_definition(request.definition.unwrap())?;
         require_namespace_write_access(&self.db, &actor, &definition.namespace)?;
         let definition = self
             .db
@@ -13676,96 +11832,6 @@ impl ChiseiService for ChiseiServiceImpl {
                 implementation_executable,
                 &implementation_status,
             )?),
-        }))
-    }
-
-    async fn get_evaluator_definition(
-        &self,
-        req: Request<GetEvaluatorDefinitionRequest>,
-    ) -> Result<Response<GetEvaluatorDefinitionResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let definition = self
-            .db
-            .get_evaluator_definition(&req.into_inner().definition_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("evaluator definition not found"))?;
-        if require_namespace_access(&self.db, &actor, &definition.namespace).is_err() {
-            return Err(Status::not_found("evaluator definition not found"));
-        }
-        let (implementation_executable, implementation_status) =
-            self.evaluator_capability(&definition);
-        Ok(Response::new(GetEvaluatorDefinitionResponse {
-            record: Some(evaluator_record(
-                &self.db,
-                &definition,
-                implementation_executable,
-                &implementation_status,
-            )?),
-        }))
-    }
-
-    async fn list_evaluator_definitions(
-        &self,
-        req: Request<ListEvaluatorDefinitionsRequest>,
-    ) -> Result<Response<ListEvaluatorDefinitionsResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let request = req.into_inner();
-        require_namespace_access(&self.db, &actor, &request.namespace)?;
-        let evaluator_id = (!request.evaluator_id.is_empty()).then_some(request.evaluator_id);
-        let definitions = self
-            .db
-            .list_evaluator_definitions(&request.namespace, evaluator_id.as_deref())
-            .map_err(Status::internal)?;
-        let records = definitions
-            .iter()
-            .map(|definition| {
-                let (implementation_executable, implementation_status) =
-                    self.evaluator_capability(definition);
-                evaluator_record(
-                    &self.db,
-                    definition,
-                    implementation_executable,
-                    &implementation_status,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Response::new(ListEvaluatorDefinitionsResponse { records }))
-    }
-
-    async fn set_evaluator_availability(
-        &self,
-        req: Request<SetEvaluatorAvailabilityRequest>,
-    ) -> Result<Response<SetEvaluatorAvailabilityResponse>, Status> {
-        require_eval_admin(&req)?;
-        let actor = authenticated_actor(&req);
-        let request = req.into_inner();
-        let definition = self
-            .db
-            .get_evaluator_definition(&request.definition_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
-        require_namespace_write_access(&self.db, &actor, &definition.namespace)?;
-        let availability = self
-            .db
-            .set_evaluator_availability(
-                &request.definition_id,
-                &request.state,
-                &request.superseded_by_definition_id,
-                &request.reason,
-                &request.request_id,
-                &actor,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .map_err(map_evaluation_resource_error)?;
-        let (implementation_executable, implementation_status) =
-            self.evaluator_capability(&definition);
-        Ok(Response::new(SetEvaluatorAvailabilityResponse {
-            record: Some(evaluator_record_with_availability(
-                &definition,
-                &availability,
-                implementation_executable,
-                &implementation_status,
-            )),
         }))
     }
 
@@ -13813,47 +11879,6 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
-    async fn get_evaluation_plan(
-        &self,
-        req: Request<GetEvaluationPlanRequest>,
-    ) -> Result<Response<GetEvaluationPlanResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let plan = self
-            .db
-            .get_evaluation_plan(&req.into_inner().plan_version_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("evaluation plan not found"))?;
-        if require_namespace_access(&self.db, &actor, &plan.namespace).is_err()
-            || !evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)?
-        {
-            return Err(Status::not_found("evaluation plan not found"));
-        }
-        Ok(Response::new(GetEvaluationPlanResponse {
-            plan: Some(to_proto_evaluation_plan(&plan)),
-        }))
-    }
-
-    async fn list_evaluation_plans(
-        &self,
-        req: Request<ListEvaluationPlansRequest>,
-    ) -> Result<Response<ListEvaluationPlansResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let request = req.into_inner();
-        require_namespace_access(&self.db, &actor, &request.namespace)?;
-        let plan_id = (!request.plan_id.is_empty()).then_some(request.plan_id);
-        let stored_plans = self
-            .db
-            .list_evaluation_plans(&request.namespace, plan_id.as_deref())
-            .map_err(Status::internal)?;
-        let mut plans = Vec::new();
-        for plan in stored_plans {
-            if evaluation_plan_visible(&self.db, &plan, &actor).map_err(Status::internal)? {
-                plans.push(to_proto_evaluation_plan(&plan));
-            }
-        }
-        Ok(Response::new(ListEvaluationPlansResponse { plans }))
-    }
-
     async fn resolve_evaluation_plan(
         &self,
         req: Request<ResolveEvaluationPlanRequest>,
@@ -13874,6 +11899,94 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         let outcome = self.resolve_evaluation_plan_internal(&prepared)?;
         Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
+    }
+
+    async fn get_eval_suite(
+        &self,
+        req: Request<GetEvalSuiteRequest>,
+    ) -> Result<Response<GetEvalSuiteResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
+        let suite = self
+            .eval
+            .get_suite(&req.into_inner().id)
+            .ok_or(Status::not_found("eval suite not found"))?;
+        Ok(Response::new(GetEvalSuiteResponse {
+            suite: Some(EvalSuite {
+                id: suite.id,
+                name: suite.name,
+                description: suite.description,
+                cases: suite
+                    .cases
+                    .into_iter()
+                    .map(|case| EvalCase {
+                        id: case.id,
+                        name: case.name,
+                        namespace: case.namespace,
+                        spec: case.spec,
+                        assertions: case
+                            .assertions
+                            .into_iter()
+                            .map(|assertion| EvalAssertion {
+                                r#type: assertion.assert_type,
+                                value: assertion.value,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            }),
+        }))
+    }
+
+    async fn get_eval_run(
+        &self,
+        req: Request<GetEvalRunRequest>,
+    ) -> Result<Response<GetEvalRunResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
+        let run = self
+            .eval
+            .get_run(&req.into_inner().id)
+            .ok_or(Status::not_found("eval run not found"))?;
+        Ok(Response::new(GetEvalRunResponse {
+            run: Some(EvalRun {
+                id: run.id,
+                suite_id: run.suite_id,
+                config_ref: run.config_ref,
+                results: run
+                    .results
+                    .into_iter()
+                    .map(|result| CaseResult {
+                        case_id: result.case_id,
+                        passed: result.passed,
+                        status: result.status,
+                        result: result.result,
+                        score: result.score,
+                        reason: result.reason,
+                        elapsed: result.elapsed,
+                    })
+                    .collect(),
+                timestamp: run.timestamp,
+            }),
+        }))
+    }
+
+    async fn list_eval_runs(
+        &self,
+        req: Request<ListEvalRunsRequest>,
+    ) -> Result<Response<ListEvalRunsResponse>, Status> {
+        require_eval_reader(&req, &self.config)?;
+        let runs = self.eval.list_runs(&req.into_inner().suite_id);
+        Ok(Response::new(ListEvalRunsResponse {
+            runs: runs
+                .into_iter()
+                .map(|run| EvalRun {
+                    id: run.id,
+                    suite_id: run.suite_id,
+                    config_ref: run.config_ref,
+                    results: Vec::new(),
+                    timestamp: run.timestamp,
+                })
+                .collect(),
+        }))
     }
 
     async fn execute_evaluation_manifest(
@@ -13900,41 +12013,6 @@ impl ChiseiService for ChiseiServiceImpl {
             .execute_evaluation_manifest_internal(&manifest, &actor, request.max_total_duration_ms)
             .await?;
         Ok(Response::new(ExecuteEvaluationManifestResponse {
-            execution: Some(to_proto_evaluation_execution_projection(&projection)),
-        }))
-    }
-
-    async fn get_evaluation_execution(
-        &self,
-        req: Request<GetEvaluationExecutionRequest>,
-    ) -> Result<Response<GetEvaluationExecutionResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let request = req.into_inner();
-        let validated = evaluation_execution_domain::prepare_execution_request(
-            evaluation_execution_domain::EvaluationExecutionRequest {
-                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
-                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
-                namespace: request.namespace,
-                manifest_digest: request.manifest_digest,
-                max_total_duration_ms: evaluation_execution_domain::DEFAULT_TOTAL_DURATION_MS,
-            },
-        )
-        .map_err(map_evaluation_resource_error)?;
-        require_namespace_access(&self.db, &actor, &validated.namespace)?;
-        let manifest = self
-            .db
-            .get_evaluation_manifest(&validated.manifest_digest)
-            .map_err(Status::internal)?
-            .filter(|manifest| manifest.namespace == validated.namespace)
-            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
-        let index = self
-            .db
-            .get_evaluation_execution_index(&validated.manifest_digest)
-            .map_err(Status::internal)?
-            .filter(|index| index.namespace == validated.namespace)
-            .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
-        let projection = Self::get_evaluation_projection(&self.db, &manifest, &index)?;
-        Ok(Response::new(GetEvaluationExecutionResponse {
             execution: Some(to_proto_evaluation_execution_projection(&projection)),
         }))
     }
@@ -14042,603 +12120,6 @@ impl ChiseiService for ChiseiServiceImpl {
         }
         Ok(Response::new(CancelEvaluationExecutionResponse {
             execution: Some(to_proto_evaluation_execution_projection(&projection)),
-        }))
-    }
-
-    async fn create_eval_suite(
-        &self,
-        req: Request<CreateEvalSuiteRequest>,
-    ) -> Result<Response<CreateEvalSuiteResponse>, Status> {
-        require_eval_admin(&req)?;
-        let s = req
-            .into_inner()
-            .suite
-            .ok_or(Status::invalid_argument("suite required"))?;
-        let suite = crate::chisei::eval::Suite {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            description: s.description.clone(),
-            cases: s
-                .cases
-                .iter()
-                .map(|c| crate::chisei::eval::Case {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    namespace: c.namespace.clone(),
-                    spec: c.spec.clone(),
-                    assertions: c
-                        .assertions
-                        .iter()
-                        .map(|a| crate::chisei::eval::Assertion {
-                            assert_type: a.r#type.clone(),
-                            value: a.value.clone(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        crate::chisei::eval::validate_builtin_suite_assertions(&suite)
-            .map_err(Status::invalid_argument)?;
-        self.eval.put_suite(suite).map_err(Status::internal)?;
-        Ok(Response::new(CreateEvalSuiteResponse { suite: Some(s) }))
-    }
-
-    async fn list_eval_suites(
-        &self,
-        req: Request<ListEvalSuitesRequest>,
-    ) -> Result<Response<ListEvalSuitesResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let suites = self.eval.list_suites();
-        let pb: Vec<EvalSuite> = suites
-            .iter()
-            .map(|s| EvalSuite {
-                id: s.id.clone(),
-                name: s.name.clone(),
-                description: s.description.clone(),
-                cases: vec![],
-            })
-            .collect();
-        Ok(Response::new(ListEvalSuitesResponse { suites: pb }))
-    }
-
-    async fn get_eval_suite(
-        &self,
-        req: Request<GetEvalSuiteRequest>,
-    ) -> Result<Response<GetEvalSuiteResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let s = self
-            .eval
-            .get_suite(&req.into_inner().id)
-            .ok_or(Status::not_found("not found"))?;
-        Ok(Response::new(GetEvalSuiteResponse {
-            suite: Some(EvalSuite {
-                id: s.id,
-                name: s.name,
-                description: s.description,
-                cases: s
-                    .cases
-                    .into_iter()
-                    .map(|case| EvalCase {
-                        id: case.id,
-                        name: case.name,
-                        namespace: case.namespace,
-                        spec: case.spec,
-                        assertions: case
-                            .assertions
-                            .into_iter()
-                            .map(|assertion| EvalAssertion {
-                                r#type: assertion.assert_type,
-                                value: assertion.value,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
-        }))
-    }
-
-    async fn create_eval_run(
-        &self,
-        req: Request<CreateEvalRunRequest>,
-    ) -> Result<Response<CreateEvalRunResponse>, Status> {
-        require_eval_admin(&req)?;
-        let req = req.into_inner();
-        let r = req.run.ok_or(Status::invalid_argument("run required"))?;
-        let run = crate::chisei::eval::Run {
-            id: r.id.clone(),
-            suite_id: r.suite_id.clone(),
-            config_ref: r.config_ref.clone(),
-            results: r
-                .results
-                .iter()
-                .map(|cr| crate::chisei::eval::CaseResult {
-                    case_id: cr.case_id.clone(),
-                    passed: cr.passed,
-                    status: cr.status.clone(),
-                    result: cr.result.clone(),
-                    score: cr.score,
-                    reason: cr.reason.clone(),
-                    elapsed: cr.elapsed,
-                })
-                .collect(),
-            timestamp: r.timestamp,
-        };
-        self.eval.put_run(run).map_err(Status::internal)?;
-        if !req.changed_file.is_empty() {
-            self.eval
-                .track_iteration(&r.suite_id, &r.id, &req.changed_file, &req.diff_hash)
-                .map_err(Status::internal)?;
-        }
-        Ok(Response::new(CreateEvalRunResponse { run: Some(r) }))
-    }
-
-    async fn get_eval_run(
-        &self,
-        req: Request<GetEvalRunRequest>,
-    ) -> Result<Response<GetEvalRunResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let run = self
-            .eval
-            .get_run(&req.into_inner().id)
-            .ok_or(Status::not_found("not found"))?;
-        Ok(Response::new(GetEvalRunResponse {
-            run: Some(EvalRun {
-                id: run.id,
-                suite_id: run.suite_id,
-                config_ref: run.config_ref,
-                results: run
-                    .results
-                    .into_iter()
-                    .map(|result| CaseResult {
-                        case_id: result.case_id,
-                        passed: result.passed,
-                        status: result.status,
-                        result: result.result,
-                        score: result.score,
-                        reason: result.reason,
-                        elapsed: result.elapsed,
-                    })
-                    .collect(),
-                timestamp: run.timestamp,
-            }),
-        }))
-    }
-
-    async fn list_eval_runs(
-        &self,
-        req: Request<ListEvalRunsRequest>,
-    ) -> Result<Response<ListEvalRunsResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let runs = self.eval.list_runs(&req.into_inner().suite_id);
-        let pb: Vec<EvalRun> = runs
-            .iter()
-            .map(|r| EvalRun {
-                id: r.id.clone(),
-                suite_id: r.suite_id.clone(),
-                config_ref: r.config_ref.clone(),
-                results: vec![],
-                timestamp: r.timestamp,
-            })
-            .collect();
-        Ok(Response::new(ListEvalRunsResponse { runs: pb }))
-    }
-
-    async fn track_eval_iteration(
-        &self,
-        req: Request<TrackEvalIterationRequest>,
-    ) -> Result<Response<TrackEvalIterationResponse>, Status> {
-        require_eval_admin(&req)?;
-        let r = req.into_inner();
-        if r.suite_id.is_empty() || r.run_id.is_empty() || r.changed_file.is_empty() {
-            return Err(Status::invalid_argument(
-                "suite_id, run_id, and changed_file are required",
-            ));
-        }
-        let iteration = self
-            .eval
-            .track_iteration(&r.suite_id, &r.run_id, &r.changed_file, &r.diff_hash)
-            .map_err(Status::internal)?;
-        Ok(Response::new(TrackEvalIterationResponse {
-            iteration: Some(eval_iteration_pb(iteration)),
-        }))
-    }
-
-    async fn get_latest_eval_iteration(
-        &self,
-        req: Request<GetLatestEvalIterationRequest>,
-    ) -> Result<Response<GetLatestEvalIterationResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let iteration = self
-            .eval
-            .latest_iteration_for_file(&req.into_inner().changed_file)
-            .ok_or(Status::not_found("iteration not found"))?;
-        Ok(Response::new(GetLatestEvalIterationResponse {
-            iteration: Some(eval_iteration_pb(iteration)),
-        }))
-    }
-
-    async fn list_eval_iterations(
-        &self,
-        req: Request<ListEvalIterationsRequest>,
-    ) -> Result<Response<ListEvalIterationsResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let r = req.into_inner();
-        let mut iterations = if r.changed_file.is_empty() {
-            self.eval.list_iterations(&r.suite_id)
-        } else {
-            self.eval.list_iterations_for_file(&r.changed_file)
-        };
-        if !r.suite_id.is_empty() {
-            iterations.retain(|iteration| iteration.suite_id == r.suite_id);
-        }
-        Ok(Response::new(ListEvalIterationsResponse {
-            iterations: iterations.into_iter().map(eval_iteration_pb).collect(),
-        }))
-    }
-
-    async fn compare_runs(
-        &self,
-        req: Request<CompareRunsRequest>,
-    ) -> Result<Response<CompareRunsResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let r = req.into_inner();
-        let d = self
-            .eval
-            .compare_runs(&r.baseline_id, &r.candidate_id)
-            .ok_or(Status::not_found("runs not found"))?;
-        Ok(Response::new(CompareRunsResponse {
-            decision: Some(GateDecision {
-                verdict: d.verdict,
-                reason: d.reason,
-                baseline_score: d.baseline_score,
-                candidate_score: d.candidate_score,
-            }),
-        }))
-    }
-
-    async fn get_evidence_context_gate(
-        &self,
-        req: Request<GetEvidenceContextGateRequest>,
-    ) -> Result<Response<GetEvidenceContextGateResponse>, Status> {
-        require_team_namespace_access(&self.db, &self.config, &req, &req.get_ref().namespace)?;
-        let request = req.into_inner();
-        let namespace = request.namespace.trim();
-        let source_type = request.source_type.trim();
-        let evidence_type = request.evidence_type.trim();
-        if namespace.is_empty() || source_type.is_empty() || evidence_type.is_empty() {
-            return Err(Status::invalid_argument(
-                "namespace, source_type, and evidence_type are required",
-            ));
-        }
-        let namespace_gate = self.pipeline_context_expansion_gate(namespace);
-        let class_gate = self.evidence_context_gate(
-            namespace,
-            source_type,
-            evidence_type,
-            namespace_gate.allowed,
-        );
-        let reason = if class_gate.effective_allowed {
-            class_gate.gate.reason.clone()
-        } else if class_gate.gate.allowed {
-            "namespace context-expansion gate is not allowed".into()
-        } else {
-            class_gate.gate.reason.clone()
-        };
-        Ok(Response::new(GetEvidenceContextGateResponse {
-            gate: Some(EvidenceContextGate {
-                source_type: class_gate.source_type,
-                evidence_type: class_gate.evidence_type,
-                profile_key: class_gate.gate.profile_key,
-                allowed: class_gate.effective_allowed,
-                verdict: class_gate.gate.verdict,
-                reason,
-                iteration_id: class_gate.gate.iteration_id,
-                baseline_run_id: class_gate.gate.baseline_run_id,
-                candidate_run_id: class_gate.gate.candidate_run_id,
-                expected_baseline_config_ref: evidence_context_config_ref(
-                    source_type,
-                    evidence_type,
-                    false,
-                ),
-                expected_candidate_config_ref: evidence_context_config_ref(
-                    source_type,
-                    evidence_type,
-                    true,
-                ),
-            }),
-        }))
-    }
-
-    async fn eval_variance(
-        &self,
-        req: Request<EvalVarianceRequest>,
-    ) -> Result<Response<EvalVarianceResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let r = req.into_inner();
-        let variance = self.eval.variance(&r.suite_id, &r.config_ref);
-        Ok(Response::new(EvalVarianceResponse {
-            variance: Some(EvalVariance {
-                suite_id: variance.suite_id,
-                config_ref: variance.config_ref,
-                run_count: variance.run_count,
-                mean_score: variance.mean_score,
-                std_dev: variance.std_dev,
-                min_score: variance.min_score,
-                max_score: variance.max_score,
-                cases: variance
-                    .cases
-                    .into_iter()
-                    .map(|case| EvalVarianceCase {
-                        case_id: case.case_id,
-                        run_count: case.run_count,
-                        pass_rate: case.pass_rate,
-                        mean_score: case.mean_score,
-                        min_score: case.min_score,
-                        max_score: case.max_score,
-                        std_dev: case.std_dev,
-                    })
-                    .collect(),
-            }),
-        }))
-    }
-
-    async fn eval_model_compare(
-        &self,
-        req: Request<EvalModelCompareRequest>,
-    ) -> Result<Response<EvalModelCompareResponse>, Status> {
-        require_eval_reader(&req, &self.config)?;
-        let r = req.into_inner();
-        let comparison = self.eval.model_compare(&r.suite_id);
-        Ok(Response::new(EvalModelCompareResponse {
-            comparison: Some(EvalModelComparison {
-                suite_id: comparison.suite_id,
-                models: comparison
-                    .models
-                    .into_iter()
-                    .map(|model| EvalModelVariance {
-                        model_id: model.model_id,
-                        variance: Some(EvalVariance {
-                            suite_id: model.variance.suite_id,
-                            config_ref: model.variance.config_ref,
-                            run_count: model.variance.run_count,
-                            mean_score: model.variance.mean_score,
-                            std_dev: model.variance.std_dev,
-                            min_score: model.variance.min_score,
-                            max_score: model.variance.max_score,
-                            cases: model
-                                .variance
-                                .cases
-                                .into_iter()
-                                .map(|case| EvalVarianceCase {
-                                    case_id: case.case_id,
-                                    run_count: case.run_count,
-                                    pass_rate: case.pass_rate,
-                                    mean_score: case.mean_score,
-                                    min_score: case.min_score,
-                                    max_score: case.max_score,
-                                    std_dev: case.std_dev,
-                                })
-                                .collect(),
-                        }),
-                    })
-                    .collect(),
-            }),
-        }))
-    }
-
-    async fn evolve_suggest(
-        &self,
-        req: Request<EvolveSuggestRequest>,
-    ) -> Result<Response<EvolveSuggestResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let request_id = req.into_inner().request_id;
-        let task = self
-            .evolve_task(&request_id)
-            .ok_or(Status::not_found("task not found"))?;
-        require_namespace_access(&self.db, &actor, &task.namespace)?;
-        let tasks = self.evolve_tasks();
-        let namespace_tasks: Vec<_> = tasks
-            .into_iter()
-            .filter(|candidate| candidate.namespace == task.namespace)
-            .collect();
-        let patterns = crate::chisei::evolve::mine_patterns(&namespace_tasks);
-        let suggestions = crate::chisei::evolve::suggest(&task, &patterns);
-        Ok(Response::new(EvolveSuggestResponse {
-            suggestions: suggestions
-                .into_iter()
-                .map(|suggestion| EvolveSuggestion {
-                    message: suggestion.message,
-                    confidence: suggestion.confidence,
-                    category: suggestion.category,
-                })
-                .collect(),
-        }))
-    }
-
-    async fn evolve_enhance(
-        &self,
-        req: Request<EvolveEnhanceRequest>,
-    ) -> Result<Response<EvolveEnhanceResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let r = req.into_inner();
-        let tasks = self.evolve_tasks();
-        let patterns = if r.request_id.is_empty() {
-            if !matches!(actor.as_str(), "root" | "local") {
-                return Err(Status::permission_denied(
-                    "global evolution enhancement requires control-plane administration",
-                ));
-            }
-            tasks
-        } else {
-            let task = self
-                .evolve_task(&r.request_id)
-                .ok_or(Status::not_found("task not found"))?;
-            require_namespace_write_access(&self.db, &actor, &task.namespace)?;
-            tasks
-                .into_iter()
-                .filter(|candidate| candidate.namespace == task.namespace)
-                .collect()
-        };
-        let mined_patterns = crate::chisei::evolve::mine_patterns(&patterns);
-        let (enhanced, modified) = crate::chisei::evolve::enhance_spec(&r.spec, &mined_patterns);
-        if modified && !r.request_id.is_empty() {
-            self.evolve_enhancements
-                .lock()
-                .expect("evolve enhancements poisoned")
-                .insert(r.request_id.clone(), r.spec.clone());
-            self.db
-                .put_evolve_enhancement(&r.request_id, &r.spec)
-                .map_err(Status::internal)?;
-        }
-        Ok(Response::new(EvolveEnhanceResponse {
-            enhanced_spec: enhanced,
-            modified,
-        }))
-    }
-
-    async fn evolve_recommend(
-        &self,
-        req: Request<EvolveRecommendRequest>,
-    ) -> Result<Response<EvolveRecommendResponse>, Status> {
-        let actor = authenticated_actor(&req);
-        let task = self
-            .evolve_task(&req.into_inner().request_id)
-            .ok_or(Status::not_found("task not found"))?;
-        require_namespace_access(&self.db, &actor, &task.namespace)?;
-        let recommendation = crate::chisei::evolve::recommend(&task).ok_or(
-            Status::failed_precondition("task does not need a recommendation"),
-        )?;
-        Ok(Response::new(EvolveRecommendResponse {
-            recommendation: Some(EvolveRecommendation {
-                action: recommendation.action,
-                reason: recommendation.reason,
-            }),
-        }))
-    }
-
-    async fn evolve_report(
-        &self,
-        req: Request<EvolveReportRequest>,
-    ) -> Result<Response<EvolveReportResponse>, Status> {
-        require_control_plane_admin(&req, "global evolution reporting")?;
-        let summary = crate::chisei::evolve::report(&self.evolve_tasks());
-        Ok(Response::new(EvolveReportResponse {
-            report: Some(EvolveReport {
-                total_tasks: summary.total_tasks,
-                succeeded: summary.succeeded,
-                failed: summary.failed,
-                success_rate: summary.success_rate,
-                patterns: summary
-                    .patterns
-                    .into_iter()
-                    .map(|pattern| EvolvePattern {
-                        pattern: pattern.pattern,
-                        occurrences: pattern.occurrences,
-                        success_rate: pattern.success_rate,
-                        category: pattern.category,
-                    })
-                    .collect(),
-            }),
-        }))
-    }
-
-    async fn evolve_patterns(
-        &self,
-        req: Request<EvolvePatternsRequest>,
-    ) -> Result<Response<EvolvePatternsResponse>, Status> {
-        require_control_plane_admin(&req, "global evolution pattern mining")?;
-        let patterns = crate::chisei::evolve::mine_patterns(&self.evolve_tasks());
-        Ok(Response::new(EvolvePatternsResponse {
-            patterns: patterns
-                .into_iter()
-                .map(|pattern| EvolvePattern {
-                    pattern: pattern.pattern,
-                    occurrences: pattern.occurrences,
-                    success_rate: pattern.success_rate,
-                    category: pattern.category,
-                })
-                .collect(),
-        }))
-    }
-
-    async fn evolve_variance(
-        &self,
-        req: Request<EvolveVarianceRequest>,
-    ) -> Result<Response<EvolveVarianceResponse>, Status> {
-        require_control_plane_admin(&req, "global evolution variance analysis")?;
-        let report = crate::chisei::evolve::analyze_variance(
-            &self.evolve_tasks(),
-            chrono::Utc::now().timestamp(),
-        );
-        Ok(Response::new(EvolveVarianceResponse {
-            report: Some(EvolveVarianceReport {
-                patterns: report
-                    .patterns
-                    .into_iter()
-                    .map(|pattern| EvolvePatternVariance {
-                        pattern: pattern.pattern,
-                        sample_size: pattern.sample_size,
-                        mean_success_rate: pattern.mean_success_rate,
-                        std_dev: pattern.std_dev,
-                        ci_95_lower: pattern.ci_95_lower,
-                        ci_95_upper: pattern.ci_95_upper,
-                        risk_flag: pattern.risk_flag,
-                        trend: pattern.trend,
-                        windows: pattern
-                            .windows
-                            .into_iter()
-                            .map(|window| EvolveVarianceWindow {
-                                window: window.window,
-                                total: window.total,
-                                succeeded: window.succeeded,
-                                success_rate: window.success_rate,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                insights: report.insights,
-            }),
-        }))
-    }
-
-    async fn evolve_ab_results(
-        &self,
-        req: Request<EvolveAbResultsRequest>,
-    ) -> Result<Response<EvolveAbResultsResponse>, Status> {
-        require_control_plane_admin(&req, "global evolution A/B reporting")?;
-        let report = crate::chisei::evolve::compute_ab_results(&self.evolve_tasks());
-        Ok(Response::new(EvolveAbResultsResponse {
-            report: Some(EvolveAbReport {
-                enhanced: Some(EvolveAbGroup {
-                    total: report.enhanced.total,
-                    succeeded: report.enhanced.succeeded,
-                    success_rate: report.enhanced.success_rate,
-                }),
-                non_enhanced: Some(EvolveAbGroup {
-                    total: report.non_enhanced.total,
-                    succeeded: report.non_enhanced.succeeded,
-                    success_rate: report.non_enhanced.success_rate,
-                }),
-            }),
-        }))
-    }
-
-    async fn evolve_templates(
-        &self,
-        req: Request<EvolveTemplatesRequest>,
-    ) -> Result<Response<EvolveTemplatesResponse>, Status> {
-        require_control_plane_admin(&req, "global evolution template generation")?;
-        let templates = crate::chisei::evolve::generate_templates(&self.evolve_tasks());
-        Ok(Response::new(EvolveTemplatesResponse {
-            templates: templates
-                .into_iter()
-                .map(|template| EvolveTemplate {
-                    id: template.name.clone(),
-                    name: template.name,
-                    content: template.content,
-                    created: chrono::Utc::now().timestamp(),
-                })
-                .collect(),
         }))
     }
 }
@@ -14797,6 +12278,84 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn gunshi_issuance_returns_aligned_dispatch_decisions() {
+        let svc = memory_service();
+        let input = serde_json::json!({
+            "contract_version": crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION,
+            "request": {
+                "capacity": {
+                    "captured_at_ms": 2_000,
+                    "policy_version": "policy-v1",
+                    "agents": [{
+                        "agent_id": "agent-a",
+                        "runtime": "native",
+                        "models": ["native-default"],
+                        "tools": ["search"],
+                        "operation_classes": ["triage"],
+                        "available_slots": 1,
+                        "healthy": true
+                    }],
+                    "model_profiles": [{
+                        "model": "native-default",
+                        "quality": 0.9,
+                        "cost_per_attempt_usd_micros": 20,
+                        "latency_ms": 30,
+                        "uncertainty": 0.1
+                    }],
+                    "budget_remaining_usd_micros": 40,
+                    "max_parallel_attempts": 1,
+                    "human_attention_minutes": 5
+                },
+                "operations": [{
+                    "operation_id": "op-1",
+                    "namespace": "support",
+                    "operation_class": "triage",
+                    "priority": 10,
+                    "risk": "low",
+                    "submitted_at_ms": 1_000,
+                    "required_tools": ["search"],
+                    "allowed_models": ["native-default"],
+                    "max_attempts": 1,
+                    "budget_ceiling_usd_micros": 40,
+                    "acceptance_criteria": ["classified"],
+                    "approval_required": false,
+                    "human_attention_minutes_required": 0
+                }],
+                "strategy": {
+                    "strategy_id": "priority",
+                    "version": "1",
+                    "baseline": "priority_first"
+                }
+            },
+            "advisory_policy": {
+                "max_memory_age_ms": 2_000,
+                "min_score": 0.5,
+                "max_evidence_references": 4
+            },
+            "kioku_evidence": []
+        });
+
+        let response = svc
+            .issue_gunshi_recommendations(Request::new(IssueGunshiRecommendationsRequest {
+                input_json: input.to_string(),
+                issuance_id: "aligned-dispatch".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let allocation: crate::chisei::gunshi::BaselineAllocation =
+            serde_json::from_str(&response.allocation_json).unwrap();
+
+        assert_eq!(allocation.plans.len(), 1);
+        assert_eq!(response.auto_dispatch_authorization_json.len(), 1);
+        assert_eq!(response.receipt_attributes_json.len(), 1);
+        let authorization: crate::chisei::gunshi_dispatch::DispatchAuthorization =
+            serde_json::from_str(&response.auto_dispatch_authorization_json[0]).unwrap();
+        assert!(!authorization.authorized);
+        assert_eq!(authorization.operation_id, "op-1");
     }
 
     #[test]
@@ -15358,15 +12917,9 @@ mod tests {
                 data_class: String::new(),
             },
         );
-        create_suite(&svc, "proj").await;
+        create_suite(&svc, "proj");
         for (id, score, timestamp) in [("class-run-1", 95, 100), ("class-run-2", 50, 200)] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(eval_run(id, "suite-1", score, timestamp)),
-                changed_file: "proj".into(),
-                diff_hash: id.into(),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(&svc, eval_run(id, "suite-1", score, timestamp), "proj", id);
         }
         assert!(
             svc.eval
@@ -15668,7 +13221,6 @@ mod tests {
             openai_api_key: None,
             ollama_url: "http://127.0.0.1:11434".into(),
             native_llm_url: Some("http://127.0.0.1:9999".into()),
-            auth_token: None,
             sample_rate: 0.0,
             sample_risk_threshold: 0.7,
             scoring_enabled: false,
@@ -15802,6 +13354,241 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
         ChiseiServiceImpl::new(db, config(":memory:"))
+    }
+
+    fn gunshi_planning_service() -> ChiseiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut config = config(":memory:");
+        config.gateway_provided_providers = vec!["openai".into()];
+        ChiseiServiceImpl::new(db, config)
+    }
+
+    fn issue_native_gunshi_plan(
+        service: &ChiseiServiceImpl,
+        issuance_id: &str,
+        policy_version: &str,
+    ) -> crate::chisei::gunshi::AllocationPlan {
+        use crate::chisei::gunshi::{
+            AgentCapacity, AllocationRequest, BaselineStrategy, CapacityEnvelope, ModelProfile,
+            OperationRisk, PendingOperation, Strategy,
+        };
+
+        let plan = crate::chisei::gunshi::recommend_baseline(&AllocationRequest {
+            capacity: CapacityEnvelope {
+                captured_at_ms: 1,
+                policy_version: policy_version.into(),
+                agents: vec![AgentCapacity {
+                    agent_id: "agent:local".into(),
+                    runtime: "openai".into(),
+                    models: BTreeSet::from(["openai/gpt-5.5".into()]),
+                    tools: BTreeSet::new(),
+                    operation_classes: BTreeSet::from(["triage".into()]),
+                    available_slots: 1,
+                    healthy: true,
+                }],
+                model_profiles: vec![ModelProfile {
+                    model: "openai/gpt-5.5".into(),
+                    quality: 0.8,
+                    cost_per_attempt_usd_micros: 10,
+                    latency_ms: 20,
+                    uncertainty: 0.1,
+                }],
+                budget_remaining_usd_micros: 10,
+                max_parallel_attempts: 1,
+                human_attention_minutes: 1,
+            },
+            operations: vec![PendingOperation {
+                operation_id: "operation:triage-1".into(),
+                namespace: "support".into(),
+                operation_class: "triage".into(),
+                priority: 7,
+                risk: OperationRisk::Low,
+                submitted_at_ms: 1,
+                required_tools: BTreeSet::new(),
+                allowed_models: BTreeSet::new(),
+                max_attempts: 1,
+                budget_ceiling_usd_micros: 10,
+                acceptance_criteria: vec!["receipt is complete".into()],
+                approval_required: false,
+                human_attention_minutes_required: 0,
+            }],
+            strategy: Strategy {
+                strategy_id: "baseline".into(),
+                version: "1".into(),
+                baseline: BaselineStrategy::Conservative,
+            },
+        })
+        .unwrap()
+        .plans
+        .remove(0);
+        crate::chisei::gunshi_feedback::record_issued_recommendations(
+            &service.db,
+            "local",
+            issuance_id,
+            "request-digest",
+            std::slice::from_ref(&plan),
+            1,
+            1,
+        )
+        .unwrap();
+        plan
+    }
+
+    fn gunshi_plan_request(
+        issuance_id: &str,
+        plan: &crate::chisei::gunshi::AllocationPlan,
+    ) -> PlanExecutionRequest {
+        PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: "request:triage-1".into(),
+                namespace: plan.namespace.clone(),
+                spec: "Triage the governed operation.".into(),
+                max_tokens: 64,
+                ..Default::default()
+            }),
+            gunshi_allocation: Some(GunshiAllocationBinding {
+                issuance_id: issuance_id.into(),
+                allocation_json: serde_json::to_string(plan).unwrap(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn issued_gunshi_allocation_feeds_native_planning_before_kioku_enrichment() {
+        let service = gunshi_planning_service();
+        let policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        let policy_version = policy.version();
+        service.policy.set_namespace_policy("support", policy);
+        let allocation = issue_native_gunshi_plan(&service, "issuance:triage-1", &policy_version);
+
+        let plan = service
+            .plan_execution(Request::new(gunshi_plan_request(
+                "issuance:triage-1",
+                &allocation,
+            )))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+
+        assert_eq!(plan.resolved_runtime, allocation.selection.runtime);
+        assert_eq!(plan.resolved_model, allocation.selection.model);
+        assert_eq!(plan.gunshi_issuance_id, "issuance:triage-1");
+        assert_eq!(plan.gunshi_allocation_id, allocation.allocation_id);
+        assert_eq!(plan.gunshi_agent_id, allocation.selection.agent_id);
+        assert_eq!(plan.gunshi_policy_version, policy_version);
+        assert_eq!(plan.gunshi_input_fingerprint, allocation.input_fingerprint);
+        assert_eq!(plan.gunshi_budget_ceiling_usd_micros, 10);
+        assert_eq!(plan.gunshi_max_attempts, 1);
+        assert!(plan.steps.iter().any(|step| step.step == "kioku_enrich"));
+        let input = plan.input.as_ref().unwrap();
+        assert_eq!(input.logical_operation_id, allocation.operation_id);
+        assert_eq!(input.task_class, allocation.operation_class);
+        assert_eq!(input.priority, i32::from(allocation.priority));
+
+        let receipt = service
+            .db
+            .get_operation_receipt(&plan.plan_id)
+            .unwrap()
+            .unwrap();
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .unwrap();
+        assert_eq!(
+            intent.attributes.get("logical_operation_id"),
+            Some(&allocation.operation_id)
+        );
+        assert_eq!(
+            intent.attributes.get("gunshi_allocation_id"),
+            Some(&allocation.allocation_id)
+        );
+        let budget = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::BudgetDecided)
+            .unwrap();
+        assert_eq!(
+            budget
+                .attributes
+                .get("gunshi_budget_ceiling_usd_micros")
+                .map(String::as_str),
+            Some("10")
+        );
+    }
+
+    #[tokio::test]
+    async fn gunshi_binding_rejects_a_modified_issued_allocation() {
+        let service = gunshi_planning_service();
+        let policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        let policy_version = policy.version();
+        service.policy.set_namespace_policy("support", policy);
+        let issued = issue_native_gunshi_plan(&service, "issuance:tamper", &policy_version);
+        let mut modified = issued.clone();
+        modified.selection.agent_id = "agent:forged".into();
+
+        let error = service
+            .plan_execution(Request::new(gunshi_plan_request(
+                "issuance:tamper",
+                &modified,
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn gunshi_binding_rejects_an_allocation_after_policy_changes() {
+        let service = gunshi_planning_service();
+        let policy = crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        };
+        let policy_version = policy.version();
+        service.policy.set_namespace_policy("support", policy);
+        let allocation = issue_native_gunshi_plan(&service, "issuance:stale", &policy_version);
+        service.policy.set_namespace_policy(
+            "support",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["openai/gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "openai/gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+
+        let error = service
+            .plan_execution(Request::new(gunshi_plan_request(
+                "issuance:stale",
+                &allocation,
+            )))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("policy version"));
     }
 
     struct ManagedExecutionExtension;
@@ -15953,6 +13740,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
+            gunshi_allocation: None,
         }
     }
 
@@ -16631,6 +14419,7 @@ mod tests {
                 source_ref: "repo://evaluators/schema-check@1".into(),
                 ..Default::default()
             }),
+            ..Default::default()
         }
     }
 
@@ -17009,9 +14798,9 @@ mod tests {
         assert_eq!(stored.content_digest, replay.content_digest);
 
         let disabled = svc
-            .set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+            .put_evaluator_definition(Request::new(PutEvaluatorDefinitionRequest {
                 definition_id: definition.definition_id.clone(),
-                state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+                availability_state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
                 reason: "maintenance".into(),
                 request_id: "disable-1".into(),
                 ..Default::default()
@@ -17029,16 +14818,6 @@ mod tests {
         );
         assert_eq!(disabled.request_id, "disable-1");
         assert_eq!(disabled.reason, "maintenance");
-        let historical = svc
-            .get_evaluation_plan(Request::new(GetEvaluationPlanRequest {
-                plan_version_id: stored.plan_version_id.clone(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .plan
-            .unwrap();
-        assert_eq!(historical.plan_version_id, stored.plan_version_id);
         let historical_replay = svc
             .put_evaluation_plan(Request::new(evaluation_plan_request(
                 "acme",
@@ -17197,7 +14976,7 @@ mod tests {
             .unwrap()
             .definition
             .unwrap();
-        let plan = svc
+        let _plan = svc
             .put_evaluation_plan(Request::new(evaluation_plan_request(
                 "acme",
                 &definition.definition_id,
@@ -17231,29 +15010,6 @@ mod tests {
             })
             .unwrap();
 
-        let mut alice_definition = Request::new(GetEvaluatorDefinitionRequest {
-            definition_id: definition.definition_id.clone(),
-        });
-        alice_definition
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        svc.get_evaluator_definition(alice_definition)
-            .await
-            .unwrap();
-        let mut mallory_plan = Request::new(GetEvaluationPlanRequest {
-            plan_version_id: plan.plan_version_id.clone(),
-        });
-        mallory_plan
-            .metadata_mut()
-            .insert("x-principal", "mallory".parse().unwrap());
-        assert_eq!(
-            svc.get_evaluation_plan(mallory_plan)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::NotFound
-        );
-
         svc.db
             .create_grant(&Grant {
                 id: "root-only-invariant".into(),
@@ -17263,20 +15019,6 @@ mod tests {
                 created: 2,
             })
             .unwrap();
-        let mut alice_plan = Request::new(GetEvaluationPlanRequest {
-            plan_version_id: plan.plan_version_id,
-        });
-        alice_plan
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.get_evaluation_plan(alice_plan)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::NotFound
-        );
-
         let mut alice_put = Request::new(evaluator_definition_request("acme"));
         alice_put
             .metadata_mut()
@@ -17355,9 +15097,9 @@ mod tests {
         assert_eq!(replay.manifest_digest, manifest.manifest_digest);
         assert_eq!(replay.created_at_ms, manifest.created_at_ms);
 
-        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+        svc.put_evaluator_definition(Request::new(PutEvaluatorDefinitionRequest {
             definition_id: definition.definition_id,
-            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+            availability_state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
             reason: "maintenance".into(),
             request_id: "disable-after-resolution".into(),
             ..Default::default()
@@ -17407,9 +15149,9 @@ mod tests {
             .unwrap()
             .definition_id
             .clone();
-        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
+        svc.put_evaluator_definition(Request::new(PutEvaluatorDefinitionRequest {
             definition_id,
-            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
+            availability_state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
             reason: "disabled after manifest resolution".into(),
             request_id: "disable-before-historical-execution".into(),
             ..Default::default()
@@ -17497,17 +15239,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(tighter.code(), tonic::Code::FailedPrecondition);
-        let queried = svc
-            .get_evaluation_execution(Request::new(GetEvaluationExecutionRequest {
-                namespace: "acme".into(),
-                manifest_digest: manifest.manifest_digest,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .execution
-            .unwrap();
-        assert_eq!(queried, first);
         let receipt = svc
             .db
             .get_operation_receipt(&first.operation_id)
@@ -18104,464 +15835,6 @@ mod tests {
         assert_eq!(outcome.findings[0].code, "invariant_resolution_incomplete");
     }
 
-    async fn install_plan_backed_release_fixture(
-        svc: &ChiseiServiceImpl,
-        expected_content_digest: &str,
-    ) -> (String, String, String) {
-        let namespace = "release";
-        governed_fact_domain::apply_profile(
-            &svc.db,
-            namespace,
-            governed_fact_domain::PROFILE_CONTRACT_VERSION,
-            "root",
-            1,
-        )
-        .unwrap();
-        let invariant_id = governed_fact_domain::put_fact(
-            &svc.db,
-            governed_fact_domain::GovernedFactInput {
-                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
-                namespace: namespace.into(),
-                fact_id: "release-content-approved".into(),
-                version: "1.0.0".into(),
-                fact_type: GovernedFactType::Invariant,
-                status: "active".into(),
-                statement: "The release candidate binds the approved immutable content.".into(),
-                applicability: governed_fact_domain::FactApplicability {
-                    subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
-                    subject_refs: vec![],
-                },
-                verification: governed_fact_domain::VerificationContract {
-                    predicate_kind:
-                        evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE
-                            .into(),
-                    input_schema: "schema://software-release-candidate/v2".into(),
-                    result_schema: "schema://digest-equality-result/v1".into(),
-                    evidence_types: vec![],
-                },
-                requirement_version_ids: vec![],
-                evidence_refs: vec![],
-                source_ref: "repo://release-policy/content@1".into(),
-                effective_from_ms: 1,
-                supersedes_object_id: String::new(),
-                access_marking: String::new(),
-            },
-            "root",
-            2,
-        )
-        .unwrap()
-        .object_id;
-        let definition = svc
-            .put_evaluator_definition(Request::new(PutEvaluatorDefinitionRequest {
-                definition: Some(EvaluatorDefinition {
-                    contract_version: evaluation_plan_domain::EVALUATOR_DEFINITION_CONTRACT.into(),
-                    namespace: namespace.into(),
-                    evaluator_id: "software-release-content-digest".into(),
-                    version: "1.0.0".into(),
-                    implementation_digest: evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_IMPLEMENTATION_DIGEST.into(),
-                    execution_class: evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS.into(),
-                    supported_predicate_kinds: vec![evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE.into()],
-                    supported_input_schemas: vec!["schema://software-release-candidate/v2".into()],
-                    supported_result_schemas: vec!["schema://digest-equality-result/v1".into()],
-                    parameter_schema_json: r#"{"type":"object","properties":{"expected_content_digest":{"type":"string"}},"required":["expected_content_digest"],"additionalProperties":false}"#.into(),
-                    evidence_classifications: vec!["internal".into()],
-                    resource_limits: Some(EvaluatorResourceLimits {
-                        timeout_ms: 1_000,
-                        max_input_bytes: 8_192,
-                        max_output_bytes: 1_024,
-                        max_evidence_items: 1,
-                    }),
-                    source_ref: "builtin://software-release-content-digest/v1".into(),
-                    ..Default::default()
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .record
-            .unwrap()
-            .definition
-            .unwrap();
-        let plan = svc
-            .put_evaluation_plan(Request::new(PutEvaluationPlanRequest {
-                plan: Some(EvaluationPlan {
-                    contract_version: evaluation_plan_domain::EVALUATION_PLAN_CONTRACT.into(),
-                    namespace: namespace.into(),
-                    plan_id: "software-release/default".into(),
-                    version: "1.0.0".into(),
-                    accepted_subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
-                    nodes: vec![EvaluationPlanNode {
-                        node_id: "release-content".into(),
-                        evaluator_definition_id: definition.definition_id.clone(),
-                        input_bindings: vec![EvaluationInputBinding {
-                            name: "release".into(),
-                            source_kind: evaluation_plan_domain::INPUT_INVARIANT.into(),
-                            schema_id: "schema://software-release-candidate/v2".into(),
-                        }],
-                        parameters_json: serde_json::json!({
-                            "expected_content_digest": expected_content_digest,
-                        })
-                        .to_string(),
-                        invariant_version_ids: vec![invariant_id.clone()],
-                        classification: evaluation_plan_domain::NODE_REQUIRED.into(),
-                        ..Default::default()
-                    }],
-                    reducer: evaluation_plan_domain::FIXED_REDUCER.into(),
-                    source_ref: "repo://release-policy/default@1".into(),
-                    ..Default::default()
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .plan
-            .unwrap();
-        (plan.plan_version_id, definition.definition_id, invariant_id)
-    }
-
-    fn plan_backed_release_request(
-        request_id: &str,
-        plan_version_id: &str,
-        subject_content_digest: &str,
-        evaluation_time_ms: i64,
-    ) -> Request<EvaluateGovernedSubjectWithPlanRequest> {
-        let mut request = Request::new(EvaluateGovernedSubjectWithPlanRequest {
-            evaluation: Some(PlanBackedGovernedSubjectEvaluation {
-                contract_version: subject::PLAN_BACKED_REQUEST_VERSION.into(),
-                namespace: "release".into(),
-                request_id: request_id.into(),
-                subject_profile: subject::SOFTWARE_RELEASE_PLAN_PROFILE.into(),
-                subject_identity: "release-candidate:42".into(),
-                subject_content_digest: subject_content_digest.into(),
-                plan_version_id: plan_version_id.into(),
-                evidence_object_ids: vec![],
-                evaluation_time_ms,
-                max_total_duration_ms: 1_000,
-            }),
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        request
-    }
-
-    #[tokio::test]
-    async fn plan_backed_release_evaluation_composes_exact_resources_and_replays() {
-        let svc = memory_service();
-        let expected_digest = format!("sha256:{}", "b".repeat(64));
-        let (plan_version_id, _, invariant_id) =
-            install_plan_backed_release_fixture(&svc, &expected_digest).await;
-        let mut first_request =
-            plan_backed_release_request("release-42", &plan_version_id, &expected_digest, 10);
-        first_request
-            .get_mut()
-            .evaluation
-            .as_mut()
-            .unwrap()
-            .max_total_duration_ms = 0;
-        let first = svc
-            .evaluate_governed_subject_with_plan(first_request)
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(first.decision, evaluation_execution_domain::VERDICT_ALLOW);
-        assert_eq!(first.plan_version_id, plan_version_id);
-        assert!(first.plan_digest.starts_with("sha256:"));
-        assert!(first.manifest_id.starts_with("evaluation-manifest:"));
-        assert!(first.manifest_digest.starts_with("sha256:"));
-        assert!(!first.invariant_set_id.is_empty());
-        assert!(first.invariant_set_digest.starts_with("sha256:"));
-        assert!(first.execution_operation_id.starts_with("evaluation-"));
-        assert!(first.gate_decision_digest.starts_with("sha256:"));
-        assert_eq!(first.covered_invariant_version_ids, vec![invariant_id]);
-        assert!(first.waived_invariant_version_ids.is_empty());
-        assert!(first.uncovered_invariant_version_ids.is_empty());
-        assert_eq!(first.step_receipt_digests.len(), 1);
-
-        let mut replay_request =
-            plan_backed_release_request("release-42", &plan_version_id, &expected_digest, 10);
-        replay_request
-            .get_mut()
-            .evaluation
-            .as_mut()
-            .unwrap()
-            .max_total_duration_ms = 0;
-        let replay = svc
-            .evaluate_governed_subject_with_plan(replay_request)
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(replay, first);
-
-        let receipt = svc
-            .db
-            .get_operation_receipt(&first.operation_id)
-            .unwrap()
-            .unwrap();
-        assert!(receipt.completeness().complete);
-        assert_eq!(
-            receipt.parent_operation_id.as_deref(),
-            Some(first.execution_operation_id.as_str())
-        );
-        let execution_receipt = svc
-            .db
-            .get_operation_receipt(&first.execution_operation_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            evaluation_total_budget_ms(&execution_receipt).unwrap(),
-            evaluation_execution_domain::DEFAULT_TOTAL_DURATION_MS
-        );
-        assert!(receipt.events.iter().any(|event| {
-            event.references.iter().any(|reference| {
-                reference.kind == "resolved_evaluation_manifest"
-                    && reference.content_hash.as_deref() == Some(first.manifest_digest.as_str())
-            })
-        }));
-        let mut reporter = Request::new(AuthorizeOperationReporterRequest {
-            operation_id: first.operation_id.clone(),
-            principal: "reporter".into(),
-            event_kinds: vec!["outcome_recorded".into()],
-        });
-        reporter
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        reporter
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-        assert_eq!(
-            svc.authorize_operation_reporter(reporter)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut same_manifest_request = plan_backed_release_request(
-            "release-42-retry-id",
-            &plan_version_id,
-            &expected_digest,
-            10,
-        );
-        same_manifest_request
-            .get_mut()
-            .evaluation
-            .as_mut()
-            .unwrap()
-            .max_total_duration_ms = 0;
-        let same_manifest = svc
-            .evaluate_governed_subject_with_plan(same_manifest_request)
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(same_manifest.manifest_digest, first.manifest_digest);
-        assert_eq!(
-            same_manifest.execution_operation_id,
-            first.execution_operation_id
-        );
-        assert_eq!(
-            same_manifest.gate_decision_digest,
-            first.gate_decision_digest
-        );
-        assert_eq!(same_manifest.decision, first.decision);
-
-        assert_eq!(
-            svc.evaluate_governed_subject_with_plan(plan_backed_release_request(
-                "release-42-tighter-budget",
-                &plan_version_id,
-                &expected_digest,
-                10,
-            ))
-            .await
-            .unwrap_err()
-            .code(),
-            tonic::Code::FailedPrecondition
-        );
-    }
-
-    #[tokio::test]
-    async fn plan_backed_release_evaluation_fails_closed_and_preserves_v1() {
-        let svc = memory_service();
-        let expected_digest = format!("sha256:{}", "b".repeat(64));
-        let other_digest = format!("sha256:{}", "c".repeat(64));
-        let (plan_version_id, definition_id, _) =
-            install_plan_backed_release_fixture(&svc, &expected_digest).await;
-        let denied = svc
-            .evaluate_governed_subject_with_plan(plan_backed_release_request(
-                "release-mismatch",
-                &plan_version_id,
-                &other_digest,
-                10,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(denied.decision, evaluation_execution_domain::VERDICT_DENY);
-        assert_eq!(denied.failure_code, "required_node_failed");
-        assert_eq!(denied.covered_invariant_version_ids.len(), 1);
-        assert!(denied.uncovered_invariant_version_ids.is_empty());
-        assert_eq!(
-            svc.evaluate_governed_subject_with_plan(plan_backed_release_request(
-                "release-mismatch",
-                &plan_version_id,
-                &expected_digest,
-                10,
-            ))
-            .await
-            .unwrap_err()
-            .code(),
-            tonic::Code::AlreadyExists
-        );
-
-        svc.set_evaluator_availability(Request::new(SetEvaluatorAvailabilityRequest {
-            definition_id,
-            state: evaluation_plan_domain::AVAILABILITY_DISABLED.into(),
-            reason: "maintenance".into(),
-            request_id: "disable-release-evaluator".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        let unavailable = svc
-            .evaluate_governed_subject_with_plan(plan_backed_release_request(
-                "release-unavailable",
-                &plan_version_id,
-                &expected_digest,
-                10,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(
-            unavailable.decision,
-            evaluation_execution_domain::VERDICT_UNAVAILABLE
-        );
-        assert_eq!(unavailable.failure_code, "evaluator_unavailable");
-        assert!(unavailable.manifest_digest.is_empty());
-
-        let uncovered_id = governed_fact_domain::put_fact(
-            &svc.db,
-            governed_fact_domain::GovernedFactInput {
-                contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
-                namespace: "release".into(),
-                fact_id: "release-additional-review".into(),
-                version: "1.0.0".into(),
-                fact_type: GovernedFactType::Invariant,
-                status: "active".into(),
-                statement: "The release candidate has additional governed review.".into(),
-                applicability: governed_fact_domain::FactApplicability {
-                    subject_profiles: vec![subject::SOFTWARE_RELEASE_PLAN_PROFILE.into()],
-                    subject_refs: vec![],
-                },
-                verification: governed_fact_domain::VerificationContract {
-                    predicate_kind:
-                        evaluation_execution_domain::SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE
-                            .into(),
-                    input_schema: "schema://software-release-candidate/v2".into(),
-                    result_schema: "schema://digest-equality-result/v1".into(),
-                    evidence_types: vec![],
-                },
-                requirement_version_ids: vec![],
-                evidence_refs: vec![],
-                source_ref: "repo://release-policy/additional-review@1".into(),
-                effective_from_ms: 1,
-                supersedes_object_id: String::new(),
-                access_marking: String::new(),
-            },
-            "root",
-            3,
-        )
-        .unwrap()
-        .object_id;
-        let uncovered = svc
-            .evaluate_governed_subject_with_plan(plan_backed_release_request(
-                "release-uncovered",
-                &plan_version_id,
-                &expected_digest,
-                10,
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(
-            uncovered.decision,
-            evaluation_execution_domain::VERDICT_UNKNOWN
-        );
-        assert_eq!(uncovered.failure_code, "invariant_uncovered");
-        assert_eq!(
-            uncovered.uncovered_invariant_version_ids,
-            vec![uncovered_id]
-        );
-
-        let mut old_profile = plan_backed_release_request(
-            "release-old-profile",
-            &plan_version_id,
-            &expected_digest,
-            10,
-        );
-        old_profile
-            .get_mut()
-            .evaluation
-            .as_mut()
-            .unwrap()
-            .subject_profile = subject::SOFTWARE_RELEASE_PROFILE.into();
-        assert_eq!(
-            svc.evaluate_governed_subject_with_plan(old_profile)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::InvalidArgument
-        );
-
-        let old_v1 = svc
-            .evaluate_governed_subject(governed_subject_request(
-                "release-v1-still-fixed",
-                subject::SOFTWARE_RELEASE_PROFILE,
-                subject::ALLOW_PROFILE,
-                chrono::Utc::now().timestamp_millis(),
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert_eq!(old_v1.decision, "allow");
-
-        let unauthenticated = Request::new(EvaluateGovernedSubjectWithPlanRequest {
-            evaluation: Some(PlanBackedGovernedSubjectEvaluation {
-                contract_version: subject::PLAN_BACKED_REQUEST_VERSION.into(),
-                namespace: "release".into(),
-                request_id: "release-unauthenticated".into(),
-                subject_profile: subject::SOFTWARE_RELEASE_PLAN_PROFILE.into(),
-                subject_identity: "release-candidate:42".into(),
-                subject_content_digest: expected_digest,
-                plan_version_id,
-                evidence_object_ids: vec![],
-                evaluation_time_ms: 10,
-                max_total_duration_ms: 1_000,
-            }),
-        });
-        assert_eq!(
-            svc.evaluate_governed_subject_with_plan(unauthenticated)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unauthenticated
-        );
-    }
-
     fn governed_subject_request(
         request_id: &str,
         subject_profile: &str,
@@ -18850,19 +16123,7 @@ mod tests {
         assert_eq!(replay.envelope, first.envelope);
         assert_eq!(replay.envelope_digest, first.envelope_digest);
 
-        let mut trust_request = Request::new(GetGovernedSubjectProvenanceTrustRootRequest {
-            export_id: "publish-1".into(),
-        });
-        trust_request
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        let root = svc
-            .get_governed_subject_provenance_trust_root(trust_request)
-            .await
-            .unwrap()
-            .into_inner()
-            .trust_root
-            .unwrap();
+        let root = first.trust_root.unwrap();
         assert_eq!(root.version, subject_provenance::TRUST_ROOT_VERSION);
         assert_eq!(root.identity, subject_provenance::ISSUER);
         assert_eq!(root.key_id, envelope.issuer_key_id);
@@ -19013,19 +16274,7 @@ mod tests {
             first.issuer_key_id
         );
 
-        let mut old_root_request = Request::new(GetGovernedSubjectProvenanceTrustRootRequest {
-            export_id: "rotation-old".into(),
-        });
-        old_root_request
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        let old_root = rotated
-            .get_governed_subject_provenance_trust_root(old_root_request)
-            .await
-            .unwrap()
-            .into_inner()
-            .trust_root
-            .unwrap();
+        let old_root = interrupted_replay.trust_root.unwrap();
         assert_eq!(old_root.key_id, first.issuer_key_id);
 
         let mut short_lived_config = config(":memory:");
@@ -19112,18 +16361,11 @@ mod tests {
                 idempotency_key: idempotency_key.into(),
                 policy_project: "team-a".into(),
             }),
+            offline: false,
         });
         request
             .metadata_mut()
             .insert("x-principal", actor.parse().unwrap());
-        request
-    }
-
-    fn external_principal_request<T>(value: T) -> Request<T> {
-        let mut request = Request::new(value);
-        request
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
         request
     }
 
@@ -19134,122 +16376,24 @@ mod tests {
             .authorize_external_action(external_action_request("local", "idem-allow"))
             .await
             .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
+            .into_inner();
         let replay = svc
             .authorize_external_action(external_action_request("local", "idem-allow"))
             .await
             .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(first.decision, "permit");
-        assert_eq!(replay.authorization_id, first.authorization_id);
-        assert!(first.permit.is_none());
-        assert!(first.assurance.unwrap().authorization_only);
-    }
-
-    #[tokio::test]
-    async fn external_action_permit_rpc_issues_verifies_and_redeems_before_execution() {
-        let svc = memory_service();
-        let decision = svc
-            .authorize_external_action(external_action_request("local", "idem-permit"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        let authorization_id = decision.authorization_id.clone();
-        let permit = svc
-            .issue_external_action_permit(external_principal_request(
-                IssueExternalActionPermitRequest {
-                    authorization_id: authorization_id.clone(),
-                    idempotency_key: "issue-permit-1".into(),
-                    offline: false,
-                },
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .permit
-            .unwrap();
-        let verify = VerifyExternalActionPermitRequest {
-            executor: permit.executor.clone(),
-            requesting_harness: permit.requesting_harness.clone(),
-            canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
-            target_selectors: permit.target_selectors.clone(),
-            observed_preconditions: permit.immutable_preconditions.clone(),
-            host_capabilities: permit.required_host_capabilities.clone(),
-            permit: Some(permit.clone()),
-        };
-        assert!(
-            svc.verify_external_action_permit(external_principal_request(verify))
-                .await
-                .unwrap()
-                .into_inner()
-                .valid
-        );
-        let redemption = svc
-            .redeem_external_action_permit(external_principal_request(
-                RedeemExternalActionPermitRequest {
-                    permit: Some(permit.clone()),
-                    executor: permit.executor.clone(),
-                    requesting_harness: permit.requesting_harness.clone(),
-                    canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
-                    target_selectors: permit.target_selectors.clone(),
-                    observed_preconditions: permit.immutable_preconditions.clone(),
-                    host_capabilities: permit.required_host_capabilities.clone(),
-                    idempotency_key: "redeem-permit-1".into(),
-                    execution_id: "execution-1".into(),
-                    invoked_at_ms: 0,
-                },
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .redemption
-            .unwrap();
-        assert_eq!(redemption.invocation_ordinal, 1);
-        assert_eq!(redemption.executor, permit.executor);
-        svc.revoke_external_action_permit(external_principal_request(
-            RevokeExternalActionPermitRequest {
-                revocation_handle: permit.revocation_handle.clone(),
-                reason: "test revocation".into(),
-            },
-        ))
-        .await
-        .unwrap();
-        let verify_revoked = VerifyExternalActionPermitRequest {
-            executor: permit.executor.clone(),
-            requesting_harness: permit.requesting_harness.clone(),
-            canonical_arguments_digest: permit.canonical_arguments_digest.clone(),
-            target_selectors: permit.target_selectors.clone(),
-            observed_preconditions: permit.immutable_preconditions.clone(),
-            host_capabilities: permit.required_host_capabilities.clone(),
-            permit: Some(permit.clone()),
-        };
-        let result = svc
-            .verify_external_action_permit(external_principal_request(verify_revoked))
-            .await
-            .unwrap()
             .into_inner();
-        assert!(!result.valid);
-        assert!(result.reason.contains("revoked"));
-        let replayed = svc
-            .issue_external_action_permit(external_principal_request(
-                IssueExternalActionPermitRequest {
-                    authorization_id,
-                    idempotency_key: "issue-permit-1".into(),
-                    offline: false,
-                },
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .permit
-            .unwrap();
-        assert_eq!(replayed.permit_id, permit.permit_id);
+        let first_decision = first.decision.unwrap();
+        let replay_decision = replay.decision.unwrap();
+        assert_eq!(first_decision.decision, "permit");
+        assert_eq!(
+            replay_decision.authorization_id,
+            first_decision.authorization_id
+        );
+        assert_eq!(
+            replay.permit.unwrap().permit_id,
+            first.permit.unwrap().permit_id
+        );
+        assert!(first_decision.assurance.unwrap().authorization_only);
     }
 
     #[tokio::test]
@@ -19289,65 +16433,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_action_approval_rejects_stale_policy_and_supports_cancellation() {
-        let svc = memory_service();
-        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("agent:local");
-        policy.action_overrides.insert(
-            "external_action/repository.write/v1".into(),
-            ActionDecision::RequireApproval,
-        );
-        svc.db.upsert_action_policy(&policy).unwrap();
-        let pending = svc
-            .authorize_external_action(external_action_request("local", "idem-approval"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(pending.decision, "require_approval");
-
-        policy.default_decision = ActionDecision::Deny;
-        svc.db.upsert_action_policy(&policy).unwrap();
-        let stale = svc
-            .resolve_external_action_approval(external_principal_request(
-                ResolveExternalActionApprovalRequest {
-                    authorization_id: pending.authorization_id.clone(),
-                    approve: true,
-                    reason: String::new(),
-                },
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(stale.decision, "deny");
-        assert!(stale.reason.contains("stale"));
-
-        let permitted = svc
-            .authorize_external_action(external_action_request("local", "idem-cancel"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        let cancelled = svc
-            .cancel_external_action_authorization(external_principal_request(
-                CancelExternalActionAuthorizationRequest {
-                    authorization_id: permitted.authorization_id,
-                    reason: "operator cancelled".into(),
-                },
-            ))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(cancelled.decision, "deny");
-        assert!(cancelled.cancelled_at_ms > 0);
-    }
-
-    #[tokio::test]
     async fn external_action_authorization_rejects_namespace_and_idempotency_abuse() {
         let svc = memory_service();
         let unauthorized = svc
@@ -19370,59 +16455,13 @@ mod tests {
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
     }
 
-    #[tokio::test]
-    async fn external_action_authority_reserves_and_releases_cumulative_limits() {
-        let svc = memory_service();
-        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("agent:local");
-        policy.max_mutations_per_work_unit = Some(1);
-        svc.db.upsert_action_policy(&policy).unwrap();
-        let budget_scope = "project:team-a/agent:local/external-action:write";
-        svc.budget
-            .set_limit(budget_scope, 1, crate::chisei::budget::PeriodType::Daily)
-            .unwrap();
-
-        let first = svc
-            .authorize_external_action(external_action_request("local", "idem-reserve-1"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(first.decision, "permit");
-
-        let blocked = svc
-            .authorize_external_action(external_action_request("local", "idem-reserve-2"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(blocked.decision, "deny");
-
-        svc.cancel_external_action_authorization(external_principal_request(
-            CancelExternalActionAuthorizationRequest {
-                authorization_id: first.authorization_id,
-                reason: "not executed".into(),
-            },
-        ))
-        .await
-        .unwrap();
-        let after_release = svc
-            .authorize_external_action(external_action_request("local", "idem-reserve-3"))
-            .await
-            .unwrap()
-            .into_inner()
-            .decision
-            .unwrap();
-        assert_eq!(after_release.decision, "permit");
-    }
-
     fn effective_summary_request(
         namespace: &str,
         principal: &str,
     ) -> Request<GetEffectivePolicySummaryRequest> {
         let mut request = Request::new(GetEffectivePolicySummaryRequest {
             namespace: namespace.into(),
+            provider: String::new(),
         });
         request
             .metadata_mut()
@@ -19434,8 +16473,8 @@ mod tests {
         namespace: &str,
         provider: &str,
         principal: Option<&str>,
-    ) -> Request<ListAvailableModelsRequest> {
-        let mut request = Request::new(ListAvailableModelsRequest {
+    ) -> Request<GetEffectivePolicySummaryRequest> {
+        let mut request = Request::new(GetEffectivePolicySummaryRequest {
             namespace: namespace.into(),
             provider: provider.into(),
         });
@@ -19455,17 +16494,17 @@ mod tests {
             .unwrap();
 
         let missing_auth = svc
-            .list_available_models(available_models_request("acme", "", None))
+            .get_effective_policy_summary(available_models_request("acme", "", None))
             .await
             .unwrap_err();
         assert_eq!(missing_auth.code(), tonic::Code::Unauthenticated);
         let denied = svc
-            .list_available_models(available_models_request("acme", "", Some("mallory")))
+            .get_effective_policy_summary(available_models_request("acme", "", Some("mallory")))
             .await
             .unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
         let response = svc
-            .list_available_models(available_models_request("acme", "native", Some("alice")))
+            .get_effective_policy_summary(available_models_request("acme", "native", Some("alice")))
             .await
             .unwrap()
             .into_inner();
@@ -19481,7 +16520,6 @@ mod tests {
     async fn effective_policy_summary_is_authorized_bounded_and_live() {
         use crate::sekai::action::RiskClass;
         use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
-        use crate::sekai::coordination::{ADMISSION_POLICY_FIFO, ContentionScope};
 
         let svc = memory_service();
         svc.db
@@ -19514,50 +16552,6 @@ mod tests {
             .risk_overrides
             .insert(RiskClass::Destructive, ActionDecision::Deny);
         svc.db.upsert_action_policy(&action_policy).unwrap();
-        svc.db
-            .create_contention_scope(&ContentionScope {
-                id: "fleet".into(),
-                name: "fleet".into(),
-                parent_scope_id: String::new(),
-                max_concurrency: 3,
-                admission_policy: ADMISSION_POLICY_FIFO.into(),
-                heartbeat_ttl_seconds: 30,
-                timeout_seconds: 60,
-                owner_principal: "local".into(),
-                created: 1,
-                updated: 1,
-            })
-            .unwrap();
-        svc.db
-            .create_contention_scope(&ContentionScope {
-                id: "acme-workers".into(),
-                name: "acme".into(),
-                parent_scope_id: "fleet".into(),
-                max_concurrency: 4,
-                admission_policy: ADMISSION_POLICY_FIFO.into(),
-                heartbeat_ttl_seconds: 30,
-                timeout_seconds: 60,
-                owner_principal: "local".into(),
-                created: 1,
-                updated: 1,
-            })
-            .unwrap();
-        let mut forbidden_binding = Request::new(SetNamespaceWorkerPolicyRequest {
-            namespace: "acme".into(),
-            contention_scope_id: "acme-workers".into(),
-        });
-        forbidden_binding
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.set_namespace_worker_policy(forbidden_binding)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        persist_namespace_worker_policy(&svc.db, "acme", "acme-workers").unwrap();
-
         let denied = svc
             .get_effective_policy_summary(effective_summary_request("acme", "mallory"))
             .await
@@ -19582,10 +16576,6 @@ mod tests {
         assert_eq!(actions.deny_rule_count, 1);
         assert_eq!(actions.require_approval_rule_count, 1);
         assert_eq!(actions.default_decision, "allow");
-        let worker = first.worker_concurrency.unwrap();
-        assert_eq!(worker.max_concurrency, 3);
-        assert_eq!(worker.policy_scope, "fleet");
-
         svc.policy.set_namespace_policy(
             "acme",
             Policy {
@@ -19633,10 +16623,6 @@ mod tests {
             (summary.routing.unwrap().configured, "routing"),
             (summary.budgets.unwrap().configured, "budgets"),
             (summary.actions.unwrap().configured, "actions"),
-            (
-                summary.worker_concurrency.unwrap().configured,
-                "worker_concurrency",
-            ),
         ] {
             assert!(!configured, "{status} unexpectedly configured");
         }
@@ -19645,124 +16631,6 @@ mod tests {
     fn file_service(path: &str) -> ChiseiServiceImpl {
         let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
         ChiseiServiceImpl::new(db, config(path))
-    }
-
-    fn statistics_target(svc: &ChiseiServiceImpl, prefix: &str, namespace: &str, id: &str) {
-        svc.db
-            .create_object(&Object {
-                id: id.into(),
-                kind: prefix.into(),
-                name: namespace.into(),
-                namespace: namespace.into(),
-                external_id: format!("{prefix}:{namespace}"),
-                properties: HashMap::new(),
-                created: 1,
-                updated: 1,
-            })
-            .unwrap();
-    }
-
-    fn statistics_grant(svc: &ChiseiServiceImpl, object_id: &str, principal: &str) {
-        svc.db
-            .create_grant(&Grant {
-                id: format!("grant-{object_id}-{principal}"),
-                object_id: object_id.into(),
-                principal: principal.into(),
-                role: Role::Viewer,
-                created: 1,
-            })
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn statistics_authorization_accepts_project_grants() {
-        let svc = memory_service();
-        statistics_target(&svc, "project", "alpha", "project-alpha");
-        statistics_grant(&svc, "project-alpha", "agent:analyst");
-        let mut request = Request::new(QueryOperationStatisticsRequest {
-            namespaces: vec!["alpha".into()],
-            start_timestamp_ms: 1,
-            end_timestamp_ms: 2,
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "agent:analyst".parse().unwrap());
-
-        let response = svc.query_operation_statistics(request).await.unwrap();
-        assert_eq!(response.into_inner().totals.unwrap().receipts, 0);
-    }
-
-    #[tokio::test]
-    async fn statistics_authorization_fails_closed_across_namespaces_and_conflicting_acls() {
-        let svc = memory_service();
-        statistics_target(&svc, "namespace", "alpha", "namespace-alpha");
-        statistics_target(&svc, "project", "alpha", "project-alpha");
-        statistics_target(&svc, "namespace", "beta", "namespace-beta");
-        statistics_grant(&svc, "namespace-alpha", "agent:analyst");
-        statistics_grant(&svc, "project-alpha", "agent:other");
-        statistics_grant(&svc, "namespace-beta", "agent:analyst");
-        let mut request = Request::new(QueryOperationStatisticsRequest {
-            namespaces: vec!["alpha".into(), "beta".into()],
-            start_timestamp_ms: 1,
-            end_timestamp_ms: 2,
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "agent:analyst".parse().unwrap());
-
-        let error = svc.query_operation_statistics(request).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn portfolio_rpcs_persist_frontier_and_allocate_objective() {
-        let svc = memory_service();
-        for (model, variant, quality, cost) in [
-            ("small", "economy@1", 80.0, 10),
-            ("large", "quality@2", 95.0, 30),
-        ] {
-            svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
-                namespace: "acme".into(),
-                task_class: "primary".into(),
-                model: model.into(),
-                quality_score: quality,
-                cost_usd_micros: cost,
-                sample_count: 5,
-                updated_at: 1,
-                prompt_variant: variant.into(),
-            }))
-            .await
-            .unwrap();
-        }
-        svc.set_portfolio_objective(Request::new(SetPortfolioObjectiveRequest {
-            objective: Some(PortfolioObjective {
-                namespace: "acme".into(),
-                mode: "minimize_cost".into(),
-                budget_usd_micros: 100,
-                quality_bar: 90.0,
-                min_samples: 3,
-                updated_at: 1,
-            }),
-        }))
-        .await
-        .unwrap();
-
-        let response = svc
-            .allocate_portfolio(Request::new(AllocatePortfolioRequest {
-                namespace: "acme".into(),
-                demands: vec![PortfolioTaskDemand {
-                    task_class: "primary".into(),
-                    expected_calls: 2,
-                    quality_bar: 0.0,
-                    has_quality_bar: false,
-                }],
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(response.allocations[0].model, "large");
-        assert_eq!(response.allocations[0].prompt_variant, "quality@2");
-        assert_eq!(response.total_cost_usd_micros, 60);
     }
 
     fn resolve_policy_request(
@@ -19787,31 +16655,69 @@ mod tests {
         }
     }
 
-    async fn create_suite(svc: &ChiseiServiceImpl, namespace: &str) {
-        svc.create_eval_suite(Request::new(CreateEvalSuiteRequest {
-            suite: Some(EvalSuite {
+    fn create_suite(svc: &ChiseiServiceImpl, namespace: &str) {
+        svc.eval
+            .put_suite(crate::chisei::eval::Suite {
                 id: "suite-1".into(),
                 name: "suite".into(),
                 description: String::new(),
-                cases: std::iter::once(EvalCase {
+                cases: std::iter::once(crate::chisei::eval::Case {
                     id: "case-1".into(),
                     name: "case".into(),
                     namespace: namespace.into(),
                     spec: "spec".into(),
                     assertions: vec![],
                 })
-                .chain((1..=MIN_EVIDENCE_CONTEXT_EVAL_CASES).map(|case| EvalCase {
-                    id: format!("evidence-case-{case}"),
-                    name: format!("evidence case {case}"),
-                    namespace: namespace.into(),
-                    spec: "compare decision quality with and without evidence".into(),
-                    assertions: vec![],
+                .chain((1..=MIN_EVIDENCE_CONTEXT_EVAL_CASES).map(|case| {
+                    crate::chisei::eval::Case {
+                        id: format!("evidence-case-{case}"),
+                        name: format!("evidence case {case}"),
+                        namespace: namespace.into(),
+                        spec: "compare decision quality with and without evidence".into(),
+                        assertions: vec![],
+                    }
                 }))
                 .collect(),
-            }),
-        }))
-        .await
-        .unwrap();
+            })
+            .unwrap();
+    }
+
+    fn seed_eval_run(
+        svc: &ChiseiServiceImpl,
+        run: EvalRun,
+        changed_file: impl AsRef<str>,
+        diff_hash: impl AsRef<str>,
+    ) {
+        let changed_file = changed_file.as_ref();
+        let diff_hash = diff_hash.as_ref();
+        let suite_id = run.suite_id.clone();
+        let run_id = run.id.clone();
+        svc.eval
+            .put_run(crate::chisei::eval::Run {
+                id: run.id,
+                suite_id: run.suite_id,
+                config_ref: run.config_ref,
+                results: run
+                    .results
+                    .into_iter()
+                    .map(|result| crate::chisei::eval::CaseResult {
+                        case_id: result.case_id,
+                        passed: result.passed,
+                        status: result.status,
+                        result: result.result,
+                        score: result.score,
+                        reason: result.reason,
+                        elapsed: result.elapsed,
+                    })
+                    .collect(),
+                timestamp: run.timestamp,
+            })
+            .unwrap();
+        if !changed_file.is_empty() {
+            svc.eval
+                .track_iteration(&suite_id, &run_id, changed_file, diff_hash)
+                .unwrap();
+        }
     }
 
     fn eval_run(id: &str, suite_id: &str, score: i32, timestamp: i64) -> EvalRun {
@@ -19860,90 +16766,24 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn evaluation_mutations_require_control_plane_administration() {
-        let svc = memory_service();
-        let mut suite_request = Request::new(CreateEvalSuiteRequest {
-            suite: Some(EvalSuite {
-                id: "forged-suite".into(),
-                name: "forged".into(),
-                description: String::new(),
-                cases: vec![],
-            }),
-        });
-        suite_request
-            .metadata_mut()
-            .insert("x-principal", "agent:untrusted".parse().unwrap());
-        assert_eq!(
-            svc.create_eval_suite(suite_request)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut run_request = Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("forged-run", "forged-suite", 100, 1)),
-            changed_file: "context-expansion:pipeline-v1:acme".into(),
-            diff_hash: "forged".into(),
-        });
-        run_request
-            .metadata_mut()
-            .insert("x-principal", "agent:untrusted".parse().unwrap());
-        assert_eq!(
-            svc.create_eval_run(run_request).await.unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut iteration_request = Request::new(TrackEvalIterationRequest {
-            suite_id: "forged-suite".into(),
-            run_id: "forged-run".into(),
-            changed_file: "context-expansion:pipeline-v1:acme".into(),
-            diff_hash: "forged".into(),
-        });
-        iteration_request
-            .metadata_mut()
-            .insert("x-principal", "agent:untrusted".parse().unwrap());
-        assert_eq!(
-            svc.track_eval_iteration(iteration_request)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-    }
-
-    #[tokio::test]
-    async fn create_eval_suite_rejects_unknown_assertion_types() {
-        let svc = memory_service();
-        let error = svc
-            .create_eval_suite(Request::new(CreateEvalSuiteRequest {
-                suite: Some(EvalSuite {
-                    id: "invalid-assertion-suite".into(),
-                    name: "invalid".into(),
-                    description: String::new(),
-                    cases: vec![EvalCase {
-                        id: "case-1".into(),
-                        name: "case".into(),
-                        namespace: "acme".into(),
-                        spec: String::new(),
-                        assertions: vec![EvalAssertion {
-                            r#type: "min_socre".into(),
-                            value: "sensitive-expected-value".into(),
-                        }],
-                    }],
-                }),
-            }))
-            .await
-            .unwrap_err();
-
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert_eq!(
-            error.message(),
-            "unsupported eval assertion type \"min_socre\""
-        );
-        assert!(!error.message().contains("sensitive-expected-value"));
-        assert!(svc.eval.get_suite("invalid-assertion-suite").is_none());
+    fn run_test_gateway_pipeline(
+        svc: &ChiseiServiceImpl,
+        request_id: &str,
+        namespace: &str,
+        spec: &str,
+        task_class: &str,
+    ) -> GatewayPipelineDecision {
+        svc.gateway_pipeline_decision(GatewayPipelineInput {
+            actor: "local",
+            delegated_principal: None,
+            request_id,
+            namespace,
+            spec,
+            model: "native-default",
+            runtime: "native",
+            task_class,
+        })
+        .unwrap()
     }
 
     #[tokio::test]
@@ -19957,25 +16797,28 @@ mod tests {
                 "local",
             )
             .unwrap();
-        let mut denied = Request::new(GetGunshiScorecardRequest {
+        let mut denied = Request::new(GetGunshiAllocationStatusRequest {
             namespace: "acme".into(),
         });
         denied
             .metadata_mut()
             .insert("x-principal", "bob".parse().unwrap());
         assert_eq!(
-            svc.get_gunshi_scorecard(denied).await.unwrap_err().code(),
+            svc.get_gunshi_allocation_status(denied)
+                .await
+                .unwrap_err()
+                .code(),
             tonic::Code::PermissionDenied
         );
 
-        let mut allowed = Request::new(GetGunshiScorecardRequest {
+        let mut allowed = Request::new(GetGunshiAllocationStatusRequest {
             namespace: "acme".into(),
         });
         allowed
             .metadata_mut()
             .insert("x-principal", "alice".parse().unwrap());
         let scorecard: crate::chisei::gunshi::AdvisoryScorecard = serde_json::from_str(
-            &svc.get_gunshi_scorecard(allowed)
+            &svc.get_gunshi_allocation_status(allowed)
                 .await
                 .unwrap()
                 .into_inner()
@@ -20009,27 +16852,6 @@ mod tests {
             .insert("x-principal", "alice".parse().unwrap());
         assert_eq!(
             svc.set_budget_limit(budget).await.unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut objective = Request::new(SetPortfolioObjectiveRequest {
-            objective: Some(PortfolioObjective {
-                namespace: "acme".into(),
-                mode: "maximize_value".into(),
-                budget_usd_micros: 1_000,
-                quality_bar: 0.8,
-                min_samples: 5,
-                updated_at: 1,
-            }),
-        });
-        objective
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.set_portfolio_objective(objective)
-                .await
-                .unwrap_err()
-                .code(),
             tonic::Code::PermissionDenied
         );
 
@@ -20153,89 +16975,6 @@ mod tests {
             svc.resolve_policy(unmanaged).await.unwrap_err().code(),
             tonic::Code::PermissionDenied
         );
-
-        let mut frontier = Request::new(GetPortfolioFrontierRequest {
-            namespace: "beta".into(),
-            task_class: "analysis".into(),
-        });
-        frontier
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.get_portfolio_frontier(frontier)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut suites = Request::new(ListEvalSuitesRequest {});
-        suites
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.list_eval_suites(suites).await.unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
-    }
-
-    #[tokio::test]
-    async fn team_budget_checks_use_authenticated_namespace_and_actor() {
-        let svc = memory_service();
-        svc.db
-            .ensure_team_namespace(
-                "acme",
-                "alice",
-                crate::sekai::security::Role::Viewer,
-                "local",
-            )
-            .unwrap();
-        svc.budget
-            .set_limit(
-                "project:acme/agent:alice",
-                100,
-                crate::chisei::budget::PeriodType::Weekly,
-            )
-            .unwrap();
-        svc.budget.record("project:acme/agent:alice", 25);
-
-        let mut allowed = Request::new(CheckBudgetRequest {
-            project: "acme".into(),
-            estimated_tokens: 10,
-            ..Default::default()
-        });
-        allowed
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        let response = svc.check_budget(allowed).await.unwrap().into_inner();
-        assert!(response.allowed);
-        assert_eq!(response.usage.unwrap().user_id, "project:acme/agent:alice");
-
-        for forged in [
-            CheckBudgetRequest {
-                subject: "project:beta/agent:mallory".into(),
-                project: "acme".into(),
-                ..Default::default()
-            },
-            CheckBudgetRequest {
-                project: "acme".into(),
-                agent: "mallory".into(),
-                ..Default::default()
-            },
-            CheckBudgetRequest {
-                project: "beta".into(),
-                ..Default::default()
-            },
-        ] {
-            let mut request = Request::new(forged);
-            request
-                .metadata_mut()
-                .insert("x-principal", "alice".parse().unwrap());
-            assert_eq!(
-                svc.check_budget(request).await.unwrap_err().code(),
-                tonic::Code::PermissionDenied
-            );
-        }
     }
 
     #[tokio::test]
@@ -20255,215 +16994,22 @@ mod tests {
             tonic::Code::PermissionDenied
         );
 
-        let mut portfolio = Request::new(RecordPortfolioObservationRequest {
-            namespace: "other-team".into(),
-            task_class: "primary".into(),
-            model: "forged".into(),
-            quality_score: 1.0,
-            cost_usd_micros: 1,
-            sample_count: 100,
-            updated_at: 1,
-            prompt_variant: String::new(),
-        });
-        portfolio
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.record_portfolio_observation(portfolio)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut sample = Request::new(RecordSampleObservationRequest {
-            observation: Some(SampleObservation {
+        let mut sample = Request::new(RecordUsageRequest {
+            sample_observation: Some(SampleObservation {
                 request_id: "forged".into(),
                 namespace: "other-team".into(),
                 spec: "forged".into(),
                 output_content: "forged".into(),
                 ..Default::default()
             }),
+            ..Default::default()
         });
         sample
             .metadata_mut()
             .insert("x-principal", "alice".parse().unwrap());
         assert_eq!(
-            svc.record_sample_observation(sample)
-                .await
-                .unwrap_err()
-                .code(),
+            svc.record_usage(sample).await.unwrap_err().code(),
             tonic::Code::PermissionDenied
-        );
-    }
-
-    #[tokio::test]
-    async fn sample_observation_readback_is_authenticated_namespace_bound_and_redacted() {
-        let svc = memory_service();
-        svc.db
-            .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                request_id: "outcome-1".into(),
-                namespace: "tenkai-outcome".into(),
-                spec: "tenkai.terminal_outcome.v1".into(),
-                resolved_model: String::new(),
-                output_content: "private-terminal-payload".into(),
-                sample_reason: "deployment_failed".into(),
-                input_tokens: 0,
-                output_tokens: 0,
-                stop_reason: "terminal".into(),
-                timestamp: 1_000,
-                scored: false,
-                task_class: String::new(),
-                cost_usd_micros: 0,
-            })
-            .unwrap();
-
-        let mut allowed = Request::new(GetSampleObservationRequest {
-            request_id: "outcome-1".into(),
-            namespace: "tenkai-outcome".into(),
-        });
-        allowed
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        let response = svc
-            .get_sample_observation(allowed)
-            .await
-            .unwrap()
-            .into_inner()
-            .observation
-            .unwrap();
-        assert_eq!(response.request_id, "outcome-1");
-        assert_eq!(response.namespace, "tenkai-outcome");
-        assert_eq!(response.state, "recorded");
-        assert_eq!(response.observed_at, 1_000);
-        assert!(response.observation_digest.starts_with("sha256:"));
-
-        let mut wrong_namespace = Request::new(GetSampleObservationRequest {
-            request_id: "outcome-1".into(),
-            namespace: "other-namespace".into(),
-        });
-        wrong_namespace
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(wrong_namespace)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::NotFound
-        );
-
-        let mut denied = Request::new(GetSampleObservationRequest {
-            request_id: "outcome-1".into(),
-            namespace: "tenkai-outcome".into(),
-        });
-        denied
-            .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(denied).await.unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
-
-        let mut gateway_denied = Request::new(GetSampleObservationRequest {
-            request_id: "outcome-1".into(),
-            namespace: "tenkai-outcome".into(),
-        });
-        gateway_denied
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(gateway_denied)
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        svc.db
-            .ensure_team_namespace(
-                "tenkai-outcome",
-                "chisei-gateway",
-                crate::sekai::security::Role::Viewer,
-                "local",
-            )
-            .unwrap();
-        let mut gateway_allowed = Request::new(GetSampleObservationRequest {
-            request_id: "outcome-1".into(),
-            namespace: "tenkai-outcome".into(),
-        });
-        gateway_allowed
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(gateway_allowed)
-                .await
-                .unwrap()
-                .into_inner()
-                .observation
-                .unwrap()
-                .request_id,
-            "outcome-1"
-        );
-
-        let mut scoring_config = config(":memory:");
-        scoring_config.scoring_enabled = true;
-        let recorder = ChiseiServiceImpl::new(svc.db.clone(), scoring_config);
-        let mut padded = Request::new(RecordSampleObservationRequest {
-            observation: Some(SampleObservation {
-                request_id: " outcome-2 ".into(),
-                namespace: " tenkai-outcome ".into(),
-                spec: "tenkai.terminal_outcome.v1".into(),
-                output_content: "private-terminal-payload-2".into(),
-                ..Default::default()
-            }),
-        });
-        padded
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        assert!(
-            recorder
-                .record_sample_observation(padded)
-                .await
-                .unwrap()
-                .into_inner()
-                .recorded
-        );
-
-        let mut exact_lookup = Request::new(GetSampleObservationRequest {
-            request_id: " outcome-2 ".into(),
-            namespace: " tenkai-outcome ".into(),
-        });
-        exact_lookup
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(exact_lookup)
-                .await
-                .unwrap()
-                .into_inner()
-                .observation
-                .unwrap()
-                .request_id,
-            " outcome-2 "
-        );
-
-        let mut padded_gateway_lookup = Request::new(GetSampleObservationRequest {
-            request_id: " outcome-2 ".into(),
-            namespace: " tenkai-outcome ".into(),
-        });
-        padded_gateway_lookup
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        assert_eq!(
-            svc.get_sample_observation(padded_gateway_lookup)
-                .await
-                .unwrap()
-                .into_inner()
-                .observation
-                .unwrap()
-                .namespace,
-            " tenkai-outcome "
         );
     }
 
@@ -20502,6 +17048,7 @@ mod tests {
                 max_tokens: 16,
                 ..Default::default()
             }),
+            gunshi_allocation: None,
         });
         planning
             .metadata_mut()
@@ -20631,7 +17178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_pipeline_audits_and_applies_the_context_expansion_gate() {
+    async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate() {
         let svc = memory_service();
         svc.db
             .create_object(&Object {
@@ -20680,50 +17227,37 @@ mod tests {
             .unwrap();
         let evidence_submission_id = project_test_evidence(&svc);
 
-        let request = |id: &str| RunPipelineRequest {
-            request: Some(PipelineRequest {
-                request_id: id.into(),
-                namespace: "acme".into(),
-                spec: "inspect ticker:AAPL".into(),
-                model: String::new(),
-                runtime: String::new(),
-                task_type: String::new(),
-                priority: 0,
-                task_class: String::new(),
-            }),
-        };
-        let denied = svc
-            .run_pipeline(Request::new(request("before-eval")))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert!(denied.prepared_spec.contains("score: 0.82"));
-        assert!(!denied.prepared_spec.contains("validate the filing date"));
-        assert!(denied.evidence_references.is_empty());
+        let denied =
+            run_test_gateway_pipeline(&svc, "before-eval", "acme", "inspect ticker:AAPL", "");
+        assert!(denied.run.prepared_spec.contains("score: 0.82"));
+        assert!(
+            !denied
+                .run
+                .prepared_spec
+                .contains("validate the filing date")
+        );
+        assert!(denied.run.evidence_references.is_empty());
 
-        create_suite(&svc, "acme").await;
+        create_suite(&svc, "acme");
         let profile = pipeline_context_expansion_profile_key("acme");
         for (id, score, timestamp) in [("context-base", 90, 1), ("context-pass", 95, 2)] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(eval_run(id, "suite-1", score, timestamp)),
-                changed_file: profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(
+                &svc,
+                eval_run(id, "suite-1", score, timestamp),
+                &profile,
+                format!("hash-{id}"),
+            );
         }
-        let allowed = svc
-            .run_pipeline(Request::new(request("after-eval")))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert!(allowed.prepared_spec.contains("validate the filing date"));
-        assert!(allowed.evidence_references.is_empty());
-        assert!(!allowed.prepared_spec.contains("result=passed"));
+        let allowed =
+            run_test_gateway_pipeline(&svc, "after-eval", "acme", "inspect ticker:AAPL", "");
+        assert!(
+            allowed
+                .run
+                .prepared_spec
+                .contains("validate the filing date")
+        );
+        assert!(allowed.run.evidence_references.is_empty());
+        assert!(!allowed.run.prepared_spec.contains("result=passed"));
 
         let class_profile =
             evidence_context_profile_key("acme", "verification_system", "verification.result");
@@ -20731,8 +17265,9 @@ mod tests {
             ("evidence-base", false, 90, 3),
             ("evidence-pass", true, 95, 4),
         ] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(evidence_eval_run(
+            seed_eval_run(
+                &svc,
+                evidence_eval_run(
                     id,
                     "suite-1",
                     "verification_system",
@@ -20740,31 +17275,16 @@ mod tests {
                     with_evidence,
                     score,
                     timestamp,
-                )),
-                changed_file: class_profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+                ),
+                &class_profile,
+                format!("hash-{id}"),
+            );
         }
-        let class_gate = svc
-            .get_evidence_context_gate(Request::new(GetEvidenceContextGateRequest {
-                namespace: "acme".into(),
-                source_type: "verification_system".into(),
-                evidence_type: "verification.result".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .gate
-            .unwrap();
-        assert!(class_gate.allowed);
-        assert_eq!(class_gate.verdict, "pass");
-        assert_eq!(class_gate.profile_key, class_profile);
-        assert_eq!(
-            class_gate.expected_baseline_config_ref,
-            evidence_context_config_ref("verification_system", "verification.result", false)
-        );
+        let class_gate =
+            svc.evidence_context_gate("acme", "verification_system", "verification.result", true);
+        assert!(class_gate.effective_allowed);
+        assert_eq!(class_gate.gate.verdict, "pass");
+        assert_eq!(class_gate.gate.profile_key, class_profile);
 
         let invalid_profile = evidence_context_profile_key(
             "acme",
@@ -20772,39 +17292,33 @@ mod tests {
             "operations.health_snapshot",
         );
         for (id, score, timestamp) in [("invalid-base", 90, 5), ("invalid-pass", 95, 6)] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(eval_run(id, "suite-1", score, timestamp)),
-                changed_file: invalid_profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(
+                &svc,
+                eval_run(id, "suite-1", score, timestamp),
+                &invalid_profile,
+                format!("hash-{id}"),
+            );
         }
-        let invalid_gate = svc
-            .get_evidence_context_gate(Request::new(GetEvidenceContextGateRequest {
-                namespace: "acme".into(),
-                source_type: "verification_system".into(),
-                evidence_type: "operations.health_snapshot".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .gate
-            .unwrap();
-        assert!(!invalid_gate.allowed);
-        assert_eq!(invalid_gate.verdict, "invalid_comparison");
+        let invalid_gate = svc.evidence_context_gate(
+            "acme",
+            "verification_system",
+            "operations.health_snapshot",
+            true,
+        );
+        assert!(!invalid_gate.effective_allowed);
+        assert_eq!(invalid_gate.gate.verdict, "invalid_comparison");
 
-        let evidence_allowed = svc
-            .run_pipeline(Request::new(request("after-evidence-eval")))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert!(evidence_allowed.prepared_spec.contains("result=passed"));
-        assert_eq!(evidence_allowed.evidence_references.len(), 1);
+        let evidence_allowed = run_test_gateway_pipeline(
+            &svc,
+            "after-evidence-eval",
+            "acme",
+            "inspect ticker:AAPL",
+            "",
+        );
+        assert!(evidence_allowed.run.prepared_spec.contains("result=passed"));
+        assert_eq!(evidence_allowed.run.evidence_references.len(), 1);
         assert_eq!(
-            evidence_allowed.evidence_references[0].submission_id,
+            evidence_allowed.run.evidence_references[0].submission_id,
             evidence_submission_id
         );
 
@@ -20852,7 +17366,7 @@ mod tests {
     #[tokio::test]
     async fn evidence_context_gate_rejects_duplicate_case_results() {
         let svc = memory_service();
-        create_suite(&svc, "acme").await;
+        create_suite(&svc, "acme");
         let evidence_type = "verification.result";
         let profile = evidence_context_profile_key("acme", "verification_system", evidence_type);
         let baseline = evidence_eval_run(
@@ -20876,13 +17390,7 @@ mod tests {
         candidate.results.push(candidate.results[0].clone());
         for run in [baseline, candidate] {
             let id = run.id.clone();
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(run),
-                changed_file: profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(&svc, run, &profile, format!("hash-{id}"));
         }
 
         let gate = svc.evidence_context_gate("acme", "verification_system", evidence_type, true);
@@ -20931,17 +17439,16 @@ mod tests {
             "bugyo-check-1",
             "bugyo-delivery-1",
         );
-        create_suite(&svc, "acme").await;
+        create_suite(&svc, "acme");
 
         let context_profile = pipeline_context_expansion_profile_key("acme");
         for (id, score, timestamp) in [("context-base", 90, 1), ("context-pass", 95, 2)] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(eval_run(id, "suite-1", score, timestamp)),
-                changed_file: context_profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(
+                &svc,
+                eval_run(id, "suite-1", score, timestamp),
+                &context_profile,
+                format!("hash-{id}"),
+            );
         }
 
         let verification_profile =
@@ -20950,8 +17457,9 @@ mod tests {
             ("verification-base", false, 90, 3),
             ("verification-pass", true, 95, 4),
         ] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(evidence_eval_run(
+            seed_eval_run(
+                &svc,
+                evidence_eval_run(
                     id,
                     "suite-1",
                     "verification_system",
@@ -20959,46 +17467,34 @@ mod tests {
                     with_evidence,
                     score,
                     timestamp,
-                )),
-                changed_file: verification_profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+                ),
+                &verification_profile,
+                format!("hash-{id}"),
+            );
         }
 
-        let request = |request_id: &str| RunPipelineRequest {
-            request: Some(PipelineRequest {
-                request_id: request_id.into(),
-                namespace: "acme".into(),
-                spec: "inspect ticker:AAPL".into(),
-                model: String::new(),
-                runtime: String::new(),
-                task_type: "analysis".into(),
-                priority: 0,
-                task_class: "analysis".into(),
-            }),
-        };
-        let before_native_comparison = svc
-            .run_pipeline(Request::new(request("before-native-comparison")))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
+        let before_native_comparison = run_test_gateway_pipeline(
+            &svc,
+            "before-native-comparison",
+            "acme",
+            "inspect ticker:AAPL",
+            "analysis",
+        );
         assert!(
             before_native_comparison
+                .run
                 .evidence_references
                 .iter()
                 .any(|reference| reference.submission_id == verification_id)
         );
         assert!(
             !before_native_comparison
+                .run
                 .evidence_references
                 .iter()
                 .any(|reference| reference.submission_id == native_id)
         );
-        assert!(before_native_comparison.memory_references.is_empty());
+        assert!(before_native_comparison.run.memory_references.is_empty());
         assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
 
         let native_profile =
@@ -21006,8 +17502,9 @@ mod tests {
         for (id, with_evidence, score, timestamp) in
             [("native-base", false, 90, 5), ("native-pass", true, 95, 6)]
         {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(evidence_eval_run(
+            seed_eval_run(
+                &svc,
+                evidence_eval_run(
                     id,
                     "suite-1",
                     "native_harness",
@@ -21015,27 +17512,26 @@ mod tests {
                     with_evidence,
                     score,
                     timestamp,
-                )),
-                changed_file: native_profile.clone(),
-                diff_hash: format!("hash-{id}"),
-            }))
-            .await
-            .unwrap();
+                ),
+                &native_profile,
+                format!("hash-{id}"),
+            );
         }
-        let after_native_comparison = svc
-            .run_pipeline(Request::new(request("after-native-comparison")))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
+        let after_native_comparison = run_test_gateway_pipeline(
+            &svc,
+            "after-native-comparison",
+            "acme",
+            "inspect ticker:AAPL",
+            "analysis",
+        );
         assert!(
             after_native_comparison
+                .run
                 .evidence_references
                 .iter()
                 .any(|reference| reference.submission_id == native_id)
         );
-        assert!(after_native_comparison.memory_references.is_empty());
+        assert!(after_native_comparison.run.memory_references.is_empty());
         assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
     }
 
@@ -21052,6 +17548,8 @@ mod tests {
             work_unit: "wu-idempotent".into(),
             metric: String::new(),
             idempotency_key: "request-1:tokens".into(),
+            operation_receipt_json: String::new(),
+            sample_observation: None,
         };
 
         for _ in 0..2 {
@@ -21086,408 +17584,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_rpcs_accept_gateway_subject_metadata() {
+    async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
         let svc = memory_service();
-        svc.set_budget_limit(Request::new(SetBudgetLimitRequest {
-            user_id: String::new(),
-            max_tokens: 10,
-            period_type: "day".into(),
-            subject: String::new(),
-            project: "sekai-chisei".into(),
-            agent: "codex-app".into(),
-            key_id: "codex-app".into(),
-            work_unit: String::new(),
-            metric: String::new(),
-        }))
-        .await
-        .unwrap();
+        let operation_id = "gateway-receipt-1";
+        let events = vec![
+            receipt_event(
+                operation_id,
+                "intent",
+                None,
+                1,
+                ReceiptEventKind::IntentRecorded,
+                "agent:caller",
+                BTreeMap::new(),
+            ),
+            receipt_event(
+                operation_id,
+                "policy",
+                Some("intent"),
+                2,
+                ReceiptEventKind::PolicyDecided,
+                "chisei-gateway",
+                BTreeMap::new(),
+            ),
+            receipt_event(
+                operation_id,
+                "route",
+                Some("policy"),
+                3,
+                ReceiptEventKind::RouteSelected,
+                "chisei-gateway",
+                BTreeMap::new(),
+            ),
+            receipt_event(
+                operation_id,
+                "budget",
+                Some("route"),
+                4,
+                ReceiptEventKind::BudgetDecided,
+                "chisei-gateway",
+                BTreeMap::new(),
+            ),
+            receipt_event(
+                operation_id,
+                "outcome",
+                Some("budget"),
+                5,
+                ReceiptEventKind::OutcomeRecorded,
+                "chisei-gateway",
+                BTreeMap::from([("status".into(), "completed".into())]),
+            ),
+        ];
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.into(),
+            parent_operation_id: None,
+            namespace: "acme".into(),
+            operation_class: "gateway.request".into(),
+            initiating_actor: "agent:caller".into(),
+            schema_version: EXECUTION_SCHEMA_VERSION.into(),
+            policy_version: "policy-v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(5),
+            events,
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+        };
+        assert!(receipt.completeness().complete);
+        let usage = RecordUsageRequest {
+            user_id: "agent:caller".into(),
+            tokens_used: 0,
+            project: "acme".into(),
+            agent: "gateway".into(),
+            work_unit: operation_id.into(),
+            idempotency_key: "gateway-receipt-1:accounting".into(),
+            operation_receipt_json: serde_json::to_string(&receipt).unwrap(),
+            ..Default::default()
+        };
 
-        let allowed = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 5,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: "background".into(),
-                mid_task: false,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(allowed.allowed);
-        assert_eq!(allowed.route_bias, "capable");
-        assert_eq!(allowed.degradation_level, "capable");
-        assert!(!allowed.warning);
+        svc.record_usage(Request::new(usage.clone())).await.unwrap();
         assert_eq!(
-            allowed.usage.unwrap().user_id,
-            "project:sekai-chisei/agent:codex-app"
+            svc.db.get_operation_receipt(operation_id).unwrap(),
+            Some(receipt)
         );
 
-        svc.record_usage(Request::new(RecordUsageRequest {
-            user_id: String::new(),
-            tokens_used: 8,
-            subject: String::new(),
-            project: "sekai-chisei".into(),
-            agent: "codex-app".into(),
-            key_id: "codex-app".into(),
-            work_unit: "wu-existing".into(),
-            metric: String::new(),
-            idempotency_key: "test-existing-usage".into(),
-        }))
-        .await
-        .unwrap();
-
-        let near_cap = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 1,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: "background".into(),
-                mid_task: false,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(near_cap.allowed);
-        assert_eq!(near_cap.route_bias, "cheap");
-        assert_eq!(near_cap.degradation_level, "cheap_cloud");
-        assert!(near_cap.warning);
-
-        let denied = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: "background".into(),
-                mid_task: false,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!denied.allowed);
-        assert_eq!(denied.route_bias, "cheap");
-        assert_eq!(denied.degradation_level, "hard_cap");
-        assert!(denied.warning);
-
-        let forged_continuation = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: "wu-new".into(),
-                metric: String::new(),
-                task_class: "reasoning".into(),
-                mid_task: true,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!forged_continuation.allowed);
-        assert_eq!(forged_continuation.degradation_level, "hard_cap");
-
-        let reused_finished_id = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: "wu-existing".into(),
-                metric: String::new(),
-                task_class: "reasoning".into(),
-                mid_task: true,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!reused_finished_id.allowed);
-        assert_eq!(reused_finished_id.degradation_level, "hard_cap");
-
-        let local_floor = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: "background".into(),
-                mid_task: false,
-                local_free_available: true,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!local_floor.allowed);
-        assert_eq!(local_floor.route_bias, "local_free");
-        assert_eq!(local_floor.degradation_level, "local_free");
-        assert!(local_floor.warning);
-
-        let reasoning_has_no_cheap_local_floor = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: String::new(),
-                project: "sekai-chisei".into(),
-                agent: "codex-app".into(),
-                key_id: "codex-app".into(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: "reasoning".into(),
-                mid_task: false,
-                local_free_available: true,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!reasoning_has_no_cheap_local_floor.allowed);
-        assert_eq!(reasoning_has_no_cheap_local_floor.route_bias, "capable");
-        assert_eq!(
-            reasoning_has_no_cheap_local_floor.degradation_level,
-            "hard_cap"
-        );
-
-        let now = chrono::Utc::now().timestamp_millis();
-        svc.db
-            .create_contention_scope(&crate::sekai::coordination::ContentionScope {
-                id: "scope-budget-test".into(),
-                name: "budget test".into(),
-                parent_scope_id: String::new(),
-                max_concurrency: 1,
-                admission_policy: crate::sekai::coordination::ADMISSION_POLICY_FIFO.into(),
-                heartbeat_ttl_seconds: 30,
-                timeout_seconds: 60,
-                owner_principal: "codex-app".into(),
-                created: now,
-                updated: now,
-            })
-            .unwrap();
-        svc.db
-            .create_work_unit(&crate::sekai::coordination::WorkUnit {
-                id: "wu-existing".into(),
-                kind: "test".into(),
-                actor: "codex-app".into(),
-                target_object_id: String::new(),
-                status: crate::sekai::coordination::WORK_UNIT_STATUS_PENDING.into(),
-                requested_spec: "continue existing work".into(),
-                scope_id: "scope-budget-test".into(),
-                priority: 0,
-                timeout_seconds: 60,
-                heartbeat_ttl_seconds: 30,
-                created_at: now,
-                admitted_at: 0,
-                started_at: 0,
-                finished_at: 0,
-                last_heartbeat_at: 0,
-                failure_reason: String::new(),
-                cancel_reason: String::new(),
-                owner_principal: "codex-app".into(),
-                creator_principal: "codex-app".into(),
-                idempotency_key: String::new(),
-                updated_at: now,
-            })
-            .unwrap();
-        assert!(
-            svc.db
-                .try_admit_work_unit("wu-existing", "codex-app", now)
-                .unwrap()
-                .admitted
-        );
-        let wrong_identity = svc
-            .check_budget(Request::new(CheckBudgetRequest {
-                user_id: String::new(),
-                estimated_tokens: 3,
-                subject: "project:sekai-chisei/agent:codex-app".into(),
-                project: "sekai-chisei".into(),
-                agent: "attacker".into(),
-                key_id: "attacker".into(),
-                work_unit: "wu-existing".into(),
-                metric: String::new(),
-                task_class: "reasoning".into(),
-                mid_task: true,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!wrong_identity.allowed);
-        assert_eq!(wrong_identity.degradation_level, "hard_cap");
-
-        let continuation_request = Request::new(CheckBudgetRequest {
-            user_id: String::new(),
-            estimated_tokens: 3,
-            subject: String::new(),
-            project: "sekai-chisei".into(),
-            agent: "codex-app".into(),
-            key_id: "codex-app".into(),
-            work_unit: "wu-existing".into(),
-            metric: String::new(),
-            task_class: "reasoning".into(),
-            mid_task: false,
-            local_free_available: false,
+        let mut untrusted = Request::new(RecordUsageRequest {
+            work_unit: "gateway-receipt-2".into(),
+            idempotency_key: "gateway-receipt-2:accounting".into(),
+            ..usage
         });
-        let continuation = svc
-            .check_budget(continuation_request)
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(continuation.allowed);
-        assert_eq!(continuation.route_bias, "capable");
-        assert_eq!(continuation.degradation_level, "warn");
-        assert!(continuation.warning);
-    }
-
-    #[tokio::test]
-    async fn record_gateway_audit_writes_decision_log() {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
-        let response = svc
-            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
-                event: Some(GatewayAuditEvent {
-                    id: String::new(),
-                    timestamp: 0,
-                    actor: "codex-app".into(),
-                    action: "gateway.model_rewrite".into(),
-                    reason: "policy resolved a different model".into(),
-                    evidence: HashMap::from([("request_id".into(), "req-1".into())]),
-                    target_id: String::new(),
-                    outcome: "routed".into(),
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .event
-            .unwrap();
-
-        assert!(!response.id.is_empty());
-        assert!(response.timestamp > 0);
-        assert_eq!(response.target_id, "llm_calls");
-        let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
-                action: Some("gateway.model_rewrite".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "local");
-        assert_eq!(
-            decisions[0].evidence.get("request_id").map(String::as_str),
-            Some("req-1")
-        );
-    }
-
-    #[tokio::test]
-    async fn record_gateway_audit_rejects_untrusted_principals() {
-        let svc = memory_service();
-        let mut request = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                actor: "root".into(),
-                action: "gateway.model_rewrite".into(),
-                outcome: "routed".into(),
-                ..Default::default()
-            }),
-        });
-        request
+        untrusted
             .metadata_mut()
-            .insert("x-principal", "alice".parse().unwrap());
+            .insert("x-principal", "agent:intruder".parse().unwrap());
         assert_eq!(
-            svc.record_gateway_audit(request).await.unwrap_err().code(),
+            svc.record_usage(untrusted).await.unwrap_err().code(),
             tonic::Code::PermissionDenied
         );
-    }
-
-    #[tokio::test]
-    async fn record_gateway_audit_strips_reserved_attestation_evidence_keys() {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        let svc = ChiseiServiceImpl::new(db.clone(), config(":memory:"));
-        let event = svc
-            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
-                event: Some(GatewayAuditEvent {
-                    id: String::new(),
-                    timestamp: 0,
-                    actor: "codex-app".into(),
-                    action: "gateway.model_rewrite".into(),
-                    reason: String::new(),
-                    evidence: HashMap::from([
-                        ("attestation_id".into(), "forged".into()),
-                        ("attestation_hash".into(), "forged".into()),
-                        ("request_id".into(), "req-1".into()),
-                    ]),
-                    target_id: String::new(),
-                    outcome: "routed".into(),
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .event
-            .unwrap();
-        assert!(!event.evidence.contains_key("attestation_id"));
-        assert!(!event.evidence.contains_key("attestation_hash"));
-        assert_eq!(event.evidence["request_id"], "req-1");
-        let stored = db.get_decision(&event.id).unwrap().unwrap();
-        assert!(!stored.evidence.contains_key("attestation_id"));
-        assert!(!stored.evidence.contains_key("attestation_hash"));
-    }
-
-    #[tokio::test]
-    async fn record_gateway_audit_clamps_future_timestamp() {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        let svc = ChiseiServiceImpl::new(db, config(":memory:"));
-        let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
-        let event = svc
-            .record_gateway_audit(Request::new(RecordGatewayAuditRequest {
-                event: Some(GatewayAuditEvent {
-                    id: String::new(),
-                    timestamp: future,
-                    actor: "codex-app".into(),
-                    action: "gateway.model_rewrite".into(),
-                    reason: String::new(),
-                    evidence: HashMap::new(),
-                    target_id: String::new(),
-                    outcome: "routed".into(),
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .event
-            .unwrap();
-        // A future timestamp would pin the ledger's purgeable prefix forever.
-        assert!(event.timestamp < future);
-        assert!(event.timestamp <= chrono::Utc::now().timestamp_millis());
     }
 
     #[tokio::test]
@@ -21628,21 +17819,19 @@ mod tests {
         }))
         .await
         .unwrap();
-        create_suite(&svc, "sekai-chisei").await;
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "sekai-chisei".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "sekai-chisei".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        create_suite(&svc, "sekai-chisei");
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "sekai-chisei",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "sekai-chisei",
+            "hash-b",
+        );
 
         let resolved = svc
             .resolve_policy(Request::new(resolve_policy_request(
@@ -21676,22 +17865,20 @@ mod tests {
         }))
         .await
         .unwrap();
-        create_suite(&svc, "sekai-chisei").await;
+        create_suite(&svc, "sekai-chisei");
         // Two runs with a score drop mark the namespace as regressed.
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "sekai-chisei".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "sekai-chisei".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "sekai-chisei",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "sekai-chisei",
+            "hash-b",
+        );
 
         // A bulk task class would normally route cheap, but the active
         // regression forces it back to the capable default tier with no bias.
@@ -21724,31 +17911,29 @@ mod tests {
         .await
         .unwrap();
         for (model, quality, cost) in [("native-cheap", 85.0, 10), ("native-default", 95.0, 30)] {
-            svc.record_portfolio_observation(Request::new(RecordPortfolioObservationRequest {
-                namespace: "sekai-chisei".into(),
-                task_class: "primary".into(),
-                model: model.into(),
-                quality_score: quality,
-                cost_usd_micros: cost,
-                sample_count: 5,
-                updated_at: 1,
-                prompt_variant: String::new(),
-            }))
-            .await
-            .unwrap();
+            svc.portfolio
+                .record(&crate::chisei::portfolio::Observation {
+                    namespace: "sekai-chisei".into(),
+                    task_class: "primary".into(),
+                    model: model.into(),
+                    prompt_variant: String::new(),
+                    quality_score: quality,
+                    cost_usd_micros: cost,
+                    sample_count: 5,
+                    updated_at: 1,
+                })
+                .unwrap();
         }
-        svc.set_portfolio_objective(Request::new(SetPortfolioObjectiveRequest {
-            objective: Some(PortfolioObjective {
+        svc.portfolio
+            .set_objective(&crate::chisei::portfolio::Objective {
                 namespace: "sekai-chisei".into(),
-                mode: "minimize_cost".into(),
+                mode: crate::chisei::portfolio::ObjectiveMode::MinimizeCost,
                 budget_usd_micros: 100,
                 quality_bar: 80.0,
                 min_samples: 3,
                 updated_at: 1,
-            }),
-        }))
-        .await
-        .unwrap();
+            })
+            .unwrap();
 
         let routed = svc
             .resolve_policy(Request::new(resolve_policy_request(
@@ -21764,15 +17949,14 @@ mod tests {
         assert_eq!(routed.model, "native-cheap");
         assert_eq!(routed.route_bias, "portfolio");
 
-        create_suite(&svc, "sekai-chisei").await;
+        create_suite(&svc, "sekai-chisei");
         for (id, score, timestamp) in [("run-1", 95, 100), ("run-2", 60, 200)] {
-            svc.create_eval_run(Request::new(CreateEvalRunRequest {
-                run: Some(eval_run(id, "suite-1", score, timestamp)),
-                changed_file: "sekai-chisei".into(),
-                diff_hash: id.into(),
-            }))
-            .await
-            .unwrap();
+            seed_eval_run(
+                &svc,
+                eval_run(id, "suite-1", score, timestamp),
+                "sekai-chisei",
+                id,
+            );
         }
         let reverted = svc
             .resolve_policy(Request::new(resolve_policy_request(
@@ -21864,48 +18048,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_eval_run_auto_tracks_iteration() {
+    async fn internal_eval_run_tracking_is_visible_to_gateway_reads() {
         let svc = memory_service();
-        create_suite(&svc, "context-a").await;
+        create_suite(&svc, "context-a");
 
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 90, 100)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 70, 200)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 90, 100),
+            "skills/context-a.md",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 70, 200),
+            "skills/context-a.md",
+            "hash-b",
+        );
 
         let latest = svc
-            .get_latest_eval_iteration(Request::new(GetLatestEvalIterationRequest {
-                changed_file: "skills/context-a.md".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .iteration
+            .eval
+            .latest_iteration_for_file("skills/context-a.md")
             .unwrap();
         assert_eq!(latest.baseline_run_id, "run-1");
         assert_eq!(latest.candidate_run_id, "run-2");
         assert!(latest.regressed);
 
-        let listed = svc
-            .list_eval_iterations(Request::new(ListEvalIterationsRequest {
-                suite_id: "suite-1".into(),
-                changed_file: String::new(),
-            }))
+        assert_eq!(svc.eval.list_iterations("suite-1").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn restored_read_contracts_return_bounded_projections() {
+        let svc = memory_service();
+        svc.db
+            .put_sample_observation(&crate::chisei::scoring::SampleObservation {
+                request_id: "observation-1".into(),
+                namespace: "context-a".into(),
+                spec: "private spec".into(),
+                resolved_model: "native-default".into(),
+                output_content: "private output".into(),
+                sample_reason: "threshold".into(),
+                input_tokens: 1,
+                output_tokens: 2,
+                stop_reason: "stop".into(),
+                timestamp: 100,
+                scored: false,
+                task_class: "primary".into(),
+                cost_usd_micros: 3,
+            })
+            .unwrap();
+
+        let mut observation_request = Request::new(GetSampleObservationRequest {
+            request_id: "observation-1".into(),
+            namespace: "context-a".into(),
+        });
+        observation_request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let observation = svc
+            .get_sample_observation(observation_request)
             .await
             .unwrap()
-            .into_inner();
-        assert_eq!(listed.iterations.len(), 2);
+            .into_inner()
+            .observation
+            .unwrap();
+        assert_eq!(observation.request_id, "observation-1");
+        assert_eq!(observation.namespace, "context-a");
+        assert_eq!(observation.state, "recorded");
+        assert_eq!(observation.observed_at, 100);
+        assert!(observation.observation_digest.starts_with("sha256:"));
+
+        svc.eval
+            .put_suite(crate::chisei::eval::Suite {
+                id: "suite-read".into(),
+                name: "suite".into(),
+                description: "readback".into(),
+                cases: vec![crate::chisei::eval::Case {
+                    id: "case-1".into(),
+                    name: "case".into(),
+                    namespace: "context-a".into(),
+                    spec: "spec".into(),
+                    assertions: vec![],
+                }],
+            })
+            .unwrap();
+        svc.eval
+            .put_run(crate::chisei::eval::Run {
+                id: "run-read".into(),
+                suite_id: "suite-read".into(),
+                config_ref: "config".into(),
+                results: vec![crate::chisei::eval::CaseResult {
+                    case_id: "case-1".into(),
+                    passed: true,
+                    status: "passed".into(),
+                    result: "ok".into(),
+                    score: 100,
+                    reason: String::new(),
+                    elapsed: 1,
+                }],
+                timestamp: 101,
+            })
+            .unwrap();
+
+        let mut suite_request = Request::new(GetEvalSuiteRequest {
+            id: "suite-read".into(),
+        });
+        suite_request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert_eq!(
+            svc.get_eval_suite(suite_request)
+                .await
+                .unwrap()
+                .into_inner()
+                .suite
+                .unwrap()
+                .cases
+                .len(),
+            1
+        );
+
+        let mut runs_request = Request::new(ListEvalRunsRequest {
+            suite_id: "suite-read".into(),
+        });
+        runs_request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert_eq!(
+            svc.list_eval_runs(runs_request)
+                .await
+                .unwrap()
+                .into_inner()
+                .runs
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -21916,34 +18192,27 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let svc = file_service(&path);
-        create_suite(&svc, "context-a").await;
+        create_suite(&svc, "context-a");
 
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "skills/context-a.md",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "skills/context-a.md",
+            "hash-b",
+        );
 
         drop(svc);
 
         let svc = file_service(&path);
         let latest = svc
-            .get_latest_eval_iteration(Request::new(GetLatestEvalIterationRequest {
-                changed_file: "skills/context-a.md".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .iteration
+            .eval
+            .latest_iteration_for_file("skills/context-a.md")
             .unwrap();
         assert!(latest.regressed);
 
@@ -21966,6 +18235,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -21995,16 +18265,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_gateway_principal_can_reserve_request_aliases() {
+    async fn configured_gateway_principal_can_claim_one_dispatch() {
         let mut svc = memory_service();
         svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
-        let reservation = ReserveGatewayRequestAliasRequest {
+        let claim = ClaimGatewayDispatchRequest {
             caller_scope: "gateway:prod".into(),
             request_alias: "attempt-1".into(),
             request_id: "request-1".into(),
             operation_id: "operation-1".into(),
+            dispatch_token: "dispatch-1".into(),
         };
-        let mut configured = Request::new(reservation.clone());
+        let mut configured = Request::new(claim.clone());
         configured
             .metadata_mut()
             .insert("x-principal", "Gateway-Prod".parse().unwrap());
@@ -22012,23 +18283,41 @@ mod tests {
             .metadata_mut()
             .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
         assert!(
-            svc.reserve_gateway_request_alias(configured)
+            svc.claim_gateway_dispatch(configured)
                 .await
                 .unwrap()
                 .into_inner()
-                .reserved
+                .claimed
         );
 
-        let mut intruder = Request::new(ReserveGatewayRequestAliasRequest {
+        let mut replay = Request::new(ClaimGatewayDispatchRequest {
+            dispatch_token: "dispatch-2".into(),
+            ..claim.clone()
+        });
+        replay
+            .metadata_mut()
+            .insert("x-principal", "Gateway-Prod".parse().unwrap());
+        replay
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+        assert!(
+            !svc.claim_gateway_dispatch(replay)
+                .await
+                .unwrap()
+                .into_inner()
+                .claimed
+        );
+
+        let mut intruder = Request::new(ClaimGatewayDispatchRequest {
             request_alias: "attempt-2".into(),
             request_id: "request-2".into(),
-            ..reservation
+            ..claim
         });
         intruder
             .metadata_mut()
             .insert("x-principal", "agent:intruder".parse().unwrap());
         assert_eq!(
-            svc.reserve_gateway_request_alias(intruder)
+            svc.claim_gateway_dispatch(intruder)
                 .await
                 .unwrap_err()
                 .code(),
@@ -22037,7 +18326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_gateway_principal_can_run_pipeline_with_delegated_membership() {
+    async fn internal_gateway_pipeline_honors_delegated_membership() {
         let mut svc = memory_service();
         svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
         svc.db
@@ -22081,527 +18370,24 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
-        let mut request = Request::new(RunPipelineRequest {
-            request: Some(PipelineRequest {
-                request_id: "gateway-observation".into(),
-                namespace: "acme".into(),
-                spec: "inspect asset:DELEGATED".into(),
-                ..Default::default()
-            }),
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        request
-            .metadata_mut()
-            .insert(DELEGATED_PRINCIPAL_HEADER, "alice".parse().unwrap());
-        let response = svc.run_pipeline(request).await.unwrap().into_inner();
+        let response = svc
+            .gateway_pipeline_decision(GatewayPipelineInput {
+                actor: "chisei-gateway",
+                delegated_principal: Some("alice"),
+                request_id: "gateway-observation",
+                namespace: "acme",
+                spec: "inspect asset:DELEGATED",
+                model: "native-default",
+                runtime: "native",
+                task_class: "",
+            })
+            .unwrap();
         assert!(
             response
-                .result
-                .unwrap()
+                .run
                 .prepared_spec
                 .contains("delegated context value")
         );
-    }
-
-    #[tokio::test]
-    async fn plan_execution_persists_causal_receipt_with_authenticated_actor() {
-        let mut svc = memory_service();
-        svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
-        svc.db
-            .create_object(&Object {
-                id: "receipt-namespace".into(),
-                kind: "namespace".into(),
-                name: "Receipt namespace".into(),
-                namespace: String::new(),
-                external_id: "namespace:receipt-ns".into(),
-                properties: HashMap::new(),
-                created: 1,
-                updated: 1,
-            })
-            .unwrap();
-        svc.db
-            .create_grant(&crate::sekai::security::Grant {
-                id: "receipt-namespace-authenticated".into(),
-                object_id: "receipt-namespace".into(),
-                principal: "agent:authenticated".into(),
-                role: crate::sekai::security::Role::Viewer,
-                created: 1,
-            })
-            .unwrap();
-        let mut request = Request::new(PlanExecutionRequest {
-            input: Some(ExecutionInput {
-                request_id: "receipt-task-1".into(),
-                namespace: "receipt-ns".into(),
-                spec: "summarize governed context".into(),
-                preferred_model: "native-default".into(),
-                preferred_runtime: "kiro".into(),
-                task_type: "summary".into(),
-                priority: 0,
-                user_id: "caller-supplied-actor".into(),
-                estimated_tokens: 0,
-                messages: vec![],
-                tools: vec![],
-                system: "do not disclose raw context".into(),
-                max_tokens: 128,
-                task_class: String::new(),
-                logical_operation_id: "external-operation-7".into(),
-                attempt_id: "retry-b".into(),
-                route_override: String::new(),
-            }),
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "agent:authenticated".parse().unwrap());
-        let plan = svc
-            .plan_execution(request)
-            .await
-            .unwrap()
-            .into_inner()
-            .plan
-            .unwrap();
-
-        let receipt = svc
-            .db
-            .get_operation_receipt(&plan.plan_id)
-            .unwrap()
-            .expect("planned receipt");
-        assert_eq!(receipt.initiating_actor, "agent:authenticated");
-        assert_eq!(receipt.operation_id, plan.plan_id);
-        assert_eq!(receipt.namespace, "receipt-ns");
-        let intent = receipt
-            .events
-            .iter()
-            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
-            .unwrap();
-        assert_eq!(
-            intent.attributes["logical_operation_id"],
-            "external-operation-7"
-        );
-        assert_eq!(intent.attributes["attempt_id"], "retry-b");
-        assert!(receipt.completed_at_ms.is_none());
-        assert!(!receipt.completeness().complete);
-        assert!(receipt.events.iter().all(|event| {
-            event.operation_id == receipt.operation_id
-                && !event.attributes.values().any(|value| {
-                    value.contains("summarize governed context")
-                        || value.contains("do not disclose raw context")
-                })
-        }));
-
-        let mut without_canonical_egress = svc
-            .db
-            .get_operation_receipt(&plan.plan_id)
-            .unwrap()
-            .unwrap();
-        without_canonical_egress
-            .events
-            .retain(|event| event.kind != ReceiptEventKind::EgressDecided);
-        svc.db
-            .put_operation_receipt(&without_canonical_egress)
-            .unwrap();
-        svc.db
-            .append_operation_receipt_event(
-                &plan.plan_id,
-                OperationReceiptEvent {
-                    event_id: format!("report:{}:tool-egress", plan.plan_id),
-                    operation_id: plan.plan_id.clone(),
-                    parent_event_id: Some(format!("{}:budget", plan.plan_id)),
-                    timestamp_ms: plan.created_at,
-                    kind: ReceiptEventKind::ActionPerformed,
-                    surface: ReceiptSurface::Action,
-                    actor: "agent:authenticated".into(),
-                    references: vec![],
-                    attributes: BTreeMap::new(),
-                },
-            )
-            .unwrap();
-
-        svc.record_completed_operation(
-            &plan,
-            "agent:authenticated",
-            &PlannedChatResponse {
-                content: "private response body".into(),
-                tool_calls: Vec::new(),
-                input_tokens: 10,
-                output_tokens: 4,
-                stop_reason: "end_turn".into(),
-                provider: "native".into(),
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: 0,
-            },
-            plan.created_at,
-            plan.created_at,
-        )
-        .unwrap();
-        let completed = svc
-            .db
-            .get_operation_receipt(&plan.plan_id)
-            .unwrap()
-            .expect("completed receipt");
-        assert!(completed.completeness().complete);
-        assert_eq!(completed.completed_at_ms, Some(plan.created_at));
-        assert!(completed.events.iter().any(|event| {
-            event.kind == ReceiptEventKind::OutcomeRecorded
-                && event.parent_event_id.as_deref()
-                    == Some(format!("{}:verification", plan.plan_id).as_str())
-        }));
-        assert!(completed.events.iter().any(|event| {
-            event.event_id.ends_with(":attempt-1")
-                && event.timestamp_ms == plan.created_at
-                && event.parent_event_id.as_deref()
-                    == Some(format!("{}:budget", plan.plan_id).as_str())
-        }));
-        assert!(completed.events.iter().all(|event| {
-            !event
-                .attributes
-                .values()
-                .any(|value| value.contains("private response body"))
-        }));
-        let mut gateway_request = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "gateway-receipt-audit".into(),
-                timestamp: plan.created_at + 26,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "gateway operation completed".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        gateway_request
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        let local_write = svc.record_gateway_audit(gateway_request).await.unwrap_err();
-        assert_eq!(local_write.code(), tonic::Code::PermissionDenied);
-
-        svc.config.insecure = true;
-        let mut insecure_gateway_replay = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "gateway-receipt-insecure-local-replay".into(),
-                timestamp: plan.created_at + 26,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "insecure local gateway replay".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        insecure_gateway_replay
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        insecure_gateway_replay
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
-        svc.record_gateway_audit(insecure_gateway_replay)
-            .await
-            .unwrap();
-        svc.config.insecure = false;
-
-        let mut root_replay = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "gateway-receipt-root-replay".into(),
-                timestamp: plan.created_at + 27,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "legacy root gateway replay".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        root_replay
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        let spoofed_root = svc.record_gateway_audit(root_replay).await.unwrap_err();
-        assert_eq!(spoofed_root.code(), tonic::Code::PermissionDenied);
-
-        let mut root_replay = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "gateway-receipt-root-token-replay".into(),
-                timestamp: plan.created_at + 27,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "authenticated root gateway replay".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        root_replay
-            .metadata_mut()
-            .insert("x-principal", "root".parse().unwrap());
-        root_replay
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-        svc.record_gateway_audit(root_replay).await.unwrap();
-
-        let mut configured_gateway_replay = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "gateway-receipt-configured-replay".into(),
-                timestamp: plan.created_at + 27,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "configured gateway replay".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        configured_gateway_replay
-            .metadata_mut()
-            .insert("x-principal", "Gateway-Prod".parse().unwrap());
-        configured_gateway_replay
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-        svc.record_gateway_audit(configured_gateway_replay)
-            .await
-            .unwrap();
-
-        let mut forged_request = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "forged-gateway-receipt".into(),
-                timestamp: plan.created_at + 27,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "forged".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&completed).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        forged_request
-            .metadata_mut()
-            .insert("x-principal", "agent:intruder".parse().unwrap());
-        forged_request
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-        let unauthorized = svc.record_gateway_audit(forged_request).await.unwrap_err();
-        assert_eq!(unauthorized.code(), tonic::Code::PermissionDenied);
-
-        let mut conflicting = completed.clone();
-        conflicting.namespace = "forged-namespace".into();
-        let mut conflicting_request = Request::new(RecordGatewayAuditRequest {
-            event: Some(GatewayAuditEvent {
-                id: "conflicting-gateway-receipt".into(),
-                timestamp: plan.created_at + 28,
-                actor: "agent:authenticated".into(),
-                action: GATEWAY_RECEIPT_ACTION.into(),
-                reason: "conflicting replay".into(),
-                evidence: HashMap::from([(
-                    "receipt_json".into(),
-                    serde_json::to_string(&conflicting).unwrap(),
-                )]),
-                target_id: plan.plan_id.clone(),
-                outcome: "recorded".into(),
-            }),
-        });
-        conflicting_request
-            .metadata_mut()
-            .insert("x-principal", "chisei-gateway".parse().unwrap());
-        conflicting_request
-            .metadata_mut()
-            .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-        let conflict = svc
-            .record_gateway_audit(conflicting_request)
-            .await
-            .unwrap_err();
-        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
-
-        let authorization = || {
-            let mut request = Request::new(AuthorizeOperationReporterRequest {
-                operation_id: plan.plan_id.clone(),
-                principal: "agent:reporter".into(),
-                event_kinds: vec!["action_performed".into()],
-            });
-            request
-                .metadata_mut()
-                .insert("x-principal", "agent:authenticated".parse().unwrap());
-            request
-                .metadata_mut()
-                .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-            request
-        };
-        let first_authorization = svc
-            .authorize_operation_reporter(authorization())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(first_authorization.authorized);
-        assert!(first_authorization.changed);
-        let replayed_authorization = svc
-            .authorize_operation_reporter(authorization())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(replayed_authorization.authorized);
-        assert!(!replayed_authorization.changed);
-        let report = || {
-            let mut request = Request::new(ReportOperationEventRequest {
-                operation_id: plan.plan_id.clone(),
-                event_id: format!("report:{}:reported-action", plan.plan_id),
-                parent_event_id: format!("{}:outcome", plan.plan_id),
-                timestamp_ms: plan.created_at,
-                kind: "action_performed".into(),
-                attributes: HashMap::from([("action_type".into(), "tool.read".into())]),
-                references: vec![],
-            });
-            request
-                .metadata_mut()
-                .insert("x-principal", "agent:reporter".parse().unwrap());
-            request
-                .metadata_mut()
-                .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-            request
-        };
-        let first = svc
-            .report_operation_event(report())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(first.recorded);
-        assert!(first.complete);
-        let replay = svc
-            .report_operation_event(report())
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!replay.recorded);
-        let mut colliding_report = report();
-        colliding_report.get_mut().event_id = format!("{}:outcome", plan.plan_id);
-        let collision = svc
-            .report_operation_event(colliding_report)
-            .await
-            .unwrap_err();
-        assert_eq!(collision.code(), tonic::Code::InvalidArgument);
-        let updated = svc
-            .db
-            .get_operation_receipt(&plan.plan_id)
-            .unwrap()
-            .unwrap();
-        assert!(updated.events.iter().any(|event| {
-            event.event_id.ends_with(":reported-action")
-                && event.actor == "agent:reporter"
-                && event.timestamp_ms == plan.created_at
-        }));
-        let terminal_conflict = svc
-            .db
-            .append_operation_receipt_event(
-                &plan.plan_id,
-                OperationReceiptEvent {
-                    event_id: format!("report:{}:late-outcome", plan.plan_id),
-                    operation_id: plan.plan_id.clone(),
-                    parent_event_id: Some(format!("report:{}:reported-action", plan.plan_id)),
-                    timestamp_ms: plan.created_at,
-                    kind: ReceiptEventKind::OutcomeRecorded,
-                    surface: ReceiptSurface::Outcome,
-                    actor: "agent:authenticated".into(),
-                    references: vec![],
-                    attributes: BTreeMap::new(),
-                },
-            )
-            .unwrap_err();
-        assert!(terminal_conflict.contains("terminal outcome"));
-
-        let mut get_request = Request::new(GetOperationReceiptRequest {
-            operation_id: plan.plan_id.clone(),
-            request_id: String::new(),
-            caller_scope: String::new(),
-            attempt: 0,
-        });
-        get_request
-            .metadata_mut()
-            .insert("x-principal", "agent:reporter".parse().unwrap());
-        let reporter_read = svc.get_operation_receipt(get_request).await.unwrap_err();
-        assert_eq!(reporter_read.code(), tonic::Code::PermissionDenied);
-
-        let mut initiator_get = Request::new(GetOperationReceiptRequest {
-            operation_id: plan.plan_id.clone(),
-            request_id: String::new(),
-            caller_scope: String::new(),
-            attempt: 0,
-        });
-        initiator_get
-            .metadata_mut()
-            .insert("x-principal", "agent:authenticated".parse().unwrap());
-        let retrieved = svc
-            .get_operation_receipt(initiator_get)
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(retrieved.complete);
-        assert!(retrieved.receipt_json.contains(":reported-action"));
-        assert!(
-            svc.get_operation_receipt(Request::new(GetOperationReceiptRequest {
-                operation_id: plan.plan_id.clone(),
-                request_id: String::new(),
-                caller_scope: String::new(),
-                attempt: 0,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .complete
-        );
-
-        let mut denied_get = Request::new(GetOperationReceiptRequest {
-            operation_id: plan.plan_id.clone(),
-            request_id: String::new(),
-            caller_scope: String::new(),
-            attempt: 0,
-        });
-        denied_get
-            .metadata_mut()
-            .insert("x-principal", "agent:intruder".parse().unwrap());
-        let denied = svc.get_operation_receipt(denied_get).await.unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-
-        let mut configured_writer_get = Request::new(GetOperationReceiptRequest {
-            operation_id: plan.plan_id.clone(),
-            request_id: String::new(),
-            caller_scope: String::new(),
-            attempt: 0,
-        });
-        configured_writer_get
-            .metadata_mut()
-            .insert("x-principal", "Gateway-Prod".parse().unwrap());
-        let denied = svc
-            .get_operation_receipt(configured_writer_get)
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-
-        let mut unauthorized_report = report();
-        unauthorized_report.get_mut().event_id = format!("report:{}:forged-action", plan.plan_id);
-        unauthorized_report
-            .metadata_mut()
-            .insert("x-principal", "agent:intruder".parse().unwrap());
-        let denied = svc
-            .report_operation_event(unauthorized_report)
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]
@@ -22825,22 +18611,20 @@ mod tests {
     #[tokio::test]
     async fn execute_plan_rechecks_regression_gate() {
         let svc = memory_service();
-        create_suite(&svc, "context-a").await;
+        create_suite(&svc, "context-a");
 
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "skills/context-a.md",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "skills/context-a.md",
+            "hash-b",
+        );
 
         let mut plan = svc
             .plan_execution(Request::new(PlanExecutionRequest {
@@ -22861,6 +18645,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -22885,23 +18670,21 @@ mod tests {
     #[tokio::test]
     async fn eval_regressed_context_is_force_sampled_and_audited() {
         let svc = memory_service();
-        create_suite(&svc, "context-a").await;
+        create_suite(&svc, "context-a");
 
         // Two runs whose drop trips the regression signal for context-a.
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "skills/context-a.md",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "skills/context-a.md",
+            "hash-b",
+        );
 
         let plan = svc
             .plan_execution(Request::new(PlanExecutionRequest {
@@ -22922,6 +18705,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -22993,6 +18777,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -23187,6 +18972,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .expect_err("unsafe provider should be rejected for sensitive private work");
@@ -23277,6 +19063,7 @@ mod tests {
                     task_class: "template_only".into(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -23356,6 +19143,7 @@ mod tests {
                     task_class: "template_only".into(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -23400,183 +19188,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_egress_denies_sensitive_private_unsafe_provider() {
-        let svc = memory_service();
-        svc.policy.set_namespace_policy(
-            "alpha",
-            crate::chisei::policy::Policy {
-                allowed_runtimes: vec![],
-                allowed_models: vec![],
-                default_runtime: "kiro".into(),
-                default_model: "native-default".into(),
-                data_class: "sensitive".into(),
-            },
-        );
-
-        let response = svc
-            .check_egress(Request::new(CheckEgressRequest {
-                namespace: "alpha".into(),
-                payload: "generic payload".into(),
-                provider: "native".into(),
-                task_class: String::new(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-
-        assert!(!response.allowed);
-        assert_eq!(response.policy_version.len(), 64);
-        assert!(response.findings.iter().any(|decision| {
-            decision
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("privacy gate"))
-        }));
-    }
-
-    fn request_as<T>(message: T, principal: &'static str) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert("x-principal", principal.parse().unwrap());
-        request
-    }
-
-    #[tokio::test]
-    async fn namespace_scoped_analytics_deny_ungranted_principals() {
-        let svc = memory_service();
-
-        let check_egress = svc
-            .check_egress(request_as(
-                CheckEgressRequest {
-                    namespace: "private".into(),
-                    ..Default::default()
-                },
-                "mallory",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(check_egress.code(), tonic::Code::PermissionDenied);
-
-        let affinity = svc
-            .get_affinity(request_as(
-                GetAffinityRequest {
-                    namespace: "private".into(),
-                },
-                "mallory",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(affinity.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn evolution_reads_and_writes_deny_cross_namespace_principals() {
-        let svc = memory_service();
-        svc.record_evolve_task(
-            "private-task",
-            "private",
-            "sensitive specification",
-            None,
-            "failed",
-            10,
-        )
-        .unwrap();
-
-        let suggest = svc
-            .evolve_suggest(request_as(
-                EvolveSuggestRequest {
-                    request_id: "private-task".into(),
-                },
-                "mallory",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(suggest.code(), tonic::Code::PermissionDenied);
-
-        let recommend = svc
-            .evolve_recommend(request_as(
-                EvolveRecommendRequest {
-                    request_id: "private-task".into(),
-                },
-                "mallory",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(recommend.code(), tonic::Code::PermissionDenied);
-
-        let enhance = svc
-            .evolve_enhance(request_as(
-                EvolveEnhanceRequest {
-                    request_id: "private-task".into(),
-                    spec: "attacker input".into(),
-                },
-                "mallory",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(enhance.code(), tonic::Code::PermissionDenied);
-        assert!(
-            !svc.db
-                .list_evolve_enhancements()
-                .unwrap()
-                .contains_key("private-task")
-        );
-    }
-
-    #[tokio::test]
-    async fn global_evolution_analytics_require_control_plane_admin() {
-        let svc = memory_service();
-
-        assert_eq!(
-            svc.evolve_report(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(
-            svc.evolve_patterns(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(
-            svc.evolve_variance(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(
-            svc.evolve_ab_results(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(
-            svc.evolve_templates(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(
-            svc.evolve_enhance(request_as(Default::default(), "mallory"))
-                .await
-                .unwrap_err()
-                .code(),
-            tonic::Code::PermissionDenied
-        );
-
-        svc.evolve_report(request_as(Default::default(), "root"))
-            .await
-            .expect("root retains global evolution reporting access");
-    }
-
-    #[tokio::test]
     async fn execute_plan_rejects_after_policy_flips_sensitive() {
         let svc = memory_service();
         let plan = svc
@@ -23598,6 +19209,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -23658,6 +19270,7 @@ mod tests {
                     max_tokens: 512,
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -23775,6 +19388,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         svc.cache_plan(plan.clone());
 
@@ -23893,6 +19507,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         svc.cache_plan(plan.clone());
 
@@ -23914,22 +19529,20 @@ mod tests {
             uuid::Uuid::new_v4()
         );
         let svc = file_service(&path);
-        create_suite(&svc, "context-a").await;
+        create_suite(&svc, "context-a");
 
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-1", "suite-1", 92, 100)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-a".into(),
-        }))
-        .await
-        .unwrap();
-        svc.create_eval_run(Request::new(CreateEvalRunRequest {
-            run: Some(eval_run("run-2", "suite-1", 60, 200)),
-            changed_file: "skills/context-a.md".into(),
-            diff_hash: "hash-b".into(),
-        }))
-        .await
-        .unwrap();
+        seed_eval_run(
+            &svc,
+            eval_run("run-1", "suite-1", 92, 100),
+            "skills/context-a.md",
+            "hash-a",
+        );
+        seed_eval_run(
+            &svc,
+            eval_run("run-2", "suite-1", 60, 200),
+            "skills/context-a.md",
+            "hash-b",
+        );
 
         svc.db
             .conn()
@@ -23957,6 +19570,7 @@ mod tests {
                     task_class: String::new(),
                     ..Default::default()
                 }),
+                gunshi_allocation: None,
             }))
             .await
             .unwrap()
@@ -24015,6 +19629,7 @@ mod tests {
                 context_tokens: 0,
                 context_projection_latency_ms: 0,
                 context_truncated: false,
+                ..Default::default()
             });
         }
         let newest = ExecutionPlan {
@@ -24058,6 +19673,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         svc.cache_plan(newest.clone());
 
@@ -24115,6 +19731,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         let fresh = ExecutionPlan {
             plan_id: "plan-fresh".into(),
@@ -24178,6 +19795,7 @@ mod tests {
                 context_tokens: 0,
                 context_projection_latency_ms: 0,
                 context_truncated: false,
+                ..Default::default()
             });
         }
         let inserted = ExecutionPlan {
@@ -24221,6 +19839,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         svc.cache_plan(inserted.clone());
 
@@ -24273,6 +19892,7 @@ mod tests {
             route_override: String::new(),
             capability_requirements_json: Vec::new(),
             expected_calls: 1,
+            pipeline_spec: "summarize team-a".into(),
         });
         admit
             .metadata_mut()
@@ -24294,6 +19914,8 @@ mod tests {
         assert!(!admitted.eval_regressed);
         assert!(admitted.deny_reason.is_empty());
         assert!(!admitted.budget_grant_id.is_empty());
+        assert!(admitted.sampling_evaluated);
+        assert!(!admitted.prepared_spec.is_empty());
 
         svc.policy
             .set_context_admission_policy(
@@ -24337,6 +19959,7 @@ mod tests {
             route_override: String::new(),
             capability_requirements_json: Vec::new(),
             expected_calls: 1,
+            pipeline_spec: String::new(),
         });
         context_denied
             .metadata_mut()
@@ -24386,6 +20009,7 @@ mod tests {
             route_override: String::new(),
             capability_requirements_json: Vec::new(),
             expected_calls: 2,
+            pipeline_spec: String::new(),
         });
         request_budget_denied
             .metadata_mut()
@@ -24420,6 +20044,7 @@ mod tests {
             route_override: String::new(),
             capability_requirements_json: Vec::new(),
             expected_calls: 1,
+            pipeline_spec: String::new(),
         });
         denied
             .metadata_mut()
@@ -24507,6 +20132,7 @@ mod tests {
             context_tokens: 0,
             context_projection_latency_ms: 0,
             context_truncated: false,
+            ..Default::default()
         };
         svc.record_planned_operation(&plan, "local").unwrap();
         svc.cache_plan(plan.clone());

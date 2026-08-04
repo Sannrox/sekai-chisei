@@ -1,10 +1,9 @@
 pub mod chisei_service;
 pub mod client;
-mod llm_service;
+mod provider_execution;
 pub mod sekai_service;
 
 pub mod pb {
-    pub(super) use sekai_proto::llm;
     pub use sekai_proto::{chisei, sekai};
 }
 
@@ -24,7 +23,6 @@ use crate::runtime_backend::RuntimeBackend;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
 use std::convert::Infallible;
-use subtle::ConstantTimeEq;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::server::NamedService;
@@ -45,20 +43,11 @@ pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
-    legacy_root_token: Option<String>,
 }
 
 impl TokenAuthInterceptor {
-    pub fn new(
-        store: Arc<PrincipalCredentialStore>,
-        db: Arc<RuntimeDb>,
-        legacy_root_token: Option<String>,
-    ) -> Self {
-        Self {
-            store,
-            db,
-            legacy_root_token,
-        }
+    pub fn new(store: Arc<PrincipalCredentialStore>, db: Arc<RuntimeDb>) -> Self {
+        Self { store, db }
     }
 
     /// Resolve a raw bearer token to an active principal credential.
@@ -69,21 +58,6 @@ impl TokenAuthInterceptor {
     pub fn resolve_credential(&self, token: &str) -> Option<PrincipalCredential> {
         self.store.maybe_reload(&self.db);
         let token_hash = hash_gateway_key(token);
-
-        if let Some(principal) = self.legacy_root_token.as_ref()
-            && token.as_bytes().ct_eq(principal.as_bytes()).into()
-        {
-            return Some(PrincipalCredential {
-                id: "legacy-root".into(),
-                principal: "root".into(),
-                token_hash,
-                status: "active".into(),
-                created: 0,
-                rotated_at: 0,
-                revoked_at: 0,
-                tenant_id: String::new(),
-            });
-        }
 
         // Recheck durable state for every authentication. The cache accelerates
         // startup discovery but never extends a rotated or revoked credential.
@@ -253,30 +227,21 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ReleaseLease"
             | "TakeoverExpiredLease"
             | "CreateObject"
-            | "GuardedCreateObject"
             | "GetObject"
             | "UpdateObject"
-            | "GuardedUpdateObject"
             | "DeleteObject"
-            | "GuardedDeleteObject"
             | "ListObjects"
             | "FindByExternalId"
             | "FindByProperty"
-            | "ResolveObjectSet"
             | "CreateLink"
             | "DeleteLink"
             | "GetLinks"
             | "GetLinkedObjects"
             | "Traverse"
             | "ListObjectChanges"
-            | "ApplyGovernedFactProfile"
-            | "PutGovernedFactVersion"
             | "GetGovernedFactVersion"
-            | "PutGovernedWaiverVersion"
-            | "GetGovernedWaiverVersion"
             | "ResolveInvariantSet"
             | "PlanExecution"
-            | "ExecutePlan"
             | "ExecutePlanStream"
     )
 }
@@ -405,7 +370,6 @@ pub fn run(
                 db.clone(),
                 provider_registry_state_path.clone(),
                 credential_store.clone(),
-                config.auth_token.clone(),
             )
             .await?;
         }
@@ -420,11 +384,7 @@ pub fn run(
                 chisei_svc.clone(),
                 LocalOrTokenAuthInterceptor {
                     local: LocalInterceptor::new(false),
-                    token: TokenAuthInterceptor::new(
-                        credential_store.clone(),
-                        db.clone(),
-                        config.auth_token.clone(),
-                    ),
+                    token: TokenAuthInterceptor::new(credential_store.clone(), db.clone()),
                 },
                 health_service.clone(),
             );
@@ -451,7 +411,7 @@ pub fn run(
 
         if !tcp_mode.token_auth_mode && !config.insecure {
             return Err(std::io::Error::other(
-                "SEKAI_AUTH_TOKEN must be set, or set SEKAI_INSECURE=1 for local dev",
+                "create a principal credential before enabling TCP, or set SEKAI_INSECURE=1 for local development",
             )
             .into());
         }
@@ -540,7 +500,7 @@ where
             config,
             sekai_svc,
             chisei_svc,
-            TokenAuthInterceptor::new(credential_store, db, config.auth_token.clone()),
+            TokenAuthInterceptor::new(credential_store, db),
             health_service,
         )
         .await
@@ -814,8 +774,7 @@ mod tests {
     fn token_auth_interceptor_enforces_missing_authorization() {
         let db = in_memory_db();
         let store = Arc::new(PrincipalCredentialStore::new());
-        let mut interceptor =
-            TokenAuthInterceptor::new(store, db, Some("legacy-root-token".to_string()));
+        let mut interceptor = TokenAuthInterceptor::new(store, db);
 
         let request = Request::new(());
         assert!(interceptor.call(request).is_err());
@@ -903,7 +862,7 @@ mod tests {
             .unwrap(),
         )));
         let mut interceptor =
-            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
+            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db);
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -928,7 +887,7 @@ mod tests {
             .unwrap(),
         )));
         let mut interceptor =
-            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db, None);
+            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db);
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -954,17 +913,9 @@ mod tests {
     #[test]
     fn enterprise_allowlist_includes_governed_facts_and_native_execution() {
         for method in [
-            "GuardedCreateObject",
-            "GuardedUpdateObject",
-            "GuardedDeleteObject",
-            "ApplyGovernedFactProfile",
-            "PutGovernedFactVersion",
             "GetGovernedFactVersion",
-            "PutGovernedWaiverVersion",
-            "GetGovernedWaiverVersion",
             "ResolveInvariantSet",
             "PlanExecution",
-            "ExecutePlan",
             "ExecutePlanStream",
         ] {
             assert!(enterprise_namespace_method(method));
@@ -982,11 +933,7 @@ mod tests {
         let credentials = db.list_active_credentials().unwrap();
         store.load(&credentials);
 
-        let mut interceptor = TokenAuthInterceptor::new(
-            Arc::new(store),
-            db.clone(),
-            Some("legacy-root-token".to_string()),
-        );
+        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db.clone());
 
         let mut request = Request::new(());
         request.metadata_mut().insert(
@@ -1030,93 +977,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any())]
-    fn tenant_scoped_credentials_fail_closed_on_uncovered_rpcs() {
-        let db = in_memory_db();
-        let store = PrincipalCredentialStore::new();
-        let token = hash_gateway_key("tenant-client-token");
-        let tenant = db.create_tenant("root", "tenant-auth-a", 1).unwrap();
-        db.create_tenant_credential(&tenant.id, "agent-a", &token, "root", true, 2)
-            .unwrap();
-        store.load(&db.list_active_credentials().unwrap());
-        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::from_static("Bearer tenant-client-token"),
-        );
-        request.extensions_mut().insert(tonic::GrpcMethod::new(
-            "sekai.SekaiService",
-            "ExecuteFunction",
-        ));
-        assert_eq!(
-            interceptor.call(request).unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn token_auth_interceptor_derives_tenant_from_credential_and_overwrites_forgery() {
-        let db = in_memory_db();
-        let store = PrincipalCredentialStore::new();
-        let token = hash_gateway_key("tenant-client-token");
-        let tenant = db.create_tenant("root", "tenant-auth-b", 1).unwrap();
-        db.create_tenant_credential(&tenant.id, "agent-a", &token, "root", true, 2)
-            .unwrap();
-        store.load(&db.list_active_credentials().unwrap());
-        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db, None);
-
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::from_static("Bearer tenant-client-token"),
-        );
-        request.metadata_mut().insert(
-            TENANT_CONTEXT_HEADER,
-            MetadataValue::from_static("tenant_forged"),
-        );
-        request
-            .extensions_mut()
-            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
-        let request = interceptor.call(request).unwrap();
-        assert_eq!(
-            request
-                .metadata()
-                .get(TENANT_CONTEXT_HEADER)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            tenant.id.as_str()
-        );
-    }
-
-    #[test]
-    fn token_auth_interceptor_supports_legacy_root_token() {
-        let db = in_memory_db();
-        let store = Arc::new(PrincipalCredentialStore::new());
-        let mut interceptor =
-            TokenAuthInterceptor::new(store, db, Some("legacy-root-token".to_string()));
-
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            "authorization",
-            MetadataValue::from_static("legacy-root-token"),
-        );
-        let request = interceptor.call(request).unwrap();
-
-        assert_eq!(
-            request
-                .metadata()
-                .get("x-principal")
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "root"
-        );
-    }
-
-    #[test]
     fn uds_interceptor_authenticates_bearer_tokens() {
         let db = in_memory_db();
         let store = PrincipalCredentialStore::new();
@@ -1126,7 +986,7 @@ mod tests {
         store.load(&db.list_active_credentials().unwrap());
         let mut interceptor = LocalOrTokenAuthInterceptor {
             local: LocalInterceptor::new(false),
-            token: TokenAuthInterceptor::new(Arc::new(store), db, None),
+            token: TokenAuthInterceptor::new(Arc::new(store), db),
         };
 
         let mut request = Request::new(());

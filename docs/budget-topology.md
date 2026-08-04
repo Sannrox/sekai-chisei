@@ -17,7 +17,7 @@ Single-region multi-replica baseline: [replica-safety.md](replica-safety.md)
 ## Authority
 
 - **Single writer per budget scope** (home pin or single-region store).
-- Gateway `CheckBudget`, fat-decide budget admission, and execution reserve share the same `BudgetTracker` / shared-store APIs. There is no process-local or region-shadow ledger for durable spend.
+- Gateway fat-decide admission and execution reserve share the same `BudgetTracker` / shared-store APIs. There is no process-local or region-shadow ledger for durable spend.
 - Auto-allocation / Gunshi budget hard limits that consult control-plane budgets must use that same tracker path when wired to the plane.
 - Transfer is a **rare admin path**: move of limit/capacity between homes, not two-phase commit on every request.
 

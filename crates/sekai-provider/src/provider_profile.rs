@@ -262,11 +262,7 @@ pub fn refresh_provider_registry(path: &Path) -> Result<(), String> {
 fn load_provider_registry_snapshot(path: &Path) -> Result<ProviderRegistry, String> {
     let locks = open_registry_locks(path)?;
     locks.lock()?;
-    let registry = read_or_initialize_provider_registry(
-        path,
-        locks.legacy_state_is_ambiguous()?,
-        legacy_registry_initialization_allowed(),
-    )?;
+    let registry = read_or_initialize_provider_registry(path, locks.legacy_state_is_ambiguous()?)?;
     Ok(registry)
 }
 
@@ -372,11 +368,8 @@ fn update_registry_lifecycle_with_expected_version(
     validate_lifecycle_update_fields(target_kind, target, state, actor, reason)?;
     let locks = open_registry_locks(state_path)?;
     locks.lock()?;
-    let mut registry = read_or_initialize_provider_registry(
-        state_path,
-        locks.legacy_state_is_ambiguous()?,
-        legacy_registry_initialization_allowed(),
-    )?;
+    let mut registry =
+        read_or_initialize_provider_registry(state_path, locks.legacy_state_is_ambiguous()?)?;
     if expected_state_version.is_some_and(|expected| registry.state_version != expected) {
         return Err("provider registry changed after lifecycle preconditions were verified".into());
     }
@@ -474,7 +467,7 @@ pub async fn update_registry_lifecycle_async(
 fn read_provider_registry(path: &Path) -> Result<ProviderRegistry, String> {
     let locks = open_registry_locks(path)?;
     locks.lock()?;
-    read_or_initialize_provider_registry(path, locks.legacy_state_is_ambiguous()?, false)
+    read_or_initialize_provider_registry(path, locks.legacy_state_is_ambiguous()?)
 }
 
 struct ProviderRegistryLocks {
@@ -733,7 +726,6 @@ fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
 fn read_or_initialize_provider_registry(
     path: &Path,
     legacy_lock_exists: bool,
-    allow_legacy_initialization: bool,
 ) -> Result<ProviderRegistry, String> {
     let initialization_path = registry_initialization_path(path);
     let initialized = registry_initialization_marker_exists(&initialization_path)?;
@@ -744,25 +736,17 @@ fn read_or_initialize_provider_registry(
             }
             Ok(registry)
         }
-        Err(error)
-            if !initialized
-                && is_missing_registry_error(&error)
-                && (!legacy_lock_exists || allow_legacy_initialization) =>
-        {
+        Err(error) if !initialized && is_missing_registry_error(&error) && !legacy_lock_exists => {
             let registry = ProviderRegistry::built_in();
             write_provider_registry_state(path, &registry)?;
             write_registry_initialization_marker(&initialization_path)?;
             Ok(registry)
         }
         Err(error) if !initialized && is_missing_registry_error(&error) => Err(format!(
-            "{error}; legacy lock state is ambiguous, recover the state file or set CHISEI_PROVIDER_REGISTRY_ALLOW_LEGACY_INITIALIZATION=1 once"
+            "{error}; unsupported pre-1.0 lock state is ambiguous; export and recreate the provider registry"
         )),
         Err(error) => Err(error),
     }
-}
-
-fn legacy_registry_initialization_allowed() -> bool {
-    std::env::var("CHISEI_PROVIDER_REGISTRY_ALLOW_LEGACY_INITIALIZATION").as_deref() == Ok("1")
 }
 
 fn read_provider_registry_unlocked(path: &Path) -> Result<ProviderRegistry, String> {
@@ -2920,7 +2904,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_empty_lock_requires_explicit_state_initialization() {
+    fn legacy_empty_lock_is_rejected() {
         let directory = std::env::temp_dir().join(format!(
             "sekai-provider-registry-legacy-lock-{}",
             uuid::Uuid::new_v4()
@@ -2929,19 +2913,9 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         File::create(registry_legacy_lock_path(&path)).unwrap();
 
-        assert!(
-            read_provider_registry(&path)
-                .unwrap_err()
-                .contains("state is missing")
-        );
-        let locks = open_registry_locks(&path).unwrap();
-        locks.lock().unwrap();
-        assert!(locks.legacy_state_is_ambiguous().unwrap());
-        let initialized = read_or_initialize_provider_registry(&path, true, true).unwrap();
-
-        assert_eq!(initialized.state_version, 0);
-        assert!(path.exists());
-        assert!(registry_initialization_path(&path).exists());
+        let error = read_provider_registry(&path).unwrap_err();
+        assert!(error.contains("unsupported pre-1.0 lock state"));
+        assert!(!path.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2990,7 +2964,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .unwrap()
                 .unwrap_err()
-                .contains("legacy lock state is ambiguous")
+                .contains("unsupported pre-1.0 lock state")
         );
         reader.join().unwrap();
         std::fs::remove_dir_all(directory).unwrap();

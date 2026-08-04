@@ -24,7 +24,6 @@ pub fn router(
     db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
-    legacy_root_token: Option<String>,
 ) -> Router {
     let ops = Router::new()
         .route("/metrics", get(metrics))
@@ -37,7 +36,7 @@ pub fn router(
 
     let console = console::router(ConsoleState {
         db: db.clone(),
-        auth: crate::grpc::TokenAuthInterceptor::new(credential_store, db, legacy_root_token),
+        auth: crate::grpc::TokenAuthInterceptor::new(credential_store, db),
         sessions: Arc::new(SessionStore::new()),
         session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
     });
@@ -51,19 +50,13 @@ pub async fn bind_and_spawn(
     db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
-    legacy_root_token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::obs::metrics::handle();
     crate::obs::metrics::spawn_upkeep_task();
 
     let listener = TcpListener::bind((bind, port)).await?;
     let actual_addr = listener.local_addr()?;
-    let app = router(
-        db,
-        provider_registry_state_path,
-        credential_store,
-        legacy_root_token,
-    );
+    let app = router(db, provider_registry_state_path, credential_store);
 
     info!(
         addr = %actual_addr,

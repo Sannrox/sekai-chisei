@@ -39,7 +39,7 @@ then removes schema types hidden by schema ACLs, action types hidden by action
 ACLs or referenced hidden schemas, and actions currently denied by effective
 action policy. Denials use generic errors and do not include hidden names,
 schemas, lifecycle data, policy rules, or replacements. Discovery itself does
-not create audit decisions, receipts, or exported assurance records.
+not create audit decisions or receipts.
 
 Every response has `cache_scope = "authorization_context"`. Cache entries only
 for the exact authenticated principal set, namespace, contract version, and
@@ -83,20 +83,13 @@ results, truncation metadata, evidence references, and receipts only.
 
 | Capability | RPC / input type | Product tier | Purpose |
 | --- | --- | --- | --- |
-| `sekai.semantic.resolve_ref` | `ResolveSemanticRef` | **core** | Resolve an object (`object_id` / `external_id`) or ontology class/relation under live authorization. Absence and denial are indistinguishable (`resolved=false`). |
 | `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
 | `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
 | `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
-| `sekai.text.search` | `SearchText` | experimental | Search an authorization-built per-request SQLite FTS5 corpus and return `HybridCandidate` rows with `text.authorized_bm25/v1` scores. Hidden rows are excluded before ranking; similarity never mints identity. See [text-fts.md](text-fts.md). |
-| `sekai.hybrid.retrieve` | `HybridRetrieve` | experimental | Late-fuse explicit representations (`graph.retrieve_context`, `text.authorized`) under a versioned fusion profile (`late_fusion.rrf/v1`, `late_fusion.graph_priority/v1`, `late_fusion.identity/v1`). Returns mixed `HybridCandidate` rows plus per-adapter status; partial adapter failure does not drop healthy sides. Pure graph callers keep `RetrieveContext`. See [hybrid-retrieval.md](hybrid-retrieval.md). |
-| `sekai.pattern.execute` | `ExecutePatternPlan` | advanced | Execute a versioned multi-hop pattern plan (`pattern_plan/v1`) with hop-time ACL re-check and hard bounds. Denied intermediate hops fail closed as absence. See [pattern-plan.md](pattern-plan.md). |
-| `sekai.pattern.explain` | `ExplainPatternPlan` | advanced | Deterministic EXPLAIN of pattern plan shape (no graph side effects). Plan-time ontology name visibility applies. See [pattern-plan.md](pattern-plan.md). |
-| `sekai.scenario.evaluate` | `EvaluateScenario` | experimental | Evaluate a request-scoped non-authoritative scenario overlay over authorized graph projections and return a hypothesis-labeled, domain-neutral impact set. Never mutates canonical facts. See [scenario-overlay.md](scenario-overlay.md). |
 
 ### Product tier filter (core pack)
 
-Research [#383](research/383-core-product-interface.md) and feature #386 tag
-RPC inventories and catalog entries with `product_tier`: `core` | `advanced` |
+RPC inventories and catalog entries use `product_tier`: `core` | `advanced` |
 `experimental`. This is **orthogonal** to backend completeness
 (`complete_*_surfaces` in the RPC inventories).
 
@@ -109,8 +102,9 @@ DiscoverCapabilitiesRequest {
 }
 ```
 
-Empty `product_tier_filter` returns the full authorized catalog (previous
-behavior). Each `CapabilityEntry` also carries `product_tier` for client-side
+Empty `product_tier_filter` returns the stable core catalog. Use `all` to
+request the full authorized catalog, or name `advanced` or `experimental`
+explicitly. Each `CapabilityEntry` also carries `product_tier` for client-side
 filtering.
 
 Each entry advertises:
@@ -139,7 +133,7 @@ and non-durable.
 
 ## Lookup-first answers (S1 / #281)
 
-When `ChiseiService.ExecutePlan` (or stream) is invoked with
+When `ChiseiService.ExecutePlanStream` is invoked with
 `ExecutionInput.task_type` set to an **allow-listed** semantic capability id
 and `spec` holding that capability's fixed structured JSON input, Chisei may
 short-circuit **after** namespace authorization and **before** provider routing:
@@ -217,39 +211,3 @@ for the compatible gateway. It is distinct from this namespace-scoped native
 ontology catalog. Provider-owned tools are not projected into the native
 catalog unless a future contract can prove both an effective provider profile
 and explicit policy permission.
-
-## Capability packages
-
-The `sekai.capability-package/v1` manifest groups declarative schema, relation,
-action, policy-default, evaluation-suite, retrieval-rule, and adapter
-declarations into one immutable package version. Package content is data only
-and uses closed, kind-specific schemas with no free-form payload, executable,
-credential-value, or authority-grant fields. Identifier validation also rejects
-common credential shapes before storage. Installation cannot widen authority;
-normal namespace, action-policy, approval, retention, and audit boundaries
-still apply when packaged declarations are consumed.
-
-Lifecycle RPCs require namespace write access and action-admin authority. The
-server derives the actor from authenticated metadata and records install,
-evaluate, upgrade, rollback, disable, and uninstall events atomically with
-lifecycle state. Request IDs are actor- and namespace-scoped and bound to
-canonical input, so an ambiguous retry cannot apply different content.
-
-**Product transition path (#389):** prefer `TransitionCapabilityPackage` with
-`CapabilityPackageTransitionAction` (`evaluate` / `upgrade` / `rollback` /
-`disable` / `uninstall`). Upgrade requires `manifest` on the same request.
-The peer RPCs (`EvaluateCapabilityPackage`, `UpgradeCapabilityPackage`,
-`RollbackCapabilityPackage`, `DisableCapabilityPackage`,
-`UninstallCapabilityPackage`) remain experimental shims over that path.
-`InstallCapabilityPackage` and `GetCapabilityPackage` stay separate.
-
-Uninstall removes only the active installation. Immutable manifests and the
-append-only event stream remain as evidence. Package state is namespace-scoped,
-so neither installation nor removal mutates another namespace. The manually
-authored versions under `examples/capability-packages/` are the single proving
-package; they are not a registry or distribution mechanism.
-
-Lifecycle persistence is covered by shared SQLite/PostgreSQL conformance for
-the reusable Sekai surface. This catalog still does not claim automatic
-authoring, remote distribution, or executable plugin installation, and it does
-not activate community PostgreSQL runtime selection by itself.

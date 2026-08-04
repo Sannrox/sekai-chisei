@@ -10,8 +10,8 @@
 //! insertions). An attacker with unrestricted write access to the database
 //! can recompute the chain from genesis, or truncate a prefix and forge the
 //! purge anchor (which leaves `head_hash` unchanged). Detecting those
-//! requires recording what [`SekaiDb::verify_ledger`] (or the
-//! `VerifyAuditLedger` RPC) reports — `head_seq`/`head_hash` *and*
+//! requires recording what [`SekaiDb::verify_ledger`] reports —
+//! `head_seq`/`head_hash` *and*
 //! `anchor_seq` — in an external trust root, comparing across runs, and
 //! alerting when the anchor advances outside an expected retention purge.
 //!

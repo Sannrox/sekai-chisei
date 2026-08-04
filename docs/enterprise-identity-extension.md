@@ -16,8 +16,8 @@ Human credentials use the session, authorization-code, PKCE, exchange, expiry,
 and revocation lifecycle. Static community credentials and gateway keys use the
 machine credential kind and keep their existing rotation and revocation
 lifecycle. Both produce the same internal context without making their issuance
-semantics interchangeable. `SEKAI_AUTH_TOKEN` remains the local compatibility
-credential and does not activate enterprise identity behavior.
+semantics interchangeable. Community principal credentials do not activate
+enterprise identity behavior.
 
 Implementations must validate state, nonce, exact redirect URI, issuer,
 audience/resource, PKCE, expiry, single-use authorization codes, credential
@@ -25,8 +25,8 @@ revocation, current membership, and current tenant status on the relevant
 operation. A missing, unsupported, or invalid contract version fails closed;
 there is no negotiation fallback to an older authority model.
 
-The native model-loop methods `PlanExecution`, `ExecutePlan`, and
-`ExecutePlanStream` accept enterprise machine contexts. They authorize the
+The native model-loop methods `PlanExecution` and `ExecutePlanStream` accept
+enterprise machine contexts. They authorize the
 complete context for namespace write access, use its principal as the planning
 and receipt actor, and ignore caller-supplied principal or tenant metadata.
 Invalid context authority is checked before a plan is consumed or an LLM

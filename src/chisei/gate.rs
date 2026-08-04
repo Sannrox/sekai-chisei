@@ -99,8 +99,8 @@ pub fn gate_candidate(
 ///
 /// - `"cheap"`: proposed because recent evidence was healthy. Gated by comparing the namespace's
 ///   sampling suite's oldest tracked run (baseline) against its most recent run (candidate
-///   evidence) via `EvalStore::compare_runs` — the same `GateDecision` machinery `CompareRuns`
-///   exposes over gRPC — requiring the newest run to be at least as good as the oldest.
+///   evidence) via `EvalStore::compare_runs`, requiring the newest run to be at least as good as
+///   the oldest. This comparison is an internal gate primitive, not a public RPC.
 /// - `"capable"`: proposed *because* `namespace_regression_signal` was active, i.e. recent
 ///   evidence is expected to be worse than older evidence. Applying the same "newest >= oldest"
 ///   check here would fail the revert precisely while the regression it corrects is still active,
@@ -413,7 +413,6 @@ mod tests {
                 status: "done".to_string(),
                 namespace: "acme".to_string(),
                 tokens_used: 100,
-                original_spec: None,
                 created: i,
             })
             .collect();
@@ -449,7 +448,6 @@ mod tests {
                 status: "done".to_string(),
                 namespace: "acme".to_string(),
                 tokens_used: 100,
-                original_spec: None,
                 created: i,
             })
             .collect();
@@ -459,7 +457,6 @@ mod tests {
             status: "failed".to_string(),
             namespace: "acme".to_string(),
             tokens_used: 100,
-            original_spec: None,
             created: 100 + i,
         }));
         let candidates = propose_template_candidates(&store, &eval, &tasks);
@@ -544,7 +541,6 @@ mod tests {
                         status: "done".into(),
                         namespace: "acme".into(),
                         tokens_used: 0,
-                        original_spec: None,
                         created: 1,
                     },
                     TaskRecord {
@@ -553,7 +549,6 @@ mod tests {
                         status: "done".into(),
                         namespace: "acme".into(),
                         tokens_used: 0,
-                        original_spec: None,
                         created: 2,
                     },
                 ]

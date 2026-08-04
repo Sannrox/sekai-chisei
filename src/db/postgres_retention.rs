@@ -722,23 +722,6 @@ fn erase_supported_subject_data(
             &[&subject],
         )
         .map_err(err)? as i32;
-    for row in client
-        .query(
-            "SELECT id,owner_principal,filter FROM sekai_object_sets ORDER BY id FOR UPDATE",
-            &[],
-        )
-        .map_err(err)?
-    {
-        let id: String = row.get(0);
-        let owner: String = row.get(1);
-        let filter: String = row.get(2);
-        if owner == subject || value_mentions_subject(&filter, &request.subject_kind, subject) {
-            result.object_sets_deleted += client
-                .execute("DELETE FROM sekai_object_sets WHERE id=$1", &[&id])
-                .map_err(err)? as i32;
-        }
-    }
-
     let work_units = client
         .query(
             "SELECT id,actor,target_object_id,requested_spec,scope_id,failure_reason,

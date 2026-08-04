@@ -1,5 +1,5 @@
 use crate::grpc::client::connect_sekai;
-use crate::grpc::pb::chisei::ListAvailableModelsRequest;
+use crate::grpc::pb::chisei::GetEffectivePolicySummaryRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use serde_json::{Value, json};
 
@@ -54,7 +54,7 @@ pub async fn run_models_list(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let channel = connect_sekai(&config.target).await?;
     let response = ChiseiServiceClient::new(channel)
-        .list_available_models(ListAvailableModelsRequest {
+        .get_effective_policy_summary(GetEffectivePolicySummaryRequest {
             namespace: config.namespace,
             provider: config.provider.unwrap_or_default(),
         })
@@ -64,7 +64,7 @@ pub async fn run_models_list(
 }
 
 pub fn render_models(
-    response: &crate::grpc::pb::chisei::ListAvailableModelsResponse,
+    response: &crate::grpc::pb::chisei::GetEffectivePolicySummaryResponse,
     as_json: bool,
 ) -> String {
     if as_json {
@@ -88,7 +88,7 @@ pub fn render_models(
             })
             .collect::<Vec<_>>();
         return serde_json::to_string_pretty(&json!({
-            "version": response.version,
+            "version": response.available_models_version,
             "namespace": response.namespace,
             "models": models,
         }))
@@ -126,7 +126,7 @@ fn capabilities_json(value: &crate::grpc::pb::chisei::AvailableModelCapabilities
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::pb::chisei::{AvailableModelRecord, ListAvailableModelsResponse};
+    use crate::grpc::pb::chisei::{AvailableModelRecord, GetEffectivePolicySummaryResponse};
 
     #[test]
     fn parses_provider_and_json_options() {
@@ -140,8 +140,8 @@ mod tests {
 
     #[test]
     fn renders_table_and_structured_json() {
-        let response = ListAvailableModelsResponse {
-            version: "chisei.available-models/v1".into(),
+        let response = GetEffectivePolicySummaryResponse {
+            available_models_version: "chisei.available-models/v1".into(),
             namespace: "acme".into(),
             models: vec![AvailableModelRecord {
                 provider: "openai".into(),
@@ -151,6 +151,7 @@ mod tests {
                 capabilities: None,
                 pricing: None,
             }],
+            ..Default::default()
         };
         assert!(render_models(&response, false).contains("openai\topenai/gpt-x\tenabled"));
         let json: Value = serde_json::from_str(&render_models(&response, true)).unwrap();

@@ -76,10 +76,6 @@ impl SekaiDb {
                 id TEXT PRIMARY KEY,
                 task_json TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS chisei_evolve_enhancements (
-                request_id TEXT PRIMARY KEY,
-                original_spec TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS chisei_sample_observations (
                 request_id TEXT PRIMARY KEY,
                 namespace TEXT NOT NULL DEFAULT '',
@@ -322,7 +318,6 @@ impl SekaiDb {
             && table_exists(&conn, "aipp_eval_runs")?
             && table_exists(&conn, "aipp_eval_iterations")?
             && table_exists(&conn, "aipp_evolve_tasks")?
-            && table_exists(&conn, "aipp_evolve_enhancements")?
         {
             let aipp_namespace_projection =
                 legacy_namespace_projection_column(&conn, "aipp_eval_iterations", true)?
@@ -356,12 +351,6 @@ impl SekaiDb {
             conn.execute(
                 "INSERT OR IGNORE INTO chisei_evolve_tasks(id, task_json)
                  SELECT id, task_json FROM aipp_evolve_tasks",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-            conn.execute(
-                "INSERT OR IGNORE INTO chisei_evolve_enhancements(request_id, original_spec)
-                 SELECT task_id, original_spec FROM aipp_evolve_enhancements",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -1517,20 +1506,6 @@ impl SekaiDb {
             .collect()
     }
 
-    pub fn put_evolve_enhancement(
-        &self,
-        request_id: &str,
-        original_spec: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT OR REPLACE INTO chisei_evolve_enhancements (request_id, original_spec) VALUES (?1, ?2)",
-            params![request_id, original_spec],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
     /// Persist a sampled execution observation captured at execute time. Idempotent on
     /// `request_id` (re-execution does not reset the `scored` flag).
     pub fn put_sample_observation(
@@ -1561,9 +1536,7 @@ impl SekaiDb {
         Ok(())
     }
 
-    /// Read one bounded observation admission record for an authorized
-    /// telemetry projection. The service hashes the returned content and never
-    /// exposes the stored prompt or output through the public readback RPC.
+    /// Read one observation for an authorized, bounded telemetry projection.
     pub fn get_sample_observation(
         &self,
         request_id: &str,
@@ -1600,9 +1573,7 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
-    /// Read one observation only when both its request identity and namespace
-    /// match. The namespace predicate keeps unauthorized rows out of the
-    /// backend result before payload deserialization.
+    /// Read one observation only when its request identity and namespace match.
     pub fn get_sample_observation_in_namespace(
         &self,
         request_id: &str,
@@ -1704,19 +1675,6 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    pub fn list_evolve_enhancements(&self) -> Result<HashMap<String, String>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT request_id, original_spec FROM chisei_evolve_enhancements")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
     }
 }
 

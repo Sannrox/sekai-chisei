@@ -11,8 +11,7 @@ use crate::obs::labels::{Outcome, Subsystem, WaitKind};
 use crate::obs::signals;
 
 use crate::domain::{
-    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, ObjectSet, PropertyFilter,
-    is_valid_property_key,
+    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
 };
 
 pub struct SekaiDb {
@@ -182,13 +181,11 @@ impl SekaiDb {
         self.migrate_deduplication()?;
         self.migrate_schema_types()?;
         self.migrate_ontology()?;
-        self.migrate_ontology_proposals()?;
         self.migrate_coordination()?;
         self.migrate_leases()?;
         self.migrate_datasets()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
-        self.migrate_capability_packages()?;
         self.migrate_chisei()?;
         self.migrate_evaluation_plans()?;
         self.migrate_evaluation_manifests()?;
@@ -201,9 +198,7 @@ impl SekaiDb {
         self.migrate_action_effects()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
-        self.migrate_temporal_history()?;
         self.migrate_usage_ledger()?;
-        self.migrate_text_fts()?;
         Ok(())
     }
 
@@ -230,16 +225,7 @@ impl SekaiDb {
                 created INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_links_from ON sekai_links(from_id, relation);
-            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);
-            CREATE TABLE IF NOT EXISTS sekai_object_sets (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                filter TEXT NOT NULL,
-                owner_principal TEXT NOT NULL,
-                created INTEGER NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_object_sets_owner_name ON sekai_object_sets(owner_principal, name);",
+            CREATE INDEX IF NOT EXISTS idx_links_to ON sekai_links(to_id, relation);",
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -634,159 +620,6 @@ impl SekaiDb {
         self.list_credentials(principal, status)
     }
 
-    #[cfg(any())]
-    pub fn list_tenant_credentials(
-        &self,
-        tenant_id: &str,
-        principal: Option<&str>,
-        status: Option<&str>,
-    ) -> Result<Vec<PrincipalCredential>, String> {
-        let conn = self.conn();
-        let mut sql = "SELECT id, principal, token_hash, status, created, rotated_at, revoked_at, tenant_id FROM sekai_principal_credentials WHERE tenant_id=?1".to_string();
-        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(tenant_id.to_string())];
-        for (column, value) in [("principal", principal), ("status", status)] {
-            if let Some(value) = value {
-                sql.push_str(&format!(" AND {column}=?{}", args.len() + 1));
-                args.push(Box::new(value.to_string()));
-            }
-        }
-        sql.push_str(" ORDER BY created,id");
-        let refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|arg| arg.as_ref()).collect();
-        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
-        statement
-            .query_map(refs.as_slice(), row_to_principal_credential)
-            .map_err(|error| error.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
-    }
-
-    #[cfg(any())]
-    pub fn create_tenant_credential(
-        &self,
-        tenant_id: &str,
-        principal: &str,
-        token_hash: &str,
-        actor: &str,
-        platform_admin: bool,
-        now: i64,
-    ) -> Result<PrincipalCredential, String> {
-        let id = format!("credential-{}", Uuid::new_v4().simple());
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
-        tx.execute(
-            "INSERT INTO sekai_principal_credentials (id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id) VALUES (?1,?2,?3,'active',?4,?4,0,?5)",
-            params![id, principal, token_hash, now, tenant_id],
-        ).map_err(|error| error.to_string())?;
-        insert_tenant_credential_audit(
-            &tx,
-            actor,
-            tenant_id,
-            principal,
-            "credential.create",
-            "created",
-            now,
-        )?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(PrincipalCredential {
-            id,
-            principal: principal.into(),
-            token_hash: token_hash.into(),
-            status: "active".into(),
-            created: now,
-            rotated_at: now,
-            revoked_at: 0,
-            tenant_id: tenant_id.into(),
-        })
-    }
-
-    #[cfg(any())]
-    pub fn rotate_tenant_credential(
-        &self,
-        tenant_id: &str,
-        principal: &str,
-        token_hash: &str,
-        actor: &str,
-        platform_admin: bool,
-        now: i64,
-    ) -> Result<Option<PrincipalCredential>, String> {
-        let id = format!("credential-{}", Uuid::new_v4().simple());
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
-        let revoked = tx.execute(
-            "UPDATE sekai_principal_credentials SET status='revoked',revoked_at=?1 WHERE tenant_id=?2 AND principal=?3 AND status='active'",
-            params![now, tenant_id, principal],
-        ).map_err(|error| error.to_string())?;
-        if revoked == 0 {
-            return Ok(None);
-        }
-        tx.execute(
-            "INSERT INTO sekai_principal_credentials (id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id) VALUES (?1,?2,?3,'active',?4,?4,0,?5)",
-            params![id, principal, token_hash, now, tenant_id],
-        ).map_err(|error| error.to_string())?;
-        insert_tenant_credential_audit(
-            &tx,
-            actor,
-            tenant_id,
-            principal,
-            "credential.rotate",
-            "rotated",
-            now,
-        )?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(Some(PrincipalCredential {
-            id,
-            principal: principal.into(),
-            token_hash: token_hash.into(),
-            status: "active".into(),
-            created: now,
-            rotated_at: now,
-            revoked_at: 0,
-            tenant_id: tenant_id.into(),
-        }))
-    }
-
-    #[cfg(any())]
-    pub fn revoke_tenant_credential(
-        &self,
-        tenant_id: &str,
-        principal: &str,
-        actor: &str,
-        platform_admin: bool,
-        now: i64,
-    ) -> Result<Option<PrincipalCredential>, String> {
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        require_tenant_credential_admin_tx(&tx, tenant_id, actor, platform_admin)?;
-        let credential = tx.query_row(
-            "SELECT id,principal,token_hash,status,created,rotated_at,revoked_at,tenant_id FROM sekai_principal_credentials WHERE tenant_id=?1 AND principal=?2 AND status='active' ORDER BY created DESC LIMIT 1",
-            params![tenant_id, principal], row_to_principal_credential,
-        ).optional().map_err(|error| error.to_string())?;
-        let Some(mut credential) = credential else {
-            return Ok(None);
-        };
-        tx.execute(
-            "UPDATE sekai_principal_credentials SET status='revoked',revoked_at=?1
-             WHERE tenant_id=?2 AND principal=?3 AND status='active'",
-            params![now, tenant_id, principal],
-        )
-        .map_err(|error| error.to_string())?;
-        insert_tenant_credential_audit(
-            &tx,
-            actor,
-            tenant_id,
-            principal,
-            "credential.revoke",
-            "revoked",
-            now,
-        )?;
-        tx.commit().map_err(|error| error.to_string())?;
-        credential.status = "revoked".into();
-        credential.revoked_at = now;
-        Ok(Some(credential))
-    }
-
     pub fn create_object(&self, o: &Object) -> Result<(), String> {
         if o.external_id.starts_with("namespace:") && o.kind != "namespace" {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
@@ -1167,176 +1000,6 @@ impl SekaiDb {
         Ok((objects, total.min(i32::MAX as i64) as i32))
     }
 
-    pub fn create_object_set(&self, set: &ObjectSet) -> Result<(), String> {
-        let conn = self.conn();
-        let filter = serde_json::to_string(&set.filter).map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO sekai_object_sets (id, name, description, filter, owner_principal, created) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![
-                set.id,
-                set.name,
-                set.description,
-                filter,
-                set.owner_principal,
-                set.created,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-
-    pub fn get_object_set(&self, id: &str) -> Result<Option<ObjectSet>, String> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE id = ?1",
-            params![id],
-            |row| {
-                let filter_json: String = row.get(3)?;
-                let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-                Ok(ObjectSet {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    filter,
-                    owner_principal: row.get(4)?,
-                    created: row.get(5)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| e.to_string())
-    }
-
-    pub fn list_object_sets(&self) -> Result<Vec<ObjectSet>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets ORDER BY created, id")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |row| {
-                let filter_json: String = row.get(3)?;
-                let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-                Ok(ObjectSet {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    filter,
-                    owner_principal: row.get(4)?,
-                    created: row.get(5)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
-        parsed.map_err(|e| e.to_string())
-    }
-
-    pub fn list_object_sets_for_principals(
-        &self,
-        principals: &[&str],
-    ) -> Result<Vec<ObjectSet>, String> {
-        if principals.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let placeholders = principals
-            .iter()
-            .map(|principal| {
-                let idx = params.len() + 1;
-                params.push(Box::new((*principal).to_string()));
-                format!("?{idx}")
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT id, name, description, filter, owner_principal, created FROM sekai_object_sets WHERE owner_principal IN ({placeholders}) ORDER BY created, id"
-            ))
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(
-                params
-                    .iter()
-                    .map(|p| p.as_ref() as &dyn rusqlite::types::ToSql)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-                |row| {
-                    let filter_json: String = row.get(3)?;
-                    let filter = serde_json::from_str::<ListFilter>(&filter_json).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                    Ok(ObjectSet {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        description: row.get(2)?,
-                        filter,
-                        owner_principal: row.get(4)?,
-                        created: row.get(5)?,
-                    })
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        let parsed: Result<Vec<_>, rusqlite::Error> = rows.collect();
-        parsed.map_err(|e| e.to_string())
-    }
-
-    pub fn delete_object_set(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn();
-        let removed = conn
-            .execute("DELETE FROM sekai_object_sets WHERE id = ?1", params![id])
-            .map_err(|e| e.to_string())?;
-        Ok(removed > 0)
-    }
-
-    pub fn delete_object_set_for_principals(
-        &self,
-        id: &str,
-        principals: &[&str],
-    ) -> Result<bool, String> {
-        if principals.is_empty() {
-            return Ok(false);
-        }
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        params.push(Box::new(id.to_string()));
-        let mut owner_placeholders = Vec::new();
-        for principal in principals {
-            let idx = params.len() + 1;
-            params.push(Box::new((*principal).to_string()));
-            owner_placeholders.push(format!("?{idx}"));
-        }
-        let owner_placeholders = owner_placeholders.join(",");
-        let conn = self.conn();
-        let removed = conn
-            .execute(
-                &format!(
-                    "DELETE FROM sekai_object_sets WHERE id = ?1 AND owner_principal IN ({owner_placeholders})"
-                ),
-                params
-                    .iter()
-                    .map(|p| p.as_ref() as &dyn rusqlite::types::ToSql)
-                    .collect::<Vec<_>>()
-                    .as_slice(),
-            )
-            .map_err(|e| e.to_string())?;
-        Ok(removed > 0)
-    }
-
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, String> {
         let conn = self.conn();
         conn.query_row(
@@ -1359,27 +1022,6 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
-    }
-
-    #[cfg(any())]
-    pub fn find_by_external_id_for_tenant(
-        &self,
-        external_id: &str,
-        tenant_id: &str,
-    ) -> Result<Option<Object>, String> {
-        let conn = self.conn();
-        conn.query_row(
-            "SELECT object.id,object.kind,object.name,object.namespace,object.external_id,
-                    object.properties,object.created,object.updated
-             FROM sekai_objects object
-             JOIN sekai_namespace_ownership ownership ON ownership.namespace=object.namespace
-             WHERE object.external_id=?1 AND ownership.tenant_id=?2
-             ORDER BY object.id LIMIT 1",
-            params![external_id, tenant_id],
-            row_to_object,
-        )
-        .optional()
-        .map_err(|error| error.to_string())
     }
 
     pub fn find_by_property(
@@ -1422,25 +1064,12 @@ impl SekaiDb {
             &l.to_id,
             &l.relation,
         )?;
-        let inserted = transaction
+        transaction
             .execute(
                 "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
                 params![l.id, l.from_id, l.to_id, l.relation, l.created],
             )
-            .map_err(|e| e.to_string())?
-            == 1;
-        if inserted {
-            // Namespace for relation history follows the from-object when present.
-            let namespace = link_namespace_tx(&transaction, &l.from_id)?;
-            crate::sekai::temporal::retain_link_history_in_tx(
-                &transaction,
-                None,
-                Some(l),
-                &namespace,
-                "system",
-                chrono::Utc::now().timestamp_millis(),
-            )?;
-        }
+            .map_err(|e| e.to_string())?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -1460,17 +1089,6 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?
             == 1;
-        if inserted {
-            let namespace = link_namespace_tx(&transaction, &l.from_id)?;
-            crate::sekai::temporal::retain_link_history_in_tx(
-                &transaction,
-                None,
-                Some(l),
-                &namespace,
-                "system",
-                chrono::Utc::now().timestamp_millis(),
-            )?;
-        }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(inserted)
     }
@@ -1478,36 +1096,9 @@ impl SekaiDb {
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
         let mut conn = self.conn();
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
-        let existing = transaction
-            .query_row(
-                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE id = ?1",
-                params![id],
-                |row| {
-                    Ok(Link {
-                        id: row.get(0)?,
-                        from_id: row.get(1)?,
-                        to_id: row.get(2)?,
-                        relation: row.get(3)?,
-                        created: row.get(4)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
         transaction
             .execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
-        if let Some(link) = existing {
-            let namespace = link_namespace_tx(&transaction, &link.from_id)?;
-            crate::sekai::temporal::retain_link_history_in_tx(
-                &transaction,
-                Some(&link),
-                None,
-                &namespace,
-                "system",
-                chrono::Utc::now().timestamp_millis(),
-            )?;
-        }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -2002,62 +1593,6 @@ fn legacy_tenant_state_message() -> String {
     "legacy SQLite tenant state detected; this community runtime is tenant-free. Back up the database and export/migrate tenant records to the PostgreSQL enterprise distribution before starting this version; no legacy tenant data was changed".into()
 }
 
-#[cfg(any())]
-fn insert_tenant_credential_audit(
-    conn: &rusqlite::Connection,
-    actor: &str,
-    tenant_id: &str,
-    principal: &str,
-    action: &str,
-    outcome: &str,
-    now: i64,
-) -> Result<(), String> {
-    crate::sekai::ledger::insert_chained_decision(
-        conn,
-        &crate::sekai::audit::Decision {
-            id: Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: actor.into(),
-            action: action.into(),
-            reason: "tenant service credential changed".into(),
-            evidence: HashMap::from([
-                ("tenant_id".into(), tenant_id.into()),
-                ("data_class".into(), "internal".into()),
-            ]),
-            target_id: format!("tenant-credential:{tenant_id}:{principal}"),
-            outcome: outcome.into(),
-        },
-    )
-}
-
-#[cfg(any())]
-fn require_tenant_credential_admin_tx(
-    conn: &rusqlite::Connection,
-    tenant_id: &str,
-    actor: &str,
-    platform_admin: bool,
-) -> Result<(), String> {
-    if platform_admin {
-        return Ok(());
-    }
-    let authorized: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sekai_tenant_memberships
-                WHERE tenant_id=?1 AND subject_id=?2 AND status='active'
-                  AND role IN ('owner','admin')
-             )",
-            params![tenant_id, actor],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if authorized {
-        Ok(())
-    } else {
-        Err("tenant credential admin required".into())
-    }
-}
-
 fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
     Ok(Link {
         id: row.get(0)?,
@@ -2066,19 +1601,6 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
         relation: row.get(3)?,
         created: row.get(4)?,
     })
-}
-
-/// Resolve the namespace used for relation history. Prefers the from-object
-/// namespace; falls back to empty (global) when the object is absent.
-fn link_namespace_tx(tx: &rusqlite::Transaction<'_>, from_id: &str) -> Result<String, String> {
-    tx.query_row(
-        "SELECT namespace FROM sekai_objects WHERE id = ?1",
-        params![from_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|e| e.to_string())
-    .map(|ns| ns.unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -2985,87 +2507,5 @@ mod tests {
         assert_ne!(journal_mode, "wal");
         drop(conn);
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn tenant_credentials_preserve_binding_rotation_revocation_and_audit() {
-        let db = test_db();
-        let tenant = db.create_tenant("root", "credential-db", 1).unwrap();
-        let created = db
-            .create_tenant_credential(&tenant.id, "worker", "hash-one", "owner", true, 2)
-            .unwrap();
-        assert!(
-            db.create_tenant_credential(&tenant.id, "worker", "hash-duplicate", "owner", true, 2,)
-                .is_err()
-        );
-        db.create_principal_credential("worker", "unbound-hash", 2)
-            .unwrap();
-        db.rotate_principal_credential("worker", "unbound-hash-2")
-            .unwrap();
-        assert!(db.get_principal_credential("hash-one").unwrap().is_some());
-        db.revoke_principal_credential("worker").unwrap().unwrap();
-        assert!(db.get_principal_credential("hash-one").unwrap().is_some());
-        assert_eq!(created.tenant_id, tenant.id);
-        assert_eq!(
-            db.get_principal_credential("hash-one").unwrap(),
-            Some(created.clone())
-        );
-
-        let rotated = db
-            .rotate_tenant_credential(&tenant.id, "worker", "hash-two", "owner", true, 3)
-            .unwrap()
-            .unwrap();
-        assert!(db.get_principal_credential("hash-one").unwrap().is_none());
-        assert_eq!(
-            db.get_principal_credential("hash-two").unwrap(),
-            Some(rotated)
-        );
-
-        db.revoke_tenant_credential(&tenant.id, "worker", "owner", true, 4)
-            .unwrap()
-            .unwrap();
-        assert!(db.get_principal_credential("hash-two").unwrap().is_none());
-        let audit = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
-                target_id: Some(format!("tenant-credential:{}:worker", tenant.id)),
-                limit: 10,
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(
-            audit
-                .iter()
-                .map(|decision| decision.action.as_str())
-                .collect::<Vec<_>>(),
-            vec![
-                "credential.revoke",
-                "credential.rotate",
-                "credential.create"
-            ]
-        );
-    }
-
-    #[test]
-    #[cfg(any())]
-    fn credential_migration_upgrades_unbound_rows_without_inference() {
-        let db = test_db();
-        let conn = db.conn();
-        conn.execute_batch(
-            "DROP TABLE sekai_principal_credentials;
-             CREATE TABLE sekai_principal_credentials (
-                id TEXT PRIMARY KEY, principal TEXT NOT NULL, token_hash TEXT NOT NULL,
-                status TEXT NOT NULL, created INTEGER NOT NULL,
-                rotated_at INTEGER NOT NULL DEFAULT 0, revoked_at INTEGER NOT NULL DEFAULT 0
-             );
-             INSERT INTO sekai_principal_credentials
-                (id,principal,token_hash,status,created,rotated_at,revoked_at)
-             VALUES ('legacy','tenant_fake.worker','legacy-hash','active',1,1,0);",
-        )
-        .unwrap();
-        drop(conn);
-        db.migrate_principal_credentials().unwrap();
-        let upgraded = db.get_principal_credential("legacy-hash").unwrap().unwrap();
-        assert!(upgraded.tenant_id.is_empty());
     }
 }

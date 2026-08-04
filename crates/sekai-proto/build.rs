@@ -1,5 +1,5 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    for name in ["sekai.proto", "chisei.proto", "llm.proto"] {
+    for name in ["sekai.proto", "chisei.proto"] {
         let workspace_contract = std::path::Path::new("../../proto").join(name);
         let packaged_contract = std::path::Path::new("proto").join(name);
         println!("cargo:rerun-if-changed={}", packaged_contract.display());
@@ -21,9 +21,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &["proto/sekai.proto", "proto/chisei.proto", "proto/llm.proto"],
-            &["proto/"],
-        )?;
+        .compile_protos(&["proto/sekai.proto", "proto/chisei.proto"], &["proto/"])?;
     Ok(())
 }

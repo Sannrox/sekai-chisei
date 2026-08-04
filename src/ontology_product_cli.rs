@@ -487,7 +487,10 @@ pub async fn plan_and_execute(
     };
 
     let plan = client
-        .plan_execution(Request::new(PlanExecutionRequest { input: Some(input) }))
+        .plan_execution(Request::new(PlanExecutionRequest {
+            input: Some(input),
+            gunshi_allocation: None,
+        }))
         .await?
         .into_inner()
         .plan
@@ -509,15 +512,20 @@ pub async fn plan_and_execute(
         });
     }
 
-    let response = client
-        .execute_plan(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+    let mut stream = client
+        .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plan) }))
         .await?
         .into_inner();
+    let mut response = None;
+    while let Some(event) = stream.message().await? {
+        if event.response.is_some() {
+            response = event.response;
+        }
+    }
+    let response = response.ok_or("execution stream returned no response")?;
 
-    let (content, provider, stop_reason) = match response.response {
-        Some(chat) => (chat.content, chat.provider, chat.stop_reason),
-        None => (String::new(), String::new(), String::new()),
-    };
+    let (content, provider, stop_reason) =
+        (response.content, response.provider, response.stop_reason);
     let preview: String = content.chars().take(240).collect();
 
     Ok(RunReport {

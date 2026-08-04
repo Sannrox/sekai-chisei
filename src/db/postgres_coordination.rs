@@ -1,12 +1,11 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::coordination::{
-    AdmissionResult, ContentionScope, CoordinationSnapshot, RESERVATION_STATUS_ACTIVE,
-    RESERVATION_STATUS_RELEASED, ReconcileFilter, ReconcileSummary, ReconciliationRecord,
-    RequestDedup, Reservation, ReservationFilter, RunEvent, ScopeBlockage,
-    WORK_UNIT_STATUS_ADMITTED, WORK_UNIT_STATUS_CANCELLED, WORK_UNIT_STATUS_COMPLETED,
-    WORK_UNIT_STATUS_FAILED, WORK_UNIT_STATUS_PENDING, WORK_UNIT_STATUS_RECONCILED,
-    WORK_UNIT_STATUS_RUNNING, WORK_UNIT_STATUS_STALE, WORK_UNIT_STATUS_TIMED_OUT, WorkUnit,
-    WorkUnitFilter,
+    AdmissionResult, ContentionScope, RESERVATION_STATUS_ACTIVE, RESERVATION_STATUS_RELEASED,
+    ReconcileFilter, ReconcileSummary, ReconciliationRecord, RequestDedup, Reservation,
+    ReservationFilter, RunEvent, WORK_UNIT_STATUS_ADMITTED, WORK_UNIT_STATUS_CANCELLED,
+    WORK_UNIT_STATUS_COMPLETED, WORK_UNIT_STATUS_FAILED, WORK_UNIT_STATUS_PENDING,
+    WORK_UNIT_STATUS_RECONCILED, WORK_UNIT_STATUS_RUNNING, WORK_UNIT_STATUS_STALE,
+    WORK_UNIT_STATUS_TIMED_OUT, WorkUnit, WorkUnitFilter,
 };
 use postgres::{GenericClient, IsolationLevel, Row, types::ToSql};
 use std::collections::{HashMap, HashSet};
@@ -669,75 +668,6 @@ impl PostgresDb {
         Ok(summary)
     }
 
-    pub fn coordination_snapshot(&self, now: i64) -> Result<CoordinationSnapshot, String> {
-        let works = self.list_work_units(&WorkUnitFilter::default())?;
-        let reservations = self.list_reservations(&ReservationFilter::default())?;
-        let scopes = self.list_contention_scopes()?;
-        let pending = works
-            .iter()
-            .filter(|w| w.status == WORK_UNIT_STATUS_PENDING)
-            .collect::<Vec<_>>();
-        let mut blocked_scopes = vec![];
-        for scope in &scopes {
-            let pending_count = pending.iter().filter(|w| w.scope_id == scope.id).count() as i32;
-            if pending_count == 0 {
-                continue;
-            }
-            let active_count = reservations
-                .iter()
-                .filter(|r| r.scope_id == scope.id && active(r, now))
-                .count() as i32;
-            blocked_scopes.push(ScopeBlockage {
-                scope_id: scope.id.clone(),
-                scope_name: scope.name.clone(),
-                reason: if active_count >= scope.max_concurrency {
-                    format!("scope {} is saturated", scope.name)
-                } else {
-                    "older pending work unit holds queue precedence".into()
-                },
-                pending_count,
-                active_count,
-            });
-        }
-        Ok(CoordinationSnapshot {
-            pending_count: pending.len() as i32,
-            running_count: works
-                .iter()
-                .filter(|w| w.status == WORK_UNIT_STATUS_RUNNING)
-                .count() as i32,
-            stale_count: works
-                .iter()
-                .filter(|w| {
-                    matches!(
-                        w.status.as_str(),
-                        WORK_UNIT_STATUS_STALE | WORK_UNIT_STATUS_TIMED_OUT
-                    )
-                })
-                .count() as i32,
-            active_reservation_count: reservations.iter().filter(|r| active(r, now)).count() as i32,
-            oldest_pending_age_ms: pending
-                .iter()
-                .map(|w| now.saturating_sub(w.created_at))
-                .max()
-                .unwrap_or(0),
-            oldest_running_age_ms: works
-                .iter()
-                .filter(|w| w.status == WORK_UNIT_STATUS_RUNNING)
-                .map(|w| now.saturating_sub(w.started_at.max(w.created_at)))
-                .max()
-                .unwrap_or(0),
-            stale_reservation_count: reservations
-                .iter()
-                .filter(|r| {
-                    r.status == RESERVATION_STATUS_ACTIVE
-                        && r.released_at == 0
-                        && r.expires_at <= now
-                })
-                .count() as i32,
-            blocked_scopes,
-        })
-    }
-
     fn finish_work_unit(
         &self,
         id: &str,
@@ -948,9 +878,6 @@ fn terminal(status: &str) -> bool {
             | WORK_UNIT_STATUS_STALE
             | WORK_UNIT_STATUS_RECONCILED
     )
-}
-fn active(r: &Reservation, now: i64) -> bool {
-    r.status == RESERVATION_STATUS_ACTIVE && r.released_at == 0 && r.expires_at > now
 }
 fn affected(count: u64, message: &str) -> Result<(), String> {
     if count == 0 {

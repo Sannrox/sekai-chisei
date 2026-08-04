@@ -673,10 +673,10 @@ mod tests {
         let result = validate_community_surface(&CommunitySurfaceManifest {
             grpc_methods: &["TokenService/Issue"],
             gateway_routes: &["/session", "/token-endpoint", "/revocation"],
-            configuration_keys: &["SEKAI_AUTH_TOKEN"],
+            configuration_keys: &["OIDC_TOKEN_ENDPOINT"],
             accepted_authority_metadata: &[],
         });
-        assert_eq!(result.unwrap_err().len(), 4);
+        assert_eq!(result.unwrap_err().len(), 5);
     }
 
     #[test]

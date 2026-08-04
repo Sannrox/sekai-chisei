@@ -47,13 +47,6 @@ fn exercise(db: RuntimeDb, prefix: &str) {
             .unwrap()
             .is_empty()
     );
-    let pressure = db
-        .runtime_work_pressure(&effect.namespace, "shikigami", 300)
-        .unwrap();
-    assert_eq!(pressure.contract_version, "sekai.runtime-work-pressure/v1");
-    assert_eq!(pressure.claimable_count, 0);
-    assert_eq!(pressure.active_claim_count, 0);
-    assert_eq!(pressure.parked_count, 1);
     assert!(
         db.park_action_work(
             &effect.effect_id,

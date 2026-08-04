@@ -12,13 +12,9 @@ or are explicit computed/query paths with named durable dependencies.
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
 
-- audited ontology mutations and definition proposals
-  (`upsert_*_with_audit`, proposal review/get/list, evidence-driven propose);
-- SQLite FTS `SearchText` / hybrid text adapter (see [text-fts.md](text-fts.md));
+- audited ontology mutations (`upsert_*_with_audit`);
 - multi-control-plane federation site/peer tables (see
   [federation-profile.md](federation-profile.md));
-- selective bitemporal history storage (SQLite-first; see
-  [temporal-history-storage.md](temporal-history-storage.md)).
 
 Evidence is checked in as:
 
@@ -39,7 +35,7 @@ Evidence is checked in as:
 | #251 | Retention, scoped content, and reconciliation |
 | #252 | RPC inventory and complete-Sekai capability evidence |
 | #259 | Action policy and approval |
-| #261–#265 | Capability packages, guarded mutations, definition lifecycle, decisions, team namespaces |
+| #261–#265 | Guarded mutations, definition lifecycle, decisions, team namespaces |
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
 
 ## Still outside this parent
@@ -48,9 +44,6 @@ Evidence is checked in as:
   `docs/postgres-chisei-parity.md`
 - Community PostgreSQL runtime activation (#238) — complete; select with `SEKAI_DB_BACKEND=postgres`
 - Tenant state, tenant RPCs, OIDC, and OAuth
-- Selective bitemporal history storage (#225) is **SQLite-first**; see
-  `docs/temporal-history-storage.md` for PostgreSQL implications without a
-  present parity claim
 
 ## Operator posture
 

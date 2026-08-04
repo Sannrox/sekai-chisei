@@ -2,13 +2,14 @@
 
 ## Supported versions
 
-`sekai-chisei` is pre-1.0. Security fixes target the current `main` line; older
-commits and prerelease snapshots do not receive separate security support.
+Security fixes target the current 1.x release line and `main`. Pre-1.0 releases
+and older snapshots do not receive separate security support.
 
 | Version | Supported |
 | --- | --- |
+| Current 1.x | Yes |
 | Current `main` | Yes |
-| Older commits and snapshots | No |
+| Pre-1.0 and older snapshots | No |
 
 ## Reporting a vulnerability
 
@@ -39,7 +40,8 @@ overrides that default. Never expose insecure mode on a non-loopback address.
 
 For network-accessible deployments, issue principal-scoped credentials with
 `cargo run --bin sekaictl -- admin access credential create <principal>` and send gRPC metadata using
-`authorization: Bearer <token>`. Keep `SEKAI_AUTH_TOKEN` as a deprecated fallback that maps to principal `root`.
+`authorization: Bearer <token>`. Client processes may read that value from
+`SEKAI_CREDENTIAL`; the server does not accept an environment bootstrap token.
 `0.0.0.0` requires TLS (`SEKAI_TLS_CERT` + `SEKAI_TLS_KEY`) unless
 `SEKAI_ALLOW_PLAINTEXT=1` is explicitly set.
 On localhost socket paths and `SEKAI_INSECURE=1`, callers rely on local

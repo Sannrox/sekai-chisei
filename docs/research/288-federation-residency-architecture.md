@@ -20,7 +20,6 @@ mutable graph or a workflow engine?
 | External permits + kill switch | Durable permits | Double-redeem must stay **plane-local** or generation-fenced |
 | Leases (object-bound) | #0005 ADR, coordination | Multi-region leases need explicit authority (see #292/#293) |
 | Attestations (policy / Shomei-style) | Get/VerifyAttestation RPCs | Cross-site **verify/import** is additive, not rewrite-home |
-| Capability package Ed25519 trust | ADR 0006 | Offline-capable keys fit multi-site packaging |
 | Replica-safe shared state | #117 closed | Shared-read patterns exist; not a global write graph |
 | PostgreSQL runtime | #238 closed | Multi-region durability may use PG per region, not one global DB |
 | Gunshi auto-dispatch | #279/#280 | Auto path must **not** cross sites under lag; kill switch is local |
@@ -55,8 +54,8 @@ and Gunshi promotion for that site’s namespaces.
 
 Cross-site:
 
-- Exchange **attested** receipts, compliance bundles, capability packages, and
-  **versioned policy packs** (not live shared mutability).
+- Exchange **attested** receipts, compliance bundles, and **versioned policy
+  packs** (not live shared mutability).
 - Federation API is **verify / import / deny**, never “apply remote mutate
   locally without attestation.”
 - Optional hierarchical namespaces and delegated policy **within** a plane or
@@ -91,8 +90,8 @@ contract, then multi-region consistency research/features.
 
 ### Cross-site (#290/#291) freeze sketch
 
-- Site identity: long-lived key (Ed25519, ADR 0006 family) per plane.
-- Importable: attestations, compliance bundles, capability packages, Gunshi
+- Site identity: long-lived key per plane.
+- Importable: attestations, compliance bundles, Gunshi
   **scorecards** as evidence only—not live auto-dispatch remote control.
 - Forbidden: remote promote of allocation policy, remote kill switch of another
   plane, remote budget debit.

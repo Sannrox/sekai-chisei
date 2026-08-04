@@ -3,7 +3,6 @@ pub mod attest_cli;
 pub mod capability_codegen;
 pub mod capability_projection;
 pub mod chisei;
-pub mod compat_shims;
 pub mod compliance_cli;
 pub mod compliance_export;
 pub mod config;

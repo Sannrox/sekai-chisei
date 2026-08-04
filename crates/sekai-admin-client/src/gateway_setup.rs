@@ -47,7 +47,7 @@ pub struct GatewaySetupConfig {
     /// Optional scope identifiers for additional policy rows to seed in addition
     /// to the project scope. Common examples are `agent:<name>` and
     /// `gateway_key:<name>`, which then participate in the policy-scopes chain
-    /// used by `ResolvePolicy`.
+    /// used by canonical gateway decisions.
     pub policy_scopes: Vec<String>,
 }
 
@@ -984,9 +984,7 @@ mod tests {
     use crate::test_support::runtime_db::RuntimeDb;
     use crate::test_support::sekai_db::SekaiDb;
     use crate::test_support::sekai_service::SekaiServiceImpl;
-    use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
     use sekai_proto::chisei::chisei_service_server::ChiseiServiceServer;
-    use sekai_proto::chisei::{CheckBudgetRequest, ResolvePolicyRequest};
     use sekai_proto::sekai::sekai_service_server::SekaiServiceServer;
     use std::sync::Arc;
     use tonic::transport::Server;
@@ -1059,7 +1057,6 @@ mod tests {
             openai_api_key: Some("test-openai-key".into()),
             ollama_url: "http://127.0.0.1:11434".into(),
             native_llm_url: None,
-            auth_token: None,
             sample_rate: 0.0,
             sample_risk_threshold: 0.7,
             scoring_enabled: false,
@@ -1215,50 +1212,6 @@ mod tests {
             key.properties.get("status").map(String::as_str),
             Some("active")
         );
-
-        let channel = connect_sekai(&target).await.unwrap();
-        let mut chisei = ChiseiServiceClient::new(channel);
-        let budget = chisei
-            .check_budget(GrpcRequest::new(CheckBudgetRequest {
-                user_id: "agent:codex-app".to_string(),
-                estimated_tokens: 43,
-                subject: String::new(),
-                project: "sekai-chisei".to_string(),
-                agent: "codex-app".to_string(),
-                key_id: "codex-app".to_string(),
-                work_unit: String::new(),
-                metric: String::new(),
-                task_class: String::new(),
-                mid_task: false,
-                local_free_available: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!budget.allowed);
-
-        let resolved = chisei
-            .resolve_policy(GrpcRequest::new(ResolvePolicyRequest {
-                namespace: "sekai-chisei".to_string(),
-                preferred_runtime: "openai".to_string(),
-                preferred_model: "gpt-4.1".to_string(),
-                subject: "agent:codex-app".to_string(),
-                task_class: String::new(),
-                project: "sekai-chisei".to_string(),
-                agent: "codex-app".to_string(),
-                user_id: String::new(),
-                key_id: "codex-app".to_string(),
-                expected_calls: 1,
-                budget_route_bias: String::new(),
-                route_override: String::new(),
-                capability_requirements_json: Vec::new(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .resolution
-            .unwrap();
-        assert_eq!(resolved.model, "gpt-5.5");
 
         let request_budget_project = db
             .gateway_test_budget_usage(

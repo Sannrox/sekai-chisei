@@ -1,6 +1,6 @@
 //! Lookup-first governed answers for allow-listed structured capabilities (#281 / S1).
 //!
-//! When a PlanExecution/ExecutePlan request targets an allow-listed #151 semantic
+//! When a PlanExecution/ExecutePlanStream request targets an allow-listed #151 semantic
 //! capability with a fixed structured contract, Chisei attempts an authorized
 //! ontology/graph lookup **after** namespace authz and **before** provider
 //! routing. A complete hit returns a normal response with **zero provider
@@ -655,9 +655,6 @@ mod tests {
         ));
         assert!(is_lookup_first_capability(
             semantic::CAPABILITY_EXPLAIN_DERIVATION
-        ));
-        assert!(!is_lookup_first_capability(
-            semantic::CAPABILITY_EVALUATE_SCENARIO
         ));
         assert!(!is_lookup_first_capability("free.form.nl.question"));
         assert!(!is_lookup_first_capability(""));

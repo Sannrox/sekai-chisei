@@ -68,12 +68,12 @@ operation-risk rules are eligible there; descriptor-specific rules run in the
 native enrichment path. This keeps the gateway conservative rather than
 inventing metadata.
 
-Native `PipelineRunResult` and `ExecutionPlan` expose the policy version,
-descriptor contract version, bounded decision/reason codes, and admitted
-source digests. The planning and `PolicyDecided` receipt events pin the same
-metadata. Gateway receipts record the operation-level decision and bounded
-reasons; they never disclose hidden descriptors or source counts. Review and
-verification outcomes are generic and do not identify held-out content.
+Native `ExecutionPlan` exposes the policy version, descriptor contract version,
+bounded decision/reason codes, and admitted source digests. The planning and
+`PolicyDecided` receipt events pin the same metadata. Gateway receipts record
+the operation-level decision and bounded reasons; they never disclose hidden
+descriptors or source counts. Review and verification outcomes are generic and
+do not identify held-out content.
 
 The policy is durable with the namespace policy object and is revalidated on
 load. Configure it through the authenticated control-plane admin surface, then
