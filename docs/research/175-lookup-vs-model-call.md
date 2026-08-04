@@ -132,11 +132,42 @@ implementation after #151 landed:
 See `docs/capability-catalog.md` (Lookup-first answers) and
 `src/chisei/lookup_first.rs`.
 
+### S2 extension
+
+The follow-up S2 implementation extends the same governed boundary to the
+complete structured contracts for `sekai.semantic.expand_relations`,
+`sekai.context.retrieve`, and `sekai.semantic.explain_derivation`. It reuses
+the native bounded retrieval engine and its authorization-filtered ontology
+snapshot, then serializes the native candidate/link/explanation/descriptor
+shape into the existing `ExecutePlanStream` response envelope.
+
+S2 is still fail-closed. A lookup hit requires every requested root and every
+returned endpoint to be authorized in the requested namespace, and it rejects
+unresolved roots, schema misses, ACL/marking failures, and any traversal,
+source-row, derivation, explanation-size, or time truncation. Explain may
+return a complete structured `found=false` result when the authorized
+traversal is complete. Entailment remains unavailable on the PostgreSQL
+community runtime because the runtime cannot provide the native
+authorization-filtered ontology snapshot required by the reasoning engine;
+asserted-only retrieval remains eligible.
+
+The short-circuit is evaluated immediately after execution namespace
+authorization and before provider selection, residency, egress, and model
+payload preparation. Hits record `provider=lookup`, `answer_path=lookup_hit`,
+zero provider token fields, and retrieval provenance on the existing receipt;
+refusals continue through the normal model path with `lookup_refusal`.
+
+The checked-in S2 fixtures cover a complete hit and a fail-closed path for
+each new capability, plus the complete negative explain case. They assert
+structured field compatibility and zero provider fields locally; they do not
+claim a production spend percentage.
+
 ## Conclusion
 
 There is a **plausible narrow deterministic set** of lookup-shaped capabilities.
 Research initially deferred broad fleet measurement; maintainer **S1** then
-shipped a bounded allow-list short-circuit via #281 (see Impact section above).
-Close this research as **recommendation complete with S1 shipped**; further
-spend % claims still require measured corpora beyond the structural dual-run
-fixture suite.
+shipped a bounded allow-list short-circuit via #281 and **S2** extended the
+same boundary to complete retrieval-shaped capability contracts (see Impact
+sections above). Close this research as **recommendation complete with S2
+shipped**; further spend % claims still require measured corpora beyond the
+structural dual-run fixture suite.

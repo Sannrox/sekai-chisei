@@ -1,5 +1,5 @@
 {
-  "suite": "s1-lookup-first",
+  "suite": "s1-s2-lookup-first",
   "issue": 281,
   "decision": "S1",
   "description": "Checked-in fixture suite for allow-listed structured lookup-first answers. Dual-run shadow uses structural equality of golden answers; no fleet spend claim.",
@@ -10,6 +10,11 @@
     "sekai.semantic.explain_derivation"
   ],
   "s1_short_circuit_capability": "sekai.semantic.resolve_ref",
+  "s2_short_circuit_capabilities": [
+    "sekai.semantic.expand_relations",
+    "sekai.context.retrieve",
+    "sekai.semantic.explain_derivation"
+  ],
   "cases": [
     {
       "id": "resolve_ref_hit",
@@ -49,6 +54,127 @@
       "expected_path": "model_path",
       "expected_refusal": "acl_denied",
       "notes": "ACL miss fails closed; catalog visibility is not an authz token."
+    }
+  ],
+  "s2_cases": [
+    {
+      "id": "expand_relations_hit",
+      "capability": "sekai.semantic.expand_relations",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "root": { "object_id": "lookup-root" },
+        "direction": "outgoing",
+        "max_depth": 1
+      },
+      "expected_path": "lookup_hit",
+      "notes": "Complete authorized expansion returns the native candidate/link shape with provider=lookup and zero tokens."
+    },
+    {
+      "id": "expand_relations_truncated_fallback",
+      "capability": "sekai.semantic.expand_relations",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "root": { "object_id": "lookup-root" },
+        "direction": "outgoing",
+        "max_depth": 1,
+        "max_objects": 1
+      },
+      "expected_path": "model_path",
+      "expected_refusal": "truncated",
+      "notes": "Any object/link truncation is incomplete for short-circuiting and falls back to the model."
+    },
+    {
+      "id": "retrieve_context_hit",
+      "capability": "sekai.context.retrieve",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "roots": [{ "object_id": "lookup-root" }],
+        "direction": "outgoing",
+        "max_depth": 1
+      },
+      "expected_path": "lookup_hit",
+      "notes": "Complete authorized retrieval preserves native candidates, links, explanations, and descriptors."
+    },
+    {
+      "id": "retrieve_context_acl_fallback",
+      "capability": "sekai.context.retrieve",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "roots": [{ "object_id": "acl-denied" }],
+        "max_depth": 0
+      },
+      "expected_path": "model_path",
+      "expected_refusal": "acl_denied",
+      "notes": "A denied root never becomes a partial lookup answer."
+    },
+    {
+      "id": "explain_derivation_hit",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "from": { "object_id": "lookup-root" },
+        "to": { "object_id": "lookup-child" },
+        "direction": "outgoing",
+        "max_depth": 1
+      },
+      "expected_path": "lookup_hit",
+      "notes": "Complete authorized explanation returns found=true, evidence refs, and descriptor."
+    },
+    {
+      "id": "explain_derivation_missing_root_fallback",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "from": { "object_id": "does-not-exist" },
+        "to": { "object_id": "lookup-child" }
+      },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete",
+      "notes": "An unresolved source root is not a complete explanation."
+    },
+    {
+      "id": "explain_derivation_acl_target_fallback",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "from": { "object_id": "lookup-root" },
+        "to": { "object_id": "acl-denied" }
+      },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete",
+      "notes": "Missing and unauthorized explanation targets share one refusal outcome to avoid an existence oracle."
+    },
+    {
+      "id": "explain_derivation_complete_negative_hit",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "from": { "object_id": "lookup-root" },
+        "to": { "object_id": "lookup-unrelated" }
+      },
+      "expected_path": "lookup_hit",
+      "notes": "A complete authorized negative result is structured found=false, not an invented explanation."
+    },
+    {
+      "id": "explain_derivation_missing_target_fallback",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": {
+        "from": { "object_id": "lookup-root" },
+        "to": { "object_id": "does-not-exist" }
+      },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete",
+      "notes": "A missing target shares the unauthorized-target outcome and cannot be distinguished by lookup telemetry."
     }
   ]
 }

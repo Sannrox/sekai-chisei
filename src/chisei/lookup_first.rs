@@ -1,4 +1,4 @@
-//! Lookup-first governed answers for allow-listed structured capabilities (#281 / S1).
+//! Lookup-first governed answers for allow-listed structured capabilities (#281 / S2).
 //!
 //! When a PlanExecution/ExecutePlanStream request targets an allow-listed #151 semantic
 //! capability with a fixed structured contract, Chisei attempts an authorized
@@ -7,18 +7,33 @@
 //! tokens**. Incomplete graph state or ACL misses fail closed to the model path
 //! and record `lookup_refusal` on the operation receipt.
 //!
-//! Scope (maintainer decision S1):
+//! Scope (maintainer decision S2):
 //! - Narrow allow-listed structured capabilities only (no free-form NL).
 //! - Fixture suite + dual-run/shadow structural equality where practical.
 //! - No fleet-wide spend-% claim.
 
+use crate::chisei::epistemic_descriptor::{
+    EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
+};
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
+use crate::sekai::action_approval::ACTION_APPROVAL_KIND;
+use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
+use crate::sekai::compute;
+use crate::sekai::governed_facts::{FACT_KIND, PROFILE_KIND, WAIVER_KIND};
+use crate::sekai::markings;
+use crate::sekai::ontology::OntologyRegistry;
+use crate::sekai::retrieval::{
+    self, ReasoningMode, RetrievalDirection, RetrievalQuery, RetrievalRoot,
+};
+use crate::sekai::schema::{self, SchemaRegistry};
+use crate::sekai::security::Role;
 use crate::sekai::semantic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Receipt / report path when structured lookup fully answers the request.
 pub const ANSWER_PATH_LOOKUP_HIT: &str = "lookup_hit";
@@ -33,7 +48,7 @@ pub const LOOKUP_PROVIDER: &str = "lookup";
 /// Stop reason on PlannedChatResponse for a full lookup hit.
 pub const LOOKUP_HIT_STOP_REASON: &str = "lookup_hit";
 
-/// S1 allow-list: fixed #151 semantic capability contracts only.
+/// S2 allow-list: fixed #151 semantic capability contracts only.
 pub const LOOKUP_FIRST_ALLOWLIST: &[&str] = &[
     semantic::CAPABILITY_RESOLVE_REF,
     semantic::CAPABILITY_EXPAND_RELATIONS,
@@ -63,6 +78,63 @@ pub struct ResolveRefInput {
     pub ontology_class: String,
     #[serde(default)]
     pub ontology_relation: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct LookupContextRoot {
+    object_id: String,
+    external_id: String,
+    link_id: String,
+}
+
+impl LookupContextRoot {
+    fn into_retrieval_root(self) -> Result<RetrievalRoot, ()> {
+        let configured = [
+            !self.object_id.is_empty(),
+            !self.external_id.is_empty(),
+            !self.link_id.is_empty(),
+        ]
+        .into_iter()
+        .filter(|configured| *configured)
+        .count();
+        if configured != 1 {
+            return Err(());
+        }
+        if !self.object_id.is_empty() {
+            Ok(RetrievalRoot::Object(self.object_id))
+        } else if !self.external_id.is_empty() {
+            Ok(RetrievalRoot::External(self.external_id))
+        } else {
+            Ok(RetrievalRoot::Link(self.link_id))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+#[serde(deny_unknown_fields)]
+struct LookupRetrievalInput {
+    /// Accepted for the native Expand/Explain request shape. ExecutePlanStream
+    /// already supplies the authoritative namespace outside the spec.
+    namespace: String,
+    roots: Vec<LookupContextRoot>,
+    root: Option<LookupContextRoot>,
+    from: Option<LookupContextRoot>,
+    to: Option<LookupContextRoot>,
+    relations: Vec<String>,
+    direction: String,
+    reasoning_mode: String,
+    max_depth: u32,
+    max_objects: u32,
+    max_links: u32,
+    kind_filter: Vec<String>,
+    max_source_rows: u32,
+    max_derived_rows: u32,
+    max_derivation_steps: u32,
+    max_time_ms: u32,
+    max_explanation_bytes: u64,
 }
 
 /// Outcome of a lookup-first attempt.
@@ -180,18 +252,701 @@ pub fn try_lookup_first(
         semantic::CAPABILITY_RESOLVE_REF => {
             try_resolve_ref(namespace, actor, structured_input_json, db)
         }
-        // Expand / retrieve / explain are allow-listed for identification and
-        // fixture documentation. S1 short-circuits only resolve_ref fully;
-        // other shapes refuse closed so callers take the model path with an
-        // explicit reason rather than inventing free-form answers.
-        semantic::CAPABILITY_EXPAND_RELATIONS
-        | semantic::CAPABILITY_RETRIEVE_CONTEXT
-        | semantic::CAPABILITY_EXPLAIN_DERIVATION => Ok(LookupDecision::Refusal {
-            capability: capability.into(),
-            reason: "capability_not_short_circuitable_in_s1".into(),
-        }),
+        semantic::CAPABILITY_EXPAND_RELATIONS => {
+            try_expand_relations(namespace, actor, structured_input_json, db)
+        }
+        semantic::CAPABILITY_RETRIEVE_CONTEXT => {
+            try_retrieve_context(namespace, actor, structured_input_json, db)
+        }
+        semantic::CAPABILITY_EXPLAIN_DERIVATION => {
+            try_explain_derivation(namespace, actor, structured_input_json, db)
+        }
         _ => Ok(LookupDecision::NotEligible),
     }
+}
+
+#[derive(Debug)]
+enum RetrievalLookupError {
+    Refusal(&'static str),
+    Storage(String),
+}
+
+fn refusal(capability: &str, reason: &'static str) -> LookupDecision {
+    LookupDecision::Refusal {
+        capability: capability.into(),
+        reason: reason.into(),
+    }
+}
+
+fn parse_retrieval_input(
+    capability: &str,
+    namespace: &str,
+    structured_input_json: &str,
+) -> Result<LookupRetrievalInput, LookupDecision> {
+    let raw = serde_json::from_str::<Value>(structured_input_json)
+        .map_err(|_| refusal(capability, "schema_miss"))?;
+    validate_retrieval_fields(capability, &raw)?;
+    let input = serde_json::from_value::<LookupRetrievalInput>(raw)
+        .map_err(|_| refusal(capability, "schema_miss"))?;
+    if !input.namespace.is_empty() && input.namespace != namespace {
+        return Err(refusal(capability, "cross_namespace"));
+    }
+    Ok(input)
+}
+
+fn validate_retrieval_fields(capability: &str, raw: &Value) -> Result<(), LookupDecision> {
+    let Some(fields) = raw.as_object() else {
+        return Err(refusal(capability, "schema_miss"));
+    };
+    let allowed = match capability {
+        semantic::CAPABILITY_EXPAND_RELATIONS => &[
+            "namespace",
+            "root",
+            "relations",
+            "direction",
+            "reasoning_mode",
+            "max_depth",
+            "max_objects",
+            "max_links",
+            "kind_filter",
+            "max_source_rows",
+            "max_derived_rows",
+            "max_derivation_steps",
+            "max_time_ms",
+            "max_explanation_bytes",
+        ][..],
+        semantic::CAPABILITY_RETRIEVE_CONTEXT => &[
+            "roots",
+            "relations",
+            "direction",
+            "max_depth",
+            "max_objects",
+            "max_links",
+            "kind_filter",
+            "reasoning_mode",
+            "max_source_rows",
+            "max_derived_rows",
+            "max_derivation_steps",
+            "max_time_ms",
+            "max_explanation_bytes",
+        ][..],
+        semantic::CAPABILITY_EXPLAIN_DERIVATION => &[
+            "namespace",
+            "from",
+            "to",
+            "relations",
+            "direction",
+            "reasoning_mode",
+            "max_depth",
+            "max_objects",
+            "max_links",
+            "max_source_rows",
+            "max_derived_rows",
+            "max_derivation_steps",
+            "max_time_ms",
+            "max_explanation_bytes",
+        ][..],
+        _ => return Err(refusal(capability, "schema_miss")),
+    };
+    if fields
+        .keys()
+        .any(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(refusal(capability, "schema_miss"));
+    }
+    Ok(())
+}
+
+fn build_retrieval_query(
+    input: &LookupRetrievalInput,
+    roots: Vec<RetrievalRoot>,
+    default_max_depth: Option<u32>,
+) -> Result<RetrievalQuery, LookupDecision> {
+    let direction = RetrievalDirection::parse(&input.direction)
+        .map_err(|_| refusal("lookup", "schema_miss"))?;
+    let reasoning_mode = ReasoningMode::parse(&input.reasoning_mode)
+        .map_err(|_| refusal("lookup", "schema_miss"))?;
+    Ok(RetrievalQuery {
+        roots,
+        relations: input.relations.clone(),
+        direction,
+        max_depth: if input.max_depth == 0 {
+            default_max_depth.unwrap_or(0)
+        } else {
+            input.max_depth
+        },
+        max_objects: input.max_objects,
+        max_links: input.max_links,
+        kind_filter: input.kind_filter.clone(),
+        reasoning_mode,
+        max_source_rows: input.max_source_rows,
+        max_derived_rows: input.max_derived_rows,
+        max_derivation_steps: input.max_derivation_steps,
+        max_time_ms: input.max_time_ms,
+        max_explanation_bytes: input.max_explanation_bytes,
+        initial_source_rows: 0,
+        source_rows_truncated: false,
+    })
+}
+
+fn try_expand_relations(
+    namespace: &str,
+    actor: &str,
+    structured_input_json: &str,
+    db: &RuntimeDb,
+) -> Result<LookupDecision, String> {
+    let capability = semantic::CAPABILITY_EXPAND_RELATIONS;
+    let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
+        Ok(input) => input,
+        Err(decision) => return Ok(decision),
+    };
+    let Some(root) = input.root.clone() else {
+        return Ok(refusal(capability, "schema_miss"));
+    };
+    let root = match root.into_retrieval_root() {
+        Ok(root) => root,
+        Err(()) => return Ok(refusal(capability, "schema_miss")),
+    };
+    let query = match build_retrieval_query(&input, vec![root], None) {
+        Ok(query) => query,
+        Err(decision) => return Ok(with_capability(decision, capability)),
+    };
+    let reasoning_mode = query.reasoning_mode;
+    let result = match run_lookup_retrieval(namespace, actor, db, query) {
+        Ok(result) => result,
+        Err(RetrievalLookupError::Refusal(reason)) => return Ok(refusal(capability, reason)),
+        Err(RetrievalLookupError::Storage(error)) => return Err(error),
+    };
+    if let Some(reason) = result_refusal_reason(&result) {
+        return Ok(refusal(capability, reason));
+    }
+    let answer = retrieval_answer_json(capability, &result, reasoning_mode, None)?;
+    let provenance = retrieval_provenance(&result);
+    Ok(LookupDecision::Hit {
+        capability: capability.into(),
+        answer_json: answer,
+        provenance,
+    })
+}
+
+fn try_retrieve_context(
+    namespace: &str,
+    actor: &str,
+    structured_input_json: &str,
+    db: &RuntimeDb,
+) -> Result<LookupDecision, String> {
+    let capability = semantic::CAPABILITY_RETRIEVE_CONTEXT;
+    let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
+        Ok(input) => input,
+        Err(decision) => return Ok(decision),
+    };
+    if input.roots.is_empty() {
+        return Ok(refusal(capability, "schema_miss"));
+    }
+    let roots = match input
+        .roots
+        .clone()
+        .into_iter()
+        .map(LookupContextRoot::into_retrieval_root)
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(roots) => roots,
+        Err(()) => return Ok(refusal(capability, "schema_miss")),
+    };
+    let query = match build_retrieval_query(&input, roots, None) {
+        Ok(query) => query,
+        Err(decision) => return Ok(with_capability(decision, capability)),
+    };
+    let reasoning_mode = query.reasoning_mode;
+    let result = match run_lookup_retrieval(namespace, actor, db, query) {
+        Ok(result) => result,
+        Err(RetrievalLookupError::Refusal(reason)) => return Ok(refusal(capability, reason)),
+        Err(RetrievalLookupError::Storage(error)) => return Err(error),
+    };
+    if let Some(reason) = result_refusal_reason(&result) {
+        return Ok(refusal(capability, reason));
+    }
+    let answer = retrieval_answer_json(capability, &result, reasoning_mode, None)?;
+    let provenance = retrieval_provenance(&result);
+    Ok(LookupDecision::Hit {
+        capability: capability.into(),
+        answer_json: answer,
+        provenance,
+    })
+}
+
+fn try_explain_derivation(
+    namespace: &str,
+    actor: &str,
+    structured_input_json: &str,
+    db: &RuntimeDb,
+) -> Result<LookupDecision, String> {
+    let capability = semantic::CAPABILITY_EXPLAIN_DERIVATION;
+    let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
+        Ok(input) => input,
+        Err(decision) => return Ok(decision),
+    };
+    let (Some(from), Some(to)) = (input.from.clone(), input.to.clone()) else {
+        return Ok(refusal(capability, "schema_miss"));
+    };
+    let from = match from.into_retrieval_root() {
+        Ok(root) => root,
+        Err(()) => return Ok(refusal(capability, "schema_miss")),
+    };
+    let to = match to.into_retrieval_root() {
+        Ok(root) => root,
+        Err(()) => return Ok(refusal(capability, "schema_miss")),
+    };
+    let principals = effective_lookup_principals(actor);
+    if !explain_target_is_authorized(&to, namespace, &principals, db)? {
+        // Missing and unauthorized targets intentionally share one outcome.
+        // A distinct refusal for an existing but hidden target would create
+        // an existence oracle through the lookup/model path boundary.
+        return Ok(refusal(capability, "incomplete"));
+    }
+    let query = match build_retrieval_query(&input, vec![from], Some(retrieval::MAX_DEPTH)) {
+        Ok(query) => query,
+        Err(decision) => return Ok(with_capability(decision, capability)),
+    };
+    let reasoning_mode = query.reasoning_mode;
+    let result = match run_lookup_retrieval(namespace, actor, db, query) {
+        Ok(result) => result,
+        Err(RetrievalLookupError::Refusal(reason)) => return Ok(refusal(capability, reason)),
+        Err(RetrievalLookupError::Storage(error)) => return Err(error),
+    };
+    if let Some(reason) = result_refusal_reason(&result) {
+        return Ok(refusal(capability, reason));
+    }
+    let answer = retrieval_answer_json(capability, &result, reasoning_mode, Some(&to))?;
+    let provenance = retrieval_provenance(&result);
+    Ok(LookupDecision::Hit {
+        capability: capability.into(),
+        answer_json: answer,
+        provenance,
+    })
+}
+
+fn with_capability(decision: LookupDecision, capability: &str) -> LookupDecision {
+    match decision {
+        LookupDecision::Refusal { reason, .. } => LookupDecision::Refusal {
+            capability: capability.into(),
+            reason,
+        },
+        other => other,
+    }
+}
+
+const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
+    ACTION_POLICY_KIND,
+    BLAST_RADIUS_KIND,
+    ACTION_APPROVAL_KIND,
+    crate::domain::KIND_CAPABILITY,
+    crate::domain::KIND_EXTERNAL_EVIDENCE,
+    PROFILE_KIND,
+    FACT_KIND,
+    WAIVER_KIND,
+    markings::PRINCIPAL_PROFILE_KIND,
+];
+
+fn is_reserved_governance_kind(kind: &str) -> bool {
+    RESERVED_GOVERNANCE_KINDS.contains(&kind)
+}
+
+fn run_lookup_retrieval(
+    namespace: &str,
+    actor: &str,
+    db: &RuntimeDb,
+    mut query: RetrievalQuery,
+) -> Result<retrieval::RetrievalResult, RetrievalLookupError> {
+    let started = Instant::now();
+    let principals = effective_lookup_principals(actor);
+    let roots = query.roots.clone();
+    if let Some(reason) = preflight_root_access(&roots, namespace, &principals, db)
+        .map_err(RetrievalLookupError::Storage)?
+    {
+        return Err(RetrievalLookupError::Refusal(reason));
+    }
+    let (ontology, source_rows, source_rows_truncated) =
+        lookup_ontology_snapshot(db, &principals, &query, started)?;
+    query.initial_source_rows = source_rows;
+    query.source_rows_truncated = source_rows_truncated;
+    let namespace = namespace.to_string();
+    let mut result = retrieval::retrieve_with_ontology_started(
+        db,
+        &query,
+        ontology.as_ref(),
+        started,
+        |object| {
+            (object.namespace.is_empty() || object.namespace == namespace)
+                && lookup_object_readable(object, &principals, db).unwrap_or(false)
+        },
+        |object| is_reserved_governance_kind(&object.kind),
+    )
+    .map_err(|error| match error {
+        retrieval::RetrievalError::InvalidArgument(_) => {
+            RetrievalLookupError::Refusal("schema_miss")
+        }
+        retrieval::RetrievalError::Storage(error) => RetrievalLookupError::Storage(error),
+    })?;
+    if query.reasoning_mode == ReasoningMode::Entailment
+        && started.elapsed() >= lookup_reasoning_timeout(query.max_time_ms)
+        && !result
+            .truncation_reasons
+            .iter()
+            .any(|reason| reason == "time")
+    {
+        result.truncation_reasons.push("time".into());
+        result.truncated = true;
+    }
+    for candidate in &mut result.candidates {
+        candidate.object = redact_lookup_object(&candidate.object, &principals, &namespace, db)
+            .map_err(RetrievalLookupError::Storage)?;
+    }
+    Ok(result)
+}
+
+fn effective_lookup_principals(actor: &str) -> Vec<String> {
+    // ExecutePlanStream receives one canonical authenticated subject. Keep it
+    // opaque; an independently authenticated principal list would need to be
+    // passed as a separate request-context value, never encoded in the name.
+    vec![actor.to_string()]
+}
+
+fn lookup_reasoning_timeout(max_time_ms: u32) -> Duration {
+    Duration::from_millis(u64::from(if max_time_ms == 0 {
+        retrieval::DEFAULT_MAX_TIME_MS
+    } else {
+        max_time_ms.min(retrieval::MAX_TIME_MS)
+    }))
+}
+
+fn preflight_root_access(
+    roots: &[RetrievalRoot],
+    namespace: &str,
+    principals: &[String],
+    db: &RuntimeDb,
+) -> Result<Option<&'static str>, String> {
+    for root in roots {
+        let objects = match root {
+            RetrievalRoot::Object(id) => db.get_object(id)?.into_iter().collect::<Vec<_>>(),
+            RetrievalRoot::External(external_id) => db
+                .find_by_external_id(external_id)?
+                .into_iter()
+                .collect::<Vec<_>>(),
+            RetrievalRoot::Link(id) => {
+                let Some(link) = db.get_link(id)? else {
+                    continue;
+                };
+                [db.get_object(&link.from_id)?, db.get_object(&link.to_id)?]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            }
+        };
+        for object in objects {
+            if !object.namespace.is_empty() && object.namespace != namespace {
+                return Ok(Some("cross_namespace"));
+            }
+            if is_reserved_governance_kind(&object.kind)
+                || !lookup_object_readable(&object, principals, db)?
+            {
+                return Ok(Some("acl_denied"));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn explain_target_is_authorized(
+    target: &RetrievalRoot,
+    namespace: &str,
+    principals: &[String],
+    db: &RuntimeDb,
+) -> Result<bool, String> {
+    let objects = match target {
+        RetrievalRoot::Object(id) => db.get_object(id)?.into_iter().collect::<Vec<_>>(),
+        RetrievalRoot::External(external_id) => db
+            .find_by_external_id(external_id)?
+            .into_iter()
+            .collect::<Vec<_>>(),
+        RetrievalRoot::Link(id) => {
+            let Some(link) = db.get_link(id)? else {
+                return Ok(false);
+            };
+            [db.get_object(&link.from_id)?, db.get_object(&link.to_id)?]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        }
+    };
+    if objects.is_empty() {
+        return Ok(false);
+    }
+    Ok(objects.iter().all(|object| {
+        (object.namespace.is_empty() || object.namespace == namespace)
+            && !is_reserved_governance_kind(&object.kind)
+            && lookup_object_readable(object, principals, db).unwrap_or(false)
+    }))
+}
+
+fn lookup_ontology_snapshot(
+    db: &RuntimeDb,
+    principals: &[String],
+    query: &RetrievalQuery,
+    started: Instant,
+) -> Result<(Option<OntologyRegistry>, u32, bool), RetrievalLookupError> {
+    if query.reasoning_mode != ReasoningMode::Entailment {
+        return Ok((None, 0, false));
+    }
+    if db.backend_name() == "postgres" {
+        return Err(RetrievalLookupError::Refusal("backend_unsupported"));
+    }
+    let deadline = started + lookup_reasoning_timeout(query.max_time_ms);
+    let source_limit = if query.max_source_rows == 0 {
+        retrieval::DEFAULT_MAX_SOURCE_ROWS
+    } else {
+        query.max_source_rows.min(retrieval::MAX_SOURCE_ROWS)
+    };
+    let mut source_rows = 0u32;
+    let mut source_rows_truncated = false;
+    let mut classes = match db.list_readable_ontology_classes(
+        principals,
+        deadline,
+        source_limit.saturating_add(1),
+    ) {
+        Ok(classes) => classes,
+        Err(_) if started.elapsed() >= lookup_reasoning_timeout(query.max_time_ms) => Vec::new(),
+        Err(error) => return Err(RetrievalLookupError::Storage(error)),
+    };
+    if classes.len() > source_limit as usize {
+        classes.truncate(source_limit as usize);
+        source_rows_truncated = true;
+    }
+    source_rows = source_rows.saturating_add(classes.len() as u32);
+    classes.retain(|_| started.elapsed() < lookup_reasoning_timeout(query.max_time_ms));
+    let visible_class_names = classes
+        .iter()
+        .map(|class| class.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for class in &mut classes {
+        class
+            .superclasses
+            .retain(|name| visible_class_names.contains(name));
+        class
+            .equivalent_classes
+            .retain(|name| visible_class_names.contains(name));
+        class
+            .disjoint_classes
+            .retain(|name| visible_class_names.contains(name));
+    }
+    let remaining_rows = source_limit.saturating_sub(source_rows);
+    let mut relations = if !source_rows_truncated && started < deadline {
+        match db.list_readable_ontology_relations(
+            principals,
+            deadline,
+            remaining_rows.saturating_add(1),
+        ) {
+            Ok(relations) => relations,
+            Err(_) if started.elapsed() >= lookup_reasoning_timeout(query.max_time_ms) => {
+                Vec::new()
+            }
+            Err(error) => return Err(RetrievalLookupError::Storage(error)),
+        }
+    } else {
+        Vec::new()
+    };
+    if relations.len() > remaining_rows as usize {
+        relations.truncate(remaining_rows as usize);
+        source_rows_truncated = true;
+    }
+    source_rows = source_rows.saturating_add(relations.len() as u32);
+    relations.retain(|_| started.elapsed() < lookup_reasoning_timeout(query.max_time_ms));
+    let visible_relation_names = relations
+        .iter()
+        .map(|relation| relation.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    relations.retain(|relation| {
+        visible_class_names.contains(&relation.domain)
+            && visible_class_names.contains(&relation.range)
+    });
+    for relation in &mut relations {
+        if !relation.inverse.is_empty() && !visible_relation_names.contains(&relation.inverse) {
+            relation.inverse.clear();
+        }
+    }
+    Ok((
+        Some(OntologyRegistry::from_parts(classes, relations)),
+        source_rows,
+        source_rows_truncated,
+    ))
+}
+
+fn result_refusal_reason(result: &retrieval::RetrievalResult) -> Option<&'static str> {
+    if result.denied_roots > 0 || result.denied_objects > 0 {
+        return Some("acl_denied");
+    }
+    if result.unresolved_roots > 0 {
+        return Some("incomplete");
+    }
+    if result.truncated {
+        return Some("truncated");
+    }
+    None
+}
+
+fn retrieval_answer_json(
+    capability: &str,
+    result: &retrieval::RetrievalResult,
+    reasoning_mode: ReasoningMode,
+    explain_to: Option<&RetrievalRoot>,
+) -> Result<String, String> {
+    if capability == semantic::CAPABILITY_EXPLAIN_DERIVATION {
+        let found_explanation = result.candidates.iter().find_map(|candidate| {
+            explain_to
+                .is_some_and(|root| retrieval_root_matches_object(root, &candidate.object, result))
+                .then(|| candidate.explanation.clone())
+        });
+        let mut evidence_refs = found_explanation
+            .as_ref()
+            .map(|explanation| explanation.source_fact_ids.clone())
+            .unwrap_or_default();
+        if let Some(explanation) = found_explanation.as_ref() {
+            for step in &explanation.steps {
+                evidence_refs.extend(step.source_fact_ids.iter().cloned());
+            }
+        }
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        let descriptor = found_explanation
+            .as_ref()
+            .map(|explanation| descriptor_json(explanation, false));
+        return serde_json::to_string(&json!({
+            "explanation": found_explanation.as_ref().map(explanation_json),
+            "found": found_explanation.is_some(),
+            "truncated": result.truncated,
+            "truncation_reasons": result.truncation_reasons,
+            "ontology_revision": result.ontology_revision,
+            "reasoning_mode": semantic::reasoning_mode_label(reasoning_mode),
+            "evidence_refs": evidence_refs,
+            "descriptor": descriptor,
+        }))
+        .map_err(|error| error.to_string());
+    }
+
+    let candidates = result
+        .candidates
+        .iter()
+        .map(candidate_json)
+        .collect::<Vec<_>>();
+    let links = result
+        .links
+        .iter()
+        .map(|link| serde_json::to_value(link).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut response = json!({
+        "candidates": candidates,
+        "links": links,
+        "truncated": result.truncated,
+        "unresolved_roots": result.unresolved_roots,
+        "denied_objects": 0,
+        "truncated_objects": result.truncated_objects,
+        "truncated_links": result.truncated_links,
+        "truncation_reasons": result.truncation_reasons,
+        "source_rows": result.source_rows,
+        "derived_rows": result.derived_rows,
+        "ontology_revision": result.ontology_revision,
+    });
+    if capability == semantic::CAPABILITY_EXPAND_RELATIONS {
+        response["reasoning_mode"] = json!(semantic::reasoning_mode_label(reasoning_mode));
+        response["epistemic_descriptor_version"] = json!(EPISTEMIC_DESCRIPTOR_VERSION);
+    } else {
+        response["epistemic_descriptor_version"] = json!(EPISTEMIC_DESCRIPTOR_VERSION);
+    }
+    serde_json::to_string(&response).map_err(|error| error.to_string())
+}
+
+fn retrieval_root_matches_object(
+    root: &RetrievalRoot,
+    object: &Object,
+    result: &retrieval::RetrievalResult,
+) -> bool {
+    match root {
+        RetrievalRoot::Object(id) => object.id == *id,
+        RetrievalRoot::External(external_id) => object.external_id == *external_id,
+        RetrievalRoot::Link(link_id) => result.links.iter().any(|link| {
+            link.id == *link_id && (link.from_id == object.id || link.to_id == object.id)
+        }),
+    }
+}
+
+fn candidate_json(candidate: &retrieval::RetrievalCandidate) -> Value {
+    json!({
+        "object": candidate.object,
+        "depth": candidate.depth,
+        "via_relation": candidate.via_relation,
+        "affinity": candidate.affinity,
+        "explanation": explanation_json(&candidate.explanation),
+        "descriptor": descriptor_json(&candidate.explanation, false),
+    })
+}
+
+fn explanation_json(explanation: &retrieval::Explanation) -> Value {
+    json!({
+        "steps": explanation
+            .steps
+            .iter()
+            .map(|step| json!({
+                "kind": step.kind,
+                "relation": step.relation,
+                "from_id": step.from_id,
+                "to_id": step.to_id,
+                "source_fact_ids": step.source_fact_ids,
+                "ontology_revision": step.ontology_revision,
+                "rule": step.rule,
+            }))
+            .collect::<Vec<_>>(),
+        "source_fact_ids": explanation.source_fact_ids,
+        "ontology_revision": explanation.ontology_revision,
+        "derived": explanation.derived,
+    })
+}
+
+fn descriptor_json(explanation: &retrieval::Explanation, source_rows_truncated: bool) -> Value {
+    serde_json::to_value(DomainEpistemicDescriptor::from_graph_explanation(
+        explanation,
+        source_rows_truncated,
+    ))
+    .expect("epistemic descriptor is serializable")
+}
+
+fn retrieval_provenance(result: &retrieval::RetrievalResult) -> BTreeMap<String, String> {
+    let mut object_ids = result
+        .candidates
+        .iter()
+        .map(|candidate| candidate.object.id.clone())
+        .collect::<Vec<_>>();
+    object_ids.sort();
+    object_ids.dedup();
+    object_ids.truncate(8);
+    let mut link_ids = result
+        .links
+        .iter()
+        .map(|link| link.id.clone())
+        .collect::<Vec<_>>();
+    link_ids.sort();
+    link_ids.dedup();
+    link_ids.truncate(8);
+    let mut provenance = BTreeMap::new();
+    if !object_ids.is_empty() {
+        provenance.insert("source_object_ids".into(), object_ids.join(","));
+    }
+    if !link_ids.is_empty() {
+        provenance.insert("source_link_ids".into(), link_ids.join(","));
+    }
+    if !result.ontology_revision.is_empty() {
+        provenance.insert("ontology_revision".into(), result.ontology_revision.clone());
+    }
+    provenance
 }
 
 fn try_resolve_ref(
@@ -396,7 +1151,127 @@ fn id_readable(object_id: &str, actor: &str, db: &RuntimeDb) -> Result<bool, Str
     Ok(grants.iter().any(|grant| grant.principal == actor))
 }
 
-/// Run the S1 fixture suite against a prepared database.
+fn id_readable_for_principals(
+    object_id: &str,
+    principals: &[String],
+    db: &RuntimeDb,
+) -> Result<bool, String> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(true);
+    }
+    let grants = db.list_grants(object_id)?;
+    if grants.is_empty() {
+        return Ok(true);
+    }
+    Ok(grants
+        .iter()
+        .any(|grant| principals.contains(&grant.principal)))
+}
+
+fn lookup_object_readable(
+    object: &Object,
+    principals: &[String],
+    db: &RuntimeDb,
+) -> Result<bool, String> {
+    if !id_readable_for_principals(&object.id, principals, db)?
+        || is_reserved_governance_kind(&object.kind)
+    {
+        return Ok(false);
+    }
+    let marking = markings::object_classification(object)?;
+    if marking.is_none() {
+        return Ok(true);
+    }
+    let primary = principals.first().map(String::as_str).unwrap_or_default();
+    let authority = lookup_principal_authority(primary, db)?;
+    Ok(
+        markings::evaluate_marking_access("lookup-first", marking, &authority).decision
+            != markings::MarkingDecision::Deny,
+    )
+}
+
+fn lookup_principal_authority(
+    actor: &str,
+    db: &RuntimeDb,
+) -> Result<markings::PrincipalAuthority, String> {
+    if let Some(trusted) = markings::trusted_service_authority(actor) {
+        return Ok(trusted);
+    }
+    let candidates = db.find_all_by_external_id(&markings::principal_profile_external_id(actor))?;
+    let mut trusted_profiles = Vec::new();
+    for object in &candidates {
+        if object.kind != markings::PRINCIPAL_PROFILE_KIND
+            || object
+                .properties
+                .get(markings::PRINCIPAL_PROFILE_SEALED_PROPERTY)
+                .is_none_or(|value| value != "true")
+        {
+            continue;
+        }
+        let grants = db.list_grants(&object.id)?;
+        if grants.iter().any(|grant| matches!(grant.role, Role::Admin)) {
+            trusted_profiles.push(object);
+        }
+    }
+    if trusted_profiles.len() > 1 {
+        return Err("multiple trusted principal profiles found".into());
+    }
+    markings::principal_authority_from_profile(actor, trusted_profiles.first().copied())
+}
+
+fn redact_lookup_object(
+    object: &Object,
+    principals: &[String],
+    namespace: &str,
+    db: &RuntimeDb,
+) -> Result<Object, String> {
+    let mut schema_registry = SchemaRegistry::new();
+    if let Some(object_type) = db.get_object_type(&object.kind)? {
+        schema_registry.register(object_type);
+    }
+    let mut projected = object.clone();
+    compute::resolve_schema_computed_with_filter(
+        &mut projected,
+        db,
+        &schema_registry,
+        |candidate| {
+            (candidate.namespace.is_empty() || candidate.namespace == namespace)
+                && lookup_object_readable(candidate, principals, db).unwrap_or(false)
+        },
+    )?;
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(projected);
+    }
+    let is_admin = db
+        .list_grants(&projected.id)?
+        .iter()
+        .any(|grant| principals.contains(&grant.principal) && matches!(grant.role, Role::Admin));
+    if is_admin {
+        return Ok(projected);
+    }
+    let Some(object_type) = schema_registry.get(&projected.kind) else {
+        return Ok(projected);
+    };
+    let mut redacted = projected;
+    for property in &object_type.properties {
+        if schema::is_restricted_property_classification(&property.classification)
+            && redacted.properties.contains_key(&property.name)
+        {
+            redacted
+                .properties
+                .insert(property.name.clone(), "[redacted]".into());
+        }
+    }
+    Ok(redacted)
+}
+
+/// Run the lookup-first fixture suite against a prepared database.
 ///
 /// Dual-run/shadow: when a case supplies `shadow_model_answer`, the lookup
 /// answer must be structurally equal (JSON value equality after parse).
@@ -586,9 +1461,334 @@ pub fn s1_fixture_cases() -> Vec<LookupFixtureCase> {
     ]
 }
 
+/// Built-in S2 fixture definitions for complete retrieval-shaped answers.
+///
+/// Every newly short-circuitable capability has at least one complete hit and
+/// one fail-closed model-path case. The negative explain case is intentional:
+/// a complete, authorized `found=false` result is still a structured hit.
+pub fn s2_fixture_cases() -> Vec<LookupFixtureCase> {
+    let expand_golden = s2_expand_golden_answer();
+    let retrieve_golden = s2_retrieve_golden_answer();
+    let explain_golden = s2_explain_golden_answer();
+    let explain_negative_golden = s2_explain_negative_golden_answer();
+    vec![
+        LookupFixtureCase {
+            id: "expand_relations_hit".into(),
+            capability: semantic::CAPABILITY_EXPAND_RELATIONS.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "root": {"object_id": "lookup-root"},
+                "direction": "outgoing",
+                "max_depth": 1
+            }),
+            expected_path: ANSWER_PATH_LOOKUP_HIT.into(),
+            expected_refusal: None,
+            expected_answer: Some(expand_golden.clone()),
+            shadow_model_answer: Some(expand_golden),
+        },
+        LookupFixtureCase {
+            id: "expand_relations_truncated_fallback".into(),
+            capability: semantic::CAPABILITY_EXPAND_RELATIONS.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "root": {"object_id": "lookup-root"},
+                "direction": "outgoing",
+                "max_depth": 1,
+                "max_objects": 1
+            }),
+            expected_path: ANSWER_PATH_MODEL.into(),
+            expected_refusal: Some("truncated".into()),
+            expected_answer: None,
+            shadow_model_answer: None,
+        },
+        LookupFixtureCase {
+            id: "retrieve_context_hit".into(),
+            capability: semantic::CAPABILITY_RETRIEVE_CONTEXT.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "roots": [{"object_id": "lookup-root"}],
+                "direction": "outgoing",
+                "max_depth": 1
+            }),
+            expected_path: ANSWER_PATH_LOOKUP_HIT.into(),
+            expected_refusal: None,
+            expected_answer: Some(retrieve_golden.clone()),
+            shadow_model_answer: Some(retrieve_golden),
+        },
+        LookupFixtureCase {
+            id: "retrieve_context_acl_fallback".into(),
+            capability: semantic::CAPABILITY_RETRIEVE_CONTEXT.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "roots": [{"object_id": "acl-denied"}],
+                "max_depth": 0
+            }),
+            expected_path: ANSWER_PATH_MODEL.into(),
+            expected_refusal: Some("acl_denied".into()),
+            expected_answer: None,
+            shadow_model_answer: None,
+        },
+        LookupFixtureCase {
+            id: "explain_derivation_hit".into(),
+            capability: semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "from": {"object_id": "lookup-root"},
+                "to": {"object_id": "lookup-child"},
+                "direction": "outgoing",
+                "max_depth": 1
+            }),
+            expected_path: ANSWER_PATH_LOOKUP_HIT.into(),
+            expected_refusal: None,
+            expected_answer: Some(explain_golden.clone()),
+            shadow_model_answer: Some(explain_golden),
+        },
+        LookupFixtureCase {
+            id: "explain_derivation_missing_root_fallback".into(),
+            capability: semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "from": {"object_id": "does-not-exist"},
+                "to": {"object_id": "lookup-child"}
+            }),
+            expected_path: ANSWER_PATH_MODEL.into(),
+            expected_refusal: Some("incomplete".into()),
+            expected_answer: None,
+            shadow_model_answer: None,
+        },
+        LookupFixtureCase {
+            id: "explain_derivation_acl_target_fallback".into(),
+            capability: semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "from": {"object_id": "lookup-root"},
+                "to": {"object_id": "acl-denied"}
+            }),
+            expected_path: ANSWER_PATH_MODEL.into(),
+            expected_refusal: Some("incomplete".into()),
+            expected_answer: None,
+            shadow_model_answer: None,
+        },
+        LookupFixtureCase {
+            id: "explain_derivation_complete_negative_hit".into(),
+            capability: semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "from": {"object_id": "lookup-root"},
+                "to": {"object_id": "lookup-unrelated"}
+            }),
+            expected_path: ANSWER_PATH_LOOKUP_HIT.into(),
+            expected_refusal: None,
+            expected_answer: Some(explain_negative_golden.clone()),
+            shadow_model_answer: Some(explain_negative_golden),
+        },
+        LookupFixtureCase {
+            id: "explain_derivation_missing_target_fallback".into(),
+            capability: semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
+            namespace: "acme".into(),
+            actor: "alice".into(),
+            input: json!({
+                "from": {"object_id": "lookup-root"},
+                "to": {"object_id": "does-not-exist"}
+            }),
+            expected_path: ANSWER_PATH_MODEL.into(),
+            expected_refusal: Some("incomplete".into()),
+            expected_answer: None,
+            shadow_model_answer: None,
+        },
+    ]
+}
+
+fn s2_descriptor(source_refs: &[&str]) -> Value {
+    json!({
+        "confidence_basis": null,
+        "contract_version": EPISTEMIC_DESCRIPTOR_VERSION,
+        "contradicting_evidence_count": null,
+        "derivation_ref": null,
+        "evidence_status": "unknown",
+        "lifecycle_status": "current",
+        "observed_at_ms": null,
+        "origin_class": "asserted",
+        "producer_confidence_bps": null,
+        "source_digests": [],
+        "source_refs": source_refs,
+        "source_row_count": source_refs.len(),
+        "source_rows_truncated": false,
+        "supporting_evidence_count": null
+    })
+}
+
+fn s2_candidate(
+    object_id: &str,
+    depth: u32,
+    affinity: f64,
+    via_relation: &str,
+    source_refs: &[&str],
+    steps: Value,
+) -> Value {
+    let color = if object_id == "lookup-root" {
+        "red"
+    } else {
+        "blue"
+    };
+    let external_id = format!("widget:{object_id}");
+    json!({
+        "affinity": affinity,
+        "depth": depth,
+        "descriptor": s2_descriptor(source_refs),
+        "explanation": {
+            "derived": false,
+            "ontology_revision": "",
+            "source_fact_ids": source_refs,
+            "steps": steps
+        },
+        "object": {
+            "created": 1_700_000_000_000i64,
+            "external_id": external_id,
+            "id": object_id,
+            "kind": "widget",
+            "name": object_id,
+            "namespace": "acme",
+            "properties": {"color": color, "name": object_id},
+            "updated": 1_700_000_000_000i64
+        },
+        "via_relation": via_relation
+    })
+}
+
+fn s2_root_candidate() -> Value {
+    s2_candidate(
+        "lookup-root",
+        0,
+        1.0,
+        "",
+        &["lookup-root"],
+        json!([{
+            "from_id": "lookup-root",
+            "kind": "asserted",
+            "ontology_revision": "",
+            "relation": "",
+            "rule": "root",
+            "source_fact_ids": ["lookup-root"],
+            "to_id": "lookup-root"
+        }]),
+    )
+}
+
+fn s2_child_candidate() -> Value {
+    s2_candidate(
+        "lookup-child",
+        1,
+        0.5,
+        "contains",
+        &["lookup-link-contains"],
+        json!([{
+            "from_id": "lookup-root",
+            "kind": "asserted",
+            "ontology_revision": "",
+            "relation": "contains",
+            "rule": "graph_link",
+            "source_fact_ids": ["lookup-link-contains"],
+            "to_id": "lookup-child"
+        }]),
+    )
+}
+
+fn s2_links() -> Value {
+    json!([{
+        "created": 1_700_000_000_000i64,
+        "from_id": "lookup-root",
+        "id": "lookup-link-contains",
+        "relation": "contains",
+        "to_id": "lookup-child"
+    }])
+}
+
+fn s2_expand_golden_answer() -> Value {
+    json!({
+        "candidates": [s2_root_candidate(), s2_child_candidate()],
+        "denied_objects": 0,
+        "derived_rows": 0,
+        "epistemic_descriptor_version": EPISTEMIC_DESCRIPTOR_VERSION,
+        "links": s2_links(),
+        "ontology_revision": "",
+        "reasoning_mode": "asserted_only",
+        "source_rows": 1,
+        "truncated": false,
+        "truncated_links": 0,
+        "truncated_objects": 0,
+        "truncation_reasons": [],
+        "unresolved_roots": 0
+    })
+}
+
+fn s2_retrieve_golden_answer() -> Value {
+    json!({
+        "candidates": [s2_root_candidate(), s2_child_candidate()],
+        "denied_objects": 0,
+        "derived_rows": 0,
+        "epistemic_descriptor_version": EPISTEMIC_DESCRIPTOR_VERSION,
+        "links": s2_links(),
+        "ontology_revision": "",
+        "source_rows": 1,
+        "truncated": false,
+        "truncated_links": 0,
+        "truncated_objects": 0,
+        "truncation_reasons": [],
+        "unresolved_roots": 0
+    })
+}
+
+fn s2_explain_golden_answer() -> Value {
+    json!({
+        "descriptor": s2_descriptor(&["lookup-link-contains"]),
+        "evidence_refs": ["lookup-link-contains"],
+        "explanation": {
+            "derived": false,
+            "ontology_revision": "",
+            "source_fact_ids": ["lookup-link-contains"],
+            "steps": [{
+                "from_id": "lookup-root",
+                "kind": "asserted",
+                "ontology_revision": "",
+                "relation": "contains",
+                "rule": "graph_link",
+                "source_fact_ids": ["lookup-link-contains"],
+                "to_id": "lookup-child"
+            }]
+        },
+        "found": true,
+        "ontology_revision": "",
+        "reasoning_mode": "asserted_only",
+        "truncated": false,
+        "truncation_reasons": []
+    })
+}
+
+fn s2_explain_negative_golden_answer() -> Value {
+    json!({
+        "descriptor": null,
+        "evidence_refs": [],
+        "explanation": null,
+        "found": false,
+        "ontology_revision": "",
+        "reasoning_mode": "asserted_only",
+        "truncated": false,
+        "truncation_reasons": []
+    })
+}
+
 /// Seed the graph state required by [`s1_fixture_cases`].
 pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
-    use crate::domain::Object;
+    use crate::domain::{Link, Object};
     use crate::sekai::security::{Grant, Role};
     use std::collections::HashMap;
 
@@ -602,6 +1802,21 @@ pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
                 ("name".into(), "lookup-root".into()),
                 ("color".into(), "red".into()),
             ]),
+        ),
+        (
+            "lookup-child",
+            "widget:lookup-child",
+            "acme",
+            HashMap::from([
+                ("name".into(), "lookup-child".into()),
+                ("color".into(), "blue".into()),
+            ]),
+        ),
+        (
+            "lookup-unrelated",
+            "widget:lookup-unrelated",
+            "acme",
+            HashMap::from([("name".into(), "lookup-unrelated".into())]),
         ),
         (
             "other-ns-object",
@@ -634,6 +1849,13 @@ pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
         object_id: "acl-denied".into(),
         principal: "bob".into(),
         role: Role::Viewer,
+        created: now,
+    })?;
+    db.create_link(&Link {
+        id: "lookup-link-contains".into(),
+        from_id: "lookup-root".into(),
+        to_id: "lookup-child".into(),
+        relation: "contains".into(),
         created: now,
     })?;
     Ok(())
@@ -694,6 +1916,132 @@ mod tests {
                 .as_deref(),
             Some("acl_denied")
         );
+    }
+
+    #[test]
+    fn s2_fixture_suite_covers_hits_and_fail_closed_paths() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        let report = run_fixture_suite("s2-lookup-first", &s2_fixture_cases(), &db);
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert_eq!(report.lookup_hits, 4);
+        assert_eq!(report.model_path, 5);
+        assert_eq!(report.lookup_refusals, 5);
+        assert_eq!(report.passed, 9);
+    }
+
+    #[test]
+    fn s2_answers_match_native_retrieval_shapes_and_zero_provider_fields() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+
+        let expand = try_lookup_first(
+            semantic::CAPABILITY_EXPAND_RELATIONS,
+            "acme",
+            "alice",
+            r#"{"root":{"object_id":"lookup-root"},"direction":"outgoing","max_depth":1}"#,
+            &db,
+        )
+        .expect("expand lookup");
+        let retrieve = try_lookup_first(
+            semantic::CAPABILITY_RETRIEVE_CONTEXT,
+            "acme",
+            "alice",
+            r#"{"roots":[{"object_id":"lookup-root"}],"direction":"outgoing","max_depth":1}"#,
+            &db,
+        )
+        .expect("retrieve lookup");
+        let explain = try_lookup_first(
+            semantic::CAPABILITY_EXPLAIN_DERIVATION,
+            "acme",
+            "alice",
+            r#"{"from":{"object_id":"lookup-root"},"to":{"object_id":"lookup-child"},"direction":"outgoing","max_depth":1}"#,
+            &db,
+        )
+        .expect("explain lookup");
+
+        let answer = |decision: LookupDecision| match decision {
+            LookupDecision::Hit {
+                answer_json,
+                provenance,
+                ..
+            } => {
+                let value: Value = serde_json::from_str(&answer_json).expect("structured JSON");
+                assert!(value.get("input_tokens").is_none());
+                assert!(value.get("output_tokens").is_none());
+                assert!(!provenance.is_empty());
+                value
+            }
+            other => panic!("expected lookup hit, got {other:?}"),
+        };
+
+        let expand = answer(expand);
+        assert_eq!(expand["reasoning_mode"], "asserted_only");
+        assert_eq!(
+            expand["epistemic_descriptor_version"],
+            EPISTEMIC_DESCRIPTOR_VERSION
+        );
+        assert_eq!(expand["candidates"][0]["object"]["id"], "lookup-root");
+        assert_eq!(expand["links"][0]["id"], "lookup-link-contains");
+
+        let retrieve = answer(retrieve);
+        assert_eq!(
+            retrieve["epistemic_descriptor_version"],
+            EPISTEMIC_DESCRIPTOR_VERSION
+        );
+        assert_eq!(retrieve["candidates"][1]["object"]["id"], "lookup-child");
+
+        let explain = answer(explain);
+        assert_eq!(explain["found"], true);
+        assert_eq!(explain["explanation"]["steps"][0]["relation"], "contains");
+        assert_eq!(explain["reasoning_mode"], "asserted_only");
+    }
+
+    #[test]
+    fn explain_complete_negative_is_a_structured_lookup_hit() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        let decision = try_lookup_first(
+            semantic::CAPABILITY_EXPLAIN_DERIVATION,
+            "acme",
+            "alice",
+            r#"{"from":{"object_id":"lookup-root"},"to":{"object_id":"lookup-unrelated"}}"#,
+            &db,
+        )
+        .expect("explain lookup");
+        match decision {
+            LookupDecision::Hit { answer_json, .. } => {
+                let value: Value = serde_json::from_str(&answer_json).unwrap();
+                assert_eq!(value["found"], false);
+                assert!(value["explanation"].is_null());
+            }
+            other => panic!("expected complete negative hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s2_rejects_unknown_and_capability_crossed_fields() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        for (capability, spec) in [
+            (
+                semantic::CAPABILITY_EXPAND_RELATIONS,
+                r#"{"root":{"object_id":"lookup-root"},"unexpected":"ignored?"}"#,
+            ),
+            (
+                semantic::CAPABILITY_RETRIEVE_CONTEXT,
+                r#"{"roots":[{"object_id":"lookup-root"}],"root":{"object_id":"lookup-root"}}"#,
+            ),
+            (
+                semantic::CAPABILITY_EXPLAIN_DERIVATION,
+                r#"{"from":{"object_id":"lookup-root"},"to":{"object_id":"lookup-child"},"kind_filter":["widget"]}"#,
+            ),
+        ] {
+            match try_lookup_first(capability, "acme", "alice", spec, &db).unwrap() {
+                LookupDecision::Refusal { reason, .. } => assert_eq!(reason, "schema_miss"),
+                other => panic!("expected schema refusal for {capability}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

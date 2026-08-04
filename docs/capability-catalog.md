@@ -138,18 +138,23 @@ When `ChiseiService.ExecutePlanStream` is invoked with
 and `spec` holding that capability's fixed structured JSON input, Chisei may
 short-circuit **after** namespace authorization and **before** provider routing:
 
-| Capability | S1 short-circuit |
+| Capability | Lookup-first short-circuit |
 | --- | --- |
-| `sekai.semantic.resolve_ref` | Full hit returns structured JSON with **zero provider tokens** (`provider=lookup`, `answer_path=lookup_hit`). |
-| `sekai.semantic.expand_relations` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
-| `sekai.context.retrieve` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
-| `sekai.semantic.explain_derivation` | Allow-listed; incomplete for short-circuit in S1 → model path with `lookup_refusal`. |
+| `sekai.semantic.resolve_ref` | S1 full hit returns structured JSON with **zero provider tokens** (`provider=lookup`, `answer_path=lookup_hit`). |
+| `sekai.semantic.expand_relations` | S2 full authorized hit returns the native candidate/link response shape with zero provider tokens; any ACL miss, unresolved root, schema miss, or truncation falls back to the model. |
+| `sekai.context.retrieve` | S2 full authorized hit returns the native candidate/link/explanation/descriptor response shape with zero provider tokens; any ACL miss, unresolved root, schema miss, or truncation falls back to the model. |
+| `sekai.semantic.explain_derivation` | S2 full authorized hit returns the native explanation/evidence/descriptor shape with zero provider tokens. A complete authorized `found=false` result is also a hit; incomplete or truncated traversal falls back to the model. |
 
 Fail closed: incomplete graph state, ACL miss, cross-namespace object, or
 schema miss records `lookup_refusal` on the operation receipt and continues on
-the normal model path (`answer_path=model_path`). Free-form natural-language
-substitution is out of scope. Fixture suite (hit / incomplete / cross-namespace
-/ ACL) and dual-run structural equality live under
+the normal model path (`answer_path=model_path`). The S2 traversal path also
+refuses PostgreSQL entailment because the native community runtime has no
+authorization-filtered ontology snapshot there; callers may use asserted-only
+retrieval. Lookup evaluation occurs after execution namespace authorization and
+before provider selection, residency, egress, or model payload preparation.
+Free-form natural-language substitution is out of scope. Fixture suite (hit /
+incomplete / cross-namespace / ACL / truncation) and dual-run structural
+equality live under
 `tests/fixtures/lookup_first/` and `chisei::lookup_first`. No fleet-wide spend
 percentage is claimed from this surface.
 
