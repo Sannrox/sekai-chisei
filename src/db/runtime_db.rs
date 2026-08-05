@@ -3125,6 +3125,17 @@ impl RuntimeDb {
         }
     }
 
+    pub fn is_evidence_schema_registered(
+        &self,
+        schema_id: &str,
+        schema_version: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.is_evidence_schema_registered(schema_id, schema_version),
+            Self::Postgres(db) => db.is_evidence_schema_registered(schema_id, schema_version),
+        }
+    }
+
     pub fn register_evidence_schema(
         &self,
         definition: &EvidenceSchemaDefinition,

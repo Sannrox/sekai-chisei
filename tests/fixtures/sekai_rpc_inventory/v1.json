@@ -1223,6 +1223,21 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListEvidenceAdapters",
+      "kind": "computed",
+      "surfaces": [
+        "sekai.evidence"
+      ],
+      "evidence": [
+        "src/evidence_adapter_catalog.rs",
+        "docs/evidence-adapter-catalog.md"
+      ],
+      "durable_dependencies": [
+        "sekai.evidence"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "SubmitEvidence",
       "kind": "persistent",
       "surfaces": [
