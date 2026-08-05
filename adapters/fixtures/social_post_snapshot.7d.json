@@ -1,0 +1,14 @@
+{
+  "source_system": "manual",
+  "account": "example_handle",
+  "post_id": "1987654321098765432",
+  "window": "7d",
+  "observed_at": "2026-08-05T12:00:00Z",
+  "metrics": {
+    "impressions": 4200,
+    "likes": 37,
+    "replies": 5,
+    "reposts": 4,
+    "quotes": 1
+  }
+}

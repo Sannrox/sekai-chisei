@@ -4,6 +4,10 @@ mod github_check_webhook;
 mod http_health_poll;
 #[path = "../adapters/ontology_concept_catalog.rs"]
 mod ontology_concept_catalog;
+#[path = "../adapters/social_post_snapshot.rs"]
+mod social_post_snapshot;
+#[path = "../adapters/social_reply.rs"]
+mod social_reply;
 #[allow(dead_code)]
 #[path = "../adapters/sdk.rs"]
 mod sdk;
@@ -204,12 +208,108 @@ fn ontology_concept_catalog_fixture_conforms_to_the_canonical_envelope() {
 }
 
 #[test]
+fn social_post_snapshot_fixture_conforms_to_the_canonical_envelope() {
+    let input = include_bytes!("../adapters/fixtures/social_post_snapshot.7d.json");
+    let draft = social_post_snapshot::translate(social_post_snapshot::parse(input).unwrap())
+        .expect("translate social post snapshot");
+    assert_eq!(draft.source_type, "social_observation_document");
+    assert_eq!(draft.signal, "other");
+    assert_eq!(draft.evidence_type, social_post_snapshot::EVIDENCE_TYPE);
+    assert_eq!(draft.source_record_id, "1987654321098765432");
+    assert_eq!(draft.source_version, "7d-complete-v1");
+    assert_eq!(draft.source_sequence, 2);
+    assert_eq!(draft.content["window"], "7d");
+    assert_eq!(draft.content["metrics"]["impressions"], 4200);
+    assert_eq!(draft.provenance["delivery"], "document");
+    assert_eq!(draft.provenance["source_system"], "manual");
+    social_post_snapshot::CONFORMANCE_PROFILE
+        .validate(&draft)
+        .unwrap();
+
+    let outbox = outbox("social-snapshot");
+    let (envelope, receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_000_000).unwrap();
+    assert_eq!(envelope.contract_version, sdk::EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(envelope.evidence_type, "social.post_snapshot");
+    assert_eq!(envelope.schema_id, "adapter.social.post_snapshot");
+    assert_eq!(envelope.content_digest.len(), 64);
+    assert_eq!(envelope.idempotency_key.len(), 64);
+    assert_eq!(envelope.intent, "upsert");
+    receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
+}
+
+#[test]
+fn social_reply_fixture_conforms_to_the_canonical_envelope() {
+    let input = include_bytes!("../adapters/fixtures/social_reply.sample.json");
+    let draft = social_reply::translate(social_reply::parse(input).unwrap())
+        .expect("translate social reply");
+    assert_eq!(draft.source_type, "social_observation_document");
+    assert_eq!(draft.evidence_type, social_reply::EVIDENCE_TYPE);
+    assert_eq!(draft.source_record_id, "1987654321098765999");
+    assert_eq!(draft.content["parent_post_id"], "1987654321098765432");
+    assert_eq!(draft.content["author_reference"], "peer_engineer");
+    assert_eq!(draft.provenance["content_trust"], "untrusted_remote_text");
+    social_reply::CONFORMANCE_PROFILE
+        .validate(&draft)
+        .unwrap();
+
+    let outbox = outbox("social-reply");
+    let (envelope, receipt) =
+        sdk::prepare_delivery_in(&outbox, &config(), draft, 1_752_394_000_000).unwrap();
+    assert_eq!(envelope.evidence_type, "social.reply");
+    assert_eq!(envelope.schema_id, "adapter.social.reply");
+    assert_eq!(envelope.source_sequence, 1);
+    receipt.acknowledge().unwrap();
+    std::fs::remove_dir(outbox).unwrap();
+}
+
+#[test]
+fn social_adapters_reject_generated_digests_and_invalid_windows() {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../adapters/fixtures/social_post_snapshot.7d.json"))
+            .unwrap();
+    snapshot["source_system"] = serde_json::json!("birdclaw_digest");
+    assert!(
+        social_post_snapshot::translate(
+            social_post_snapshot::parse(&serde_json::to_vec(&snapshot).unwrap()).unwrap()
+        )
+        .unwrap_err()
+        .contains("generated social digests")
+    );
+
+    snapshot["source_system"] = serde_json::json!("manual");
+    snapshot["window"] = serde_json::json!("30d");
+    assert!(
+        social_post_snapshot::translate(
+            social_post_snapshot::parse(&serde_json::to_vec(&snapshot).unwrap()).unwrap()
+        )
+        .unwrap_err()
+        .contains("24h or 7d")
+    );
+
+    let mut reply: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../adapters/fixtures/social_reply.sample.json"))
+            .unwrap();
+    reply["text"] = serde_json::json!("");
+    assert!(
+        social_reply::translate(
+            social_reply::parse(&serde_json::to_vec(&reply).unwrap()).unwrap()
+        )
+        .unwrap_err()
+        .contains("text is required")
+    );
+}
+
+#[test]
 fn adapters_reject_malformed_source_inputs_before_submission() {
     assert!(github_check_webhook::parse(br#"{"action":"completed"}"#).is_err());
     assert!(ontology_concept_catalog::parse(br#"{"catalog_id":""}"#).is_err());
     let input = br#"{"status":"ok","observed_at":"not-a-time"}"#;
     let payload = http_health_poll::parse(input).unwrap();
     assert!(http_health_poll::translate(payload, "health", None, 1_000).is_err());
+    assert!(social_post_snapshot::parse(br#"{"post_id":"1"}"#).is_err());
+    assert!(social_reply::parse(br#"{"reply_id":"1"}"#).is_err());
 }
 
 #[test]

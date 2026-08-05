@@ -1,5 +1,10 @@
 # External evidence reference adapters
 
+Discovery of built-in adapter profiles and families is available through gRPC
+`SekaiService.ListEvidenceAdapters` and
+`sekai_chisei::evidence_adapter_catalog` (control-plane scope, not tenant). See
+[evidence-adapter-catalog.md](../docs/evidence-adapter-catalog.md).
+
 These programs demonstrate the adapter boundary without adding vendor clients to
 the Sekai core:
 
@@ -13,6 +18,11 @@ the Sekai core:
   document into `ontology.concept_catalog` evidence for governed
   ontology-definition proposals (#147). Extraction and review stay in Sekai
   core; the adapter never mutates definitions.
+- `evidence_social_post_snapshot` and `evidence_social_reply` map bounded social
+  observation documents into `social.post_snapshot` and `social.reply` evidence.
+  Collection (manual export, webhook fan-in, external poller, or CLI) stays
+  outside the control plane; see
+  [social-evidence-adapters.md](../docs/social-evidence-adapters.md).
 
 All three use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
 the content digest and replay key, persist the exact delivery in a durable local
@@ -64,6 +74,18 @@ admins call `ProposeOntologyDefinitions` (prefer `dry_run=true` first) and
 ```sh
 cargo run --example evidence_ontology_concept_catalog \
   < adapters/fixtures/ontology_concept_catalog.service.json
+```
+
+The social adapters use evidence types `social.post_snapshot` /
+`social.reply` and schemas `adapter.social.post_snapshot@1.0.0` /
+`adapter.social.reply@1.0.0`. Target the durable publication or post external
+id the product already owns; do not point the funnel at raw network credentials:
+
+```sh
+cargo run --example evidence_social_post_snapshot \
+  < adapters/fixtures/social_post_snapshot.7d.json
+cargo run --example evidence_social_reply \
+  < adapters/fixtures/social_reply.sample.json
 ```
 
 Conformance fixtures live in `adapters/fixtures/` and run without network access

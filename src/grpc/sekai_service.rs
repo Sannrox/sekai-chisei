@@ -11360,6 +11360,59 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(RegisterEvidenceSchemaResponse {}))
     }
 
+    async fn list_evidence_adapters(
+        &self,
+        req: Request<crate::grpc::pb::sekai::ListEvidenceAdaptersRequest>,
+    ) -> Result<Response<crate::grpc::pb::sekai::ListEvidenceAdaptersResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let registered_only = req.into_inner().registered_only;
+        let mut adapters = Vec::new();
+        for profile in crate::evidence_adapter_catalog::built_in_evidence_adapters() {
+            let schema_registered = self
+                .db
+                .is_evidence_schema_registered(&profile.schema_id, &profile.schema_version)
+                .map_err(Status::internal)?;
+            if registered_only && !schema_registered {
+                continue;
+            }
+            adapters.push(crate::grpc::pb::sekai::EvidenceAdapterProfile {
+                adapter_id: profile.adapter_id,
+                family: profile.family,
+                evidence_type: profile.evidence_type,
+                schema_id: profile.schema_id,
+                schema_version: profile.schema_version,
+                source_type: profile.source_type,
+                signal: profile.signal,
+                delivery: profile.delivery,
+                requires_expiry: profile.requires_expiry,
+                reference_example: profile.reference_example,
+                description: profile.description,
+                schema_registered,
+            });
+        }
+        let families = crate::evidence_adapter_catalog::built_in_evidence_adapter_families()
+            .into_iter()
+            .filter(|family| {
+                !registered_only
+                    || family.adapter_ids.iter().any(|adapter_id| {
+                        adapters
+                            .iter()
+                            .any(|adapter| adapter.adapter_id == *adapter_id)
+                    })
+            })
+            .map(|family| crate::grpc::pb::sekai::EvidenceAdapterFamily {
+                family: family.family,
+                display_name: family.display_name,
+                description: family.description,
+                adapter_ids: family.adapter_ids,
+            })
+            .collect();
+        Ok(Response::new(
+            crate::grpc::pb::sekai::ListEvidenceAdaptersResponse { adapters, families },
+        ))
+    }
+
     async fn submit_evidence(
         &self,
         req: Request<SubmitEvidenceRequest>,

@@ -115,6 +115,22 @@ impl PostgresDb {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    pub fn is_evidence_schema_registered(
+        &self,
+        schema_id: &str,
+        schema_version: &str,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let row = connection
+            .query_opt(
+                "SELECT 1 FROM sekai_evidence_schemas
+                 WHERE schema_id=$1 AND schema_version=$2",
+                &[&schema_id, &schema_version],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(row.is_some())
+    }
+
     pub fn register_evidence_schema(
         &self,
         definition: &EvidenceSchemaDefinition,

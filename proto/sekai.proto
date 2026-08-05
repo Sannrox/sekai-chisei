@@ -1241,6 +1241,35 @@ message EvidenceSubmissionResult {
 
 message RegisterEvidenceSchemaRequest { EvidenceSchemaDefinition definition = 1; }
 message RegisterEvidenceSchemaResponse {}
+// Built-in reference evidence adapter discovery (not tenant connector config).
+message EvidenceAdapterProfile {
+  string adapter_id = 1;
+  string family = 2;
+  string evidence_type = 3;
+  string schema_id = 4;
+  string schema_version = 5;
+  string source_type = 6;
+  string signal = 7;
+  string delivery = 8;
+  bool requires_expiry = 9;
+  string reference_example = 10;
+  string description = 11;
+  bool schema_registered = 12;
+}
+message EvidenceAdapterFamily {
+  string family = 1;
+  string display_name = 2;
+  string description = 3;
+  repeated string adapter_ids = 4;
+}
+message ListEvidenceAdaptersRequest {
+  // When true, only adapters whose schema_id+version are registered here.
+  bool registered_only = 1;
+}
+message ListEvidenceAdaptersResponse {
+  repeated EvidenceAdapterProfile adapters = 1;
+  repeated EvidenceAdapterFamily families = 2;
+}
 message SubmitEvidenceRequest { EvidenceEnvelope envelope = 1; }
 message SubmitEvidenceResponse { EvidenceSubmissionResult result = 1; }
 message GetEvidenceSubmissionRequest { string submission_id = 1; }
@@ -1473,6 +1502,7 @@ service SekaiService {
   rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
   rpc GetProvenanceReport(GetProvenanceReportRequest) returns (GetProvenanceReportResponse);
   rpc RegisterEvidenceSchema(RegisterEvidenceSchemaRequest) returns (RegisterEvidenceSchemaResponse);
+  rpc ListEvidenceAdapters(ListEvidenceAdaptersRequest) returns (ListEvidenceAdaptersResponse);
   rpc SubmitEvidence(SubmitEvidenceRequest) returns (SubmitEvidenceResponse);
   rpc GetEvidenceSubmission(GetEvidenceSubmissionRequest) returns (GetEvidenceSubmissionResponse);
   rpc ListEvidenceSubmissions(ListEvidenceSubmissionsRequest) returns (ListEvidenceSubmissionsResponse);

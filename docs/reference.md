@@ -22,6 +22,10 @@ lives in the separate [research index](research/README.md).
 - [Examples](../examples/README.md) — runnable, domain-neutral integrations.
 - [External evidence adapters](../adapters/README.md) — versioned evidence
   submission contract and reference adapters.
+- [Social observation evidence adapters](social-evidence-adapters.md) —
+  stdin funnel for `social.post_snapshot` and `social.reply`.
+- [Evidence adapter catalog](evidence-adapter-catalog.md) —
+  `ListEvidenceAdapters` discovery of built-in adapter families.
 - [Compatibility gateway](gateway.md) — optional integration for Codex, Claude
   Code, OpenAI-compatible, and Anthropic-compatible clients.
 

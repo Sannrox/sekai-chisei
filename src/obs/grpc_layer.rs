@@ -231,6 +231,7 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "GetGovernedFactVersion"
                 | "ResolveInvariantSet"
                 | "ListSchemaTypes"
+                | "ListEvidenceAdapters"
                 | "CreateFunction"
                 | "ListFunctions"
                 | "CreateDataset"

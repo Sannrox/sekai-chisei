@@ -14,6 +14,7 @@ pub mod domain;
 pub mod domain_admin;
 pub mod enterprise;
 pub mod enterprise_conformance;
+pub mod evidence_adapter_catalog;
 pub mod evaluation_plan_cli;
 pub use sekai_provider::gateway_keys;
 pub mod gateway_report;
