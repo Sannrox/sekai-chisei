@@ -4,13 +4,13 @@ mod github_check_webhook;
 mod http_health_poll;
 #[path = "../adapters/ontology_concept_catalog.rs"]
 mod ontology_concept_catalog;
+#[allow(dead_code)]
+#[path = "../adapters/sdk.rs"]
+mod sdk;
 #[path = "../adapters/social_post_snapshot.rs"]
 mod social_post_snapshot;
 #[path = "../adapters/social_reply.rs"]
 mod social_reply;
-#[allow(dead_code)]
-#[path = "../adapters/sdk.rs"]
-mod sdk;
 
 use sdk::AdapterConfig;
 #[cfg(unix)]
@@ -250,9 +250,7 @@ fn social_reply_fixture_conforms_to_the_canonical_envelope() {
     assert_eq!(draft.content["parent_post_id"], "1987654321098765432");
     assert_eq!(draft.content["author_reference"], "peer_engineer");
     assert_eq!(draft.provenance["content_trust"], "untrusted_remote_text");
-    social_reply::CONFORMANCE_PROFILE
-        .validate(&draft)
-        .unwrap();
+    social_reply::CONFORMANCE_PROFILE.validate(&draft).unwrap();
 
     let outbox = outbox("social-reply");
     let (envelope, receipt) =
@@ -266,9 +264,10 @@ fn social_reply_fixture_conforms_to_the_canonical_envelope() {
 
 #[test]
 fn social_adapters_reject_generated_digests_and_invalid_windows() {
-    let mut snapshot: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../adapters/fixtures/social_post_snapshot.7d.json"))
-            .unwrap();
+    let mut snapshot: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../adapters/fixtures/social_post_snapshot.7d.json"
+    ))
+    .unwrap();
     snapshot["source_system"] = serde_json::json!("birdclaw_digest");
     assert!(
         social_post_snapshot::translate(
@@ -288,16 +287,15 @@ fn social_adapters_reject_generated_digests_and_invalid_windows() {
         .contains("24h or 7d")
     );
 
-    let mut reply: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../adapters/fixtures/social_reply.sample.json"))
-            .unwrap();
+    let mut reply: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../adapters/fixtures/social_reply.sample.json"
+    ))
+    .unwrap();
     reply["text"] = serde_json::json!("");
     assert!(
-        social_reply::translate(
-            social_reply::parse(&serde_json::to_vec(&reply).unwrap()).unwrap()
-        )
-        .unwrap_err()
-        .contains("text is required")
+        social_reply::translate(social_reply::parse(&serde_json::to_vec(&reply).unwrap()).unwrap())
+            .unwrap_err()
+            .contains("text is required")
     );
 }
 

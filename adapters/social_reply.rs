@@ -24,13 +24,7 @@ pub const CONFORMANCE_PROFILE: ConformanceProfile = ConformanceProfile {
 };
 
 const MAX_TEXT_BYTES: usize = 8 * 1024;
-const OPTIONAL_METRICS: [&str; 5] = [
-    "impressions",
-    "likes",
-    "replies",
-    "reposts",
-    "quotes",
-];
+const OPTIONAL_METRICS: [&str; 5] = ["impressions", "likes", "replies", "reposts", "quotes"];
 
 #[derive(Debug, Deserialize)]
 pub struct ReplyDocument {
@@ -50,8 +44,7 @@ pub struct ReplyDocument {
 }
 
 pub fn parse(input: &[u8]) -> Result<ReplyDocument, String> {
-    serde_json::from_slice(input)
-        .map_err(|error| format!("invalid social reply document: {error}"))
+    serde_json::from_slice(input).map_err(|error| format!("invalid social reply document: {error}"))
 }
 
 pub fn translate(document: ReplyDocument) -> Result<EvidenceDraft, String> {

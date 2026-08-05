@@ -49,8 +49,8 @@ pub fn built_in_evidence_adapters() -> Vec<EvidenceAdapterProfile> {
             delivery: "webhook".into(),
             requires_expiry: false,
             reference_example: "evidence_github_check_webhook".into(),
-            description: "GitHub check_run webhook payload to source-control verification evidence."
-                .into(),
+            description:
+                "GitHub check_run webhook payload to source-control verification evidence.".into(),
         },
         EvidenceAdapterProfile {
             adapter_id: "adapter.http.health_snapshot".into(),

@@ -23,13 +23,7 @@ pub const CONFORMANCE_PROFILE: ConformanceProfile = ConformanceProfile {
     requires_expiry: false,
 };
 
-const REQUIRED_METRICS: [&str; 5] = [
-    "impressions",
-    "likes",
-    "replies",
-    "reposts",
-    "quotes",
-];
+const REQUIRED_METRICS: [&str; 5] = ["impressions", "likes", "replies", "reposts", "quotes"];
 
 #[derive(Debug, Deserialize)]
 pub struct PostSnapshotDocument {
