@@ -28,6 +28,10 @@ output-token, total-token, and optional priced-cost totals for model-path
 receipts. It contains no prompt bodies, provider credentials, or raw receipt
 event payloads.
 
+Path counters are evidence dimensions rather than a forced single-choice
+classification: a mixed receipt can contribute to both `lookup_hit` and
+`model_path`, while model usage follows its recorded `ModelCalled` events.
+
 These are realized receipt facts for one authorized namespace and time window,
 not a fleet-wide ROI or spend-percentage claim. The report is read-only,
 bounded to one year and 4,096 receipts, and does not change routing or promote
