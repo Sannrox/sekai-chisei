@@ -1,5 +1,38 @@
 # Team operations
 
+## Lookup-first substitution report
+
+Inspect realized lookup-first and model-path evidence from the configured local
+control-plane backend:
+
+```sh
+sekaictl report substitution \
+  --namespace acme \
+  --since-ms 1783900800000 \
+  --until-ms 1784505600000 \
+  --json \
+  --output reports/acme-substitution.json
+```
+
+The command reads the bounded, namespace-scoped receipt window selected by
+`DB_PATH` (or the configured PostgreSQL backend). With `SEKAI_CREDENTIAL`, the
+command authenticates the credential against the configured backend; an
+optional `--principal` or `SEKAI_PRINCIPAL` must match that authenticated
+principal. Without a credential, the command runs as the local bootstrap
+principal, which is the trusted local operator boundary; an arbitrary named
+principal is rejected. It fails closed when the authenticated identity cannot
+access the requested namespace. The report includes counts of
+`lookup_hit`, `model_path`, `lookup_refusal`, and unclassified receipts;
+refusal counts by reason; task-type breakdowns; and provider, input-token,
+output-token, total-token, and optional priced-cost totals for model-path
+receipts. It contains no prompt bodies, provider credentials, or raw receipt
+event payloads.
+
+These are realized receipt facts for one authorized namespace and time window,
+not a fleet-wide ROI or spend-percentage claim. The report is read-only,
+bounded to one year and 4,096 receipts, and does not change routing or promote
+a provider/model.
+
 Generate operation reports through the authenticated control plane before
 building a team summary. Each input is already restricted to the caller's
 authorized receipt projection:
