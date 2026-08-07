@@ -8,10 +8,13 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
+    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report substitution --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
 }
 
 pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
+    if args.first().is_some_and(|arg| arg == "substitution") {
+        return substitution_report(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "summary") {
         return summarize(&args[1..]);
     }
@@ -54,6 +57,142 @@ pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
         print!("{}", render_report(&report));
     }
     Ok(())
+}
+
+fn substitution_report(args: &[String]) -> Result<(), BoxErr> {
+    let namespace = flag(args, "--namespace")
+        .ok_or_else(|| std::io::Error::other("--namespace is required"))?;
+    let since_ms = flag(args, "--since-ms")
+        .ok_or_else(|| std::io::Error::other("--since-ms is required"))?
+        .parse::<i64>()?;
+    let until_ms = flag(args, "--until-ms")
+        .ok_or_else(|| std::io::Error::other("--until-ms is required"))?
+        .parse::<i64>()?;
+    let config = crate::config::Config::from_env();
+    let backend_config = crate::runtime_backend::RuntimeBackendConfig::from_env(&config.db_path)
+        .map_err(std::io::Error::other)?;
+    let backend = crate::runtime_backend::RuntimeBackend::initialize(backend_config)
+        .map_err(std::io::Error::other)?;
+    let database = backend.database();
+    let principal = report_principal(args, database.as_ref())?;
+    let report = crate::substitution_report::query_substitution_report(
+        database.as_ref(),
+        &principal,
+        &namespace,
+        since_ms,
+        until_ms,
+    )
+    .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(output) = flag(args, "--output") {
+        std::fs::write(&output, format!("{json}\n"))?;
+        println!("created {output}");
+    } else if args.iter().any(|arg| arg == "--json") {
+        println!("{json}");
+    } else {
+        print!("{}", render_substitution_report(&report));
+    }
+    Ok(())
+}
+
+fn report_principal(
+    args: &[String],
+    db: &crate::db::runtime_db::RuntimeDb,
+) -> Result<String, BoxErr> {
+    let requested = flag(args, "--principal")
+        .or_else(|| std::env::var("SEKAI_PRINCIPAL").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let credential_token = std::env::var("SEKAI_CREDENTIAL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(token) = credential_token else {
+        if let Some(principal) = requested.as_deref()
+            && principal != "local"
+        {
+            return Err(std::io::Error::other(
+                "--principal requires a valid SEKAI_CREDENTIAL; local is the only unauthenticated CLI principal",
+            )
+            .into());
+        }
+        return Ok("local".into());
+    };
+
+    let store = crate::sekai::credentials::PrincipalCredentialStore::new();
+    if !store.maybe_reload(db) {
+        return Err(std::io::Error::other("SEKAI_CREDENTIAL could not be authenticated").into());
+    }
+    let authenticated = store
+        .resolve(&token)
+        .ok_or_else(|| std::io::Error::other("SEKAI_CREDENTIAL could not be authenticated"))?;
+    if let Some(requested) = requested
+        && requested != authenticated.principal
+    {
+        return Err(std::io::Error::other(
+            "--principal does not match the authenticated SEKAI_CREDENTIAL principal",
+        )
+        .into());
+    }
+    Ok(authenticated.principal)
+}
+
+fn render_substitution_report(report: &crate::substitution_report::SubstitutionReport) -> String {
+    let mut out = format!(
+        "namespace: {}\nwindow: [{}..{})\nreceipts_considered: {}\nlookup_hit: {}\nmodel_path: {}\nlookup_refusal: {}\nunclassified: {}\nnon_eligible_model_paths: {}\n",
+        text_value(&report.namespace),
+        report.since_ms,
+        report.until_ms,
+        report.receipts_considered,
+        report.counts.lookup_hit,
+        report.counts.model_path,
+        report.counts.lookup_refusal,
+        report.counts.unclassified,
+        report.non_eligible_model_paths,
+    );
+    for (reason, count) in &report.lookup_refusal_reasons {
+        out.push_str(&format!(
+            "lookup_refusal_reason: {}={count}\n",
+            text_value(reason)
+        ));
+    }
+    out.push_str(&format!(
+        "model_calls: {}\ninput_tokens: {}\noutput_tokens: {}\ntotal_tokens: {}\ncost_usd_micros: {}\n",
+        report.model_usage.calls,
+        report.model_usage.input_tokens,
+        report.model_usage.output_tokens,
+        report.model_usage.total_tokens,
+        report.model_usage.cost_usd_micros,
+    ));
+    for (provider, usage) in &report.model_usage.providers {
+        out.push_str(&format!(
+            "provider: {} calls={} input_tokens={} output_tokens={} cost_usd_micros={}\n",
+            text_value(provider),
+            usage.calls,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cost_usd_micros
+        ));
+    }
+    for (task_type, summary) in &report.by_task_type {
+        out.push_str(&format!(
+            "task_type: {} receipts={} lookup_hit={} model_path={} lookup_refusal={} non_eligible_model_path={}\n",
+            text_value(task_type),
+            summary.receipts,
+            summary.lookup_hit,
+            summary.model_path,
+            summary.lookup_refusal,
+            summary.non_eligible_model_path,
+        ));
+        for (reason, count) in &summary.lookup_refusal_reasons {
+            out.push_str(&format!(
+                "  task_type_lookup_refusal_reason: {}={count}\n",
+                text_value(reason)
+            ));
+        }
+    }
+    out
 }
 
 fn summarize(args: &[String]) -> Result<(), BoxErr> {
