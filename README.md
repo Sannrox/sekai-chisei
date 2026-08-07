@@ -90,6 +90,43 @@ domain-neutral examples; your domain concepts live in your own ontology and
 seed documents. Continue with the [ontology guide](docs/ontology.md) for
 separate apply, seed, run, and receipt commands.
 
+### Reference ontology domain pack
+
+The lookup-first density demo at
+`tests/fixtures/lookup_first/reference_domain/` is a small reliability graph:
+services depend on services, teams own services, and incidents connect to
+services and runbooks. Load it with the normal product-loop commands:
+
+```bash
+PACK=tests/fixtures/lookup_first/reference_domain
+cargo run --bin sekaictl -- ontology apply --file "$PACK/domain-v1.json"
+cargo run --bin sekaictl -- ontology seed --file "$PACK/seed-v1.json"
+
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.resolve_ref \
+  --spec '{"external_id":"service:checkout-api"}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.expand_relations \
+  --spec '{"root":{"object_id":"svc-checkout-api"},"relations":["service_depends_on","service_owned_by"],"direction":"outgoing","max_depth":2}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.context.retrieve \
+  --spec '{"roots":[{"object_id":"svc-checkout-api"}],"direction":"both","max_depth":2}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.explain_derivation \
+  --spec '{"from":{"object_id":"svc-checkout-api"},"to":{"object_id":"svc-ledger"},"relations":["service_depends_on"],"direction":"outgoing","max_depth":2}'
+```
+
+The expected outcomes are recorded in
+`lookup-first-v1.json`: `lookup_hit` for the four complete resolve/expand/
+retrieve/explain cases, and `model_path` with `lookup_refusal=incomplete` for
+the intentionally unknown service. This is an example domain, not product
+ontology; its classes, kinds, relations, and objects are not built into the
+server or core protocol.
+
 Verify the service and repository:
 
 ```bash

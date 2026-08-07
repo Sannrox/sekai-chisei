@@ -1,0 +1,90 @@
+{
+  "version": "sekai.seed/v1",
+  "namespace": "reliability-demo",
+  "objects": [
+    {
+      "id": "svc-checkout-api",
+      "kind": "demo_reliability_service",
+      "name": "checkout-api",
+      "external_id": "service:checkout-api",
+      "properties": {
+        "tier": "prod",
+        "owner_team": "commerce"
+      }
+    },
+    {
+      "id": "svc-payments",
+      "kind": "demo_reliability_service",
+      "name": "payments",
+      "external_id": "service:payments",
+      "properties": {
+        "tier": "prod",
+        "owner_team": "commerce"
+      }
+    },
+    {
+      "id": "svc-ledger",
+      "kind": "demo_reliability_service",
+      "name": "ledger",
+      "external_id": "service:ledger",
+      "properties": {
+        "tier": "prod",
+        "owner_team": "finance"
+      }
+    },
+    {
+      "id": "team-commerce",
+      "kind": "demo_reliability_team",
+      "name": "commerce",
+      "external_id": "team:commerce"
+    },
+    {
+      "id": "inc-checkout-latency",
+      "kind": "demo_reliability_incident",
+      "name": "checkout latency",
+      "external_id": "incident:checkout-latency",
+      "properties": {
+        "severity": "high",
+        "status": "open"
+      }
+    },
+    {
+      "id": "runbook-checkout-latency",
+      "kind": "demo_reliability_runbook",
+      "name": "checkout latency response",
+      "external_id": "runbook:checkout-latency"
+    }
+  ],
+  "links": [
+    {
+      "id": "link-checkout-payments",
+      "from": "svc-checkout-api",
+      "to": "svc-payments",
+      "relation": "service_depends_on"
+    },
+    {
+      "id": "link-payments-ledger",
+      "from": "svc-payments",
+      "to": "svc-ledger",
+      "relation": "service_depends_on"
+    },
+    {
+      "id": "link-checkout-commerce",
+      "from": "svc-checkout-api",
+      "to": "team-commerce",
+      "relation": "service_owned_by"
+    },
+    {
+      "id": "link-latency-checkout",
+      "from": "inc-checkout-latency",
+      "to": "svc-checkout-api",
+      "relation": "incident_affects"
+    },
+    {
+      "id": "link-latency-runbook",
+      "from": "inc-checkout-latency",
+      "to": "runbook-checkout-latency",
+      "relation": "incident_mitigated_by"
+    }
+  ]
+}

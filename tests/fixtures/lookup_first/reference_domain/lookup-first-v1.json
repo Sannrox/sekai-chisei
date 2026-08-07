@@ -1,0 +1,102 @@
+{
+  "version": "sekai.lookup-first-reference-domain/v1",
+  "namespace": "reliability-demo",
+  "actor": "local",
+  "description": "Offline expected paths for the reference ontology domain pack",
+  "cases": [
+    {
+      "id": "resolve_checkout_api_hit",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "reliability-demo",
+      "actor": "local",
+      "input": { "external_id": "service:checkout-api" },
+      "expected_path": "lookup_hit",
+      "expected": {
+        "object_ids": ["svc-checkout-api"]
+      },
+      "notes": "S1 complete external-id resolution is answered from the graph."
+    },
+    {
+      "id": "expand_checkout_dependency_chain_hit",
+      "capability": "sekai.semantic.expand_relations",
+      "namespace": "reliability-demo",
+      "actor": "local",
+      "input": {
+        "root": { "object_id": "svc-checkout-api" },
+        "relations": ["service_depends_on", "service_owned_by"],
+        "direction": "outgoing",
+        "max_depth": 2
+      },
+      "expected_path": "lookup_hit",
+      "expected": {
+        "object_ids": ["svc-checkout-api", "svc-payments", "svc-ledger", "team-commerce"],
+        "link_ids": ["link-checkout-payments", "link-payments-ledger", "link-checkout-commerce"],
+        "min_candidates": 4
+      },
+      "notes": "S2 two-hop expansion reaches payments and ledger without provider use."
+    },
+    {
+      "id": "retrieve_checkout_context_hit",
+      "capability": "sekai.context.retrieve",
+      "namespace": "reliability-demo",
+      "actor": "local",
+      "input": {
+        "roots": [{ "object_id": "svc-checkout-api" }],
+        "direction": "both",
+        "max_depth": 2
+      },
+      "expected_path": "lookup_hit",
+      "expected": {
+        "object_ids": [
+          "svc-checkout-api",
+          "svc-payments",
+          "svc-ledger",
+          "team-commerce",
+          "inc-checkout-latency",
+          "runbook-checkout-latency"
+        ],
+        "link_ids": [
+          "link-checkout-payments",
+          "link-payments-ledger",
+          "link-checkout-commerce",
+          "link-latency-checkout",
+          "link-latency-runbook"
+        ],
+        "min_candidates": 6
+      },
+      "notes": "S2 context retrieval includes dependency, ownership, and incident context."
+    },
+    {
+      "id": "explain_checkout_ledger_derivation_hit",
+      "capability": "sekai.semantic.explain_derivation",
+      "namespace": "reliability-demo",
+      "actor": "local",
+      "input": {
+        "from": { "object_id": "svc-checkout-api" },
+        "to": { "object_id": "svc-ledger" },
+        "relations": ["service_depends_on"],
+        "direction": "outgoing",
+        "max_depth": 2
+      },
+      "expected_path": "lookup_hit",
+      "expected": {
+        "found": true,
+        "min_explanation_steps": 2,
+        "step_relations": ["service_depends_on"],
+        "evidence_ids": ["link-checkout-payments", "link-payments-ledger"]
+      },
+      "notes": "S2 explanation returns the two asserted dependency links."
+    },
+    {
+      "id": "resolve_unknown_service_model_fallback",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "reliability-demo",
+      "actor": "local",
+      "input": { "object_id": "svc-unknown" },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete",
+      "expected": {},
+      "notes": "An incomplete graph fails closed to the normal model path."
+    }
+  ]
+}

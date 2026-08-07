@@ -716,6 +716,49 @@ fn load_spec(arg: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::runtime_db::RuntimeDb;
+    use crate::domain::{Link, Object};
+    use serde::Deserialize;
+    use std::collections::BTreeSet;
+
+    #[derive(Debug, Deserialize)]
+    struct ReferenceLookupPack {
+        version: String,
+        namespace: String,
+        actor: String,
+        cases: Vec<ReferenceLookupCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ReferenceLookupCase {
+        id: String,
+        capability: String,
+        namespace: String,
+        actor: String,
+        input: serde_json::Value,
+        expected_path: String,
+        #[serde(default)]
+        expected_refusal: Option<String>,
+        expected: ReferenceLookupExpectation,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct ReferenceLookupExpectation {
+        #[serde(default)]
+        object_ids: Vec<String>,
+        #[serde(default)]
+        link_ids: Vec<String>,
+        #[serde(default)]
+        min_candidates: usize,
+        #[serde(default)]
+        found: Option<bool>,
+        #[serde(default)]
+        min_explanation_steps: usize,
+        #[serde(default)]
+        step_relations: Vec<String>,
+        #[serde(default)]
+        evidence_ids: Vec<String>,
+    }
 
     const SAMPLE_DOMAIN: &str = r#"{
       "version": "sekai.ontology-product/v1",
@@ -823,6 +866,253 @@ mod tests {
         }
         if seed_path.exists() {
             load_seed_document(seed_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn reference_domain_pack_validates_versions_graph_and_lookup_paths() {
+        let domain = load_domain_document(Path::new(
+            "tests/fixtures/lookup_first/reference_domain/domain-v1.json",
+        ))
+        .expect("reference domain");
+        let seed = load_seed_document(Path::new(
+            "tests/fixtures/lookup_first/reference_domain/seed-v1.json",
+        ))
+        .expect("reference seed");
+        let raw_cases = std::fs::read_to_string(
+            "tests/fixtures/lookup_first/reference_domain/lookup-first-v1.json",
+        )
+        .expect("reference lookup cases");
+        let pack: ReferenceLookupPack =
+            serde_json::from_str(&raw_cases).expect("reference lookup pack");
+
+        assert_eq!(domain.version, DOMAIN_DOC_VERSION);
+        assert_eq!(seed.version, SEED_DOC_VERSION);
+        assert_eq!(pack.version, "sekai.lookup-first-reference-domain/v1");
+        assert_eq!(pack.namespace, seed.namespace);
+        assert_eq!(pack.actor, "local");
+
+        let class_names: BTreeSet<_> = domain
+            .classes
+            .iter()
+            .map(|class| class.name.as_str())
+            .collect();
+        assert_eq!(
+            class_names,
+            BTreeSet::from(["Incident", "Runbook", "Service", "Team"])
+        );
+        assert!(
+            domain
+                .classes
+                .iter()
+                .all(|class| class.mapped_kind.starts_with("demo_"))
+        );
+        let relation_names: BTreeSet<_> = domain
+            .relations
+            .iter()
+            .map(|relation| relation.name.as_str())
+            .collect();
+        assert_eq!(
+            relation_names,
+            BTreeSet::from([
+                "incident_affects",
+                "incident_mitigated_by",
+                "service_depends_on",
+                "service_owned_by",
+            ])
+        );
+        assert!(domain.relations.iter().all(|relation| {
+            class_names.contains(relation.domain.as_str())
+                && class_names.contains(relation.range.as_str())
+        }));
+
+        let object_ids: BTreeSet<_> = seed
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect();
+        assert_eq!(object_ids.len(), 6);
+        assert!(seed.links.iter().all(|link| {
+            object_ids.contains(link.from.as_str())
+                && object_ids.contains(link.to.as_str())
+                && relation_names.contains(link.relation.as_str())
+        }));
+        assert!(
+            seed.links.len() >= 5,
+            "multi-hop graph must include enough links"
+        );
+
+        let db = RuntimeDb::memory();
+        let now = 1_700_000_000_000;
+        for object in &seed.objects {
+            db.create_object(&Object {
+                id: object.id.clone(),
+                kind: object.kind.clone(),
+                name: object.name.clone(),
+                namespace: seed.namespace.clone(),
+                external_id: object.external_id.clone(),
+                properties: object.properties.clone(),
+                created: now,
+                updated: now,
+            })
+            .expect("seed object");
+        }
+        for link in &seed.links {
+            db.create_link(&Link {
+                id: link.id.clone(),
+                from_id: link.from.clone(),
+                to_id: link.to.clone(),
+                relation: link.relation.clone(),
+                created: now,
+            })
+            .expect("seed link");
+        }
+
+        let capabilities: BTreeSet<_> = pack
+            .cases
+            .iter()
+            .map(|case| case.capability.as_str())
+            .collect();
+        assert!(capabilities.contains(semantic::CAPABILITY_RESOLVE_REF));
+        assert!(capabilities.contains(semantic::CAPABILITY_EXPAND_RELATIONS));
+        assert!(capabilities.contains(semantic::CAPABILITY_RETRIEVE_CONTEXT));
+        assert!(capabilities.contains(semantic::CAPABILITY_EXPLAIN_DERIVATION));
+
+        for case in &pack.cases {
+            let decision = lookup_first::try_lookup_first(
+                &case.capability,
+                &case.namespace,
+                &case.actor,
+                &case.input.to_string(),
+                &db,
+            )
+            .expect("lookup-first case");
+            match case.expected_path.as_str() {
+                lookup_first::ANSWER_PATH_LOOKUP_HIT => {
+                    let lookup_first::LookupDecision::Hit { answer_json, .. } = decision else {
+                        panic!("{} expected lookup hit, got {decision:?}", case.id);
+                    };
+                    assert_reference_lookup_answer(case, &answer_json);
+                }
+                lookup_first::ANSWER_PATH_MODEL => match decision {
+                    lookup_first::LookupDecision::Refusal { reason, .. } => {
+                        assert_eq!(case.expected_refusal.as_deref(), Some(reason.as_str()));
+                    }
+                    other => panic!("{} expected model-path refusal, got {other:?}", case.id),
+                },
+                other => panic!("{} has unsupported answer path {other:?}", case.id),
+            }
+        }
+    }
+
+    fn assert_reference_lookup_answer(case: &ReferenceLookupCase, answer_json: &str) {
+        let answer: serde_json::Value =
+            serde_json::from_str(answer_json).expect("lookup answer JSON");
+        let expected = &case.expected;
+
+        if !expected.object_ids.is_empty() {
+            let actual_ids: BTreeSet<String> = answer
+                .get("candidates")
+                .and_then(serde_json::Value::as_array)
+                .map(|candidates| {
+                    candidates
+                        .iter()
+                        .filter_map(|candidate| candidate["object"]["id"].as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .or_else(|| {
+                    answer
+                        .get("object")
+                        .and_then(|object| object["id"].as_str())
+                        .map(|id| BTreeSet::from([id.to_owned()]))
+                })
+                .unwrap_or_default();
+            for object_id in &expected.object_ids {
+                assert!(
+                    actual_ids.contains(object_id),
+                    "{} answer omitted expected object {object_id}: {answer}",
+                    case.id
+                );
+            }
+        }
+
+        if expected.min_candidates > 0 {
+            let actual_count = answer
+                .get("candidates")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            assert!(
+                actual_count >= expected.min_candidates,
+                "{} expected at least {} candidates, got {actual_count}: {answer}",
+                case.id,
+                expected.min_candidates
+            );
+        }
+
+        if !expected.link_ids.is_empty() {
+            let actual_link_ids: BTreeSet<String> = answer
+                .get("links")
+                .and_then(serde_json::Value::as_array)
+                .map(|links| {
+                    links
+                        .iter()
+                        .filter_map(|link| link["id"].as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for link_id in &expected.link_ids {
+                assert!(
+                    actual_link_ids.contains(link_id),
+                    "{} answer omitted expected link {link_id}: {answer}",
+                    case.id
+                );
+            }
+        }
+
+        if let Some(found) = expected.found {
+            assert_eq!(answer["found"], found, "{} answer: {answer}", case.id);
+        }
+
+        if expected.min_explanation_steps > 0 || !expected.step_relations.is_empty() {
+            let steps = answer["explanation"]["steps"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{} answer has no explanation steps: {answer}", case.id));
+            assert!(
+                steps.len() >= expected.min_explanation_steps,
+                "{} expected at least {} explanation steps, got {}: {answer}",
+                case.id,
+                expected.min_explanation_steps,
+                steps.len()
+            );
+            let actual_relations: BTreeSet<_> = steps
+                .iter()
+                .filter_map(|step| step["relation"].as_str())
+                .collect();
+            for relation in &expected.step_relations {
+                assert!(
+                    actual_relations.contains(relation.as_str()),
+                    "{} answer omitted explanation relation {relation}: {answer}",
+                    case.id
+                );
+            }
+        }
+
+        if !expected.evidence_ids.is_empty() {
+            let actual_evidence: BTreeSet<_> = answer["evidence_refs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            for evidence_id in &expected.evidence_ids {
+                assert!(
+                    actual_evidence.contains(evidence_id.as_str()),
+                    "{} answer omitted evidence {evidence_id}: {answer}",
+                    case.id
+                );
+            }
         }
     }
 }
