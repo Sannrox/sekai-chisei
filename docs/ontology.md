@@ -142,8 +142,11 @@ be deleted while another class or relation references it. A relation cannot be
 deleted while another relation names it as an inverse.
 
 Mapped relation domain and range constraints are enforced on new links and
-relevant object-kind updates. Existing links are not rewritten. Cardinality,
-inverse, and transitivity metadata do not synthesize links or facts.
+relevant object-kind updates. Existing links are not rewritten. Cardinality is
+advisory metadata in the 1.x contract: its declaration shape is validated, but
+it does not reject links or relation-definition updates, count graph state, or
+synthesize, repair, or delete facts. See [ADR 0018](decisions/0018-ontology-relation-cardinality.md).
+Inverse and transitivity metadata do not synthesize links or facts.
 
 ## Read-only inspection artifact
 
