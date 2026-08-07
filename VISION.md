@@ -162,7 +162,8 @@ durable facts, governed decisions, evaluation, and learning.
 
 The codebase already establishes the core direction:
 
-- a Rust gRPC server with separate `sekai`, `chisei`, and `llm` services
+- a Rust gRPC server exposing the `SekaiService` and `ChiseiService` public
+  contracts; provider execution remains internal adapter machinery
 - a SQLite-default object graph (optional community PostgreSQL for dual-backend
   reusable surfaces) with links, datasets, virtual tables, lineage, audit,
   actions, and security controls
