@@ -13,9 +13,7 @@ use crate::sekai::parked_work::{
     validate_checkpoint_tuple, validate_reason, validate_request_id,
 };
 use rusqlite::{OptionalExtension, params};
-use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fmt};
 
 pub const EFFECT_STATUS_PENDING: &str = "pending";
 pub const EFFECT_STATUS_CLAIMED: &str = "claimed";
@@ -112,115 +110,6 @@ fn json_value_contains_nul(value: &serde_json::Value) -> bool {
             false
         }
     }
-}
-
-struct DuplicateObjectKeyDetector;
-
-struct DuplicateObjectValueSeed;
-
-impl<'de> DeserializeSeed<'de> for DuplicateObjectValueSeed {
-    type Value = bool;
-
-    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DuplicateObjectKeyDetector)
-    }
-}
-
-impl<'de> Visitor<'de> for DuplicateObjectKeyDetector {
-    type Value = bool;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON value")
-    }
-
-    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut keys = HashSet::new();
-        let mut duplicate = false;
-        while let Some(key) = access.next_key::<String>()? {
-            if !keys.insert(key) {
-                duplicate = true;
-            }
-            duplicate |= access.next_value_seed(DuplicateObjectValueSeed)?;
-        }
-        Ok(duplicate)
-    }
-
-    fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut duplicate = false;
-        while let Some(value) = access.next_element_seed(DuplicateObjectValueSeed)? {
-            duplicate |= value;
-        }
-        Ok(duplicate)
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E>
-    where
-        E: serde::de::Error,
-    {
-        Ok(false)
-    }
-}
-
-fn json_contains_duplicate_keys(input: &str) -> Result<bool, String> {
-    let mut deserializer = serde_json::Deserializer::from_str(input);
-    let duplicate = deserializer
-        .deserialize_any(DuplicateObjectKeyDetector)
-        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
-    deserializer
-        .end()
-        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
-    Ok(duplicate)
 }
 
 /// Rewrite JSON while preserving the original lexical representation of
@@ -499,7 +388,10 @@ impl ActionEffect {
         if !payload.is_object() {
             return Err("payload_json must be a JSON object".into());
         }
-        if reject_duplicate_keys && json_contains_duplicate_keys(&self.payload_json)? {
+        if reject_duplicate_keys
+            && crate::sekai::json::contains_duplicate_object_keys(&self.payload_json)
+                .map_err(|error| format!("payload_json must be JSON: {error}"))?
+        {
             return Err("payload_json must not contain duplicate object keys".into());
         }
         Ok(payload)
@@ -2667,7 +2559,9 @@ mod tests {
                 .payload_json
                 .contains("\"large\":9007199254740993.0")
         );
-        assert!(!json_contains_duplicate_keys(&migrated.payload_json).unwrap());
+        assert!(
+            !crate::sekai::json::contains_duplicate_object_keys(&migrated.payload_json).unwrap()
+        );
     }
 
     #[test]

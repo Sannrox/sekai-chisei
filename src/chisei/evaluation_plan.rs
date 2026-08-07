@@ -530,16 +530,21 @@ pub fn validate_parameters(schema_json: &str, parameters_json: &str) -> Result<(
         .collect::<BTreeSet<_>>();
     for name in &required {
         if !object.contains_key(*name) {
-            return Err(format!("required evaluator parameter {name:?} is missing"));
+            return Err(format!("required parameter {name:?} is missing"));
         }
     }
     for (name, value) in object {
         let property = properties
             .get(name)
-            .ok_or_else(|| format!("unknown evaluator parameter {name:?}"))?;
+            .ok_or_else(|| "unknown parameter".to_string())?;
         validate_parameter_value(name, property, value)?;
     }
     Ok(())
+}
+
+/// Validate only the closed v1 parameter-schema contract.
+pub fn validate_parameter_schema(schema_json: &str) -> Result<(), String> {
+    parse_parameter_schema(schema_json).map(|_| ())
 }
 
 pub fn prepare_availability(
@@ -706,6 +711,11 @@ fn validate_acyclic(nodes: &[EvaluationPlanNode]) -> Result<(), String> {
 }
 
 fn parse_parameter_schema(input: &str) -> Result<Value, String> {
+    if crate::sekai::json::contains_duplicate_object_keys(input)
+        .map_err(|error| format!("parameter_schema_json must be JSON: {error}"))?
+    {
+        return Err("parameter schema must not contain duplicate object keys".into());
+    }
     let mut schema: Value = serde_json::from_str(input)
         .map_err(|error| format!("parameter_schema_json must be JSON: {error}"))?;
     let root = schema
@@ -834,10 +844,20 @@ fn validate_parameter_property(name: &str, property: &Value) -> Result<(), Strin
 fn validate_parameter_value(name: &str, schema: &Value, value: &Value) -> Result<(), String> {
     let parameter_type = schema["type"].as_str().expect("validated type");
     validate_primitive_type(name, parameter_type, value)?;
-    if let Some(values) = schema.get("enum").and_then(Value::as_array)
-        && !values.contains(value)
-    {
-        return Err(format!("parameter {name:?} is not in its declared enum"));
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let matches = if parameter_type == "number" {
+            let number = safe_number(name, value)?;
+            values.iter().any(|candidate| {
+                safe_number(name, candidate)
+                    .map(|candidate| candidate == number)
+                    .unwrap_or(false)
+            })
+        } else {
+            values.contains(value)
+        };
+        if !matches {
+            return Err(format!("parameter {name:?} is not in its declared enum"));
+        }
     }
     if parameter_type == "integer" {
         let integer = json_integer(value).expect("validated integer parameter");
@@ -942,10 +962,16 @@ fn safe_number(name: &str, value: &Value) -> Result<f64, String> {
             "number parameter {name:?} exceeds the exact v1 numeric range; use integer type"
         ));
     }
-    value
+    let number = value
         .as_f64()
         .filter(|value| value.is_finite())
-        .ok_or_else(|| format!("parameter {name:?} must be a finite number"))
+        .ok_or_else(|| format!("parameter {name:?} must be a finite number"))?;
+    if number.fract() == 0.0 && number.abs() > MAX_EXACT_INTEGER as f64 {
+        return Err(format!(
+            "number parameter {name:?} exceeds the exact v1 numeric range"
+        ));
+    }
+    Ok(number)
 }
 
 fn validate_resource_limits(limits: &EvaluatorResourceLimits) -> Result<(), String> {
@@ -1392,6 +1418,37 @@ mod tests {
                 .unwrap_err()
                 .contains("outside")
         );
+    }
+
+    #[test]
+    fn number_parameters_reject_float_encoded_large_integers() {
+        let schema = r#"{"type":"object","properties":{"ratio":{"type":"number"}},"required":["ratio"],"additionalProperties":false}"#;
+        assert!(
+            validate_parameters(schema, r#"{"ratio":1e20}"#)
+                .unwrap_err()
+                .contains("exact v1 numeric range")
+        );
+        assert!(
+            validate_parameters(schema, r#"{"ratio":-1e20}"#)
+                .unwrap_err()
+                .contains("exact v1 numeric range")
+        );
+    }
+
+    #[test]
+    fn duplicate_parameter_schema_keys_fail_closed() {
+        let schema = r#"{"type":"object","properties":{"role":{"type":"string"}},"properties":{"role":{"type":"string","enum":["admin"]}},"required":["role"],"additionalProperties":false}"#;
+        assert!(
+            validate_parameter_schema(schema)
+                .unwrap_err()
+                .contains("duplicate object keys")
+        );
+    }
+
+    #[test]
+    fn number_enum_accepts_integer_and_float_encodings() {
+        let schema = r#"{"type":"object","properties":{"value":{"type":"number","enum":[1]}},"required":["value"],"additionalProperties":false}"#;
+        validate_parameters(schema, r#"{"value":1.0}"#).unwrap();
     }
 
     #[test]

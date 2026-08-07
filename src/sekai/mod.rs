@@ -23,6 +23,7 @@ pub mod function;
 pub mod governed_action_type;
 pub mod governed_facts;
 pub mod handoff;
+pub mod json;
 pub mod learning;
 pub mod lease;
 pub mod ledger;
