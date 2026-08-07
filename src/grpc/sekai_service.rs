@@ -47,6 +47,13 @@ use uuid::Uuid;
 
 const REDACTED_VALUE: &str = "[redacted]";
 
+fn validate_governed_action_parameters(
+    parameter_schema_json: &str,
+    parameters_json: &str,
+) -> Result<(), String> {
+    crate::chisei::evaluation_plan::validate_parameters(parameter_schema_json, parameters_json)
+}
+
 pub struct SekaiServiceImpl {
     db: Arc<RuntimeDb>,
     actions: Arc<RwLock<ActionExecutor>>,
@@ -4528,7 +4535,6 @@ fn from_proto_governed_action_type(
         updated_at_ms: proto.updated_at_ms,
         disabled_at_ms: proto.disabled_at_ms,
     };
-    domain.validate().map_err(Status::invalid_argument)?;
     Ok(domain)
 }
 
@@ -7462,11 +7468,23 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or_else(|| Status::invalid_argument("type required"))?;
         let actor = authorize_namespace_action_admin(self, &principals, &proto.namespace)?;
         let domain = from_proto_governed_action_type(proto)?;
+        let existing = self
+            .db
+            .get_governed_action_type(&domain.namespace, &domain.type_id, &domain.version)
+            .map_err(Status::internal)?;
+        if existing.is_none() {
+            domain.validate().map_err(Status::invalid_argument)?;
+        }
         let stored = self
             .db
             .put_governed_action_type(domain, &actor, now_millis())
             .map_err(|e| {
-                if e.contains("immutable") || e.contains("required") || e.contains("unknown effect")
+                if e.contains("immutable")
+                    || e.contains("required")
+                    || e.contains("unknown effect")
+                    || e.contains("duplicate effect")
+                    || e.contains("parameter_schema_json")
+                    || e.contains("must not contain whitespace")
                 {
                     Status::invalid_argument(e)
                 } else {
@@ -7592,6 +7610,9 @@ impl SekaiService for SekaiServiceImpl {
                 "idempotency_key must not contain whitespace",
             ));
         }
+        // Reject ambiguous duplicate-key JSON before idempotency lookup. The
+        // raw payload and Value-based digest could disagree, so this is a
+        // deliberate breaking boundary rather than a replay-compatibility path.
         validate_parameters_json(&inner.parameters_json).map_err(Status::invalid_argument)?;
 
         let mut evidence_ids = inner.evidence_submission_ids.clone();
@@ -7641,6 +7662,17 @@ impl SekaiService for SekaiServiceImpl {
                     Status::internal(e)
                 }
             })?;
+        crate::chisei::evaluation_plan::validate_parameter_schema(&type_def.parameter_schema_json)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "governed action type parameter schema invalid: {error}"
+                ))
+            })?;
+        validate_governed_action_parameters(
+            &type_def.parameter_schema_json,
+            &inner.parameters_json,
+        )
+        .map_err(|error| Status::invalid_argument(format!("action parameters invalid: {error}")))?;
 
         // Policy gate: policy_scope on type, else namespace/agent resolution.
         let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -12046,6 +12078,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn governed_action_schema_is_always_enforced() {
+        let schema = r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#;
+        assert!(validate_governed_action_parameters(schema, r#"{"summary":"ok"}"#).is_ok());
+        assert!(validate_governed_action_parameters(schema, r#"{"summary":"ok","x":1}"#).is_err());
+        assert!(validate_governed_action_parameters(schema, "[]").is_err());
+        assert!(
+            validate_governed_action_parameters(r#"{"type":"object"}"#, "{}").is_err(),
+            "historical object-only schemas must fail closed"
+        );
+        assert!(
+            crate::chisei::evaluation_plan::validate_parameter_schema(r#"{"type":"object"}"#)
+                .is_err()
+        );
+    }
+
     fn with_principal<T>(payload: T) -> Request<T> {
         with_named_principal(payload, "tester")
     }
@@ -14260,7 +14308,9 @@ mod tests {
             type_id: "review.intake".into(),
             version: "1.0.0".into(),
             description: "Admit review".into(),
-            parameter_schema_json: r#"{"type":"object"}"#.into(),
+            parameter_schema_json:
+                r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#
+                    .into(),
             allowed_effect_kinds: vec!["runtime_dispatch".into(), "notify".into()],
             policy_scope: String::new(),
             budget_scope: String::new(),
@@ -14282,6 +14332,18 @@ mod tests {
             .unwrap();
         assert!(put.enabled);
         assert_eq!(put.created_by, "tester");
+
+        let mut invalid_schema = type_def.clone();
+        invalid_schema.version = "2.0.0".into();
+        invalid_schema.parameter_schema_json = r#"{"type":"object"}"#.into();
+        let invalid_schema_error = svc
+            .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+                r#type: Some(invalid_schema),
+                request_id: "put-invalid-schema".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid_schema_error.code(), tonic::Code::InvalidArgument);
 
         let got = svc
             .get_governed_action_type(with_principal(GetGovernedActionTypeRequest {
@@ -14370,7 +14432,7 @@ mod tests {
             type_id: "review.intake".into(),
             version: "1.0.0".into(),
             description: "Admit review".into(),
-            parameter_schema_json: r#"{"type":"object"}"#.into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#.into(),
             allowed_effect_kinds: vec!["runtime_dispatch".into()],
             policy_scope: String::new(),
             budget_scope: String::new(),
@@ -14532,6 +14594,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_rejects_parameters_outside_governed_action_schema() {
+        use crate::sekai::action_instance::STATUS_ADMITTED;
+
+        let svc = service();
+        grant_action_admin(&svc);
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "validated.action".into(),
+                version: "1.0.0".into(),
+                description: "validate action parameters".into(),
+                parameter_schema_json: r#"{
+                    "type":"object",
+                    "properties":{
+                        "mode":{"type":"string","enum":["safe","fast"]},
+                        "label":{"type":"string","minLength":2,"maxLength":4},
+                        "count":{"type":"integer","minimum":1,"maximum":3},
+                        "ratio":{"type":"number","minimum":0.5,"maximum":1.5},
+                        "enabled":{"type":"boolean"}
+                    },
+                    "required":["mode","label","count","ratio","enabled"],
+                    "additionalProperties":false
+                }"#
+                .into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+            }),
+            request_id: "put-validated-action".into(),
+        }))
+        .await
+        .unwrap();
+
+        let invalid = [
+            (
+                "missing-required",
+                r#"{"mode":"safe","label":"ok","count":1,"ratio":1.0}"#,
+                "required",
+            ),
+            (
+                "unknown-field",
+                r#"{"mode":"safe","label":"ok","count":1,"ratio":1.0,"enabled":true,"extra":true}"#,
+                "unknown",
+            ),
+            (
+                "wrong-type",
+                r#"{"mode":"safe","label":"ok","count":"1","ratio":1.0,"enabled":true}"#,
+                "does not match type",
+            ),
+            (
+                "invalid-enum",
+                r#"{"mode":"slow","label":"ok","count":1,"ratio":1.0,"enabled":true}"#,
+                "enum",
+            ),
+            (
+                "out-of-range",
+                r#"{"mode":"safe","label":"ok","count":4,"ratio":1.0,"enabled":true}"#,
+                "outside",
+            ),
+            (
+                "string-length",
+                r#"{"mode":"safe","label":"s","count":1,"ratio":1.0,"enabled":true}"#,
+                "length",
+            ),
+        ];
+        for (key, parameters_json, expected_error) in invalid {
+            let error = svc
+                .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                    namespace: "acme".into(),
+                    type_id: "validated.action".into(),
+                    version: "1.0.0".into(),
+                    parameters_json: parameters_json.into(),
+                    idempotency_key: key.into(),
+                    evidence_submission_ids: vec![],
+                    request_id: format!("request-{key}"),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{key}");
+            assert!(error.message().contains("action parameters invalid"));
+            assert!(error.message().contains(expected_error), "{key}: {error}");
+            assert!(
+                svc.db
+                    .get_action_instance_by_idempotency("acme", key)
+                    .unwrap()
+                    .is_none(),
+                "{key} must not persist an ActionInstance"
+            );
+        }
+
+        let duplicate_error = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "validated.action".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"mode":"safe","mode":"fast","label":"ok","count":1,"ratio":1.0,"enabled":true}"#.into(),
+                idempotency_key: "duplicate-key".into(),
+                evidence_submission_ids: vec![],
+                request_id: "request-duplicate-key".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate_error.code(), tonic::Code::InvalidArgument);
+        assert!(duplicate_error.message().contains("duplicate object keys"));
+        assert!(
+            svc.db
+                .get_action_instance_by_idempotency("acme", "duplicate-key")
+                .unwrap()
+                .is_none()
+        );
+
+        let valid = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "validated.action".into(),
+                version: "1.0.0".into(),
+                parameters_json:
+                    r#"{"mode":"safe","label":"ok","count":1,"ratio":1.0,"enabled":true}"#.into(),
+                idempotency_key: "valid".into(),
+                evidence_submission_ids: vec![],
+                request_id: "request-valid".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instance
+            .unwrap();
+        assert_eq!(valid.status, STATUS_ADMITTED);
+        assert_eq!(
+            svc.db
+                .list_action_effects_for_instance(&valid.instance_id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn submit_rejects_invalid_materialized_effect_before_admit() {
         use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
 
@@ -14543,7 +14748,7 @@ mod tests {
                 type_id: "dispatch.nul".into(),
                 version: "1.0.0".into(),
                 description: "reject malformed effect".into(),
-                parameter_schema_json: r#"{"type":"object"}"#.into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
                 allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
                 policy_scope: String::new(),
                 budget_scope: String::new(),
@@ -14596,7 +14801,7 @@ mod tests {
                 type_id: "dispatch.only".into(),
                 version: "1.0.0".into(),
                 description: "claim".into(),
-                parameter_schema_json: r#"{"type":"object"}"#.into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
                 allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
                 policy_scope: String::new(),
                 budget_scope: String::new(),

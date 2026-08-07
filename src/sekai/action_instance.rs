@@ -75,6 +75,7 @@ pub fn compute_request_digest(
     parameters_json: &str,
     evidence_submission_ids: &[String],
 ) -> Result<String, String> {
+    reject_duplicate_parameter_keys(parameters_json)?;
     let params: serde_json::Value = serde_json::from_str(parameters_json)
         .map_err(|e| format!("parameters_json must be JSON: {e}"))?;
     if !params.is_object() {
@@ -97,10 +98,20 @@ pub fn compute_request_digest(
 }
 
 pub fn validate_parameters_json(parameters_json: &str) -> Result<(), String> {
+    reject_duplicate_parameter_keys(parameters_json)?;
     let params: serde_json::Value = serde_json::from_str(parameters_json)
         .map_err(|e| format!("parameters_json must be JSON: {e}"))?;
     if !params.is_object() {
         return Err("parameters_json must be a JSON object".into());
+    }
+    Ok(())
+}
+
+fn reject_duplicate_parameter_keys(parameters_json: &str) -> Result<(), String> {
+    let duplicate = crate::sekai::json::contains_duplicate_object_keys(parameters_json)
+        .map_err(|error| format!("parameters_json must be JSON: {error}"))?;
+    if duplicate {
+        return Err("parameters_json must not contain duplicate object keys".into());
     }
     Ok(())
 }
@@ -408,6 +419,8 @@ mod tests {
         assert_eq!(a, b);
         let c = compute_request_digest("acme", "t", "1", r#"{"a":1,"b":3}"#, &[]).unwrap();
         assert_ne!(a, c);
+        let duplicate = compute_request_digest("acme", "t", "1", r#"{"a":1,"a":2}"#, &[]);
+        assert!(duplicate.unwrap_err().contains("duplicate object keys"));
     }
 
     #[test]

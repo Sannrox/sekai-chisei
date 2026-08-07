@@ -30,15 +30,22 @@ receipt / harvest spine. This is **not** graph `ExecuteAction`.
    - same key + same digest → return original result (`replay=true`);
    - same key + different digest → `AlreadyExists` conflict.
 5. Type must exist and be **enabled** (`require_enabled`).
-6. **Policy** via existing ActionPolicy resolution; action name
+6. Validate the producer parameters against the type's exact immutable closed
+   schema. Missing required fields, unknown fields, wrong primitive types,
+   invalid enum values, and values outside declared bounds fail before
+   admission and effect materialization. Stored schemas outside the closed
+   subset fail closed; there is no object-only compatibility fallback.
+7. **Policy** via existing ActionPolicy resolution; action name
    `submit_action_instance`, risk class write. Deny → durable instance with
    `status=denied` (not a hard gRPC error so clients can inspect the receipt).
-7. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
+8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
    when a `BudgetTracker` is configured. Exhausted → `status=denied`.
-8. Persist instance; write operation receipt events (intent, policy, budget,
+9. Persist instance; write operation receipt events (intent, policy, budget,
    outcome); audit decision. On admit, record one budget unit.
 
-Effects (`runtime_dispatch`, `notify`) are **not** materialized here (#398).
+After a durable admit, allowed `runtime_dispatch` and `notify` effects are
+materialized as typed child records (#398). Parameter validation completes
+before either the instance or its effects are admitted.
 
 ## Producer contract
 
@@ -60,6 +67,5 @@ SQLite migrate-on-use and PostgreSQL migration
 ## Non-goals
 
 - Runtime claim / dispatch placement (#399)
-- Typed effect records (#398)
 - External mutation (permits)
 - Auto-submit from raw webhooks

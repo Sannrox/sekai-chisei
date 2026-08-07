@@ -25,7 +25,7 @@ pub struct GovernedActionType {
     pub type_id: String,
     pub version: String,
     pub description: String,
-    /// JSON object describing parameters (JSON Schema or plane map).
+    /// JSON object describing parameters using the closed v1 subset.
     pub parameter_schema_json: String,
     pub allowed_effect_kinds: Vec<String>,
     /// Empty means use namespace policy defaults.
@@ -61,6 +61,10 @@ impl GovernedActionType {
         if !schema.is_object() {
             return Err("parameter_schema_json must be a JSON object".into());
         }
+        crate::chisei::evaluation_plan::validate_parameter_schema(&self.parameter_schema_json)
+            .map_err(|error| {
+                format!("parameter_schema_json must use the closed v1 subset: {error}")
+            })?;
         if self.allowed_effect_kinds.is_empty() {
             return Err("allowed_effect_kinds required".into());
         }
@@ -114,7 +118,8 @@ impl SekaiDb {
             CREATE INDEX IF NOT EXISTS idx_governed_action_types_enabled
                 ON sekai_governed_action_types(namespace, type_id, enabled);",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn put_governed_action_type(
@@ -124,10 +129,6 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<GovernedActionType, String> {
         self.migrate_governed_action_types()?;
-        type_def.validate()?;
-        if type_def.created_by.is_empty() {
-            type_def.created_by = actor.to_string();
-        }
         let fingerprint = body_fingerprint(&type_def)?;
         // Must not hold a pool connection across get_*: in-memory pools are
         // single-connection and re-acquire would deadlock.
@@ -145,6 +146,12 @@ impl SekaiDb {
             // Idempotent put: return stored row (enabled state may differ).
             return Ok(existing);
         }
+        // Exact re-put remains idempotent, but legacy object-only rows never
+        // regain admission compatibility; only new rows are validated here.
+        type_def.validate()?;
+        if type_def.created_by.is_empty() {
+            type_def.created_by = actor.to_string();
+        }
         type_def.created_at_ms = now_ms;
         type_def.updated_at_ms = now_ms;
         if !type_def.enabled {
@@ -156,7 +163,8 @@ impl SekaiDb {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_governed_action_types
-             (namespace, type_id, version, body_json, enabled, created_by, created_at_ms, updated_at_ms, disabled_at_ms)
+             (namespace, type_id, version, body_json, enabled, created_by,
+              created_at_ms, updated_at_ms, disabled_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 type_def.namespace,
@@ -333,8 +341,7 @@ mod tests {
             type_id: "review.intake".into(),
             version: "1.0.0".into(),
             description: "Admit a review decision".into(),
-            parameter_schema_json:
-                r#"{"type":"object","properties":{"summary":{"type":"string"}}}"#.into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#.into(),
             allowed_effect_kinds: vec![
                 EFFECT_KIND_RUNTIME_DISPATCH.into(),
                 EFFECT_KIND_NOTIFY.into(),
@@ -410,5 +417,14 @@ mod tests {
         let mut bad = sample(true);
         bad.allowed_effect_kinds = vec!["shell_exec".into()];
         assert!(db.put_governed_action_type(bad, "op", 1).is_err());
+    }
+
+    #[test]
+    fn rejects_parameter_schema_outside_closed_subset() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut bad = sample(true);
+        bad.parameter_schema_json = r#"{"type":"object"}"#.into();
+        let error = db.put_governed_action_type(bad, "op", 1).unwrap_err();
+        assert!(error.contains("closed v1 subset"), "{error}");
     }
 }

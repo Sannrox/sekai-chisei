@@ -21,10 +21,6 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<GovernedActionType, String> {
-        type_def.validate()?;
-        if type_def.created_by.is_empty() {
-            type_def.created_by = actor.to_string();
-        }
         let fingerprint = body_fingerprint(&type_def)?;
         if let Some(existing) = self.get_governed_action_type(
             &type_def.namespace,
@@ -38,6 +34,12 @@ impl PostgresDb {
                 );
             }
             return Ok(existing);
+        }
+        // Match SQLite: exact re-put is idempotent, while new rows must use
+        // the closed schema contract with no legacy admission fallback.
+        type_def.validate()?;
+        if type_def.created_by.is_empty() {
+            type_def.created_by = actor.to_string();
         }
         type_def.created_at_ms = now_ms;
         type_def.updated_at_ms = now_ms;
