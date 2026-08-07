@@ -70,6 +70,36 @@ Document versions:
 - Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`)
 - Seed: `sekai.seed/v1` (`tests/fixtures/product_loop/seed-v1.json`)
 
+### Reference lookup-first domain pack
+
+The maintained reference pack under
+`tests/fixtures/lookup_first/reference_domain/` exercises the complete
+structured lookup surface with a multi-hop reliability graph. It is loaded
+through the same CLI path as any user-owned domain document:
+
+```bash
+PACK=tests/fixtures/lookup_first/reference_domain
+cargo run --bin sekaictl -- ontology apply --file "$PACK/domain-v1.json"
+cargo run --bin sekaictl -- ontology seed --file "$PACK/seed-v1.json"
+```
+
+The offline expected-path table is checked by
+`ontology_product_cli::tests::reference_domain_pack_validates_versions_graph_and_lookup_paths`
+and is also recorded in `lookup-first-v1.json`:
+
+| Step | Expected `answer_path` | Expected refusal |
+| --- | --- | --- |
+| Resolve `service:checkout-api` | `lookup_hit` | — |
+| Expand checkout dependencies to depth 2 | `lookup_hit` | — |
+| Retrieve checkout context in both directions | `lookup_hit` | — |
+| Explain checkout → ledger derivation | `lookup_hit` | — |
+| Resolve unknown service | `model_path` | `incomplete` |
+
+The four complete cases are S1/S2 structured hits with no provider call. The
+unknown-service case demonstrates the fail-closed fallback boundary. This is
+an example domain, not product ontology: the classes, custom kinds, relations,
+and objects exist only in the checked-in pack and are not server built-ins.
+
 Domain concepts stay in **your** fixtures, not in core protos. ADR 0003
 `ontology inspect` remains a separate static HTML snapshot path.
 

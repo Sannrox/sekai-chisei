@@ -1,0 +1,59 @@
+{
+  "version": "sekai.ontology-product/v1",
+  "classes": [
+    {
+      "name": "Service",
+      "description": "A deployable service in the example reliability domain",
+      "mapped_kind": "demo_reliability_service",
+      "ensure_kind": true,
+      "kind_description": "Example-domain service kind; not a product built-in"
+    },
+    {
+      "name": "Team",
+      "description": "A team that owns an example-domain service",
+      "mapped_kind": "demo_reliability_team",
+      "ensure_kind": true,
+      "kind_description": "Example-domain team kind; not a product built-in"
+    },
+    {
+      "name": "Incident",
+      "description": "An operational incident in the example reliability domain",
+      "mapped_kind": "demo_reliability_incident",
+      "ensure_kind": true,
+      "kind_description": "Example-domain incident kind; not a product built-in"
+    },
+    {
+      "name": "Runbook",
+      "description": "A response runbook for an example-domain incident",
+      "mapped_kind": "demo_reliability_runbook",
+      "ensure_kind": true,
+      "kind_description": "Example-domain runbook kind; not a product built-in"
+    }
+  ],
+  "relations": [
+    {
+      "name": "service_depends_on",
+      "description": "A service depends on another service",
+      "domain": "Service",
+      "range": "Service"
+    },
+    {
+      "name": "service_owned_by",
+      "description": "A service is owned by a team",
+      "domain": "Service",
+      "range": "Team"
+    },
+    {
+      "name": "incident_affects",
+      "description": "An incident affects a service",
+      "domain": "Incident",
+      "range": "Service"
+    },
+    {
+      "name": "incident_mitigated_by",
+      "description": "An incident is mitigated by a runbook",
+      "domain": "Incident",
+      "range": "Runbook"
+    }
+  ]
+}
