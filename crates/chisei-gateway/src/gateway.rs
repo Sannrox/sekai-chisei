@@ -15306,6 +15306,58 @@ mod tests {
             }))
             .await
             .unwrap();
+        wait_for_seeded_gateway_decision(target, default_model, runtime).await;
+    }
+
+    async fn wait_for_seeded_gateway_decision(target: &str, default_model: &str, runtime: &str) {
+        let request = DecideGatewayExecutionRequest {
+            contract_version: "gateway.decide/v2".to_string(),
+            namespace: "default".to_string(),
+            requested_model: default_model.to_string(),
+            operation_class: "gateway.http".to_string(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "seeded-policy-readiness".to_string(),
+            correlation_attempt: 1,
+            estimated_tokens: 1,
+            task_class: "general".to_string(),
+            preferred_runtime: runtime.to_string(),
+            project: "default".to_string(),
+            agent: "claude-code".to_string(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: true,
+            user_id: "claude-code".to_string(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
+            pipeline_spec: String::new(),
+        };
+        for _ in 0..250 {
+            let channel = connect_sekai(target).await.unwrap();
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                ChiseiServiceClient::new(channel)
+                    .decide_gateway_execution(GrpcRequest::new(request.clone())),
+            )
+            .await
+            {
+                Ok(Ok(response)) if response.get_ref().admitted => return,
+                Ok(Ok(response)) => panic!(
+                    "seeded gateway policy was not admitted: {}",
+                    response.get_ref().deny_message
+                ),
+                Ok(Err(status))
+                    if !matches!(
+                        status.code(),
+                        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
+                    ) =>
+                {
+                    panic!("seeded gateway policy readiness failed: {status}")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("seeded gateway policy did not become ready");
     }
 
     #[tokio::test]
@@ -15487,8 +15539,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value = resp.json().await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "gateway response: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["type"], "message");
         assert_eq!(body["content"][0]["text"], "local ok");
 

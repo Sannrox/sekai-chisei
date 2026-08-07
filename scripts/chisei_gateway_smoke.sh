@@ -66,6 +66,38 @@ wait_for_http_or_exit() {
   return 1
 }
 
+wait_for_gateway_response() {
+  local url="$1"
+  local response_path="$2"
+  local gateway_log="$3"
+  local status
+
+  # A listening gateway can still be waiting for its control-plane decision
+  # path. Exercise the same request that the smoke test asserts, retrying only
+  # the documented transient unavailable response rather than accepting it.
+  for _ in $(seq 1 120); do
+    status="$(curl -sS -o "$response_path" -w '%{http_code}' "$url" \
+      -H "authorization: Bearer sk-chisei-codex-app" \
+      -H "content-type: application/json" \
+      -d '{"model":"gpt-5.5","input":"hello from smoke"}' || true)"
+    if [ "$status" = "200" ]; then
+      return 0
+    fi
+    if [ "$status" != "503" ]; then
+      echo "gateway readiness request returned HTTP ${status:-no response}" >&2
+      cat "$response_path" >&2 || true
+      sed -n '1,120p' "$gateway_log" >&2 || true
+      return 1
+    fi
+    sleep 0.05
+  done
+
+  echo "gateway readiness request remained unavailable" >&2
+  cat "$response_path" >&2 || true
+  sed -n '1,120p' "$gateway_log" >&2 || true
+  return 1
+}
+
 live_client_enabled() {
   local client="$1"
   case "${CHISEI_GATEWAY_SMOKE_LIVE_CLIENTS:-0}" in
@@ -335,10 +367,10 @@ if [ -z "$GATEWAY_PORT" ]; then
   exit 1
 fi
 
-curl -fsS "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
-  -H "authorization: Bearer sk-chisei-codex-app" \
-  -H "content-type: application/json" \
-  -d '{"model":"gpt-5.5","input":"hello from smoke"}' >"$TMPDIR/openai-response.json"
+wait_for_gateway_response \
+  "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
+  "$TMPDIR/openai-response.json" \
+  "$TMPDIR/gateway.log"
 
 curl -fsS "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
   -H "authorization: Bearer codex-local-login-smoke-token" \
