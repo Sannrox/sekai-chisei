@@ -164,6 +164,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RunLookupFirstPromotionGate",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "src/chisei/lookup_first.rs",
+        "src/grpc/chisei_service.rs",
+        "tests/fixtures/lookup_first/promotion-gate-v1.json",
+        "docs/lookup-first-promotion-gate.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetOperationReceipt",
       "kind": "persistent",
       "surfaces": [

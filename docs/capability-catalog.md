@@ -158,6 +158,12 @@ equality live under
 `tests/fixtures/lookup_first/` and `chisei::lookup_first`. No fleet-wide spend
 percentage is claimed from this surface.
 
+The deterministic promotion boundary is the separate
+[lookup-first promotion gate](lookup-first-promotion-gate.md). Its v1 suite
+requires structured golden answers, rejects free-form NL and cheap-model arms,
+records bounded `lookup_first.gate` audit evidence, and never applies route
+policy automatically.
+
 Attributed invocations write a canonical `operation.receipt/v1` record with
 intent, live policy, native routing, budget-check, and outcome events. Receipt
 and audit evidence contain principal identifiers and opaque approval or permit

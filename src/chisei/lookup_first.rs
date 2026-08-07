@@ -31,6 +31,7 @@ use crate::sekai::security::Role;
 use crate::sekai::semantic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -47,6 +48,14 @@ pub const ANSWER_PATH_ATTR: &str = "answer_path";
 pub const LOOKUP_PROVIDER: &str = "lookup";
 /// Stop reason on PlannedChatResponse for a full lookup hit.
 pub const LOOKUP_HIT_STOP_REASON: &str = "lookup_hit";
+/// Closed v1 contract for the operator-controlled lookup-vs-golden promotion gate.
+pub const LOOKUP_FIRST_GATE_CONTRACT_VERSION: &str = "chisei.lookup-first-promotion-gate/v1";
+/// Audit action recorded after every valid gate execution.
+pub const LOOKUP_FIRST_GATE_AUDIT_ACTION: &str = "lookup_first.gate";
+/// The gate is intentionally bounded independently from generic evaluation suites.
+pub const LOOKUP_FIRST_GATE_MAX_CASES: usize = 256;
+pub const LOOKUP_FIRST_GATE_MAX_SUITE_BYTES: usize = 1024 * 1024;
+const LOOKUP_FIRST_GATE_MAX_DETAIL_BYTES: usize = 512;
 
 /// S2 allow-list: fixed #151 semantic capability contracts only.
 pub const LOOKUP_FIRST_ALLOWLIST: &[&str] = &[
@@ -199,6 +208,58 @@ pub struct LookupFixtureSuiteReport {
     pub cases: Vec<LookupFixtureCaseResult>,
 }
 
+/// One strict, versioned lookup-vs-golden gate case.
+///
+/// This is deliberately separate from [`LookupFixtureCase`]. The latter also
+/// supports the older S1/S2 test helper's optional shadow field; the promotion
+/// gate accepts only the v1 lookup-vs-golden shape selected by research #527.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LookupPromotionGateCase {
+    pub id: String,
+    pub capability: String,
+    pub namespace: String,
+    pub actor: String,
+    /// Structured JSON input only. Free-form natural-language strings are rejected.
+    pub input: Value,
+    pub expected_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_refusal: Option<String>,
+    /// Required for every lookup hit; equality is JSON value equality after parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_answer: Option<Value>,
+}
+
+/// Published v1 gate document. The exact canonical content is digest-bound in
+/// the audit decision; raw cases and answers are never written to that audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LookupPromotionGateSuite {
+    pub contract_version: String,
+    pub suite_id: String,
+    pub namespace: String,
+    pub cases: Vec<LookupPromotionGateCase>,
+}
+
+/// Bounded, secret-free result of a lookup-vs-golden gate execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LookupPromotionGateReport {
+    pub contract_version: String,
+    pub suite_id: String,
+    pub namespace: String,
+    pub suite_digest: String,
+    #[serde(default)]
+    pub audit_decision_id: String,
+    /// `allow` means every case passed; `deny` leaves policy unchanged.
+    pub verdict: String,
+    pub lookup_hits: u64,
+    pub model_path: u64,
+    pub lookup_refusals: u64,
+    pub passed: u64,
+    pub failed: u64,
+    pub cases: Vec<LookupFixtureCaseResult>,
+}
+
 /// Snapshot of process-local runtime counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupFirstCounters {
@@ -226,6 +287,227 @@ pub fn record_model_path(refused: bool) {
         LOOKUP_REFUSAL_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
     crate::obs::signals::record_lookup_first(crate::obs::labels::LookupFirstPath::ModelPath);
+}
+
+/// Parse and validate a published lookup-vs-golden suite.
+pub fn parse_lookup_promotion_gate_suite(raw: &str) -> Result<LookupPromotionGateSuite, String> {
+    if raw.len() > LOOKUP_FIRST_GATE_MAX_SUITE_BYTES {
+        return Err(format!(
+            "lookup promotion suite exceeds {LOOKUP_FIRST_GATE_MAX_SUITE_BYTES} bytes"
+        ));
+    }
+    let suite = serde_json::from_str::<LookupPromotionGateSuite>(raw)
+        .map_err(|error| format!("malformed lookup promotion suite: {error}"))?;
+    validate_lookup_promotion_gate_suite(&suite)?;
+    Ok(suite)
+}
+
+pub fn validate_lookup_promotion_gate_suite(
+    suite: &LookupPromotionGateSuite,
+) -> Result<(), String> {
+    if suite.contract_version != LOOKUP_FIRST_GATE_CONTRACT_VERSION {
+        return Err(format!(
+            "lookup promotion suite contract must be {LOOKUP_FIRST_GATE_CONTRACT_VERSION}"
+        ));
+    }
+    validate_gate_identifier("suite_id", &suite.suite_id, 128)?;
+    validate_gate_namespace(&suite.namespace)?;
+    if suite.cases.is_empty() || suite.cases.len() > LOOKUP_FIRST_GATE_MAX_CASES {
+        return Err(format!(
+            "lookup promotion suite requires 1..={LOOKUP_FIRST_GATE_MAX_CASES} cases"
+        ));
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    for case in &suite.cases {
+        validate_gate_identifier("case id", &case.id, 128)?;
+        if !ids.insert(case.id.as_str()) {
+            return Err(format!("duplicate lookup promotion case id {:?}", case.id));
+        }
+        if case.namespace != suite.namespace {
+            return Err(format!(
+                "case {:?} namespace must match suite namespace",
+                case.id
+            ));
+        }
+        if case.actor.trim().is_empty() || case.actor != case.actor.trim() {
+            return Err(format!(
+                "case {:?} actor must be non-empty and trimmed",
+                case.id
+            ));
+        }
+        if !case.input.is_object() {
+            return Err(format!(
+                "case {:?} input must be a structured JSON object",
+                case.id
+            ));
+        }
+        if !is_lookup_first_capability(&case.capability) {
+            return Err(format!(
+                "case {:?} capability is not an allow-listed structured capability",
+                case.id
+            ));
+        }
+        if let Some(expected_answer) = &case.expected_answer
+            && !expected_answer.is_object()
+        {
+            return Err(format!(
+                "case {:?} expected_answer must be a structured JSON object",
+                case.id
+            ));
+        }
+        if let Some(expected_refusal) = &case.expected_refusal {
+            validate_gate_identifier("expected_refusal", expected_refusal, 128)
+                .map_err(|error| format!("case {:?} {error}", case.id))?;
+        }
+        match case.expected_path.as_str() {
+            ANSWER_PATH_LOOKUP_HIT => {
+                if case.expected_answer.is_none() || case.expected_refusal.is_some() {
+                    return Err(format!(
+                        "lookup-hit case {:?} requires expected_answer and forbids expected_refusal",
+                        case.id
+                    ));
+                }
+            }
+            ANSWER_PATH_MODEL => {
+                if case.expected_refusal.is_none() || case.expected_answer.is_some() {
+                    return Err(format!(
+                        "model-path case {:?} requires expected_refusal and forbids expected_answer",
+                        case.id
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "case {:?} has unsupported expected_path {:?}",
+                    case.id, other
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_gate_identifier(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.trim().is_empty() || value != value.trim() {
+        return Err(format!("{field} must be non-empty and trimmed"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field} exceeds {max_bytes} bytes"));
+    }
+    Ok(())
+}
+
+fn validate_gate_namespace(namespace: &str) -> Result<(), String> {
+    validate_gate_identifier("namespace", namespace, 256)
+}
+
+/// Execute the v1 gate without contacting a provider or mutating policy.
+pub fn run_lookup_promotion_gate(
+    suite: &LookupPromotionGateSuite,
+    db: &RuntimeDb,
+) -> Result<LookupPromotionGateReport, String> {
+    validate_lookup_promotion_gate_suite(suite)?;
+    let cases = suite
+        .cases
+        .iter()
+        .map(|case| LookupFixtureCase {
+            id: case.id.clone(),
+            capability: case.capability.clone(),
+            namespace: case.namespace.clone(),
+            actor: case.actor.clone(),
+            input: case.input.clone(),
+            expected_path: case.expected_path.clone(),
+            expected_refusal: case.expected_refusal.clone(),
+            expected_answer: case.expected_answer.clone(),
+            shadow_model_answer: None,
+        })
+        .collect::<Vec<_>>();
+    let result = run_fixture_suite(&suite.suite_id, &cases, db);
+    let suite_digest = lookup_promotion_suite_digest(suite)?;
+    Ok(LookupPromotionGateReport {
+        contract_version: suite.contract_version.clone(),
+        suite_id: suite.suite_id.clone(),
+        namespace: suite.namespace.clone(),
+        suite_digest,
+        audit_decision_id: String::new(),
+        verdict: if result.failed == 0 { "allow" } else { "deny" }.into(),
+        lookup_hits: result.lookup_hits,
+        model_path: result.model_path,
+        lookup_refusals: result.lookup_refusals,
+        passed: result.passed,
+        failed: result.failed,
+        cases: result
+            .cases
+            .into_iter()
+            .map(bound_gate_case_result)
+            .collect(),
+    })
+}
+
+pub fn lookup_promotion_suite_digest(suite: &LookupPromotionGateSuite) -> Result<String, String> {
+    let bytes = crate::shomei::canonical_json_with_finite_numbers(suite)?;
+    Ok(format!("sha256:{:x}", sha2::Sha256::digest(bytes)))
+}
+
+/// Persist only bounded, secret-free gate evidence. The suite and golden answers
+/// remain operator-owned artifacts; the audit stores their digest and case-result digest.
+pub fn record_lookup_promotion_gate(
+    db: &RuntimeDb,
+    actor: &str,
+    report: &LookupPromotionGateReport,
+) -> Result<String, String> {
+    if actor.trim().is_empty() || actor != actor.trim() {
+        return Err("gate audit actor must be non-empty and trimmed".into());
+    }
+    let case_results_digest = {
+        let bytes = crate::shomei::canonical_json_with_finite_numbers(&report.cases)?;
+        format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+    };
+    let decision_id = uuid::Uuid::new_v4().to_string();
+    let mut evidence = BTreeMap::new();
+    evidence.insert("contract_version".into(), report.contract_version.clone());
+    evidence.insert("suite_id".into(), report.suite_id.clone());
+    evidence.insert("namespace".into(), report.namespace.clone());
+    evidence.insert("suite_digest".into(), report.suite_digest.clone());
+    evidence.insert("case_results_digest".into(), case_results_digest);
+    evidence.insert("lookup_hits".into(), report.lookup_hits.to_string());
+    evidence.insert("model_path".into(), report.model_path.to_string());
+    evidence.insert("lookup_refusals".into(), report.lookup_refusals.to_string());
+    evidence.insert("passed".into(), report.passed.to_string());
+    evidence.insert("failed".into(), report.failed.to_string());
+    let verdict = report.verdict.as_str();
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: decision_id.clone(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: actor.into(),
+        action: LOOKUP_FIRST_GATE_AUDIT_ACTION.into(),
+        reason: if verdict == "allow" {
+            "lookup-vs-golden promotion gate passed".into()
+        } else {
+            "lookup-vs-golden promotion gate failed; prior route policy remains unchanged".into()
+        },
+        evidence: evidence.into_iter().collect(),
+        target_id: format!("lookup-first:{}:{}", report.namespace, report.suite_id),
+        outcome: verdict.into(),
+    })?;
+    Ok(decision_id)
+}
+
+fn bound_gate_case_result(mut result: LookupFixtureCaseResult) -> LookupFixtureCaseResult {
+    if result
+        .detail
+        .as_ref()
+        .is_some_and(|detail| detail.len() > LOOKUP_FIRST_GATE_MAX_DETAIL_BYTES)
+        && let Some(detail) = result.detail.as_mut()
+    {
+        let mut boundary = LOOKUP_FIRST_GATE_MAX_DETAIL_BYTES;
+        while !detail.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        detail.truncate(boundary);
+    }
+    result
 }
 
 /// Attempt lookup-first for an allow-listed capability with structured input JSON.
@@ -2081,6 +2363,119 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("dual-run")
+        );
+    }
+
+    fn promotion_suite_from_fixture_cases(
+        cases: Vec<LookupFixtureCase>,
+    ) -> LookupPromotionGateSuite {
+        LookupPromotionGateSuite {
+            contract_version: LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
+            suite_id: "lookup-first-v1".into(),
+            namespace: "acme".into(),
+            cases: cases
+                .into_iter()
+                .map(|case| LookupPromotionGateCase {
+                    id: case.id,
+                    capability: case.capability,
+                    namespace: case.namespace,
+                    actor: case.actor,
+                    input: case.input,
+                    expected_path: case.expected_path,
+                    expected_refusal: case.expected_refusal,
+                    expected_answer: case.expected_answer,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn lookup_promotion_suite_rejects_free_form_and_shadow_fields() {
+        let free_form = serde_json::json!({
+            "contract_version": LOOKUP_FIRST_GATE_CONTRACT_VERSION,
+            "suite_id": "suite",
+            "namespace": "acme",
+            "cases": [{
+                "id": "free-form",
+                "capability": semantic::CAPABILITY_RESOLVE_REF,
+                "namespace": "acme",
+                "actor": "alice",
+                "input": "resolve this",
+                "expected_path": ANSWER_PATH_LOOKUP_HIT,
+                "expected_answer": {}
+            }]
+        });
+        let error = parse_lookup_promotion_gate_suite(&free_form.to_string()).unwrap_err();
+        assert!(error.contains("structured JSON object"), "{error}");
+
+        let shadow = serde_json::json!({
+            "contract_version": LOOKUP_FIRST_GATE_CONTRACT_VERSION,
+            "suite_id": "suite",
+            "namespace": "acme",
+            "cases": [{
+                "id": "shadow",
+                "capability": semantic::CAPABILITY_RESOLVE_REF,
+                "namespace": "acme",
+                "actor": "alice",
+                "input": {"object_id": "lookup-root"},
+                "expected_path": ANSWER_PATH_LOOKUP_HIT,
+                "expected_answer": {},
+                "shadow_model_answer": {}
+            }]
+        });
+        let error = parse_lookup_promotion_gate_suite(&shadow.to_string()).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn lookup_promotion_gate_passes_and_records_bounded_audit() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        let suite = promotion_suite_from_fixture_cases(s1_fixture_cases());
+        let report = run_lookup_promotion_gate(&suite, &db).expect("gate");
+        assert_eq!(report.verdict, "allow");
+        assert_eq!(report.failed, 0);
+        assert!(report.suite_digest.starts_with("sha256:"));
+
+        let decision_id = record_lookup_promotion_gate(&db, "alice", &report).expect("audit");
+        let decision = db.get_decision(&decision_id).expect("read audit").unwrap();
+        assert_eq!(decision.action, LOOKUP_FIRST_GATE_AUDIT_ACTION);
+        assert_eq!(decision.outcome, "allow");
+        assert_eq!(decision.evidence["failed"], "0");
+        assert!(!decision.evidence.contains_key("answer_json"));
+    }
+
+    #[test]
+    fn checked_in_lookup_promotion_suite_executes_offline() {
+        let raw = include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json");
+        let suite = parse_lookup_promotion_gate_suite(raw).expect("promotion gate fixture");
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        let report = run_lookup_promotion_gate(&suite, &db).expect("offline gate");
+        assert_eq!(report.verdict, "allow", "{report:?}");
+        assert_eq!(report.passed, 2);
+        assert_eq!(report.failed, 0);
+    }
+
+    #[test]
+    fn lookup_promotion_gate_denies_on_golden_mismatch_without_policy_effect() {
+        let db = RuntimeDb::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        let mut cases = s1_fixture_cases();
+        cases[0].expected_answer = Some(json!({"resolved": false}));
+        let suite = promotion_suite_from_fixture_cases(cases);
+        let report = run_lookup_promotion_gate(&suite, &db).expect("gate");
+        assert_eq!(report.verdict, "deny");
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.cases[0].answer_path, ANSWER_PATH_LOOKUP_HIT);
+        assert!(!report.cases[0].passed);
+        let decision_id = record_lookup_promotion_gate(&db, "alice", &report).expect("audit");
+        let decision = db.get_decision(&decision_id).expect("read audit").unwrap();
+        assert_eq!(decision.outcome, "deny");
+        assert!(
+            decision
+                .reason
+                .contains("prior route policy remains unchanged")
         );
     }
 }

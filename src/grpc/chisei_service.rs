@@ -31,6 +31,7 @@ use crate::chisei::external_action as external;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
+use crate::chisei::lookup_first;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{ContextAdmissionAction, Policy, PolicyResolver};
 use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
@@ -606,6 +607,36 @@ fn required_authenticated_actor<T>(request: &Request<T>) -> Result<String, Statu
 fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
     if matches!(authenticated_actor(request).as_str(), "root" | "local") {
         Ok(())
+    } else {
+        Err(Status::permission_denied(
+            "evaluation mutation requires control-plane administration",
+        ))
+    }
+}
+
+fn required_lookup_promotion_admin<T>(request: &Request<T>) -> Result<String, Status> {
+    let source = auth_source(request)
+        .ok_or_else(|| Status::unauthenticated("authenticated request source required"))?;
+    let metadata_actor = required_authenticated_actor(request)?;
+    let actor = if let Some(context) = request
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        if context.principal.subject != metadata_actor {
+            return Err(Status::unauthenticated(
+                "authenticated principal does not match request context",
+            ));
+        }
+        context.principal.subject.clone()
+    } else if source == "local" {
+        metadata_actor
+    } else {
+        return Err(Status::unauthenticated(
+            "authenticated request context required",
+        ));
+    };
+    if matches!(actor.as_str(), "root" | "local") {
+        Ok(actor)
     } else {
         Err(Status::permission_denied(
             "evaluation mutation requires control-plane administration",
@@ -12123,6 +12154,71 @@ impl ChiseiService for ChiseiServiceImpl {
         }))
     }
 
+    async fn run_lookup_first_promotion_gate(
+        &self,
+        req: Request<RunLookupFirstPromotionGateRequest>,
+    ) -> Result<Response<RunLookupFirstPromotionGateResponse>, Status> {
+        let actor = required_lookup_promotion_admin(&req)?;
+        let request = req.into_inner();
+        if request.contract_version != lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION {
+            return Err(Status::invalid_argument(format!(
+                "lookup promotion gate contract must be {}",
+                lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION
+            )));
+        }
+        let namespace = canonical_namespace(&request.namespace)?;
+        require_namespace_access(&self.db, &actor, namespace)?;
+        if request.suite_json.len() > lookup_first::LOOKUP_FIRST_GATE_MAX_SUITE_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "lookup promotion suite exceeds {} bytes",
+                lookup_first::LOOKUP_FIRST_GATE_MAX_SUITE_BYTES
+            )));
+        }
+        let suite = lookup_first::parse_lookup_promotion_gate_suite(&request.suite_json)
+            .map_err(Status::invalid_argument)?;
+        if suite.namespace != namespace {
+            return Err(Status::invalid_argument(
+                "lookup promotion suite namespace does not match request namespace",
+            ));
+        }
+        for case in &suite.cases {
+            require_namespace_access(&self.db, &case.actor, namespace)?;
+        }
+
+        let mut report = lookup_first::run_lookup_promotion_gate(&suite, &self.db)
+            .map_err(Status::failed_precondition)?;
+        let decision_id = lookup_first::record_lookup_promotion_gate(&self.db, &actor, &report)
+            .map_err(Status::internal)?;
+        report.audit_decision_id = decision_id;
+
+        Ok(Response::new(RunLookupFirstPromotionGateResponse {
+            report: Some(LookupFirstPromotionGateReport {
+                contract_version: report.contract_version,
+                suite_id: report.suite_id,
+                namespace: report.namespace,
+                suite_digest: report.suite_digest,
+                audit_decision_id: report.audit_decision_id,
+                verdict: report.verdict,
+                lookup_hits: report.lookup_hits,
+                model_path: report.model_path,
+                lookup_refusals: report.lookup_refusals,
+                passed: report.passed,
+                failed: report.failed,
+                cases: report
+                    .cases
+                    .into_iter()
+                    .map(|case| LookupFirstPromotionGateCaseResult {
+                        id: case.id,
+                        answer_path: case.answer_path,
+                        lookup_refusal: case.lookup_refusal.unwrap_or_default(),
+                        passed: case.passed,
+                        detail: case.detail.unwrap_or_default(),
+                    })
+                    .collect(),
+            }),
+        }))
+    }
+
     async fn execute_evaluation_manifest(
         &self,
         req: Request<ExecuteEvaluationManifestRequest>,
@@ -18418,6 +18514,101 @@ mod tests {
                 .map(|result| (result.case_id.as_str(), result.passed))
                 .collect::<Vec<_>>(),
             vec![("case-a", true), ("case-b", false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
+        let svc = memory_service();
+        lookup_first::seed_s1_fixture_graph(&svc.db).unwrap();
+        svc.db
+            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .unwrap();
+
+        let mut missing_source = Request::new(RunLookupFirstPromotionGateRequest {
+            contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
+            namespace: "acme".into(),
+            suite_json: include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json")
+                .into(),
+        });
+        missing_source
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        assert_eq!(
+            svc.run_lookup_first_promotion_gate(missing_source)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+
+        let mut request = Request::new(RunLookupFirstPromotionGateRequest {
+            contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
+            namespace: "acme".into(),
+            suite_json: include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json")
+                .into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
+
+        let report = svc
+            .run_lookup_first_promotion_gate(request)
+            .await
+            .unwrap()
+            .into_inner()
+            .report
+            .unwrap();
+        assert_eq!(report.verdict, "allow");
+        assert_eq!(report.passed, 2);
+        assert_eq!(report.failed, 0);
+        assert!(!report.audit_decision_id.is_empty());
+        let decision = svc
+            .db
+            .get_decision(&report.audit_decision_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decision.action,
+            lookup_first::LOOKUP_FIRST_GATE_AUDIT_ACTION
+        );
+        assert_eq!(decision.actor, "local");
+        assert!(!decision.evidence.contains_key("answer_json"));
+
+        let unauthorized_suite = serde_json::json!({
+            "contract_version": lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION,
+            "suite_id": "unauthorized-case-actor",
+            "namespace": "acme",
+            "cases": [{
+                "id": "inaccessible-actor",
+                "capability": crate::sekai::semantic::CAPABILITY_RESOLVE_REF,
+                "namespace": "acme",
+                "actor": "mallory",
+                "input": {"object_id": "does-not-exist"},
+                "expected_path": "model_path",
+                "expected_refusal": "incomplete"
+            }]
+        });
+        let mut unauthorized = Request::new(RunLookupFirstPromotionGateRequest {
+            contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
+            namespace: "acme".into(),
+            suite_json: unauthorized_suite.to_string(),
+        });
+        unauthorized
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        unauthorized
+            .metadata_mut()
+            .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
+        assert_eq!(
+            svc.run_lookup_first_promotion_gate(unauthorized)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
         );
     }
 

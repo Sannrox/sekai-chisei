@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ChiseiPublicApiV1",
+      "description": "The clean-break Sekai Chisei 1.0 public gRPC surface: 29 Chisei operations. The surface keeps four external-action lifecycle operations, three Gunshi allocation operations, three gateway-coordination operations, and the strict lookup-first promotion gate. Native execution is a PlanExecution -> ExecutePlanStream pipeline with Kioku enrichment and optional Gunshi allocation provenance. Gateway admission is canonicalized in DecideGatewayExecution; standalone budget checks and policy resolution are internal. Evaluation read/analytics facades, plan-backed governed-subject evaluation, operation statistics, and public policy dry-run are removed; receipts remain the authoritative query path.",
+      "superclasses": [],
+      "properties": []
+    },
+    {
+      "name": "LookupFirstPromotionGate",
+      "description": "A strict Chisei v1 evaluation boundary that executes a bounded structured lookup-vs-golden fixture suite for one namespace, compares exact lookup-hit answers or explicit model-path refusals, records only bounded secret-free audit evidence, and leaves the prior route policy unchanged on failure.",
+      "superclasses": [],
+      "properties": [
+        {
+          "name": "contract_version",
+          "type": "string",
+          "required": true,
+          "description": "The exact chisei.lookup-first-promotion-gate/v1 contract identifier."
+        },
+        {
+          "name": "suite_digest",
+          "type": "string",
+          "required": true,
+          "description": "The canonical SHA-256 digest of the operator-owned structured suite."
+        },
+        {
+          "name": "verdict",
+          "type": "string",
+          "required": true,
+          "description": "The closed gate outcome: allow when every case passes, otherwise deny."
+        },
+        {
+          "name": "audit_decision_id",
+          "type": "string",
+          "required": true,
+          "description": "The durable audit decision identifier for the gate result."
+        }
+      ]
+    },
+    {
+      "name": "LookupFirstPromotionGateSuite",
+      "description": "An operator-owned strict v1 JSON artifact containing a finite namespace-scoped set of structured lookup capabilities with exact golden answers or explicit bounded model-path refusals; free-form natural language, shadow-model fields, provider calls, and automatic route-policy application are outside the contract.",
+      "superclasses": [],
+      "properties": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "exposes_lookup_first_promotion_gate",
+      "description": "The Chisei public API exposes the authenticated RunLookupFirstPromotionGate operation as the strict v1 lookup-first promotion boundary.",
+      "domain": "ChiseiPublicApiV1",
+      "range": "LookupFirstPromotionGate",
+      "cardinality": { "min": 1, "max": 1 }
+    },
+    {
+      "name": "evaluates_lookup_promotion_suite",
+      "description": "A lookup-first promotion gate evaluates exactly one operator-owned structured fixture suite per invocation.",
+      "domain": "LookupFirstPromotionGate",
+      "range": "LookupFirstPromotionGateSuite",
+      "cardinality": { "min": 1, "max": 1 }
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ChiseiPublicApiV1",
+      "source": "sekai-chisei",
+      "locator": "proto/chisei.proto;RunLookupFirstPromotionGate",
+      "confidence": 1.0
+    },
+    {
+      "subject": "LookupFirstPromotionGate",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/lookup_first.rs;run_lookup_promotion_gate;record_lookup_promotion_gate",
+      "confidence": 1.0
+    },
+    {
+      "subject": "LookupFirstPromotionGateSuite",
+      "source": "sekai-chisei",
+      "locator": "src/chisei/lookup_first.rs;LookupPromotionGateSuite;parse_lookup_promotion_gate_suite",
+      "confidence": 1.0
+    },
+    {
+      "subject": "exposes_lookup_first_promotion_gate",
+      "source": "sekai-chisei",
+      "locator": "proto/chisei.proto;rpc RunLookupFirstPromotionGate",
+      "confidence": 1.0
+    },
+    {
+      "subject": "evaluates_lookup_promotion_suite",
+      "source": "sekai-chisei",
+      "locator": "src/grpc/chisei_service.rs;run_lookup_first_promotion_gate",
+      "confidence": 1.0
+    }
+  ]
+}

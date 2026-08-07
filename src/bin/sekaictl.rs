@@ -231,6 +231,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+        "lookup-first-gate" => {
+            match sekai_chisei::lookup_gate_cli::run(args.into_iter().skip(1).collect()).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
         "team" => match args.get(1).map(String::as_str) {
             Some("join") => {
                 let config = sekai_chisei::team_cli::TeamJoinConfig::from_env_and_args(
@@ -372,6 +381,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("governance"), Some("gunshi")) => ("gunshi", 3),
         (Some("governance"), Some("subject")) => ("governed-subject", 3),
         (Some("evaluation"), Some("plan")) => ("evaluation-plan", 3),
+        (Some("evaluation"), Some("lookup-first-gate")) => ("lookup-first-gate", 3),
         (Some("assurance"), Some("attest")) => ("attest", 3),
         (Some("assurance"), Some("compliance")) => ("compliance", 3),
         (Some("assurance"), Some("provenance")) => ("provenance", 3),
@@ -540,6 +550,7 @@ fn print_admin_usage() {
          \n\
          Evaluation:\n\
            sekaictl admin evaluation plan ...\n\
+           sekaictl admin evaluation lookup-first-gate ...\n\
          \n\
          Assurance:\n\
            sekaictl admin assurance <attest|compliance|provenance|replay> ...\n\
@@ -558,6 +569,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
         "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
         "evaluation-plan" => Some(sekai_chisei::evaluation_plan_cli::usage().to_string()),
+        "lookup-first-gate" => Some(sekai_chisei::lookup_gate_cli::usage().to_string()),
         "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
         "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
         "provenance" => Some("usage: sekaictl admin assurance provenance <work-unit>".to_string()),
@@ -582,6 +594,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "gunshi" => Some("admin governance gunshi"),
         "governed-subject" => Some("admin governance subject"),
         "evaluation-plan" => Some("admin evaluation plan"),
+        "lookup-first-gate" => Some("admin evaluation lookup-first-gate"),
         "attest" => Some("admin assurance attest"),
         "compliance" => Some("admin assurance compliance"),
         "provenance" => Some("admin assurance provenance"),
@@ -625,6 +638,7 @@ mod tests {
             (vec!["governance", "gunshi"], "gunshi"),
             (vec!["governance", "subject"], "governed-subject"),
             (vec!["evaluation", "plan"], "evaluation-plan"),
+            (vec!["evaluation", "lookup-first-gate"], "lookup-first-gate"),
             (vec!["assurance", "attest"], "attest"),
             (vec!["assurance", "compliance"], "compliance"),
             (vec!["assurance", "provenance"], "provenance"),
@@ -664,6 +678,7 @@ mod tests {
             "gunshi",
             "governed-subject",
             "evaluation-plan",
+            "lookup-first-gate",
             "attest",
             "compliance",
             "provenance",
@@ -687,6 +702,7 @@ mod tests {
             ("gunshi", "admin governance gunshi"),
             ("governed-subject", "admin governance subject"),
             ("evaluation-plan", "admin evaluation plan"),
+            ("lookup-first-gate", "admin evaluation lookup-first-gate"),
             ("attest", "admin assurance attest"),
             ("compliance", "admin assurance compliance"),
             ("provenance", "admin assurance provenance"),
