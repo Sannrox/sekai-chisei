@@ -23,8 +23,9 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Cardinality bound for the range side of a relation. `max = None` means
-/// unbounded. Inference does not act on these bounds yet; they are durable
-/// metadata that #142 will enforce.
+/// unbounded. Inference does not act on these bounds; in the 1.x contract they
+/// remain advisory metadata. Declaration validation rejects malformed ranges,
+/// but link writes and relation updates do not enforce cardinality.
 ///
 /// The default (`min = 0`, `max = None`) is the least restrictive bound, so
 /// projecting or importing existing relations never tightens behavior.
