@@ -65,8 +65,13 @@ clean tree.
 ### 4. Verify and review
 
 1. Add focused deterministic tests while implementing.
-2. Run `verify-change` and retain exact commands, results, skips, and remaining
-   uncertainty.
+2. Run `verify-change` for intermediate local evidence and retain exact
+   commands, results, skips, and remaining uncertainty. Carry its evidence
+   state, review disposition, baseline and candidate identities, root-cause/
+   sibling analysis, and any freshness limitation forward. Dirty-worktree
+   results are not the final PR proof.
+   A `review-required` disposition may coexist with `validated` evidence; do
+   not mark it `review-complete` or `merged` by assertion.
 3. Run `autoreview` before committing. Fix actionable findings and rerun the
    relevant checks until no material finding remains or a documented blocker
    requires maintainer judgment.
@@ -77,7 +82,12 @@ clean tree.
 
 1. Stage only the intended paths and create a narrow imperative commit.
    Never use `--no-gpg-sign`. If signing fails, stop and fix GPG.
-2. Publish the topic branch with **GitHub-verified** commits via
+2. Run `verify-change` again against the committed candidate before publishing.
+   Require the full candidate SHA, clean-content guard, exact proof, and the
+   appropriate review disposition. If this final verification or any review
+   fix changes content, repeat review, commit, and final verification before
+   continuing. The PR must carry this immutable candidate evidence.
+3. Publish the topic branch with **GitHub-verified** commits via
    `scripts/gh-verified-push.sh` (GraphQL `createCommitOnBranch`), not a plain
    `git push`, unless the user explicitly asks for git-protocol push:
    - New branch:  
@@ -86,13 +96,18 @@ clean tree.
      `scripts/gh-verified-push.sh --branch <topic> --sync-local`
    - Confirm the script reports `verification.verified=true` and that the
      hosted tree matches local `HEAD`.
-3. Open a ready Pull Request that:
+4. After `--sync-local` moves the branch to the server-created commit, record
+   that new full SHA and run `verify-change` against it. Require a clean
+   content guard and exact candidate evidence before opening the PR. If
+   post-publish verification fails, do not open or land the PR; fix from the
+   synced branch and repeat review, publish, and post-publish verification.
+5. Open a ready Pull Request that:
    - links and closes the Issue;
    - summarizes behavior rather than file operations;
    - lists verification evidence and any skipped checks;
    - calls out configuration, compatibility, migration, and security impact;
    - includes an agent transcript when the project workflow requires it.
-4. Return the Pull Request URL. Do not publish when the ceiling is Implement.
+6. Return the Pull Request URL. Do not publish when the ceiling is Implement.
 
 ### 6. Land when authorized
 
@@ -119,6 +134,8 @@ Return:
 - Issue and authority ceiling;
 - branch, commit, and Pull Request when created;
 - implemented outcome;
+- verification evidence state, review disposition, delivery status, exact
+  baseline/candidate identities, and remaining uncertainty;
 - verification and review evidence;
 - merge state and newly available follow-up work when applicable;
 - blockers, skipped checks, and remaining uncertainty.
