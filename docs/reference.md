@@ -40,6 +40,8 @@ lives in the separate [research index](research/README.md).
   namespace context.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan
   authoring, publication, inspection, dry-run resolution, and execution.
+- [Lookup-first promotion gate](lookup-first-promotion-gate.md) — deterministic
+  structured golden checks with audited, explicit-only promotion evidence.
 - [Team operations](team-operations.md) — namespace bootstrap and operator
   workflows.
 - [Performance benchmarks](performance-benchmarks.md) — reproduce the

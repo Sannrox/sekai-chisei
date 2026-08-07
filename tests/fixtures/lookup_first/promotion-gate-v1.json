@@ -1,0 +1,38 @@
+{
+  "contract_version": "chisei.lookup-first-promotion-gate/v1",
+  "suite_id": "lookup-first-reference-v1",
+  "namespace": "acme",
+  "cases": [
+    {
+      "id": "resolve_ref_hit",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "external_id": "widget:lookup-root" },
+      "expected_path": "lookup_hit",
+      "expected_answer": {
+        "capability": "sekai.semantic.resolve_ref",
+        "ref_kind": "object",
+        "resolved": true,
+        "namespace": "acme",
+        "object": {
+          "id": "lookup-root",
+          "kind": "widget",
+          "name": "lookup-root",
+          "namespace": "acme",
+          "external_id": "widget:lookup-root",
+          "properties": { "name": "lookup-root", "color": "red" }
+        }
+      }
+    },
+    {
+      "id": "resolve_ref_incomplete_fallback",
+      "capability": "sekai.semantic.resolve_ref",
+      "namespace": "acme",
+      "actor": "alice",
+      "input": { "object_id": "does-not-exist" },
+      "expected_path": "model_path",
+      "expected_refusal": "incomplete"
+    }
+  ]
+}

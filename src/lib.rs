@@ -24,6 +24,7 @@ pub mod grpc;
 pub mod gunshi_cli;
 pub mod harness;
 pub mod launch;
+pub mod lookup_gate_cli;
 pub use sekai_provider::llm;
 pub mod memory_cli;
 pub mod models_cli;
