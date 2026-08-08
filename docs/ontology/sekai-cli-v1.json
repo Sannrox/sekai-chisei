@@ -2,6 +2,16 @@
   "schema_version": 1,
   "classes": [
     {
+      "name": "Crate",
+      "description": "A Rust crate boundary used by the portable CLI ontology projection.",
+      "superclasses": []
+    },
+    {
+      "name": "Component",
+      "description": "A named implementation component in the portable CLI ontology projection.",
+      "superclasses": []
+    },
+    {
       "name": "SekaiOntology",
       "description": "The sekai-ontology crate: portable ontology library and CLI tool with deterministic discovery, semantic diffing, and a read-only natural-language frontend.",
       "superclasses": ["Crate"]
@@ -19,6 +29,41 @@
     {
       "name": "OntologyAsk",
       "description": "A read-only natural-language interpreter that compiles supported questions into bounded ontology explain or query plans.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "DirectoryEntity",
+      "description": "A deterministic local filesystem directory fact identified by its normalized absolute path and assigned ontology kind.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "Directory",
+      "description": "The standard ontology class for a filesystem directory represented as a durable local fact.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "WorkspaceDirectory",
+      "description": "A directory that scopes multiple projects and their local ontologies.",
+      "superclasses": ["Directory"]
+    },
+    {
+      "name": "ProjectDirectory",
+      "description": "A project root directory with its own local ontology scope.",
+      "superclasses": ["Directory"]
+    },
+    {
+      "name": "DirectoryLink",
+      "description": "A deterministic fact connecting two directory entities, including direct parent-child containment.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "DirectoryIndexer",
+      "description": "The local-only scanner and persistence boundary that indexes bounded directory trees without following symlinks and optionally prunes stale facts.",
+      "superclasses": ["Component"]
+    },
+    {
+      "name": "DirectoryQuery",
+      "description": "A bounded traversal over stored directory entities and links with explicit direction, relation, and depth options.",
       "superclasses": ["Component"]
     }
   ],
@@ -40,6 +85,37 @@
       "description": "The portable ontology CLI provides a read-only natural-language frontend over typed plans.",
       "domain": "SekaiOntology",
       "range": "OntologyAsk"
+    },
+    {
+      "name": "provides_directory_indexing",
+      "description": "The portable ontology CLI provides deterministic local directory indexing and subtree exchange.",
+      "domain": "SekaiOntology",
+      "range": "DirectoryIndexer"
+    },
+    {
+      "name": "records_directory_entities",
+      "description": "The directory indexer records normalized directory entities as durable local facts.",
+      "domain": "DirectoryIndexer",
+      "range": "DirectoryEntity"
+    },
+    {
+      "name": "records_directory_links",
+      "description": "The directory indexer records deterministic links between directory entities.",
+      "domain": "DirectoryIndexer",
+      "range": "DirectoryLink"
+    },
+    {
+      "name": "provides_directory_query",
+      "description": "The portable ontology CLI provides bounded traversal over directory facts.",
+      "domain": "SekaiOntology",
+      "range": "DirectoryQuery"
+    },
+    {
+      "name": "contains",
+      "description": "Direct filesystem parent-child containment between directory classes; stored directory links are traversed with bounded depth.",
+      "domain": "Directory",
+      "range": "Directory",
+      "transitive": true
     }
   ],
   "provenance": [
@@ -47,6 +123,18 @@
       "subject": "SekaiOntology",
       "source": "crates/sekai-ontology/src/main.rs",
       "locator": "find/diff/ask commands",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Crate",
+      "source": "crates/sekai-ontology/Cargo.toml",
+      "locator": "package.name",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Component",
+      "source": "crates/sekai-ontology/src/lib.rs",
+      "locator": "portable ontology components",
       "confidence": 1.0
     },
     {
@@ -68,6 +156,48 @@
       "confidence": 1.0
     },
     {
+      "subject": "DirectoryEntity",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "DirectoryEntity",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Directory",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "directory_ontology_document",
+      "confidence": 1.0
+    },
+    {
+      "subject": "WorkspaceDirectory",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "directory_ontology_document",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ProjectDirectory",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "directory_ontology_document",
+      "confidence": 1.0
+    },
+    {
+      "subject": "DirectoryLink",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "DirectoryLink",
+      "confidence": 1.0
+    },
+    {
+      "subject": "DirectoryIndexer",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "SqliteOntology::index_directory",
+      "confidence": 1.0
+    },
+    {
+      "subject": "DirectoryQuery",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "SqliteOntology::query_directories",
+      "confidence": 1.0
+    },
+    {
       "subject": "provides_search",
       "source": "crates/sekai-ontology/src/main.rs",
       "locator": "run_find",
@@ -83,6 +213,36 @@
       "subject": "provides_read_only_ask",
       "source": "crates/sekai-ontology/src/main.rs",
       "locator": "run_ask",
+      "confidence": 1.0
+    },
+    {
+      "subject": "provides_directory_indexing",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "run_directory",
+      "confidence": 1.0
+    },
+    {
+      "subject": "records_directory_entities",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "index_directory",
+      "confidence": 1.0
+    },
+    {
+      "subject": "records_directory_links",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "persist_all",
+      "confidence": 1.0
+    },
+    {
+      "subject": "provides_directory_query",
+      "source": "crates/sekai-ontology/src/main.rs",
+      "locator": "run_directory query",
+      "confidence": 1.0
+    },
+    {
+      "subject": "contains",
+      "source": "crates/sekai-ontology/src/directory.rs",
+      "locator": "directory_ontology_document",
       "confidence": 1.0
     }
   ]

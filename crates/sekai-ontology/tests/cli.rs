@@ -246,8 +246,17 @@ fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
     let help = String::from_utf8(help.stdout).unwrap();
     for command in [
-        "export", "explain", "query", "find", "diff", "ask", "validate", "import", "entity",
+        "export",
+        "explain",
+        "query",
+        "find",
+        "diff",
+        "ask",
+        "validate",
+        "import",
+        "entity",
         "relation",
+        "directory",
     ] {
         assert!(help.contains(command), "help is missing {command}");
         assert!(
@@ -255,6 +264,168 @@ fn embedded_skill_only_documents_shipping_commands() {
             "skill is missing {command}"
         );
     }
+}
+
+#[test]
+fn directory_commands_index_query_export_import_and_prune() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("Projects");
+    fs::create_dir_all(root.join("alpha/src")).unwrap();
+    fs::create_dir(root.join(".hidden")).unwrap();
+    let database = temporary.path().join("knowledge.db");
+    let database = database.to_str().unwrap();
+    let root = root.to_str().unwrap();
+
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "directory", "init"])
+            .status
+            .success()
+    );
+
+    let index = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "directory",
+        "index",
+        root,
+        "--kind",
+        "WorkspaceDirectory",
+        "--max-depth",
+        "2",
+    ]);
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let index: Value = serde_json::from_slice(&index.stdout).unwrap();
+    assert_eq!(index["command"], "directory.index");
+    assert_eq!(index["data"]["scanned_entities"], 3);
+    assert_eq!(index["data"]["scanned_links"], 2);
+
+    let tree = sekai(&[
+        "--db",
+        database,
+        "directory",
+        "tree",
+        root,
+        "--max-depth",
+        "2",
+    ]);
+    assert!(tree.status.success());
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    assert!(tree.contains("Projects"));
+    assert!(tree.contains("alpha"));
+    assert!(tree.contains("src"));
+    assert!(!tree.contains("hidden"));
+
+    let query = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "directory",
+        "query",
+        root,
+        "--direction",
+        "outbound",
+        "--relation",
+        "contains",
+        "--depth",
+        "2",
+    ]);
+    assert!(query.status.success());
+    let query: Value = serde_json::from_slice(&query.stdout).unwrap();
+    assert_eq!(query["command"], "directory.query");
+    assert_eq!(query["data"]["entities"].as_array().unwrap().len(), 2);
+
+    let exported = sekai(&["--db", database, "directory", "export", root]);
+    assert!(exported.status.success());
+    let exported_path = temporary.path().join("directory.json");
+    fs::write(&exported_path, &exported.stdout).unwrap();
+
+    let destination = temporary.path().join("destination.db");
+    assert!(
+        sekai(&["--db", destination.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    let imported = sekai(&[
+        "--db",
+        destination.to_str().unwrap(),
+        "--json",
+        "directory",
+        "import",
+        exported_path.to_str().unwrap(),
+    ]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let imported: Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(imported["data"]["imported_entities"], 3);
+
+    fs::remove_dir_all(std::path::Path::new(root).join("alpha/src")).unwrap();
+    let pruned = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "directory",
+        "index",
+        root,
+        "--prune",
+    ]);
+    assert!(pruned.status.success());
+    let pruned: Value = serde_json::from_slice(&pruned.stdout).unwrap();
+    assert_eq!(pruned["data"]["removed_entities"], 1);
+    assert_eq!(pruned["data"]["removed_links"], 1);
+}
+
+#[test]
+fn nearest_scoped_database_wins_over_the_user_default() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("Projects");
+    let project = workspace.join("alpha/src");
+    fs::create_dir_all(&project).unwrap();
+    let scoped = workspace.join(".sekai/knowledge.db");
+    fs::create_dir_all(scoped.parent().unwrap()).unwrap();
+    assert!(
+        sekai(&["--db", scoped.to_str().unwrap(), "init"])
+            .status
+            .success()
+    );
+    assert!(
+        sekai(&["--db", scoped.to_str().unwrap(), "directory", "init"])
+            .status
+            .success()
+    );
+
+    let fake_home = temporary.path().join("home");
+    fs::create_dir(&fake_home).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    command
+        .args(["--json", "entity", "list"])
+        .current_dir(&project)
+        .env("HOME", &fake_home)
+        .env_remove("SEKAI_DB");
+    #[cfg(not(target_os = "macos"))]
+    command.env_remove("XDG_DATA_HOME");
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entity| { entity["name"] == "Directory" })
+    );
 }
 
 #[test]

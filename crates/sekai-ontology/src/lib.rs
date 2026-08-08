@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+mod directory;
+
+pub use directory::{
+    DEFAULT_DIRECTORY_KIND, DIRECTORY_RELATION_CONTAINS, DIRECTORY_SCHEMA_VERSION,
+    DirectoryDocument, DirectoryEntity, DirectoryImportReport, DirectoryIndexReport, DirectoryLink,
+    DirectoryQueryResult, DirectoryScanOptions, MAX_DIRECTORY_DEPTH, directory_ontology_document,
+};
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_QUERY_DEPTH: u32 = 32;
 pub const EMBEDDED_SKILL: &str = include_str!("../assets/SKILL.md");
@@ -301,6 +309,7 @@ impl SqliteOntology {
         if has_metadata {
             let ontology = Self { connection };
             ontology.check_schema_version()?;
+            directory::ensure_schema(&ontology.connection)?;
             return Ok(ontology);
         }
         let transaction = connection.transaction().map_err(database_error)?;
@@ -331,7 +340,9 @@ impl SqliteOntology {
             )
             .map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
-        Ok(Self { connection })
+        let ontology = Self { connection };
+        directory::ensure_schema(&ontology.connection)?;
+        Ok(ontology)
     }
 
     pub fn import_json(&mut self, input: &str) -> Result<(), Error> {
@@ -1123,7 +1134,11 @@ impl Ontology for SqliteOntology {
     fn validate(&self) -> Result<Vec<ValidationIssue>, Error> {
         self.check_schema_version()?;
         let (classes, relations, provenance) = load_all(&self.connection)?;
-        Ok(validate_parts(&classes, &relations, &provenance))
+        let mut issues = validate_parts(&classes, &relations, &provenance);
+        issues.extend(directory::validate_database(&self.connection)?);
+        issues.sort_by(|left, right| left.path.cmp(&right.path).then(left.code.cmp(&right.code)));
+        issues.dedup();
+        Ok(issues)
     }
 
     fn explain(&self, name: &str) -> Result<ExplainResult, Error> {

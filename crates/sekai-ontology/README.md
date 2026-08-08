@@ -17,16 +17,26 @@ sekai --db knowledge.db --json ask "What does Api depend on?"
 sekai --json diff before.json after.json
 sekai --db knowledge.db --json entity list
 sekai --db knowledge.db --json relation list
+sekai --db knowledge.db directory init
+sekai --db knowledge.db directory index ~/Projects --kind WorkspaceDirectory --prune
+sekai --db knowledge.db directory tree ~/Projects
 ```
 
 The database is resolved in this order (first match wins):
 
 1. `--db <path>` (explicit flag)
 2. `SEKAI_DB` environment variable
-3. User-level default when the file exists:
+3. The nearest existing `.sekai/knowledge.db` while walking upward from the
+   current directory
+4. User-level default when the file exists:
    - macOS: `~/Library/Application Support/sekai/knowledge.db`
    - Linux: `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
-4. `knowledge.db` in the current directory
+5. `knowledge.db` in the current directory
+
+This lets `~/Projects/.sekai/knowledge.db` describe a workspace while
+`~/Projects/project-a/.sekai/knowledge.db` overrides it for one project.
+Explicit `--db` or `SEKAI_DB` remains the escape hatch for scripts and
+cross-scope inspection.
 
 Import accepts a versioned JSON document:
 
@@ -132,6 +142,33 @@ data rather than using a failure exit code as a change indicator.
 
 The JSON contract is version 1. New optional fields may be added within version
 1; incompatible changes require a new schema version.
+
+## Directory facts
+
+The portable ontology keeps class/relation definitions separate from local
+filesystem facts. `directory init` installs the `Directory`,
+`WorkspaceDirectory`, `ProjectDirectory`, and transitive `contains` vocabulary.
+`directory index` then stores deterministic directory entities and direct
+parent-child links in the same SQLite file.
+
+```bash
+sekai --db ~/Projects/.sekai/knowledge.db init
+sekai --db ~/Projects/.sekai/knowledge.db directory init
+sekai --db ~/Projects/.sekai/knowledge.db directory index ~/Projects \
+  --kind WorkspaceDirectory --prune
+
+sekai --db ~/Projects/project-a/.sekai/knowledge.db init
+sekai --db ~/Projects/project-a/.sekai/knowledge.db directory init
+sekai --db ~/Projects/project-a/.sekai/knowledge.db directory index . \
+  --kind ProjectDirectory --prune
+```
+
+`directory tree` renders a bounded human hierarchy. `directory query` returns
+bounded links and reached entities in the same stable JSON envelope style as
+ontology queries. `directory export` and `directory import` exchange a
+versioned subtree document; `directory import -` reads from stdin. Indexing
+skips hidden directories by default, never follows symlinks, and only prunes
+stale facts when `--prune` is explicit.
 
 ## Agent skill
 
