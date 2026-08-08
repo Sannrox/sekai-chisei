@@ -1,13 +1,15 @@
 use sekai_ontology::{
-    AskInterpretation, AskOperation, AskStatus, DefinitionKind, EMBEDDED_SKILL, Error,
-    ExportDocument, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology, TraversalDirection,
-    ValidationIssue, diff_documents, interpret_question,
+    AskInterpretation, AskOperation, AskStatus, DEFAULT_DIRECTORY_KIND, DefinitionKind,
+    DirectoryDocument, DirectoryScanOptions, EMBEDDED_SKILL, Error, ExportDocument,
+    MAX_DIRECTORY_DEPTH, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology,
+    TraversalDirection, ValidationIssue, diff_documents, interpret_question,
 };
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +56,11 @@ struct Arguments {
     operands: Vec<String>,
     query_options: QueryOptions,
     query_options_set: bool,
+    directory_max_depth: u32,
+    directory_max_depth_set: bool,
+    directory_include_hidden: bool,
+    directory_prune: bool,
+    directory_kind: Option<String>,
     skill_path: Option<PathBuf>,
     force: bool,
     uninstall: bool,
@@ -81,9 +88,28 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, Error> {
     let arguments = parse_arguments(env::args().skip(1))?;
-    if arguments.command != "query" && arguments.query_options_set {
+    if !matches!(arguments.command.as_str(), "query" | "directory") && arguments.query_options_set {
         return Err(Error::Input(
             "--direction, --relation, and --depth are only valid with query".into(),
+        ));
+    }
+    if arguments.command == "directory"
+        && arguments.query_options_set
+        && arguments.operands.first().map(String::as_str) != Some("query")
+    {
+        return Err(Error::Input(
+            "--direction, --relation, and --depth are only valid with directory query".into(),
+        ));
+    }
+    if arguments.command != "directory"
+        && (arguments.directory_max_depth_set
+            || arguments.directory_include_hidden
+            || arguments.directory_prune
+            || arguments.directory_kind.is_some())
+    {
+        return Err(Error::Input(
+            "--max-depth, --include-hidden, --prune, and --kind are only valid with directory"
+                .into(),
         ));
     }
     if arguments.command != "skill"
@@ -204,6 +230,7 @@ fn run() -> Result<ExitCode, Error> {
         "find" => run_find(&arguments)?,
         "diff" => run_diff(&arguments)?,
         "ask" => return run_ask(&arguments),
+        "directory" => return run_directory(&arguments),
         "entity" => run_entity(&arguments)?,
         "relation" => run_relation(&arguments)?,
         "skill" => return run_skill(&arguments),
@@ -293,6 +320,238 @@ fn run_ask(arguments: &Arguments) -> Result<ExitCode, Error> {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(EXIT_USAGE_OR_INPUT))
+    }
+}
+
+fn run_directory(arguments: &Arguments) -> Result<ExitCode, Error> {
+    let verb = arguments.operands.first().map(String::as_str).unwrap_or("");
+    match verb {
+        "init" => {
+            if arguments.operands.len() != 1
+                || arguments.directory_max_depth_set
+                || arguments.directory_include_hidden
+                || arguments.directory_prune
+                || arguments.directory_kind.is_some()
+            {
+                return Err(directory_usage());
+            }
+            let mut ontology = SqliteOntology::open(&arguments.database)?;
+            ontology.initialize_directory_ontology()?;
+            println!(
+                "directory vocabulary ready in {}",
+                arguments.database.display()
+            );
+        }
+        "index" => {
+            if arguments.operands.len() != 2
+                || arguments.query_options_set
+                || arguments.directory_kind.as_deref() == Some("")
+            {
+                return Err(directory_usage());
+            }
+            let root = &arguments.operands[1];
+            let options = DirectoryScanOptions {
+                max_depth: arguments.directory_max_depth,
+                include_hidden: arguments.directory_include_hidden,
+                root_kind: arguments
+                    .directory_kind
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_DIRECTORY_KIND.into()),
+            };
+            let mut ontology = SqliteOntology::open(&arguments.database)?;
+            let report = ontology.index_directory(root, options, arguments.directory_prune)?;
+            if arguments.json {
+                print_json("directory.index", report)?;
+            } else {
+                println!(
+                    "indexed {} directories and {} contains links under {}",
+                    report.scanned_entities, report.scanned_links, report.root
+                );
+                if report.pruned {
+                    println!(
+                        "pruned {} directories and {} links",
+                        report.removed_entities, report.removed_links
+                    );
+                }
+            }
+        }
+        "export" | "tree" => {
+            if arguments.operands.len() != 2
+                || arguments.query_options_set
+                || arguments.directory_include_hidden
+                || arguments.directory_prune
+                || arguments.directory_kind.is_some()
+            {
+                return Err(directory_usage());
+            }
+            let ontology = SqliteOntology::open_read_only(&arguments.database)?;
+            let document = ontology.export_directory_with_depth(
+                &arguments.operands[1],
+                arguments.directory_max_depth,
+            )?;
+            if verb == "export" {
+                print_directory_document(&document, arguments.json, "directory.export")?;
+            } else if arguments.json {
+                print_json("directory.tree", document)?;
+            } else {
+                print_directory_tree(&document);
+            }
+        }
+        "import" => {
+            if arguments.operands.len() != 2
+                || arguments.query_options_set
+                || arguments.directory_max_depth_set
+                || arguments.directory_include_hidden
+                || arguments.directory_prune
+                || arguments.directory_kind.is_some()
+            {
+                return Err(directory_usage());
+            }
+            let document = load_directory_document(&arguments.operands[1])?;
+            let mut ontology = SqliteOntology::open(&arguments.database)?;
+            let report = ontology.import_directory_document(document)?;
+            if arguments.json {
+                print_json("directory.import", report)?;
+            } else {
+                println!(
+                    "imported {} directories and {} links under {}",
+                    report.imported_entities, report.imported_links, report.root
+                );
+            }
+        }
+        "query" => {
+            if arguments.operands.len() != 2
+                || arguments.directory_max_depth_set
+                || arguments.directory_include_hidden
+                || arguments.directory_prune
+                || arguments.directory_kind.is_some()
+            {
+                return Err(directory_usage());
+            }
+            let ontology = SqliteOntology::open_read_only(&arguments.database)?;
+            let result = ontology
+                .query_directories(&arguments.operands[1], arguments.query_options.clone())?;
+            if arguments.json {
+                print_json("directory.query", result)?;
+            } else {
+                print_directory_query(&result);
+            }
+        }
+        _ => return Err(directory_usage()),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn directory_usage() -> Error {
+    Error::Input(
+        "usage: sekai [--db <path>] directory <init|index <root>|export <root>|tree <root>|import <path|->|query <path>> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]".into(),
+    )
+}
+
+fn load_directory_document(path: &str) -> Result<DirectoryDocument, Error> {
+    let mut input = String::new();
+    if path == "-" {
+        io::stdin().read_to_string(&mut input).map_err(|error| {
+            Error::Input(format!(
+                "cannot read directory document from stdin: {error}"
+            ))
+        })?;
+    } else {
+        input = fs::read_to_string(path)
+            .map_err(|error| Error::Input(format!("cannot read '{path}': {error}")))?;
+    }
+    let value: Value = serde_json::from_str(&input)
+        .map_err(|error| Error::Input(format!("invalid directory document: {error}")))?;
+    let value = if let Some(command) = value.get("command").and_then(Value::as_str) {
+        if !matches!(command, "directory.export" | "directory.tree") {
+            return Err(Error::Input(format!(
+                "JSON input has command '{command}', expected 'directory.export' or 'directory.tree'"
+            )));
+        }
+        value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| Error::Input("directory JSON envelope has no data field".into()))?
+    } else {
+        value
+    };
+    serde_json::from_value(value)
+        .map_err(|error| Error::Input(format!("invalid directory document: {error}")))
+}
+
+fn print_directory_document(
+    document: &DirectoryDocument,
+    envelope: bool,
+    command: &'static str,
+) -> Result<(), Error> {
+    if envelope {
+        print_json(command, document.clone())
+    } else {
+        let output = serde_json::to_string_pretty(document)
+            .map_err(|error| Error::Input(format!("cannot encode directory document: {error}")))?;
+        println!("{output}");
+        Ok(())
+    }
+}
+
+fn print_directory_query(result: &sekai_ontology::DirectoryQueryResult) {
+    println!("{}", result.start);
+    for link in &result.links {
+        println!("  {}: {} -> {}", link.relation, link.from_id, link.to_id);
+    }
+    for entity in &result.entities {
+        println!("  reached: {} ({})", entity.path, entity.kind);
+    }
+}
+
+fn print_directory_tree(document: &DirectoryDocument) {
+    let entities = document
+        .entities
+        .iter()
+        .map(|entity| (entity.id.as_str(), entity))
+        .collect::<BTreeMap<_, _>>();
+    let mut children = BTreeMap::<&str, Vec<&sekai_ontology::DirectoryEntity>>::new();
+    for link in &document.links {
+        if link.relation == sekai_ontology::DIRECTORY_RELATION_CONTAINS
+            && let Some(child) = entities.get(link.to_id.as_str())
+        {
+            children
+                .entry(link.from_id.as_str())
+                .or_default()
+                .push(*child);
+        }
+    }
+    for values in children.values_mut() {
+        values.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    let root_id = document
+        .entities
+        .iter()
+        .find(|entity| entity.path == document.root)
+        .map(|entity| entity.id.as_str())
+        .unwrap_or("");
+    println!("{}", document.root);
+    let mut visited = BTreeSet::new();
+    render_directory_children(root_id, "", &children, &mut visited);
+}
+
+fn render_directory_children(
+    parent_id: &str,
+    prefix: &str,
+    children: &BTreeMap<&str, Vec<&sekai_ontology::DirectoryEntity>>,
+    visited: &mut BTreeSet<String>,
+) {
+    let Some(values) = children.get(parent_id) else {
+        return;
+    };
+    for (index, child) in values.iter().enumerate() {
+        let last = index + 1 == values.len();
+        let marker = if last { "└── " } else { "├── " };
+        println!("{prefix}{marker}{}", child.name);
+        if visited.insert(child.id.clone()) {
+            let next_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+            render_directory_children(&child.id, &next_prefix, children, visited);
+        }
     }
 }
 
@@ -821,18 +1080,34 @@ fn target_is_symlink(target: &Path) -> Result<bool, Error> {
 
 /// Resolve the default database path when neither `--db` nor `SEKAI_DB` is set.
 ///
-/// Returns the user-level default if the file already exists:
+/// Returns the nearest scoped `.sekai/knowledge.db`, then the user-level
+/// default if the file already exists:
 /// - macOS: `~/Library/Application Support/sekai/knowledge.db`
 /// - Other (Linux, etc.): `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
 ///
 /// Falls back to `knowledge.db` in the current working directory.
 fn resolve_default_database() -> PathBuf {
+    if let Some(path) = nearest_scoped_database() {
+        return path;
+    }
     if let Some(path) = user_default_database()
         && path.exists()
     {
         return path;
     }
     PathBuf::from("knowledge.db")
+}
+
+fn nearest_scoped_database() -> Option<PathBuf> {
+    let current = env::current_dir().ok()?;
+    let mut directory = current.as_path();
+    loop {
+        let scoped = directory.join(".sekai/knowledge.db");
+        if scoped.is_file() {
+            return Some(scoped);
+        }
+        directory = directory.parent()?;
+    }
 }
 
 /// Compute the platform-specific user-level database path without checking existence.
@@ -859,6 +1134,11 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut direction_set = false;
     let mut relation_set = false;
     let mut depth_set = false;
+    let mut directory_max_depth = MAX_DIRECTORY_DEPTH;
+    let mut directory_max_depth_set = false;
+    let mut directory_include_hidden = false;
+    let mut directory_prune = false;
+    let mut directory_kind = None;
     let mut skill_path = None;
     let mut force = false;
     let mut uninstall = false;
@@ -926,6 +1206,53 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
                 })?;
                 depth_set = true;
             }
+            "--max-depth" => {
+                if directory_max_depth_set {
+                    return Err(Error::Input(
+                        "--max-depth may only be specified once".into(),
+                    ));
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| Error::Input("--max-depth requires a value".into()))?;
+                directory_max_depth = value.parse().map_err(|_| {
+                    Error::Input(format!(
+                        "invalid directory max depth '{value}'; expected 0..{MAX_DIRECTORY_DEPTH}"
+                    ))
+                })?;
+                if directory_max_depth > MAX_DIRECTORY_DEPTH {
+                    return Err(Error::Input(format!(
+                        "directory max depth {directory_max_depth} exceeds maximum {MAX_DIRECTORY_DEPTH}"
+                    )));
+                }
+                directory_max_depth_set = true;
+            }
+            "--include-hidden" => {
+                if directory_include_hidden {
+                    return Err(Error::Input(
+                        "--include-hidden may only be specified once".into(),
+                    ));
+                }
+                directory_include_hidden = true;
+            }
+            "--prune" => {
+                if directory_prune {
+                    return Err(Error::Input("--prune may only be specified once".into()));
+                }
+                directory_prune = true;
+            }
+            "--kind" => {
+                if directory_kind.is_some() {
+                    return Err(Error::Input("--kind may only be specified once".into()));
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| Error::Input("--kind requires a value".into()))?;
+                if value.trim().is_empty() {
+                    return Err(Error::Input("--kind requires a non-empty value".into()));
+                }
+                directory_kind = Some(value);
+            }
             "-h" | "--help" if positional.is_empty() => positional.push("help".into()),
             _ if argument.starts_with('-') => {
                 return Err(Error::Input(format!("unknown option '{argument}'")));
@@ -941,6 +1268,11 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         operands: positional.into_iter().skip(1).collect(),
         query_options,
         query_options_set: direction_set || relation_set || depth_set,
+        directory_max_depth,
+        directory_max_depth_set,
+        directory_include_hidden,
+        directory_prune,
+        directory_kind,
         skill_path,
         force,
         uninstall,
@@ -968,7 +1300,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  4. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain/query plans.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  directory init\n  directory index <root> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]\n  directory export <root> [--max-depth <0..64>]\n  directory tree <root> [--max-depth <0..64>]\n  directory import <path|->\n  directory query <path> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..64>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. nearest existing .sekai/knowledge.db from the current directory upward\n  4. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  5. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain/query plans.\nDirectory indexing never follows symlinks; `--prune` removes stale indexed facts under the selected root.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {
