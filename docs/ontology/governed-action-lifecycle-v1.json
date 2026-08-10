@@ -3,7 +3,7 @@
   "classes": [
     {
       "name": "GovernedActionLifecycleModule",
-      "description": "Sekai-owned module that resolves action policy, coordinates budget and blast-radius limits, binds policy attestations, and commits generic approval hold, approve, and deny transitions with audit evidence.",
+      "description": "Sekai-owned module that resolves action policy, coordinates budget and blast-radius limits, binds policy attestations, commits generic approval transitions, and owns execution outcome and limit-denial audit ordering with post-effect metering.",
       "superclasses": []
     },
     {
@@ -20,7 +20,7 @@
   "relations": [
     {
       "name": "delegates_governed_action_lifecycle_to",
-      "description": "The gRPC transport delegates policy, resource metering, attestation, and generic approval transition behavior to the governed action lifecycle module.",
+      "description": "The gRPC transport delegates policy, resource metering, attestation, execution outcome and limit-denial auditing, and generic approval transition behavior to the governed action lifecycle module.",
       "domain": "SekaiGrpcTransportAdapter",
       "range": "GovernedActionLifecycleModule"
     },
@@ -35,7 +35,7 @@
     {
       "subject": "GovernedActionLifecycleModule",
       "source": "src/sekai/action_lifecycle.rs",
-      "locator": "GovernedActionContext/hold_action/complete_approval/deny_approval",
+      "locator": "GovernedActionContext/ActionAudit/record_outcome/check_limits_and_record/hold_action/complete_approval/deny_approval",
       "confidence": 1.0
     },
     {

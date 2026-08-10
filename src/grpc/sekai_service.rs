@@ -25,7 +25,9 @@ use crate::domain;
 use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
-use crate::sekai::action_lifecycle::{self, ActionLimitExceeded, GovernedActionContext};
+use crate::sekai::action_lifecycle::{
+    self, ActionAudit, ActionLimitExceeded, GovernedActionContext,
+};
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::attestation;
 use crate::sekai::capability;
@@ -8287,35 +8289,26 @@ impl SekaiService for SekaiServiceImpl {
                 .planned_ops(&r.action, &r.params)
                 .map_err(Status::invalid_argument)?;
             let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
-            evidence.insert("risk_class".into(), action_risk.as_str().into());
-            evidence.insert("decision".into(), decision.as_str().into());
             evidence.insert("dry_run".into(), "true".into());
-            if !work_unit.is_empty() {
-                evidence.insert("work_unit".into(), work_unit.clone());
-            }
-            if !policy_scope.is_empty() {
-                evidence.insert("policy_scope".into(), policy_scope.clone());
-            }
-            let decision_id = uuid::Uuid::new_v4().to_string();
-            let attested =
-                lifecycle.attest(&decision_id, &r.action, &actor, &mut evidence, now_millis());
-            self.db
-                .record_decision_with_attestation(
-                    &audit::Decision {
-                        id: decision_id,
-                        timestamp: now_millis(),
+            lifecycle
+                .record_outcome(
+                    &self.db,
+                    self.budget.as_deref(),
+                    ActionAudit {
                         actor: actor.clone(),
+                        attestation_actor: actor.clone(),
                         action: r.action.clone(),
-                        reason: "execute_action_dry_run".into(),
-                        evidence,
                         target_id: target_ids.first().cloned().unwrap_or_default(),
-                        outcome: format!(
-                            "dry-run: {} planned op(s), decision={}",
-                            planned_ops.len(),
-                            decision.as_str()
-                        ),
+                        evidence,
+                        timestamp: now_millis(),
                     },
-                    attested.as_ref(),
+                    "execute_action_dry_run",
+                    format!(
+                        "dry-run: {} planned op(s), decision={}",
+                        planned_ops.len(),
+                        decision.as_str()
+                    ),
+                    false,
                 )
                 .map_err(Status::internal)?;
             let mut response = Response::new(ExecuteActionResponse {
@@ -8414,29 +8407,21 @@ impl SekaiService for SekaiServiceImpl {
                     .unwrap()
                     .finalize(decision.as_str(), "denied")?;
             }
-            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
-            evidence.insert("risk_class".into(), action_risk.as_str().into());
-            evidence.insert("policy_scope".into(), policy_scope.clone());
-            evidence.insert("decision".into(), decision.as_str().into());
-            if !work_unit.is_empty() {
-                evidence.insert("work_unit".into(), work_unit.clone());
-            }
-            let decision_id = uuid::Uuid::new_v4().to_string();
-            let attested =
-                lifecycle.attest(&decision_id, &r.action, &actor, &mut evidence, now_millis());
-            self.db
-                .record_decision_with_attestation(
-                    &audit::Decision {
-                        id: decision_id,
-                        timestamp: now_millis(),
+            lifecycle
+                .record_outcome(
+                    &self.db,
+                    self.budget.as_deref(),
+                    ActionAudit {
                         actor: actor.clone(),
+                        attestation_actor: actor.clone(),
                         action: r.action.clone(),
-                        reason: "action_policy_denied".into(),
-                        evidence,
                         target_id: target_ids.first().cloned().unwrap_or_default(),
-                        outcome: format!("{} by action policy {}", decision.as_str(), policy_scope),
+                        evidence: redact_action_evidence(&r.params, &sensitive_params, None),
+                        timestamp: now_millis(),
                     },
-                    attested.as_ref(),
+                    "action_policy_denied",
+                    format!("{} by action policy {}", decision.as_str(), policy_scope),
+                    false,
                 )
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(format!(
@@ -8448,62 +8433,30 @@ impl SekaiService for SekaiServiceImpl {
         // Blast-radius caps (Plan 9, Phase C): hard-stop runaway loops by
         // capping mutations/deletes per work unit. Only enforced when a policy
         // sets a cap and the call carries a work-unit attribution.
-        if let Err(limit) = lifecycle.check_limits(&self.db, self.budget.as_deref()) {
+        if let Err(limit) = lifecycle.check_limits_and_record(
+            &self.db,
+            self.budget.as_deref(),
+            ActionAudit {
+                actor: actor.clone(),
+                attestation_actor: actor.clone(),
+                action: r.action.clone(),
+                target_id: target_ids.first().cloned().unwrap_or_default(),
+                evidence: redact_action_evidence(&r.params, &sensitive_params, None),
+                timestamp: now_millis(),
+            },
+        ) {
             match limit {
                 ActionLimitExceeded::Internal(error) => return Err(Status::internal(error)),
-                ActionLimitExceeded::BlastRadius {
-                    work_unit,
-                    used_mutations,
-                    used_deletes,
-                } => {
-                    let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
-                    evidence.insert("risk_class".into(), action_risk.as_str().into());
-                    evidence.insert("policy_scope".into(), policy_scope.clone());
-                    evidence.insert("work_unit".into(), work_unit.clone());
-                    evidence.insert("used_mutations".into(), used_mutations.to_string());
-                    evidence.insert("used_deletes".into(), used_deletes.to_string());
-                    self.db
-                        .record_decision(&audit::Decision {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            timestamp: now_millis(),
-                            actor: actor.clone(),
-                            action: r.action.clone(),
-                            reason: "action_blast_radius_exceeded".into(),
-                            evidence,
-                            target_id: target_ids.first().cloned().unwrap_or_default(),
-                            outcome: format!(
-                                "blast-radius cap exceeded for work unit {}",
-                                work_unit
-                            ),
-                        })
-                        .map_err(Status::internal)?;
+                ActionLimitExceeded::BlastRadius { work_unit, .. } => {
                     return Err(Status::resource_exhausted(format!(
                         "blast-radius cap exceeded for work unit {}",
                         work_unit
                     )));
                 }
-                ActionLimitExceeded::Budget { subject, reason } => {
+                ActionLimitExceeded::Budget { subject, .. } => {
                     if let Some(guard) = receipt_guard.as_mut() {
                         guard.mark_budget_decided("budget_exceeded");
                     }
-                    let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
-                    evidence.insert("risk_class".into(), action_risk.as_str().into());
-                    evidence.insert("budget_subject".into(), subject.clone());
-                    if !work_unit.is_empty() {
-                        evidence.insert("work_unit".into(), work_unit.clone());
-                    }
-                    self.db
-                        .record_decision(&audit::Decision {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            timestamp: now_millis(),
-                            actor: actor.clone(),
-                            action: r.action.clone(),
-                            reason: "action_budget_exceeded".into(),
-                            evidence,
-                            target_id: target_ids.first().cloned().unwrap_or_default(),
-                            outcome: reason,
-                        })
-                        .map_err(Status::internal)?;
                     return Err(Status::resource_exhausted(format!(
                         "action budget exhausted for {}",
                         subject
@@ -8556,41 +8509,26 @@ impl SekaiService for SekaiServiceImpl {
         drop(actions);
         drop(schema);
         self.refresh_security_after_action(&r.action, &r.params, &actor)?;
-        let mut evidence =
-            redact_action_evidence(&r.params, &sensitive_params, schema_restricted_property);
-        evidence.insert("risk_class".into(), action_risk.as_str().into());
-        evidence.insert("decision".into(), decision.as_str().into());
-        if !policy_scope.is_empty() {
-            evidence.insert("policy_scope".into(), policy_scope.clone());
-        }
-        if !work_unit.is_empty() {
-            evidence.insert("work_unit".into(), work_unit.clone());
-        }
-        let decision_id = uuid::Uuid::new_v4().to_string();
-        let attested =
-            lifecycle.attest(&decision_id, &r.action, &actor, &mut evidence, now_millis());
-        self.db
-            .record_decision_with_attestation(
-                &audit::Decision {
-                    id: decision_id,
-                    timestamp: now_millis(),
+        lifecycle
+            .record_outcome(
+                &self.db,
+                self.budget.as_deref(),
+                ActionAudit {
                     actor: actor.clone(),
+                    attestation_actor: actor.clone(),
                     action: r.action.clone(),
-                    reason: "execute_action".into(),
-                    evidence,
                     target_id: target_ids.first().cloned().unwrap_or_default(),
-                    outcome: redact_action_outcome(
-                        &r.action,
+                    evidence: redact_action_evidence(
                         &r.params,
-                        &msg,
+                        &sensitive_params,
                         schema_restricted_property,
                     ),
+                    timestamp: now_millis(),
                 },
-                attested.as_ref(),
+                "execute_action",
+                redact_action_outcome(&r.action, &r.params, &msg, schema_restricted_property),
+                true,
             )
-            .map_err(Status::internal)?;
-        lifecycle
-            .record_usage(&self.db, self.budget.as_deref())
             .map_err(Status::internal)?;
         let mut response = Response::new(ExecuteActionResponse {
             result: Some(ActionResult {
@@ -8737,36 +8675,22 @@ impl SekaiService for SekaiServiceImpl {
         )
         .map_err(Status::internal)?;
         if lifecycle.decision == ActionDecision::Deny {
-            let mut evidence = HashMap::from([
-                ("approval_id".to_string(), approval.id.clone()),
-                ("policy_scope".to_string(), lifecycle.policy_scope.clone()),
-                ("risk_class".to_string(), action_risk.as_str().into()),
-                ("decision".to_string(), "deny".into()),
-            ]);
-            if !approval.work_unit.is_empty() {
-                evidence.insert("work_unit".into(), approval.work_unit.clone());
-            }
-            let decision_id = uuid::Uuid::new_v4().to_string();
-            let attested = lifecycle.attest(
-                &decision_id,
-                &approval.action,
-                &approval.actor,
-                &mut evidence,
-                now_millis(),
-            );
-            self.db
-                .record_decision_with_attestation(
-                    &audit::Decision {
-                        id: decision_id,
-                        timestamp: now_millis(),
-                        actor: approver,
+            let evidence = HashMap::from([("approval_id".to_string(), approval.id.clone())]);
+            lifecycle
+                .record_outcome(
+                    &self.db,
+                    self.budget.as_deref(),
+                    ActionAudit {
+                        actor: approver.clone(),
+                        attestation_actor: approval.actor.clone(),
                         action: approval.action.clone(),
-                        reason: "action_approval_policy_denied".into(),
-                        evidence,
                         target_id: approval.target_id.clone(),
-                        outcome: "policy now denies the held action".into(),
+                        evidence,
+                        timestamp: now_millis(),
                     },
-                    attested.as_ref(),
+                    "action_approval_policy_denied",
+                    "policy now denies the held action".into(),
+                    false,
                 )
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
@@ -8774,7 +8698,18 @@ impl SekaiService for SekaiServiceImpl {
             ));
         }
 
-        if let Err(limit) = lifecycle.check_limits(&self.db, self.budget.as_deref()) {
+        if let Err(limit) = lifecycle.check_limits_and_record(
+            &self.db,
+            self.budget.as_deref(),
+            ActionAudit {
+                actor: approver.clone(),
+                attestation_actor: approval.actor.clone(),
+                action: approval.action.clone(),
+                target_id: approval.target_id.clone(),
+                evidence: HashMap::from([("approval_id".to_string(), approval.id.clone())]),
+                timestamp: now_millis(),
+            },
+        ) {
             match limit {
                 ActionLimitExceeded::Internal(error) => return Err(Status::internal(error)),
                 ActionLimitExceeded::BlastRadius { work_unit, .. } => {
@@ -8784,25 +8719,6 @@ impl SekaiService for SekaiServiceImpl {
                     )));
                 }
                 ActionLimitExceeded::Budget { subject, .. } => {
-                    let mut evidence =
-                        HashMap::from([("budget_subject".to_string(), subject.clone())]);
-                    evidence.insert("risk_class".to_string(), action_risk.as_str().into());
-                    evidence.insert("decision".to_string(), "deny".into());
-                    if !approval.work_unit.is_empty() {
-                        evidence.insert("work_unit".into(), approval.work_unit.clone());
-                    }
-                    self.db
-                        .record_decision(&audit::Decision {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            timestamp: now_millis(),
-                            actor: approver,
-                            action: approval.action.clone(),
-                            reason: "action_budget_exceeded".into(),
-                            evidence,
-                            target_id: approval.target_id.clone(),
-                            outcome: format!("action budget exhausted for {subject}"),
-                        })
-                        .map_err(Status::internal)?;
                     return Err(Status::resource_exhausted(format!(
                         "action budget exhausted for {}",
                         subject
