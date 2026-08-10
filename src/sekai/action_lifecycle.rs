@@ -52,6 +52,17 @@ pub enum ActionLimitExceeded {
     },
 }
 
+/// Transport-neutral evidence for one governed Action lifecycle transition.
+#[derive(Debug, Clone)]
+pub struct ActionAudit {
+    pub actor: String,
+    pub attestation_actor: String,
+    pub action: String,
+    pub target_id: String,
+    pub evidence: HashMap<String, String>,
+    pub timestamp: i64,
+}
+
 impl GovernedActionContext {
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
@@ -148,6 +159,97 @@ impl GovernedActionContext {
         blast_result
     }
 
+    /// Commit a governed Action outcome and its attestation, then meter an
+    /// effect only after the audit record is durable.
+    pub fn record_outcome(
+        &self,
+        db: &RuntimeDb,
+        budget: Option<&BudgetTracker>,
+        mut audit: ActionAudit,
+        reason: &str,
+        outcome: String,
+        meter: bool,
+    ) -> Result<(), String> {
+        self.decorate_evidence(&mut audit.evidence);
+        let decision_id = uuid::Uuid::new_v4().to_string();
+        let attested = self.attest(
+            &decision_id,
+            &audit.action,
+            &audit.attestation_actor,
+            &mut audit.evidence,
+            audit.timestamp,
+        );
+        db.record_decision_with_attestation(
+            &audit::Decision {
+                id: decision_id,
+                timestamp: audit.timestamp,
+                actor: audit.actor,
+                action: audit.action,
+                reason: reason.to_string(),
+                evidence: audit.evidence,
+                target_id: audit.target_id,
+                outcome,
+            },
+            attested.as_ref(),
+        )?;
+        if meter {
+            self.record_usage(db, budget)?;
+        }
+        Ok(())
+    }
+
+    /// Check limits and durably record the denial through the same lifecycle
+    /// interface used by direct execution and approval resumption.
+    pub fn check_limits_and_record(
+        &self,
+        db: &RuntimeDb,
+        budget: Option<&BudgetTracker>,
+        mut audit: ActionAudit,
+    ) -> Result<(), ActionLimitExceeded> {
+        let limit = match self.check_limits(db, budget) {
+            Ok(()) => return Ok(()),
+            Err(limit) => limit,
+        };
+        self.decorate_evidence(&mut audit.evidence);
+        let (reason, outcome) = match &limit {
+            ActionLimitExceeded::Internal(_) => return Err(limit),
+            ActionLimitExceeded::BlastRadius {
+                work_unit,
+                used_mutations,
+                used_deletes,
+            } => {
+                audit
+                    .evidence
+                    .insert("used_mutations".into(), used_mutations.to_string());
+                audit
+                    .evidence
+                    .insert("used_deletes".into(), used_deletes.to_string());
+                (
+                    "action_blast_radius_exceeded",
+                    format!("blast-radius cap exceeded for work unit {work_unit}"),
+                )
+            }
+            ActionLimitExceeded::Budget { subject, reason } => {
+                audit
+                    .evidence
+                    .insert("budget_subject".into(), subject.clone());
+                ("action_budget_exceeded", reason.clone())
+            }
+        };
+        db.record_decision(&audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: audit.timestamp,
+            actor: audit.actor,
+            action: audit.action,
+            reason: reason.into(),
+            evidence: audit.evidence,
+            target_id: audit.target_id,
+            outcome,
+        })
+        .map_err(ActionLimitExceeded::Internal)?;
+        Err(limit)
+    }
+
     pub fn attest(
         &self,
         decision_id: &str,
@@ -188,6 +290,17 @@ impl GovernedActionContext {
                 caps => Some(caps),
             }
         })
+    }
+
+    fn decorate_evidence(&self, evidence: &mut HashMap<String, String>) {
+        evidence.insert("risk_class".into(), self.risk.as_str().into());
+        evidence.insert("decision".into(), self.decision.as_str().into());
+        if !self.policy_scope.is_empty() {
+            evidence.insert("policy_scope".into(), self.policy_scope.clone());
+        }
+        if !self.work_unit.is_empty() {
+            evidence.insert("work_unit".into(), self.work_unit.clone());
+        }
     }
 }
 
@@ -684,6 +797,104 @@ mod tests {
         context.record_usage(&db, None).unwrap();
 
         assert_eq!(db.get_blast_radius("wu-2").unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn governed_context_records_outcome_and_usage_behind_one_interface() {
+        let db = RuntimeDb::memory();
+        let mut policy = ActionPolicy::allow_all("agent:alice");
+        policy.max_mutations_per_work_unit = Some(3);
+        db.upsert_action_policy(&policy).unwrap();
+        let context = GovernedActionContext::resolve(
+            &db,
+            "alice",
+            "demo",
+            "set_property",
+            RiskClass::Write,
+            "wu-outcome",
+            1,
+            0,
+            "__erased__",
+        )
+        .unwrap();
+
+        context
+            .record_outcome(
+                &db,
+                None,
+                ActionAudit {
+                    actor: "alice".into(),
+                    attestation_actor: "alice".into(),
+                    action: "set_property".into(),
+                    target_id: "obj-1".into(),
+                    evidence: HashMap::from([("safe".into(), "value".into())]),
+                    timestamp: 20,
+                },
+                "execute_action",
+                "updated".into(),
+                true,
+            )
+            .unwrap();
+
+        let decisions = db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].evidence["risk_class"], "write");
+        assert_eq!(decisions[0].evidence["work_unit"], "wu-outcome");
+        assert_eq!(db.get_blast_radius("wu-outcome").unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn governed_context_records_limit_denial_behind_one_interface() {
+        let db = RuntimeDb::memory();
+        let mut policy = ActionPolicy::allow_all("agent:alice");
+        policy.max_mutations_per_work_unit = Some(1);
+        db.upsert_action_policy(&policy).unwrap();
+        db.add_blast_radius("wu-limit", 1, 0).unwrap();
+        let context = GovernedActionContext::resolve(
+            &db,
+            "alice",
+            "demo",
+            "set_property",
+            RiskClass::Write,
+            "wu-limit",
+            1,
+            0,
+            "__erased__",
+        )
+        .unwrap();
+
+        let result = context.check_limits_and_record(
+            &db,
+            None,
+            ActionAudit {
+                actor: "alice".into(),
+                attestation_actor: "alice".into(),
+                action: "set_property".into(),
+                target_id: "obj-1".into(),
+                evidence: HashMap::new(),
+                timestamp: 20,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ActionLimitExceeded::BlastRadius { .. })
+        ));
+        let decisions = db
+            .list_decisions(&audit::DecisionFilter {
+                action: Some("set_property".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions[0].reason, "action_blast_radius_exceeded");
+        assert_eq!(decisions[0].evidence["used_mutations"], "1");
     }
 
     #[test]
