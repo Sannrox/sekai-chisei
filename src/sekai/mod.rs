@@ -1,5 +1,6 @@
 pub mod action;
 pub mod action_approval;
+pub(crate) mod action_approval_lifecycle;
 pub mod action_effect;
 pub mod action_instance;
 pub mod action_instance_admission;

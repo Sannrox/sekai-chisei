@@ -25,6 +25,10 @@ use crate::domain;
 use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
+use crate::sekai::action_approval_lifecycle::{
+    ActionApprovalLifecycle, ApprovalActionProfile, ApprovalLifecycleError,
+    ApproveAction as ApproveActionCommand, DenyAction as DenyActionCommand,
+};
 use crate::sekai::action_lifecycle::{
     self, ActionAudit, ActionLimitExceeded, GovernedActionContext,
 };
@@ -3382,6 +3386,64 @@ fn action_policy_namespace(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
+}
+
+fn approval_lifecycle_status(error: ApprovalLifecycleError) -> Status {
+    match error {
+        ApprovalLifecycleError::NotFound => Status::not_found("approval not found"),
+        ApprovalLifecycleError::Terminal { id, status } => {
+            Status::failed_precondition(format!("approval {id} is already {status}"))
+        }
+        ApprovalLifecycleError::PolicyDenied => {
+            Status::failed_precondition("action policy now denies this approval")
+        }
+        ApprovalLifecycleError::Limit(ActionLimitExceeded::Internal(error))
+        | ApprovalLifecycleError::Storage(error) => Status::internal(error),
+        ApprovalLifecycleError::Limit(ActionLimitExceeded::BlastRadius { work_unit, .. }) => {
+            Status::resource_exhausted(format!(
+                "blast-radius cap exceeded for work unit {work_unit}"
+            ))
+        }
+        ApprovalLifecycleError::Limit(ActionLimitExceeded::Budget { subject, .. }) => {
+            Status::resource_exhausted(format!("action budget exhausted for {subject}"))
+        }
+        ApprovalLifecycleError::InvalidArgument(error) => Status::invalid_argument(error),
+        ApprovalLifecycleError::FailedPrecondition(error) => Status::failed_precondition(error),
+        ApprovalLifecycleError::ReferencedNotFound(error) => Status::not_found(error),
+        ApprovalLifecycleError::PermissionDenied(error) => Status::permission_denied(error),
+        ApprovalLifecycleError::Unauthenticated(error) => Status::unauthenticated(error),
+        ApprovalLifecycleError::AlreadyExists(error) => Status::already_exists(error),
+        ApprovalLifecycleError::ResourceExhausted(error) => Status::resource_exhausted(error),
+        ApprovalLifecycleError::Unavailable(error) => Status::unavailable(error),
+    }
+}
+
+fn approval_adapter_error(status: Status) -> ApprovalLifecycleError {
+    match status.code() {
+        tonic::Code::InvalidArgument => {
+            ApprovalLifecycleError::InvalidArgument(status.message().into())
+        }
+        tonic::Code::FailedPrecondition => {
+            ApprovalLifecycleError::FailedPrecondition(status.message().into())
+        }
+        tonic::Code::PermissionDenied => {
+            ApprovalLifecycleError::PermissionDenied(status.message().into())
+        }
+        tonic::Code::Unauthenticated => {
+            ApprovalLifecycleError::Unauthenticated(status.message().into())
+        }
+        tonic::Code::AlreadyExists => {
+            ApprovalLifecycleError::AlreadyExists(status.message().into())
+        }
+        tonic::Code::ResourceExhausted => {
+            ApprovalLifecycleError::ResourceExhausted(status.message().into())
+        }
+        tonic::Code::Unavailable => ApprovalLifecycleError::Unavailable(status.message().into()),
+        tonic::Code::NotFound => {
+            ApprovalLifecycleError::ReferencedNotFound(status.message().into())
+        }
+        _ => ApprovalLifecycleError::Storage(status.message().into()),
+    }
 }
 
 fn to_proto_attestation(a: &attestation::PolicyAttestation) -> PolicyAttestation {
@@ -8324,261 +8386,149 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ApproveActionResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
-        let mut approval = self
-            .db
-            .get_action_approval(&r.approval_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("approval not found"))?;
+        let lifecycle = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref());
+        let approval = lifecycle
+            .load(&r.approval_id)
+            .map_err(approval_lifecycle_status)?;
         check_action_admin(&self.security, &approval.policy_scope, &principals)?;
-        if approval.status != action_approval::ApprovalStatus::Pending {
-            return Err(Status::failed_precondition(format!(
-                "approval {} is already {}",
-                approval.id,
-                approval.status.as_str()
-            )));
-        }
         let approver = principals.first().cloned().unwrap_or_default();
-
-        // Re-check policy at execution time: a tightened policy that now denies
-        // the action must block the resume even though it was approved.
-        let target_ids = {
-            let actions = self
-                .actions
-                .read()
-                .map_err(|_| Status::internal("action registry unavailable"))?;
-            actions
-                .target_ids(&self.db, &approval.action, &approval.params)
-                .unwrap_or_default()
-        };
-        let namespace = action_policy_namespace(&self.db, &target_ids, &approval.params);
-        let action_risk = {
-            let actions = self
-                .actions
-                .read()
-                .map_err(|_| Status::internal("action registry unavailable"))?;
-            actions.action_risk_class(&approval.action)
-        };
-        let (op_mutations, op_deletes) = {
-            let actions = self
-                .actions
-                .read()
-                .map_err(|_| Status::internal("action registry unavailable"))?;
-            actions.action_op_counts(&approval.action, &approval.params)
-        };
-        let lifecycle = GovernedActionContext::resolve(
-            &self.db,
-            &approval.actor,
-            &namespace,
-            &approval.action,
-            action_risk,
-            &approval.work_unit,
-            op_mutations,
-            op_deletes,
-            ERASED_NAMESPACE,
-        )
-        .map_err(Status::internal)?;
-        if lifecycle.decision == ActionDecision::Deny {
-            let evidence = HashMap::from([("approval_id".to_string(), approval.id.clone())]);
-            lifecycle
-                .record_outcome(
-                    &self.db,
-                    self.budget.as_deref(),
-                    ActionAudit {
-                        actor: approver.clone(),
-                        attestation_actor: approval.actor.clone(),
-                        action: approval.action.clone(),
-                        target_id: approval.target_id.clone(),
-                        evidence,
-                        timestamp: now_millis(),
-                    },
-                    "action_approval_policy_denied",
-                    "policy now denies the held action".into(),
-                    false,
-                )
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "action policy now denies this approval",
-            ));
-        }
-
-        if let Err(limit) = lifecycle.check_limits_and_record(
-            &self.db,
-            self.budget.as_deref(),
-            ActionAudit {
-                actor: approver.clone(),
-                attestation_actor: approval.actor.clone(),
-                action: approval.action.clone(),
-                target_id: approval.target_id.clone(),
-                evidence: HashMap::from([("approval_id".to_string(), approval.id.clone())]),
-                timestamp: now_millis(),
-            },
-        ) {
-            match limit {
-                ActionLimitExceeded::Internal(error) => return Err(Status::internal(error)),
-                ActionLimitExceeded::BlastRadius { work_unit, .. } => {
-                    return Err(Status::resource_exhausted(format!(
-                        "blast-radius cap exceeded for work unit {}",
-                        work_unit
-                    )));
-                }
-                ActionLimitExceeded::Budget { subject, .. } => {
-                    return Err(Status::resource_exhausted(format!(
-                        "action budget exhausted for {}",
-                        subject
-                    )));
-                }
-            }
-        }
-
-        // Resume the effect, re-checking write access, markings, and purpose
-        // for the original proposer (authority may have changed while held).
-        let proposer = vec![approval.actor.clone()];
-        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
-            let effect_id = approval
-                .params
-                .get("effect_id")
-                .ok_or_else(|| Status::invalid_argument("effect_id required"))?;
-            let effect = self
-                .db
-                .get_action_effect(effect_id)
-                .map_err(Status::internal)?
-                .ok_or_else(|| Status::not_found("action effect not found"))?;
-            let submitted_namespace = approval
-                .params
-                .get("namespace")
-                .map(String::as_str)
-                .unwrap_or("");
-            if submitted_namespace != effect.namespace {
-                return Err(Status::failed_precondition(
-                    "parked resolution namespace no longer matches effect",
-                ));
-            }
-            check_team_namespace(&self.db, &proposer, &effect.namespace, true)?;
-        }
-        let actions = self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?;
-        let resume_targets = actions
-            .target_ids(&self.db, &approval.action, &approval.params)
-            .map_err(Status::invalid_argument)?;
-        for target_id in &resume_targets {
-            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
-                enforce_object_marking_access(
-                    &self.db,
-                    &target,
-                    &proposer,
-                    &format!("approve_action:{}:{}", approval.action, target_id),
-                )?;
-            }
-        }
-        let required_purpose = actions
-            .get_action_type(&approval.action)
-            .map(|action_type| action_type.required_purpose.clone())
-            .unwrap_or_default();
-        if !required_purpose.trim().is_empty() {
-            let authority = resolve_principal_authority(&self.db, &proposer)?;
-            let purpose = markings::evaluate_purpose_access(
-                &format!("approve_action:{}", approval.action),
-                &required_purpose,
-                &authority,
-            );
-            if purpose.decision == markings::MarkingDecision::Deny {
-                let evidence = HashMap::from([
-                    ("required_purpose".into(), purpose.required_purpose.clone()),
-                    ("detail".into(), purpose.detail.clone()),
-                    ("outcome".into(), "denied".into()),
-                ]);
-                let _ = record_marking_or_purpose_decision(
-                    &self.db,
-                    &approval.actor,
-                    "purpose.execute",
-                    approval.target_id.as_str(),
-                    &purpose.decision_id,
-                    "denied",
-                    evidence,
-                );
-                return Err(Status::permission_denied("purpose not allow-listed"));
-            }
-            if purpose.decision == markings::MarkingDecision::Allow {
-                let evidence = HashMap::from([
-                    ("required_purpose".into(), purpose.required_purpose.clone()),
-                    ("detail".into(), purpose.detail.clone()),
-                    ("outcome".into(), "allowed".into()),
-                ]);
-                record_marking_or_purpose_decision(
-                    &self.db,
-                    &approval.actor,
-                    "purpose.execute",
-                    approval.target_id.as_str(),
-                    &purpose.decision_id,
-                    "allowed",
-                    evidence,
-                )?;
-            }
-        }
-        drop(actions);
-        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
-            let resolution_action_id = approval
-                .params
-                .get("resolution_action_id")
-                .ok_or_else(|| Status::invalid_argument("resolution_action_id required"))?;
-            self.db
-                .authorize_parked_resolution_approval(resolution_action_id, &approval.id)
-                .map_err(Status::failed_precondition)?;
-        }
-        let msg = self.run_action_effect(
-            &approval.action,
-            &approval.params,
-            &approval.actor,
-            &proposer,
-        )?;
-
-        // Preserve approval-resume semantics: the effect is already committed,
-        // so metering persistence remains best-effort rather than leaving the
-        // approval pending after a successful effect.
-        let _ = lifecycle.record_usage(&self.db, self.budget.as_deref());
-
-        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
-            let effect_id = approval
-                .params
-                .get("effect_id")
-                .cloned()
-                .unwrap_or_default();
-            let park_generation = approval
-                .params
-                .get("park_generation")
-                .cloned()
-                .unwrap_or_default();
-            for mut competing in self
-                .db
-                .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
-                .map_err(Status::internal)?
-            {
-                if competing.action == approval.action
-                    && competing.id != approval.id
-                    && competing.params.get("effect_id") == Some(&effect_id)
-                    && competing.params.get("park_generation") == Some(&park_generation)
-                {
-                    competing.status = action_approval::ApprovalStatus::Denied;
-                    competing.decided_by = principals.first().cloned().unwrap_or_default();
-                    competing.outcome = format!("stale: superseded by resolution {}", approval.id);
-                    competing.updated = now_millis();
-                    self.db
-                        .update_action_approval(&competing)
-                        .map_err(Status::internal)?;
-                }
-            }
-        }
-        action_lifecycle::complete_approval(
-            &self.db,
-            &lifecycle,
-            &mut approval,
-            principals.first().map(String::as_str).unwrap_or_default(),
-            &msg,
-            now_millis(),
-        )
-        .map_err(Status::internal)?;
+        let outcome = lifecycle
+            .approve(
+                ApproveActionCommand {
+                    approval_id: &r.approval_id,
+                    approver: &approver,
+                    erased_namespace: ERASED_NAMESPACE,
+                    now_ms: now_millis(),
+                },
+                |approval| {
+                    let actions = self.actions.read().map_err(|_| {
+                        ApprovalLifecycleError::Storage("action registry unavailable".into())
+                    })?;
+                    let target_ids = actions
+                        .target_ids(&self.db, &approval.action, &approval.params)
+                        .unwrap_or_default();
+                    let (op_mutations, op_deletes) =
+                        actions.action_op_counts(&approval.action, &approval.params);
+                    Ok(ApprovalActionProfile {
+                        target_ids,
+                        risk: actions.action_risk_class(&approval.action),
+                        op_mutations,
+                        op_deletes,
+                    })
+                },
+                |approval, proposer| {
+                    if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
+                        let effect_id = approval.params.get("effect_id").ok_or_else(|| {
+                            ApprovalLifecycleError::InvalidArgument("effect_id required".into())
+                        })?;
+                        let effect = self
+                            .db
+                            .get_action_effect(effect_id)
+                            .map_err(ApprovalLifecycleError::Storage)?
+                            .ok_or_else(|| {
+                                ApprovalLifecycleError::ReferencedNotFound(
+                                    "action effect not found".into(),
+                                )
+                            })?;
+                        let submitted_namespace = approval
+                            .params
+                            .get("namespace")
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if submitted_namespace != effect.namespace {
+                            return Err(ApprovalLifecycleError::FailedPrecondition(
+                                "parked resolution namespace no longer matches effect".into(),
+                            ));
+                        }
+                        check_team_namespace(&self.db, proposer, &effect.namespace, true)
+                            .map_err(approval_adapter_error)?;
+                    }
+                    let actions = self.actions.read().map_err(|_| {
+                        ApprovalLifecycleError::Storage("action registry unavailable".into())
+                    })?;
+                    let resume_targets = actions
+                        .target_ids(&self.db, &approval.action, &approval.params)
+                        .map_err(ApprovalLifecycleError::InvalidArgument)?;
+                    for target_id in &resume_targets {
+                        if let Some(target) = self
+                            .db
+                            .get_object(target_id)
+                            .map_err(ApprovalLifecycleError::Storage)?
+                        {
+                            enforce_object_marking_access(
+                                &self.db,
+                                &target,
+                                proposer,
+                                &format!("approve_action:{}:{}", approval.action, target_id),
+                            )
+                            .map_err(approval_adapter_error)?;
+                        }
+                    }
+                    let required_purpose = actions
+                        .get_action_type(&approval.action)
+                        .map(|action_type| action_type.required_purpose.clone())
+                        .unwrap_or_default();
+                    if !required_purpose.trim().is_empty() {
+                        let authority = resolve_principal_authority(&self.db, proposer)
+                            .map_err(approval_adapter_error)?;
+                        let purpose = markings::evaluate_purpose_access(
+                            &format!("approve_action:{}", approval.action),
+                            &required_purpose,
+                            &authority,
+                        );
+                        if purpose.decision == markings::MarkingDecision::Deny {
+                            let evidence = HashMap::from([
+                                ("required_purpose".into(), purpose.required_purpose.clone()),
+                                ("detail".into(), purpose.detail.clone()),
+                                ("outcome".into(), "denied".into()),
+                            ]);
+                            let _ = record_marking_or_purpose_decision(
+                                &self.db,
+                                &approval.actor,
+                                "purpose.execute",
+                                approval.target_id.as_str(),
+                                &purpose.decision_id,
+                                "denied",
+                                evidence,
+                            );
+                            return Err(ApprovalLifecycleError::PermissionDenied(
+                                "purpose not allow-listed".into(),
+                            ));
+                        }
+                        if purpose.decision == markings::MarkingDecision::Allow {
+                            let evidence = HashMap::from([
+                                ("required_purpose".into(), purpose.required_purpose.clone()),
+                                ("detail".into(), purpose.detail.clone()),
+                                ("outcome".into(), "allowed".into()),
+                            ]);
+                            record_marking_or_purpose_decision(
+                                &self.db,
+                                &approval.actor,
+                                "purpose.execute",
+                                approval.target_id.as_str(),
+                                &purpose.decision_id,
+                                "allowed",
+                                evidence,
+                            )
+                            .map_err(approval_adapter_error)?;
+                        }
+                    }
+                    Ok(())
+                },
+                |approval, proposer| {
+                    self.run_action_effect(
+                        &approval.action,
+                        &approval.params,
+                        &approval.actor,
+                        proposer,
+                    )
+                    .map_err(approval_adapter_error)
+                },
+                now_millis,
+            )
+            .map_err(approval_lifecycle_status)?;
+        let approval = outcome.approval;
+        let msg = outcome.message;
 
         if let Err(error) = self.resolve_catalog_approval_receipt(
             &approval.work_unit,
@@ -8615,28 +8565,20 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<DenyActionResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
-        let mut approval = self
-            .db
-            .get_action_approval(&r.approval_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::not_found("approval not found"))?;
+        let lifecycle = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref());
+        let approval = lifecycle
+            .load(&r.approval_id)
+            .map_err(approval_lifecycle_status)?;
         check_action_admin(&self.security, &approval.policy_scope, &principals)?;
-        if approval.status != action_approval::ApprovalStatus::Pending {
-            return Err(Status::failed_precondition(format!(
-                "approval {} is already {}",
-                approval.id,
-                approval.status.as_str()
-            )));
-        }
         let decided_by = principals.first().cloned().unwrap_or_default();
-        let denied_at = now_millis();
-        if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
-            self.db
-                .reject_parked_resolution(&approval.id, "rejected", &decided_by, denied_at)
-                .map_err(Status::internal)?;
-        }
-        action_lifecycle::deny_approval(&self.db, &mut approval, &decided_by, &r.reason, denied_at)
-            .map_err(Status::internal)?;
+        let approval = lifecycle
+            .deny(DenyActionCommand {
+                approval_id: &r.approval_id,
+                decided_by: &decided_by,
+                reason: &r.reason,
+                now_ms: now_millis(),
+            })
+            .map_err(approval_lifecycle_status)?;
         if let Err(error) = self.resolve_catalog_approval_receipt(
             &approval.work_unit,
             &approval.id,
