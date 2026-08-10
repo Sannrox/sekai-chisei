@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ActionApprovalLifecycleModule",
+      "description": "Sekai-owned deep module that loads pending governed action approvals, re-resolves live policy and resource limits, orders held-effect preparation and execution, meters committed effects, resolves competing parked work, and commits terminal approval decisions.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates and authorizes approval callers, maps protocol values and errors, and supplies marking, purpose, effect-execution, and receipt-projection adapters to Sekai lifecycle modules.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedActionApproval",
+      "description": "Durable pending or terminal decision record binding the proposing actor, exact action parameters, policy scope, risk class, target, work unit, and deciding principal.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_action_approval_lifecycle_to",
+      "description": "The gRPC transport delegates approval state, live policy and limit checks, held-effect ordering, metering, competing parked-work resolution, and terminal transitions to the action approval lifecycle module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ActionApprovalLifecycleModule"
+    },
+    {
+      "name": "resolves_governed_action_approval",
+      "description": "The action approval lifecycle module resolves a pending governed action approval to an approved or denied terminal state while preserving execution and audit ordering.",
+      "domain": "ActionApprovalLifecycleModule",
+      "range": "GovernedActionApproval"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ActionApprovalLifecycleModule",
+      "source": "src/sekai/action_approval_lifecycle.rs",
+      "locator": "ActionApprovalLifecycle",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl::approve_action/SekaiServiceImpl::deny_action",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GovernedActionApproval",
+      "source": "src/sekai/action_approval.rs",
+      "locator": "ActionApproval",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_action_approval_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "approve_action/deny_action lifecycle calls",
+      "confidence": 1.0
+    },
+    {
+      "subject": "resolves_governed_action_approval",
+      "source": "src/sekai/action_approval_lifecycle.rs",
+      "locator": "approve/deny",
+      "confidence": 1.0
+    }
+  ]
+}

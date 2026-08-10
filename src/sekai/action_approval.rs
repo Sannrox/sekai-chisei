@@ -3,8 +3,8 @@
 //! When policy resolves `require_approval`, the proposed action is held as an
 //! `action_approval` Sekai object instead of executing. The exact params are
 //! persisted (needed to resume on approval) while sensitive values are redacted
-//! when surfaced to clients. Approve/deny transitions and the resume path live
-//! in the gRPC service.
+//! when surfaced to clients. Approval decisions and held-effect resumption live
+//! in the action approval lifecycle module.
 
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
