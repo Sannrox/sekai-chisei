@@ -26,6 +26,7 @@ pub mod handoff;
 pub mod json;
 pub mod learning;
 pub mod lease;
+pub(crate) mod lease_lifecycle;
 pub mod ledger;
 pub mod lineage;
 pub mod markings;

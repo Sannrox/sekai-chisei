@@ -37,6 +37,11 @@ use crate::sekai::evidence_store::{
 };
 use crate::sekai::governed_facts as governed_fact_domain;
 use crate::sekai::handoff as handoff_domain;
+use crate::sekai::lease_lifecycle::{
+    AcquireLease as AcquireLeaseCommand, GetLease as GetLeaseCommand, LeaseLifecycle,
+    LeaseLifecycleError, RefreshLease as RefreshLeaseCommand, ReleaseLease as ReleaseLeaseCommand,
+    TakeoverExpiredLease as TakeoverExpiredLeaseCommand, object_bound_target,
+};
 use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
@@ -4186,6 +4191,16 @@ fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
     }
 }
 
+fn map_lease_lifecycle_error(error: LeaseLifecycleError) -> Status {
+    match error {
+        LeaseLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        LeaseLifecycleError::PermissionDenied(message) => Status::permission_denied(message),
+        LeaseLifecycleError::NotFound(message) => Status::not_found(message),
+        LeaseLifecycleError::Storage(message) => Status::internal(message),
+        LeaseLifecycleError::Lease(error) => map_lease_error(error),
+    }
+}
+
 fn to_proto_lease(lease: &crate::sekai::lease::Lease) -> Lease {
     Lease {
         namespace: lease.namespace.clone(),
@@ -4677,68 +4692,6 @@ fn authorize_action_instance_read(
     Ok(())
 }
 
-/// Lease keys that coordinate an existing object use this prefix so the
-/// coordination identity cannot be squatted without object ACL access.
-const OBJECT_BOUND_LEASE_KEY_PREFIX: &str = "object:";
-
-/// Returns `Ok(Some(object_id))` for a canonical `object:<object_id>` key.
-/// Non-canonical spellings (whitespace, empty id) are rejected so authorization
-/// and persistence cannot diverge across distinct keys for one object.
-fn object_bound_lease_target(key: &str) -> Result<Option<&str>, Status> {
-    let Some(rest) = key.strip_prefix(OBJECT_BOUND_LEASE_KEY_PREFIX) else {
-        return Ok(None);
-    };
-    if rest.is_empty() || rest != rest.trim() || rest.chars().any(char::is_whitespace) {
-        return Err(Status::invalid_argument(
-            "object-bound lease key must be exactly object:<object_id> with no whitespace",
-        ));
-    }
-    Ok(Some(rest))
-}
-
-/// When the lease key is object-bound (`object:<object_id>`), authorize through
-/// the target object ACL and require the lease namespace to match the object.
-///
-/// `allow_missing_target` is for `ReleaseLease` after a guarded delete: the
-/// coordination row must still be releasable when the object audit identity is
-/// gone and cannot be recreated.
-fn authorize_object_bound_lease(
-    db: &RuntimeDb,
-    security: &SecurityChecker,
-    principals: &[String],
-    lease_namespace: &str,
-    key: &str,
-    write: bool,
-    allow_missing_target: bool,
-) -> Result<(), Status> {
-    let Some(object_id) = object_bound_lease_target(key)? else {
-        return Ok(());
-    };
-    let Some(object) = db.get_object(object_id).map_err(Status::internal)? else {
-        return if allow_missing_target {
-            // Namespace write was already enforced by the caller.
-            Ok(())
-        } else {
-            Err(Status::not_found(format!(
-                "object-bound lease target {object_id} not found"
-            )))
-        };
-    };
-    // ACL before namespace validation so inaccessible objects do not reveal
-    // their home namespace via a distinct InvalidArgument error.
-    if write {
-        check_write(security, object_id, principals)?;
-    } else {
-        check_read(security, object_id, principals)?;
-    }
-    if object.namespace != lease_namespace {
-        return Err(Status::permission_denied(
-            "object-bound lease namespace must match the target object namespace",
-        ));
-    }
-    Ok(())
-}
-
 /// Object-bound lease preconditions must name the same object being mutated
 /// and the same namespace as that object.
 fn enforce_object_bound_lease_precondition(
@@ -4747,7 +4700,7 @@ fn enforce_object_bound_lease_precondition(
     mutation_target_object_id: Option<&str>,
     mutation_target_namespace: Option<&str>,
 ) -> Result<(), Status> {
-    let Some(bound_id) = object_bound_lease_target(key)? else {
+    let Some(bound_id) = object_bound_target(key).map_err(map_lease_lifecycle_error)? else {
         return Ok(());
     };
     match mutation_target_object_id {
@@ -5211,52 +5164,19 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
-        authorize_object_bound_lease(
-            &self.db,
-            &self.security,
-            &principals,
-            &input.namespace,
-            &input.key,
-            true,
-            false,
-        )?;
         let actor = principals.first().cloned().unwrap_or_default();
-        let lease = self
-            .db
-            .acquire_lease(
-                &input.namespace,
-                &input.key,
-                &input.owner,
-                input.ttl_ms,
-                &input.request_id,
-                &actor,
-                &self.site_id,
-                now_millis(),
-            )
-            .map_err(map_lease_error)?;
-        // Re-validate object-bound targets after persistence so a concurrent
-        // delete cannot leave a freshly returned active lease without a live
-        // target. Best-effort release if the race is detected.
-        if let Ok(Some(object_id)) = object_bound_lease_target(&input.key)
-            && self
-                .db
-                .get_object(object_id)
-                .map_err(Status::internal)?
-                .is_none()
-        {
-            let _ = self.db.release_lease(
-                &input.namespace,
-                &input.key,
-                &lease.fencing_token,
-                &format!("{}:race-cleanup", input.request_id),
-                &actor,
-                &self.site_id,
-                now_millis(),
-            );
-            return Err(Status::not_found(format!(
-                "object-bound lease target {object_id} not found"
-            )));
-        }
+        let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .acquire(AcquireLeaseCommand {
+                namespace: &input.namespace,
+                key: &input.key,
+                owner: &input.owner,
+                ttl_ms: input.ttl_ms,
+                request_id: &input.request_id,
+                actor: &actor,
+                principals: &principals,
+                now_ms: now_millis(),
+            })
+            .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(AcquireLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
@@ -5277,20 +5197,13 @@ impl SekaiService for SekaiServiceImpl {
             false,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, false)?;
-        authorize_object_bound_lease(
-            &self.db,
-            &self.security,
-            &principals,
-            &input.namespace,
-            &input.key,
-            false,
-            false,
-        )?;
-        let lease = self
-            .db
-            .get_lease(&input.namespace, &input.key)
-            .map_err(map_lease_error)?
-            .ok_or(Status::not_found("lease not found"))?;
+        let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .get(GetLeaseCommand {
+                namespace: &input.namespace,
+                key: &input.key,
+                principals: &principals,
+            })
+            .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(GetLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
@@ -5311,29 +5224,19 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
-        authorize_object_bound_lease(
-            &self.db,
-            &self.security,
-            &principals,
-            &input.namespace,
-            &input.key,
-            true,
-            false,
-        )?;
         let actor = principals.first().cloned().unwrap_or_default();
-        let lease = self
-            .db
-            .refresh_lease(
-                &input.namespace,
-                &input.key,
-                &input.fencing_token,
-                input.ttl_ms,
-                &input.request_id,
-                &actor,
-                &self.site_id,
-                now_millis(),
-            )
-            .map_err(map_lease_error)?;
+        let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .refresh(RefreshLeaseCommand {
+                namespace: &input.namespace,
+                key: &input.key,
+                fencing_token: &input.fencing_token,
+                ttl_ms: input.ttl_ms,
+                request_id: &input.request_id,
+                actor: &actor,
+                principals: &principals,
+                now_ms: now_millis(),
+            })
+            .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(RefreshLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
@@ -5354,28 +5257,18 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
-        authorize_object_bound_lease(
-            &self.db,
-            &self.security,
-            &principals,
-            &input.namespace,
-            &input.key,
-            true,
-            true,
-        )?;
         let actor = principals.first().cloned().unwrap_or_default();
-        let lease = self
-            .db
-            .release_lease(
-                &input.namespace,
-                &input.key,
-                &input.fencing_token,
-                &input.request_id,
-                &actor,
-                &self.site_id,
-                now_millis(),
-            )
-            .map_err(map_lease_error)?;
+        let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .release(ReleaseLeaseCommand {
+                namespace: &input.namespace,
+                key: &input.key,
+                fencing_token: &input.fencing_token,
+                request_id: &input.request_id,
+                actor: &actor,
+                principals: &principals,
+                now_ms: now_millis(),
+            })
+            .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(ReleaseLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
@@ -5396,31 +5289,21 @@ impl SekaiService for SekaiServiceImpl {
             true,
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
-        authorize_object_bound_lease(
-            &self.db,
-            &self.security,
-            &principals,
-            &input.namespace,
-            &input.key,
-            true,
-            false,
-        )?;
         let actor = principals.first().cloned().unwrap_or_default();
-        let lease = self
-            .db
-            .takeover_expired_lease(
-                &input.namespace,
-                &input.key,
-                &input.owner,
-                &input.expected_fencing_token,
-                input.expected_expires_at_ms,
-                input.ttl_ms,
-                &input.request_id,
-                &actor,
-                &self.site_id,
-                now_millis(),
-            )
-            .map_err(map_lease_error)?;
+        let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .takeover_expired(TakeoverExpiredLeaseCommand {
+                namespace: &input.namespace,
+                key: &input.key,
+                owner: &input.owner,
+                expected_fencing_token: &input.expected_fencing_token,
+                expected_expires_at_ms: input.expected_expires_at_ms,
+                ttl_ms: input.ttl_ms,
+                request_id: &input.request_id,
+                actor: &actor,
+                principals: &principals,
+                now_ms: now_millis(),
+            })
+            .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(TakeoverExpiredLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
         }))
