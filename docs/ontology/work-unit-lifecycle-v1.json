@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "WorkUnitLifecycleModule",
+      "description": "Sekai-owned deep module whose interface owns Work Unit admission and terminal transition replay identity, transition persistence, and durable request deduplication ordering.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates and authorizes Work Unit callers, maps protocol messages, and delegates durable lifecycle behavior to the Work Unit lifecycle module.",
+      "superclasses": []
+    },
+    {
+      "name": "WorkUnit",
+      "description": "Durable coordination record that moves through pending, running, and terminal lifecycle states while holding contention-scope reservations.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_work_unit_lifecycle_to",
+      "description": "The gRPC transport delegates admission replay, lifecycle transitions, persistence, and request deduplication to the Work Unit lifecycle module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "WorkUnitLifecycleModule"
+    },
+    {
+      "name": "governs_work_unit",
+      "description": "The Work Unit lifecycle module governs durable admission and terminal transitions for Work Units.",
+      "domain": "WorkUnitLifecycleModule",
+      "range": "WorkUnit"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "WorkUnitLifecycleModule",
+      "source": "src/sekai/work_unit_lifecycle.rs",
+      "locator": "WorkUnitLifecycle/admit/transition",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "try_admit_work_unit/heartbeat_work_unit/complete_work_unit/fail_work_unit/cancel_work_unit",
+      "confidence": 1.0
+    },
+    {
+      "subject": "WorkUnit",
+      "source": "src/sekai/coordination.rs",
+      "locator": "WorkUnit",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_work_unit_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "WorkUnitLifecycle call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_work_unit",
+      "source": "src/sekai/work_unit_lifecycle.rs",
+      "locator": "admit/transition",
+      "confidence": 1.0
+    }
+  ]
+}
