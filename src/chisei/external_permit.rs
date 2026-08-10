@@ -775,12 +775,39 @@ impl SekaiDb {
         }
     }
 
-    pub fn revoke_permit(&self, handle: &str, reason: &str, now_ms: i64) -> Result<bool, String> {
+    pub fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
         self.ensure_external_permit_tables()?;
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let changed = tx.execute(
             "INSERT OR IGNORE INTO chisei_external_action_revocations(revocation_handle,reason,revoked_at_ms) VALUES(?1,?2,?3)",
             rusqlite::params![handle, reason, now_ms]
-        ).map(|count| count == 1).map_err(|error| error.to_string())
+        ).map_err(|error| error.to_string())? == 1;
+        if changed {
+            crate::sekai::ledger::insert_chained_decision(
+                &tx,
+                &crate::sekai::audit::Decision {
+                    id: format!("{handle}:audit:revoked"),
+                    timestamp: now_ms,
+                    actor: actor.into(),
+                    action: "external_action_permit/revoke".into(),
+                    reason: reason.into(),
+                    evidence: HashMap::from([("revocation_handle".into(), handle.into())]),
+                    target_id: handle.into(),
+                    outcome: "revoked".into(),
+                },
+            )?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
     }
 
     pub fn set_permit_kill_switch(
@@ -1412,6 +1439,7 @@ mod tests {
         ));
         db.revoke_permit(
             &permit.revocation_handle,
+            "operator:test",
             "revoked after lost response",
             10_001,
         )
@@ -1509,8 +1537,13 @@ mod tests {
             .unwrap_err()
             .contains("reauthorization")
         );
-        db.revoke_permit(&permit.revocation_handle, "operator revoked", 3_001)
-            .unwrap();
+        db.revoke_permit(
+            &permit.revocation_handle,
+            "operator:test",
+            "operator revoked",
+            3_001,
+        )
+        .unwrap();
         assert!(
             db.redeem_permit(
                 &permit,
@@ -1618,6 +1651,7 @@ mod tests {
             .unwrap();
         db.revoke_permit(
             &permit.revocation_handle,
+            "operator:test",
             "learned after disconnected execution",
             4_001,
         )
@@ -1816,8 +1850,13 @@ mod tests {
             .contains("expand")
         );
 
-        db.revoke_permit(&root.revocation_handle, "root revoked", 3_100)
-            .unwrap();
+        db.revoke_permit(
+            &root.revocation_handle,
+            "operator:test",
+            "root revoked",
+            3_100,
+        )
+        .unwrap();
         assert!(
             db.validate_delegation_chain(&child)
                 .unwrap_err()

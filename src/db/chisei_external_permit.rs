@@ -26,7 +26,13 @@ pub trait ChiseiExternalPermitBackend: Send + Sync {
         idempotency_key: &str,
     ) -> Result<Option<Permit>, String>;
 
-    fn revoke_permit(&self, handle: &str, reason: &str, now_ms: i64) -> Result<bool, String>;
+    fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String>;
 
     fn set_permit_kill_switch(
         &self,
@@ -69,8 +75,14 @@ macro_rules! forward_external_permit {
             <$target>::replay_permit(self, authorization_id, idempotency_key)
         }
 
-        fn revoke_permit(&self, handle: &str, reason: &str, now_ms: i64) -> Result<bool, String> {
-            <$target>::revoke_permit(self, handle, reason, now_ms)
+        fn revoke_permit(
+            &self,
+            handle: &str,
+            actor: &str,
+            reason: &str,
+            now_ms: i64,
+        ) -> Result<bool, String> {
+            <$target>::revoke_permit(self, handle, actor, reason, now_ms)
         }
 
         fn set_permit_kill_switch(

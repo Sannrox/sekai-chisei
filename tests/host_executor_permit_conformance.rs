@@ -553,8 +553,13 @@ fn redeem_after_revoke_fails() {
     let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
     let record = authorization(10_000, 2);
     let (permit, key) = persist_and_issue(&db, &record);
-    db.revoke_permit(&permit.revocation_handle, "operator revoked", 3_500)
-        .unwrap();
+    db.revoke_permit(
+        &permit.revocation_handle,
+        "operator:test",
+        "operator revoked",
+        3_500,
+    )
+    .unwrap();
     let err = db
         .redeem_permit(
             &permit,
@@ -700,8 +705,13 @@ fn broken_harness_fails_every_negative_case() {
                 let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
                 let record = authorization(10_000, 2);
                 let (permit, key) = persist_and_issue(&db, &record);
-                db.revoke_permit(&permit.revocation_handle, "operator revoked", 3_500)
-                    .unwrap();
+                db.revoke_permit(
+                    &permit.revocation_handle,
+                    "operator:test",
+                    "operator revoked",
+                    3_500,
+                )
+                .unwrap();
                 let context = host_context(&permit, permit.required_host_capabilities.clone());
                 assert!(
                     BrokenHarness::redeem_permit(

@@ -3316,10 +3316,16 @@ impl RuntimeDb {
         }
     }
 
-    pub fn revoke_permit(&self, handle: &str, reason: &str, now_ms: i64) -> Result<bool, String> {
+    pub fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
         match self {
-            Self::Sqlite(db) => db.revoke_permit(handle, reason, now_ms),
-            Self::Postgres(db) => db.revoke_permit(handle, reason, now_ms),
+            Self::Sqlite(db) => db.revoke_permit(handle, actor, reason, now_ms),
+            Self::Postgres(db) => db.revoke_permit(handle, actor, reason, now_ms),
         }
     }
 

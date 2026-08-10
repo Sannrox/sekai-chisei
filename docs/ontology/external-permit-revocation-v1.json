@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ExternalPermitPersistenceModule",
+      "description": "Backend-neutral persistence module that owns durable external-permit issuance, policy, revocation, and kill-switch behavior across SQLite and PostgreSQL adapters.",
+      "superclasses": []
+    },
+    {
+      "name": "ExternalPermitRevocation",
+      "description": "Idempotent durable denial of a permit revocation handle, recorded atomically with its immutable audit decision.",
+      "superclasses": []
+    },
+    {
+      "name": "ImmutableAuditDecision",
+      "description": "Chained decision record that preserves actor, reason, target, timestamp, evidence, and outcome for a governed mutation.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces transport admission, maps protocol messages and errors, and delegates durable behavior to domain modules.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_permit_revocation_to",
+      "description": "The gRPC transport delegates external-permit revocation and its audit obligation to the persistence module.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "ExternalPermitPersistenceModule"
+    },
+    {
+      "name": "atomically_records_revocation",
+      "description": "The persistence module records revocation state and its audit decision in one backend transaction.",
+      "domain": "ExternalPermitPersistenceModule",
+      "range": "ExternalPermitRevocation"
+    },
+    {
+      "name": "is_evidenced_by_audit_decision",
+      "description": "Every newly persisted external-permit revocation is evidenced by exactly one immutable audit decision.",
+      "domain": "ExternalPermitRevocation",
+      "range": "ImmutableAuditDecision",
+      "cardinality": {
+        "min": 1,
+        "max": 1
+      }
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ExternalPermitPersistenceModule",
+      "source": "src/db/chisei_external_permit.rs",
+      "locator": "ChiseiExternalPermitBackend",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ExternalPermitRevocation",
+      "source": "src/chisei/external_permit.rs",
+      "locator": "SekaiDb::revoke_permit",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ImmutableAuditDecision",
+      "source": "src/sekai/audit.rs",
+      "locator": "Decision",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "ChiseiServiceImpl::transition_external_action",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_permit_revocation_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "RuntimeDb::revoke_permit call site",
+      "confidence": 1.0
+    },
+    {
+      "subject": "atomically_records_revocation",
+      "source": "src/chisei/external_permit.rs",
+      "locator": "SekaiDb::revoke_permit transaction",
+      "confidence": 1.0
+    },
+    {
+      "subject": "is_evidenced_by_audit_decision",
+      "source": "tests/chisei_external_permit_backend_conformance.rs",
+      "locator": "run_contract revocation audit assertions",
+      "confidence": 1.0
+    }
+  ]
+}

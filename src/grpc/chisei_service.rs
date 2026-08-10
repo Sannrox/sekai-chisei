@@ -9192,25 +9192,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 let now = chrono::Utc::now().timestamp_millis();
                 let changed = self
                     .db
-                    .revoke_permit(&input.revocation_handle, &input.reason, now)
+                    .revoke_permit(&input.revocation_handle, &actor, &input.reason, now)
                     .map_err(Status::internal)?;
-                if changed {
-                    self.db
-                        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-                            id: format!("{}:audit:revoked", input.revocation_handle),
-                            timestamp: now,
-                            actor,
-                            action: "external_action_permit/revoke".into(),
-                            reason: input.reason,
-                            evidence: HashMap::from([(
-                                "revocation_handle".into(),
-                                input.revocation_handle.clone(),
-                            )]),
-                            target_id: input.revocation_handle,
-                            outcome: "revoked".into(),
-                        }])
-                        .map_err(Status::internal)?;
-                }
                 Ok(Response::new(TransitionExternalActionResponse {
                     decision: None,
                     permit: None,
