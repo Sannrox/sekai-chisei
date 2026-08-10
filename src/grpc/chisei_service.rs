@@ -28,6 +28,7 @@ use crate::chisei::evaluation_execution as evaluation_execution_domain;
 use crate::chisei::evaluation_manifest as evaluation_manifest_domain;
 use crate::chisei::evaluation_plan as evaluation_plan_domain;
 use crate::chisei::external_action as external;
+use crate::chisei::external_action_lifecycle as external_lifecycle;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
@@ -47,7 +48,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{ListFilter, Object};
-use crate::sekai::action::RiskClass;
+#[cfg(test)]
 use crate::sekai::action_policy::ActionDecision;
 use crate::sekai::coordination::{
     RESERVATION_STATUS_ACTIVE, ReservationFilter, WORK_UNIT_STATUS_RUNNING,
@@ -936,64 +937,6 @@ fn external_host_context(
     }
 }
 
-fn external_policy_version(policy: Option<&crate::sekai::action_policy::ActionPolicy>) -> String {
-    let canonical: BTreeMap<String, String> = policy
-        .map(|policy| policy.to_properties().into_iter().collect())
-        .unwrap_or_default();
-    content_version(&canonical)
-}
-
-fn external_audit_evidence(record: &external::AuthorizationRecord) -> HashMap<String, String> {
-    HashMap::from([
-        (
-            "authorization_id".into(),
-            record.decision.authorization_id.clone(),
-        ),
-        (
-            "request_digest".into(),
-            record.decision.request_digest.clone(),
-        ),
-        ("namespace".into(), record.request.namespace.clone()),
-        ("action_type".into(), record.request.action_type.clone()),
-        ("risk_class".into(), record.request.risk_class.clone()),
-        ("decision".into(), record.decision.decision.clone()),
-        ("policy_scope".into(), record.decision.policy_scope.clone()),
-        (
-            "policy_version".into(),
-            record.decision.policy_version.clone(),
-        ),
-    ])
-}
-
-fn ensure_external_action_audit(
-    db: &RuntimeDb,
-    record: &external::AuthorizationRecord,
-) -> Result<(), Status> {
-    let lifecycle = if record.approval_status.is_empty() {
-        record.decision.decision.as_str()
-    } else {
-        record.approval_status.as_str()
-    };
-    db.record_decisions_idempotently(&[crate::sekai::audit::Decision {
-        id: format!("{}:audit:{}", record.decision.authorization_id, lifecycle),
-        timestamp: record.decision_updated_at_ms,
-        actor: record.decision_actor.clone(),
-        action: format!("external_action/{}", record.request.action_type),
-        reason: format!("external_action_authorization_{lifecycle}"),
-        evidence: external_audit_evidence(record),
-        target_id: record.decision.authorization_id.clone(),
-        outcome: record.decision.decision.clone(),
-    }])
-    .map_err(Status::internal)
-}
-
-fn external_budget_scope(request: &external::ExternalActionRequest) -> String {
-    format!(
-        "project:{}/agent:{}/external-action:{}",
-        request.namespace, request.actor, request.risk_class
-    )
-}
-
 fn issue_external_permit(
     service: &ChiseiServiceImpl,
     authorization: &external::AuthorizationRecord,
@@ -1160,80 +1103,6 @@ fn persist_gateway_operation_receipt(
             outcome: "recorded".into(),
         }])
         .map_err(Status::internal)
-}
-
-fn release_external_reservations(
-    db: &RuntimeDb,
-    budget: &BudgetTracker,
-    record: &mut external::AuthorizationRecord,
-) -> Result<(), Status> {
-    let units = i32::try_from(record.request.requested_invocation_count).unwrap_or(i32::MAX);
-    if record.budget_reserved {
-        budget
-            .record_idempotent_with_metric(
-                &external_budget_scope(&record.request),
-                -units,
-                METRIC_TOKENS,
-                &format!(
-                    "external-action-release:{}",
-                    record.decision.authorization_id
-                ),
-            )
-            .map_err(Status::internal)?;
-        record.budget_reserved = false;
-    }
-    if record.blast_radius_reserved {
-        db.release_external_action_blast_radius(&record.decision.authorization_id, &record.request)
-            .map_err(Status::internal)?;
-        record.blast_radius_reserved = false;
-    }
-    Ok(())
-}
-
-fn persist_released_external_flags(
-    db: &RuntimeDb,
-    reserved: &external::AuthorizationRecord,
-    released: &external::AuthorizationRecord,
-) -> Result<(), Status> {
-    if reserved != released {
-        let _ = db
-            .compare_and_swap_external_action_authorization(reserved, released)
-            .map_err(Status::internal)?;
-    }
-    Ok(())
-}
-
-fn reclaim_expired_external_action_reservations(
-    db: &RuntimeDb,
-    budget: &BudgetTracker,
-    now_ms: i64,
-) -> Result<(), Status> {
-    for expected in db
-        .list_external_action_authorizations()
-        .map_err(Status::internal)?
-        .into_iter()
-        .filter(|record| {
-            (record.budget_reserved || record.blast_radius_reserved)
-                && record.decision.expires_at_ms <= now_ms
-        })
-    {
-        let mut expired = expected.clone();
-        expired.decision.decision = "deny".into();
-        expired.decision.reason = "external-action authorization expired".into();
-        expired.approval_status = "expired".into();
-        expired.decision_actor = "chisei.external_action_expiry".into();
-        expired.decision_updated_at_ms = now_ms;
-        if db
-            .compare_and_swap_external_action_authorization(&expected, &expired)
-            .map_err(Status::internal)?
-        {
-            let reserved = expired.clone();
-            release_external_reservations(db, budget, &mut expired)?;
-            persist_released_external_flags(db, &reserved, &expired)?;
-            ensure_external_action_audit(db, &expired)?;
-        }
-    }
-    Ok(())
 }
 
 fn require_namespace_access(db: &RuntimeDb, actor: &str, namespace: &str) -> Result<(), Status> {
@@ -8828,7 +8697,8 @@ impl ChiseiService for ChiseiServiceImpl {
             &request.policy_project,
         )?;
         let now = chrono::Utc::now().timestamp_millis();
-        reclaim_expired_external_action_reservations(&self.db, &self.budget, now)?;
+        external_lifecycle::reclaim_expired(&self.db, &self.budget, now)
+            .map_err(Status::internal)?;
         let request_digest = request
             .canonical_digest()
             .map_err(Status::invalid_argument)?;
@@ -8842,7 +8712,7 @@ impl ChiseiService for ChiseiServiceImpl {
                 authorization_id = claimed_id;
             }
             external::AuthorizationClaim::Existing(existing) => {
-                ensure_external_action_audit(&self.db, &existing)?;
+                external_lifecycle::ensure_audit(&self.db, &existing).map_err(Status::internal)?;
                 let permit = (existing.decision.decision == "permit")
                     .then(|| {
                         issue_external_permit(
@@ -8872,12 +8742,6 @@ impl ChiseiService for ChiseiServiceImpl {
             }
         }
 
-        let risk = RiskClass::parse(
-            request
-                .authoritative_risk_class()
-                .map_err(Status::invalid_argument)?,
-        )
-        .ok_or_else(|| Status::invalid_argument("invalid risk_class"))?;
         let policy =
             match self
                 .db
@@ -8891,117 +8755,62 @@ impl ChiseiService for ChiseiServiceImpl {
                     return Err(Status::internal(error));
                 }
             };
-        let policy_scope = policy
-            .as_ref()
-            .map(|policy| policy.scope.clone())
-            .unwrap_or_default();
-        let policy_version = external_policy_version(policy.as_ref());
-        let external_action_name = format!("external_action/{}", request.action_type);
-        let mut policy_decision = policy
-            .as_ref()
-            .map(|policy| policy.decide(&external_action_name, risk))
-            .unwrap_or(ActionDecision::Allow);
-        let mut reason = "external action satisfies current policy".to_string();
-
-        if request.deadline_ms <= now {
-            policy_decision = ActionDecision::Deny;
-            reason = "external-action request expired".into();
-        }
-        let approval_id = if policy_decision == ActionDecision::RequireApproval {
-            format!("external-approval-{}", uuid::Uuid::new_v4().simple())
-        } else {
-            String::new()
-        };
-        let mut record = external::AuthorizationRecord {
-            request: request.clone(),
-            decision: external::ExternalActionDecision {
-                version: external::DECISION_VERSION.into(),
-                authorization_id: authorization_id.clone(),
-                request_digest: request_digest.clone(),
-                decision: String::new(),
-                reason,
-                approval_id,
-                policy_scope,
-                policy_version,
-                created_at_ms: now,
-                expires_at_ms: request.deadline_ms,
-                cancelled_at_ms: 0,
-                assurance: external::AssuranceDeclaration::default(),
-            },
-            approval_status: if policy_decision == ActionDecision::RequireApproval {
-                "pending".into()
-            } else {
-                String::new()
-            },
-            budget_reserved: false,
-            blast_radius_reserved: false,
-            decision_actor: actor.clone(),
-            decision_updated_at_ms: now,
-        };
-        if policy_decision != ActionDecision::Deny {
-            let max_mutations = policy
-                .as_ref()
-                .and_then(|policy| policy.max_mutations_per_work_unit);
-            let max_deletes = (risk == RiskClass::Destructive)
-                .then(|| {
-                    policy
-                        .as_ref()
-                        .and_then(|policy| policy.max_deletes_per_work_unit)
-                })
-                .flatten();
-            if max_mutations.is_some() || max_deletes.is_some() {
-                match self.db.reserve_external_action_blast_radius(
-                    &authorization_id,
-                    &request,
-                    max_mutations,
-                    max_deletes,
-                ) {
-                    Ok(()) => record.blast_radius_reserved = true,
-                    Err(_) => {
-                        policy_decision = ActionDecision::Deny;
-                        record.decision.reason =
-                            "external-action cumulative blast-radius cap exceeded".into();
-                    }
+        let mut plan = external_lifecycle::AuthorizationPlan::resolve(
+            request.clone(),
+            authorization_id.clone(),
+            request_digest.clone(),
+            &actor,
+            policy.as_ref(),
+            now,
+        )
+        .map_err(Status::invalid_argument)?;
+        if plan.policy_decision != crate::sekai::action_policy::ActionDecision::Deny
+            && (plan.max_mutations.is_some() || plan.max_deletes.is_some())
+        {
+            match self.db.reserve_external_action_blast_radius(
+                &authorization_id,
+                &request,
+                plan.max_mutations,
+                plan.max_deletes,
+            ) {
+                Ok(()) => plan.record.blast_radius_reserved = true,
+                Err(_) => {
+                    plan.policy_decision = crate::sekai::action_policy::ActionDecision::Deny;
+                    plan.record.decision.reason =
+                        "external-action cumulative blast-radius cap exceeded".into();
                 }
             }
         }
-        if policy_decision != ActionDecision::Deny {
+        if plan.policy_decision != crate::sekai::action_policy::ActionDecision::Deny {
             let requested_units =
                 i32::try_from(request.requested_invocation_count).unwrap_or(i32::MAX);
             if self
                 .budget
                 .check_and_reserve_idempotent(
-                    &external_budget_scope(&request),
+                    &external_lifecycle::budget_scope(&request),
                     requested_units,
                     &format!("external-action-reserve:{authorization_id}"),
                 )
                 .is_ok()
             {
-                record.budget_reserved = true;
+                plan.record.budget_reserved = true;
             } else {
-                policy_decision = ActionDecision::Deny;
-                record.decision.reason = "external-action budget exhausted".into();
-                release_external_reservations(&self.db, &self.budget, &mut record)?;
+                plan.policy_decision = crate::sekai::action_policy::ActionDecision::Deny;
+                plan.record.decision.reason = "external-action budget exhausted".into();
+                external_lifecycle::release_reservations(&self.db, &self.budget, &mut plan.record)
+                    .map_err(Status::internal)?;
             }
         }
-        record.decision.decision = match policy_decision {
-            ActionDecision::Allow => "permit",
-            ActionDecision::Deny => "deny",
-            ActionDecision::RequireApproval => "require_approval",
-        }
-        .into();
-        if policy_decision == ActionDecision::Deny {
-            record.decision.approval_id.clear();
-            record.approval_status.clear();
-        }
+        let mut record = plan.finish();
         if let Err(error) = self.db.put_external_action_authorization(&record) {
             let _ = self
                 .db
                 .abandon_external_action_claim(&request, &request_digest);
-            release_external_reservations(&self.db, &self.budget, &mut record)?;
+            external_lifecycle::release_reservations(&self.db, &self.budget, &mut record)
+                .map_err(Status::internal)?;
             return Err(Status::internal(error));
         }
-        ensure_external_action_audit(&self.db, &record)?;
+        external_lifecycle::ensure_audit(&self.db, &record).map_err(Status::internal)?;
         let permit = (record.decision.decision == "permit")
             .then(|| {
                 issue_external_permit(
@@ -9038,13 +8847,6 @@ impl ChiseiService for ChiseiServiceImpl {
                     .get_external_action_authorization_by_id(&input.authorization_id)
                     .map_err(Status::internal)?
                     .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
-                if record.approval_status != "pending"
-                    || record.decision.decision != "require_approval"
-                {
-                    return Err(Status::failed_precondition(
-                        "external-action approval is not pending",
-                    ));
-                }
                 let expected = record.clone();
                 let now = chrono::Utc::now().timestamp_millis();
                 let current_policy = self
@@ -9069,37 +8871,16 @@ impl ChiseiService for ChiseiServiceImpl {
                     )
                 })
                 .is_err();
-                if access_revoked {
-                    record.decision.decision = "deny".into();
-                    record.decision.reason =
-                        "external-action requester no longer has namespace access".into();
-                    record.approval_status = "revoked".into();
-                } else if now >= record.decision.expires_at_ms {
-                    record.decision.decision = "deny".into();
-                    record.decision.reason = "external-action approval expired".into();
-                    record.approval_status = "expired".into();
-                } else if external_policy_version(current_policy.as_ref())
-                    != record.decision.policy_version
-                {
-                    record.decision.decision = "deny".into();
-                    record.decision.reason =
-                        "external-action approval is stale after policy change".into();
-                    record.approval_status = "stale".into();
-                } else if input.transition == "approve" {
-                    record.decision.decision = "permit".into();
-                    record.decision.reason = "external action approved".into();
-                    record.approval_status = "approved".into();
-                } else {
-                    record.decision.decision = "deny".into();
-                    record.decision.reason = if input.reason.trim().is_empty() {
-                        "external action denied by approver".into()
-                    } else {
-                        input.reason.clone()
-                    };
-                    record.approval_status = "denied".into();
-                }
-                record.decision_actor = actor.clone();
-                record.decision_updated_at_ms = now;
+                external_lifecycle::approve_or_deny(
+                    &mut record,
+                    &input.transition,
+                    &input.reason,
+                    &actor,
+                    now,
+                    access_revoked,
+                    current_policy.as_ref(),
+                )
+                .map_err(Status::failed_precondition)?;
                 if !self
                     .db
                     .compare_and_swap_external_action_authorization(&expected, &record)
@@ -9111,10 +8892,12 @@ impl ChiseiService for ChiseiServiceImpl {
                 }
                 if record.decision.decision != "permit" {
                     let reserved = record.clone();
-                    release_external_reservations(&self.db, &self.budget, &mut record)?;
-                    persist_released_external_flags(&self.db, &reserved, &record)?;
+                    external_lifecycle::release_reservations(&self.db, &self.budget, &mut record)
+                        .map_err(Status::internal)?;
+                    external_lifecycle::persist_released_flags(&self.db, &reserved, &record)
+                        .map_err(Status::internal)?;
                 }
-                ensure_external_action_audit(&self.db, &record)?;
+                external_lifecycle::ensure_audit(&self.db, &record).map_err(Status::internal)?;
                 let permit = (record.decision.decision == "permit")
                     .then(|| {
                         issue_external_permit(
@@ -9144,20 +8927,11 @@ impl ChiseiService for ChiseiServiceImpl {
                         "external-action cancellation denied",
                     ));
                 }
+                let now = chrono::Utc::now().timestamp_millis();
                 let changed = record.decision.cancelled_at_ms == 0;
                 if changed {
                     let expected = record.clone();
-                    let now = chrono::Utc::now().timestamp_millis();
-                    record.decision.cancelled_at_ms = now;
-                    record.decision.decision = "deny".into();
-                    record.decision.reason = if input.reason.trim().is_empty() {
-                        "external-action authorization cancelled".into()
-                    } else {
-                        input.reason
-                    };
-                    record.approval_status = "cancelled".into();
-                    record.decision_actor = actor;
-                    record.decision_updated_at_ms = now;
+                    external_lifecycle::cancel(&mut record, &actor, &input.reason, now);
                     if !self
                         .db
                         .compare_and_swap_external_action_authorization(&expected, &record)
@@ -9169,9 +8943,11 @@ impl ChiseiService for ChiseiServiceImpl {
                     }
                 }
                 let reserved = record.clone();
-                release_external_reservations(&self.db, &self.budget, &mut record)?;
-                persist_released_external_flags(&self.db, &reserved, &record)?;
-                ensure_external_action_audit(&self.db, &record)?;
+                external_lifecycle::release_reservations(&self.db, &self.budget, &mut record)
+                    .map_err(Status::internal)?;
+                external_lifecycle::persist_released_flags(&self.db, &reserved, &record)
+                    .map_err(Status::internal)?;
+                external_lifecycle::ensure_audit(&self.db, &record).map_err(Status::internal)?;
                 Ok(Response::new(TransitionExternalActionResponse {
                     decision: Some(external_decision_to_proto(&record.decision)),
                     permit: None,
