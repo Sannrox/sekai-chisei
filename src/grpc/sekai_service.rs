@@ -38,9 +38,10 @@ use crate::sekai::evidence_store::{
 use crate::sekai::governed_facts as governed_fact_domain;
 use crate::sekai::handoff as handoff_domain;
 use crate::sekai::lease_lifecycle::{
-    AcquireLease as AcquireLeaseCommand, GetLease as GetLeaseCommand, LeaseLifecycle,
-    LeaseLifecycleError, RefreshLease as RefreshLeaseCommand, ReleaseLease as ReleaseLeaseCommand,
-    TakeoverExpiredLease as TakeoverExpiredLeaseCommand, object_bound_target,
+    AcquireLease as AcquireLeaseCommand, GetLease as GetLeaseCommand, GuardedMutationPrecondition,
+    GuardedMutationTarget, LeaseLifecycle, LeaseLifecycleError,
+    RefreshLease as RefreshLeaseCommand, ReleaseLease as ReleaseLeaseCommand,
+    TakeoverExpiredLease as TakeoverExpiredLeaseCommand,
 };
 use crate::sekai::markings;
 use crate::sekai::schema::{self, SchemaRegistry};
@@ -4194,6 +4195,7 @@ fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
 fn map_lease_lifecycle_error(error: LeaseLifecycleError) -> Status {
     match error {
         LeaseLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        LeaseLifecycleError::FailedPrecondition(message) => Status::failed_precondition(message),
         LeaseLifecycleError::PermissionDenied(message) => Status::permission_denied(message),
         LeaseLifecycleError::NotFound(message) => Status::not_found(message),
         LeaseLifecycleError::Storage(message) => Status::internal(message),
@@ -4692,37 +4694,6 @@ fn authorize_action_instance_read(
     Ok(())
 }
 
-/// Object-bound lease preconditions must name the same object being mutated
-/// and the same namespace as that object.
-fn enforce_object_bound_lease_precondition(
-    key: &str,
-    lease_namespace: &str,
-    mutation_target_object_id: Option<&str>,
-    mutation_target_namespace: Option<&str>,
-) -> Result<(), Status> {
-    let Some(bound_id) = object_bound_target(key).map_err(map_lease_lifecycle_error)? else {
-        return Ok(());
-    };
-    match mutation_target_object_id {
-        None => Err(Status::invalid_argument(
-            "object-bound lease keys cannot guard object creation; use a free-form key",
-        )),
-        Some(target) if target != bound_id => Err(Status::failed_precondition(
-            "object-bound lease key must match the mutation target object id",
-        )),
-        Some(_) => {
-            if let Some(object_namespace) = mutation_target_namespace
-                && object_namespace != lease_namespace
-            {
-                return Err(Status::failed_precondition(
-                    "object-bound lease namespace must match the mutation target object namespace",
-                ));
-            }
-            Ok(())
-        }
-    }
-}
-
 struct GuardedCreateObjectRequest {
     object: Option<Object>,
     lease_precondition: Option<LeasePrecondition>,
@@ -4795,12 +4766,13 @@ impl SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
-        enforce_object_bound_lease_precondition(
-            &precondition.key,
-            &precondition.namespace,
-            None,
-            None,
-        )?;
+        LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .validate_guarded_mutation(GuardedMutationPrecondition {
+                key: &precondition.key,
+                lease_namespace: &precondition.namespace,
+                target: GuardedMutationTarget::Create,
+            })
+            .map_err(map_lease_lifecycle_error)?;
         let domain_object = from_proto_obj(&object);
         if let Some(value) = domain_object
             .properties
@@ -4965,12 +4937,16 @@ impl SekaiServiceImpl {
                 &format!("guarded_update_object:{}", existing.id),
             )?;
         }
-        enforce_object_bound_lease_precondition(
-            &precondition.key,
-            &precondition.namespace,
-            Some(object.id.as_str()),
-            Some(object.namespace.as_str()),
-        )?;
+        LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .validate_guarded_mutation(GuardedMutationPrecondition {
+                key: &precondition.key,
+                lease_namespace: &precondition.namespace,
+                target: GuardedMutationTarget::Object {
+                    id: object.id.as_str(),
+                    namespace: Some(object.namespace.as_str()),
+                },
+            })
+            .map_err(map_lease_lifecycle_error)?;
         let mut domain_object = from_proto_obj(&object);
         if let Some(value) = domain_object
             .properties
@@ -5089,12 +5065,16 @@ impl SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
         check_write(&self.security, &input.id, &principals)?;
         let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
-        enforce_object_bound_lease_precondition(
-            &precondition.key,
-            &precondition.namespace,
-            Some(input.id.as_str()),
-            expected.as_ref().map(|object| object.namespace.as_str()),
-        )?;
+        LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .validate_guarded_mutation(GuardedMutationPrecondition {
+                key: &precondition.key,
+                lease_namespace: &precondition.namespace,
+                target: GuardedMutationTarget::Object {
+                    id: input.id.as_str(),
+                    namespace: expected.as_ref().map(|object| object.namespace.as_str()),
+                },
+            })
+            .map_err(map_lease_lifecycle_error)?;
         if let Some(existing) = &expected {
             enforce_namespace_tenant_context(
                 &self.db,

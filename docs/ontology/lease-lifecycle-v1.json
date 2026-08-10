@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "CoordinationLeaseLifecycleModule",
+      "description": "Transport-independent module that owns coordination-lease authorization, persistence orchestration, object-bound key parsing, and guarded-mutation precondition validation.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces tenant and team-namespace admission, and maps protocol messages and errors around domain modules.",
+      "superclasses": []
+    },
+    {
+      "name": "GuardedObjectMutation",
+      "description": "Object create, update, or delete operation fenced by a coordination-lease precondition.",
+      "superclasses": []
+    },
+    {
+      "name": "ObjectBoundLeasePrecondition",
+      "description": "Canonical object:<object_id> lease key whose object identity and namespace must match an existing-object mutation and which cannot guard object creation.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_lease_lifecycle_to",
+      "description": "The gRPC transport delegates transport-independent coordination-lease behavior to the lease lifecycle module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "CoordinationLeaseLifecycleModule"
+    },
+    {
+      "name": "validates_guarded_mutation",
+      "description": "The lease lifecycle module validates object identity and namespace invariants before a guarded object mutation crosses the persistence seam.",
+      "domain": "CoordinationLeaseLifecycleModule",
+      "range": "GuardedObjectMutation"
+    },
+    {
+      "name": "is_fenced_by_object_bound_lease",
+      "description": "An existing-object guarded mutation may be fenced by a canonical object-bound lease precondition validated by the lease lifecycle module.",
+      "domain": "GuardedObjectMutation",
+      "range": "ObjectBoundLeasePrecondition"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "CoordinationLeaseLifecycleModule",
+      "source": "src/sekai/lease_lifecycle.rs",
+      "locator": "LeaseLifecycle",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GuardedObjectMutation",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "guarded_create_object/guarded_update_object/guarded_delete_object",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ObjectBoundLeasePrecondition",
+      "source": "src/sekai/lease_lifecycle.rs",
+      "locator": "GuardedMutationPrecondition",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_lease_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "LeaseLifecycle::validate_guarded_mutation call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "validates_guarded_mutation",
+      "source": "src/sekai/lease_lifecycle.rs",
+      "locator": "LeaseLifecycle::validate_guarded_mutation",
+      "confidence": 1.0
+    },
+    {
+      "subject": "is_fenced_by_object_bound_lease",
+      "source": "src/sekai/lease_lifecycle.rs",
+      "locator": "GuardedMutationTarget",
+      "confidence": 1.0
+    }
+  ]
+}

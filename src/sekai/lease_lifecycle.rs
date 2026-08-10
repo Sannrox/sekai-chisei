@@ -62,9 +62,24 @@ pub(crate) struct TakeoverExpiredLease<'a> {
     pub now_ms: i64,
 }
 
+pub(crate) struct GuardedMutationPrecondition<'a> {
+    pub key: &'a str,
+    pub lease_namespace: &'a str,
+    pub target: GuardedMutationTarget<'a>,
+}
+
+pub(crate) enum GuardedMutationTarget<'a> {
+    Create,
+    Object {
+        id: &'a str,
+        namespace: Option<&'a str>,
+    },
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum LeaseLifecycleError {
     InvalidArgument(String),
+    FailedPrecondition(String),
     PermissionDenied(String),
     NotFound(String),
     Storage(String),
@@ -220,6 +235,37 @@ impl<'a> LeaseLifecycle<'a> {
             .map_err(LeaseLifecycleError::Lease)
     }
 
+    /// Validate that an object-bound lease guards exactly the object mutation
+    /// named by the caller. Free-form lease keys can guard any mutation.
+    pub(crate) fn validate_guarded_mutation(
+        &self,
+        command: GuardedMutationPrecondition<'_>,
+    ) -> Result<(), LeaseLifecycleError> {
+        let Some(bound_id) = object_bound_target(command.key)? else {
+            return Ok(());
+        };
+        match command.target {
+            GuardedMutationTarget::Create => Err(LeaseLifecycleError::InvalidArgument(
+                "object-bound lease keys cannot guard object creation; use a free-form key".into(),
+            )),
+            GuardedMutationTarget::Object { id, .. } if id != bound_id => {
+                Err(LeaseLifecycleError::FailedPrecondition(
+                    "object-bound lease key must match the mutation target object id".into(),
+                ))
+            }
+            GuardedMutationTarget::Object {
+                namespace: Some(namespace),
+                ..
+            } if namespace != command.lease_namespace => {
+                Err(LeaseLifecycleError::FailedPrecondition(
+                    "object-bound lease namespace must match the mutation target object namespace"
+                        .into(),
+                ))
+            }
+            GuardedMutationTarget::Object { .. } => Ok(()),
+        }
+    }
+
     pub(crate) fn authorize_object_bound(
         &self,
         principals: &[String],
@@ -269,7 +315,7 @@ impl<'a> LeaseLifecycle<'a> {
     }
 }
 
-pub(crate) fn object_bound_target(key: &str) -> Result<Option<&str>, LeaseLifecycleError> {
+fn object_bound_target(key: &str) -> Result<Option<&str>, LeaseLifecycleError> {
     let Some(rest) = key.strip_prefix(OBJECT_BOUND_LEASE_KEY_PREFIX) else {
         return Ok(None);
     };
@@ -351,15 +397,63 @@ mod tests {
     }
 
     #[test]
-    fn object_bound_keys_have_one_canonical_spelling() {
-        assert_eq!(object_bound_target("free-form").unwrap(), None);
-        assert_eq!(
-            object_bound_target("object:target").unwrap(),
-            Some("target")
-        );
+    fn guarded_mutation_interface_owns_object_binding_rules() {
+        let db = RuntimeDb::memory();
+        let security = SecurityChecker::new();
+        let lifecycle = LeaseLifecycle::new(&db, &security, "local");
+
+        let validate = |key, target| {
+            lifecycle.validate_guarded_mutation(GuardedMutationPrecondition {
+                key,
+                lease_namespace: "default",
+                target,
+            })
+        };
+
+        assert_eq!(validate("free-form", GuardedMutationTarget::Create), Ok(()));
         assert!(matches!(
-            object_bound_target("object: target"),
+            validate(
+                "object: target",
+                GuardedMutationTarget::Object {
+                    id: "target",
+                    namespace: Some("default")
+                }
+            ),
             Err(LeaseLifecycleError::InvalidArgument(_))
         ));
+        assert!(matches!(
+            validate("object:target", GuardedMutationTarget::Create),
+            Err(LeaseLifecycleError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            validate(
+                "object:target",
+                GuardedMutationTarget::Object {
+                    id: "other",
+                    namespace: Some("default")
+                }
+            ),
+            Err(LeaseLifecycleError::FailedPrecondition(_))
+        ));
+        assert!(matches!(
+            validate(
+                "object:target",
+                GuardedMutationTarget::Object {
+                    id: "target",
+                    namespace: Some("other")
+                }
+            ),
+            Err(LeaseLifecycleError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            validate(
+                "object:target",
+                GuardedMutationTarget::Object {
+                    id: "target",
+                    namespace: Some("default")
+                }
+            ),
+            Ok(())
+        );
     }
 }
