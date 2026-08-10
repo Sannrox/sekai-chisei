@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "GovernedActionLifecycleModule",
+      "description": "Sekai-owned module that resolves action policy, coordinates budget and blast-radius limits, binds policy attestations, and commits generic approval hold, approve, and deny transitions with audit evidence.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces tenant, namespace, marking, purpose, and capability preflight, and maps protocol messages and errors around Sekai domain modules.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedActionApproval",
+      "description": "Durable pending or terminal decision record that binds the proposing actor, exact action parameters, policy scope, risk class, target, work unit, and deciding principal.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_governed_action_lifecycle_to",
+      "description": "The gRPC transport delegates policy, resource metering, attestation, and generic approval transition behavior to the governed action lifecycle module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "GovernedActionLifecycleModule"
+    },
+    {
+      "name": "governs_action_approval",
+      "description": "The governed action lifecycle module creates and resolves durable governed action approval records while preserving audit evidence and terminal-state protection.",
+      "domain": "GovernedActionLifecycleModule",
+      "range": "GovernedActionApproval"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "GovernedActionLifecycleModule",
+      "source": "src/sekai/action_lifecycle.rs",
+      "locator": "GovernedActionContext/hold_action/complete_approval/deny_approval",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GovernedActionApproval",
+      "source": "src/sekai/action_approval.rs",
+      "locator": "ActionApproval",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_governed_action_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "execute_action/approve_action/deny_action lifecycle call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_action_approval",
+      "source": "src/sekai/action_lifecycle.rs",
+      "locator": "hold_action/complete_approval/deny_approval",
+      "confidence": 1.0
+    }
+  ]
+}
