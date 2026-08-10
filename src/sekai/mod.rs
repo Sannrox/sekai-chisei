@@ -30,6 +30,7 @@ pub(crate) mod lease_lifecycle;
 pub mod ledger;
 pub mod lineage;
 pub mod markings;
+pub mod object_mutation;
 pub mod observation;
 pub mod ontology;
 pub mod parked_work;

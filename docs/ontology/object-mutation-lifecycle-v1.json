@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ObjectMutationLifecycleModule",
+      "description": "Private Sekai-owned module whose small interface concentrates direct and generation-fenced object create, update, delete, and replay persistence behind one guarded-or-direct seam.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces tenant, namespace, marking, schema, and object admission, and maps protocol messages and errors around Sekai domain modules.",
+      "superclasses": []
+    },
+    {
+      "name": "GuardedObjectMutationAdapter",
+      "description": "Generation-fenced persistence adapter that binds object mutation, lease validation, idempotent replay, and audit in the backend transaction.",
+      "superclasses": []
+    },
+    {
+      "name": "DirectObjectMutationAdapter",
+      "description": "Direct persistence adapter that commits an admitted object mutation and its audit without a lease precondition.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_object_mutation_to",
+      "description": "The gRPC transport delegates admitted create, update, and delete persistence through the object mutation lifecycle module instead of maintaining parallel guarded and direct paths.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ObjectMutationLifecycleModule"
+    },
+    {
+      "name": "selects_guarded_mutation_adapter",
+      "description": "The object mutation lifecycle module selects generation-fenced persistence when an admitted request carries a lease precondition.",
+      "domain": "ObjectMutationLifecycleModule",
+      "range": "GuardedObjectMutationAdapter"
+    },
+    {
+      "name": "selects_direct_mutation_adapter",
+      "description": "The object mutation lifecycle module selects direct audited persistence when an admitted request has no lease precondition.",
+      "domain": "ObjectMutationLifecycleModule",
+      "range": "DirectObjectMutationAdapter"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ObjectMutationLifecycleModule",
+      "source": "src/sekai/object_mutation.rs",
+      "locator": "ObjectMutation",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl create_object/update_object/delete_object",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GuardedObjectMutationAdapter",
+      "source": "src/sekai/object_mutation.rs",
+      "locator": "ObjectMutation::guarded/replay/create/update/delete",
+      "confidence": 1.0
+    },
+    {
+      "subject": "DirectObjectMutationAdapter",
+      "source": "src/sekai/object_mutation.rs",
+      "locator": "ObjectMutation::direct/create/update/delete",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_object_mutation_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "guarded_create_object/guarded_update_object/guarded_delete_object mutation call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "selects_guarded_mutation_adapter",
+      "source": "src/sekai/object_mutation.rs",
+      "locator": "ObjectMutation guarded branches",
+      "confidence": 1.0
+    },
+    {
+      "subject": "selects_direct_mutation_adapter",
+      "source": "src/sekai/object_mutation.rs",
+      "locator": "ObjectMutation direct branches",
+      "confidence": 1.0
+    }
+  ]
+}
