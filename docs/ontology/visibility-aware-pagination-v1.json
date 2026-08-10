@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "VisibilityAwarePaginationModule",
+      "description": "Private in-process module that scans storage rows in bounded batches, filters caller-visible rows, applies offset and limit to visible rows, and fails closed when the scan budget is exhausted.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces tenant and team-namespace admission, and maps protocol messages and errors around domain modules.",
+      "superclasses": []
+    },
+    {
+      "name": "VisibilityFilteredDecisionListing",
+      "description": "Decision listing whose page includes only rows readable by the authenticated caller, without exposing whether hidden rows exist.",
+      "superclasses": []
+    },
+    {
+      "name": "VisibilityFilteredAttestationListing",
+      "description": "Attestation listing whose offset and limit count only policy scopes administered by the authenticated caller.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_visibility_pagination_to",
+      "description": "The gRPC transport delegates bounded post-fetch visibility pagination to one shared module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "VisibilityAwarePaginationModule"
+    },
+    {
+      "name": "paginates_visible_decisions",
+      "description": "The shared pagination module applies bounded visibility-aware pagination to decision listings.",
+      "domain": "VisibilityAwarePaginationModule",
+      "range": "VisibilityFilteredDecisionListing"
+    },
+    {
+      "name": "paginates_visible_attestations",
+      "description": "The shared pagination module applies bounded visibility-aware pagination to attestation listings.",
+      "domain": "VisibilityAwarePaginationModule",
+      "range": "VisibilityFilteredAttestationListing"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "VisibilityAwarePaginationModule",
+      "source": "src/grpc/visible_page.rs",
+      "locator": "scan_visible_page",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl",
+      "confidence": 1.0
+    },
+    {
+      "subject": "VisibilityFilteredDecisionListing",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "list_decisions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "VisibilityFilteredAttestationListing",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "list_attestations",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_visibility_pagination_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "scan_visible_page call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "paginates_visible_decisions",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "list_decisions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "paginates_visible_attestations",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "list_attestations",
+      "confidence": 1.0
+    }
+  ]
+}

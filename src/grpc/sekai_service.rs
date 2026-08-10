@@ -9,6 +9,7 @@ use tonic::{Request, Response, Status};
 
 use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
+use super::visible_page::{VisiblePageError, scan_visible_page};
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
@@ -10847,8 +10848,6 @@ impl SekaiService for SekaiServiceImpl {
         } else {
             100
         };
-        let batch_size = visible_limit.max(50).min(200);
-        let max_scan = visible_limit.saturating_mul(10).max(200);
         let actor_filter = if inner.actor.is_empty() {
             None
         } else {
@@ -10866,31 +10865,24 @@ impl SekaiService for SekaiServiceImpl {
             check_read(&self.security, &inner.target_id, &principals)?;
             Some(inner.target_id.clone())
         };
-        let mut decisions = Vec::new();
-        let mut offset = 0;
-        let mut scanned = 0usize;
         let managed_team_principal = is_managed_team_principal(&self.db, &principals)?;
-        while decisions.len() < visible_limit && scanned < max_scan {
-            let batch = self
-                .db
-                .list_decisions(&audit::DecisionFilter {
+        let decisions = scan_visible_page(
+            visible_limit,
+            0,
+            |limit, offset| {
+                self.db.list_decisions(&audit::DecisionFilter {
                     actor: actor_filter.clone(),
                     action: action_filter.clone(),
                     target_id: target_filter.clone(),
                     after: inner.after,
-                    limit: batch_size as i32,
+                    limit,
                     offset,
                 })
-                .map_err(Status::internal)?;
-            if batch.is_empty() {
-                break;
-            }
-            scanned += batch.len();
-            offset += batch.len() as i32;
-            for decision in batch {
+            },
+            |decision| {
                 if decision.target_id.is_empty() {
                     if managed_team_principal {
-                        continue;
+                        return false;
                     }
                 } else if check_object_namespace_access(
                     &self.db,
@@ -10901,28 +10893,29 @@ impl SekaiService for SekaiServiceImpl {
                 .is_err()
                     || check_read(&self.security, &decision.target_id, &principals).is_err()
                 {
-                    continue;
+                    return false;
                 }
-                decisions.push(Decision {
-                    id: decision.id,
-                    timestamp: decision.timestamp,
-                    actor: decision.actor,
-                    action: decision.action,
-                    reason: decision.reason,
-                    evidence: decision.evidence,
-                    target_id: decision.target_id,
-                    outcome: decision.outcome,
-                });
-                if decisions.len() >= visible_limit {
-                    break;
-                }
-            }
-        }
-        if decisions.len() < visible_limit && scanned >= max_scan {
-            return Err(Status::resource_exhausted(
+                true
+            },
+        )
+        .map_err(|error| match error {
+            VisiblePageError::Fetch(error) => Status::internal(error),
+            VisiblePageError::ScanBudgetExhausted => Status::resource_exhausted(
                 "decision visibility scan limit exceeded; refine filters",
-            ));
-        }
+            ),
+        })?
+        .into_iter()
+        .map(|decision| Decision {
+            id: decision.id,
+            timestamp: decision.timestamp,
+            actor: decision.actor,
+            action: decision.action,
+            reason: decision.reason,
+            evidence: decision.evidence,
+            target_id: decision.target_id,
+            outcome: decision.outcome,
+        })
+        .collect();
         Ok(Response::new(ListDecisionsResponse { decisions }))
     }
     async fn list_object_changes(
@@ -11054,49 +11047,30 @@ impl SekaiService for SekaiServiceImpl {
             100
         };
         let visible_offset = inner.offset.max(0) as usize;
-        let batch_size = visible_limit.clamp(50, 200);
-        let max_scan = (visible_offset + visible_limit).saturating_mul(10).max(200);
-        let mut attestations = Vec::new();
-        let mut scanned = 0usize;
-        let mut skipped = 0usize;
-        let mut scan_offset = 0i32;
-        while attestations.len() < visible_limit && scanned < max_scan {
-            let batch = self
-                .db
-                .list_attestations(
+        let attestations = scan_visible_page(
+            visible_limit,
+            visible_offset,
+            |limit, offset| {
+                self.db.list_attestations(
                     decision_id.as_deref(),
                     policy_scope.as_deref(),
-                    batch_size as i32,
-                    scan_offset,
+                    limit,
+                    offset,
                 )
-                .map_err(Status::internal)?;
-            if batch.is_empty() {
-                break;
-            }
-            scan_offset += batch.len() as i32;
-            scanned += batch.len();
-            for attestation in &batch {
-                if check_action_admin(&self.security, &attestation.policy_scope, &principals)
-                    .is_err()
-                {
-                    continue;
-                }
-                if skipped < visible_offset {
-                    skipped += 1;
-                    continue;
-                }
-                if attestations.len() < visible_limit {
-                    attestations.push(to_proto_attestation(attestation));
-                }
-            }
-        }
-        // A short page from an exhausted scan budget must not read like the
-        // end of the data (matches list_decisions).
-        if attestations.len() < visible_limit && scanned >= max_scan {
-            return Err(Status::resource_exhausted(
+            },
+            |attestation| {
+                check_action_admin(&self.security, &attestation.policy_scope, &principals).is_ok()
+            },
+        )
+        .map_err(|error| match error {
+            VisiblePageError::Fetch(error) => Status::internal(error),
+            VisiblePageError::ScanBudgetExhausted => Status::resource_exhausted(
                 "attestation visibility scan limit exceeded; refine filters",
-            ));
-        }
+            ),
+        })?
+        .iter()
+        .map(to_proto_attestation)
+        .collect();
         Ok(Response::new(ListAttestationsResponse { attestations }))
     }
 
