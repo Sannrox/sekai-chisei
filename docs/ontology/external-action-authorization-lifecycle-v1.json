@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ExternalActionAuthorizationLifecycleModule",
+      "description": "Chisei-owned module that resolves external-action policy snapshots, applies approval and cancellation transitions, reclaims expired authority, releases reservations, and records durable audit projections.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces namespace and project access preflight, translates protocol values, and delegates external-action lifecycle behavior to Chisei modules.",
+      "superclasses": []
+    },
+    {
+      "name": "ExternalActionAuthorization",
+      "description": "Durable state-machine record binding an external-action request, policy snapshot, decision, approval status, reservation state, deciding actor, and lifecycle timestamps.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_external_action_lifecycle_to",
+      "description": "The gRPC transport delegates policy snapshotting, lifecycle transitions, expiry cleanup, reservation release, and audit projection to the external-action authorization lifecycle module.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "ExternalActionAuthorizationLifecycleModule"
+    },
+    {
+      "name": "governs_external_action_authorization",
+      "description": "The external-action authorization lifecycle module creates and transitions durable external-action authorization records.",
+      "domain": "ExternalActionAuthorizationLifecycleModule",
+      "range": "ExternalActionAuthorization"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ExternalActionAuthorizationLifecycleModule",
+      "source": "src/chisei/external_action_lifecycle.rs",
+      "locator": "AuthorizationPlan/approve_or_deny/cancel/reclaim_expired",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "authorize_external_action/transition_external_action",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ExternalActionAuthorization",
+      "source": "src/chisei/external_action.rs",
+      "locator": "AuthorizationRecord",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_external_action_lifecycle_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "external_lifecycle call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_external_action_authorization",
+      "source": "src/chisei/external_action_lifecycle.rs",
+      "locator": "AuthorizationPlan/approve_or_deny/cancel/reclaim_expired",
+      "confidence": 1.0
+    }
+  ]
+}

@@ -14,6 +14,7 @@ pub mod evaluation_manifest;
 pub mod evaluation_plan;
 pub mod evolve;
 pub mod external_action;
+pub mod external_action_lifecycle;
 pub mod external_permit;
 pub mod federation;
 pub mod gate;
