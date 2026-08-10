@@ -1,5 +1,5 @@
 pub mod chisei_service;
-pub mod client;
+pub use sekai_admin_client::client;
 mod provider_execution;
 pub mod sekai_service;
 
