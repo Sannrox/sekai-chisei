@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ActionInstanceAdmissionModule",
+      "description": "Sekai-owned deep module whose interface admits one governed ActionInstance and owns validation, idempotent replay, policy and budget decisions, receipt and audit ordering, effect planning, and post-admission metering.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, enforces tenant, namespace, marking, purpose, and capability preflight, and maps protocol messages and errors around Sekai domain modules.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedActionInstance",
+      "description": "Durable admission envelope for a versioned governed action type, exact parameters, evidence references, principal, policy and budget outcomes, and operation receipt identity.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_action_instance_admission_to",
+      "description": "The gRPC transport adapter delegates ActionInstance lifecycle admission to the transport-neutral admission module after authentication and tenant enforcement.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ActionInstanceAdmissionModule"
+    },
+    {
+      "name": "admits_governed_action_instance",
+      "description": "The admission module validates and durably records a governed ActionInstance together with its receipt, audit evidence, and planned effects.",
+      "domain": "ActionInstanceAdmissionModule",
+      "range": "GovernedActionInstance"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ActionInstanceAdmissionModule",
+      "source": "src/sekai/action_instance_admission.rs",
+      "locator": "ActionInstanceAdmission/admit/record_admission",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl/submit_action_instance",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GovernedActionInstance",
+      "source": "src/sekai/action_instance.rs",
+      "locator": "ActionInstance",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_action_instance_admission_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "submit_action_instance admission call",
+      "confidence": 1.0
+    },
+    {
+      "subject": "admits_governed_action_instance",
+      "source": "src/sekai/action_instance_admission.rs",
+      "locator": "admit/record_admission",
+      "confidence": 1.0
+    }
+  ]
+}
