@@ -3,10 +3,11 @@
 use sekai_chisei::chisei::external_action::PERMIT_VERSION;
 use sekai_chisei::chisei::external_permit::{ExternalPermitPolicy, Permit};
 use sekai_chisei::db::chisei_external_permit::ChiseiExternalPermitBackend;
+use sekai_chisei::db::decision::DecisionBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use std::collections::BTreeMap;
 
-trait PermitHarness: ChiseiExternalPermitBackend {}
+trait PermitHarness: ChiseiExternalPermitBackend + DecisionBackend {}
 impl PermitHarness for SekaiDb {}
 impl PermitHarness for PostgresDb {}
 
@@ -104,11 +105,18 @@ fn exercise(db: &dyn PermitHarness, prefix: &str) {
     );
 
     assert!(
-        db.revoke_permit(&permit.revocation_handle, "stop", 2_000)
+        db.revoke_permit(&permit.revocation_handle, "operator:test", "stop", 2_000)
             .unwrap()
     );
+    let audit = db
+        .get_decision(&format!("{}:audit:revoked", permit.revocation_handle))
+        .unwrap()
+        .expect("revocation audit");
+    assert_eq!(audit.actor, "operator:test");
+    assert_eq!(audit.reason, "stop");
+    assert_eq!(audit.target_id, permit.revocation_handle);
     assert!(
-        !db.revoke_permit(&permit.revocation_handle, "stop", 2_001)
+        !db.revoke_permit(&permit.revocation_handle, "operator:test", "stop", 2_001)
             .unwrap()
     );
 

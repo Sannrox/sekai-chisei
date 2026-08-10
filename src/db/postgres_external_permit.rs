@@ -147,8 +147,18 @@ impl PostgresDb {
         }
     }
 
-    pub fn revoke_permit(&self, handle: &str, reason: &str, now_ms: i64) -> Result<bool, String> {
-        self.connection()?
+    pub fn revoke_permit(
+        &self,
+        handle: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let changed = tx
             .execute(
                 "INSERT INTO chisei_external_action_revocations(
                     revocation_handle, reason, revoked_at_ms
@@ -156,8 +166,25 @@ impl PostgresDb {
                  ON CONFLICT DO NOTHING",
                 &[&handle, &reason, &now_ms],
             )
-            .map(|count| count == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?
+            == 1;
+        if changed {
+            insert_chained_decision(
+                &mut tx,
+                &Decision {
+                    id: format!("{handle}:audit:revoked"),
+                    timestamp: now_ms,
+                    actor: actor.into(),
+                    action: "external_action_permit/revoke".into(),
+                    reason: reason.into(),
+                    evidence: HashMap::from([("revocation_handle".into(), handle.into())]),
+                    target_id: handle.into(),
+                    outcome: "revoked".into(),
+                },
+            )?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(changed)
     }
 
     pub fn set_permit_kill_switch(
