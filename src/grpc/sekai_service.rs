@@ -53,6 +53,10 @@ use crate::sekai::object_mutation::{
 };
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
+use crate::sekai::work_unit_lifecycle::{
+    AdmitWorkUnit, TransitionWorkUnit, WorkUnitLifecycle, WorkUnitLifecycleError,
+    WorkUnitTransition,
+};
 use crate::sekai::{
     audit, compute, coordination, dataset, function, ontology, retrieval, security, semantic,
 };
@@ -4152,6 +4156,33 @@ fn map_lease_lifecycle_error(error: LeaseLifecycleError) -> Status {
         LeaseLifecycleError::Storage(message) => Status::internal(message),
         LeaseLifecycleError::Lease(error) => map_lease_error(error),
     }
+}
+
+fn map_work_unit_lifecycle_error(error: WorkUnitLifecycleError) -> Status {
+    match error {
+        WorkUnitLifecycleError::NotFound(message) => Status::not_found(message),
+        WorkUnitLifecycleError::FailedPrecondition(message) => Status::failed_precondition(message),
+        WorkUnitLifecycleError::Storage(message) => Status::internal(message),
+    }
+}
+
+fn transition_work_unit<'a>(
+    db: &RuntimeDb,
+    principals: &[String],
+    work_unit_id: &str,
+    request_id: &str,
+    transition: WorkUnitTransition<'a>,
+) -> Result<coordination::WorkUnit, Status> {
+    let principal = dedup_principal(principals);
+    WorkUnitLifecycle::new(db)
+        .transition(TransitionWorkUnit {
+            work_unit_id,
+            request_id,
+            principal: &principal,
+            transition,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        })
+        .map_err(map_work_unit_lifecycle_error)
 }
 
 fn map_mutation_persistence_error(error: MutationPersistenceError) -> Status {
@@ -9013,54 +9044,21 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
         check_work_unit_write(&self.db, &self.security, &work_unit, &principals)?;
-        if let Some(record) = self
-            .db
-            .get_dedup_request(&inner.request_id, "try_admit_work_unit")
-            .map_err(Status::internal)?
-        {
-            if record.work_unit_id == work_unit_id
-                && record.principal == dedup_principal(&principals)
-            {
-                let current = self
-                    .db
-                    .get_work_unit(&work_unit_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                let reservations = self
-                    .db
-                    .list_reservations(&coordination::ReservationFilter {
-                        work_unit_id: Some(work_unit_id.clone()),
-                        status: Some(coordination::RESERVATION_STATUS_ACTIVE.into()),
-                        ..Default::default()
-                    })
-                    .map_err(Status::internal)?;
-                return Ok(Response::new(TryAdmitWorkUnitResponse {
-                    admitted: current.status == coordination::WORK_UNIT_STATUS_RUNNING,
-                    queue_position: 0,
-                    reason: String::new(),
-                    work_unit: Some(to_proto_work_unit(&current)),
-                    reservations: reservations.iter().map(to_proto_reservation).collect(),
-                }));
-            }
-        }
         let owner = principals
             .first()
             .cloned()
             .ok_or(Status::unauthenticated("principal required"))?;
-        let result = self
-            .db
-            .try_admit_work_unit(&work_unit_id, &owner, chrono::Utc::now().timestamp_millis())
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "try_admit_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: result.work_unit.scope_id.clone(),
-                work_unit_id: result.work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let principal = dedup_principal(&principals);
+        let result = WorkUnitLifecycle::new(&self.db)
+            .admit(AdmitWorkUnit {
+                work_unit_id: &work_unit_id,
+                request_id: &inner.request_id,
+                principal: &principal,
+                lease_owner: &owner,
+                now_ms,
             })
-            .map_err(Status::internal)?;
+            .map_err(map_work_unit_lifecycle_error)?;
         Ok(Response::new(TryAdmitWorkUnitResponse {
             admitted: result.admitted,
             queue_position: result.queue_position,
@@ -9087,36 +9085,13 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
         check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
-        if let Some(record) = self
-            .db
-            .get_dedup_request(&inner.request_id, "heartbeat_work_unit")
-            .map_err(Status::internal)?
-        {
-            if record.work_unit_id == work_unit_id {
-                let work_unit = self
-                    .db
-                    .get_work_unit(&work_unit_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                return Ok(Response::new(HeartbeatWorkUnitResponse {
-                    work_unit: Some(to_proto_work_unit(&work_unit)),
-                }));
-            }
-        }
-        let work_unit = self
-            .db
-            .heartbeat_work_unit(&work_unit_id, chrono::Utc::now().timestamp_millis())
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "heartbeat_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::internal)?;
+        let work_unit = transition_work_unit(
+            &self.db,
+            &principals,
+            &work_unit_id,
+            &inner.request_id,
+            WorkUnitTransition::Heartbeat,
+        )?;
         Ok(Response::new(HeartbeatWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -9135,36 +9110,13 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
         check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
-        if let Some(record) = self
-            .db
-            .get_dedup_request(&inner.request_id, "complete_work_unit")
-            .map_err(Status::internal)?
-        {
-            if record.work_unit_id == work_unit_id {
-                let work_unit = self
-                    .db
-                    .get_work_unit(&work_unit_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                return Ok(Response::new(CompleteWorkUnitResponse {
-                    work_unit: Some(to_proto_work_unit(&work_unit)),
-                }));
-            }
-        }
-        let work_unit = self
-            .db
-            .complete_work_unit(&work_unit_id, chrono::Utc::now().timestamp_millis())
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "complete_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::internal)?;
+        let work_unit = transition_work_unit(
+            &self.db,
+            &principals,
+            &work_unit_id,
+            &inner.request_id,
+            WorkUnitTransition::Complete,
+        )?;
         Ok(Response::new(CompleteWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -9182,40 +9134,13 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
         check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
-        if let Some(record) = self
-            .db
-            .get_dedup_request(&inner.request_id, "fail_work_unit")
-            .map_err(Status::internal)?
-        {
-            if record.work_unit_id == inner.work_unit_id {
-                let work_unit = self
-                    .db
-                    .get_work_unit(&inner.work_unit_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                return Ok(Response::new(FailWorkUnitResponse {
-                    work_unit: Some(to_proto_work_unit(&work_unit)),
-                }));
-            }
-        }
-        let work_unit = self
-            .db
-            .fail_work_unit(
-                &inner.work_unit_id,
-                &inner.failure_reason,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "fail_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::internal)?;
+        let work_unit = transition_work_unit(
+            &self.db,
+            &principals,
+            &inner.work_unit_id,
+            &inner.request_id,
+            WorkUnitTransition::Fail(&inner.failure_reason),
+        )?;
         Ok(Response::new(FailWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -9233,40 +9158,13 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
         check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
-        if let Some(record) = self
-            .db
-            .get_dedup_request(&inner.request_id, "cancel_work_unit")
-            .map_err(Status::internal)?
-        {
-            if record.work_unit_id == inner.work_unit_id {
-                let work_unit = self
-                    .db
-                    .get_work_unit(&inner.work_unit_id)
-                    .map_err(Status::internal)?
-                    .ok_or(Status::not_found("work unit not found"))?;
-                return Ok(Response::new(CancelWorkUnitResponse {
-                    work_unit: Some(to_proto_work_unit(&work_unit)),
-                }));
-            }
-        }
-        let work_unit = self
-            .db
-            .cancel_work_unit(
-                &inner.work_unit_id,
-                &inner.cancel_reason,
-                chrono::Utc::now().timestamp_millis(),
-            )
-            .map_err(Status::failed_precondition)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "cancel_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::internal)?;
+        let work_unit = transition_work_unit(
+            &self.db,
+            &principals,
+            &inner.work_unit_id,
+            &inner.request_id,
+            WorkUnitTransition::Cancel(&inner.cancel_reason),
+        )?;
         Ok(Response::new(CancelWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))

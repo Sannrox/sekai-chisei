@@ -47,3 +47,4 @@ pub mod semantic;
 pub mod sentinel;
 pub mod skillextract;
 pub mod tool_bridge;
+pub(crate) mod work_unit_lifecycle;
