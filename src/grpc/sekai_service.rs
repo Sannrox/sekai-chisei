@@ -47,6 +47,10 @@ use crate::sekai::evidence_store::{
 };
 use crate::sekai::governed_facts as governed_fact_domain;
 use crate::sekai::handoff as handoff_domain;
+use crate::sekai::handoff_lifecycle::{
+    CreateHandoff as CreateHandoffCommand, HandoffLifecycle, HandoffLifecycleError,
+    RevokeHandoff as RevokeHandoffCommand,
+};
 use crate::sekai::lease_lifecycle::{
     AcquireLease as AcquireLeaseCommand, GetLease as GetLeaseCommand, GuardedMutationPrecondition,
     GuardedMutationTarget, LeaseLifecycle, LeaseLifecycleError,
@@ -4117,6 +4121,16 @@ fn handoff_reference_available(
     Ok(available)
 }
 
+fn map_handoff_lifecycle_error(error: HandoffLifecycleError) -> Status {
+    match error {
+        HandoffLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        HandoffLifecycleError::AlreadyExists(message) => Status::already_exists(message),
+        HandoffLifecycleError::FailedPrecondition(message) => Status::failed_precondition(message),
+        HandoffLifecycleError::NotFound(message) => Status::not_found(message),
+        HandoffLifecycleError::Storage(message) => Status::internal(message),
+    }
+}
+
 fn aggregate_reconcile_summary(
     summary: &mut coordination::ReconcileSummary,
     next: coordination::ReconcileSummary,
@@ -5380,11 +5394,6 @@ impl SekaiService for SekaiServiceImpl {
             .first()
             .cloned()
             .ok_or(Status::unauthenticated("principal required"))?;
-        if proto.intended_scope != proto.namespace {
-            return Err(Status::invalid_argument(
-                "intended_scope must equal the manifest namespace",
-            ));
-        }
         let manifest = handoff_domain::HandoffManifest {
             schema_version: handoff_domain::HANDOFF_VERSION.into(),
             id: proto.id,
@@ -5407,76 +5416,28 @@ impl SekaiService for SekaiServiceImpl {
             supersedes_manifest_id: proto.supersedes_manifest_id,
             revoked: false,
         };
-        manifest.validate().map_err(Status::invalid_argument)?;
-        let request_digest = manifest
-            .canonical_digest()
-            .map_err(Status::invalid_argument)?;
-        if let Some((existing_digest, existing)) = self
-            .db
-            .get_handoff_by_request(&manifest.creator_principal, &inner.request_id)
-            .map_err(Status::internal)?
-        {
-            if existing_digest != request_digest {
-                return Err(Status::already_exists(
-                    "request_id is already bound to different handoff input",
-                ));
-            }
-            return Ok(Response::new(CreateHandoffResponse {
-                manifest: Some(to_proto_handoff(&existing)),
-            }));
-        }
         let current_time = now_millis();
-        if manifest.created_at_ms > current_time.saturating_add(60_000)
-            || manifest.expires_at_ms <= current_time
-        {
-            return Err(Status::invalid_argument(
-                "handoff timestamps are outside the accepted window",
-            ));
-        }
-        for reference in manifest
-            .references
-            .iter()
-            .filter(|reference| !reference.omitted)
-        {
-            if !handoff_reference_available(
-                self,
-                reference,
-                &manifest.namespace,
-                &principals,
-                current_time,
-            )? {
-                return Err(Status::failed_precondition(
-                    "handoff contains an unavailable reference",
-                ));
-            }
-        }
-        if !manifest.supersedes_manifest_id.is_empty() {
-            let predecessor = self
-                .db
-                .get_handoff(&manifest.supersedes_manifest_id)
-                .map_err(Status::internal)?
-                .ok_or(Status::failed_precondition(
-                    "superseded handoff is unavailable",
-                ))?;
-            if predecessor.creator_principal != manifest.creator_principal
-                || predecessor.intended_principal != manifest.intended_principal
-                || predecessor.namespace != manifest.namespace
-            {
-                return Err(Status::failed_precondition(
-                    "superseded handoff is unavailable",
-                ));
-            }
-        }
-        let stored = self
-            .db
-            .create_handoff(&manifest, &inner.request_id)
-            .map_err(|error| {
-                if error.contains("different handoff") {
-                    Status::already_exists(error)
-                } else {
-                    Status::invalid_argument(error)
-                }
-            })?;
+        let namespace = manifest.namespace.clone();
+        let stored = HandoffLifecycle::new(&self.db)
+            .create(
+                CreateHandoffCommand {
+                    manifest,
+                    request_id: &inner.request_id,
+                    principals: &principals,
+                    now_ms: current_time,
+                },
+                |reference| {
+                    handoff_reference_available(
+                        self,
+                        reference,
+                        &namespace,
+                        &principals,
+                        current_time,
+                    )
+                    .map_err(|status| HandoffLifecycleError::Storage(status.to_string()))
+                },
+            )
+            .map_err(map_handoff_lifecycle_error)?;
         Ok(Response::new(CreateHandoffResponse {
             manifest: Some(to_proto_handoff(&stored)),
         }))
@@ -5489,28 +5450,15 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
-        let existing = self
-            .db
-            .get_handoff(&inner.manifest_id)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("handoff not found"))?;
-        if !principals.iter().any(|principal| {
-            principal == &existing.creator_principal
-                || matches!(principal.as_str(), "root" | "local")
-        }) {
-            return Err(Status::not_found("handoff not found"));
-        }
-        let actor = principals.first().cloned().unwrap_or_default();
-        let revoked = self
-            .db
-            .revoke_handoff(
-                &inner.manifest_id,
-                &actor,
-                &inner.reason,
-                &inner.request_id,
-                now_millis(),
-            )
-            .map_err(Status::invalid_argument)?;
+        let revoked = HandoffLifecycle::new(&self.db)
+            .revoke(RevokeHandoffCommand {
+                manifest_id: &inner.manifest_id,
+                reason: &inner.reason,
+                request_id: &inner.request_id,
+                principals: &principals,
+                now_ms: now_millis(),
+            })
+            .map_err(map_handoff_lifecycle_error)?;
         Ok(Response::new(RevokeHandoffResponse {
             manifest: Some(to_proto_handoff(&revoked)),
         }))

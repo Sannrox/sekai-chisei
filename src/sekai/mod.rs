@@ -25,6 +25,7 @@ pub mod function;
 pub mod governed_action_type;
 pub mod governed_facts;
 pub mod handoff;
+pub(crate) mod handoff_lifecycle;
 pub mod json;
 pub mod learning;
 pub mod lease;
