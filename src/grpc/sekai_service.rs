@@ -68,7 +68,8 @@ use crate::sekai::object_mutation::{
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::work_unit_lifecycle::{
-    AdmitWorkUnit, TransitionWorkUnit, WorkUnitLifecycle, WorkUnitLifecycleError,
+    AdmitWorkUnit, CreateAuthorizationTarget, CreateWorkUnit, CreateWorkUnitError,
+    ReconcileWorkUnits, TransitionWorkUnit, WorkUnitLifecycle, WorkUnitLifecycleError,
     WorkUnitTransition,
 };
 use crate::sekai::{
@@ -2501,23 +2502,6 @@ fn trim_page<T>(items: &mut Vec<T>, limit: i32) {
     }
 }
 
-fn initialize_work_unit_for_create(work_unit: &mut coordination::WorkUnit, principal: &str) {
-    if work_unit.owner_principal.is_empty() {
-        work_unit.owner_principal = principal.into();
-    }
-    if work_unit.creator_principal.is_empty() {
-        work_unit.creator_principal = principal.into();
-    }
-    work_unit.status = coordination::WORK_UNIT_STATUS_PENDING.into();
-    work_unit.admitted_at = 0;
-    work_unit.started_at = 0;
-    work_unit.finished_at = 0;
-    work_unit.last_heartbeat_at = 0;
-    work_unit.failure_reason.clear();
-    work_unit.cancel_reason.clear();
-    work_unit.updated_at = work_unit.created_at;
-}
-
 fn to_domain_handoff_reference(reference: &HandoffReference) -> handoff_domain::HandoffReference {
     handoff_domain::HandoffReference {
         kind: reference.kind.clone(),
@@ -2682,46 +2666,6 @@ fn map_handoff_lifecycle_error(error: HandoffLifecycleError) -> Status {
     }
 }
 
-fn aggregate_reconcile_summary(
-    summary: &mut coordination::ReconcileSummary,
-    next: coordination::ReconcileSummary,
-) {
-    summary.work_units_reconciled += next.work_units_reconciled;
-    summary.reservations_released += next.reservations_released;
-    summary.details.extend(next.details);
-}
-
-fn reconcile_owned_scope(
-    db: &RuntimeDb,
-    now_ms: i64,
-    scope_id: String,
-    dry_run: bool,
-    limit: i32,
-    summary: &mut coordination::ReconcileSummary,
-) -> Result<(), Status> {
-    if limit > 0 && summary.work_units_reconciled >= limit {
-        return Ok(());
-    }
-    let remaining = if limit > 0 {
-        limit - summary.work_units_reconciled
-    } else {
-        0
-    };
-    let next = db
-        .reconcile_work_units(
-            now_ms,
-            &coordination::ReconcileFilter {
-                dry_run,
-                work_unit_id: None,
-                scope_id: Some(scope_id),
-                limit: remaining,
-            },
-        )
-        .map_err(Status::internal)?;
-    aggregate_reconcile_summary(summary, next);
-    Ok(())
-}
-
 fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
     let role = security::Role::parse(&g.role).ok_or(Status::invalid_argument("invalid role"))?;
     Ok(security::Grant {
@@ -2790,6 +2734,8 @@ fn map_lease_lifecycle_error(error: LeaseLifecycleError) -> Status {
 fn map_work_unit_lifecycle_error(error: WorkUnitLifecycleError) -> Status {
     match error {
         WorkUnitLifecycleError::NotFound(message) => Status::not_found(message),
+        WorkUnitLifecycleError::PermissionDenied(message) => Status::permission_denied(message),
+        WorkUnitLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
         WorkUnitLifecycleError::FailedPrecondition(message) => Status::failed_precondition(message),
         WorkUnitLifecycleError::Storage(message) => Status::internal(message),
     }
@@ -5545,7 +5491,7 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
-        let mut work_unit = inner
+        let work_unit = inner
             .work_unit
             .ok_or(Status::invalid_argument("work_unit required"))
             .map(|work_unit| from_proto_work_unit(&work_unit))?;
@@ -5553,78 +5499,45 @@ impl SekaiService for SekaiServiceImpl {
             .first()
             .cloned()
             .ok_or(Status::unauthenticated("principal required"))?;
-        if let Some(existing) = self
-            .db
-            .get_dedup_request(&inner.request_id, "create_work_unit")
-            .map_err(Status::internal)?
-            .filter(|record| record.principal == principal)
-        {
-            let work_unit = self
-                .db
-                .get_work_unit(&existing.work_unit_id)
-                .map_err(Status::internal)?
-                .ok_or(Status::not_found("work unit not found"))?;
-            return Ok(Response::new(CreateWorkUnitResponse {
-                work_unit: Some(to_proto_work_unit(&work_unit)),
-            }));
-        }
-        if !work_unit.idempotency_key.is_empty() {
-            if let Some(existing) = self
-                .db
-                .get_work_unit_by_idempotency_key(&work_unit.idempotency_key)
-                .map_err(Status::internal)?
-            {
-                check_work_unit_read(&self.db, &self.security, &existing, &principals)?;
-                return Ok(Response::new(CreateWorkUnitResponse {
-                    work_unit: Some(to_proto_work_unit(&existing)),
-                }));
-            }
-        }
-        if !work_unit.target_object_id.is_empty() {
-            check_object_namespace_access(
-                &self.db,
-                &principals,
-                &work_unit.target_object_id,
-                true,
-            )?;
-            check_write(&self.security, &work_unit.target_object_id, &principals)?;
-        } else if is_managed_team_principal(&self.db, &principals)? {
-            return Err(Status::permission_denied(
-                "team work units require a namespace-bound target object",
-            ));
-        }
-        let scope = self
-            .db
-            .get_contention_scope(&work_unit.scope_id)
-            .map_err(Status::internal)?
-            .ok_or(Status::not_found("scope not found"))?;
-        check_scope_read(&scope, &principals)?;
-        initialize_work_unit_for_create(&mut work_unit, &principal);
-        self.db
-            .create_work_unit(&work_unit)
-            .map_err(Status::invalid_argument)?;
-        let event = coordination::RunEvent {
-            id: format!("evt:{}:created:{}", work_unit.id, work_unit.created_at),
-            work_unit_id: work_unit.id.clone(),
-            event_type: "created".into(),
-            message: "work unit created".into(),
-            evidence: std::collections::HashMap::from([(
-                "scope_id".into(),
-                work_unit.scope_id.clone(),
-            )]),
-            created_at: work_unit.created_at,
-        };
-        self.db.append_run_event(&event).map_err(Status::internal)?;
-        self.db
-            .record_dedup_request(&coordination::RequestDedup {
-                request_id: inner.request_id,
-                operation: "create_work_unit".into(),
-                principal: dedup_principal(&principals),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: chrono::Utc::now().timestamp_millis(),
-            })
-            .map_err(Status::internal)?;
+        let work_unit = WorkUnitLifecycle::new(&self.db)
+            .create(
+                CreateWorkUnit {
+                    work_unit,
+                    request_id: &inner.request_id,
+                    principal: &principal,
+                    now_ms: chrono::Utc::now().timestamp_millis(),
+                },
+                |target| match target {
+                    CreateAuthorizationTarget::IdempotencyReplay(existing) => {
+                        check_work_unit_read(&self.db, &self.security, existing, &principals)
+                    }
+                    CreateAuthorizationTarget::New(candidate) => {
+                        if !candidate.target_object_id.is_empty() {
+                            check_object_namespace_access(
+                                &self.db,
+                                &principals,
+                                &candidate.target_object_id,
+                                true,
+                            )?;
+                            check_write(&self.security, &candidate.target_object_id, &principals)?;
+                        } else if is_managed_team_principal(&self.db, &principals)? {
+                            return Err(Status::permission_denied(
+                                "team work units require a namespace-bound target object",
+                            ));
+                        }
+                        let scope = self
+                            .db
+                            .get_contention_scope(&candidate.scope_id)
+                            .map_err(Status::internal)?
+                            .ok_or(Status::not_found("scope not found"))?;
+                        check_scope_read(&scope, &principals)
+                    }
+                },
+            )
+            .map_err(|error| match error {
+                CreateWorkUnitError::Authorization(status) => status,
+                CreateWorkUnitError::Lifecycle(error) => map_work_unit_lifecycle_error(error),
+            })?;
         Ok(Response::new(CreateWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -5911,87 +5824,16 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let inner = req.into_inner();
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let summary = if !inner.work_unit_id.is_empty() {
-            let work_unit = self
-                .db
-                .get_work_unit(&inner.work_unit_id)
-                .map_err(Status::internal)?
-                .ok_or(Status::not_found("work unit not found"))?;
-            let scope = self
-                .db
-                .get_contention_scope(&work_unit.scope_id)
-                .map_err(Status::internal)?
-                .ok_or(Status::not_found("scope not found"))?;
-            check_scope_write(&scope, &principals)?;
-            if !inner.scope_id.is_empty() && inner.scope_id != work_unit.scope_id {
-                return Ok(Response::new(ReconcileWorkUnitsResponse {
-                    work_units_reconciled: 0,
-                    reservations_released: 0,
-                    details: Vec::new(),
-                }));
-            }
-            self.db
-                .reconcile_work_units(
-                    now_ms,
-                    &coordination::ReconcileFilter {
-                        dry_run: inner.dry_run,
-                        work_unit_id: Some(inner.work_unit_id),
-                        scope_id: if inner.scope_id.is_empty() {
-                            None
-                        } else {
-                            Some(inner.scope_id)
-                        },
-                        limit: inner.limit,
-                    },
-                )
-                .map_err(Status::internal)?
-        } else if !inner.scope_id.is_empty() {
-            let scope = self
-                .db
-                .get_contention_scope(&inner.scope_id)
-                .map_err(Status::internal)?
-                .ok_or(Status::not_found("scope not found"))?;
-            check_scope_write(&scope, &principals)?;
-            self.db
-                .reconcile_work_units(
-                    now_ms,
-                    &coordination::ReconcileFilter {
-                        dry_run: inner.dry_run,
-                        work_unit_id: None,
-                        scope_id: Some(inner.scope_id),
-                        limit: inner.limit,
-                    },
-                )
-                .map_err(Status::internal)?
-        } else {
-            let mut owned_scope_ids: Vec<String> = self
-                .db
-                .list_contention_scopes()
-                .map_err(Status::internal)?
-                .into_iter()
-                .filter(|scope| principal_matches(&scope.owner_principal, &principals))
-                .map(|scope| scope.id)
-                .collect();
-            owned_scope_ids.sort();
-            if owned_scope_ids.is_empty() {
-                return Err(Status::permission_denied(
-                    "reconcile requires scope ownership",
-                ));
-            }
-            let mut summary = coordination::ReconcileSummary::default();
-            for scope_id in owned_scope_ids {
-                reconcile_owned_scope(
-                    &self.db,
-                    now_ms,
-                    scope_id,
-                    inner.dry_run,
-                    inner.limit,
-                    &mut summary,
-                )?;
-            }
-            summary
-        };
+        let summary = WorkUnitLifecycle::new(&self.db)
+            .reconcile(ReconcileWorkUnits {
+                work_unit_id: &inner.work_unit_id,
+                scope_id: &inner.scope_id,
+                principals: &principals,
+                dry_run: inner.dry_run,
+                limit: inner.limit,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .map_err(map_work_unit_lifecycle_error)?;
         Ok(Response::new(ReconcileWorkUnitsResponse {
             work_units_reconciled: summary.work_units_reconciled,
             reservations_released: summary.reservations_released,

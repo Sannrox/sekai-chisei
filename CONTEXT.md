@@ -124,6 +124,19 @@ runtime claims, acknowledges terminal or parked outcomes, records host claim
 events, projects receipt harvest events, and records audit decisions after
 durable persistence.
 
+## Work Unit coordination
+
+A **Work Unit** is a durable coordination record that moves through pending,
+running, and terminal states while holding reservations in an owned contention
+scope. Its lifecycle interface owns creation replay, server-owned state
+normalization, created-event and deduplication ordering, admission, terminal
+transitions, and authorized reconciliation across owned scopes.
+
+The gRPC adapter owns caller authentication, target-object authorization, and
+protocol projection. It supplies an authorization hook for creation candidates
+and idempotency replays; the lifecycle decides when that hook runs so request
+replay ordering remains transport-independent.
+
 ## Action execution
 
 ## Catalog invocation receipt lifecycle
