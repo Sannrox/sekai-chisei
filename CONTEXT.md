@@ -72,6 +72,19 @@ The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline.
 
+## Evaluation manifest resolution
+
+The **Evaluation manifest resolution lifecycle** freezes one authorized,
+situation-specific Evaluation plan into a canonical immutable manifest. Its
+private interface owns request replay, authorization-filtered invariant and
+Evidence closure, evaluator availability and integrity checks, fail-closed
+coverage outcomes, snapshot consistency, canonical construction, and durable
+persistence ordering.
+
+The gRPC adapter owns caller authentication, request preparation, future-time
+admission, and protocol projection. Resolution remains an internal
+deterministic phase, separate from deterministic and stochastic execution.
+
 ## Evaluation execution
 
 The **Evaluation execution lifecycle** executes and cancels one resolved
