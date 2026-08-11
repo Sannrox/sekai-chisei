@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ActionWorkLifecycleModule",
+      "description": "Sekai-owned deep module whose interface owns runtime Action Work listing, claim, heartbeat, acknowledgement, parking, claim-event reporting, receipt harvest, audit recording, and storage-error classification.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates and authorizes Action Work callers, maps protocol messages, and delegates durable lifecycle behavior to the Action Work lifecycle module.",
+      "superclasses": []
+    },
+    {
+      "name": "ActionWork",
+      "description": "Runtime-dispatch work materialized as an ActionInstance effect and advanced by generation-fenced host claims, heartbeats, terminal acknowledgements, parking, and continuation events.",
+      "superclasses": []
+    },
+    {
+      "name": "ActionWorkPersistenceAdapter",
+      "description": "SQLite or PostgreSQL persistence adapter exposed through RuntimeDb for Action Work effects, parks, continuations, claim events, operation receipts, and audit decisions.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_action_work_lifecycle_to",
+      "description": "The gRPC transport delegates Action Work listing, claim, heartbeat, acknowledgement, parking, event reporting, receipt harvest, audit, and error classification to the Action Work lifecycle module.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ActionWorkLifecycleModule"
+    },
+    {
+      "name": "governs_action_work",
+      "description": "The Action Work lifecycle module governs durable host claim and acknowledgement transitions for Action Work.",
+      "domain": "ActionWorkLifecycleModule",
+      "range": "ActionWork"
+    },
+    {
+      "name": "uses_action_work_persistence_adapter",
+      "description": "The Action Work lifecycle module uses the RuntimeDb persistence adapter seam for SQLite and PostgreSQL Action Work storage.",
+      "domain": "ActionWorkLifecycleModule",
+      "range": "ActionWorkPersistenceAdapter"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ActionWorkLifecycleModule",
+      "source": "src/sekai/action_work_lifecycle.rs",
+      "locator": "ActionWorkLifecycle",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "list_claimable_action_work/claim_action_work/heartbeat_action_claim/ack_action_work/report_action_claim_event",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ActionWork",
+      "source": "src/sekai/action_effect.rs",
+      "locator": "ActionEffect runtime_dispatch claim and acknowledgement methods",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ActionWorkPersistenceAdapter",
+      "source": "src/db/runtime_db.rs",
+      "locator": "list_claimable_action_work/claim_action_work/heartbeat_action_claim/ack_action_work/park_action_work/report_action_claim_event",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_action_work_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "ActionWorkLifecycle call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_action_work",
+      "source": "src/sekai/action_work_lifecycle.rs",
+      "locator": "list_claimable/claim/heartbeat/ack/report_event",
+      "confidence": 1.0
+    },
+    {
+      "subject": "uses_action_work_persistence_adapter",
+      "source": "src/sekai/action_work_lifecycle.rs",
+      "locator": "RuntimeDb calls",
+      "confidence": 1.0
+    }
+  ]
+}

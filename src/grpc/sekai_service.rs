@@ -35,6 +35,11 @@ use crate::sekai::action_lifecycle::{
     self, ActionAudit, ActionLimitExceeded, GovernedActionContext,
 };
 use crate::sekai::action_policy::{self, ActionDecision};
+use crate::sekai::action_work_lifecycle::{
+    AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
+    ClaimActionWork as ClaimActionWorkCommand, HeartbeatActionClaim as HeartbeatActionClaimCommand,
+    ReportActionClaimEvent as ReportActionClaimEventCommand,
+};
 use crate::sekai::attestation;
 use crate::sekai::capability;
 use crate::sekai::evidence as evidence_domain;
@@ -3449,6 +3454,18 @@ fn approval_adapter_error(status: Status) -> ApprovalLifecycleError {
             ApprovalLifecycleError::ReferencedNotFound(status.message().into())
         }
         _ => ApprovalLifecycleError::Storage(status.message().into()),
+    }
+}
+
+fn action_work_lifecycle_status(error: ActionWorkLifecycleError) -> Status {
+    match error {
+        ActionWorkLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
+        ActionWorkLifecycleError::FailedPrecondition(message) => {
+            Status::failed_precondition(message)
+        }
+        ActionWorkLifecycleError::AlreadyExists(message) => Status::already_exists(message),
+        ActionWorkLifecycleError::NotFound(message) => Status::not_found(message),
+        ActionWorkLifecycleError::Internal(message) => Status::internal(message),
     }
 }
 
@@ -7356,10 +7373,9 @@ impl SekaiService for SekaiServiceImpl {
         } else {
             inner.limit as usize
         };
-        let effects = self
-            .db
-            .list_claimable_action_work(&inner.namespace, runtime, now_millis(), limit)
-            .map_err(Status::internal)?
+        let effects = ActionWorkLifecycle::new(&self.db)
+            .list_claimable(&inner.namespace, runtime, now_millis(), limit)
+            .map_err(action_work_lifecycle_status)?
             .iter()
             .map(to_proto_action_effect)
             .collect();
@@ -7389,59 +7405,26 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or_else(|| Status::not_found("action effect not found"))?;
         // Claim requires namespace write so only authorized hosts can take work.
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
-        let stored = self
-            .db
-            .claim_action_work(
-                &inner.effect_id,
-                &inner.runtime_id,
-                &inner.request_id,
-                inner.ttl_ms,
+        let actor = principals.first().cloned().unwrap_or_default();
+        let claimed = ActionWorkLifecycle::new(&self.db)
+            .claim(
+                ClaimActionWorkCommand {
+                    effect_id: &inner.effect_id,
+                    runtime_id: &inner.runtime_id,
+                    request_id: &inner.request_id,
+                    ttl_ms: inner.ttl_ms,
+                },
+                &actor,
                 now_millis(),
             )
-            .map_err(|e| {
-                if e.contains("already claimed")
-                    || e.contains("not claimable")
-                    || e.contains("retry limit exceeded")
-                    || e.contains("dead-lettered")
-                {
-                    Status::failed_precondition(e)
-                } else if e.contains("required") || e.contains("ttl") || e.contains("NUL") {
-                    Status::invalid_argument(e)
-                } else if e.contains("not found") {
-                    Status::not_found(e)
-                } else {
-                    Status::internal(e)
-                }
-            })?;
-        let actor = principals.first().cloned().unwrap_or_default();
-        let _ = self.db.record_decision(&audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now_millis(),
-            actor,
-            action: "claim_action_work".into(),
-            reason: "action_effect_claimed".into(),
-            evidence: std::collections::HashMap::from([
-                ("effect_id".into(), stored.effect_id.clone()),
-                ("runtime_id".into(), stored.claim_owner.clone()),
-                ("generation".into(), stored.claim_generation.to_string()),
-                ("instance_id".into(), stored.instance_id.clone()),
-                ("operation_id".into(), stored.operation_id.clone()),
-            ]),
-            target_id: stored.effect_id.clone(),
-            outcome: stored.status.clone(),
-        });
-        let active = self
-            .db
-            .get_active_continuation(&stored)
-            .map_err(Status::internal)?;
+            .map_err(action_work_lifecycle_status)?;
         Ok(Response::new(ClaimActionWorkResponse {
-            effect: Some(to_proto_action_effect(&stored)),
-            continuation: active
+            effect: Some(to_proto_action_effect(&claimed.effect)),
+            continuation: claimed
+                .continuation
                 .as_ref()
-                .map(|(continuation, _)| to_proto_action_work_continuation(continuation)),
-            park: active
-                .as_ref()
-                .map(|(_, park)| to_proto_action_work_park(park)),
+                .map(to_proto_action_work_continuation),
+            park: claimed.park.as_ref().map(to_proto_action_work_park),
         }))
     }
 
@@ -7458,25 +7441,20 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action effect not found"))?;
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
-        let stored = self
-            .db
-            .heartbeat_action_claim(
-                &inner.effect_id,
-                &inner.runtime_id,
-                inner.claim_generation,
-                &inner.fencing_token,
-                inner.ttl_ms,
+        let actor = principals.first().cloned().unwrap_or_default();
+        let stored = ActionWorkLifecycle::new(&self.db)
+            .heartbeat(
+                HeartbeatActionClaimCommand {
+                    effect_id: &inner.effect_id,
+                    runtime_id: &inner.runtime_id,
+                    claim_generation: inner.claim_generation,
+                    fencing_token: &inner.fencing_token,
+                    ttl_ms: inner.ttl_ms,
+                },
+                &actor,
                 now_millis(),
             )
-            .map_err(|e| {
-                if e.contains("fencing") || e.contains("expired") || e.contains("not claimed") {
-                    Status::failed_precondition(e)
-                } else if e.contains("not found") {
-                    Status::not_found(e)
-                } else {
-                    Status::invalid_argument(e)
-                }
-            })?;
+            .map_err(action_work_lifecycle_status)?;
         Ok(Response::new(HeartbeatActionClaimResponse {
             effect: Some(to_proto_action_effect(&stored)),
         }))
@@ -7497,165 +7475,28 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
         let now = now_millis();
         let actor = principals.first().cloned().unwrap_or_default();
-        if inner.outcome == crate::sekai::action_effect::ACK_OUTCOME_PARKED {
-            let result = self
-                .db
-                .park_action_work(
-                    &inner.effect_id,
-                    &inner.runtime_id,
-                    inner.claim_generation,
-                    &inner.fencing_token,
-                    &inner.reason,
-                    &inner.request_id,
-                    &inner.checkpoint_store_id,
-                    &inner.checkpoint_ref,
-                    &inner.checkpoint_digest,
-                    &actor,
-                    now,
-                )
-                .map_err(|error| {
-                    if error.contains("fencing")
-                        || error.contains("expired")
-                        || error.contains("not claimed")
-                        || error.contains("retry limit")
-                    {
-                        Status::failed_precondition(error)
-                    } else if error.contains("required")
-                        || error.contains("checkpoint")
-                        || error.contains("bounds")
-                        || error.contains("NUL")
-                    {
-                        Status::invalid_argument(error)
-                    } else if error.contains("conflict") {
-                        Status::already_exists(error)
-                    } else {
-                        Status::internal(error)
-                    }
-                })?;
-            let _ = self.db.record_decision(&audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now,
-                actor,
-                action: "ack_action_work".into(),
-                reason: "action_effect_parked".into(),
-                evidence: HashMap::from([
-                    ("effect_id".into(), result.effect.effect_id.clone()),
-                    ("operation_id".into(), result.effect.operation_id.clone()),
-                    ("park_id".into(), result.park.park_id.clone()),
-                    (
-                        "park_generation".into(),
-                        result.park.park_generation.to_string(),
-                    ),
-                    ("request_digest".into(), result.park.request_digest.clone()),
-                ]),
-                target_id: result.effect.effect_id.clone(),
-                outcome: "awaiting_continuation".into(),
-            });
-            return Ok(Response::new(AckActionWorkResponse {
-                effect: Some(to_proto_action_effect(&result.effect)),
-                park: Some(to_proto_action_work_park(&result.park)),
-                replay: result.replay,
-            }));
-        }
-        let stored = self
-            .db
-            .ack_action_work(
-                &inner.effect_id,
-                &inner.runtime_id,
-                inner.claim_generation,
-                &inner.fencing_token,
-                &inner.outcome,
-                &inner.reason,
+        let acked = ActionWorkLifecycle::new(&self.db)
+            .ack(
+                AckActionWorkCommand {
+                    effect_id: &inner.effect_id,
+                    runtime_id: &inner.runtime_id,
+                    claim_generation: inner.claim_generation,
+                    fencing_token: &inner.fencing_token,
+                    outcome: &inner.outcome,
+                    reason: &inner.reason,
+                    request_id: &inner.request_id,
+                    checkpoint_store_id: &inner.checkpoint_store_id,
+                    checkpoint_ref: &inner.checkpoint_ref,
+                    checkpoint_digest: &inner.checkpoint_digest,
+                },
+                &actor,
                 now,
             )
-            .map_err(|e| {
-                if e.contains("fencing") || e.contains("expired") || e.contains("not claimed") {
-                    Status::failed_precondition(e)
-                } else if e.contains("invalid") || e.contains("NUL") {
-                    Status::invalid_argument(e)
-                } else if e.contains("not found") {
-                    Status::not_found(e)
-                } else {
-                    Status::internal(e)
-                }
-            })?;
-        // #400: bind host ack into the operation receipt harvest spine.
-        if matches!(
-            stored.status.as_str(),
-            crate::sekai::action_effect::EFFECT_STATUS_COMPLETED
-                | crate::sekai::action_effect::EFFECT_STATUS_FAILED
-        ) {
-            if let Some(mut receipt) = self
-                .db
-                .get_operation_receipt(&stored.operation_id)
-                .map_err(Status::internal)?
-            {
-                let has_outcome = receipt
-                    .events
-                    .iter()
-                    .any(|e| e.kind == ReceiptEventKind::OutcomeRecorded);
-                if !has_outcome {
-                    let parent = receipt
-                        .events
-                        .last()
-                        .map(|e| e.event_id.clone())
-                        .unwrap_or_else(|| format!("{}:intent", stored.operation_id));
-                    receipt.events.push(OperationReceiptEvent {
-                        event_id: format!("{}:action-ack", stored.operation_id),
-                        operation_id: stored.operation_id.clone(),
-                        parent_event_id: Some(parent.clone()),
-                        timestamp_ms: now,
-                        kind: ReceiptEventKind::ActionPerformed,
-                        surface: ReceiptEventKind::ActionPerformed.surface(),
-                        actor: inner.runtime_id.clone(),
-                        references: Vec::new(),
-                        attributes: BTreeMap::from([
-                            ("effect_id".into(), stored.effect_id.clone()),
-                            ("instance_id".into(), stored.instance_id.clone()),
-                            ("source".into(), "ack_action_work".into()),
-                        ]),
-                    });
-                    receipt.events.push(OperationReceiptEvent {
-                        event_id: format!("{}:outcome", stored.operation_id),
-                        operation_id: stored.operation_id.clone(),
-                        parent_event_id: Some(format!("{}:action-ack", stored.operation_id)),
-                        timestamp_ms: now,
-                        kind: ReceiptEventKind::OutcomeRecorded,
-                        surface: ReceiptEventKind::OutcomeRecorded.surface(),
-                        actor: inner.runtime_id.clone(),
-                        references: Vec::new(),
-                        attributes: BTreeMap::from([
-                            ("outcome".into(), stored.status.clone()),
-                            ("effect_id".into(), stored.effect_id.clone()),
-                        ]),
-                    });
-                    receipt.completed_at_ms = Some(now);
-                    self.db
-                        .put_operation_receipt(&receipt)
-                        .map_err(Status::internal)?;
-                }
-            }
-        }
-        let _ = self.db.record_decision(&audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor,
-            action: "ack_action_work".into(),
-            reason: format!("action_effect_{}", stored.status),
-            evidence: std::collections::HashMap::from([
-                ("effect_id".into(), stored.effect_id.clone()),
-                ("runtime_id".into(), stored.claim_owner.clone()),
-                ("outcome".into(), stored.status.clone()),
-                ("instance_id".into(), stored.instance_id.clone()),
-                ("operation_id".into(), stored.operation_id.clone()),
-            ]),
-            target_id: stored.effect_id.clone(),
-            outcome: stored.status.clone(),
-        });
+            .map_err(action_work_lifecycle_status)?;
         Ok(Response::new(AckActionWorkResponse {
-            effect: Some(to_proto_action_effect(&stored)),
-            park: None,
-            replay: false,
+            effect: Some(to_proto_action_effect(&acked.effect)),
+            park: acked.park.as_ref().map(to_proto_action_work_park),
+            replay: acked.replay,
         }))
     }
 
@@ -7672,28 +7513,23 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action effect not found"))?;
         check_team_namespace(&self.db, &principals, &effect.namespace, true)?;
-        let replay = self
-            .db
-            .report_action_claim_event(
-                &inner.effect_id,
-                &inner.runtime_id,
-                inner.claim_generation,
-                &inner.fencing_token,
-                &inner.kind,
-                &inner.checkpoint_digest,
-                &inner.reason_code,
-                &inner.request_id,
+        let actor = principals.first().cloned().unwrap_or_default();
+        let replay = ActionWorkLifecycle::new(&self.db)
+            .report_event(
+                ReportActionClaimEventCommand {
+                    effect_id: &inner.effect_id,
+                    runtime_id: &inner.runtime_id,
+                    claim_generation: inner.claim_generation,
+                    fencing_token: &inner.fencing_token,
+                    kind: &inner.kind,
+                    checkpoint_digest: &inner.checkpoint_digest,
+                    reason_code: &inner.reason_code,
+                    request_id: &inner.request_id,
+                },
+                &actor,
                 now_millis(),
             )
-            .map_err(|error| {
-                if error.contains("fence") {
-                    Status::failed_precondition(error)
-                } else if error.contains("conflict") {
-                    Status::already_exists(error)
-                } else {
-                    Status::invalid_argument(error)
-                }
-            })?;
+            .map_err(action_work_lifecycle_status)?;
         Ok(Response::new(ReportActionClaimEventResponse { replay }))
     }
 
