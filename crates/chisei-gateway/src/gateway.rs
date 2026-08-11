@@ -13745,11 +13745,7 @@ mod tests {
     }
 
     async fn spawn_gateway_with_config(config: GatewayConfig) -> String {
-        spawn_gateway_with_runtime(
-            config,
-            GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None),
-        )
-        .await
+        spawn_gateway_with_runtime(config, test_gateway_runtime()).await
     }
 
     async fn spawn_gateway_with_runtime(
@@ -13770,6 +13766,17 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}")
+    }
+
+    fn test_gateway_runtime() -> GatewayRuntime {
+        GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None).with_resilience(
+            ResilienceConfig {
+                control_plane_retries: 4,
+                control_plane_retry_backoff: Duration::from_millis(50),
+                control_plane_timeout: Duration::from_secs(10),
+                ..ResilienceConfig::default()
+            },
+        )
     }
 
     fn short_http_timeouts() -> HttpTimeouts {
