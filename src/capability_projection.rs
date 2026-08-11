@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tonic::{Code, Request, Status, metadata::MetadataValue};
 
-use crate::grpc::pb::sekai::{
-    ActionParamDef, ActionTypeDef, CapabilityEntry, ObjectType, PropertyDef, StructFieldDef,
-};
+use crate::grpc::pb::sekai::{CapabilityEntry, ObjectType, PropertyDef, StructFieldDef};
 
 pub const PROJECTION_VERSION: &str = "sekai.capability-projection/v1";
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -47,7 +45,6 @@ pub struct ProjectedCapability {
     pub limits: BTreeMap<String, u64>,
     pub evidence_requirements: Vec<String>,
     pub object_schema: Option<Value>,
-    pub action_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,7 +159,6 @@ impl ProjectedCapability {
                 .collect(),
             evidence_requirements: entry.evidence_requirements.clone(),
             object_schema: entry.object_type.as_ref().map(object_schema),
-            action_schema: entry.action_type.as_ref().map(action_schema),
         })
     }
 
@@ -311,42 +307,10 @@ fn grpc_code_name(code: Code) -> &'static str {
 }
 
 fn invocation_input_schema(capability: &ProjectedCapability) -> Value {
-    capability.action_schema.clone().unwrap_or_else(|| {
-        json!({
-            "type": "object",
-            "description": format!("Canonical protobuf JSON for {}", capability.input_type),
-        })
-    })
-}
-
-fn action_schema(action: &ActionTypeDef) -> Value {
-    let properties = action
-        .params
-        .iter()
-        .map(|parameter| (parameter.name.clone(), action_parameter_schema(parameter)))
-        .collect::<serde_json::Map<_, _>>();
-    let required = action
-        .params
-        .iter()
-        .filter(|parameter| parameter.required)
-        .map(|parameter| Value::String(parameter.name.clone()))
-        .collect::<Vec<_>>();
     json!({
         "type": "object",
-        "properties": properties,
-        "required": required,
-        "additionalProperties": false,
-        "x-sekai-action": action.name,
-        "x-sekai-target-kind": action.target_kind,
+        "description": format!("Canonical protobuf JSON for {}", capability.input_type),
     })
-}
-
-fn action_parameter_schema(parameter: &ActionParamDef) -> Value {
-    let mut schema = scalar_schema(&parameter.r#type, &parameter.enum_values);
-    if let Some(object) = schema.as_object_mut() {
-        object.insert("x-sekai-required".into(), Value::Bool(parameter.required));
-    }
-    schema
 }
 
 fn object_schema(object_type: &ObjectType) -> Value {
@@ -383,22 +347,6 @@ fn struct_field_schema(field: &StructFieldDef) -> Value {
     })
 }
 
-fn scalar_schema(kind: &str, enum_values: &[String]) -> Value {
-    let json_type = match kind {
-        "int" | "integer" => "integer",
-        "float" | "double" | "number" => "number",
-        "bool" | "boolean" => "boolean",
-        "json" | "struct" => "object",
-        "list" | "array" => "array",
-        _ => "string",
-    };
-    let mut schema = json!({"type": json_type});
-    if !enum_values.is_empty() {
-        schema["enum"] = json!(enum_values);
-    }
-    schema
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,40 +360,26 @@ mod tests {
 
     fn entry() -> CapabilityEntry {
         CapabilityEntry {
-            name: "sekai.actions.write".into(),
-            description: "Write a governed value.".into(),
-            kind: "action".into(),
+            name: "sekai.objects.list".into(),
+            description: "List visible objects.".into(),
+            kind: "query".into(),
             lifecycle_state: "active".into(),
             contract_version: "1.0".into(),
             minimum_compatible_version: "1.0".into(),
             maximum_compatible_version: "1.0".into(),
             replacement_capability: String::new(),
-            input_type: "sekai.ExecuteActionRequest".into(),
-            output_type: "sekai.ExecuteActionResponse".into(),
-            required_scopes: vec!["namespace:write".into()],
-            policy_decision_points: vec!["namespace_access".into(), "action_policy".into()],
-            risk_class: "write".into(),
-            approval_behavior: "may_require".into(),
+            input_type: "sekai.ListObjectsRequest".into(),
+            output_type: "sekai.ListObjectsResponse".into(),
+            required_scopes: vec!["namespace:read".into()],
+            policy_decision_points: vec!["namespace_access".into()],
+            risk_class: "read".into(),
+            approval_behavior: "none".into(),
             limits: vec![CapabilityLimit {
-                name: "max_mutations_per_invocation".into(),
-                value: 1,
+                name: "max_page_size".into(),
+                value: 100,
             }],
             object_type: None,
-            action_type: Some(ActionTypeDef {
-                name: "write".into(),
-                description: "Write a value.".into(),
-                params: vec![ActionParamDef {
-                    name: "value".into(),
-                    r#type: "string".into(),
-                    required: true,
-                    enum_values: vec![],
-                }],
-                ops: vec![],
-                target_kind: "record".into(),
-                created: 0,
-                required_purpose: String::new(),
-            }),
-            evidence_requirements: vec!["audit_receipt".into()],
+            evidence_requirements: vec![],
             product_tier: "advanced".into(),
         }
     }
@@ -471,10 +405,7 @@ mod tests {
         assert_eq!(metadata, projection);
         assert_eq!(tool.name, projection.name);
         assert_eq!(tool.input_schema["additionalProperties"], false);
-        assert_eq!(
-            tool.input_schema["properties"]["input"]["required"],
-            json!(["value"])
-        );
+        assert_eq!(tool.input_schema["properties"]["input"]["type"], "object");
 
         let sdk = projection
             .invocation("operation-1", json!({"value": "safe"}))
@@ -498,7 +429,7 @@ mod tests {
         );
         assert_eq!(
             request.metadata().get("x-sekai-capability").unwrap(),
-            "sekai.actions.write"
+            "sekai.objects.list"
         );
         assert_eq!(
             request.metadata().get("x-sekai-operation-id").unwrap(),
@@ -539,9 +470,9 @@ mod tests {
         let sdk = projection()
             .invocation("operation-1", json!({"value": "safe"}))
             .unwrap();
-        let denied = sdk.normalize_error(&Status::permission_denied("write denied"));
+        let denied = sdk.normalize_error(&Status::permission_denied("query denied"));
         assert_eq!(denied.code, "permission_denied");
-        assert_eq!(denied.capability, "sekai.actions.write");
+        assert_eq!(denied.capability, "sekai.objects.list");
         assert_eq!(denied.operation_id, "operation-1");
         assert!(!denied.retryable);
     }
@@ -580,7 +511,7 @@ mod tests {
         .collect();
         assert_eq!(actual, fixture.expected_metadata);
         assert_eq!(
-            sdk.normalize_error(&Status::permission_denied("write denied")),
+            sdk.normalize_error(&Status::permission_denied("query denied")),
             fixture.expected_error
         );
     }

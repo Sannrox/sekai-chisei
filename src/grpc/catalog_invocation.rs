@@ -79,10 +79,12 @@ impl<'a> CatalogInvocation<'a> {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn mark_policy_decided(&mut self, decision: &str) {
         self.policy_decision = Some(decision.to_string());
     }
 
+    #[cfg(test)]
     pub(super) fn mark_budget_decided(&mut self, decision: &str) {
         self.budget_decision = Some(decision.to_string());
     }
@@ -101,81 +103,6 @@ impl<'a> CatalogInvocation<'a> {
         )?;
         self.finalized = true;
         Ok(())
-    }
-
-    pub(super) fn resolve_approval(
-        db: &RuntimeDb,
-        operation_id: &str,
-        approval_id: &str,
-        actor: &str,
-        decision: &str,
-        action: Option<&str>,
-        outcome: &str,
-    ) -> Result<(), Status> {
-        if operation_id.is_empty() {
-            return Ok(());
-        }
-        let Some(mut receipt) = db
-            .get_operation_receipt(operation_id)
-            .map_err(Status::internal)?
-        else {
-            return Ok(());
-        };
-        if receipt.operation_class != "catalog_invocation"
-            || !receipt.events.iter().any(|event| {
-                event.kind == ReceiptEventKind::OutcomeRecorded
-                    && event.attributes.get("approval_id").map(String::as_str) == Some(approval_id)
-            })
-        {
-            return Ok(());
-        }
-        receipt
-            .events
-            .retain(|event| event.kind != ReceiptEventKind::OutcomeRecorded);
-        let now = now_millis();
-        let event =
-            |suffix: &str,
-             parent: &str,
-             kind: ReceiptEventKind,
-             attributes: BTreeMap<String, String>| OperationReceiptEvent {
-                event_id: format!("{operation_id}:{suffix}"),
-                operation_id: operation_id.into(),
-                parent_event_id: Some(format!("{operation_id}:{parent}")),
-                timestamp_ms: now,
-                kind,
-                surface: kind.surface(),
-                actor: actor.into(),
-                references: Vec::new(),
-                attributes,
-            };
-        receipt.events.push(event(
-            "approval",
-            "budget",
-            ReceiptEventKind::ApprovalDecided,
-            BTreeMap::from([
-                ("approval_id".into(), approval_id.into()),
-                ("decision".into(), decision.into()),
-            ]),
-        ));
-        let outcome_parent = if let Some(action) = action {
-            receipt.events.push(event(
-                "action",
-                "approval",
-                ReceiptEventKind::ActionPerformed,
-                BTreeMap::from([("action".into(), action.into())]),
-            ));
-            "action"
-        } else {
-            "approval"
-        };
-        receipt.events.push(event(
-            "outcome",
-            outcome_parent,
-            ReceiptEventKind::OutcomeRecorded,
-            BTreeMap::from([("outcome".into(), outcome.into())]),
-        ));
-        receipt.completed_at_ms = Some(now);
-        db.put_operation_receipt(&receipt).map_err(Status::internal)
     }
 }
 

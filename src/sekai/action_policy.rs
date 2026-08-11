@@ -3,7 +3,7 @@
 //! A per-scope policy over action types and ops: allow / deny / require-approval.
 //! Policies are stored Sekai-natively as objects of kind `action_policy` with
 //! `external_id = action_policy:{scope}` and reloaded like namespace model
-//! policy. Enforcement happens at the `ExecuteAction` boundary, and decisions
+//! policy. Enforcement happens at governed write and admission boundaries, and decisions
 //! flow through the existing Sekai audit path.
 
 use crate::db::sekai::SekaiDb;

@@ -184,18 +184,6 @@ fn governed_learning_namespace(target: &Object) -> Result<String, String> {
     Ok(namespace)
 }
 
-pub(crate) fn record_learning_target_ids(
-    db: &RuntimeDb,
-    params: &HashMap<String, String>,
-) -> Result<Vec<String>, String> {
-    let input = RecordLearningInput::from_params(params)?;
-    let target = db
-        .get_object(&input.target_id)?
-        .ok_or_else(|| format!("object not found: {}", input.target_id))?;
-    governed_learning_namespace(&target)?;
-    Ok(vec![input.target_id, input.id])
-}
-
 pub(crate) fn record_learning(
     db: &RuntimeDb,
     schema: &SchemaRegistry,
@@ -411,7 +399,6 @@ fn ensure_matching_retry(
 mod tests {
     use super::*;
     use crate::domain::Direction;
-    use crate::sekai::action::{ActionExecutor, RiskClass};
     use crate::sekai::security::{Grant, Role};
 
     fn target(id: &str) -> Object {
@@ -448,72 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn record_learning_action_is_governed_as_two_sensitive_writes() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
-        db.create_object(&target("target-1")).unwrap();
-        let executor = ActionExecutor::new();
-        let params = record_params();
-
-        assert_eq!(
-            executor
-                .target_ids(&db, RECORD_LEARNING_ACTION, &params)
-                .unwrap(),
-            vec!["target-1".to_string(), "learning-request-42".to_string()]
-        );
-        assert_eq!(
-            executor.action_risk_class(RECORD_LEARNING_ACTION),
-            RiskClass::Write
-        );
-        assert_eq!(
-            executor.action_op_counts(RECORD_LEARNING_ACTION, &params),
-            (2, 0)
-        );
-        assert_eq!(
-            executor
-                .schema_kinds(&db, RECORD_LEARNING_ACTION, &params)
-                .unwrap(),
-            vec![KIND_LEARNING.to_string()]
-        );
-        assert_eq!(
-            executor
-                .planned_ops(RECORD_LEARNING_ACTION, &params)
-                .unwrap()
-                .len(),
-            2
-        );
-        let sensitive = executor.sensitive_param_names(RECORD_LEARNING_ACTION);
-        for name in [
-            "title",
-            "prevention",
-            "reasoning",
-            "source_request_id",
-            "score",
-            "passed",
-            "task_class",
-            "model",
-            "producer",
-            "status",
-        ] {
-            assert!(sensitive.contains(name));
-        }
-    }
-
-    #[test]
     fn record_learning_atomically_creates_object_link_acl_and_audit() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
-        let executor = ActionExecutor::new();
         let params = record_params();
-
-        executor
-            .execute(
-                &db,
-                &SchemaRegistry::new(),
-                RECORD_LEARNING_ACTION,
-                &params,
-                "worker-1",
-            )
-            .unwrap();
+        record_learning(&db, &SchemaRegistry::new(), &params, "worker-1").unwrap();
 
         let learning = db.get_object("learning-request-42").unwrap().unwrap();
         assert_eq!(learning.kind, KIND_LEARNING);
@@ -558,14 +484,11 @@ mod tests {
             })
             .unwrap();
         }
-        let executor = ActionExecutor::new();
         let params = record_params();
         let schema = SchemaRegistry::new();
 
         for _ in 0..2 {
-            executor
-                .execute(&db, &schema, RECORD_LEARNING_ACTION, &params, "alice")
-                .unwrap();
+            record_learning(&db, &schema, &params, "alice").unwrap();
         }
 
         let mut grants = db
@@ -600,15 +523,12 @@ mod tests {
     fn record_learning_rejects_untrusted_properties_and_collisions() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_object(&target("target-1")).unwrap();
-        let executor = ActionExecutor::new();
         let schema = SchemaRegistry::new();
 
         for key in ["classification", "chisei.egress.allow_provider"] {
             let mut params = record_params();
             params.insert(key.into(), "public".into());
-            let error = executor
-                .target_ids(&db, RECORD_LEARNING_ACTION, &params)
-                .unwrap_err();
+            let error = RecordLearningInput::from_params(&params).unwrap_err();
             assert!(error.contains("unknown param"));
         }
 
@@ -617,15 +537,7 @@ mod tests {
             ..target("other")
         })
         .unwrap();
-        let error = executor
-            .execute(
-                &db,
-                &schema,
-                RECORD_LEARNING_ACTION,
-                &record_params(),
-                "worker-1",
-            )
-            .unwrap_err();
+        let error = record_learning(&db, &schema, &record_params(), "worker-1").unwrap_err();
         assert!(error.contains("object id collision"));
         assert!(
             db.get_links("learning-request-42", REL_TOUCHES, &Direction::Outgoing)
@@ -736,7 +648,7 @@ mod tests {
         let mut params = record_params();
         params.insert("target_id".into(), "unscoped".into());
         assert!(
-            record_learning_target_ids(&db, &params)
+            record_learning(&db, &SchemaRegistry::new(), &params, "worker-1")
                 .unwrap_err()
                 .contains("no governed namespace")
         );

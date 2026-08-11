@@ -2,7 +2,7 @@
 
 Issue: [#395](https://github.com/Sannrox/sekai-chisei/issues/395)  
 Date: 2026-07-27  
-Status: **recommendation complete**  
+Status: **historical recommendation; legacy graph Action removed before 1.0**
 Follow-ups: existing #396–#401 (re-grounded below); no Design Discussion required for the mapping freeze if follow-ups stay additive and respect boundaries in this document.
 
 ## Decision question

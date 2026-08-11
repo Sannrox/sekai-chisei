@@ -22,8 +22,6 @@ use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEve
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
-use crate::sekai::action::ActionTypeDef;
-use crate::sekai::action_approval::{ActionApproval, ApprovalStatus};
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
 use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
@@ -1015,13 +1013,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn create_action_approval(&self, approval: &ActionApproval) -> Result<(), String> {
-        match self {
-            Self::Sqlite(db) => db.create_action_approval(approval),
-            Self::Postgres(db) => db.create_action_approval(approval),
-        }
-    }
-
     pub fn create_contention_scope(&self, scope: &ContentionScope) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.create_contention_scope(scope),
@@ -1147,13 +1138,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.create_work_unit(work_unit),
             Self::Postgres(db) => db.create_work_unit(work_unit),
-        }
-    }
-
-    pub fn delete_action_type(&self, name: &str) -> Result<bool, String> {
-        match self {
-            Self::Sqlite(db) => db.delete_action_type(name),
-            Self::Postgres(db) => db.delete_action_type(name),
         }
     }
 
@@ -1380,13 +1364,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.find_operation_receipt_by_request_id(request_id),
             Self::Postgres(db) => db.find_operation_receipt_by_request_id(request_id),
-        }
-    }
-
-    pub fn get_action_approval(&self, id: &str) -> Result<Option<ActionApproval>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_action_approval(id),
-            Self::Postgres(db) => db.get_action_approval(id),
         }
     }
 
@@ -1751,27 +1728,10 @@ impl RuntimeDb {
         }
     }
 
-    pub fn list_action_approvals(
-        &self,
-        status: Option<ApprovalStatus>,
-    ) -> Result<Vec<ActionApproval>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_action_approvals(status),
-            Self::Postgres(db) => db.list_action_approvals(status),
-        }
-    }
-
     pub fn list_action_policies(&self) -> Result<Vec<ActionPolicy>, String> {
         match self {
             Self::Sqlite(db) => db.list_action_policies(),
             Self::Postgres(db) => db.list_action_policies(),
-        }
-    }
-
-    pub fn list_action_types(&self) -> Result<Vec<ActionTypeDef>, String> {
-        match self {
-            Self::Sqlite(db) => db.list_action_types(),
-            Self::Postgres(db) => db.list_action_types(),
         }
     }
 
@@ -3454,13 +3414,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn update_action_approval(&self, approval: &ActionApproval) -> Result<(), String> {
-        match self {
-            Self::Sqlite(db) => db.update_action_approval(approval),
-            Self::Postgres(db) => db.update_action_approval(approval),
-        }
-    }
-
     pub fn update_contention_scope(&self, scope: &ContentionScope) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.update_contention_scope(scope),
@@ -3500,13 +3453,6 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.upsert_action_policy(policy),
             Self::Postgres(db) => db.upsert_action_policy(policy),
-        }
-    }
-
-    pub fn upsert_action_type(&self, action_type: &ActionTypeDef) -> Result<ActionTypeDef, String> {
-        match self {
-            Self::Sqlite(db) => db.upsert_action_type(action_type),
-            Self::Postgres(db) => db.upsert_action_type(action_type),
         }
     }
 
@@ -3658,19 +3604,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn action_type_target_ids(
-        &self,
-        action_type: &ActionTypeDef,
-        params: &HashMap<String, String>,
-    ) -> Result<Vec<String>, String> {
-        match self {
-            Self::Sqlite(db) => db.action_type_target_ids(action_type, params),
-            Self::Postgres(_) => Err(
-                "action_type_target_ids is unavailable on the PostgreSQL community runtime".into(),
-            ),
-        }
-    }
-
     /// SQLite-only raw connection access for legacy internals/tests.
     pub fn with_sqlite_conn<R>(
         &self,
@@ -3682,21 +3615,6 @@ impl RuntimeDb {
                 Ok(f(&conn))
             }
             Self::Postgres(_) => Err("raw SQLite connection is unavailable on PostgreSQL".into()),
-        }
-    }
-
-    pub fn execute_action_type(
-        &self,
-        action_type: &ActionTypeDef,
-        params: &HashMap<String, String>,
-        schema: &SchemaRegistry,
-        actor: &str,
-    ) -> Result<String, String> {
-        match self {
-            Self::Sqlite(db) => db.execute_action_type(action_type, params, schema, actor),
-            Self::Postgres(_) => {
-                Err("execute_action_type is unavailable on the PostgreSQL community runtime".into())
-            }
         }
     }
 

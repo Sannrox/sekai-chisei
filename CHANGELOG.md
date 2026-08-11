@@ -17,6 +17,9 @@
 
 ### Removed
 
+- Remove the pre-1.0 graph Action mutation DSL, its type registry, approval
+  queue, execution RPCs, persistence, CLI, and examples. Governed Action Types,
+  Action Instances, effects, work, and ActionPolicy remain the v1 contract.
 - Remove the server-side `SEKAI_AUTH_TOKEN` root bootstrap. Clients use
   `SEKAI_CREDENTIAL` with a durable principal-scoped credential.
 - Remove the unused capability-package and trust vertical: seven package

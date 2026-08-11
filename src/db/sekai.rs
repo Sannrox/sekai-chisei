@@ -59,6 +59,20 @@ pub struct PrincipalCredential {
 }
 
 impl SekaiDb {
+    fn drop_legacy_action_types(&self) -> Result<(), String> {
+        self.conn()
+            .execute_batch(
+                "DROP TABLE IF EXISTS sekai_action_types;
+                 DELETE FROM sekai_grants
+                   WHERE object_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval');
+                 DELETE FROM sekai_links
+                   WHERE from_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval')
+                      OR to_id IN (SELECT id FROM sekai_objects WHERE kind='action_approval');
+                 DELETE FROM sekai_objects WHERE kind='action_approval';",
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn new(path: &str) -> Result<Self, String> {
         Self::new_with_enterprise_extension(path, None)
     }
@@ -192,7 +206,7 @@ impl SekaiDb {
         self.migrate_evaluation_executions()?;
         self.migrate_governed_subject_provenance()?;
         self.migrate_kioku()?;
-        self.migrate_action_types()?;
+        self.drop_legacy_action_types()?;
         self.migrate_governed_action_types()?;
         self.migrate_action_instances()?;
         self.migrate_action_effects()?;
@@ -2481,6 +2495,44 @@ mod tests {
                 .iter()
                 .any(|column| column == "tenant_id")
         );
+    }
+
+    #[test]
+    fn startup_removes_pre_v1_legacy_action_state() {
+        let path = temp_db_path("legacy-actions");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE sekai_action_types (name TEXT PRIMARY KEY);
+                 INSERT INTO sekai_action_types (name) VALUES ('legacy');",
+            )
+            .unwrap();
+        db.create_object(&Object {
+            id: "approval-legacy".into(),
+            kind: "action_approval".into(),
+            name: "legacy".into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        drop(db);
+
+        let reopened = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let legacy_table_count: i64 = reopened
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sekai_action_types'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_table_count, 0);
+        assert!(reopened.get_object("approval-legacy").unwrap().is_none());
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

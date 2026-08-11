@@ -9,7 +9,7 @@ Research freeze: [research/395-action-effect-mapping.md](research/395-action-eff
 Authenticated callers **submit** a decision unit against a registered
 `GovernedActionType`. The plane runs admission gates and persists an
 **`ActionInstance`** with a bound **`operation_id`** for the existing operation
-receipt / harvest spine. This is **not** graph `ExecuteAction`.
+receipt / harvest spine.
 
 ## Wire names
 

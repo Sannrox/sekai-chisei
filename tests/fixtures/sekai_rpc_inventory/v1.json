@@ -657,42 +657,6 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "CreateActionType",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions"
-      ],
-      "evidence": [
-        "src/grpc/sekai_service.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListActionTypes",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions"
-      ],
-      "evidence": [
-        "tests/reusable_sekai_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "DeleteActionType",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions"
-      ],
-      "evidence": [
-        "tests/reusable_sekai_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "PutGovernedActionType",
       "kind": "persistent",
       "surfaces": [
@@ -863,21 +827,6 @@
       "product_tier": "advanced"
     },
     {
-      "rpc": "ExecuteAction",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "src/sekai/action.rs"
-      ],
-      "durable_dependencies": [
-        "sekai.action-definitions",
-        "sekai.graph",
-        "sekai.authorization",
-        "sekai.audit"
-      ],
-      "product_tier": "advanced"
-    },
-    {
       "rpc": "SetActionPolicy",
       "kind": "persistent",
       "surfaces": [
@@ -905,45 +854,6 @@
     },
     {
       "rpc": "ListActionPolicies",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/action_governance_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ApproveAction",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/action_governance_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "DenyAction",
-      "kind": "persistent",
-      "surfaces": [
-        "sekai.action-definitions",
-        "sekai.audit"
-      ],
-      "evidence": [
-        "tests/action_governance_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "advanced"
-    },
-    {
-      "rpc": "ListPendingApprovals",
       "kind": "persistent",
       "surfaces": [
         "sekai.action-definitions",

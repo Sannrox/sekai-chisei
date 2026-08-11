@@ -1,11 +1,5 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
-#[path = "action_approval_execution.rs"]
-mod action_approval_execution;
-#[path = "action_definition_lifecycle.rs"]
-mod action_definition_lifecycle;
-#[path = "action_execution.rs"]
-mod action_execution;
 #[path = "catalog_invocation.rs"]
 mod catalog_invocation;
 #[path = "object_mutation_lifecycle.rs"]
@@ -20,7 +14,7 @@ mod semantic_retrieval_lifecycle;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
@@ -30,20 +24,13 @@ use super::visible_page::{VisiblePageError, scan_visible_page};
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
-#[cfg(test)]
-use crate::chisei::receipt::ReceiptEventKind;
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain;
 use crate::gateway_keys::hash_gateway_key;
-use crate::sekai::action::{self, ActionExecutor, RiskClass};
-use crate::sekai::action_approval;
-use crate::sekai::action_approval_lifecycle::{
-    ActionApprovalLifecycle, ApprovalLifecycleError, DenyAction as DenyActionCommand,
-};
-use crate::sekai::action_lifecycle::ActionLimitExceeded;
+use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
     AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
@@ -89,9 +76,6 @@ use crate::sekai::{
 };
 use uuid::Uuid;
 
-use self::action_definition_lifecycle::{
-    ActionDefinitionLifecycle, ActionDefinitionLifecycleError,
-};
 use self::catalog_invocation::CatalogInvocation;
 use self::object_mutation_lifecycle::{
     GuardedCreateObjectRequest, GuardedDeleteObjectRequest, GuardedUpdateObjectRequest,
@@ -113,20 +97,8 @@ fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) 
     }
 }
 
-fn map_action_definition_lifecycle_error(error: ActionDefinitionLifecycleError) -> Status {
-    match error {
-        ActionDefinitionLifecycleError::Unavailable(error)
-        | ActionDefinitionLifecycleError::Persistence(error) => Status::internal(error),
-        ActionDefinitionLifecycleError::InvalidDefinition(error)
-        | ActionDefinitionLifecycleError::ProtectedBuiltin(error) => {
-            Status::invalid_argument(error)
-        }
-    }
-}
-
 pub struct SekaiServiceImpl {
     db: Arc<RuntimeDb>,
-    action_definitions: ActionDefinitionLifecycle,
     security: Arc<SecurityChecker>,
     schema_definitions: SchemaDefinitionLifecycle,
     budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
@@ -148,10 +120,8 @@ impl SekaiServiceImpl {
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
         let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
-        let action_definitions = ActionDefinitionLifecycle::load(db.clone());
         Self {
             db,
-            action_definitions,
             security,
             schema_definitions,
             budget: None,
@@ -269,15 +239,8 @@ impl SekaiServiceImpl {
         namespace: &str,
         principals: &[String],
     ) -> Result<Vec<CapabilityEntry>, Status> {
-        let actions = self
-            .action_definitions
-            .fresh_snapshot()
-            .map_err(|_| Status::internal("capability catalog unavailable"))?;
         check_team_namespace(&self.db, principals, namespace, false)
             .map_err(|_| Status::permission_denied("capability discovery denied"))?;
-        let can_write_namespace =
-            check_team_namespace(&self.db, principals, namespace, true).is_ok();
-
         let schema = self
             .schema_definitions
             .refresh_snapshot()
@@ -295,11 +258,6 @@ impl SekaiServiceImpl {
                     .is_ok()
             })
             .collect::<Vec<_>>();
-        let visible_kinds = visible_types
-            .iter()
-            .map(|object_type| object_type.kind.as_str())
-            .collect::<std::collections::HashSet<_>>();
-
         let mut entries = visible_types
             .iter()
             .map(object_query_capability)
@@ -309,234 +267,8 @@ impl SekaiServiceImpl {
         entries.push(retrieve_context_capability());
         entries.push(explain_derivation_capability());
         entries.push(kioku_candidates_capability());
-
-        let actor = principals.first().map(String::as_str).unwrap_or_default();
-        let resolved_policy = self
-            .db
-            .resolve_action_policy(actor, namespace, namespace)
-            .map_err(|_| Status::internal("capability catalog unavailable"))?;
-        let policy_mutation_limit = resolved_policy
-            .as_ref()
-            .and_then(|policy| policy.max_mutations_per_work_unit);
-        let policy_delete_limit = resolved_policy
-            .as_ref()
-            .and_then(|policy| policy.max_deletes_per_work_unit);
-        for action_type in actions.capability_action_types() {
-            if !can_write_namespace {
-                continue;
-            }
-            if !action_type.target_kind.is_empty()
-                && action_type.target_kind != "*"
-                && !visible_kinds.contains(action_type.target_kind.as_str())
-            {
-                continue;
-            }
-            if action_type.ops.iter().any(|op| {
-                op.op == "create_object"
-                    && !op.property.is_empty()
-                    && !visible_kinds.contains(op.property.as_str())
-            }) {
-                continue;
-            }
-            if check_read(
-                &self.security,
-                &action_object_id(&action_type.name),
-                principals,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            let risk = actions.action_risk_class(&action_type.name);
-            let (mutation_count, delete_count) =
-                actions.action_op_counts(&action_type.name, &HashMap::new());
-            let limits = ActionCapabilityLimits {
-                mutation_count,
-                delete_count,
-                policy_mutation_limit,
-                policy_delete_limit,
-            };
-            let decision = resolved_policy
-                .as_ref()
-                .map(|policy| policy.decide(&action_type.name, risk))
-                .unwrap_or(ActionDecision::Allow);
-            if decision == ActionDecision::Deny {
-                continue;
-            }
-            if action_type.name == "create_object" {
-                for object_type in visible_types
-                    .iter()
-                    .filter(|object_type| object_type.kind != "namespace")
-                {
-                    entries.push(create_object_capability(
-                        &action_type,
-                        object_type,
-                        risk,
-                        decision == ActionDecision::RequireApproval,
-                        limits,
-                    ));
-                }
-                continue;
-            }
-            entries.push(action_capability(
-                format!("sekai.actions.{}", action_type.name),
-                action_type,
-                risk,
-                decision == ActionDecision::RequireApproval,
-                limits,
-            ));
-        }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
-    }
-
-    /// Execute an action's effect (target auth + schema validation + mutation +
-    /// audit) without policy gating. Used to resume an approved held action.
-    /// `principals` are the identities re-checked for write access at execution
-    /// time. Returns the executor's success message.
-    fn run_action_effect(
-        &self,
-        action_name: &str,
-        params: &HashMap<String, String>,
-        actor: &str,
-        principals: &[String],
-    ) -> Result<String, Status> {
-        if self.db.enterprise_extension().is_some() {
-            return Err(Status::failed_precondition(
-                "enterprise action resumption requires a durable approval identity contract",
-            ));
-        }
-        let actions = self
-            .action_definitions
-            .fresh_snapshot()
-            .map_err(map_action_definition_lifecycle_error)?;
-        let tenant_context: Option<RequestEnterpriseContext> = None;
-        let mask_missing_link = actions.masks_missing_link(action_name);
-        let sensitive_params = actions.sensitive_param_names(action_name);
-        let target_ids = actions
-            .target_ids(&self.db, action_name, params)
-            .map_err(|err| {
-                if mask_missing_link && err == "link not found" {
-                    Status::permission_denied("write denied")
-                } else {
-                    Status::invalid_argument(err)
-                }
-            })?;
-        if actions.creates_namespace(action_name, params) {
-            return Err(Status::permission_denied(
-                "namespace objects must be managed through EnsureTeamNamespace",
-            ));
-        }
-        for target_id in &target_ids {
-            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
-                enforce_namespace_tenant_context(
-                    &self.db,
-                    tenant_context.as_ref(),
-                    &target.namespace,
-                    true,
-                )?;
-                check_team_namespace(&self.db, principals, &target.namespace, true)?;
-            }
-            check_write(&self.security, target_id, principals)?;
-        }
-        if let Some(namespace) = params.get("namespace") {
-            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, true)?;
-            check_team_namespace(&self.db, principals, namespace, true)?;
-        } else if action_name == "create_object"
-            && (tenant_context.is_some() || is_managed_team_principal(&self.db, principals)?)
-        {
-            return Err(Status::permission_denied(
-                "team object creation requires a canonical namespace",
-            ));
-        }
-        let schema_kinds = actions
-            .schema_kinds(&self.db, action_name, params)
-            .map_err(Status::invalid_argument)?;
-        ensure_action_schema_kinds_allowed(&schema_kinds)?;
-        for kind in schema_kinds {
-            self.require_schema_kind_loaded(&kind)?;
-        }
-        let schema = self
-            .schema_definitions
-            .snapshot()
-            .map_err(map_schema_definition_lifecycle_error)?;
-        actions
-            .validate_action_schema(action_name, &schema)
-            .map_err(Status::invalid_argument)?;
-        let schema_restricted_property =
-            schema_restricted_action_property(&self.db, &schema, params);
-        let provisional_learning_grant = (action_name
-            == crate::sekai::learning::RECORD_LEARNING_ACTION)
-            .then(|| security::Grant {
-                id: String::new(),
-                object_id: params.get("id").cloned().unwrap_or_default(),
-                principal: actor.to_string(),
-                role: security::Role::Admin,
-                created: now_millis(),
-            })
-            .filter(|grant| !grant.object_id.is_empty());
-        if let Some(grant) = &provisional_learning_grant {
-            self.security.add_grant(grant);
-        }
-        let msg = match actions.execute(&self.db, &schema, action_name, params, actor) {
-            Ok(msg) => msg,
-            Err(error) => {
-                if let Some(grant) = &provisional_learning_grant {
-                    self.security
-                        .remove_grant(&grant.object_id, &grant.principal);
-                }
-                return Err(Status::invalid_argument(error));
-            }
-        };
-        drop(schema);
-        self.refresh_security_after_action(action_name, params, actor)?;
-        self.db
-            .record_decision(&audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now_millis(),
-                actor: actor.to_string(),
-                action: action_name.to_string(),
-                reason: "execute_action".into(),
-                evidence: redact_action_evidence(
-                    params,
-                    &sensitive_params,
-                    schema_restricted_property,
-                ),
-                target_id: target_ids.first().cloned().unwrap_or_default(),
-                outcome: redact_action_outcome(
-                    action_name,
-                    params,
-                    &msg,
-                    schema_restricted_property,
-                ),
-            })
-            .map_err(Status::internal)?;
-        Ok(msg)
-    }
-
-    fn refresh_security_after_action(
-        &self,
-        action_name: &str,
-        params: &HashMap<String, String>,
-        actor: &str,
-    ) -> Result<(), Status> {
-        if action_name != crate::sekai::learning::RECORD_LEARNING_ACTION {
-            return Ok(());
-        }
-        let learning_id = params
-            .get("id")
-            .ok_or_else(|| Status::internal("record_learning id missing after execution"))?;
-        let grants = self.db.list_grants(learning_id).map_err(Status::internal)?;
-        if grants.is_empty() {
-            return Err(Status::internal(
-                "record_learning completed without a learning ACL",
-            ));
-        }
-        self.security.remove_grant(learning_id, actor);
-        for grant in &grants {
-            self.security.add_grant(grant);
-        }
-        Ok(())
     }
 
     fn resolve_computed_for_response(
@@ -610,7 +342,6 @@ fn base_capability(
         approval_behavior: "none".to_string(),
         limits: Vec::new(),
         object_type: None,
-        action_type: None,
         evidence_requirements: Vec::new(),
         product_tier,
     }
@@ -855,153 +586,6 @@ fn kioku_candidates_capability() -> CapabilityEntry {
     entry
 }
 
-#[derive(Clone, Copy)]
-struct ActionCapabilityLimits {
-    mutation_count: u32,
-    delete_count: u32,
-    policy_mutation_limit: Option<u32>,
-    policy_delete_limit: Option<u32>,
-}
-
-fn action_capability(
-    capability_name: String,
-    action_type: action::ActionTypeDef,
-    risk: RiskClass,
-    approval_required: bool,
-    limits: ActionCapabilityLimits,
-) -> CapabilityEntry {
-    let mut entry = base_capability(
-        capability_name,
-        action_type.description.clone(),
-        "action",
-        "sekai.ExecuteActionRequest",
-        "sekai.ExecuteActionResponse",
-    );
-    entry.required_scopes = vec!["namespace:write".into(), "object:write".into()];
-    entry.policy_decision_points = vec![
-        "namespace_access".into(),
-        "object_acl".into(),
-        "action_policy".into(),
-        "budget".into(),
-        "approval".into(),
-    ];
-    entry.risk_class = risk.as_str().to_string();
-    entry.approval_behavior = if approval_required {
-        "required".into()
-    } else {
-        "may_require".into()
-    };
-    entry.limits.push(CapabilityLimit {
-        name: "max_mutations_per_invocation".into(),
-        value: u64::from(limits.mutation_count),
-    });
-    if limits.delete_count > 0 {
-        entry.limits.push(CapabilityLimit {
-            name: "max_deletes_per_invocation".into(),
-            value: u64::from(limits.delete_count),
-        });
-    }
-    if let Some(limit) = limits.policy_mutation_limit {
-        entry.limits.push(CapabilityLimit {
-            name: "max_mutations_per_work_unit".into(),
-            value: u64::from(limit),
-        });
-    }
-    if let Some(limit) = limits.policy_delete_limit {
-        entry.limits.push(CapabilityLimit {
-            name: "max_deletes_per_work_unit".into(),
-            value: u64::from(limit),
-        });
-    }
-    if action_type.name == crate::sekai::learning::RECORD_LEARNING_ACTION {
-        entry.limits.extend([
-            CapabilityLimit {
-                name: "score_min".into(),
-                value: 0,
-            },
-            CapabilityLimit {
-                name: "score_max".into(),
-                value: 100,
-            },
-        ]);
-    }
-    entry.action_type = Some(to_proto_action_type(&action_type));
-    entry
-}
-
-fn create_object_capability(
-    base_action_type: &action::ActionTypeDef,
-    object_type: &schema::ObjectType,
-    risk: RiskClass,
-    approval_required: bool,
-    limits: ActionCapabilityLimits,
-) -> CapabilityEntry {
-    let mut action_type = base_action_type.clone();
-    action_type.target_kind = object_type.kind.clone();
-    action_type.description = format!(
-        "Create a schema-governed {} object in an authorized namespace.",
-        object_type.kind
-    );
-    action_type.params = vec![
-        action::ActionParamDef {
-            name: "id".into(),
-            param_type: schema::PropertyType::String,
-            required: true,
-            enum_values: Vec::new(),
-        },
-        action::ActionParamDef {
-            name: "kind".into(),
-            param_type: schema::PropertyType::Enum,
-            required: true,
-            enum_values: vec![object_type.kind.clone()],
-        },
-        action::ActionParamDef {
-            name: "name".into(),
-            param_type: schema::PropertyType::String,
-            required: true,
-            enum_values: Vec::new(),
-        },
-        action::ActionParamDef {
-            name: "namespace".into(),
-            param_type: schema::PropertyType::String,
-            required: true,
-            enum_values: Vec::new(),
-        },
-        action::ActionParamDef {
-            name: "external_id".into(),
-            param_type: schema::PropertyType::String,
-            required: false,
-            enum_values: Vec::new(),
-        },
-    ];
-    action_type.params.extend(
-        object_type
-            .properties
-            .iter()
-            .filter(|property| {
-                !matches!(
-                    property.name.as_str(),
-                    "id" | "kind" | "name" | "namespace" | "external_id"
-                )
-            })
-            .map(|property| action::ActionParamDef {
-                name: property.name.clone(),
-                param_type: property.prop_type.clone(),
-                required: property.required,
-                enum_values: property.enum_values.clone(),
-            }),
-    );
-    let mut entry = action_capability(
-        format!("sekai.actions.create_object.{}", object_type.kind),
-        action_type,
-        risk,
-        approval_required,
-        limits,
-    );
-    entry.object_type = Some(to_proto_schema_type(object_type));
-    entry
-}
-
 fn map_capability_error(error: capability::CatalogError) -> Status {
     match error {
         capability::CatalogError::UnsupportedContractVersion => {
@@ -1040,15 +624,6 @@ fn caller_principals(req: &Request<impl std::any::Any>) -> Vec<String> {
             }
         })
         .unwrap_or_else(|| vec!["anonymous".to_string()])
-}
-
-fn work_unit_from_metadata(req: &Request<impl std::any::Any>) -> String {
-    req.metadata()
-        .get("x-chisei-work-unit")
-        .or_else(|| req.metadata().get("x-chisei-task-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_string())
-        .unwrap_or_default()
 }
 
 fn require_authenticated(principals: &[String]) -> Result<(), Status> {
@@ -1295,94 +870,6 @@ fn now_millis() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
-}
-
-fn redact_action_evidence(
-    params: &std::collections::HashMap<String, String>,
-    sensitive_params: &std::collections::HashSet<String>,
-    schema_restricted_property: Option<bool>,
-) -> std::collections::HashMap<String, String> {
-    params
-        .iter()
-        // Reserved evidence keys are written by the attestation binding, not
-        // by callers; a param with the same name must not be able to plant a
-        // fake attestation reference in the audit log.
-        .filter(|(key, _)| {
-            key.as_str() != attestation::EVIDENCE_ATTESTATION_ID
-                && key.as_str() != attestation::EVIDENCE_ATTESTATION_HASH
-        })
-        .map(|(key, value)| {
-            let lower = key.to_ascii_lowercase();
-            let sensitive_property = params
-                .get("key")
-                .or_else(|| params.get("property"))
-                .map(|property| {
-                    schema_restricted_property.unwrap_or_else(|| is_sensitive_name(property))
-                })
-                .unwrap_or(false);
-            let value = if is_sensitive_name(&lower)
-                || sensitive_params.contains(key)
-                || ((lower == "value" || lower == "new_value") && sensitive_property)
-            {
-                "[redacted]".to_string()
-            } else {
-                value.clone()
-            };
-            (key.clone(), value)
-        })
-        .collect()
-}
-
-fn redact_action_outcome(
-    action: &str,
-    params: &std::collections::HashMap<String, String>,
-    outcome: &str,
-    schema_restricted_property: Option<bool>,
-) -> String {
-    if action == "set_property"
-        && params
-            .get("key")
-            .map(|property| {
-                schema_restricted_property.unwrap_or_else(|| is_sensitive_name(property))
-            })
-            .unwrap_or(false)
-    {
-        return format!(
-            "set {}.{} = [redacted]",
-            params.get("id").cloned().unwrap_or_default(),
-            params.get("key").cloned().unwrap_or_default()
-        );
-    }
-    outcome.to_string()
-}
-
-fn schema_restricted_action_property(
-    db: &RuntimeDb,
-    schema: &schema::SchemaRegistry,
-    params: &std::collections::HashMap<String, String>,
-) -> Option<bool> {
-    let property_name = params.get("key").or_else(|| params.get("property"))?;
-    let object_id = params.get("id").or_else(|| params.get("object_id"))?;
-    let object = db.get_object(object_id).ok().flatten()?;
-    let object_type = schema.get(&object.kind)?;
-    let property = object_type
-        .properties
-        .iter()
-        .find(|property| property.name == *property_name)?;
-    Some(schema::is_restricted_property_classification(
-        &property.classification,
-    ))
-}
-
-fn is_sensitive_name(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("key")
-        || lower.contains("password")
-        || lower.contains("passphrase")
-        || lower.contains("passwd")
-        || lower.contains("credential")
 }
 
 fn check_read(
@@ -2597,125 +2084,24 @@ fn action_object_id(name: &str) -> String {
 }
 
 /// Internal governance object kinds that must never be created, mutated, read,
-/// or listed through the generic object CRUD RPCs. They hold policy, held-action
-/// params (potentially sensitive), and blast-radius counters, and are managed
-/// only through their dedicated RPCs + server-internal DB paths. Exposing them
-/// via CRUD would leak held params and let callers forge policy or tamper with
-/// blast-radius counters.
+/// or listed through the generic object CRUD RPCs. They hold policy and
+/// blast-radius counters and are managed only through dedicated RPCs plus
+/// server-internal DB paths.
 const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     action_policy::ACTION_POLICY_KIND,
     action_policy::BLAST_RADIUS_KIND,
-    action_approval::ACTION_APPROVAL_KIND,
+    // Retired pre-1.0 state is purged on startup, so this name must never be
+    // reusable through generic CRUD.
+    "action_approval",
     crate::domain::KIND_CAPABILITY,
     crate::domain::KIND_EXTERNAL_EVIDENCE,
     governed_fact_domain::PROFILE_KIND,
     governed_fact_domain::FACT_KIND,
     governed_fact_domain::WAIVER_KIND,
 ];
-const ERASED_NAMESPACE: &str = "[erased]";
 
 fn is_reserved_governance_kind(kind: &str) -> bool {
     RESERVED_GOVERNANCE_KINDS.contains(&kind)
-}
-
-fn ensure_action_schema_kinds_allowed(kinds: &[String]) -> Result<(), Status> {
-    if kinds.iter().any(|kind| is_reserved_governance_kind(kind)) {
-        return Err(Status::permission_denied(
-            "reserved governance kinds require dedicated APIs",
-        ));
-    }
-    Ok(())
-}
-
-/// Resolve the namespace used for action-policy scope resolution: prefer the
-/// namespace of an existing target object, falling back to a `namespace` param
-/// (used by `create_object` before the object exists).
-fn action_policy_namespace(
-    db: &RuntimeDb,
-    target_ids: &[String],
-    params: &std::collections::HashMap<String, String>,
-) -> String {
-    for id in target_ids {
-        if let Ok(Some(object)) = db.get_object(id) {
-            if object.kind == "namespace" {
-                let namespace = object
-                    .external_id
-                    .strip_prefix("namespace:")
-                    .map(str::trim)
-                    .filter(|namespace| !namespace.is_empty())
-                    .unwrap_or_else(|| object.name.trim());
-                if !namespace.is_empty() {
-                    return namespace.to_string();
-                }
-            }
-            if !object.namespace.trim().is_empty() {
-                return object.namespace;
-            }
-        }
-    }
-    params
-        .get("namespace")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_default()
-}
-
-fn approval_lifecycle_status(error: ApprovalLifecycleError) -> Status {
-    match error {
-        ApprovalLifecycleError::NotFound => Status::not_found("approval not found"),
-        ApprovalLifecycleError::Terminal { id, status } => {
-            Status::failed_precondition(format!("approval {id} is already {status}"))
-        }
-        ApprovalLifecycleError::PolicyDenied => {
-            Status::failed_precondition("action policy now denies this approval")
-        }
-        ApprovalLifecycleError::Limit(ActionLimitExceeded::Internal(error))
-        | ApprovalLifecycleError::Storage(error) => Status::internal(error),
-        ApprovalLifecycleError::Limit(ActionLimitExceeded::BlastRadius { work_unit, .. }) => {
-            Status::resource_exhausted(format!(
-                "blast-radius cap exceeded for work unit {work_unit}"
-            ))
-        }
-        ApprovalLifecycleError::Limit(ActionLimitExceeded::Budget { subject, .. }) => {
-            Status::resource_exhausted(format!("action budget exhausted for {subject}"))
-        }
-        ApprovalLifecycleError::InvalidArgument(error) => Status::invalid_argument(error),
-        ApprovalLifecycleError::FailedPrecondition(error) => Status::failed_precondition(error),
-        ApprovalLifecycleError::ReferencedNotFound(error) => Status::not_found(error),
-        ApprovalLifecycleError::PermissionDenied(error) => Status::permission_denied(error),
-        ApprovalLifecycleError::Unauthenticated(error) => Status::unauthenticated(error),
-        ApprovalLifecycleError::AlreadyExists(error) => Status::already_exists(error),
-        ApprovalLifecycleError::ResourceExhausted(error) => Status::resource_exhausted(error),
-        ApprovalLifecycleError::Unavailable(error) => Status::unavailable(error),
-    }
-}
-
-fn approval_adapter_error(status: Status) -> ApprovalLifecycleError {
-    match status.code() {
-        tonic::Code::InvalidArgument => {
-            ApprovalLifecycleError::InvalidArgument(status.message().into())
-        }
-        tonic::Code::FailedPrecondition => {
-            ApprovalLifecycleError::FailedPrecondition(status.message().into())
-        }
-        tonic::Code::PermissionDenied => {
-            ApprovalLifecycleError::PermissionDenied(status.message().into())
-        }
-        tonic::Code::Unauthenticated => {
-            ApprovalLifecycleError::Unauthenticated(status.message().into())
-        }
-        tonic::Code::AlreadyExists => {
-            ApprovalLifecycleError::AlreadyExists(status.message().into())
-        }
-        tonic::Code::ResourceExhausted => {
-            ApprovalLifecycleError::ResourceExhausted(status.message().into())
-        }
-        tonic::Code::Unavailable => ApprovalLifecycleError::Unavailable(status.message().into()),
-        tonic::Code::NotFound => {
-            ApprovalLifecycleError::ReferencedNotFound(status.message().into())
-        }
-        _ => ApprovalLifecycleError::Storage(status.message().into()),
-    }
 }
 
 fn action_work_lifecycle_status(error: ActionWorkLifecycleError) -> Status {
@@ -2742,24 +2128,6 @@ fn to_proto_attestation(a: &attestation::PolicyAttestation) -> PolicyAttestation
         decision: a.decision.clone(),
         content_hash: a.content_hash.clone(),
         created: a.created,
-    }
-}
-
-fn to_proto_action_approval(approval: &action_approval::ActionApproval) -> ActionApproval {
-    ActionApproval {
-        id: approval.id.clone(),
-        status: approval.status.as_str().to_string(),
-        actor: approval.actor.clone(),
-        action: approval.action.clone(),
-        params: approval.redacted_params(),
-        work_unit: approval.work_unit.clone(),
-        policy_scope: approval.policy_scope.clone(),
-        risk_class: approval.risk_class.clone(),
-        target_id: approval.target_id.clone(),
-        created: approval.created,
-        updated: approval.updated,
-        decided_by: approval.decided_by.clone(),
-        outcome: approval.outcome.clone(),
     }
 }
 
@@ -2802,7 +2170,7 @@ fn from_proto_action_policy(policy: &ActionPolicy) -> Result<action_policy::Acti
     }
     let mut risk_overrides = HashMap::new();
     for (risk, decision) in &policy.risk_overrides {
-        let parsed_risk = action::RiskClass::parse(risk)
+        let parsed_risk = RiskClass::parse(risk)
             .ok_or_else(|| Status::invalid_argument(format!("invalid risk class {risk}")))?;
         let decision = ActionDecision::parse(decision)
             .ok_or_else(|| Status::invalid_argument(format!("invalid decision for risk {risk}")))?;
@@ -2818,78 +2186,6 @@ fn from_proto_action_policy(policy: &ActionPolicy) -> Result<action_policy::Acti
         max_deletes_per_work_unit: (policy.max_deletes_per_work_unit > 0)
             .then_some(policy.max_deletes_per_work_unit),
     })
-}
-
-fn to_proto_action_type(action_type: &action::ActionTypeDef) -> ActionTypeDef {
-    ActionTypeDef {
-        name: action_type.name.clone(),
-        description: action_type.description.clone(),
-        params: action_type
-            .params
-            .iter()
-            .map(to_proto_action_param)
-            .collect(),
-        ops: action_type.ops.iter().map(to_proto_action_op).collect(),
-        target_kind: action_type.target_kind.clone(),
-        created: action_type.created,
-        required_purpose: action_type.required_purpose.clone(),
-    }
-}
-
-fn from_proto_action_type(action_type: &ActionTypeDef) -> Result<action::ActionTypeDef, Status> {
-    let params = action_type
-        .params
-        .iter()
-        .map(from_proto_action_param)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(action::ActionTypeDef {
-        name: action_type.name.clone(),
-        description: action_type.description.clone(),
-        params,
-        ops: action_type.ops.iter().map(from_proto_action_op).collect(),
-        target_kind: action_type.target_kind.clone(),
-        created: action_type.created,
-        required_purpose: action_type.required_purpose.trim().to_string(),
-    })
-}
-
-fn from_proto_action_param(param: &ActionParamDef) -> Result<action::ActionParamDef, Status> {
-    let param_type = schema::PropertyType::parse(&param.r#type).ok_or_else(|| {
-        Status::invalid_argument(format!("unknown action param type: {}", param.r#type))
-    })?;
-    Ok(action::ActionParamDef {
-        name: param.name.clone(),
-        param_type,
-        required: param.required,
-        enum_values: param.enum_values.clone(),
-    })
-}
-
-fn from_proto_action_op(op: &ActionOp) -> action::ActionOp {
-    action::ActionOp {
-        op: op.op.clone(),
-        property: op.property.clone(),
-        value_from: op.value_from.clone(),
-        relation: op.relation.clone(),
-    }
-}
-
-fn to_proto_action_param(param: &action::ActionParamDef) -> ActionParamDef {
-    ActionParamDef {
-        name: param.name.clone(),
-        r#type: param.param_type.as_str().to_string(),
-        required: param.required,
-        enum_values: param.enum_values.clone(),
-    }
-}
-
-fn to_proto_action_op(op: &action::ActionOp) -> ActionOp {
-    ActionOp {
-        op: op.op.clone(),
-        property: op.property.clone(),
-        value_from: op.value_from.clone(),
-        relation: op.relation.clone(),
-    }
 }
 
 fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
@@ -5510,76 +4806,6 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(DeleteOntologyRelationResponse {}))
     }
 
-    async fn create_action_type(
-        &self,
-        req: Request<CreateActionTypeRequest>,
-    ) -> Result<Response<CreateActionTypeResponse>, Status> {
-        // This is intentionally a compatibility path for the legacy graph
-        // mutation DSL. It must not map ActionTypeDef into GovernedActionType:
-        // the two registries have different execution semantics.
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let action_type = req
-            .into_inner()
-            .action_type
-            .ok_or(Status::invalid_argument("action_type required"))?;
-        let parsed = from_proto_action_type(&action_type)?;
-        check_action_admin(&self.security, &parsed.name, &principals)?;
-        let schema = self
-            .schema_definitions
-            .refresh_snapshot()
-            .map_err(map_schema_definition_lifecycle_error)?;
-        let stored = self
-            .action_definitions
-            .put_definition(parsed, &schema)
-            .map_err(map_action_definition_lifecycle_error)?;
-        Ok(Response::new(CreateActionTypeResponse {
-            action_type: Some(to_proto_action_type(&stored)),
-        }))
-    }
-
-    async fn list_action_types(
-        &self,
-        req: Request<ListActionTypesRequest>,
-    ) -> Result<Response<ListActionTypesResponse>, Status> {
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let action_types = self
-            .action_definitions
-            .fresh_snapshot()
-            .map_err(map_action_definition_lifecycle_error)?
-            .list_action_types()
-            .iter()
-            .filter(|action_type| {
-                check_read(
-                    &self.security,
-                    &action_object_id(&action_type.name),
-                    &principals,
-                )
-                .is_ok()
-            })
-            .map(to_proto_action_type)
-            .collect();
-        Ok(Response::new(ListActionTypesResponse { action_types }))
-    }
-
-    async fn delete_action_type(
-        &self,
-        req: Request<DeleteActionTypeRequest>,
-    ) -> Result<Response<DeleteActionTypeResponse>, Status> {
-        let principals = caller_principals(&req);
-        require_authenticated(&principals)?;
-        let name = req.into_inner().name;
-        if name.trim().is_empty() {
-            return Err(Status::invalid_argument("name required"));
-        }
-        check_action_admin(&self.security, &name, &principals)?;
-        self.action_definitions
-            .delete_definition(&name)
-            .map_err(map_action_definition_lifecycle_error)?;
-        Ok(Response::new(DeleteActionTypeResponse {}))
-    }
-
     async fn put_governed_action_type(
         &self,
         req: Request<PutGovernedActionTypeRequest>,
@@ -6054,152 +5280,6 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(ReportActionClaimEventResponse { replay }))
     }
 
-    async fn execute_action(
-        &self,
-        req: Request<ExecuteActionRequest>,
-    ) -> Result<Response<ExecuteActionResponse>, Status> {
-        if self.db.enterprise_extension().is_some() {
-            return Err(Status::failed_precondition(
-                "enterprise action execution requires a durable approval identity contract",
-            ));
-        }
-        let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
-        let mut work_unit = work_unit_from_metadata(&req);
-        let invoked_capability = req
-            .metadata()
-            .get("x-sekai-capability")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let operation_id = invoked_capability.as_ref().map(|_| {
-            req.metadata()
-                .get("x-sekai-operation-id")
-                .and_then(|value| value.to_str().ok())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("catalog-invocation-{}", Uuid::new_v4().simple()))
-        });
-        let catalog_version = req
-            .metadata()
-            .get("x-sekai-catalog-version")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let catalog_namespace = req
-            .metadata()
-            .get("x-sekai-namespace")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        if let Some(operation_id) = operation_id.as_deref() {
-            if work_unit.is_empty() {
-                work_unit = operation_id.to_string();
-            } else if work_unit != operation_id {
-                return Err(Status::invalid_argument(
-                    "catalog operation and work-unit correlation must match",
-                ));
-            }
-        }
-        let inner = req.into_inner();
-        let dry_run = inner.dry_run;
-        let r = inner
-            .request
-            .ok_or(Status::invalid_argument("request required"))?;
-        let invocation_namespace = catalog_namespace.as_deref().unwrap_or_else(|| {
-            r.params
-                .get("namespace")
-                .map(String::as_str)
-                .unwrap_or_default()
-        });
-        if let Some(capability_name) = &invoked_capability {
-            if invocation_namespace.is_empty() {
-                return Err(Status::invalid_argument(
-                    "catalog action invocation requires namespace",
-                ));
-            }
-            let entry = self
-                .discoverable_capabilities(invocation_namespace, &principals)?
-                .into_iter()
-                .find(|entry| {
-                    entry.name == *capability_name
-                        && entry.action_type.as_ref().is_some_and(|action| {
-                            action.name == r.action
-                                && (r.action != "create_object"
-                                    || r.params.get("kind") == Some(&action.target_kind))
-                        })
-                });
-            if entry.is_none() {
-                if let Some(operation_id) = operation_id.as_deref() {
-                    let actor = principals.first().map(String::as_str).unwrap_or_default();
-                    CatalogInvocation::record_refusal(
-                        &self.db,
-                        operation_id,
-                        invocation_namespace,
-                        actor,
-                        capability_name,
-                        catalog_version.as_deref(),
-                        "capability_unavailable",
-                    )?;
-                }
-                return Err(Status::failed_precondition("capability unavailable"));
-            }
-        }
-        let mut receipt_guard = if let Some((capability_name, operation_id)) =
-            invoked_capability.as_ref().zip(operation_id.as_ref())
-        {
-            let actor = principals.first().cloned().unwrap_or_default();
-            Some(CatalogInvocation::begin(
-                &self.db,
-                operation_id.clone(),
-                invocation_namespace,
-                actor,
-                capability_name.clone(),
-                catalog_version.clone(),
-            )?)
-        } else {
-            None
-        };
-        let execution = action_execution::ActionExecution::new(self);
-        let admitted = execution.admit(
-            &r,
-            &principals,
-            tenant_context.as_ref(),
-            &work_unit,
-            invoked_capability.is_some().then_some(invocation_namespace),
-        )?;
-        let result = execution.execute(r, dry_run, admitted, receipt_guard.as_mut());
-        let result = match result {
-            Ok(result) => result,
-            Err(mut status) => {
-                if let Some(operation_id) = operation_id.as_deref() {
-                    status.metadata_mut().insert(
-                        "x-sekai-operation-id",
-                        operation_id
-                            .parse()
-                            .map_err(|_| Status::internal("invalid operation id"))?,
-                    );
-                }
-                return Err(status);
-            }
-        };
-        let mut response = Response::new(ExecuteActionResponse {
-            result: Some(result),
-        });
-        if let Some(operation_id) = operation_id.as_deref() {
-            response.metadata_mut().insert(
-                "x-sekai-operation-id",
-                operation_id
-                    .parse()
-                    .map_err(|_| Status::internal("invalid operation id"))?,
-            );
-        }
-        Ok(response)
-    }
     async fn set_action_policy(
         &self,
         req: Request<SetActionPolicyRequest>,
@@ -6245,118 +5325,6 @@ impl SekaiService for SekaiServiceImpl {
         let policies = self.db.list_action_policies().map_err(Status::internal)?;
         Ok(Response::new(ListActionPoliciesResponse {
             policies: policies.iter().map(to_proto_action_policy).collect(),
-        }))
-    }
-
-    async fn approve_action(
-        &self,
-        req: Request<ApproveActionRequest>,
-    ) -> Result<Response<ApproveActionResponse>, Status> {
-        let principals = caller_principals(&req);
-        let r = req.into_inner();
-        let approval = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref())
-            .load(&r.approval_id)
-            .map_err(approval_lifecycle_status)?;
-        check_action_admin(&self.security, &approval.policy_scope, &principals)?;
-        let approver = principals.first().cloned().unwrap_or_default();
-        let outcome = action_approval_execution::ActionApprovalExecution::new(self)
-            .approve(&r.approval_id, &approver)
-            .map_err(approval_lifecycle_status)?;
-        let approval = outcome.approval;
-        let msg = outcome.message;
-
-        if let Err(error) = CatalogInvocation::resolve_approval(
-            &self.db,
-            &approval.work_unit,
-            &approval.id,
-            &approval.decided_by,
-            "approved",
-            Some(&approval.action),
-            "succeeded",
-        ) {
-            tracing::error!(
-                operation_id = approval.work_unit,
-                approval_id = approval.id,
-                error = %error,
-                "approved action committed but catalog receipt projection failed"
-            );
-        }
-
-        Ok(Response::new(ApproveActionResponse {
-            result: Some(ActionResult {
-                action: approval.action.clone(),
-                message: msg,
-                dry_run: false,
-                planned_ops: Vec::new(),
-                decision: "approved".into(),
-                approval_id: approval.id.clone(),
-            }),
-            approval: Some(to_proto_action_approval(&approval)),
-        }))
-    }
-
-    async fn deny_action(
-        &self,
-        req: Request<DenyActionRequest>,
-    ) -> Result<Response<DenyActionResponse>, Status> {
-        let principals = caller_principals(&req);
-        let r = req.into_inner();
-        let lifecycle = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref());
-        let approval = lifecycle
-            .load(&r.approval_id)
-            .map_err(approval_lifecycle_status)?;
-        check_action_admin(&self.security, &approval.policy_scope, &principals)?;
-        let decided_by = principals.first().cloned().unwrap_or_default();
-        let approval = lifecycle
-            .deny(DenyActionCommand {
-                approval_id: &r.approval_id,
-                decided_by: &decided_by,
-                reason: &r.reason,
-                now_ms: now_millis(),
-            })
-            .map_err(approval_lifecycle_status)?;
-        if let Err(error) = CatalogInvocation::resolve_approval(
-            &self.db,
-            &approval.work_unit,
-            &approval.id,
-            &approval.decided_by,
-            "denied",
-            None,
-            "denied",
-        ) {
-            tracing::error!(
-                operation_id = approval.work_unit,
-                approval_id = approval.id,
-                error = %error,
-                "approval denial committed but catalog receipt projection failed"
-            );
-        }
-        Ok(Response::new(DenyActionResponse {
-            approval: Some(to_proto_action_approval(&approval)),
-        }))
-    }
-
-    async fn list_pending_approvals(
-        &self,
-        req: Request<ListPendingApprovalsRequest>,
-    ) -> Result<Response<ListPendingApprovalsResponse>, Status> {
-        let principals = caller_principals(&req);
-        check_action_admin(&self.security, "", &principals)?;
-        let r = req.into_inner();
-        let status = match r.status.trim().to_ascii_lowercase().as_str() {
-            "" | "pending" => Some(action_approval::ApprovalStatus::Pending),
-            "all" => None,
-            other => Some(
-                action_approval::ApprovalStatus::parse(other)
-                    .ok_or_else(|| Status::invalid_argument("invalid status filter"))?,
-            ),
-        };
-        let approvals = self
-            .db
-            .list_action_approvals(status)
-            .map_err(Status::internal)?;
-        Ok(Response::new(ListPendingApprovalsResponse {
-            approvals: approvals.iter().map(to_proto_action_approval).collect(),
         }))
     }
 
@@ -8301,6 +7269,9 @@ impl KnowledgeWriter for SekaiServiceImpl {
                     .find_by_external_id(&format!("project:{namespace}"))?)
                 .ok_or_else(|| format!("no governed target found for namespace: {namespace}"))?,
         };
+        if !self.security.can_write(&target.id, &["chisei.scoring"]) {
+            return Err("knowledge write target access denied".into());
+        }
 
         let learning_id = scoring_learning_id(namespace, &request.request_id);
         let passed = if request.passed { "true" } else { "false" };
@@ -8354,50 +7325,68 @@ impl KnowledgeWriter for SekaiServiceImpl {
             ("producer".into(), "chisei.scoring".into()),
             ("status".into(), "candidate".into()),
         ]);
-        let mut rpc_request = Request::new(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
-                params,
+        let resolved_policy =
+            self.db
+                .resolve_action_policy("chisei.scoring", namespace, namespace)?;
+        let decision = resolved_policy
+            .as_ref()
+            .map(|policy| {
+                policy.decide(
+                    crate::sekai::learning::RECORD_LEARNING_ACTION,
+                    RiskClass::Write,
+                )
+            })
+            .unwrap_or(ActionDecision::Allow);
+        if decision != ActionDecision::Allow {
+            self.db.record_decision(&audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now_millis(),
                 actor: "chisei.scoring".into(),
-            }),
-            dry_run: false,
-        });
-        rpc_request.metadata_mut().insert(
-            "x-principal",
-            tonic::metadata::MetadataValue::from_static("chisei.scoring"),
-        );
-        rpc_request.metadata_mut().insert(
-            "x-chisei-work-unit",
-            tonic::metadata::MetadataValue::try_from(learning_id.as_str())
-                .map_err(|error| format!("invalid knowledge work-unit metadata: {error}"))?,
-        );
-
-        match <Self as SekaiService>::execute_action(self, rpc_request).await {
-            Ok(response) => {
-                let result = response
-                    .into_inner()
-                    .result
-                    .ok_or_else(|| "record_learning returned no action result".to_string())?;
-                match result.decision.as_str() {
-                    "allow" | "require_approval" => Ok(KnowledgeWriteOutcome::Accepted),
-                    "deny" => Ok(KnowledgeWriteOutcome::PolicyDenied),
-                    decision => Err(format!(
-                        "record_learning returned unknown policy decision: {decision}"
-                    )),
-                }
-            }
-            Err(status)
-                if status.code() == tonic::Code::PermissionDenied
-                    && status.message().contains("denied by policy") =>
-            {
-                Ok(KnowledgeWriteOutcome::PolicyDenied)
-            }
-            Err(status) => Err(format!(
-                "record_learning failed ({}): {}",
-                status.code(),
-                status.message()
-            )),
+                action: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+                reason: "action_policy_denied".into(),
+                evidence: HashMap::from([
+                    (
+                        "policy_scope".into(),
+                        resolved_policy
+                            .as_ref()
+                            .map(|policy| policy.scope.clone())
+                            .unwrap_or_default(),
+                    ),
+                    ("decision".into(), decision.as_str().into()),
+                ]),
+                target_id: target.id.clone(),
+                outcome: "policy_denied".into(),
+            })?;
+            return Ok(KnowledgeWriteOutcome::PolicyDenied);
         }
+        let schema = self
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(|error| format!("learning schema unavailable: {error:?}"))?;
+        crate::sekai::learning::record_learning(&self.db, &schema, &params, "chisei.scoring")?;
+        self.db.record_decision(&audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now_millis(),
+            actor: "chisei.scoring".into(),
+            action: crate::sekai::learning::RECORD_LEARNING_ACTION.into(),
+            reason: "action_policy_allowed".into(),
+            evidence: params
+                .keys()
+                .filter(|key| key.as_str() != "id" && key.as_str() != "target_id")
+                .map(|key| (key.clone(), REDACTED_VALUE.into()))
+                .chain(std::iter::once(("decision".into(), "allow".into())))
+                .collect(),
+            target_id: target.id.clone(),
+            outcome: "executed".into(),
+        })?;
+        let grants = self.db.list_grants(&learning_id)?;
+        if grants.is_empty() {
+            return Err("record_learning completed without a learning ACL".into());
+        }
+        for grant in &grants {
+            self.security.add_grant(grant);
+        }
+        Ok(KnowledgeWriteOutcome::Accepted)
     }
 }
 
@@ -8702,21 +7691,6 @@ mod tests {
         svc.security.add_grant(&grant);
     }
 
-    fn seed_domain_object(svc: &SekaiServiceImpl, id: &str) {
-        svc.db
-            .create_object(&domain::Object {
-                id: id.into(),
-                kind: "namespace".into(),
-                name: id.into(),
-                namespace: "".into(),
-                external_id: "".into(),
-                properties: HashMap::new(),
-                created: 0,
-                updated: 0,
-            })
-            .unwrap();
-    }
-
     fn seed_scoring_namespace(svc: &SekaiServiceImpl, namespace: &str) -> String {
         let id = format!("namespace-{namespace}");
         svc.db
@@ -8744,64 +7718,6 @@ mod tests {
             passed: true,
             reasoning: "The implementation satisfies the requested behavior.".into(),
         }
-    }
-
-    #[tokio::test]
-    async fn execute_action_denies_ungranted_principal_even_when_actor_claims_owner() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "set_property".into(),
-                        params: HashMap::from([
-                            ("id".into(), "obj-1".into()),
-                            ("key".into(), "status".into()),
-                            ("value".into(), "done".into()),
-                        ]),
-                        actor: "alice".into(),
-                    }),
-                    dry_run: false,
-                },
-                "bob",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-    }
-
-    #[tokio::test]
-    async fn execute_action_allows_granted_principal() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
-
-        svc.execute_action(with_named_principal(
-            ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "done".into()),
-                    ]),
-                    actor: "bob".into(),
-                }),
-                dry_run: false,
-            },
-            "alice",
-        ))
-        .await
-        .unwrap();
-
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "done");
     }
 
     #[tokio::test]
@@ -8928,51 +7844,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_action_records_decision_with_authenticated_actor() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        grant_object_role(&svc, "obj-1", "alice", security::Role::Editor);
-
-        let mut request = with_named_principal(
-            ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "password".into()),
-                        ("value".into(), "secret-value".into()),
-                    ]),
-                    actor: "mallory".into(),
-                }),
-                dry_run: false,
-            },
-            "alice",
-        );
-        request
-            .metadata_mut()
-            .insert("x-chisei-work-unit", "successful-work".parse().unwrap());
-        svc.execute_action(request).await.unwrap();
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].actor, "alice");
-        assert_eq!(decisions[0].target_id, "obj-1");
-        assert_eq!(decisions[0].reason, "execute_action");
-        assert_eq!(decisions[0].evidence["key"], "[redacted]");
-        assert_eq!(decisions[0].evidence["value"], "[redacted]");
-        assert_eq!(decisions[0].evidence["work_unit"], "successful-work");
-        assert_eq!(decisions[0].evidence["risk_class"], "write");
-        assert_eq!(decisions[0].evidence["decision"], "allow");
-        assert_eq!(decisions[0].outcome, "set obj-1.password = [redacted]");
-    }
-
-    #[tokio::test]
     async fn record_decision_clamps_future_timestamp() {
         let svc = service();
         let future = now_millis() + 86_400_000;
@@ -9030,95 +7901,6 @@ mod tests {
         let stored = svc.db.get_decision(&recorded.id).unwrap().unwrap();
         assert!(!stored.evidence.contains_key("attestation_id"));
         assert!(!stored.evidence.contains_key("attestation_hash"));
-    }
-
-    #[tokio::test]
-    async fn execute_action_set_property_respects_schema() {
-        let svc = service();
-        grant_schema_admin(&svc);
-        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
-            r#type: Some(widget_schema_type()),
-        }))
-        .await
-        .unwrap();
-        svc.db
-            .create_object(&from_proto_obj(&widget_object(
-                "widget-1",
-                HashMap::from([
-                    ("name".into(), "spinner".into()),
-                    ("color".into(), "red".into()),
-                ]),
-            )))
-            .unwrap();
-        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "set_property".into(),
-                        params: HashMap::from([
-                            ("id".into(), "widget-1".into()),
-                            ("key".into(), "color".into()),
-                            ("value".into(), "green".into()),
-                        ]),
-                        actor: "alice".into(),
-                    }),
-                    dry_run: false,
-                },
-                "alice",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("not in"));
-        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
-        assert_eq!(obj.properties["color"], "red");
-        assert!(
-            svc.db
-                .list_decisions(&audit::DecisionFilter {
-                    action: Some("set_property".into()),
-                    ..Default::default()
-                })
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_action_create_object_accepts_schema_properties() {
-        let svc = service();
-        grant_schema_admin(&svc);
-        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
-            r#type: Some(widget_schema_type()),
-        }))
-        .await
-        .unwrap();
-        grant_object_role(&svc, "widget-1", "alice", security::Role::Editor);
-
-        svc.execute_action(with_named_principal(
-            ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "create_object".into(),
-                    params: HashMap::from([
-                        ("id".into(), "widget-1".into()),
-                        ("kind".into(), "widget".into()),
-                        ("name".into(), "spinner".into()),
-                        ("color".into(), "blue".into()),
-                    ]),
-                    actor: "".into(),
-                }),
-                dry_run: false,
-            },
-            "alice",
-        ))
-        .await
-        .unwrap();
-
-        let obj = svc.db.get_object("widget-1").unwrap().unwrap();
-        assert_eq!(obj.properties["name"], "spinner");
-        assert_eq!(obj.properties["color"], "blue");
     }
 
     #[tokio::test]
@@ -9250,228 +8032,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("expected float"));
-    }
-
-    #[tokio::test]
-    async fn action_audit_prefers_schema_classification_over_name_heuristic() {
-        let svc = service();
-        grant_schema_admin(&svc);
-        let mut schema_type = widget_schema_type();
-        schema_type.properties.push(PropertyDef {
-            name: "api_key_label".into(),
-            r#type: "string".into(),
-            required: false,
-            description: "".into(),
-            enum_values: vec![],
-            link_kind: "".into(),
-            compute_expr: "".into(),
-            classification: "public".into(),
-            struct_fields: vec![],
-        });
-        schema_type.properties.push(PropertyDef {
-            name: "secret_note".into(),
-            r#type: "string".into(),
-            required: false,
-            description: "".into(),
-            enum_values: vec![],
-            link_kind: "".into(),
-            compute_expr: "".into(),
-            classification: "sensitive".into(),
-            struct_fields: vec![],
-        });
-        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
-            r#type: Some(schema_type),
-        }))
-        .await
-        .unwrap();
-        svc.db
-            .create_object(&domain::Object {
-                id: "widget-audit".into(),
-                kind: "widget".into(),
-                name: "widget".into(),
-                namespace: "".into(),
-                external_id: "".into(),
-                properties: HashMap::from([
-                    ("name".into(), "spinner".into()),
-                    ("color".into(), "blue".into()),
-                ]),
-                created: 0,
-                updated: 0,
-            })
-            .unwrap();
-
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "widget-audit".into()),
-                    ("key".into(), "api_key_label".into()),
-                    ("value".into(), "public alias".into()),
-                ]),
-                actor: "".into(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "widget-audit".into()),
-                    ("key".into(), "secret_note".into()),
-                    ("value".into(), "launch code".into()),
-                ]),
-                actor: "".into(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let public_decision = decisions
-            .iter()
-            .find(|decision| decision.outcome.contains("api_key_label"))
-            .unwrap();
-        let sensitive_decision = decisions
-            .iter()
-            .find(|decision| decision.outcome.contains("secret_note"))
-            .unwrap();
-        assert_eq!(public_decision.evidence["value"], "public alias");
-        assert_eq!(
-            public_decision.outcome,
-            "set widget-audit.api_key_label = public alias"
-        );
-        assert_eq!(sensitive_decision.evidence["value"], "[redacted]");
-        assert_eq!(
-            sensitive_decision.outcome,
-            "set widget-audit.secret_note = [redacted]"
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_action_allows_local_principal_on_unrestricted_object() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-
-        svc.execute_action(with_named_principal(
-            ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "local".into()),
-                    ]),
-                    actor: "".into(),
-                }),
-                dry_run: false,
-            },
-            "local",
-        ))
-        .await
-        .unwrap();
-
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "local");
-    }
-
-    #[tokio::test]
-    async fn execute_action_create_link_requires_write_on_both_endpoints() {
-        let svc = service();
-        seed_domain_object(&svc, "from-1");
-        seed_domain_object(&svc, "to-1");
-        grant_object_role(&svc, "from-1", "alice", security::Role::Editor);
-        grant_object_role(&svc, "to-1", "bob", security::Role::Editor);
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "create_link".into(),
-                        params: HashMap::from([
-                            ("from_id".into(), "from-1".into()),
-                            ("to_id".into(), "to-1".into()),
-                            ("relation".into(), "depends_on".into()),
-                        ]),
-                        actor: "alice".into(),
-                    }),
-                    dry_run: false,
-                },
-                "alice",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(svc.db.get_link("from-1->to-1").unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn execute_action_delete_link_requires_write_on_both_endpoints() {
-        let svc = service();
-        seed_domain_object(&svc, "from-1");
-        seed_domain_object(&svc, "to-1");
-        svc.db
-            .create_link(&domain::Link {
-                id: "link-1".into(),
-                from_id: "from-1".into(),
-                to_id: "to-1".into(),
-                relation: "depends_on".into(),
-                created: 0,
-            })
-            .unwrap();
-        grant_object_role(&svc, "from-1", "alice", security::Role::Editor);
-        grant_object_role(&svc, "to-1", "bob", security::Role::Editor);
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "delete_link".into(),
-                        params: HashMap::from([("id".into(), "link-1".into())]),
-                        actor: "alice".into(),
-                    }),
-                    dry_run: false,
-                },
-                "alice",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert_eq!(err.message(), "write denied");
-        assert!(svc.db.get_link("link-1").unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn execute_action_delete_link_hides_unknown_link() {
-        let svc = service();
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "delete_link".into(),
-                        params: HashMap::from([("id".into(), "missing-link".into())]),
-                        actor: "alice".into(),
-                    }),
-                    dry_run: false,
-                },
-                "alice",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert_eq!(err.message(), "write denied");
     }
 
     #[tokio::test]
@@ -11304,172 +9864,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_claim_api_exclusivity_and_ack() {
-        // #399: claim exclusivity, fence, reclaim, ack.
-        use crate::sekai::action_effect::{
-            EFFECT_STATUS_CLAIMED, EFFECT_STATUS_COMPLETED, EFFECT_STATUS_PENDING,
-        };
-        use crate::sekai::action_instance::STATUS_ADMITTED;
-        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
-
-        let svc = service();
-        grant_action_admin(&svc);
-        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
-            r#type: Some(GovernedActionType {
-                namespace: "acme".into(),
-                type_id: "dispatch.only".into(),
-                version: "1.0.0".into(),
-                description: "claim".into(),
-                parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
-                allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
-                policy_scope: String::new(),
-                budget_scope: String::new(),
-                enabled: true,
-                created_by: String::new(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                disabled_at_ms: 0,
-            }),
-            request_id: "put-claim".into(),
-        }))
-        .await
-        .unwrap();
-        let admit = svc
-            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
-                namespace: "acme".into(),
-                type_id: "dispatch.only".into(),
-                version: "1.0.0".into(),
-                parameters_json: r#"{"runtime":"shikigami"}"#.into(),
-                idempotency_key: "claim-1".into(),
-                evidence_submission_ids: vec![],
-                request_id: "req-claim-1".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .instance
-            .unwrap();
-        assert_eq!(admit.status, STATUS_ADMITTED);
-
-        let claimable = svc
-            .list_claimable_action_work(with_principal(ListClaimableActionWorkRequest {
-                namespace: "acme".into(),
-                runtime_id: "shikigami".into(),
-                limit: 10,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .effects;
-        assert_eq!(claimable.len(), 1);
-        assert_eq!(claimable[0].status, EFFECT_STATUS_PENDING);
-        let effect_id = claimable[0].effect_id.clone();
-
-        let claimed = svc
-            .claim_action_work(with_principal(ClaimActionWorkRequest {
-                effect_id: effect_id.clone(),
-                runtime_id: "shikigami".into(),
-                request_id: "c1".into(),
-                ttl_ms: 60_000,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .effect
-            .unwrap();
-        assert_eq!(claimed.status, EFFECT_STATUS_CLAIMED);
-        assert_eq!(claimed.claim_generation, 1);
-
-        let denied = svc
-            .claim_action_work(with_principal(ClaimActionWorkRequest {
-                effect_id: effect_id.clone(),
-                runtime_id: "other".into(),
-                request_id: "c2".into(),
-                ttl_ms: 60_000,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
-
-        let hb = svc
-            .heartbeat_action_claim(with_principal(HeartbeatActionClaimRequest {
-                effect_id: effect_id.clone(),
-                runtime_id: "shikigami".into(),
-                claim_generation: 1,
-                fencing_token: claimed.claim_fencing_token.clone(),
-                ttl_ms: 60_000,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .effect
-            .unwrap();
-        assert!(hb.claim_expires_at_ms > claimed.claim_expires_at_ms - 1);
-
-        let acked = svc
-            .ack_action_work(with_principal(AckActionWorkRequest {
-                effect_id: effect_id.clone(),
-                runtime_id: "shikigami".into(),
-                claim_generation: 1,
-                fencing_token: claimed.claim_fencing_token.clone(),
-                outcome: "completed".into(),
-                reason: String::new(),
-                request_id: String::new(),
-                checkpoint_store_id: String::new(),
-                checkpoint_ref: String::new(),
-                checkpoint_digest: String::new(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .effect
-            .unwrap();
-        assert_eq!(acked.status, EFFECT_STATUS_COMPLETED);
-        // #400: ack binds harvest/outcome onto the operation receipt spine.
-        let receipt = svc
-            .db
-            .get_operation_receipt(&admit.operation_id)
-            .unwrap()
-            .expect("receipt");
-        assert!(
-            receipt
-                .events
-                .iter()
-                .any(|e| e.kind == ReceiptEventKind::OutcomeRecorded)
-        );
-        let effects = svc
-            .db
-            .list_action_effects_for_instance(&admit.instance_id)
-            .unwrap();
-        let instance = svc
-            .db
-            .get_action_instance(&admit.instance_id)
-            .unwrap()
-            .unwrap();
-        let view = crate::sekai::action_lifecycle::evaluate_action_lifecycle(
-            &instance,
-            &effects,
-            Some(&receipt),
-        );
-        assert!(view.mismatches.is_empty(), "{:?}", view.mismatches);
-
-        // Unauthorized principal denied
-        let unauth = svc
-            .claim_action_work(with_named_principal(
-                ClaimActionWorkRequest {
-                    effect_id: "nope".into(),
-                    runtime_id: "shikigami".into(),
-                    request_id: "x".into(),
-                    ttl_ms: 1000,
-                },
-                "bob",
-            ))
-            .await;
-        // may be not_found or permission depending on path; ensure not success for random id
-        assert!(unauth.is_err());
-    }
-
-    #[tokio::test]
     async fn list_schema_types_requires_principal() {
         let svc = service();
         let err = svc
@@ -11489,195 +9883,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn create_action_type_compatibility_preserves_execute_action_semantics() {
-        let svc = service();
-        grant_schema_admin(&svc);
-        grant_action_admin(&svc);
-        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
-            r#type: Some(widget_schema_type()),
-        }))
-        .await
-        .unwrap();
-
-        let action = ActionTypeDef {
-            name: "set_widget_color".into(),
-            description: "Set a widget color through the graph action DSL.".into(),
-            params: vec![ActionParamDef {
-                name: "color".into(),
-                r#type: "enum".into(),
-                required: true,
-                enum_values: vec!["red".into(), "blue".into()],
-            }],
-            ops: vec![ActionOp {
-                op: "set_property".into(),
-                property: "color".into(),
-                value_from: "color".into(),
-                relation: String::new(),
-            }],
-            target_kind: "widget".into(),
-            created: 0,
-            required_purpose: String::new(),
-        };
-        let created = svc
-            .create_action_type(with_principal(CreateActionTypeRequest {
-                action_type: Some(action.clone()),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .action_type
-            .unwrap();
-        let mut expected = action;
-        expected.created = created.created;
-        assert_eq!(created, expected);
-
-        let mut replay = created.clone();
-        replay.created = 0;
-        let replayed = svc
-            .create_action_type(with_principal(CreateActionTypeRequest {
-                action_type: Some(replay),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .action_type
-            .unwrap();
-        assert_eq!(replayed.created, created.created);
-
-        let mut replay_with_changed_timestamp = created.clone();
-        replay_with_changed_timestamp.created = created.created + 999;
-        let replayed_with_changed_timestamp = svc
-            .create_action_type(with_principal(CreateActionTypeRequest {
-                action_type: Some(replay_with_changed_timestamp),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .action_type
-            .unwrap();
-        assert_eq!(replayed_with_changed_timestamp.created, created.created);
-
-        svc.db
-            .create_object(&from_proto_obj(&widget_object(
-                "widget-compat",
-                HashMap::from([("name".into(), "compat".into())]),
-            )))
-            .unwrap();
-        grant_object_role(&svc, "widget-compat", "tester", security::Role::Editor);
-
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_widget_color".into(),
-                params: HashMap::from([
-                    ("id".into(), "widget-compat".into()),
-                    ("color".into(), "blue".into()),
-                ]),
-                actor: "tester".into(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-
-        let object = svc.db.get_object("widget-compat").unwrap().unwrap();
-        assert_eq!(object.properties.get("color"), Some(&"blue".into()));
-    }
-
-    #[tokio::test]
-    async fn create_action_type_compatibility_requires_action_admin() {
-        let svc = service();
-        let err = svc
-            .create_action_type(with_principal(CreateActionTypeRequest {
-                action_type: Some(ActionTypeDef {
-                    name: "untrusted_action".into(),
-                    description: String::new(),
-                    params: vec![],
-                    ops: vec![],
-                    target_kind: "widget".into(),
-                    created: 0,
-                    required_purpose: String::new(),
-                }),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn execute_action_refreshes_definitions_from_shared_storage() {
-        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        let writer = SekaiServiceImpl::new(db.clone());
-        writer
-            .create_schema_type(with_named_principal(
-                CreateSchemaTypeRequest {
-                    r#type: Some(widget_schema_type()),
-                },
-                "local",
-            ))
-            .await
-            .unwrap();
-        let reader = SekaiServiceImpl::new(db.clone());
-        let action = ActionTypeDef {
-            name: "set_widget_color_shared".into(),
-            description: "Set a widget color from another service instance.".into(),
-            params: vec![ActionParamDef {
-                name: "color".into(),
-                r#type: "string".into(),
-                required: true,
-                enum_values: vec![],
-            }],
-            ops: vec![ActionOp {
-                op: "set_property".into(),
-                property: "color".into(),
-                value_from: "color".into(),
-                relation: String::new(),
-            }],
-            target_kind: "widget".into(),
-            created: 0,
-            required_purpose: String::new(),
-        };
-        writer
-            .create_action_type(with_named_principal(
-                CreateActionTypeRequest {
-                    action_type: Some(action),
-                },
-                "local",
-            ))
-            .await
-            .unwrap();
-        writer
-            .db
-            .create_object(&from_proto_obj(&widget_object(
-                "widget-shared",
-                HashMap::from([("name".into(), "shared".into())]),
-            )))
-            .unwrap();
-
-        reader
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "set_widget_color_shared".into(),
-                        params: HashMap::from([
-                            ("id".into(), "widget-shared".into()),
-                            ("color".into(), "blue".into()),
-                        ]),
-                        actor: "local".into(),
-                    }),
-                    dry_run: false,
-                },
-                "local",
-            ))
-            .await
-            .unwrap();
-
-        let object = reader.db.get_object("widget-shared").unwrap().unwrap();
-        assert_eq!(object.properties.get("color"), Some(&"blue".into()));
     }
 
     #[tokio::test]
@@ -12486,86 +10691,6 @@ mod tests {
         }))
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn user_defined_action_blocks_when_target_schema_failed_to_load() {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        db.migrate_schema_types().unwrap();
-        {
-            let conn = db.conn();
-            conn.execute(
-                "INSERT INTO sekai_object_types (kind, description, properties_json, created, updated)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                ("broken", "Broken schema", "[", 1_i64),
-            )
-            .unwrap();
-        }
-        db.upsert_action_type(&action::ActionTypeDef {
-            name: "touch_broken".into(),
-            description: "".into(),
-            params: vec![action::ActionParamDef {
-                name: "value".into(),
-                param_type: schema::PropertyType::String,
-                required: true,
-                enum_values: vec![],
-            }],
-            ops: vec![action::ActionOp {
-                op: "set_property".into(),
-                property: "status".into(),
-                value_from: "value".into(),
-                relation: "".into(),
-            }],
-            target_kind: "broken".into(),
-            created: 1,
-            required_purpose: String::new(),
-        })
-        .unwrap();
-        let svc = SekaiServiceImpl::new(db.clone());
-        svc.db
-            .create_object(&domain::Object {
-                id: "broken-1".into(),
-                kind: "broken".into(),
-                name: "broken".into(),
-                namespace: "".into(),
-                external_id: "".into(),
-                properties: HashMap::new(),
-                created: 0,
-                updated: 0,
-            })
-            .unwrap();
-        grant_object_role(&svc, "broken-1", "alice", security::Role::Editor);
-
-        let err = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "touch_broken".into(),
-                        params: HashMap::from([
-                            ("id".into(), "broken-1".into()),
-                            ("value".into(), "done".into()),
-                        ]),
-                        actor: "".into(),
-                    }),
-                    dry_run: false,
-                },
-                "alice",
-            ))
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::Internal);
-        assert!(err.message().contains("broken"));
-        assert!(
-            !svc.db
-                .get_object("broken-1")
-                .unwrap()
-                .unwrap()
-                .properties
-                .contains_key("status")
-        );
     }
 
     #[tokio::test]
@@ -14134,139 +12259,9 @@ mod tests {
                 .write_knowledge(&approval_request)
                 .await
                 .unwrap(),
-            KnowledgeWriteOutcome::Accepted
+            KnowledgeWriteOutcome::PolicyDenied
         );
         assert!(approval_svc.db.get_object(&approval_id).unwrap().is_none());
-        let pending = approval_svc
-            .db
-            .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(
-            pending[0].action,
-            crate::sekai::learning::RECORD_LEARNING_ACTION
-        );
-        assert_eq!(pending[0].params["id"], approval_id);
-        assert_eq!(pending[0].work_unit, approval_id);
-    }
-
-    #[tokio::test]
-    async fn execute_action_denied_by_policy_is_blocked_and_audited() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        // Deny destructive ops for this agent scope.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Allow,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::from([(
-                    action::RiskClass::Destructive,
-                    action_policy::ActionDecision::Deny,
-                )]),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        // Create a link then attempt to delete it (destructive).
-        svc.db
-            .create_link(&domain::Link {
-                id: "obj-1->obj-1".into(),
-                from_id: "obj-1".into(),
-                to_id: "obj-1".into(),
-                relation: "self".into(),
-                created: 0,
-            })
-            .unwrap();
-
-        let mut request = with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "delete_link".into(),
-                params: HashMap::from([("id".into(), "obj-1->obj-1".into())]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        });
-        request
-            .metadata_mut()
-            .insert("x-chisei-work-unit", "denied-action-work".parse().unwrap());
-        let err = svc.execute_action(request).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-
-        // Link still exists (no mutation).
-        assert!(svc.db.get_link("obj-1->obj-1").unwrap().is_some());
-
-        // Denial was audited.
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("delete_link".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].reason, "action_policy_denied");
-        assert_eq!(decisions[0].evidence["risk_class"], "destructive");
-        assert_eq!(decisions[0].evidence["decision"], "deny");
-        assert_eq!(decisions[0].evidence["policy_scope"], "agent:tester");
-        assert_eq!(decisions[0].evidence["work_unit"], "denied-action-work");
-
-        // The denial carries a verifiable attestation of the policy applied.
-        // Attestation reads expose the policy snapshot, so they are gated on
-        // action admin like direct policy reads.
-        let attestation_id = decisions[0].evidence["attestation_id"].clone();
-        let denied = svc
-            .get_attestation(with_principal(GetAttestationRequest {
-                id: attestation_id.clone(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-        let hidden = svc
-            .list_attestations(with_principal(ListAttestationsRequest {
-                decision_id: String::new(),
-                policy_scope: String::new(),
-                limit: 0,
-                offset: 0,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .attestations;
-        assert!(hidden.is_empty());
-
-        grant_action_admin(&svc);
-        let listed = svc
-            .list_attestations(with_principal(ListAttestationsRequest {
-                decision_id: decisions[0].id.clone(),
-                policy_scope: String::new(),
-                limit: 0,
-                offset: 0,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .attestations;
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, attestation_id);
-        assert_eq!(listed[0].decision, "deny");
-        assert_eq!(listed[0].policy_scope, "agent:tester");
-        assert_eq!(listed[0].inputs["action"], "delete_link");
-        assert_eq!(listed[0].inputs["risk_class"], "destructive");
-
-        let report = svc
-            .verify_attestation(with_principal(VerifyAttestationRequest {
-                id: attestation_id,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(report.ok, "{}", report.error);
-        assert!(report.hash_ok);
-        assert!(report.replay_ok);
-        assert!(report.decision_linked);
-        assert_eq!(report.replayed_decision, "deny");
     }
 
     #[tokio::test]
@@ -14296,7 +12291,7 @@ mod tests {
                     policy: &action_policy::ActionPolicy::allow_all(scope),
                     action: "set_property",
                     actor: "tester",
-                    risk: action::RiskClass::Write,
+                    risk: RiskClass::Write,
                     namespace: "default",
                     decision: action_policy::ActionDecision::Allow,
                     created,
@@ -14325,732 +12320,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_action_without_policy_records_no_attestation() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "ok".into()),
-                ]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert!(!decisions[0].evidence.contains_key("attestation_id"));
-        assert!(
-            svc.db
-                .list_attestations(None, None, 10, 0)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_action_allowed_by_policy_executes() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        // Deny only destructive; writes (set_property) are allowed.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Allow,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::from([(
-                    action::RiskClass::Destructive,
-                    action_policy::ActionDecision::Deny,
-                )]),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "done".into()),
-                ]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "done");
-    }
-
-    #[tokio::test]
-    async fn execute_action_without_policy_is_allowed_backward_compatible() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        // A deny-all policy for a *different* agent must not affect this caller.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:someone-else".into(),
-                default_decision: action_policy::ActionDecision::Deny,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "done".into()),
-                ]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "done");
-    }
-
-    #[tokio::test]
-    async fn execute_action_require_approval_holds_and_returns_pending() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::RequireApproval,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        let mut req = Request::new(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "done".into()),
-                ]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        });
-        req.metadata_mut().insert(
-            "x-principal",
-            tonic::metadata::MetadataValue::try_from("tester").unwrap(),
-        );
-        req.metadata_mut().insert(
-            "x-chisei-work-unit",
-            tonic::metadata::MetadataValue::try_from("wu-1").unwrap(),
-        );
-
-        let result = svc
-            .execute_action(req)
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert_eq!(result.decision, "require_approval");
-        assert!(!result.approval_id.is_empty());
-
-        // No mutation happened.
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-
-        // A pending approval was persisted with work-unit + exact params.
-        let pending = svc
-            .db
-            .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, result.approval_id);
-        assert_eq!(pending[0].action, "set_property");
-        assert_eq!(pending[0].work_unit, "wu-1");
-        assert_eq!(pending[0].params["value"], "done");
-
-        // The hold was audited.
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].reason, "action_approval_pending");
-    }
-
-    #[tokio::test]
-    async fn execute_action_dry_run_reports_plan_without_mutating() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-
-        let result = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "done".into()),
-                    ]),
-                    actor: String::new(),
-                }),
-                dry_run: true,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-
-        assert!(result.dry_run);
-        assert_eq!(result.decision, "allow");
-        assert_eq!(result.planned_ops, vec!["set_property obj-1.status"]);
-
-        // No mutation happened.
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-
-        // A dry-run decision was audited.
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].reason, "execute_action_dry_run");
-        assert_eq!(decisions[0].evidence["dry_run"], "true");
-    }
-
-    #[tokio::test]
-    async fn execute_action_dry_run_surfaces_deny_without_erroring() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Deny,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        // Dry-run returns the plan + decision even though the policy denies.
-        let result = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "done".into()),
-                    ]),
-                    actor: String::new(),
-                }),
-                dry_run: true,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        assert!(result.dry_run);
-        assert_eq!(result.decision, "deny");
-        assert_eq!(result.planned_ops.len(), 1);
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-    }
-
-    fn hold_set_property(svc: &SekaiServiceImpl) -> String {
-        // Set a require-approval policy and hold a set_property action.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::RequireApproval,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-        let approval = action_approval::ActionApproval::pending(
-            "tester",
-            "set_property",
-            HashMap::from([
-                ("id".to_string(), "obj-1".to_string()),
-                ("key".to_string(), "status".to_string()),
-                ("value".to_string(), "done".to_string()),
-            ]),
-            "wu-1",
-            "agent:tester",
-            "write",
-            "obj-1",
-            1000,
-        );
-        svc.db.create_action_approval(&approval).unwrap();
-        approval.id
-    }
-
-    #[tokio::test]
-    async fn approve_action_resumes_execution_and_audits() {
-        let svc = service();
-        grant_action_admin(&svc);
-        seed_domain_object(&svc, "obj-1");
-        let id = hold_set_property(&svc);
-
-        let response = svc
-            .approve_action(with_principal(ApproveActionRequest {
-                approval_id: id.clone(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(response.result.unwrap().decision, "approved");
-        assert_eq!(response.approval.unwrap().status, "approved");
-
-        // The held action executed.
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "done");
-
-        // Approval recorded + no longer pending.
-        assert!(
-            svc.db
-                .list_action_approvals(Some(action_approval::ApprovalStatus::Pending))
-                .unwrap()
-                .is_empty()
-        );
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let approved = decisions
-            .iter()
-            .find(|d| d.reason == "action_approval_approved")
-            .unwrap();
-        assert_eq!(approved.evidence["work_unit"], "wu-1");
-        assert_eq!(approved.evidence["risk_class"], "write");
-        assert_eq!(approved.evidence["decision"], "require_approval");
-        assert_eq!(approved.evidence["approval_status"], "approved");
-        assert!(decisions.iter().any(|d| d.reason == "execute_action"));
-    }
-
-    #[tokio::test]
-    async fn deny_action_drops_hold_without_executing() {
-        let svc = service();
-        grant_action_admin(&svc);
-        seed_domain_object(&svc, "obj-1");
-        let id = hold_set_property(&svc);
-
-        let approval = svc
-            .deny_action(with_principal(DenyActionRequest {
-                approval_id: id,
-                reason: "not now".into(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .approval
-            .unwrap();
-        assert_eq!(approval.status, "denied");
-        assert_eq!(approval.outcome, "not now");
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let denied = decisions
-            .iter()
-            .find(|decision| decision.reason == "action_approval_denied")
-            .unwrap();
-        assert_eq!(denied.evidence["work_unit"], "wu-1");
-        assert_eq!(denied.evidence["risk_class"], "write");
-        assert_eq!(denied.evidence["decision"], "deny");
-
-        // No mutation.
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-    }
-
-    #[tokio::test]
-    async fn approve_action_rechecks_policy_and_blocks_when_now_denied() {
-        let svc = service();
-        grant_action_admin(&svc);
-        seed_domain_object(&svc, "obj-1");
-        let id = hold_set_property(&svc);
-
-        // Tighten the policy to deny before approving.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Deny,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        let err = svc
-            .approve_action(with_principal(ApproveActionRequest { approval_id: id }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-
-        // Still not executed.
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert!(!obj.properties.contains_key("status"));
-    }
-
-    #[tokio::test]
-    async fn approve_action_requires_admin() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        let id = hold_set_property(&svc);
-        let err = svc
-            .approve_action(with_principal(ApproveActionRequest { approval_id: id }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    }
-
-    #[tokio::test]
-    async fn list_pending_approvals_filters_by_status() {
-        let svc = service();
-        grant_action_admin(&svc);
-        seed_domain_object(&svc, "obj-1");
-        let id = hold_set_property(&svc);
-
-        let pending = svc
-            .list_pending_approvals(with_principal(ListPendingApprovalsRequest {
-                status: String::new(),
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .approvals;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, id);
-        // Sensitive params would be redacted; here plain values pass through.
-        assert_eq!(pending[0].params["value"], "done");
-    }
-
-    fn work_unit_request(
-        action: &str,
-        params: HashMap<String, String>,
-        wu: &str,
-    ) -> Request<ExecuteActionRequest> {
-        let mut req = Request::new(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: action.into(),
-                params,
-                actor: String::new(),
-            }),
-            dry_run: false,
-        });
-        req.metadata_mut().insert(
-            "x-principal",
-            tonic::metadata::MetadataValue::try_from("tester").unwrap(),
-        );
-        req.metadata_mut().insert(
-            "x-chisei-work-unit",
-            tonic::metadata::MetadataValue::try_from(wu).unwrap(),
-        );
-        req
-    }
-
-    #[tokio::test]
-    async fn blast_radius_delete_cap_hard_stops_after_limit() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        // Allow everything but cap deletes at 1 per work unit.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Allow,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: Some(1),
-            })
-            .unwrap();
-        for link_id in ["obj-1->a", "obj-1->b"] {
-            svc.db
-                .create_link(&domain::Link {
-                    id: link_id.into(),
-                    from_id: "obj-1".into(),
-                    to_id: "obj-1".into(),
-                    relation: "self".into(),
-                    created: 0,
-                })
-                .unwrap();
-        }
-
-        // First delete within cap succeeds.
-        svc.execute_action(work_unit_request(
-            "delete_link",
-            HashMap::from([("id".into(), "obj-1->a".into())]),
-            "wu-1",
-        ))
-        .await
-        .unwrap();
-
-        // Second delete exceeds the cap and is hard-stopped.
-        let err = svc
-            .execute_action(work_unit_request(
-                "delete_link",
-                HashMap::from([("id".into(), "obj-1->b".into())]),
-                "wu-1",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        // The second link still exists.
-        assert!(svc.db.get_link("obj-1->b").unwrap().is_some());
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("delete_link".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(
-            decisions
-                .iter()
-                .any(|d| d.reason == "action_blast_radius_exceeded")
-        );
-    }
-
-    #[tokio::test]
-    async fn blast_radius_counters_are_scoped_per_work_unit() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Allow,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: Some(1),
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        // First mutation on wu-1 succeeds.
-        svc.execute_action(work_unit_request(
-            "set_property",
-            HashMap::from([
-                ("id".into(), "obj-1".into()),
-                ("key".into(), "status".into()),
-                ("value".into(), "a".into()),
-            ]),
-            "wu-1",
-        ))
-        .await
-        .unwrap();
-
-        // Second mutation on wu-1 exceeds the cap.
-        let err = svc
-            .execute_action(work_unit_request(
-                "set_property",
-                HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "b".into()),
-                ]),
-                "wu-1",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-
-        // A different work unit has its own counter and succeeds.
-        svc.execute_action(work_unit_request(
-            "set_property",
-            HashMap::from([
-                ("id".into(), "obj-1".into()),
-                ("key".into(), "status".into()),
-                ("value".into(), "c".into()),
-            ]),
-            "wu-2",
-        ))
-        .await
-        .unwrap();
-        let obj = svc.db.get_object("obj-1").unwrap().unwrap();
-        assert_eq!(obj.properties["status"], "c");
-    }
-
-    #[tokio::test]
-    async fn action_class_budget_denies_when_exhausted() {
-        use crate::chisei::budget::{BudgetTracker, PeriodType};
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
-        let budget = Arc::new(BudgetTracker::new(db.clone()));
-        // Allow 1 write action, then deny.
-        budget
-            .set_limit("action:write", 1, PeriodType::Daily)
-            .unwrap();
-        let svc = SekaiServiceImpl::with_budget(db, budget.clone());
-        seed_domain_object(&svc, "obj-1");
-
-        // First write consumes the budget.
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: "set_property".into(),
-                params: HashMap::from([
-                    ("id".into(), "obj-1".into()),
-                    ("key".into(), "status".into()),
-                    ("value".into(), "a".into()),
-                ]),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-
-        // Second write is denied by the exhausted budget.
-        let err = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "b".into()),
-                    ]),
-                    actor: String::new(),
-                }),
-                dry_run: false,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-
-        // Usage reflects exactly one recorded action.
-        assert_eq!(budget.get_usage("action:write").tokens_used, 1);
-
-        let decisions = svc
-            .db
-            .list_decisions(&audit::DecisionFilter {
-                action: Some("set_property".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(
-            decisions
-                .iter()
-                .any(|d| d.reason == "action_budget_exceeded")
-        );
-    }
-
-    #[tokio::test]
-    async fn governed_tool_call_is_policy_checked_via_execute_action() {
-        use crate::sekai::tool_bridge::ToolCall;
-
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        // Deny destructive tool-calls for this agent.
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::Allow,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::from([(
-                    action::RiskClass::Destructive,
-                    action_policy::ActionDecision::Deny,
-                )]),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-        svc.db
-            .create_link(&domain::Link {
-                id: "obj-1->obj-1".into(),
-                from_id: "obj-1".into(),
-                to_id: "obj-1".into(),
-                relation: "self".into(),
-                created: 0,
-            })
-            .unwrap();
-
-        // An allowed write tool-call funnels through ExecuteAction and runs.
-        let write_call = ToolCall::from_json_arguments(
-            "set_property",
-            r#"{"id":"obj-1","key":"status","value":"done"}"#,
-        )
-        .unwrap();
-        svc.execute_action(with_principal(ExecuteActionRequest {
-            request: Some(ActionRequest {
-                action: write_call.action_name().to_string(),
-                params: write_call.to_action_params().unwrap(),
-                actor: String::new(),
-            }),
-            dry_run: false,
-        }))
-        .await
-        .unwrap();
-        assert_eq!(
-            svc.db.get_object("obj-1").unwrap().unwrap().properties["status"],
-            "done"
-        );
-
-        // A destructive tool-call is denied by policy at the same boundary.
-        let delete_call =
-            ToolCall::from_json_arguments("delete_link", r#"{"id":"obj-1->obj-1"}"#).unwrap();
-        let err = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: delete_call.action_name().to_string(),
-                    params: delete_call.to_action_params().unwrap(),
-                    actor: String::new(),
-                }),
-                dry_run: false,
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        assert!(svc.db.get_link("obj-1->obj-1").unwrap().is_some());
-    }
-
-    #[tokio::test]
     async fn reserved_governance_objects_are_hidden_from_generic_crud() {
         let svc = service();
         svc.db
@@ -15069,6 +12338,20 @@ mod tests {
                     properties: HashMap::from([("default_decision".into(), "allow".into())]),
                     created: 0,
                     updated: 0,
+                }),
+                lease_precondition: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: "retired-approval".into(),
+                    kind: "action_approval".into(),
+                    name: "must remain reserved".into(),
+                    ..Default::default()
                 }),
                 lease_precondition: None,
             }))
@@ -15101,66 +12384,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_approval_params_not_readable_via_get_object() {
-        let svc = service();
-        seed_domain_object(&svc, "obj-1");
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::RequireApproval,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: None,
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-        let result = svc
-            .execute_action(with_principal(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("api_key".into(), "super-secret".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), "done".into()),
-                    ]),
-                    actor: String::new(),
-                }),
-                dry_run: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner()
-            .result
-            .unwrap();
-        let approval_id = result.approval_id;
-        assert!(!approval_id.is_empty());
-
-        // The stored approval object (raw params incl. the secret) is not
-        // reachable through the generic GetObject RPC.
-        let err = svc
-            .get_object(with_principal(GetObjectRequest {
-                id: approval_id.clone(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
-
-        // Nor via a broad ListObjects for the reserved kind.
-        let listed = svc
-            .list_objects(with_principal(ListObjectsRequest {
-                filter: Some(ListFilter {
-                    kind: "action_approval".into(),
-                    ..Default::default()
-                }),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(listed.objects.len(), 0);
-    }
-
-    #[tokio::test]
     async fn blast_radius_object_not_writable_via_update_object() {
         let svc = service();
         svc.db.add_blast_radius("wu-1", 1, 0).unwrap();
@@ -15188,71 +12411,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(svc.db.get_blast_radius("wu-1").unwrap(), (1, 0));
-    }
-
-    #[tokio::test]
-    async fn approved_action_is_metered_against_blast_radius() {
-        let svc = service();
-        grant_action_admin(&svc);
-        seed_domain_object(&svc, "obj-1");
-        svc.db
-            .upsert_action_policy(&action_policy::ActionPolicy {
-                scope: "agent:tester".into(),
-                default_decision: action_policy::ActionDecision::RequireApproval,
-                action_overrides: HashMap::new(),
-                risk_overrides: HashMap::new(),
-                max_mutations_per_work_unit: Some(1),
-                max_deletes_per_work_unit: None,
-            })
-            .unwrap();
-
-        let mut ids = Vec::new();
-        for value in ["a", "b"] {
-            let mut req = Request::new(ExecuteActionRequest {
-                request: Some(ActionRequest {
-                    action: "set_property".into(),
-                    params: HashMap::from([
-                        ("id".into(), "obj-1".into()),
-                        ("key".into(), "status".into()),
-                        ("value".into(), value.to_string()),
-                    ]),
-                    actor: String::new(),
-                }),
-                dry_run: false,
-            });
-            req.metadata_mut().insert(
-                "x-principal",
-                tonic::metadata::MetadataValue::try_from("tester").unwrap(),
-            );
-            req.metadata_mut().insert(
-                "x-chisei-work-unit",
-                tonic::metadata::MetadataValue::try_from("wu-1").unwrap(),
-            );
-            let result = svc
-                .execute_action(req)
-                .await
-                .unwrap()
-                .into_inner()
-                .result
-                .unwrap();
-            ids.push(result.approval_id);
-        }
-
-        // First approval executes and consumes the single-mutation cap.
-        svc.approve_action(with_principal(ApproveActionRequest {
-            approval_id: ids[0].clone(),
-        }))
-        .await
-        .unwrap();
-
-        // Second approval is hard-stopped by the per-work-unit blast-radius cap.
-        let err = svc
-            .approve_action(with_principal(ApproveActionRequest {
-                approval_id: ids[1].clone(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]
@@ -16162,60 +13320,5 @@ mod tests {
         assert_eq!(stale.code(), tonic::Code::Aborted);
         assert_eq!(stale.message(), "capability catalog version unavailable");
         assert!(!stale.message().contains("widget"));
-    }
-
-    #[tokio::test]
-    async fn capability_catalog_never_advertises_or_executes_reserved_creation() {
-        let svc = service();
-        let catalog = svc
-            .discover_capabilities(with_named_principal(
-                DiscoverCapabilitiesRequest {
-                    namespace: "acme".into(),
-                    page_size: 200,
-                    ..Default::default()
-                },
-                "local",
-            ))
-            .await
-            .unwrap()
-            .into_inner();
-        for kind in RESERVED_GOVERNANCE_KINDS {
-            assert!(catalog.capabilities.iter().all(|entry| {
-                entry
-                    .object_type
-                    .as_ref()
-                    .is_none_or(|object_type| object_type.kind != *kind)
-                    && entry.name != format!("sekai.actions.create_object.{kind}")
-            }));
-        }
-
-        let params = HashMap::from([
-            ("id".into(), "forged-policy".into()),
-            ("kind".into(), action_policy::ACTION_POLICY_KIND.into()),
-            ("name".into(), "forged".into()),
-            ("namespace".into(), "acme".into()),
-        ]);
-        let denied = svc
-            .execute_action(with_named_principal(
-                ExecuteActionRequest {
-                    request: Some(ActionRequest {
-                        action: "create_object".into(),
-                        params: params.clone(),
-                        actor: String::new(),
-                    }),
-                    dry_run: false,
-                },
-                "local",
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-        assert!(svc.db.get_object("forged-policy").unwrap().is_none());
-
-        let resumed = svc
-            .run_action_effect("create_object", &params, "local", &["local".into()])
-            .unwrap_err();
-        assert_eq!(resumed.code(), tonic::Code::PermissionDenied);
-        assert!(svc.db.get_object("forged-policy").unwrap().is_none());
     }
 }

@@ -6,8 +6,7 @@ Research freeze: [research/395-action-effect-mapping.md](research/395-action-eff
 ## Purpose
 
 Operators register **namespace-scoped, versioned decision types** that the plane
-may admit later as `ActionInstance` records (#397). This is **not** the graph
-mutation DSL exposed by `ExecuteAction`.
+may admit later as `ActionInstance` records (#397).
 
 ## Wire names
 
@@ -67,16 +66,7 @@ definition.
 - Condition engines that auto-submit actions
 - Running agent turns or hosting runtimes
 - Domain webhook / GitHub type packs in core
-- Replacing graph `ExecuteAction`
-
-## Legacy graph-action compatibility
-
-Clients that still execute the legacy graph mutation DSL may use the
-authenticated, action-admin-gated `CreateActionType` compatibility RPC. It
-persists and activates an `ActionTypeDef` for `ExecuteAction` without mapping
-it into this governed registry. New integrations should use
-`PutGovernedActionType` and `SubmitActionInstance`; the two registries remain
-semantically distinct.
+- An in-process graph-mutation action DSL
 
 ## Dual-backend
 

@@ -1,13 +1,12 @@
-//! `sekaictl admin governance action` CLI: manage governed-action policy and approvals (Plan 9).
+//! `sekaictl admin governance action` CLI: manage governed-action policy.
 //!
 //! Connects to the sekai control plane (via `CHISEI_GRPC_URL` or `SEKAI_SOCKET`,
-//! defaulting to the local UDS) and drives the action-policy and approval RPCs.
+//! defaulting to the local UDS) and drives the action-policy RPCs.
 
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
-    ActionPolicy, ApproveActionRequest, DenyActionRequest, GetActionPolicyRequest,
-    ListActionPoliciesRequest, ListPendingApprovalsRequest, SetActionPolicyRequest,
+    ActionPolicy, GetActionPolicyRequest, ListActionPoliciesRequest, SetActionPolicyRequest,
 };
 use std::collections::HashMap;
 
@@ -20,9 +19,6 @@ pub fn usage() -> String {
         "                           [--max-mutations <n>] [--max-deletes <n>]",
         "sekaictl admin governance action policy get --scope <scope>",
         "sekaictl admin governance action policy list",
-        "sekaictl admin governance action approvals list [--status pending|approved|denied|all]",
-        "sekaictl admin governance action approvals approve --id <approval_id>",
-        "sekaictl admin governance action approvals deny --id <approval_id> [--reason <text>]",
     ]
     .join("\n")
 }
@@ -70,7 +66,6 @@ pub async fn run_action_command(args: Vec<String>) -> Result<(), BoxErr> {
     }
     match args[0].as_str() {
         "policy" => run_policy(args.into_iter().skip(1).collect()).await,
-        "approvals" => run_approvals(args.into_iter().skip(1).collect()).await,
         other => {
             eprintln!("unknown action command {other:?}");
             println!("{}", usage());
@@ -190,68 +185,6 @@ async fn run_policy(args: Vec<String>) -> Result<(), BoxErr> {
             eprintln!("unknown action policy command {other:?}");
             println!("{}", usage());
             return Err(std::io::Error::other("unknown action policy command").into());
-        }
-    }
-    Ok(())
-}
-
-async fn run_approvals(args: Vec<String>) -> Result<(), BoxErr> {
-    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{}", usage());
-        return Ok(());
-    }
-    let channel = connect_sekai(&target()).await?;
-    let mut sekai = SekaiServiceClient::new(channel);
-
-    match args[0].as_str() {
-        "list" => {
-            let status = flag_value(&args[1..], "--status").unwrap_or_default();
-            let approvals = sekai
-                .list_pending_approvals(ListPendingApprovalsRequest { status })
-                .await?
-                .into_inner()
-                .approvals;
-            if approvals.is_empty() {
-                println!("no approvals");
-            }
-            println!("id\tstatus\taction\trisk\ttarget\tactor\twork_unit");
-            for a in approvals {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    a.id, a.status, a.action, a.risk_class, a.target_id, a.actor, a.work_unit
-                );
-            }
-        }
-        "approve" => {
-            let id = flag_value(&args[1..], "--id")
-                .ok_or_else(|| std::io::Error::other("--id required"))?;
-            let resp = sekai
-                .approve_action(ApproveActionRequest { approval_id: id })
-                .await?
-                .into_inner();
-            if let Some(result) = resp.result {
-                println!("approved: {} ({})", result.message, result.decision);
-            }
-        }
-        "deny" => {
-            let id = flag_value(&args[1..], "--id")
-                .ok_or_else(|| std::io::Error::other("--id required"))?;
-            let reason = flag_value(&args[1..], "--reason").unwrap_or_default();
-            let approval = sekai
-                .deny_action(DenyActionRequest {
-                    approval_id: id,
-                    reason,
-                })
-                .await?
-                .into_inner()
-                .approval
-                .unwrap_or_default();
-            println!("denied: {} ({})", approval.id, approval.outcome);
-        }
-        other => {
-            eprintln!("unknown action approvals command {other:?}");
-            println!("{}", usage());
-            return Err(std::io::Error::other("unknown action approvals command").into());
         }
     }
     Ok(())

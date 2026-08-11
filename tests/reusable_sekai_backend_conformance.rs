@@ -1,11 +1,9 @@
-use sekai_chisei::db::action::ActionTypeBackend;
 use sekai_chisei::db::credential::CredentialBackend;
 use sekai_chisei::db::dataset::DatasetBackend;
 use sekai_chisei::db::lease::LeaseBackend;
 use sekai_chisei::db::ontology::OntologyBackend;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::sekai::action::{ActionOp, ActionParamDef, ActionTypeDef};
 use sekai_chisei::sekai::dataset::{ColumnDef, Dataset, RowFilter, RowQuery, VirtualTable};
 use sekai_chisei::sekai::ontology::{
     Cardinality, OntologyClass, OntologyProperty, OntologyRelation,
@@ -149,31 +147,6 @@ fn exercise_ontology(db: &dyn OntologyBackend, prefix: &str) {
     assert!(db.delete_ontology_class(&parent.name).unwrap());
 }
 
-fn exercise_actions(db: &dyn ActionTypeBackend, prefix: &str) {
-    let action = ActionTypeDef {
-        name: format!("{prefix}-tag"),
-        description: "tag an artifact".into(),
-        params: vec![ActionParamDef {
-            name: "value".into(),
-            param_type: PropertyType::String,
-            required: true,
-            enum_values: vec![],
-        }],
-        ops: vec![ActionOp {
-            op: "set_property".into(),
-            property: "tag".into(),
-            value_from: "value".into(),
-            relation: String::new(),
-        }],
-        target_kind: "artifact".into(),
-        created: 10,
-        required_purpose: String::new(),
-    };
-    assert_eq!(db.upsert_action_type(&action).unwrap(), action);
-    assert_eq!(db.list_action_types().unwrap(), vec![action.clone()]);
-    assert!(db.delete_action_type(&action.name).unwrap());
-}
-
 fn exercise_leases(db: &dyn LeaseBackend, prefix: &str) {
     let namespace = format!("{prefix}-namespace");
     let key = format!("{prefix}-key");
@@ -280,14 +253,12 @@ fn exercise_credentials(db: &dyn CredentialBackend, prefix: &str) {
 fn exercise_backend(
     datasets: &dyn DatasetBackend,
     ontology: &dyn OntologyBackend,
-    actions: &dyn ActionTypeBackend,
     leases: &dyn LeaseBackend,
     credentials: &dyn CredentialBackend,
     prefix: &str,
 ) {
     exercise_datasets(datasets, prefix);
     exercise_ontology(ontology, prefix);
-    exercise_actions(actions, prefix);
     exercise_leases(leases, prefix);
     exercise_credentials(credentials, prefix);
 }
@@ -295,7 +266,7 @@ fn exercise_backend(
 #[test]
 fn sqlite_reusable_sekai_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();
-    exercise_backend(&db, &db, &db, &db, &db, "sqlite");
+    exercise_backend(&db, &db, &db, &db, "sqlite");
 }
 
 fn postgres_test_database() -> PostgresDb {
@@ -315,7 +286,7 @@ fn postgres_test_database() -> PostgresDb {
 fn postgres_reusable_sekai_conformance() {
     let db = postgres_test_database();
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
-    exercise_backend(&db, &db, &db, &db, &db, &prefix);
+    exercise_backend(&db, &db, &db, &db, &prefix);
 }
 
 #[test]

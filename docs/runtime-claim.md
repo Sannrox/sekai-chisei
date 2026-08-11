@@ -65,8 +65,9 @@ ack terminal outcomes. The plane never spawns processes or holds model tools.
 ## Governance and checkpoint configuration
 
 `resolve_parked_work/v1` uses normal Action policy. A policy may allow immediate
-invocation, deny it durably, or hold it for `ApproveAction`. Approval does not
-weaken the invocation-time effect and park-generation checks.
+invocation or prevent automatic invocation. Requiring approval does not weaken
+the invocation-time effect and park-generation checks, and no legacy graph
+Action approval RPC can resume the work.
 
 `SEKAI_CHECKPOINT_STORES` is a comma-separated allowlist of logical checkpoint
 provider ids accepted at park time. When unset, checkpoint metadata is rejected
