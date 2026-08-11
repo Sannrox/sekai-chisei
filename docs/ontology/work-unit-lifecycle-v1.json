@@ -3,12 +3,12 @@
   "classes": [
     {
       "name": "WorkUnitLifecycleModule",
-      "description": "Sekai-owned deep module whose interface owns Work Unit admission and terminal transition replay identity, transition persistence, and durable request deduplication ordering.",
+      "description": "Sekai-owned deep module whose interface owns Work Unit creation and replay, state normalization, created-event ordering, admission, transitions, authorized reconciliation, and durable request deduplication ordering.",
       "superclasses": []
     },
     {
       "name": "SekaiGrpcTransportAdapter",
-      "description": "gRPC adapter that authenticates and authorizes Work Unit callers, maps protocol messages, and delegates durable lifecycle behavior to the Work Unit lifecycle module.",
+      "description": "gRPC adapter that authenticates Work Unit callers, authorizes target-object access, maps protocol messages, and delegates durable lifecycle behavior to the Work Unit lifecycle module.",
       "superclasses": []
     },
     {
@@ -20,13 +20,13 @@
   "relations": [
     {
       "name": "delegates_work_unit_lifecycle_to",
-      "description": "The gRPC transport delegates admission replay, lifecycle transitions, persistence, and request deduplication to the Work Unit lifecycle module.",
+      "description": "The gRPC transport delegates creation replay, normalization, event ordering, admission, transitions, reconciliation, persistence, and request deduplication to the Work Unit lifecycle module.",
       "domain": "SekaiGrpcTransportAdapter",
       "range": "WorkUnitLifecycleModule"
     },
     {
       "name": "governs_work_unit",
-      "description": "The Work Unit lifecycle module governs durable admission and terminal transitions for Work Units.",
+      "description": "The Work Unit lifecycle module governs durable creation, admission, transitions, and reconciliation for Work Units.",
       "domain": "WorkUnitLifecycleModule",
       "range": "WorkUnit"
     }
@@ -35,13 +35,13 @@
     {
       "subject": "WorkUnitLifecycleModule",
       "source": "src/sekai/work_unit_lifecycle.rs",
-      "locator": "WorkUnitLifecycle/admit/transition",
+      "locator": "WorkUnitLifecycle/create/admit/transition/reconcile",
       "confidence": 1.0
     },
     {
       "subject": "SekaiGrpcTransportAdapter",
       "source": "src/grpc/sekai_service.rs",
-      "locator": "try_admit_work_unit/heartbeat_work_unit/complete_work_unit/fail_work_unit/cancel_work_unit",
+      "locator": "create_work_unit/try_admit_work_unit/heartbeat_work_unit/complete_work_unit/fail_work_unit/cancel_work_unit/reconcile_work_units",
       "confidence": 1.0
     },
     {
@@ -59,7 +59,7 @@
     {
       "subject": "governs_work_unit",
       "source": "src/sekai/work_unit_lifecycle.rs",
-      "locator": "admit/transition",
+      "locator": "create/admit/transition/reconcile",
       "confidence": 1.0
     }
   ]
