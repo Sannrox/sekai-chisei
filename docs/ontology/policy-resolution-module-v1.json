@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "PolicyResolutionModule",
+      "description": "Deep private Chisei module whose interface produces one permitted route or denial and owns policy-scope precedence, regression safeguards, privacy and capability gates, route overrides, cost-tier and portfolio selection, runtime canonicalization, and fallback projection.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Chisei callers, translates protocol messages, and delegates domain routing input to Policy resolution.",
+      "superclasses": []
+    },
+    {
+      "name": "GatewayExecutionDecision",
+      "description": "Governed gateway execution decision that consumes Policy resolution through its private domain interface.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_policy_resolution_to",
+      "description": "The gRPC transport delegates policy resolution after caller authentication.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "PolicyResolutionModule"
+    },
+    {
+      "name": "resolves_route_through",
+      "description": "Gateway execution obtains its governed route through the Policy resolution domain interface.",
+      "domain": "GatewayExecutionDecision",
+      "range": "PolicyResolutionModule"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "PolicyResolutionModule",
+      "source": "src/grpc/chisei_service/policy_resolution.rs",
+      "locator": "ChiseiServiceImpl::resolve_policy_for_actor",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "authenticated_actor",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GatewayExecutionDecision",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "ChiseiService::decide_gateway_execution",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_policy_resolution_to",
+      "source": "src/grpc/chisei_service/policy_resolution.rs",
+      "locator": "resolve_policy_for_actor call",
+      "confidence": 1.0
+    },
+    {
+      "subject": "resolves_route_through",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "resolve_policy_for_actor call in decide_gateway_execution",
+      "confidence": 1.0
+    }
+  ]
+}
