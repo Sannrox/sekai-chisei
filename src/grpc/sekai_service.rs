@@ -8,6 +8,8 @@ mod action_execution;
 mod catalog_invocation;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
+#[path = "ontology_definition_lifecycle.rs"]
+mod ontology_definition_lifecycle;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 
@@ -5575,90 +5577,7 @@ impl SekaiService for SekaiServiceImpl {
             .class
             .ok_or(Status::invalid_argument("class required"))?;
         let parsed = from_proto_ontology_class(&proto)?;
-        check_ontology_admin(
-            &self.security,
-            &ontology_class_object_id(&parsed.name),
-            &principals,
-        )?;
-        for reference in parsed
-            .superclasses
-            .iter()
-            .chain(&parsed.equivalent_classes)
-            .chain(&parsed.disjoint_classes)
-        {
-            check_read(
-                &self.security,
-                &ontology_class_object_id(reference),
-                &principals,
-            )?;
-        }
-        // Ontology-first kind ensure (#387): when mapped_kind is set and not yet
-        // registered, create an empty ObjectType under schema admin (same principal
-        // already passed ontology admin, which includes schema admin).
-        if !parsed.mapped_kind.is_empty() {
-            let kind = parsed.mapped_kind.as_str();
-            let needs_ensure = {
-                let schema = self
-                    .schema
-                    .read()
-                    .map_err(|_| Status::internal("schema registry unavailable"))?;
-                schema.get(kind).is_none()
-            };
-            if needs_ensure {
-                if schema::is_builtin_schema_kind(kind) {
-                    return Err(Status::invalid_argument(
-                        "mapped schema kind not found for builtin kind",
-                    ));
-                }
-                // Ontology admin already authorized this mutation; ensuring the
-                // mapped kind is part of ontology-first authoring (#387), not a
-                // separate schema-only privilege.
-                let object_type = schema::ObjectType {
-                    kind: kind.to_string(),
-                    description: format!("Object kind ensured for ontology class {}", parsed.name),
-                    properties: Vec::new(),
-                    is_builtin: false,
-                    implements: Vec::new(),
-                };
-                {
-                    let registry = self
-                        .schema
-                        .read()
-                        .map_err(|_| Status::internal("schema registry unavailable"))?;
-                    schema::validate_object_type_definition(
-                        &object_type,
-                        registry.get(&object_type.kind),
-                        &registry,
-                    )
-                    .map_err(Status::invalid_argument)?;
-                }
-                validate_computed_property_functions(&self.db, &object_type)?;
-                self.db
-                    .upsert_object_type(&object_type)
-                    .map_err(Status::internal)?;
-                self.schema
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))?
-                    .register(object_type);
-                self.schema_load_errors
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))?
-                    .remove(kind);
-            } else {
-                check_read(&self.security, &schema_object_id(kind), &principals)?;
-            }
-        }
-        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
-        let existing = registry.get_class(&parsed.name).cloned();
-        // Validate against the rest of the ontology, not the prior version of
-        // this same class, so cycle/reference checks are deterministic.
-        registry.remove_class(&parsed.name);
-        ontology::validate_class_definition(&parsed, existing.as_ref(), &registry)
-            .map_err(Status::invalid_argument)?;
-        let actor = principals.first().map(String::as_str).unwrap_or_default();
-        self.db
-            .upsert_ontology_class_with_audit(&parsed, actor)
-            .map_err(Status::internal)?;
+        let parsed = self.create_ontology_class_definition(&principals, parsed)?;
         Ok(Response::new(CreateOntologyClassResponse {
             class: Some(to_proto_ontology_class(&parsed)),
         }))
@@ -5674,51 +5593,7 @@ impl SekaiService for SekaiServiceImpl {
         if name.trim().is_empty() {
             return Err(Status::invalid_argument("class name required"));
         }
-        check_ontology_admin(
-            &self.security,
-            &ontology_class_object_id(&name),
-            &principals,
-        )?;
-        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
-        // Refuse to orphan classes or relations that still reference this one.
-        for class in registry.classes() {
-            if class.name == name {
-                continue;
-            }
-            if class
-                .superclasses
-                .iter()
-                .chain(&class.equivalent_classes)
-                .chain(&class.disjoint_classes)
-                .any(|reference| reference == &name)
-            {
-                return Err(Status::failed_precondition(format!(
-                    "class '{}' still references '{name}'",
-                    class.name
-                )));
-            }
-        }
-        for relation in registry.relations() {
-            if relation.domain == name || relation.range == name {
-                return Err(Status::failed_precondition(format!(
-                    "relation '{}' still uses '{name}' as domain or range",
-                    relation.name
-                )));
-            }
-        }
-        let actor = principals.first().map(String::as_str).unwrap_or_default();
-        let object_id = ontology_class_object_id(&name);
-        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
-        if !self
-            .db
-            .delete_ontology_class_with_audit(&name, actor)
-            .map_err(Status::internal)?
-        {
-            return Err(Status::not_found("ontology class not found"));
-        }
-        for grant in &grants {
-            self.security.remove_grant(&object_id, &grant.principal);
-        }
+        self.delete_ontology_class_definition(&principals, &name)?;
         Ok(Response::new(DeleteOntologyClassResponse {}))
     }
 
@@ -5778,46 +5653,7 @@ impl SekaiService for SekaiServiceImpl {
             .relation
             .ok_or(Status::invalid_argument("relation required"))?;
         let parsed = from_proto_ontology_relation(&proto)?;
-        check_ontology_admin(
-            &self.security,
-            &ontology_relation_object_id(&parsed.name),
-            &principals,
-        )?;
-        for endpoint in [&parsed.domain, &parsed.range] {
-            check_read(
-                &self.security,
-                &ontology_class_object_id(endpoint),
-                &principals,
-            )?;
-        }
-        if !parsed.inverse.is_empty() {
-            check_read(
-                &self.security,
-                &ontology_relation_object_id(&parsed.inverse),
-                &principals,
-            )?;
-        }
-        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
-        let existing = registry.get_relation(&parsed.name).cloned();
-        registry.remove_relation(&parsed.name);
-        ontology::validate_relation_definition(&parsed, existing.as_ref(), &registry)
-            .map_err(Status::invalid_argument)?;
-        for referencing in registry
-            .relations()
-            .into_iter()
-            .filter(|relation| relation.inverse == parsed.name)
-        {
-            if referencing.domain != parsed.range || referencing.range != parsed.domain {
-                return Err(Status::invalid_argument(format!(
-                    "relation '{}' would no longer reverse inverse '{}'",
-                    referencing.name, parsed.name
-                )));
-            }
-        }
-        let actor = principals.first().map(String::as_str).unwrap_or_default();
-        self.db
-            .upsert_ontology_relation_with_audit(&parsed, actor)
-            .map_err(Status::internal)?;
+        let parsed = self.create_ontology_relation_definition(&principals, parsed)?;
         Ok(Response::new(CreateOntologyRelationResponse {
             relation: Some(to_proto_ontology_relation(&parsed)),
         }))
@@ -5833,35 +5669,7 @@ impl SekaiService for SekaiServiceImpl {
         if name.trim().is_empty() {
             return Err(Status::invalid_argument("relation name required"));
         }
-        check_ontology_admin(
-            &self.security,
-            &ontology_relation_object_id(&name),
-            &principals,
-        )?;
-        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
-        if let Some(referencing) = registry
-            .relations()
-            .into_iter()
-            .find(|relation| relation.name != name && relation.inverse == name)
-        {
-            return Err(Status::failed_precondition(format!(
-                "relation '{}' still uses '{name}' as its inverse",
-                referencing.name
-            )));
-        }
-        let actor = principals.first().map(String::as_str).unwrap_or_default();
-        let object_id = ontology_relation_object_id(&name);
-        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
-        if !self
-            .db
-            .delete_ontology_relation_with_audit(&name, actor)
-            .map_err(Status::internal)?
-        {
-            return Err(Status::not_found("ontology relation not found"));
-        }
-        for grant in &grants {
-            self.security.remove_grant(&object_id, &grant.principal);
-        }
+        self.delete_ontology_relation_definition(&principals, &name)?;
         Ok(Response::new(DeleteOntologyRelationResponse {}))
     }
 
