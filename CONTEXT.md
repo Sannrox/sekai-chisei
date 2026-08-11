@@ -26,3 +26,15 @@ The **Action Work lifecycle** lists claimable work, claims and heartbeats
 runtime claims, acknowledges terminal or parked outcomes, records host claim
 events, projects receipt harvest events, and records audit decisions after
 durable persistence.
+
+## Action execution admission
+
+**Action execution admission** is the ordered, pre-effect phase of legacy
+governed Action execution. It resolves live targets, enforces target,
+classification, purpose, namespace, and schema constraints, and freezes the
+governed policy context before dry-run, approval, denial, limit checks, or
+effect execution can proceed.
+
+The gRPC adapter owns caller authentication, capability-catalog correlation,
+and protocol response metadata. Admission trusts the authenticated principals,
+not the actor supplied inside the protocol request.

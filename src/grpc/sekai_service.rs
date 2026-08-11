@@ -2,6 +2,8 @@
 
 #[path = "action_approval_execution.rs"]
 mod action_approval_execution;
+#[path = "action_execution.rs"]
+mod action_execution;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -31,9 +33,7 @@ use crate::sekai::action_approval;
 use crate::sekai::action_approval_lifecycle::{
     ActionApprovalLifecycle, ApprovalLifecycleError, DenyAction as DenyActionCommand,
 };
-use crate::sekai::action_lifecycle::{
-    self, ActionAudit, ActionLimitExceeded, GovernedActionContext,
-};
+use crate::sekai::action_lifecycle::{self, ActionAudit, ActionLimitExceeded};
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
     AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
@@ -7658,175 +7658,19 @@ impl SekaiService for SekaiServiceImpl {
         } else {
             None
         };
-        let actions = self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?;
-        let mask_missing_link = actions.masks_missing_link(&r.action);
-        let sensitive_params = actions.sensitive_param_names(&r.action);
-        let target_ids = actions
-            .target_ids(&self.db, &r.action, &r.params)
-            .map_err(|err| {
-                if mask_missing_link && err == "link not found" {
-                    Status::permission_denied("write denied")
-                } else {
-                    Status::invalid_argument(err)
-                }
-            })?;
-        if invoked_capability.is_some() {
-            for target_id in &target_ids {
-                if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)?
-                    && target.namespace != invocation_namespace
-                {
-                    return Err(Status::failed_precondition(
-                        "capability namespace does not match action target",
-                    ));
-                }
-            }
-            if let Some(namespace) = r.params.get("namespace")
-                && namespace != invocation_namespace
-            {
-                return Err(Status::failed_precondition(
-                    "capability namespace does not match action target",
-                ));
-            }
-        }
-        if actions.creates_namespace(&r.action, &r.params) {
-            return Err(Status::permission_denied(
-                "namespace objects must be managed through EnsureTeamNamespace",
-            ));
-        }
-        for target_id in &target_ids {
-            if let Some(target) = self.db.get_object(target_id).map_err(Status::internal)? {
-                if target.kind == markings::PRINCIPAL_PROFILE_KIND {
-                    return Err(Status::permission_denied(
-                        "principal_profile objects require credential-admin CRUD paths",
-                    ));
-                }
-                enforce_namespace_tenant_context(
-                    &self.db,
-                    tenant_context.as_ref(),
-                    &target.namespace,
-                    true,
-                )?;
-                check_team_namespace(&self.db, &principals, &target.namespace, true)?;
-                // Marked targets require clearance for action execution too.
-                let _ = enforce_object_marking_access(
-                    &self.db,
-                    &target,
-                    &principals,
-                    &format!("execute_action:{}:{}", r.action, target_id),
-                )?;
-            }
-            check_write(&self.security, target_id, &principals)?;
-        }
-        // Reject invalid classification writes through set_property / fixed params
-        // and registered action ops that set the classification property.
-        if r.params
-            .get("key")
-            .is_some_and(|key| key == markings::OBJECT_CLASSIFICATION_PROPERTY)
-        {
-            if let Some(value) = r.params.get("value") {
-                markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
-            }
-        }
-        if let Some(value) = r.params.get(markings::OBJECT_CLASSIFICATION_PROPERTY) {
-            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
-        }
-        if let Some(action_type) = actions.get_action_type(&r.action) {
-            for op in &action_type.ops {
-                if op.op == "set_property"
-                    && op.property == markings::OBJECT_CLASSIFICATION_PROPERTY
-                {
-                    let value = if op.value_from.is_empty() {
-                        r.params.get("value")
-                    } else {
-                        r.params.get(&op.value_from)
-                    };
-                    if let Some(value) = value {
-                        markings::parse_optional_classification(value)
-                            .map_err(Status::invalid_argument)?;
-                    }
-                }
-            }
-        }
-        // Purpose gate for registered action types with required_purpose.
-        {
-            let required_purpose = actions
-                .get_action_type(&r.action)
-                .map(|action_type| action_type.required_purpose.clone())
-                .unwrap_or_default();
-            if !required_purpose.trim().is_empty() {
-                let authority = resolve_principal_authority(&self.db, &principals)?;
-                let purpose = markings::evaluate_purpose_access(
-                    &format!("execute_action:{}", r.action),
-                    &required_purpose,
-                    &authority,
-                );
-                let actor = principals.first().cloned().unwrap_or_default();
-                let mut evidence = HashMap::from([
-                    ("required_purpose".into(), purpose.required_purpose.clone()),
-                    ("detail".into(), purpose.detail.clone()),
-                ]);
-                if purpose.decision == markings::MarkingDecision::Deny {
-                    evidence.insert("outcome".into(), "denied".into());
-                    let _ = record_marking_or_purpose_decision(
-                        &self.db,
-                        &actor,
-                        "purpose.execute",
-                        target_ids.first().map(String::as_str).unwrap_or(""),
-                        &purpose.decision_id,
-                        "denied",
-                        evidence,
-                    );
-                    return Err(Status::permission_denied("purpose not allow-listed"));
-                }
-                if purpose.decision == markings::MarkingDecision::Allow {
-                    evidence.insert("outcome".into(), "allowed".into());
-                    record_marking_or_purpose_decision(
-                        &self.db,
-                        &actor,
-                        "purpose.execute",
-                        target_ids.first().map(String::as_str).unwrap_or(""),
-                        &purpose.decision_id,
-                        "allowed",
-                        evidence,
-                    )?;
-                }
-            }
-        }
-        if let Some(namespace) = r.params.get("namespace") {
-            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, true)?;
-            check_team_namespace(&self.db, &principals, namespace, true)?;
-        } else if r.action == "create_object"
-            && (tenant_context.is_some() || is_managed_team_principal(&self.db, &principals)?)
-        {
-            return Err(Status::permission_denied(
-                "team object creation requires a canonical namespace",
-            ));
-        }
-        let schema_kinds = actions
-            .schema_kinds(&self.db, &r.action, &r.params)
-            .map_err(Status::invalid_argument)?;
-        ensure_action_schema_kinds_allowed(&schema_kinds)?;
-        let actor = principals.first().cloned().unwrap_or_default();
-        // Governed-action policy gate (Plan 9, Phase A). Resolved by
-        // agent-then-namespace scope; no policy == allow (backward compatible).
-        let action_risk = actions.action_risk_class(&r.action);
-        let policy_namespace = action_policy_namespace(&self.db, &target_ids, &r.params);
-        let (op_mutations, op_deletes) = actions.action_op_counts(&r.action, &r.params);
-        let lifecycle = GovernedActionContext::resolve(
-            &self.db,
-            &actor,
-            &policy_namespace,
-            &r.action,
-            action_risk,
+        let admitted = action_execution::ActionExecutionAdmission::new(self).admit(
+            &r,
+            &principals,
+            tenant_context.as_ref(),
             &work_unit,
-            op_mutations,
-            op_deletes,
-            ERASED_NAMESPACE,
-        )
-        .map_err(Status::internal)?;
+            invoked_capability.is_some().then_some(invocation_namespace),
+        )?;
+        let target_ids = admitted.target_ids;
+        let sensitive_params = admitted.sensitive_params;
+        let schema_kinds = admitted.schema_kinds;
+        let actor = admitted.actor;
+        let lifecycle = admitted.lifecycle;
+        let actions = admitted.actions;
         let decision = lifecycle.decision;
         let policy_scope = lifecycle.policy_scope.clone();
         if let Some(guard) = receipt_guard.as_mut() {
