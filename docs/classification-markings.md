@@ -53,18 +53,9 @@ Principal attributes live on a graph object with:
 
 Marking checks apply to `GetObject`, `FindByExternalId`, `FindByProperty`,
 `ListObjects`, `Traverse`, `UpdateObject`, `DeleteObject`, context retrieval,
-action execution, and approval resume. `ListObjects` walks principal-visible
+governed mutation and admission boundaries. `ListObjects` walks principal-visible
 SQL pages, counts only marking-visible rows for `total`, and returns the
 requested offset/limit window over that filtered set.
-
-## Action purpose
-
-`ActionTypeDef.required_purpose` (proto field 7) gates invocation:
-
-- Empty / unset: no purpose check.
-- Set: principal’s `allowed_purposes` must include the token, unless the actor
-  is a trusted service principal. Fail closed otherwise with
-  `purpose not allow-listed`.
 
 ## Audit / receipts
 
@@ -74,7 +65,6 @@ When a marking or purpose gate is **applicable** (not `not_applicable`):
   (per-object; includes decision id).
 - Bulk surfaces (`ListObjects`, `Traverse`, find, retrieval) **enforce** marking
   without per-row allow audits to avoid ledger spam.
-- purpose allows/denies record `purpose.execute`
 
 Evidence includes decision id (`marking:…` / `purpose:…`), classification
 tokens, and a short detail string. Denied marking checks intentionally avoid

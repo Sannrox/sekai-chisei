@@ -1,24 +1,5 @@
 # Examples
 
-## Reference capability host
-
-`capability_reference_host` is a host-neutral reference consumer for the agent-facing
-capability catalog. It discovers a governed action from the live namespace
-catalog, binds the projected public contract, invokes it, presents or resolves
-an approval, and retrieves the causal operation report. The host contains no
-compiled list of Chisei actions.
-
-```bash
-CAPABILITY_NAMESPACE=default \
-CAPABILITY_NAME=sekai.actions.set_property \
-CAPABILITY_INPUT='{"id":"object-1","key":"status","value":"reviewed"}' \
-SEKAI_INSECURE=1 cargo run --example capability_reference_host
-```
-
-Set `CAPABILITY_APPROVAL=approve` or `deny` to demonstrate operator handling when
-policy holds the discovered action. Production deployments use
-`SEKAI_CREDENTIAL` and a scoped `SEKAI_PRINCIPAL`; insecure mode is local-only.
-
 Runnable examples for the `sekai-chisei` control plane. Each one is a standalone
 binary that links the library crate and talks to a running gRPC server.
 
@@ -116,24 +97,6 @@ ollama pull llama3.2
 
 If the model is not reachable, the step reports the error and the demo still
 finishes.
-
-## governed_tool_use
-
-[governed_tool_use.rs](governed_tool_use.rs) demonstrates the governed tool-use
-bridge: it maps a model tool-call to an `ExecuteAction` request — the
-single enforcement point — so the call is policy-checked, dry-run-able,
-held-for-approval, budget-limited, and audited before any graph mutation.
-
-```bash
-SEKAI_INSECURE=1 cargo run          # server in one terminal
-cargo run --example governed_tool_use   # demo in another
-```
-
-It seeds a target object, sets an action policy (allow writes, require approval
-for destructive ops), then runs tool-calls through `ExecuteAction`: a write is
-dry-run and executed, a destructive `delete_link` is held for approval, and the
-pending approvals are listed. In `SEKAI_INSECURE=1` mode the `local` principal is
-an admin, so setting policy and listing approvals succeed.
 
 ## delegation
 

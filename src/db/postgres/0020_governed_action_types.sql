@@ -1,4 +1,4 @@
--- Governed Action type registry (#396). Distinct from graph sekai_action_types.
+-- Governed Action type registry (#396).
 
 CREATE TABLE IF NOT EXISTS sekai_governed_action_types (
     namespace TEXT NOT NULL,

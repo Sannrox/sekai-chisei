@@ -17,7 +17,6 @@ use crate::chisei::epistemic_descriptor::{
 };
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
-use crate::sekai::action_approval::ACTION_APPROVAL_KIND;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::compute;
 use crate::sekai::governed_facts::{FACT_KIND, PROFILE_KIND, WAIVER_KIND};
@@ -821,7 +820,7 @@ fn with_capability(decision: LookupDecision, capability: &str) -> LookupDecision
 const RESERVED_GOVERNANCE_KINDS: &[&str] = &[
     ACTION_POLICY_KIND,
     BLAST_RADIUS_KIND,
-    ACTION_APPROVAL_KIND,
+    "action_approval",
     crate::domain::KIND_CAPABILITY,
     crate::domain::KIND_EXTERNAL_EVIDENCE,
     PROFILE_KIND,

@@ -526,9 +526,7 @@ fn find_subject_related_object_ids(
         loop {
             let mut discovered = Vec::new();
             for (id, object_kind, properties_json) in &objects {
-                if related_ids.contains(id)
-                    || object_kind != crate::sekai::action_approval::ACTION_APPROVAL_KIND
-                {
+                if related_ids.contains(id) || object_kind != "action_approval" {
                     continue;
                 }
                 let approval_matches = serde_json::from_str::<
@@ -1848,8 +1846,7 @@ impl SekaiDb {
                 || contains_typed_subject(&external_id, &request.subject_kind, &request.subject)
                 || (kind != request.subject_kind
                     && contains_delimited_identifier(&external_id, &request.subject));
-            let approval_matches = kind == crate::sekai::action_approval::ACTION_APPROVAL_KIND
-                && subject_object_ids.contains(&id);
+            let approval_matches = kind == "action_approval" && subject_object_ids.contains(&id);
             let represents_subject = approval_matches || known_subject_object_ids.contains(&id);
             if represents_subject {
                 continue;
@@ -4312,7 +4309,7 @@ mod tests {
         .unwrap();
         db.create_object(&crate::domain::Object {
             id: "pending-approval".into(),
-            kind: crate::sekai::action_approval::ACTION_APPROVAL_KIND.into(),
+            kind: "action_approval".into(),
             name: "pending approval".into(),
             namespace: "ns".into(),
             external_id: "action-approval:pending".into(),
@@ -4329,7 +4326,7 @@ mod tests {
         .unwrap();
         db.create_object(&crate::domain::Object {
             id: "related-approval".into(),
-            kind: crate::sekai::action_approval::ACTION_APPROVAL_KIND.into(),
+            kind: "action_approval".into(),
             name: "related approval".into(),
             namespace: "ns".into(),
             external_id: "action-approval:related".into(),

@@ -45,6 +45,7 @@ const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation
 const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluation_executions.sql");
 const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0027_governed_subject_provenance.sql");
+const REMOVE_LEGACY_ACTIONS_SCHEMA: &str = include_str!("postgres/0028_remove_legacy_actions.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -183,6 +184,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 26,
         name: "governed_subject_provenance",
         sql: GOVERNED_SUBJECT_PROVENANCE_SCHEMA,
+    },
+    Migration {
+        version: 27,
+        name: "remove_legacy_actions",
+        sql: REMOVE_LEGACY_ACTIONS_SCHEMA,
     },
 ];
 
@@ -640,6 +646,10 @@ mod tests {
                 "missing PostgreSQL table {table}"
             );
         }
+        assert!(REMOVE_LEGACY_ACTIONS_SCHEMA.contains("DROP TABLE IF EXISTS sekai_action_types"));
+        assert!(
+            REMOVE_LEGACY_ACTIONS_SCHEMA.contains("DROP TABLE IF EXISTS sekai_action_approvals")
+        );
         assert!(!CONTROL_PLANE_SCHEMA.contains("AUTOINCREMENT"));
         assert!(!CONTROL_PLANE_SCHEMA.contains("INSERT OR"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));

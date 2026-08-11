@@ -1,9 +1,7 @@
 use sekai_chisei::db::action_governance::ActionGovernanceBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::action::RiskClass;
-use sekai_chisei::sekai::action_approval::{ActionApproval, ApprovalStatus};
 use sekai_chisei::sekai::action_policy::{ActionDecision, ActionPolicy};
-use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 
 fn exercise(db: &dyn ActionGovernanceBackend, prefix: &str) {
@@ -48,84 +46,11 @@ fn exercise(db: &dyn ActionGovernanceBackend, prefix: &str) {
     assert_eq!(db.add_blast_radius(&work_unit, 2, 1).unwrap(), (2, 1));
     assert_eq!(db.add_blast_radius(&work_unit, 3, 1).unwrap(), (5, 2));
     assert_eq!(db.get_blast_radius(&work_unit).unwrap(), (5, 2));
-
-    let approval = ActionApproval::pending(
-        format!("{prefix}-actor"),
-        "rotate_key",
-        HashMap::from([
-            ("target".into(), "key-a".into()),
-            ("api_key".into(), "secret".into()),
-        ]),
-        &work_unit,
-        &project,
-        "destructive",
-        "key-a",
-        100,
-    );
-    db.create_action_approval(&approval).unwrap();
-    assert!(db.create_action_approval(&approval).is_err());
-    assert_eq!(
-        db.list_action_approvals(Some(ApprovalStatus::Pending))
-            .unwrap(),
-        vec![approval.clone()]
-    );
-
-    let mut approved = approval.clone();
-    approved.status = ApprovalStatus::Approved;
-    approved.decided_by = "admin".into();
-    approved.outcome = "executed".into();
-    approved.updated = 200;
-    db.update_action_approval(&approved).unwrap();
-    db.update_action_approval(&approved).unwrap();
-    assert_eq!(
-        db.get_action_approval(&approval.id)
-            .unwrap()
-            .unwrap()
-            .status,
-        ApprovalStatus::Approved
-    );
-    let mut denied = approved;
-    denied.status = ApprovalStatus::Denied;
-    denied.updated = 300;
-    assert!(db.update_action_approval(&denied).is_err());
 }
 
 #[test]
 fn sqlite_action_governance_conformance() {
     exercise(&SekaiDb::new(":memory:").unwrap(), "sqlite");
-}
-
-#[test]
-fn sqlite_conflicting_approval_decisions_have_one_winner() {
-    let directory = tempfile::tempdir().unwrap();
-    let db = Arc::new(SekaiDb::new(directory.path().join("sekai.db").to_str().unwrap()).unwrap());
-    let approval = ActionApproval::pending(
-        "actor",
-        "delete",
-        HashMap::new(),
-        "work",
-        "namespace",
-        "destructive",
-        "target",
-        100,
-    );
-    db.create_action_approval(&approval).unwrap();
-    let barrier = Arc::new(Barrier::new(3));
-    let handles = [ApprovalStatus::Approved, ApprovalStatus::Denied].map(|status| {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        let mut decision = approval.clone();
-        std::thread::spawn(move || {
-            decision.status = status;
-            decision.updated = 200;
-            decision.decided_by = status.as_str().into();
-            barrier.wait();
-            db.update_action_approval(&decision)
-        })
-    });
-    barrier.wait();
-    let results = handles.map(|handle| handle.join().unwrap());
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
 }
 
 fn postgres() -> PostgresDb {
@@ -150,39 +75,6 @@ fn postgres_action_governance_conformance_and_restart() {
             .unwrap(),
         (5, 2)
     );
-}
-
-#[test]
-#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
-fn postgres_conflicting_approval_decisions_have_one_winner() {
-    let db = Arc::new(postgres());
-    let approval = ActionApproval::pending(
-        "actor",
-        "delete",
-        HashMap::new(),
-        "work",
-        "namespace",
-        "destructive",
-        "target",
-        100,
-    );
-    db.create_action_approval(&approval).unwrap();
-    let barrier = Arc::new(Barrier::new(3));
-    let handles = [ApprovalStatus::Approved, ApprovalStatus::Denied].map(|status| {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        let mut decision = approval.clone();
-        std::thread::spawn(move || {
-            decision.status = status;
-            decision.updated = 200;
-            decision.decided_by = status.as_str().into();
-            barrier.wait();
-            db.update_action_approval(&decision)
-        })
-    });
-    barrier.wait();
-    let results = handles.map(|handle| handle.join().unwrap());
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Governed ActionInstance admission (#397 / research #395).
 //!
 //! Thin durable decision envelope: type + parameters + idempotency →
-//! admit/deny with bound `operation_id`. Not graph `ExecuteAction`.
+//! admit/deny with a bound `operation_id`.
 //! Effects materialization is #398.
 
 use crate::db::sekai::SekaiDb;

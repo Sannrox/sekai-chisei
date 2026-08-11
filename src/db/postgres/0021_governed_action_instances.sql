@@ -1,4 +1,4 @@
--- Governed ActionInstance admission (#397). Distinct from graph ExecuteAction.
+-- Governed ActionInstance admission (#397).
 
 CREATE TABLE IF NOT EXISTS sekai_action_instances (
     instance_id TEXT PRIMARY KEY,

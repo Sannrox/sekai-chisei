@@ -141,7 +141,7 @@ argument digest, targets, preconditions, risk, expected effects, limits,
 executor, and deadline into one stable request digest. The decision path reuses
 action policy, approval, budget, blast-radius, namespace authorization, audit,
 and idempotency boundaries while keeping external actions distinct from native
-`ExecuteAction` calls.
+governed Action execution.
 
 An authorization decision is not execution evidence. The v1 decision contract
 does not issue a signed permit; permit issuance, redemption, and submitted host
@@ -240,7 +240,8 @@ internal authenticated context; caller metadata never constructs that context.
 - Object context is filtered by schema classification and egress policy before
   an external provider receives it.
 - Model output and graph-derived context remain untrusted data. Tool
-  permissions and model-proposed effects must be checked at `ExecuteAction`.
+  permissions and model-proposed effects must be checked at the host executor
+  permit and governed effect boundaries.
 - Evaluation gates can prevent a context expansion or learning rule from being
   adopted when candidate behavior regresses against its baseline.
 

@@ -22,9 +22,9 @@ export interface SdkInvocation {
 const CAPABILITIES = {
   "sekai.action.assign_color": {
     name: "sekai.action.assign_color",
-    input_type: "sekai.ExecuteActionRequest",
-    output_type: "sekai.ExecuteActionResponse",
-    kind: "action",
+    input_type: "sekai.ListObjectsRequest",
+    output_type: "sekai.ListObjectsResponse",
+    kind: "query",
   },
 } as const;
 

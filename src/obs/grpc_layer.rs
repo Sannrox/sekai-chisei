@@ -248,7 +248,6 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "RecordDecision"
                 | "ListDecisions"
                 | "ListObjectChanges"
-                | "ExecuteAction"
                 | "GetLineage"
                 | "CreateContentionScope"
                 | "UpdateContentionScope"

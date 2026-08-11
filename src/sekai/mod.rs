@@ -1,10 +1,7 @@
 pub mod action;
-pub mod action_approval;
-pub(crate) mod action_approval_lifecycle;
 pub mod action_effect;
 pub mod action_instance;
 pub mod action_instance_admission;
-pub mod action_lifecycle;
 pub mod action_policy;
 pub(crate) mod action_work_lifecycle;
 pub mod attestation;
@@ -50,5 +47,4 @@ pub mod security;
 pub mod semantic;
 pub mod sentinel;
 pub mod skillextract;
-pub mod tool_bridge;
 pub(crate) mod work_unit_lifecycle;

@@ -1,7 +1,6 @@
-//! Backend-neutral governed-action policy and approval persistence.
+//! Backend-neutral governed-action policy persistence.
 
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
-use crate::sekai::action_approval::{ActionApproval, ApprovalStatus};
 use crate::sekai::action_policy::ActionPolicy;
 
 pub trait ActionGovernanceBackend: Send + Sync {
@@ -21,13 +20,6 @@ pub trait ActionGovernanceBackend: Send + Sync {
         mutations: u32,
         deletes: u32,
     ) -> Result<(u32, u32), String>;
-    fn create_action_approval(&self, approval: &ActionApproval) -> Result<(), String>;
-    fn get_action_approval(&self, id: &str) -> Result<Option<ActionApproval>, String>;
-    fn update_action_approval(&self, approval: &ActionApproval) -> Result<(), String>;
-    fn list_action_approvals(
-        &self,
-        status: Option<ApprovalStatus>,
-    ) -> Result<Vec<ActionApproval>, String>;
 }
 
 macro_rules! forward {
@@ -59,21 +51,6 @@ macro_rules! forward {
             deletes: u32,
         ) -> Result<(u32, u32), String> {
             <$target>::add_blast_radius(self, work_unit, mutations, deletes)
-        }
-        fn create_action_approval(&self, value: &ActionApproval) -> Result<(), String> {
-            <$target>::create_action_approval(self, value)
-        }
-        fn get_action_approval(&self, id: &str) -> Result<Option<ActionApproval>, String> {
-            <$target>::get_action_approval(self, id)
-        }
-        fn update_action_approval(&self, value: &ActionApproval) -> Result<(), String> {
-            <$target>::update_action_approval(self, value)
-        }
-        fn list_action_approvals(
-            &self,
-            status: Option<ApprovalStatus>,
-        ) -> Result<Vec<ActionApproval>, String> {
-            <$target>::list_action_approvals(self, status)
         }
     };
 }
