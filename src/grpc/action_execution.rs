@@ -10,8 +10,9 @@ use super::{
     ERASED_NAMESPACE, RequestEnterpriseContext, SekaiServiceImpl, action_policy_namespace,
     check_team_namespace, check_write, enforce_namespace_tenant_context,
     enforce_object_marking_access, ensure_action_schema_kinds_allowed, is_managed_team_principal,
-    now_millis, record_marking_or_purpose_decision, redact_action_evidence, redact_action_outcome,
-    resolve_principal_authority, schema_restricted_action_property,
+    map_schema_definition_lifecycle_error, now_millis, record_marking_or_purpose_decision,
+    redact_action_evidence, redact_action_outcome, resolve_principal_authority,
+    schema_restricted_action_property,
 };
 use crate::grpc::pb::sekai::{ActionRequest, ActionResult};
 use crate::sekai::action_lifecycle::{ActionAudit, ActionLimitExceeded, GovernedActionContext};
@@ -316,9 +317,9 @@ impl<'a> ActionExecution<'a> {
         }
         let schema = self
             .service
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         actions
             .validate_action_schema(&request.action, &schema)
             .map_err(Status::invalid_argument)?;

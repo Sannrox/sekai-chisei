@@ -144,9 +144,9 @@ impl SekaiServiceImpl {
         } else {
             self.require_schema_kind_loaded(&domain_object.kind)?;
             let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             schema
                 .validate(&domain_object)
                 .map_err(Status::invalid_argument)?;
@@ -327,9 +327,9 @@ impl SekaiServiceImpl {
         } else {
             self.require_schema_kind_loaded(&domain_object.kind)?;
             let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             if existing.is_some() {
                 preserve_redacted_restricted_properties(
                     &self.db,
