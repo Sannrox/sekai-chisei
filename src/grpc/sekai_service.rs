@@ -33,7 +33,7 @@ use crate::sekai::action_approval;
 use crate::sekai::action_approval_lifecycle::{
     ActionApprovalLifecycle, ApprovalLifecycleError, DenyAction as DenyActionCommand,
 };
-use crate::sekai::action_lifecycle::{self, ActionAudit, ActionLimitExceeded};
+use crate::sekai::action_lifecycle::ActionLimitExceeded;
 use crate::sekai::action_policy::{self, ActionDecision};
 use crate::sekai::action_work_lifecycle::{
     AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
@@ -7257,301 +7257,33 @@ impl SekaiService for SekaiServiceImpl {
         } else {
             None
         };
-        let admitted = action_execution::ActionExecutionAdmission::new(self).admit(
+        let execution = action_execution::ActionExecution::new(self);
+        let admitted = execution.admit(
             &r,
             &principals,
             tenant_context.as_ref(),
             &work_unit,
             invoked_capability.is_some().then_some(invocation_namespace),
         )?;
-        let target_ids = admitted.target_ids;
-        let sensitive_params = admitted.sensitive_params;
-        let schema_kinds = admitted.schema_kinds;
-        let actor = admitted.actor;
-        let lifecycle = admitted.lifecycle;
-        let actions = admitted.actions;
-        let decision = lifecycle.decision;
-        let policy_scope = lifecycle.policy_scope.clone();
-        if let Some(guard) = receipt_guard.as_mut() {
-            guard.mark_policy_decided(decision.as_str());
-        }
-
-        // Dry-run (Plan 9, Phase B): report the planned ops and the resolved
-        // decision without executing or erroring, leaving the graph untouched.
-        if dry_run {
-            let planned_ops = actions
-                .planned_ops(&r.action, &r.params)
-                .map_err(Status::invalid_argument)?;
-            let mut evidence = redact_action_evidence(&r.params, &sensitive_params, None);
-            evidence.insert("dry_run".into(), "true".into());
-            lifecycle
-                .record_outcome(
-                    &self.db,
-                    self.budget.as_deref(),
-                    ActionAudit {
-                        actor: actor.clone(),
-                        attestation_actor: actor.clone(),
-                        action: r.action.clone(),
-                        target_id: target_ids.first().cloned().unwrap_or_default(),
-                        evidence,
-                        timestamp: now_millis(),
-                    },
-                    "execute_action_dry_run",
-                    format!(
-                        "dry-run: {} planned op(s), decision={}",
-                        planned_ops.len(),
-                        decision.as_str()
-                    ),
-                    false,
-                )
-                .map_err(Status::internal)?;
-            let mut response = Response::new(ExecuteActionResponse {
-                result: Some(ActionResult {
-                    action: r.action,
-                    message: format!("dry run: {} planned op(s)", planned_ops.len()),
-                    dry_run: true,
-                    planned_ops,
-                    decision: decision.as_str().into(),
-                    approval_id: String::new(),
-                }),
-            });
-            if let (Some(_), Some(operation_id)) =
-                (invoked_capability.as_deref(), operation_id.as_deref())
-            {
-                if let Err(error) = receipt_guard
-                    .as_mut()
-                    .unwrap()
-                    .finalize(decision.as_str(), "dry_run")
-                {
-                    let mut status =
-                        Status::internal(format!("catalog receipt finalization failed: {error}"));
+        let result = execution.execute(r, dry_run, admitted, receipt_guard.as_mut());
+        let result = match result {
+            Ok(result) => result,
+            Err(mut status) => {
+                if let Some(operation_id) = operation_id.as_deref() {
                     status.metadata_mut().insert(
                         "x-sekai-operation-id",
                         operation_id
                             .parse()
                             .map_err(|_| Status::internal("invalid operation id"))?,
                     );
-                    return Err(status);
                 }
-                response.metadata_mut().insert(
-                    "x-sekai-operation-id",
-                    operation_id
-                        .parse()
-                        .map_err(|_| Status::internal("invalid operation id"))?,
-                );
-            }
-            return Ok(response);
-        }
-
-        if decision == ActionDecision::RequireApproval {
-            let approval = action_lifecycle::hold_action(
-                &self.db,
-                &lifecycle,
-                &actor,
-                &r.action,
-                r.params.clone(),
-                target_ids.first().map(String::as_str).unwrap_or_default(),
-                redact_action_evidence(&r.params, &sensitive_params, None),
-                now_millis(),
-            )
-            .map_err(Status::internal)?;
-            let mut response = Response::new(ExecuteActionResponse {
-                result: Some(ActionResult {
-                    action: r.action,
-                    message: format!("action held for approval: {}", approval.id),
-                    dry_run: false,
-                    planned_ops: Vec::new(),
-                    decision: decision.as_str().into(),
-                    approval_id: approval.id.clone(),
-                }),
-            });
-            if let (Some(_), Some(operation_id)) =
-                (invoked_capability.as_deref(), operation_id.as_deref())
-            {
-                let approval_outcome = format!("approval_required:{}", approval.id);
-                if let Err(error) = receipt_guard
-                    .as_mut()
-                    .unwrap()
-                    .finalize(decision.as_str(), &approval_outcome)
-                {
-                    let mut status =
-                        Status::internal(format!("catalog receipt finalization failed: {error}"));
-                    status.metadata_mut().insert(
-                        "x-sekai-operation-id",
-                        operation_id
-                            .parse()
-                            .map_err(|_| Status::internal("invalid operation id"))?,
-                    );
-                    return Err(status);
-                }
-                response.metadata_mut().insert(
-                    "x-sekai-operation-id",
-                    operation_id
-                        .parse()
-                        .map_err(|_| Status::internal("invalid operation id"))?,
-                );
-            }
-            return Ok(response);
-        }
-
-        if decision == ActionDecision::Deny {
-            if invoked_capability.is_some() {
-                receipt_guard
-                    .as_mut()
-                    .unwrap()
-                    .finalize(decision.as_str(), "denied")?;
-            }
-            lifecycle
-                .record_outcome(
-                    &self.db,
-                    self.budget.as_deref(),
-                    ActionAudit {
-                        actor: actor.clone(),
-                        attestation_actor: actor.clone(),
-                        action: r.action.clone(),
-                        target_id: target_ids.first().cloned().unwrap_or_default(),
-                        evidence: redact_action_evidence(&r.params, &sensitive_params, None),
-                        timestamp: now_millis(),
-                    },
-                    "action_policy_denied",
-                    format!("{} by action policy {}", decision.as_str(), policy_scope),
-                    false,
-                )
-                .map_err(Status::internal)?;
-            return Err(Status::permission_denied(format!(
-                "action {} denied by policy",
-                r.action
-            )));
-        }
-
-        // Blast-radius caps (Plan 9, Phase C): hard-stop runaway loops by
-        // capping mutations/deletes per work unit. Only enforced when a policy
-        // sets a cap and the call carries a work-unit attribution.
-        if let Err(limit) = lifecycle.check_limits_and_record(
-            &self.db,
-            self.budget.as_deref(),
-            ActionAudit {
-                actor: actor.clone(),
-                attestation_actor: actor.clone(),
-                action: r.action.clone(),
-                target_id: target_ids.first().cloned().unwrap_or_default(),
-                evidence: redact_action_evidence(&r.params, &sensitive_params, None),
-                timestamp: now_millis(),
-            },
-        ) {
-            match limit {
-                ActionLimitExceeded::Internal(error) => return Err(Status::internal(error)),
-                ActionLimitExceeded::BlastRadius { work_unit, .. } => {
-                    return Err(Status::resource_exhausted(format!(
-                        "blast-radius cap exceeded for work unit {}",
-                        work_unit
-                    )));
-                }
-                ActionLimitExceeded::Budget { subject, .. } => {
-                    if let Some(guard) = receipt_guard.as_mut() {
-                        guard.mark_budget_decided("budget_exceeded");
-                    }
-                    return Err(Status::resource_exhausted(format!(
-                        "action budget exhausted for {}",
-                        subject
-                    )));
-                }
-            }
-        }
-        if let Some(guard) = receipt_guard.as_mut() {
-            guard.mark_budget_decided(if self.budget.is_some() {
-                "allow"
-            } else {
-                "not_configured"
-            });
-        }
-        for kind in schema_kinds {
-            self.require_schema_kind_loaded(&kind)?;
-        }
-        let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        actions
-            .validate_action_schema(&r.action, &schema)
-            .map_err(Status::invalid_argument)?;
-        let schema_restricted_property =
-            schema_restricted_action_property(&self.db, &schema, &r.params);
-        let provisional_learning_grant = (r.action
-            == crate::sekai::learning::RECORD_LEARNING_ACTION)
-            .then(|| security::Grant {
-                id: String::new(),
-                object_id: r.params.get("id").cloned().unwrap_or_default(),
-                principal: actor.clone(),
-                role: security::Role::Admin,
-                created: now_millis(),
-            })
-            .filter(|grant| !grant.object_id.is_empty());
-        if let Some(grant) = &provisional_learning_grant {
-            self.security.add_grant(grant);
-        }
-        let msg = match actions.execute(&self.db, &schema, &r.action, &r.params, &actor) {
-            Ok(msg) => msg,
-            Err(error) => {
-                if let Some(grant) = &provisional_learning_grant {
-                    self.security
-                        .remove_grant(&grant.object_id, &grant.principal);
-                }
-                return Err(Status::invalid_argument(error));
-            }
-        };
-        drop(actions);
-        drop(schema);
-        self.refresh_security_after_action(&r.action, &r.params, &actor)?;
-        lifecycle
-            .record_outcome(
-                &self.db,
-                self.budget.as_deref(),
-                ActionAudit {
-                    actor: actor.clone(),
-                    attestation_actor: actor.clone(),
-                    action: r.action.clone(),
-                    target_id: target_ids.first().cloned().unwrap_or_default(),
-                    evidence: redact_action_evidence(
-                        &r.params,
-                        &sensitive_params,
-                        schema_restricted_property,
-                    ),
-                    timestamp: now_millis(),
-                },
-                "execute_action",
-                redact_action_outcome(&r.action, &r.params, &msg, schema_restricted_property),
-                true,
-            )
-            .map_err(Status::internal)?;
-        let mut response = Response::new(ExecuteActionResponse {
-            result: Some(ActionResult {
-                action: r.action,
-                message: msg,
-                dry_run: false,
-                planned_ops: Vec::new(),
-                decision: decision.as_str().into(),
-                approval_id: String::new(),
-            }),
-        });
-        if let (Some(_), Some(operation_id)) =
-            (invoked_capability.as_deref(), operation_id.as_deref())
-        {
-            if let Err(error) = receipt_guard
-                .as_mut()
-                .unwrap()
-                .finalize(decision.as_str(), "succeeded")
-            {
-                let mut status =
-                    Status::internal(format!("catalog receipt finalization failed: {error}"));
-                status.metadata_mut().insert(
-                    "x-sekai-operation-id",
-                    operation_id
-                        .parse()
-                        .map_err(|_| Status::internal("invalid operation id"))?,
-                );
                 return Err(status);
             }
+        };
+        let mut response = Response::new(ExecuteActionResponse {
+            result: Some(result),
+        });
+        if let Some(operation_id) = operation_id.as_deref() {
             response.metadata_mut().insert(
                 "x-sekai-operation-id",
                 operation_id
