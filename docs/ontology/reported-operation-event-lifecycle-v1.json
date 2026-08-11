@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {"name":"ReportedOperationEventLifecycle","description":"Deep private Chisei module whose interface owns externally reported receipt-event admission, authorization, bounded validation, causal ordering, durable append, completeness, and Kioku attribution.","superclasses":[]},
+    {"name":"CanonicalOperationReceipt","description":"Durable authoritative receipt whose ordered events record the governed operation decision path and completeness.","superclasses":[]},
+    {"name":"ChiseiGrpcTransportAdapter","description":"gRPC adapter that supplies authenticated transport context and delegates reported Operation Receipt event admission to the private lifecycle.","superclasses":[]}
+  ],
+  "relations": [
+    {"name":"delegates_reported_operation_event_to","description":"The Chisei gRPC transport delegates reported receipt-event admission to the lifecycle module.","domain":"ChiseiGrpcTransportAdapter","range":"ReportedOperationEventLifecycle"},
+    {"name":"appends_to_canonical_operation_receipt","description":"The lifecycle validates and durably appends an authorized reported event to its canonical Operation Receipt.","domain":"ReportedOperationEventLifecycle","range":"CanonicalOperationReceipt"}
+  ],
+  "provenance": [
+    {"subject":"ReportedOperationEventLifecycle","source":"src/grpc/chisei_service/reported_operation_event_lifecycle.rs","locator":"ReportedOperationEventLifecycle/admit","confidence":1.0},
+    {"subject":"CanonicalOperationReceipt","source":"src/chisei/receipt.rs","locator":"OperationReceipt","confidence":1.0},
+    {"subject":"ChiseiGrpcTransportAdapter","source":"src/grpc/chisei_service.rs","locator":"report_operation_event","confidence":1.0},
+    {"subject":"delegates_reported_operation_event_to","source":"src/grpc/chisei_service.rs","locator":"ReportedOperationEventLifecycle call site","confidence":1.0},
+    {"subject":"appends_to_canonical_operation_receipt","source":"src/grpc/chisei_service/reported_operation_event_lifecycle.rs","locator":"admit/append_operation_receipt_event","confidence":1.0}
+  ]
+}

@@ -165,6 +165,19 @@ replay ordering remains transport-independent.
 
 ## Action execution
 
+## Reported Operation Receipt events
+
+The **reported Operation Receipt event lifecycle** admits one authenticated
+external event into a canonical receipt. Its private interface owns authority
+exclusions, reportable-kind and causal-time validation, bounded redacted
+attributes and governed references, replay kind resolution, reporter
+authorization, prospective completeness, Kioku attribution preflight, durable
+append ordering, and auditable post-commit attribution failure.
+
+The gRPC adapter supplies authenticated transport context and projects the
+result. Evaluation authority receipts remain internal-only, and the canonical
+Operation Receipt remains the durable authority.
+
 ## Catalog invocation receipt lifecycle
 
 The **Catalog invocation receipt lifecycle** records one capability-catalog
