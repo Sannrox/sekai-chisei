@@ -4,10 +4,12 @@
 mod action_approval_execution;
 #[path = "action_execution.rs"]
 mod action_execution;
+#[path = "catalog_invocation.rs"]
+mod catalog_invocation;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
@@ -18,10 +20,8 @@ use super::visible_page::{VisiblePageError, scan_visible_page};
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
-use crate::chisei::receipt::{
-    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-    ReceiptSurface, UncoveredSurface,
-};
+#[cfg(test)]
+use crate::chisei::receipt::ReceiptEventKind;
 use crate::chisei::scoring::{KnowledgeWriteOutcome, KnowledgeWriteRequest, KnowledgeWriter};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
@@ -77,6 +77,8 @@ use crate::sekai::{
 };
 use uuid::Uuid;
 
+use self::catalog_invocation::CatalogInvocation;
+
 const REDACTED_VALUE: &str = "[redacted]";
 
 pub struct SekaiServiceImpl {
@@ -93,367 +95,7 @@ pub struct SekaiServiceImpl {
     site_id: String,
 }
 
-struct CatalogReceiptGuard<'a> {
-    service: &'a SekaiServiceImpl,
-    operation_id: String,
-    namespace: String,
-    actor: String,
-    capability_name: String,
-    catalog_version: Option<String>,
-    policy_decision: Option<String>,
-    budget_decision: Option<String>,
-    finalized: bool,
-}
-
-impl CatalogReceiptGuard<'_> {
-    fn mark_policy_decided(&mut self, decision: &str) {
-        self.policy_decision = Some(decision.to_string());
-    }
-
-    fn mark_budget_decided(&mut self, decision: &str) {
-        self.budget_decision = Some(decision.to_string());
-    }
-
-    fn finalize(&mut self, decision: &str, outcome: &str) -> Result<(), Status> {
-        self.service.record_catalog_invocation_receipt(
-            &self.operation_id,
-            &self.namespace,
-            &self.actor,
-            &self.capability_name,
-            self.catalog_version.as_deref(),
-            decision,
-            outcome,
-            false,
-        )?;
-        self.finalized = true;
-        Ok(())
-    }
-}
-
-impl Drop for CatalogReceiptGuard<'_> {
-    fn drop(&mut self) {
-        if !self.finalized {
-            let budget_outcome = self
-                .budget_decision
-                .as_deref()
-                .map(|decision| format!("invocation_failed_after_budget:{decision}"));
-            let (decision, outcome) = if let Some(outcome) = budget_outcome.as_deref() {
-                (self.policy_decision.as_deref().unwrap_or("allow"), outcome)
-            } else {
-                self.policy_decision
-                    .as_deref()
-                    .map(|decision| (decision, "invocation_failed_after_policy"))
-                    .unwrap_or(("refuse", "invocation_failed"))
-            };
-            let _ = self.service.record_catalog_invocation_receipt(
-                &self.operation_id,
-                &self.namespace,
-                &self.actor,
-                &self.capability_name,
-                self.catalog_version.as_deref(),
-                decision,
-                outcome,
-                false,
-            );
-        }
-    }
-}
-
 impl SekaiServiceImpl {
-    #[allow(clippy::too_many_arguments)]
-    fn record_catalog_invocation_receipt(
-        &self,
-        operation_id: &str,
-        namespace: &str,
-        actor: &str,
-        capability_name: &str,
-        catalog_version: Option<&str>,
-        decision: &str,
-        outcome: &str,
-        insert_only: bool,
-    ) -> Result<(), Status> {
-        let now = now_millis();
-        let started_at_ms = if insert_only {
-            now
-        } else {
-            self.db
-                .get_operation_receipt(operation_id)
-                .map_err(Status::internal)?
-                .map(|receipt| receipt.started_at_ms)
-                .unwrap_or(now)
-        };
-        let event = |suffix: &str, parent: Option<&str>, kind: ReceiptEventKind, attributes| {
-            OperationReceiptEvent {
-                event_id: format!("{operation_id}:{suffix}"),
-                operation_id: operation_id.into(),
-                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
-                timestamp_ms: now,
-                surface: kind.surface(),
-                kind,
-                actor: actor.into(),
-                references: Vec::new(),
-                attributes,
-            }
-        };
-        let attributes =
-            |key: &str, value: &str| BTreeMap::from([(key.to_string(), value.to_string())]);
-        let outcome_attributes = || {
-            if let Some(approval_id) = outcome.strip_prefix("approval_required:") {
-                BTreeMap::from([
-                    ("outcome".into(), "approval_required".into()),
-                    ("approval_id".into(), approval_id.into()),
-                ])
-            } else {
-                attributes("outcome", outcome)
-            }
-        };
-        let mut intent_attributes = attributes("capability", capability_name);
-        if let Some(catalog_version) = catalog_version.filter(|value| !value.trim().is_empty()) {
-            intent_attributes.insert("reported_catalog_version".into(), catalog_version.into());
-        }
-        let mut intent = event(
-            "intent",
-            None,
-            ReceiptEventKind::IntentRecorded,
-            intent_attributes,
-        );
-        intent.timestamp_ms = started_at_ms;
-        let (completed_at_ms, events, uncovered_surfaces) = if insert_only && decision == "pending"
-        {
-            (None, vec![intent], Vec::new())
-        } else if decision == "refuse" {
-            (
-                Some(now),
-                vec![
-                    intent,
-                    event(
-                        "outcome",
-                        Some("intent"),
-                        ReceiptEventKind::OutcomeRecorded,
-                        outcome_attributes(),
-                    ),
-                ],
-                [
-                    ReceiptSurface::Policy,
-                    ReceiptSurface::Routing,
-                    ReceiptSurface::Budget,
-                ]
-                .into_iter()
-                .map(|surface| UncoveredSurface {
-                    surface,
-                    reason: "invocation failed before this decision point".into(),
-                })
-                .collect(),
-            )
-        } else if let Some(budget_decision) =
-            outcome.strip_prefix("invocation_failed_after_budget:")
-        {
-            (
-                Some(now),
-                vec![
-                    intent,
-                    event(
-                        "policy",
-                        Some("intent"),
-                        ReceiptEventKind::PolicyDecided,
-                        attributes("decision", decision),
-                    ),
-                    event(
-                        "routing",
-                        Some("policy"),
-                        ReceiptEventKind::RouteSelected,
-                        attributes("route", "native"),
-                    ),
-                    event(
-                        "budget",
-                        Some("routing"),
-                        ReceiptEventKind::BudgetDecided,
-                        attributes("decision", budget_decision),
-                    ),
-                    event(
-                        "outcome",
-                        Some("budget"),
-                        ReceiptEventKind::OutcomeRecorded,
-                        attributes("outcome", "invocation_failed_after_budget"),
-                    ),
-                ],
-                Vec::new(),
-            )
-        } else if outcome == "invocation_failed_after_policy" {
-            (
-                Some(now),
-                vec![
-                    intent,
-                    event(
-                        "policy",
-                        Some("intent"),
-                        ReceiptEventKind::PolicyDecided,
-                        attributes("decision", decision),
-                    ),
-                    event(
-                        "routing",
-                        Some("policy"),
-                        ReceiptEventKind::RouteSelected,
-                        attributes("route", "native"),
-                    ),
-                    event(
-                        "outcome",
-                        Some("routing"),
-                        ReceiptEventKind::OutcomeRecorded,
-                        outcome_attributes(),
-                    ),
-                ],
-                vec![UncoveredSurface {
-                    surface: ReceiptSurface::Budget,
-                    reason: "invocation failed before budget decision".into(),
-                }],
-            )
-        } else {
-            let budget_decision = match outcome.split_once(':').map_or(outcome, |value| value.0) {
-                "dry_run" => "not_applicable_dry_run",
-                "approval_required" => "deferred_pending_approval",
-                "denied" | "capability_unavailable" => "not_applicable_policy_denied",
-                _ => "checked_at_invocation",
-            };
-            (
-                Some(now),
-                vec![
-                    intent,
-                    event(
-                        "policy",
-                        Some("intent"),
-                        ReceiptEventKind::PolicyDecided,
-                        attributes("decision", decision),
-                    ),
-                    event(
-                        "routing",
-                        Some("policy"),
-                        ReceiptEventKind::RouteSelected,
-                        attributes("route", "native"),
-                    ),
-                    event(
-                        "budget",
-                        Some("routing"),
-                        ReceiptEventKind::BudgetDecided,
-                        attributes("decision", budget_decision),
-                    ),
-                    event(
-                        "outcome",
-                        Some("budget"),
-                        ReceiptEventKind::OutcomeRecorded,
-                        outcome_attributes(),
-                    ),
-                ],
-                Vec::new(),
-            )
-        };
-        let receipt = OperationReceipt {
-            version: OPERATION_RECEIPT_VERSION.into(),
-            operation_id: operation_id.into(),
-            parent_operation_id: None,
-            namespace: namespace.into(),
-            operation_class: "catalog_invocation".into(),
-            initiating_actor: actor.into(),
-            schema_version: capability::CONTRACT_VERSION.into(),
-            policy_version: "live_invocation_check".into(),
-            started_at_ms,
-            completed_at_ms,
-            events,
-            uncovered_surfaces,
-            reporter_grants: Vec::new(),
-        };
-        if insert_only {
-            return self.db.insert_operation_receipt(&receipt).map_err(|error| {
-                if error.contains("UNIQUE constraint failed") {
-                    Status::already_exists("operation receipt already exists")
-                } else {
-                    Status::internal(error)
-                }
-            });
-        } else {
-            self.db.put_operation_receipt(&receipt)
-        }
-        .map_err(Status::internal)
-    }
-
-    fn resolve_catalog_approval_receipt(
-        &self,
-        operation_id: &str,
-        approval_id: &str,
-        actor: &str,
-        decision: &str,
-        action: Option<&str>,
-        outcome: &str,
-    ) -> Result<(), Status> {
-        if operation_id.is_empty() {
-            return Ok(());
-        }
-        let Some(mut receipt) = self
-            .db
-            .get_operation_receipt(operation_id)
-            .map_err(Status::internal)?
-        else {
-            return Ok(());
-        };
-        if receipt.operation_class != "catalog_invocation"
-            || !receipt.events.iter().any(|event| {
-                event.kind == ReceiptEventKind::OutcomeRecorded
-                    && event.attributes.get("approval_id").map(String::as_str) == Some(approval_id)
-            })
-        {
-            return Ok(());
-        }
-        receipt
-            .events
-            .retain(|event| event.kind != ReceiptEventKind::OutcomeRecorded);
-        let now = now_millis();
-        let event =
-            |suffix: &str,
-             parent: &str,
-             kind: ReceiptEventKind,
-             attributes: BTreeMap<String, String>| OperationReceiptEvent {
-                event_id: format!("{operation_id}:{suffix}"),
-                operation_id: operation_id.into(),
-                parent_event_id: Some(format!("{operation_id}:{parent}")),
-                timestamp_ms: now,
-                kind,
-                surface: kind.surface(),
-                actor: actor.into(),
-                references: Vec::new(),
-                attributes,
-            };
-        receipt.events.push(event(
-            "approval",
-            "budget",
-            ReceiptEventKind::ApprovalDecided,
-            BTreeMap::from([
-                ("approval_id".into(), approval_id.into()),
-                ("decision".into(), decision.into()),
-            ]),
-        ));
-        let outcome_parent = if let Some(action) = action {
-            receipt.events.push(event(
-                "action",
-                "approval",
-                ReceiptEventKind::ActionPerformed,
-                BTreeMap::from([("action".into(), action.into())]),
-            ));
-            "action"
-        } else {
-            "approval"
-        };
-        receipt.events.push(event(
-            "outcome",
-            outcome_parent,
-            ReceiptEventKind::OutcomeRecorded,
-            BTreeMap::from([("outcome".into(), outcome.into())]),
-        ));
-        receipt.completed_at_ms = Some(now);
-        self.db
-            .put_operation_receipt(&receipt)
-            .map_err(Status::internal)
-    }
-
     pub fn new(db: Arc<RuntimeDb>) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
@@ -591,7 +233,7 @@ impl SekaiServiceImpl {
         expected_capability: &str,
         namespace: &str,
         principals: &[String],
-    ) -> Result<Option<(String, CatalogReceiptGuard<'a>)>, Status> {
+    ) -> Result<Option<(String, CatalogInvocation<'a>)>, Status> {
         let Some(capability_name) = Self::catalog_metadata_value(req, "x-sekai-capability") else {
             return Ok(None);
         };
@@ -622,43 +264,27 @@ impl SekaiServiceImpl {
             .into_iter()
             .any(|entry| entry.name == capability_name && capability_name == expected_capability);
         if !visible {
-            self.record_catalog_invocation_receipt(
+            CatalogInvocation::record_refusal(
+                &self.db,
                 &operation_id,
                 namespace,
                 &actor,
                 &capability_name,
                 catalog_version.as_deref(),
-                "refuse",
                 "capability_unavailable",
-                true,
             )?;
             return Err(Status::failed_precondition("capability unavailable"));
         }
 
-        self.record_catalog_invocation_receipt(
-            &operation_id,
-            namespace,
-            &actor,
-            &capability_name,
-            catalog_version.as_deref(),
-            "pending",
-            "invocation_started",
-            true,
-        )?;
-        Ok(Some((
+        let invocation = CatalogInvocation::begin(
+            &self.db,
             operation_id.clone(),
-            CatalogReceiptGuard {
-                service: self,
-                operation_id,
-                namespace: namespace.to_string(),
-                actor,
-                capability_name,
-                catalog_version,
-                policy_decision: None,
-                budget_decision: None,
-                finalized: false,
-            },
-        )))
+            namespace,
+            actor,
+            capability_name,
+            catalog_version,
+        )?;
+        Ok(Some((operation_id, invocation)))
     }
 
     fn execute_retrieve_context(
@@ -5646,27 +5272,14 @@ impl SekaiService for SekaiServiceImpl {
             })?;
             let operation_id = operation_id.as_ref().unwrap();
             let actor = principals.first().cloned().unwrap_or_default();
-            self.record_catalog_invocation_receipt(
-                operation_id,
+            receipt_guard = Some(CatalogInvocation::begin(
+                &self.db,
+                operation_id.clone(),
                 namespace,
-                &actor,
-                capability_name,
-                catalog_version.as_deref(),
-                "pending",
-                "invocation_started",
-                true,
-            )?;
-            receipt_guard = Some(CatalogReceiptGuard {
-                service: self,
-                operation_id: operation_id.clone(),
-                namespace: namespace.to_string(),
                 actor,
-                capability_name: capability_name.clone(),
-                catalog_version: catalog_version.clone(),
-                policy_decision: None,
-                budget_decision: None,
-                finalized: false,
-            });
+                capability_name.clone(),
+                catalog_version.clone(),
+            )?);
             let expected = format!("sekai.objects.query.{kind}");
             if capability_name != &expected
                 || !self
@@ -7616,15 +7229,14 @@ impl SekaiService for SekaiServiceImpl {
             if entry.is_none() {
                 if let Some(operation_id) = operation_id.as_deref() {
                     let actor = principals.first().map(String::as_str).unwrap_or_default();
-                    self.record_catalog_invocation_receipt(
+                    CatalogInvocation::record_refusal(
+                        &self.db,
                         operation_id,
                         invocation_namespace,
                         actor,
                         capability_name,
                         catalog_version.as_deref(),
-                        "refuse",
                         "capability_unavailable",
-                        true,
                     )?;
                 }
                 return Err(Status::failed_precondition("capability unavailable"));
@@ -7634,27 +7246,14 @@ impl SekaiService for SekaiServiceImpl {
             invoked_capability.as_ref().zip(operation_id.as_ref())
         {
             let actor = principals.first().cloned().unwrap_or_default();
-            self.record_catalog_invocation_receipt(
-                operation_id,
+            Some(CatalogInvocation::begin(
+                &self.db,
+                operation_id.clone(),
                 invocation_namespace,
-                &actor,
-                capability_name,
-                catalog_version.as_deref(),
-                "pending",
-                "invocation_started",
-                true,
-            )?;
-            Some(CatalogReceiptGuard {
-                service: self,
-                operation_id: operation_id.clone(),
-                namespace: invocation_namespace.to_string(),
                 actor,
-                capability_name: capability_name.clone(),
-                catalog_version: catalog_version.clone(),
-                policy_decision: None,
-                budget_decision: None,
-                finalized: false,
-            })
+                capability_name.clone(),
+                catalog_version.clone(),
+            )?)
         } else {
             None
         };
@@ -8027,7 +7626,8 @@ impl SekaiService for SekaiServiceImpl {
         let approval = outcome.approval;
         let msg = outcome.message;
 
-        if let Err(error) = self.resolve_catalog_approval_receipt(
+        if let Err(error) = CatalogInvocation::resolve_approval(
+            &self.db,
             &approval.work_unit,
             &approval.id,
             &approval.decided_by,
@@ -8076,7 +7676,8 @@ impl SekaiService for SekaiServiceImpl {
                 now_ms: now_millis(),
             })
             .map_err(approval_lifecycle_status)?;
-        if let Err(error) = self.resolve_catalog_approval_receipt(
+        if let Err(error) = CatalogInvocation::resolve_approval(
+            &self.db,
             &approval.work_unit,
             &approval.id,
             &approval.decided_by,

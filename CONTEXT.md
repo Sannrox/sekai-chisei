@@ -38,3 +38,16 @@ effect execution can proceed.
 The gRPC adapter owns caller authentication, capability-catalog correlation,
 and protocol response metadata. Admission trusts the authenticated principals,
 not the actor supplied inside the protocol request.
+
+## Catalog invocation receipt lifecycle
+
+The **Catalog invocation receipt lifecycle** records one capability-catalog
+attributed invocation from its pending intent through policy, routing, budget,
+approval, action, and terminal outcome events. It preserves the original start
+time, records uncovered decision surfaces for early failures, fails closed when
+an invocation exits without explicit completion, and continues held invocations
+after an approval decision.
+
+The gRPC adapter owns request metadata, caller authentication, live capability
+visibility, and response metadata. The receipt lifecycle owns durable event
+ordering and completion semantics behind one private interface.

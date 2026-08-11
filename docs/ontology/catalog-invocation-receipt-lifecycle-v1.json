@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "CatalogInvocationReceiptLifecycleModule",
+      "description": "Deep private module whose interface owns pending Catalog invocation receipt creation, policy and budget decision tracking, fail-closed completion, durable event ordering, uncovered surfaces, and approval continuation.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, checks live capability visibility, maps protocol messages and response metadata, and delegates Catalog invocation receipt lifecycle persistence.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_catalog_invocation_receipts_to",
+      "description": "The gRPC transport delegates durable Catalog invocation receipt state, event ordering, failure completion, and approval continuation after authenticating the caller and checking live capability visibility.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "CatalogInvocationReceiptLifecycleModule"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "CatalogInvocationReceiptLifecycleModule",
+      "source": "src/grpc/catalog_invocation.rs",
+      "locator": "CatalogInvocation",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_catalog_invocation_receipts_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "CatalogInvocation call sites",
+      "confidence": 1.0
+    }
+  ]
+}
