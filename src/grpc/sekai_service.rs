@@ -1,5 +1,8 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
+#[path = "action_approval_execution.rs"]
+mod action_approval_execution;
+
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -26,8 +29,7 @@ use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::{self, ActionExecutor, RiskClass};
 use crate::sekai::action_approval;
 use crate::sekai::action_approval_lifecycle::{
-    ActionApprovalLifecycle, ApprovalActionProfile, ApprovalLifecycleError,
-    ApproveAction as ApproveActionCommand, DenyAction as DenyActionCommand,
+    ActionApprovalLifecycle, ApprovalLifecycleError, DenyAction as DenyActionCommand,
 };
 use crate::sekai::action_lifecycle::{
     self, ActionAudit, ActionLimitExceeded, GovernedActionContext,
@@ -8386,146 +8388,13 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ApproveActionResponse>, Status> {
         let principals = caller_principals(&req);
         let r = req.into_inner();
-        let lifecycle = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref());
-        let approval = lifecycle
+        let approval = ActionApprovalLifecycle::new(&self.db, self.budget.as_deref())
             .load(&r.approval_id)
             .map_err(approval_lifecycle_status)?;
         check_action_admin(&self.security, &approval.policy_scope, &principals)?;
         let approver = principals.first().cloned().unwrap_or_default();
-        let outcome = lifecycle
-            .approve(
-                ApproveActionCommand {
-                    approval_id: &r.approval_id,
-                    approver: &approver,
-                    erased_namespace: ERASED_NAMESPACE,
-                    now_ms: now_millis(),
-                },
-                |approval| {
-                    let actions = self.actions.read().map_err(|_| {
-                        ApprovalLifecycleError::Storage("action registry unavailable".into())
-                    })?;
-                    let target_ids = actions
-                        .target_ids(&self.db, &approval.action, &approval.params)
-                        .unwrap_or_default();
-                    let (op_mutations, op_deletes) =
-                        actions.action_op_counts(&approval.action, &approval.params);
-                    Ok(ApprovalActionProfile {
-                        target_ids,
-                        risk: actions.action_risk_class(&approval.action),
-                        op_mutations,
-                        op_deletes,
-                    })
-                },
-                |approval, proposer| {
-                    if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
-                        let effect_id = approval.params.get("effect_id").ok_or_else(|| {
-                            ApprovalLifecycleError::InvalidArgument("effect_id required".into())
-                        })?;
-                        let effect = self
-                            .db
-                            .get_action_effect(effect_id)
-                            .map_err(ApprovalLifecycleError::Storage)?
-                            .ok_or_else(|| {
-                                ApprovalLifecycleError::ReferencedNotFound(
-                                    "action effect not found".into(),
-                                )
-                            })?;
-                        let submitted_namespace = approval
-                            .params
-                            .get("namespace")
-                            .map(String::as_str)
-                            .unwrap_or("");
-                        if submitted_namespace != effect.namespace {
-                            return Err(ApprovalLifecycleError::FailedPrecondition(
-                                "parked resolution namespace no longer matches effect".into(),
-                            ));
-                        }
-                        check_team_namespace(&self.db, proposer, &effect.namespace, true)
-                            .map_err(approval_adapter_error)?;
-                    }
-                    let actions = self.actions.read().map_err(|_| {
-                        ApprovalLifecycleError::Storage("action registry unavailable".into())
-                    })?;
-                    let resume_targets = actions
-                        .target_ids(&self.db, &approval.action, &approval.params)
-                        .map_err(ApprovalLifecycleError::InvalidArgument)?;
-                    for target_id in &resume_targets {
-                        if let Some(target) = self
-                            .db
-                            .get_object(target_id)
-                            .map_err(ApprovalLifecycleError::Storage)?
-                        {
-                            enforce_object_marking_access(
-                                &self.db,
-                                &target,
-                                proposer,
-                                &format!("approve_action:{}:{}", approval.action, target_id),
-                            )
-                            .map_err(approval_adapter_error)?;
-                        }
-                    }
-                    let required_purpose = actions
-                        .get_action_type(&approval.action)
-                        .map(|action_type| action_type.required_purpose.clone())
-                        .unwrap_or_default();
-                    if !required_purpose.trim().is_empty() {
-                        let authority = resolve_principal_authority(&self.db, proposer)
-                            .map_err(approval_adapter_error)?;
-                        let purpose = markings::evaluate_purpose_access(
-                            &format!("approve_action:{}", approval.action),
-                            &required_purpose,
-                            &authority,
-                        );
-                        if purpose.decision == markings::MarkingDecision::Deny {
-                            let evidence = HashMap::from([
-                                ("required_purpose".into(), purpose.required_purpose.clone()),
-                                ("detail".into(), purpose.detail.clone()),
-                                ("outcome".into(), "denied".into()),
-                            ]);
-                            let _ = record_marking_or_purpose_decision(
-                                &self.db,
-                                &approval.actor,
-                                "purpose.execute",
-                                approval.target_id.as_str(),
-                                &purpose.decision_id,
-                                "denied",
-                                evidence,
-                            );
-                            return Err(ApprovalLifecycleError::PermissionDenied(
-                                "purpose not allow-listed".into(),
-                            ));
-                        }
-                        if purpose.decision == markings::MarkingDecision::Allow {
-                            let evidence = HashMap::from([
-                                ("required_purpose".into(), purpose.required_purpose.clone()),
-                                ("detail".into(), purpose.detail.clone()),
-                                ("outcome".into(), "allowed".into()),
-                            ]);
-                            record_marking_or_purpose_decision(
-                                &self.db,
-                                &approval.actor,
-                                "purpose.execute",
-                                approval.target_id.as_str(),
-                                &purpose.decision_id,
-                                "allowed",
-                                evidence,
-                            )
-                            .map_err(approval_adapter_error)?;
-                        }
-                    }
-                    Ok(())
-                },
-                |approval, proposer| {
-                    self.run_action_effect(
-                        &approval.action,
-                        &approval.params,
-                        &approval.actor,
-                        proposer,
-                    )
-                    .map_err(approval_adapter_error)
-                },
-                now_millis,
-            )
+        let outcome = action_approval_execution::ActionApprovalExecution::new(self)
+            .approve(&r.approval_id, &approver)
             .map_err(approval_lifecycle_status)?;
         let approval = outcome.approval;
         let msg = outcome.message;
