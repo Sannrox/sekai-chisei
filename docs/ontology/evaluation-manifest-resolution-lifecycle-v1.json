@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "EvaluationManifestResolutionLifecycle",
+      "description": "Deep private Chisei module whose interface owns authorized request replay, invariant and Evidence closure, evaluator validation, fail-closed manifest construction, snapshot consistency, and durable persistence ordering.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Evaluation callers, prepares and projects protocol messages, and delegates deterministic manifest resolution to the resolution lifecycle.",
+      "superclasses": []
+    },
+    {
+      "name": "ResolvedEvaluationManifest",
+      "description": "Canonical immutable document freezing the exact plan, evaluator definitions, invariant set, waivers, Evidence, subject binding, and evaluation time used by Evaluation execution.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_evaluation_manifest_resolution_to",
+      "description": "The Chisei gRPC transport delegates the complete deterministic manifest resolution protocol to the private lifecycle module.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "EvaluationManifestResolutionLifecycle"
+    },
+    {
+      "name": "resolves_canonical_evaluation_manifest",
+      "description": "The resolution lifecycle produces or replays one canonical immutable resolved Evaluation manifest.",
+      "domain": "EvaluationManifestResolutionLifecycle",
+      "range": "ResolvedEvaluationManifest"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "EvaluationManifestResolutionLifecycle",
+      "source": "src/grpc/chisei_service/evaluation_manifest_resolution.rs",
+      "locator": "EvaluationManifestResolutionLifecycle/resolve",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "resolve_evaluation_plan",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ResolvedEvaluationManifest",
+      "source": "src/chisei/evaluation_manifest.rs",
+      "locator": "ResolvedEvaluationManifest",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_evaluation_manifest_resolution_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "EvaluationManifestResolutionLifecycle call site",
+      "confidence": 1.0
+    },
+    {
+      "subject": "resolves_canonical_evaluation_manifest",
+      "source": "src/grpc/chisei_service/evaluation_manifest_resolution.rs",
+      "locator": "resolve/resolve_evaluation_manifest_live",
+      "confidence": 1.0
+    }
+  ]
+}
