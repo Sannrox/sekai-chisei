@@ -1,5 +1,18 @@
 # Domain context
 
+## Schema definition
+
+The **Schema definition lifecycle** loads, repairs, validates, persists, and
+converges runtime ObjectType definitions through one private interface. It owns
+the process-local registry, global and per-kind load failures, computed-property
+function validation, durable writes, and cache repair.
+
+Object mutation, Action execution, ontology mapped-kind ensure, capability
+discovery, and the gRPC adapter consume domain snapshots rather than registry
+locks. Definitions are refreshed before schema-governed writes so multiple
+runtime instances converge on durable state. Schema history and implicit
+versioning remain outside this lifecycle.
+
 ## Evidence admission
 
 The **Evidence admission lifecycle** admits externally produced Evidence

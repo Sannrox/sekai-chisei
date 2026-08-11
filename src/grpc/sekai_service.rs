@@ -10,6 +10,8 @@ mod catalog_invocation;
 mod object_mutation_lifecycle;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
+#[path = "schema_definition_lifecycle.rs"]
+mod schema_definition_lifecycle;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 
@@ -89,17 +91,29 @@ use self::catalog_invocation::CatalogInvocation;
 use self::object_mutation_lifecycle::{
     GuardedCreateObjectRequest, GuardedDeleteObjectRequest, GuardedUpdateObjectRequest,
 };
+use self::schema_definition_lifecycle::{
+    SchemaDefinitionLifecycle, SchemaDefinitionLifecycleError,
+};
 
 const REDACTED_VALUE: &str = "[redacted]";
+
+fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) -> Status {
+    match error {
+        SchemaDefinitionLifecycleError::Unavailable(error) => Status::internal(error),
+        SchemaDefinitionLifecycleError::InvalidDefinition(error)
+        | SchemaDefinitionLifecycleError::InvalidComputedProperty(error) => {
+            Status::invalid_argument(error)
+        }
+        SchemaDefinitionLifecycleError::Persistence(error) => Status::internal(error),
+    }
+}
 
 pub struct SekaiServiceImpl {
     db: Arc<RuntimeDb>,
     actions: Arc<RwLock<ActionExecutor>>,
     action_type_mutation: Arc<Mutex<()>>,
     security: Arc<SecurityChecker>,
-    schema: Arc<RwLock<SchemaRegistry>>,
-    schema_unavailable_error: Arc<RwLock<Option<String>>>,
-    schema_load_errors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    schema_definitions: SchemaDefinitionLifecycle,
     budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
     gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
@@ -132,36 +146,13 @@ impl SekaiServiceImpl {
                 ActionExecutor::new()
             }
         };
-        let (types, schema_unavailable_error, schema_load_errors) =
-            match db.list_object_types_with_errors() {
-                Ok((types, errors)) => {
-                    for (kind, error) in &errors {
-                        tracing::error!(kind, %error, "failed to load schema type");
-                    }
-                    (types, None, errors)
-                }
-                Err(error) => {
-                    tracing::error!(%error, "failed to load schema types");
-                    (Vec::new(), Some(error), std::collections::HashMap::new())
-                }
-            };
-        let interfaces = match db.list_interfaces() {
-            Ok(interfaces) => interfaces,
-            Err(error) => {
-                tracing::error!(%error, "failed to load interfaces");
-                Vec::new()
-            }
-        };
-        let registry = SchemaRegistry::from_types_and_interfaces(types, interfaces);
-        let schema = Arc::new(RwLock::new(registry));
+        let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
         Self {
             db,
             actions: Arc::new(RwLock::new(actions)),
             action_type_mutation: Arc::new(Mutex::new(())),
             security,
-            schema,
-            schema_unavailable_error: Arc::new(RwLock::new(schema_unavailable_error)),
-            schema_load_errors: Arc::new(RwLock::new(schema_load_errors)),
+            schema_definitions,
             budget: None,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
@@ -213,17 +204,9 @@ impl SekaiServiceImpl {
     }
 
     fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
-        self.recover_schema_registry()?;
-        let errors = self
-            .schema_load_errors
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
-        if let Some(error) = errors.get(kind) {
-            return Err(Status::internal(format!(
-                "schema type {kind} unavailable: {error}"
-            )));
-        }
-        Ok(())
+        self.schema_definitions
+            .ensure_kind_loaded(kind)
+            .map_err(map_schema_definition_lifecycle_error)
     }
 
     fn catalog_metadata_value(req: &Request<impl prost::Message>, key: &str) -> Option<String> {
@@ -310,8 +293,8 @@ impl SekaiServiceImpl {
             check_team_namespace(&self.db, principals, namespace, true).is_ok();
 
         let schema = self
-            .schema
-            .read()
+            .schema_definitions
+            .refresh_snapshot()
             .map_err(|_| Status::internal("capability catalog unavailable"))?;
         let visible_types = schema
             .all()
@@ -493,9 +476,9 @@ impl SekaiServiceImpl {
             self.require_schema_kind_loaded(&kind)?;
         }
         let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         actions
             .validate_action_schema(action_name, &schema)
             .map_err(Status::invalid_argument)?;
@@ -584,10 +567,9 @@ impl SekaiServiceImpl {
     ) -> Result<domain::Object, Status> {
         let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .clone();
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         compute::resolve_schema_computed_with_filter(&mut object, &self.db, &schema, |candidate| {
             !is_reserved_governance_kind(&candidate.kind)
                 && check_team_namespace(&self.db, principals, &candidate.namespace, false).is_ok()
@@ -620,52 +602,6 @@ impl SekaiServiceImpl {
             .into_iter()
             .map(|object| self.resolve_computed_for_response(object, principals, tenant_context))
             .collect()
-    }
-
-    fn recover_schema_registry(&self) -> Result<(), Status> {
-        let current_error = self
-            .schema_unavailable_error
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .clone();
-        if current_error.is_none() {
-            return Ok(());
-        }
-
-        match (
-            self.db.list_object_types_with_errors(),
-            self.db.list_interfaces(),
-        ) {
-            (Ok((types, errors)), Ok(interfaces)) => {
-                for (kind, error) in &errors {
-                    tracing::error!(kind, %error, "failed to load schema type");
-                }
-                *self
-                    .schema
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))? =
-                    SchemaRegistry::from_types_and_interfaces(types, interfaces);
-                *self
-                    .schema_load_errors
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))? = errors;
-                *self
-                    .schema_unavailable_error
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))? = None;
-                Ok(())
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                *self
-                    .schema_unavailable_error
-                    .write()
-                    .map_err(|_| Status::internal("schema registry unavailable"))? =
-                    Some(error.clone());
-                Err(Status::internal(format!(
-                    "schema registry unavailable: {error}"
-                )))
-            }
-        }
     }
 }
 
@@ -2976,29 +2912,6 @@ fn to_proto_action_op(op: &action::ActionOp) -> ActionOp {
     }
 }
 
-fn validate_computed_property_functions(
-    db: &RuntimeDb,
-    object_type: &schema::ObjectType,
-) -> Result<(), Status> {
-    for property in &object_type.properties {
-        if property.prop_type != schema::PropertyType::Computed || property.compute_expr.is_empty()
-        {
-            continue;
-        }
-        if db
-            .get_function(&property.compute_expr)
-            .map_err(Status::internal)?
-            .is_none()
-        {
-            return Err(Status::invalid_argument(format!(
-                "computed property {} references unknown function {}",
-                property.name, property.compute_expr
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn to_proto_dataset(d: &dataset::Dataset) -> Dataset {
     Dataset {
         id: d.id.clone(),
@@ -4573,9 +4486,9 @@ impl SekaiService for SekaiServiceImpl {
         }
         {
             let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             let mut queried_properties = filter
                 .property_filters
                 .iter()
@@ -4687,9 +4600,9 @@ impl SekaiService for SekaiServiceImpl {
         }
         {
             let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             ensure_property_query_allowed(&schema, &principals, &r.kind, [r.key.clone()])?;
         }
         let objs = self
@@ -4959,9 +4872,9 @@ impl SekaiService for SekaiServiceImpl {
             property_filter: q.property_filter,
         };
         let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?;
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         let queried_properties = gq.property_filter.keys().cloned().collect::<Vec<_>>();
         if gq.kind_filter.is_empty() {
             ensure_property_query_allowed(&schema, &principals, "", queried_properties)?;
@@ -5430,9 +5343,9 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let types = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?
             .all()
             .iter()
             .filter(|object_type| {
@@ -5459,26 +5372,10 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::invalid_argument("schema type required"))?;
         let parsed = from_proto_schema_type(&object_type)?;
         check_schema_admin(&self.security, &parsed.kind, &principals)?;
-        {
-            let registry = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
-            schema::validate_object_type_definition(&parsed, registry.get(&parsed.kind), &registry)
-                .map_err(Status::invalid_argument)?;
-        }
-        validate_computed_property_functions(&self.db, &parsed)?;
-        self.db
-            .upsert_object_type(&parsed)
-            .map_err(Status::internal)?;
-        self.schema
-            .write()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .register(parsed.clone());
-        self.schema_load_errors
-            .write()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .remove(&parsed.kind);
+        let parsed = self
+            .schema_definitions
+            .put_definition(parsed)
+            .map_err(map_schema_definition_lifecycle_error)?;
         Ok(Response::new(CreateSchemaTypeResponse {
             r#type: Some(to_proto_schema_type(&parsed)),
         }))
@@ -5655,9 +5552,9 @@ impl SekaiService for SekaiServiceImpl {
             )
             .map_err(Status::invalid_argument)?;
             let schema = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
+                .schema_definitions
+                .refresh_snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             action::validate_action_type_against_schema(&parsed, &schema)
                 .map_err(Status::invalid_argument)?;
         }
@@ -7770,10 +7667,9 @@ impl SekaiService for SekaiServiceImpl {
                 .map_err(Status::internal)?,
         };
         let schema = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .clone();
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         let changes = self
             .db
             .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
@@ -11938,7 +11834,13 @@ mod tests {
         incident.description = "Operational incident".into();
 
         // Kind must not exist yet.
-        assert!(svc.schema.read().unwrap().get("incident_kind").is_none());
+        assert!(
+            svc.schema_definitions
+                .snapshot()
+                .unwrap()
+                .get("incident_kind")
+                .is_none()
+        );
 
         let created = svc
             .create_ontology_class(with_principal(CreateOntologyClassRequest {
@@ -11951,7 +11853,11 @@ mod tests {
             .unwrap();
         assert_eq!(created.mapped_kind, "incident_kind");
         assert!(
-            svc.schema.read().unwrap().get("incident_kind").is_some(),
+            svc.schema_definitions
+                .snapshot()
+                .unwrap()
+                .get("incident_kind")
+                .is_some(),
             "mapped kind must be ensured for ontology-first product path"
         );
 
@@ -12463,7 +12369,9 @@ mod tests {
             is_builtin: false,
         };
         svc.db.upsert_interface(&interface).unwrap();
-        svc.schema.write().unwrap().register_interface(interface);
+        svc.schema_definitions
+            .register_interface(interface)
+            .unwrap();
 
         let mut invalid_type = widget_schema_type();
         invalid_type.implements = vec!["Trackable".into()];

@@ -179,9 +179,9 @@ impl SekaiServiceImpl {
         }
         let kind = parsed.mapped_kind.as_str();
         let needs_ensure = self
-            .schema
-            .read()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?
             .get(kind)
             .is_none();
         if !needs_ensure {
@@ -199,30 +199,9 @@ impl SekaiServiceImpl {
             is_builtin: false,
             implements: Vec::new(),
         };
-        {
-            let registry = self
-                .schema
-                .read()
-                .map_err(|_| Status::internal("schema registry unavailable"))?;
-            schema::validate_object_type_definition(
-                &object_type,
-                registry.get(&object_type.kind),
-                &registry,
-            )
-            .map_err(Status::invalid_argument)?;
-        }
-        validate_computed_property_functions(&self.db, &object_type)?;
-        self.db
-            .upsert_object_type(&object_type)
-            .map_err(Status::internal)?;
-        self.schema
-            .write()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .register(object_type);
-        self.schema_load_errors
-            .write()
-            .map_err(|_| Status::internal("schema registry unavailable"))?
-            .remove(kind);
+        self.schema_definitions
+            .put_definition(object_type)
+            .map_err(map_schema_definition_lifecycle_error)?;
         Ok(())
     }
 }
