@@ -1,5 +1,17 @@
 # Domain context
 
+## Policy resolution
+
+The **Policy resolution module** produces one permitted route or denial from
+authenticated routing input. Its private interface owns policy-scope
+precedence, regression and promoted-capable safeguards, privacy and capability
+gates, explicit route overrides, local-free, cheap, and portfolio selection,
+runtime canonicalization, and fallback projection.
+
+The gRPC adapter owns caller authentication and protocol translation. Gateway
+execution and other authenticated callers cross the same domain seam without
+manufacturing transport requests.
+
 ## Native execution planning
 
 The **Native execution planning pipeline** produces one executable or denied
