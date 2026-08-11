@@ -72,6 +72,20 @@ The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline.
 
+## Evaluation execution
+
+The **Evaluation execution lifecycle** executes and cancels one resolved
+Evaluation manifest through one private ordered path. It owns durable creation
+and replay, frozen execution budgets, evaluator availability, per-manifest
+serialization, cancellation state and persistence, worker dispatch, Evidence
+loading, step and gate receipt ordering, recovery, and terminal cleanup.
+
+The gRPC adapter owns caller authentication, namespace authorization, manifest
+lookup, and protocol translation. Deterministic and stochastic evaluators keep
+their separate execution classes, external evaluators remain behind their
+registered adapter seam, and the canonical operation receipt remains the
+durable authority.
+
 ## Object mutation
 
 The **Object mutation lifecycle** creates, updates, and deletes Objects through
