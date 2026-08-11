@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "HandoffLifecycleModule",
+      "description": "Sekai-owned deep module whose interface owns Handoff manifest invariants, replay identity, timestamp validation, predecessor compatibility, durable creation, and revocation authority.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Handoff callers, authorizes namespace access, evaluates reference visibility, maps protocol messages, and delegates durable lifecycle behavior.",
+      "superclasses": []
+    },
+    {
+      "name": "HandoffManifest",
+      "description": "Versioned immutable manifest that transfers bounded context references between principals without copying content or granting access.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_handoff_lifecycle_to",
+      "description": "The gRPC transport delegates creation and revocation ordering to the Handoff lifecycle module after authentication and namespace authorization.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "HandoffLifecycleModule"
+    },
+    {
+      "name": "governs_handoff_manifest",
+      "description": "The Handoff lifecycle module governs durable creation and revocation of Handoff manifests.",
+      "domain": "HandoffLifecycleModule",
+      "range": "HandoffManifest"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "HandoffLifecycleModule",
+      "source": "src/sekai/handoff_lifecycle.rs",
+      "locator": "HandoffLifecycle/create/revoke",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "create_handoff/revoke_handoff",
+      "confidence": 1.0
+    },
+    {
+      "subject": "HandoffManifest",
+      "source": "src/sekai/handoff.rs",
+      "locator": "HandoffManifest",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_handoff_lifecycle_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "HandoffLifecycle call sites",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_handoff_manifest",
+      "source": "src/sekai/handoff_lifecycle.rs",
+      "locator": "create/revoke",
+      "confidence": 1.0
+    }
+  ]
+}
