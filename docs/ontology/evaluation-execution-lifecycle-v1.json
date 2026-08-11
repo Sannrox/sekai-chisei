@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "EvaluationExecutionLifecycle",
+      "description": "Deep private Chisei module whose interface executes or cancels one resolved Evaluation manifest and owns durable creation and replay, frozen budgets, evaluator availability, per-manifest serialization, cancellation persistence, worker dispatch, Evidence loading, step and gate receipt ordering, recovery, and terminal cleanup.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Evaluation execution callers, authorizes namespace access, resolves the durable manifest, translates protocol messages, and delegates execution or cancellation to the Evaluation execution lifecycle.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_evaluation_execution_to",
+      "description": "The gRPC transport delegates execution and cancellation after caller authentication, namespace authorization, and manifest lookup.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "EvaluationExecutionLifecycle"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "EvaluationExecutionLifecycle",
+      "source": "src/grpc/chisei_service/evaluation_execution_lifecycle.rs",
+      "locator": "EvaluationExecutionLifecycle::execute and EvaluationExecutionLifecycle::cancel",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "ChiseiService::execute_evaluation_manifest and ChiseiService::cancel_evaluation_execution",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_evaluation_execution_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "evaluation_execution_lifecycle execute and cancel calls",
+      "confidence": 1.0
+    }
+  ]
+}

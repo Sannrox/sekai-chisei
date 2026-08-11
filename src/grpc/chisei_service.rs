@@ -3,16 +3,12 @@ use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use prost::Message as _;
 use sha2::Digest;
-use tokio::sync::Mutex as AsyncMutex;
 use tonic::{Request, Response, Status};
 
 use super::pb::chisei::chisei_service_server::ChiseiService;
@@ -56,6 +52,7 @@ use crate::sekai::coordination::{
 use crate::sekai::governed_facts::{self as governed_fact_domain, GovernedFactType};
 use crate::sekai::markings;
 
+mod evaluation_execution_lifecycle;
 mod execution_planning;
 mod policy_resolution;
 
@@ -71,8 +68,7 @@ pub struct ChiseiServiceImpl {
     active_promotions: Arc<ActivePromotions>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
-    evaluation_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    evaluation_execution_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    evaluation_execution_lifecycle: evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
     db: Arc<RuntimeDb>,
     config: Config,
     provider_registry_state_path: Option<PathBuf>,
@@ -4076,8 +4072,17 @@ impl ChiseiServiceImpl {
         ));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
+        let budget = Arc::new(BudgetTracker::new(db.clone()));
+        let evaluation_execution_lifecycle =
+            evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
+                db.clone(),
+                budget.clone(),
+                evaluator_registry.clone(),
+                stochastic_evaluator_registry.clone(),
+                crate::chisei::privacy::safe_providers(&config),
+            );
         Self {
-            budget: Arc::new(BudgetTracker::new(db.clone())),
+            budget,
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
@@ -4088,8 +4093,7 @@ impl ChiseiServiceImpl {
             active_promotions: Arc::new(ActivePromotions::new()),
             evaluator_registry,
             stochastic_evaluator_registry,
-            evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
-            evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            evaluation_execution_lifecycle,
             db,
             config,
             provider_registry_state_path,
@@ -4158,447 +4162,6 @@ impl ChiseiServiceImpl {
         )
     }
 
-    fn get_evaluation_projection(
-        db: &RuntimeDb,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        index: &evaluation_execution_domain::EvaluationExecutionIndex,
-    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
-        let receipt = db
-            .get_operation_receipt(&index.operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
-        evaluation_total_budget_ms(&receipt)?;
-        evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
-    }
-
-    fn ensure_evaluation_execution(
-        &self,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        actor: &str,
-        max_total_duration_ms: u64,
-    ) -> Result<evaluation_execution_domain::EvaluationExecutionIndex, Status> {
-        if let Some(index) = self
-            .db
-            .get_evaluation_execution_index(&manifest.manifest_digest)
-            .map_err(Status::internal)?
-        {
-            if index.namespace != manifest.namespace
-                || index.executor_version != evaluation_execution_domain::EXECUTOR_VERSION
-                || index.operation_id != evaluation_operation_id(&manifest.manifest_digest)
-            {
-                return Err(Status::data_loss(
-                    "evaluation execution index binding is invalid",
-                ));
-            }
-            return Ok(index);
-        }
-        let topological_order =
-            evaluation_execution_domain::deterministic_topological_order(manifest)
-                .map_err(Status::data_loss)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let receipt = initial_evaluation_receipt(
-            manifest,
-            actor,
-            now_ms,
-            max_total_duration_ms,
-            &topological_order,
-        )?;
-        let index = evaluation_execution_domain::EvaluationExecutionIndex {
-            manifest_digest: manifest.manifest_digest.clone(),
-            operation_id: receipt.operation_id.clone(),
-            namespace: manifest.namespace.clone(),
-            executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
-            started_by: actor.into(),
-            created_at_ms: now_ms,
-        };
-        self.db
-            .create_evaluation_execution(&index, &receipt)
-            .map_err(Status::internal)
-    }
-
-    fn request_evaluation_cancellation(
-        &self,
-        index: &evaluation_execution_domain::EvaluationExecutionIndex,
-        receipt: &OperationReceipt,
-        actor: &str,
-    ) -> Result<(), Status> {
-        let append = self.db.append_operation_receipt_event(
-            &index.operation_id,
-            evaluation_cancellation_event(receipt, actor, chrono::Utc::now().timestamp_millis()),
-        );
-        if let Err(error) = append {
-            let reconciled = self
-                .db
-                .get_operation_receipt(&index.operation_id)
-                .map_err(Status::internal)?
-                .is_some_and(|receipt| {
-                    receipt.completed_at_ms.is_some() || evaluation_cancellation_requested(&receipt)
-                });
-            if !reconciled {
-                return Err(Status::internal(error));
-            }
-        }
-        Ok(())
-    }
-
-    fn load_evaluation_node_evidence(
-        db: &RuntimeDb,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
-    ) -> Result<Vec<evaluation_execution_domain::EvaluationEvidenceInput>, String> {
-        let by_object = manifest
-            .evidence
-            .iter()
-            .map(|evidence| (evidence.evidence_object_id.as_str(), evidence))
-            .collect::<BTreeMap<_, _>>();
-        let mut inputs = Vec::with_capacity(node.evidence_object_ids.len());
-        for object_id in &node.evidence_object_ids {
-            let binding = by_object
-                .get(object_id.as_str())
-                .ok_or_else(|| "manifest node evidence binding is missing".to_string())?;
-            let submission = db
-                .get_evidence_submission(&binding.submission_id)?
-                .ok_or_else(|| {
-                    evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string()
-                })?;
-            let envelope = submission.envelope.ok_or_else(|| {
-                evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string()
-            })?;
-            let retained_content_digest = crate::sekai::evidence_store::canonical_content_digest(
-                &envelope.content,
-            )
-            .map_err(|_| evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string())?;
-            if submission.id != binding.submission_id
-                || submission.namespace != manifest.namespace
-                || submission.content_digest != binding.content_digest
-                || submission.schema_id != binding.schema_id
-                || submission.schema_version != binding.schema_version
-                || envelope.content_digest != binding.content_digest
-                || retained_content_digest != binding.content_digest
-                || envelope.schema_id != binding.schema_id
-                || envelope.schema_version != binding.schema_version
-            {
-                return Err(evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.into());
-            }
-            inputs.push(evaluation_execution_domain::EvaluationEvidenceInput {
-                evidence_object_id: binding.evidence_object_id.clone(),
-                submission_id: binding.submission_id.clone(),
-                content_digest: binding.content_digest.clone(),
-                schema_id: binding.schema_id.clone(),
-                schema_version: binding.schema_version.clone(),
-                content: envelope.content,
-            });
-        }
-        Ok(inputs)
-    }
-
-    fn unavailable_evaluation_node_evidence(
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
-    ) -> Result<Vec<evaluation_execution_domain::EvaluationEvidenceInput>, String> {
-        let by_object = manifest
-            .evidence
-            .iter()
-            .map(|evidence| (evidence.evidence_object_id.as_str(), evidence))
-            .collect::<BTreeMap<_, _>>();
-        node.evidence_object_ids
-            .iter()
-            .map(|object_id| {
-                let binding = by_object
-                    .get(object_id.as_str())
-                    .ok_or_else(|| "manifest node evidence binding is missing".to_string())?;
-                Ok(evaluation_execution_domain::EvaluationEvidenceInput {
-                    evidence_object_id: binding.evidence_object_id.clone(),
-                    submission_id: binding.submission_id.clone(),
-                    content_digest: binding.content_digest.clone(),
-                    schema_id: binding.schema_id.clone(),
-                    schema_version: binding.schema_version.clone(),
-                    content: serde_json::Value::Null,
-                })
-            })
-            .collect()
-    }
-
-    fn stochastic_egress_reasons(
-        &self,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-    ) -> BTreeMap<String, String> {
-        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
-        let mut reasons = BTreeMap::new();
-        for node in &manifest.nodes {
-            let Some(policy) = &node.evaluator.stochastic_policy else {
-                continue;
-            };
-            if policy.egress_policy
-                == evaluation_plan_domain::STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL
-                && !crate::chisei::privacy::provider_safe_to_send(&policy.provider, &safe_providers)
-            {
-                reasons.insert(
-                    node.node_id.clone(),
-                    evaluation_execution_domain::REASON_STOCHASTIC_EGRESS_DENIED.into(),
-                );
-            }
-        }
-        reasons
-    }
-
-    #[cfg(test)]
-    fn stochastic_budget_reason(
-        budget: &BudgetTracker,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        node: &evaluation_manifest_domain::ResolvedEvaluationNode,
-    ) -> Option<String> {
-        let policy = node.evaluator.stochastic_policy.as_ref()?;
-        let Ok(amount) = i32::try_from(policy.max_total_tokens) else {
-            return Some(evaluation_execution_domain::REASON_STOCHASTIC_TOKEN_BUDGET.into());
-        };
-        let scope = format!(
-            "project:{}/stochastic-evaluation:{}",
-            manifest.namespace, node.node_id
-        );
-        let idempotency_key = format!(
-            "stochastic-evaluation-reserve:{}:{}",
-            manifest.manifest_digest, node.node_id
-        );
-        budget
-            .check_and_reserve_idempotent(&scope, amount, &idempotency_key)
-            .err()
-            .map(|_| evaluation_execution_domain::REASON_STOCHASTIC_TOKEN_BUDGET.into())
-    }
-
-    fn run_evaluation_execution(
-        db: &RuntimeDb,
-        engine: &evaluation_execution_domain::EvaluationExecutionEngine<'_>,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        index: &evaluation_execution_domain::EvaluationExecutionIndex,
-        max_total_duration_ms: u64,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
-        let existing = Self::get_evaluation_projection(db, manifest, index)?;
-        if existing.decision.is_some() {
-            return Ok(existing);
-        }
-        let invocation_started = Instant::now();
-        let total_budget = Duration::from_millis(max_total_duration_ms);
-        let elapsed_before_invocation_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_sub(index.created_at_ms)
-            .max(0) as u64;
-        let elapsed_before_invocation = Duration::from_millis(elapsed_before_invocation_ms);
-        let order = evaluation_execution_domain::deterministic_topological_order(manifest)
-            .map_err(Status::data_loss)?;
-        let nodes = manifest
-            .nodes
-            .iter()
-            .map(|node| (node.node_id.as_str(), node))
-            .collect::<BTreeMap<_, _>>();
-        let mut prior_steps = existing
-            .steps
-            .into_iter()
-            .map(|step| (step.node_id.clone(), step))
-            .collect::<BTreeMap<_, _>>();
-
-        for node_id in order {
-            if prior_steps.contains_key(&node_id) {
-                continue;
-            }
-            if db
-                .get_operation_receipt(&index.operation_id)
-                .map_err(Status::internal)?
-                .is_some_and(|receipt| evaluation_cancellation_requested(&receipt))
-            {
-                cancelled.store(true, Ordering::Release);
-            }
-            let node = nodes
-                .get(node_id.as_str())
-                .ok_or_else(|| Status::data_loss("evaluation node is missing"))?;
-            let evidence = Self::load_evaluation_node_evidence(db, manifest, node);
-            let evaluator_evidence = match &evidence {
-                Ok(evidence) => evidence.clone(),
-                Err(_) => Self::unavailable_evaluation_node_evidence(manifest, node)
-                    .map_err(Status::data_loss)?,
-            };
-            let definition = db
-                .get_evaluator_definition(&node.evaluator.definition_id)
-                .map_err(Status::internal)?
-                .and_then(|definition| {
-                    let canonical = evaluation_plan_domain::prepare_definition(
-                        definition.clone(),
-                        &definition.created_by,
-                        definition.created_at_ms,
-                    )
-                    .ok()?;
-                    (canonical == definition
-                        && definition.content_digest == node.evaluator.definition_digest
-                        && definition.implementation_digest == node.evaluator.implementation_digest
-                        && definition.stochastic_policy == node.evaluator.stochastic_policy)
-                        .then_some(definition)
-                });
-            let remaining = total_budget
-                .saturating_sub(elapsed_before_invocation)
-                .saturating_sub(invocation_started.elapsed());
-            let input = evaluation_execution_domain::build_evaluator_input(
-                manifest,
-                node,
-                evaluator_evidence,
-                &prior_steps,
-            )
-            .map_err(Status::data_loss)?;
-            let mut execution = engine
-                .execute_node(evaluation_execution_domain::EvaluationNodeExecution {
-                    manifest,
-                    node,
-                    input: input.clone(),
-                    evidence_available: evidence.is_ok(),
-                    prior_steps: &prior_steps,
-                    definition: definition.as_ref(),
-                    remaining,
-                    cancelled: cancelled.clone(),
-                })
-                .map_err(|error| match error {
-                    evaluation_execution_domain::EvaluationExecutionError::Internal(message) => {
-                        Status::internal(message)
-                    }
-                })?;
-            if db
-                .get_operation_receipt(&index.operation_id)
-                .map_err(Status::internal)?
-                .is_some_and(|receipt| evaluation_cancellation_requested(&receipt))
-                && execution.receipt.reason_code
-                    != evaluation_execution_domain::REASON_EXECUTION_CANCELLED
-            {
-                cancelled.store(true, Ordering::Release);
-                execution = evaluation_execution_domain::make_nonexecuted_node(
-                    manifest,
-                    node,
-                    &input,
-                    evaluation_execution_domain::STATUS_SKIPPED,
-                    evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
-                )
-                .map_err(Status::internal)?;
-            }
-            let event = evaluation_step_event(
-                &index.operation_id,
-                node,
-                &execution.receipt,
-                chrono::Utc::now().timestamp_millis(),
-            )?;
-            let (receipt, recorded) = match db
-                .append_operation_receipt_event(&index.operation_id, event)
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    let receipt = db
-                        .get_operation_receipt(&index.operation_id)
-                        .map_err(Status::internal)?
-                        .ok_or_else(|| {
-                            Status::data_loss("evaluation execution receipt is missing")
-                        })?;
-                    let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
-                        .map_err(Status::data_loss)?;
-                    let durable_step = projection
-                        .steps
-                        .iter()
-                        .find(|step| step.node_id == node.node_id);
-                    let durable_step_matches =
-                        durable_step.is_some_and(|step| step == &execution.receipt);
-                    let durable_cancellation_won =
-                        evaluation_cancellation_requested(&receipt) && durable_step.is_some();
-                    if projection.decision.is_some()
-                        || durable_step_matches
-                        || durable_cancellation_won
-                    {
-                        (receipt, false)
-                    } else if evaluation_cancellation_requested(&receipt) {
-                        cancelled.store(true, Ordering::Release);
-                        execution = evaluation_execution_domain::make_nonexecuted_node(
-                            manifest,
-                            node,
-                            &input,
-                            evaluation_execution_domain::STATUS_SKIPPED,
-                            evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
-                        )
-                        .map_err(Status::internal)?;
-                        let cancellation_event = evaluation_step_event(
-                            &index.operation_id,
-                            node,
-                            &execution.receipt,
-                            chrono::Utc::now().timestamp_millis(),
-                        )?;
-                        db.append_operation_receipt_event(&index.operation_id, cancellation_event)
-                            .map_err(Status::internal)?
-                    } else {
-                        return Err(Status::internal(error));
-                    }
-                }
-            };
-            let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
-                .map_err(Status::data_loss)?;
-            if recorded {
-                let durable_step = projection
-                    .steps
-                    .iter()
-                    .find(|step| step.node_id == node.node_id)
-                    .ok_or_else(|| Status::data_loss("durable evaluation step is missing"))?;
-                let (metrics_evaluator, metrics_version) = engine.metric_labels(manifest, node);
-                crate::obs::signals::record_evaluation_step(
-                    metrics_evaluator,
-                    metrics_version,
-                    &durable_step.status,
-                    execution.elapsed,
-                );
-            }
-            prior_steps = projection
-                .steps
-                .into_iter()
-                .map(|step| (step.node_id.clone(), step))
-                .collect();
-        }
-
-        let steps = prior_steps.values().cloned().collect::<Vec<_>>();
-        let decision = evaluation_execution_domain::reduce_gate(manifest, &steps)
-            .map_err(Status::data_loss)?;
-        let parent_event_id = order_parent_event_id(manifest, &index.operation_id);
-        let event = evaluation_gate_event(
-            &index.operation_id,
-            parent_event_id.clone(),
-            &decision,
-            chrono::Utc::now().timestamp_millis(),
-        )?;
-        let receipt = match db.append_operation_receipt_event(&index.operation_id, event) {
-            Ok((receipt, _)) => receipt,
-            Err(error) => {
-                let receipt = db
-                    .get_operation_receipt(&index.operation_id)
-                    .map_err(Status::internal)?
-                    .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
-                let projection = evaluation_projection_from_receipt(manifest, index, &receipt)
-                    .map_err(Status::data_loss)?;
-                if projection.decision.is_some() {
-                    receipt
-                } else {
-                    if !evaluation_cancellation_requested(&receipt) {
-                        return Err(Status::internal(error));
-                    }
-                    cancelled.store(true, Ordering::Release);
-                    let cancellation_decision =
-                        evaluation_execution_domain::reduce_cancelled_gate(manifest, &steps)
-                            .map_err(Status::data_loss)?;
-                    let cancellation_event = evaluation_gate_event(
-                        &index.operation_id,
-                        parent_event_id,
-                        &cancellation_decision,
-                        chrono::Utc::now().timestamp_millis(),
-                    )?;
-                    db.append_operation_receipt_event(&index.operation_id, cancellation_event)
-                        .map_err(Status::internal)?
-                        .0
-                }
-            }
-        };
-        evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
-    }
-
     fn resolve_evaluation_plan_internal(
         &self,
         prepared: &evaluation_manifest_domain::PreparedResolutionRequest,
@@ -4647,98 +4210,6 @@ impl ChiseiServiceImpl {
             outcome.manifest = Some(stored);
         }
         Ok(outcome)
-    }
-
-    async fn execute_evaluation_manifest_internal(
-        &self,
-        manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
-        actor: &str,
-        max_total_duration_ms: u64,
-    ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
-        for node in &manifest.nodes {
-            if let Some(definition) = self
-                .db
-                .get_evaluator_definition(&node.evaluator.definition_id)
-                .map_err(Status::internal)?
-            {
-                self.ensure_external_evaluator_registered(&definition);
-            }
-        }
-        let index = self.ensure_evaluation_execution(manifest, actor, max_total_duration_ms)?;
-        let receipt = self
-            .db
-            .get_operation_receipt(&index.operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
-        let frozen_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
-        if frozen_total_duration_ms > max_total_duration_ms {
-            return Err(Status::failed_precondition(
-                "existing evaluation execution budget exceeds the requested bound",
-            ));
-        }
-        let cancelled = {
-            let mut cancellations = self
-                .evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
-            cancellations
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone()
-        };
-        let execution_lock = {
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            locks
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let _guard = execution_lock.lock().await;
-        let worker_db = self.db.clone();
-        let worker_budget = self.budget.clone();
-        let worker_registry = self.evaluator_registry.clone();
-        let worker_stochastic_registry = self.stochastic_evaluator_registry.clone();
-        let stochastic_egress_reasons = self.stochastic_egress_reasons(manifest);
-        let worker_manifest = manifest.clone();
-        let worker_index = index;
-        let projection = tokio::task::spawn_blocking(move || {
-            let engine = evaluation_execution_domain::EvaluationExecutionEngine::new(
-                &worker_registry,
-                &worker_stochastic_registry,
-                &stochastic_egress_reasons,
-                &worker_budget,
-            );
-            Self::run_evaluation_execution(
-                &worker_db,
-                &engine,
-                &worker_manifest,
-                &worker_index,
-                frozen_total_duration_ms,
-                cancelled,
-            )
-        })
-        .await
-        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
-        if projection.decision.is_some() {
-            self.evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
-                .remove(&manifest.manifest_digest);
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            if locks
-                .get(&manifest.manifest_digest)
-                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
-            {
-                locks.remove(&manifest.manifest_digest);
-            }
-        }
-        Ok(projection)
     }
 
     fn pipeline_context_expansion_gate(
@@ -5110,6 +4581,22 @@ impl ChiseiServiceImpl {
         ));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(&db, &policy);
+        let evaluator_registry =
+            Arc::new(evaluation_execution_domain::DeterministicEvaluatorRegistry::default());
+        let stochastic_evaluator_registry = Arc::new(
+            crate::chisei::stochastic_evaluation::production_stochastic_evaluator_registry(
+                config.clone(),
+            )
+            .expect("compiled stochastic evaluator registry must be valid"),
+        );
+        let evaluation_execution_lifecycle =
+            evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
+                db.clone(),
+                budget.clone(),
+                evaluator_registry.clone(),
+                stochastic_evaluator_registry.clone(),
+                crate::chisei::privacy::safe_providers(&config),
+            );
         Self {
             budget,
             policy,
@@ -5120,17 +4607,9 @@ impl ChiseiServiceImpl {
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
-            evaluator_registry: Arc::new(
-                evaluation_execution_domain::DeterministicEvaluatorRegistry::default(),
-            ),
-            stochastic_evaluator_registry: Arc::new(
-                crate::chisei::stochastic_evaluation::production_stochastic_evaluator_registry(
-                    config.clone(),
-                )
-                .expect("compiled stochastic evaluator registry must be valid"),
-            ),
-            evaluation_cancellations: Arc::new(Mutex::new(HashMap::new())),
-            evaluation_execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            evaluator_registry,
+            stochastic_evaluator_registry,
+            evaluation_execution_lifecycle,
             db,
             config,
             provider_registry_state_path,
@@ -10974,7 +10453,8 @@ impl ChiseiService for ChiseiServiceImpl {
             .filter(|manifest| manifest.namespace == request.namespace)
             .ok_or_else(|| Status::not_found("evaluation manifest not found"))?;
         let projection = self
-            .execute_evaluation_manifest_internal(&manifest, &actor, request.max_total_duration_ms)
+            .evaluation_execution_lifecycle
+            .execute(&manifest, &actor, request.max_total_duration_ms)
             .await?;
         Ok(Response::new(ExecuteEvaluationManifestResponse {
             execution: Some(to_proto_evaluation_execution_projection(&projection)),
@@ -11010,79 +10490,10 @@ impl ChiseiService for ChiseiServiceImpl {
             .map_err(Status::internal)?
             .filter(|index| index.namespace == validated.namespace)
             .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
-        let cancelled = {
-            let mut cancellations = self
-                .evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?;
-            let cancelled = cancellations
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                .clone();
-            cancelled.store(true, Ordering::Release);
-            cancelled
-        };
-        let receipt = self
-            .db
-            .get_operation_receipt(&index.operation_id)
-            .map_err(Status::internal)?
-            .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
-        let max_total_duration_ms = evaluation_total_budget_ms(&receipt)?;
-        if receipt.completed_at_ms.is_none() && !evaluation_cancellation_requested(&receipt) {
-            self.request_evaluation_cancellation(&index, &receipt, &actor)?;
-        }
-        let execution_lock = {
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            locks
-                .entry(manifest.manifest_digest.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let _guard = execution_lock.lock().await;
-        let worker_db = self.db.clone();
-        let worker_budget = self.budget.clone();
-        let worker_registry = self.evaluator_registry.clone();
-        let worker_stochastic_registry = self.stochastic_evaluator_registry.clone();
-        let stochastic_egress_reasons = BTreeMap::new();
-        let worker_manifest = manifest.clone();
-        let worker_index = index.clone();
-        let projection = tokio::task::spawn_blocking(move || {
-            let engine = evaluation_execution_domain::EvaluationExecutionEngine::new(
-                &worker_registry,
-                &worker_stochastic_registry,
-                &stochastic_egress_reasons,
-                &worker_budget,
-            );
-            Self::run_evaluation_execution(
-                &worker_db,
-                &engine,
-                &worker_manifest,
-                &worker_index,
-                max_total_duration_ms,
-                cancelled,
-            )
-        })
-        .await
-        .map_err(|error| Status::internal(format!("evaluation worker failed: {error}")))??;
-        if projection.decision.is_some() {
-            self.evaluation_cancellations
-                .lock()
-                .map_err(|_| Status::internal("evaluation cancellation lock poisoned"))?
-                .remove(&manifest.manifest_digest);
-            let mut locks = self
-                .evaluation_execution_locks
-                .lock()
-                .map_err(|_| Status::internal("evaluation execution lock poisoned"))?;
-            if locks
-                .get(&manifest.manifest_digest)
-                .is_some_and(|lock| Arc::ptr_eq(lock, &execution_lock))
-            {
-                locks.remove(&manifest.manifest_digest);
-            }
-        }
+        let projection = self
+            .evaluation_execution_lifecycle
+            .cancel(&manifest, &index, &actor)
+            .await?;
         Ok(Response::new(CancelEvaluationExecutionResponse {
             execution: Some(to_proto_evaluation_execution_projection(&projection)),
         }))
@@ -12289,7 +11700,8 @@ mod tests {
             2,
         );
         assert_eq!(
-            svc.stochastic_egress_reasons(&denied)
+            svc.evaluation_execution_lifecycle
+                .stochastic_egress_reasons_for_test(&denied)
                 .get("model-review")
                 .map(String::as_str),
             Some(evaluation_execution_domain::REASON_STOCHASTIC_EGRESS_DENIED)
@@ -12304,7 +11716,7 @@ mod tests {
             u32::MAX,
         );
         assert_eq!(
-            ChiseiServiceImpl::stochastic_budget_reason(
+            evaluation_execution_lifecycle::EvaluationExecutionLifecycle::stochastic_budget_reason(
                 &allowed.budget,
                 &unbudgetable,
                 &unbudgetable.nodes[0],
@@ -14253,7 +13665,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let index = svc
-            .ensure_evaluation_execution(&manifest, "starter", 1_000)
+            .evaluation_execution_lifecycle
+            .ensure_execution_for_test(&manifest, "starter", 1_000)
             .unwrap();
         let stale_receipt = svc
             .db
@@ -14261,9 +13674,11 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        svc.request_evaluation_cancellation(&index, &stale_receipt, "first-writer")
+        svc.evaluation_execution_lifecycle
+            .request_cancellation_for_test(&index, &stale_receipt, "first-writer")
             .unwrap();
-        svc.request_evaluation_cancellation(&index, &stale_receipt, "second-writer")
+        svc.evaluation_execution_lifecycle
+            .request_cancellation_for_test(&index, &stale_receipt, "second-writer")
             .unwrap();
 
         let receipt = svc
