@@ -3,12 +3,17 @@
   "classes": [
     {
       "name": "ActionApprovalLifecycleModule",
-      "description": "Sekai-owned deep module that loads pending governed action approvals, re-resolves live policy and resource limits, orders held-effect preparation and execution, meters committed effects, resolves competing parked work, and commits terminal approval decisions.",
+      "description": "Sekai-owned module that loads pending governed action approvals, re-resolves live policy and resource limits, meters committed effects, resolves competing parked work, and commits terminal approval decisions.",
+      "superclasses": []
+    },
+    {
+      "name": "ActionApprovalExecutionModule",
+      "description": "Deep module exposing one approval execution interface while owning live action resolution, marking and purpose reauthorization, parked-work validation, held-effect execution, and terminal lifecycle ordering.",
       "superclasses": []
     },
     {
       "name": "SekaiGrpcTransportAdapter",
-      "description": "gRPC adapter that authenticates and authorizes approval callers, maps protocol values and errors, and supplies marking, purpose, effect-execution, and receipt-projection adapters to Sekai lifecycle modules.",
+      "description": "gRPC adapter that authenticates and authorizes approval callers, invokes the action approval execution module, maps protocol values and errors, and projects the post-commit catalog receipt.",
       "superclasses": []
     },
     {
@@ -19,8 +24,20 @@
   ],
   "relations": [
     {
+      "name": "invokes_action_approval_execution",
+      "description": "The gRPC transport invokes one approval execution interface after caller authorization.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ActionApprovalExecutionModule"
+    },
+    {
+      "name": "orders_action_approval_lifecycle",
+      "description": "The action approval execution module supplies concrete reauthorization and held-effect behavior to the durable lifecycle ordering.",
+      "domain": "ActionApprovalExecutionModule",
+      "range": "ActionApprovalLifecycleModule"
+    },
+    {
       "name": "delegates_action_approval_lifecycle_to",
-      "description": "The gRPC transport delegates approval state, live policy and limit checks, held-effect ordering, metering, competing parked-work resolution, and terminal transitions to the action approval lifecycle module.",
+      "description": "The gRPC transport delegates approval loading and denial transitions directly to the action approval lifecycle module.",
       "domain": "SekaiGrpcTransportAdapter",
       "range": "ActionApprovalLifecycleModule"
     },
@@ -32,6 +49,24 @@
     }
   ],
   "provenance": [
+    {
+      "subject": "ActionApprovalExecutionModule",
+      "source": "src/grpc/action_approval_execution.rs",
+      "locator": "ActionApprovalExecution::approve",
+      "confidence": 1.0
+    },
+    {
+      "subject": "invokes_action_approval_execution",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiServiceImpl::approve_action",
+      "confidence": 1.0
+    },
+    {
+      "subject": "orders_action_approval_lifecycle",
+      "source": "src/grpc/action_approval_execution.rs",
+      "locator": "ActionApprovalExecution::approve",
+      "confidence": 1.0
+    },
     {
       "subject": "ActionApprovalLifecycleModule",
       "source": "src/sekai/action_approval_lifecycle.rs",
@@ -53,7 +88,7 @@
     {
       "subject": "delegates_action_approval_lifecycle_to",
       "source": "src/grpc/sekai_service.rs",
-      "locator": "approve_action/deny_action lifecycle calls",
+      "locator": "approve_action load and deny_action lifecycle calls",
       "confidence": 1.0
     },
     {
