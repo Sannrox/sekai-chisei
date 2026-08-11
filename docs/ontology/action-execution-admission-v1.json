@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "ActionExecutionAdmissionModule",
+      "description": "Deep private Sekai module whose interface concentrates live Action target resolution, authorization, classification, purpose, namespace, schema, and governed policy admission before any dry-run, approval, denial, limit check, or effect execution.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates callers, correlates capability-catalog invocations, maps protocol messages and response metadata, and delegates pre-effect Action admission.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedActionLifecycleModule",
+      "description": "Sekai-owned module that resolves action policy, coordinates budget and blast-radius limits, binds policy attestations, commits generic approval transitions, and owns execution outcome and limit-denial audit ordering with post-effect metering.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_action_execution_admission_to",
+      "description": "The gRPC transport delegates ordered pre-effect Action admission after authenticating the caller and resolving catalog correlation.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "ActionExecutionAdmissionModule"
+    },
+    {
+      "name": "freezes_governed_action_context_from",
+      "description": "Action execution admission resolves and freezes the governed Action lifecycle context used by subsequent policy, approval, limit, audit, and metering behavior.",
+      "domain": "ActionExecutionAdmissionModule",
+      "range": "GovernedActionLifecycleModule"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "ActionExecutionAdmissionModule",
+      "source": "src/grpc/action_execution.rs",
+      "locator": "ActionExecutionAdmission/admit",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiService::execute_action",
+      "confidence": 1.0
+    },
+    {
+      "subject": "GovernedActionLifecycleModule",
+      "source": "src/sekai/action_lifecycle.rs",
+      "locator": "GovernedActionContext",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_action_execution_admission_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "ActionExecutionAdmission::admit call",
+      "confidence": 1.0
+    },
+    {
+      "subject": "freezes_governed_action_context_from",
+      "source": "src/grpc/action_execution.rs",
+      "locator": "GovernedActionContext::resolve call",
+      "confidence": 1.0
+    }
+  ]
+}
