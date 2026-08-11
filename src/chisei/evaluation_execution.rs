@@ -7,13 +7,15 @@
 //! engine itself receives no ambient provider, persistence, filesystem, or
 //! action capability.
 
+use crate::chisei::budget::BudgetTracker;
 use crate::chisei::evaluation_manifest::{
     ResolvedEvaluationManifest, ResolvedEvaluationNode, ResolvedInvariantBinding,
 };
 #[cfg(test)]
 use crate::chisei::evaluation_plan::validate_adapter_endpoint;
 use crate::chisei::evaluation_plan::{
-    EvaluatorResourceLimits, FIXED_REDUCER, NODE_REQUIRED, StochasticEvaluatorPolicy,
+    EXTERNAL_ADAPTER_EXECUTION_CLASS, EvaluatorDefinition, EvaluatorResourceLimits, FIXED_REDUCER,
+    NODE_REQUIRED, STOCHASTIC_EXECUTION_CLASS, StochasticEvaluatorPolicy,
     validate_runtime_adapter_endpoint,
 };
 use base64::Engine as _;
@@ -1017,6 +1019,205 @@ pub struct EvaluationExecutionIndex {
 pub struct NodeExecution {
     pub receipt: EvaluationStepReceipt,
     pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluationExecutionError {
+    Internal(String),
+}
+
+impl std::fmt::Display for EvaluationExecutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self::Internal(message) = self;
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for EvaluationExecutionError {}
+
+/// The deep execution module for one resolved node. It owns evaluator
+/// selection, dependency and cancellation semantics, stochastic egress and
+/// budget admission, and the exact evaluator invocation. Callers only provide
+/// durable inputs and persist the returned receipt.
+pub struct EvaluationExecutionEngine<'a> {
+    deterministic_registry: &'a DeterministicEvaluatorRegistry,
+    stochastic_registry: &'a StochasticEvaluatorRegistry,
+    stochastic_egress_reasons: &'a BTreeMap<String, String>,
+    budget: &'a BudgetTracker,
+}
+
+pub struct EvaluationNodeExecution<'a> {
+    pub manifest: &'a ResolvedEvaluationManifest,
+    pub node: &'a ResolvedEvaluationNode,
+    pub input: DeterministicEvaluatorInput,
+    pub evidence_available: bool,
+    pub prior_steps: &'a BTreeMap<String, EvaluationStepReceipt>,
+    pub definition: Option<&'a EvaluatorDefinition>,
+    pub remaining: Duration,
+    pub cancelled: Arc<AtomicBool>,
+}
+
+impl<'a> EvaluationExecutionEngine<'a> {
+    pub fn new(
+        deterministic_registry: &'a DeterministicEvaluatorRegistry,
+        stochastic_registry: &'a StochasticEvaluatorRegistry,
+        stochastic_egress_reasons: &'a BTreeMap<String, String>,
+        budget: &'a BudgetTracker,
+    ) -> Self {
+        Self {
+            deterministic_registry,
+            stochastic_registry,
+            stochastic_egress_reasons,
+            budget,
+        }
+    }
+
+    pub fn metric_labels(
+        &self,
+        manifest: &ResolvedEvaluationManifest,
+        node: &ResolvedEvaluationNode,
+    ) -> (&'static str, &'static str) {
+        if node.evaluator.stochastic_policy.is_some() {
+            self.stochastic_registry
+                .metric_labels(&node.evaluator.implementation_digest)
+        } else {
+            self.deterministic_registry.metric_labels_for_namespace(
+                &manifest.namespace,
+                &node.evaluator.definition_digest,
+                &node.evaluator.implementation_digest,
+            )
+        }
+    }
+
+    pub fn execute_node(
+        &self,
+        execution: EvaluationNodeExecution<'_>,
+    ) -> Result<NodeExecution, EvaluationExecutionError> {
+        let EvaluationNodeExecution {
+            manifest,
+            node,
+            input,
+            evidence_available,
+            prior_steps,
+            definition,
+            remaining,
+            cancelled,
+        } = execution;
+        if cancelled.load(Ordering::Acquire) {
+            return make_nonexecuted_node(
+                manifest,
+                node,
+                &input,
+                STATUS_SKIPPED,
+                REASON_EXECUTION_CANCELLED,
+            )
+            .map_err(EvaluationExecutionError::Internal);
+        }
+        if let Some((status, reason)) = dependency_blocking_status(node, prior_steps) {
+            return make_nonexecuted_node(manifest, node, &input, status, reason)
+                .map_err(EvaluationExecutionError::Internal);
+        }
+        if !evidence_available {
+            return make_nonexecuted_node(
+                manifest,
+                node,
+                &input,
+                STATUS_UNKNOWN,
+                REASON_EVIDENCE_UNAVAILABLE,
+            )
+            .map_err(EvaluationExecutionError::Internal);
+        }
+        let Some(definition) = definition else {
+            return make_nonexecuted_node(
+                manifest,
+                node,
+                &input,
+                STATUS_UNAVAILABLE,
+                REASON_EVALUATOR_UNAVAILABLE,
+            )
+            .map_err(EvaluationExecutionError::Internal);
+        };
+        if definition.execution_class == EXTERNAL_ADAPTER_EXECUTION_CLASS
+            && !self.deterministic_registry.contains_external_adapter(
+                &definition.namespace,
+                &definition.content_digest,
+                &definition.implementation_digest,
+            )
+        {
+            return make_nonexecuted_node(
+                manifest,
+                node,
+                &input,
+                STATUS_UNAVAILABLE,
+                REASON_EVALUATOR_UNAVAILABLE,
+            )
+            .map_err(EvaluationExecutionError::Internal);
+        }
+        if definition.execution_class != STOCHASTIC_EXECUTION_CLASS {
+            return execute_registered_node(
+                self.deterministic_registry,
+                manifest,
+                node,
+                input,
+                &definition.resource_limits,
+                remaining,
+                cancelled,
+            )
+            .map_err(EvaluationExecutionError::Internal);
+        }
+        if let Some(reason) = self.stochastic_egress_reasons.get(&node.node_id) {
+            return make_nonexecuted_node(manifest, node, &input, STATUS_UNAVAILABLE, reason)
+                .map_err(EvaluationExecutionError::Internal);
+        }
+        if self
+            .stochastic_registry
+            .contains(&definition.implementation_digest)
+        {
+            let Some(policy) = node.evaluator.stochastic_policy.as_ref() else {
+                return make_nonexecuted_node(
+                    manifest,
+                    node,
+                    &input,
+                    STATUS_UNAVAILABLE,
+                    REASON_EVALUATOR_UNAVAILABLE,
+                )
+                .map_err(EvaluationExecutionError::Internal);
+            };
+            let amount = i32::try_from(policy.max_total_tokens).ok();
+            let scope = format!(
+                "project:{}/stochastic-evaluation:{}",
+                manifest.namespace, node.node_id
+            );
+            let idempotency_key = format!(
+                "stochastic-evaluation-reserve:{}:{}",
+                manifest.manifest_digest, node.node_id
+            );
+            if amount.is_none_or(|amount| {
+                self.budget
+                    .check_and_reserve_idempotent(&scope, amount, &idempotency_key)
+                    .is_err()
+            }) {
+                return make_nonexecuted_node(
+                    manifest,
+                    node,
+                    &input,
+                    STATUS_UNAVAILABLE,
+                    REASON_STOCHASTIC_TOKEN_BUDGET,
+                )
+                .map_err(EvaluationExecutionError::Internal);
+            }
+        }
+        execute_stochastic_node(
+            self.stochastic_registry,
+            manifest,
+            node,
+            input,
+            &definition.resource_limits,
+            remaining,
+            cancelled,
+        )
+        .map_err(EvaluationExecutionError::Internal)
+    }
 }
 
 pub fn prepare_execution_request(

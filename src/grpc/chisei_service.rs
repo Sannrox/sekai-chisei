@@ -86,13 +86,6 @@ struct BoundGunshiAllocation {
     plan: crate::chisei::gunshi::AllocationPlan,
 }
 
-struct EvaluationExecutionRuntime<'a> {
-    deterministic_registry: &'a evaluation_execution_domain::DeterministicEvaluatorRegistry,
-    stochastic_registry: &'a evaluation_execution_domain::StochasticEvaluatorRegistry,
-    stochastic_egress_reasons: &'a BTreeMap<String, String>,
-    budget: &'a BudgetTracker,
-}
-
 const MAX_CACHED_EXECUTION_PLANS: usize = 128;
 const MAX_CACHED_EXECUTION_PLAN_AGE_MS: i64 = 15 * 60 * 1000;
 const POLICY_KIND: &str = "policy";
@@ -4338,6 +4331,7 @@ impl ChiseiServiceImpl {
         reasons
     }
 
+    #[cfg(test)]
     fn stochastic_budget_reason(
         budget: &BudgetTracker,
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
@@ -4363,7 +4357,7 @@ impl ChiseiServiceImpl {
 
     fn run_evaluation_execution(
         db: &RuntimeDb,
-        runtime: EvaluationExecutionRuntime<'_>,
+        engine: &evaluation_execution_domain::EvaluationExecutionEngine<'_>,
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
         index: &evaluation_execution_domain::EvaluationExecutionIndex,
         max_total_duration_ms: u64,
@@ -4413,40 +4407,10 @@ impl ChiseiServiceImpl {
                 Err(_) => Self::unavailable_evaluation_node_evidence(manifest, node)
                     .map_err(Status::data_loss)?,
             };
-            let input = evaluation_execution_domain::build_evaluator_input(
-                manifest,
-                node,
-                evaluator_evidence,
-                &prior_steps,
-            )
-            .map_err(Status::data_loss)?;
-            let mut execution = if cancelled.load(Ordering::Acquire) {
-                evaluation_execution_domain::make_nonexecuted_node(
-                    manifest,
-                    node,
-                    &input,
-                    evaluation_execution_domain::STATUS_SKIPPED,
-                    evaluation_execution_domain::REASON_EXECUTION_CANCELLED,
-                )
-            } else if let Some((status, reason)) =
-                evaluation_execution_domain::dependency_blocking_status(node, &prior_steps)
-            {
-                evaluation_execution_domain::make_nonexecuted_node(
-                    manifest, node, &input, status, reason,
-                )
-            } else if evidence.is_err() {
-                evaluation_execution_domain::make_nonexecuted_node(
-                    manifest,
-                    node,
-                    &input,
-                    evaluation_execution_domain::STATUS_UNKNOWN,
-                    evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE,
-                )
-            } else {
-                let definition = db
-                    .get_evaluator_definition(&node.evaluator.definition_id)
-                    .map_err(Status::internal)?;
-                let definition = definition.and_then(|definition| {
+            let definition = db
+                .get_evaluator_definition(&node.evaluator.definition_id)
+                .map_err(Status::internal)?
+                .and_then(|definition| {
                     let canonical = evaluation_plan_domain::prepare_definition(
                         definition.clone(),
                         &definition.created_by,
@@ -4459,92 +4423,32 @@ impl ChiseiServiceImpl {
                         && definition.stochastic_policy == node.evaluator.stochastic_policy)
                         .then_some(definition)
                 });
-                if let Some(definition) = definition {
-                    let remaining = total_budget
-                        .saturating_sub(elapsed_before_invocation)
-                        .saturating_sub(invocation_started.elapsed());
-                    if definition.execution_class
-                        == evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
-                        && !runtime.deterministic_registry.contains_external_adapter(
-                            &definition.namespace,
-                            &definition.content_digest,
-                            &definition.implementation_digest,
-                        )
-                    {
-                        evaluation_execution_domain::make_nonexecuted_node(
-                            manifest,
-                            node,
-                            &input,
-                            evaluation_execution_domain::STATUS_UNAVAILABLE,
-                            evaluation_execution_domain::REASON_EVALUATOR_UNAVAILABLE,
-                        )
-                    } else if definition.execution_class
-                        == evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
-                    {
-                        if let Some(reason) = runtime.stochastic_egress_reasons.get(&node.node_id) {
-                            evaluation_execution_domain::make_nonexecuted_node(
-                                manifest,
-                                node,
-                                &input,
-                                evaluation_execution_domain::STATUS_UNAVAILABLE,
-                                reason,
-                            )
-                        } else if !runtime
-                            .stochastic_registry
-                            .contains(&definition.implementation_digest)
-                        {
-                            evaluation_execution_domain::execute_stochastic_node(
-                                runtime.stochastic_registry,
-                                manifest,
-                                node,
-                                input.clone(),
-                                &definition.resource_limits,
-                                remaining,
-                                cancelled.clone(),
-                            )
-                        } else if let Some(reason) =
-                            Self::stochastic_budget_reason(runtime.budget, manifest, node)
-                        {
-                            evaluation_execution_domain::make_nonexecuted_node(
-                                manifest,
-                                node,
-                                &input,
-                                evaluation_execution_domain::STATUS_UNAVAILABLE,
-                                &reason,
-                            )
-                        } else {
-                            evaluation_execution_domain::execute_stochastic_node(
-                                runtime.stochastic_registry,
-                                manifest,
-                                node,
-                                input.clone(),
-                                &definition.resource_limits,
-                                remaining,
-                                cancelled.clone(),
-                            )
-                        }
-                    } else {
-                        evaluation_execution_domain::execute_registered_node(
-                            runtime.deterministic_registry,
-                            manifest,
-                            node,
-                            input.clone(),
-                            &definition.resource_limits,
-                            remaining,
-                            cancelled.clone(),
-                        )
+            let remaining = total_budget
+                .saturating_sub(elapsed_before_invocation)
+                .saturating_sub(invocation_started.elapsed());
+            let input = evaluation_execution_domain::build_evaluator_input(
+                manifest,
+                node,
+                evaluator_evidence,
+                &prior_steps,
+            )
+            .map_err(Status::data_loss)?;
+            let mut execution = engine
+                .execute_node(evaluation_execution_domain::EvaluationNodeExecution {
+                    manifest,
+                    node,
+                    input: input.clone(),
+                    evidence_available: evidence.is_ok(),
+                    prior_steps: &prior_steps,
+                    definition: definition.as_ref(),
+                    remaining,
+                    cancelled: cancelled.clone(),
+                })
+                .map_err(|error| match error {
+                    evaluation_execution_domain::EvaluationExecutionError::Internal(message) => {
+                        Status::internal(message)
                     }
-                } else {
-                    evaluation_execution_domain::make_nonexecuted_node(
-                        manifest,
-                        node,
-                        &input,
-                        evaluation_execution_domain::STATUS_UNAVAILABLE,
-                        evaluation_execution_domain::REASON_EVALUATOR_UNAVAILABLE,
-                    )
-                }
-            }
-            .map_err(Status::internal)?;
+                })?;
             if db
                 .get_operation_receipt(&index.operation_id)
                 .map_err(Status::internal)?
@@ -4625,18 +4529,7 @@ impl ChiseiServiceImpl {
                     .iter()
                     .find(|step| step.node_id == node.node_id)
                     .ok_or_else(|| Status::data_loss("durable evaluation step is missing"))?;
-                let (metrics_evaluator, metrics_version) =
-                    if node.evaluator.stochastic_policy.is_some() {
-                        runtime
-                            .stochastic_registry
-                            .metric_labels(&node.evaluator.implementation_digest)
-                    } else {
-                        runtime.deterministic_registry.metric_labels_for_namespace(
-                            &manifest.namespace,
-                            &node.evaluator.definition_digest,
-                            &node.evaluator.implementation_digest,
-                        )
-                    };
+                let (metrics_evaluator, metrics_version) = engine.metric_labels(manifest, node);
                 crate::obs::signals::record_evaluation_step(
                     metrics_evaluator,
                     metrics_version,
@@ -4801,14 +4694,15 @@ impl ChiseiServiceImpl {
         let worker_manifest = manifest.clone();
         let worker_index = index;
         let projection = tokio::task::spawn_blocking(move || {
+            let engine = evaluation_execution_domain::EvaluationExecutionEngine::new(
+                &worker_registry,
+                &worker_stochastic_registry,
+                &stochastic_egress_reasons,
+                &worker_budget,
+            );
             Self::run_evaluation_execution(
                 &worker_db,
-                EvaluationExecutionRuntime {
-                    deterministic_registry: &worker_registry,
-                    stochastic_registry: &worker_stochastic_registry,
-                    stochastic_egress_reasons: &stochastic_egress_reasons,
-                    budget: &worker_budget,
-                },
+                &engine,
                 &worker_manifest,
                 &worker_index,
                 frozen_total_duration_ms,
@@ -12075,14 +11969,15 @@ impl ChiseiService for ChiseiServiceImpl {
         let worker_manifest = manifest.clone();
         let worker_index = index.clone();
         let projection = tokio::task::spawn_blocking(move || {
+            let engine = evaluation_execution_domain::EvaluationExecutionEngine::new(
+                &worker_registry,
+                &worker_stochastic_registry,
+                &stochastic_egress_reasons,
+                &worker_budget,
+            );
             Self::run_evaluation_execution(
                 &worker_db,
-                EvaluationExecutionRuntime {
-                    deterministic_registry: &worker_registry,
-                    stochastic_registry: &worker_stochastic_registry,
-                    stochastic_egress_reasons: &stochastic_egress_reasons,
-                    budget: &worker_budget,
-                },
+                &engine,
                 &worker_manifest,
                 &worker_index,
                 max_total_duration_ms,

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "DeterministicEvaluationExecution",
+      "description": "Deep Chisei module for the established chisei.deterministic-evaluation-executor/v1 manifest execution protocol. Its engine owns dependency and cancellation semantics, exact deterministic, external, or bounded stochastic evaluator selection, stochastic egress and budget admission, and node invocation while canonical operation-receipt events remain the durable authority.",
+      "superclasses": []
+    }
+  ],
+  "relations": [],
+  "provenance": [
+    {
+      "subject": "DeterministicEvaluationExecution",
+      "source": "src/chisei/evaluation_execution.rs",
+      "locator": "EvaluationExecutionEngine/execute_node",
+      "confidence": 1.0
+    },
+    {
+      "subject": "DeterministicEvaluationExecution",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "run_evaluation_execution EvaluationExecutionEngine call",
+      "confidence": 1.0
+    }
+  ]
+}
