@@ -1,5 +1,16 @@
 # Domain context
 
+## Object mutation
+
+The **Object mutation lifecycle** creates, updates, and deletes Objects through
+one private ordered path. It owns tenant and namespace admission, optional
+generation-fenced lease validation and replay, marking and schema enforcement,
+direct or guarded persistence, principal-profile grants, and response
+resolution.
+
+The gRPC adapter owns protocol request and response translation. The lifecycle
+selects the direct or guarded persistence adapter behind its private interface.
+
 ## Handoff
 
 A **Handoff** is a versioned, immutable manifest that transfers bounded context

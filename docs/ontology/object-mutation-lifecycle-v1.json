@@ -3,12 +3,12 @@
   "classes": [
     {
       "name": "ObjectMutationLifecycleModule",
-      "description": "Private Sekai-owned module whose small interface concentrates direct and generation-fenced object create, update, delete, and replay persistence behind one guarded-or-direct seam.",
+      "description": "Private Sekai-owned module whose create, update, and delete interface concentrates tenant, namespace, lease, marking, schema, replay, direct or guarded persistence, principal-profile grant, and response-resolution ordering.",
       "superclasses": []
     },
     {
       "name": "SekaiGrpcTransportAdapter",
-      "description": "gRPC adapter that authenticates callers, enforces tenant, namespace, marking, schema, and object admission, and maps protocol messages and errors around Sekai domain modules.",
+      "description": "gRPC adapter that translates protocol requests and responses around Sekai domain modules.",
       "superclasses": []
     },
     {
@@ -25,7 +25,7 @@
   "relations": [
     {
       "name": "delegates_object_mutation_to",
-      "description": "The gRPC transport delegates admitted create, update, and delete persistence through the object mutation lifecycle module instead of maintaining parallel guarded and direct paths.",
+      "description": "The gRPC transport delegates create, update, and delete admission and persistence ordering through the object mutation lifecycle module.",
       "domain": "SekaiGrpcTransportAdapter",
       "range": "ObjectMutationLifecycleModule"
     },
@@ -45,8 +45,8 @@
   "provenance": [
     {
       "subject": "ObjectMutationLifecycleModule",
-      "source": "src/sekai/object_mutation.rs",
-      "locator": "ObjectMutation",
+      "source": "src/grpc/object_mutation_lifecycle.rs",
+      "locator": "SekaiServiceImpl guarded_create_object/guarded_update_object/guarded_delete_object",
       "confidence": 1.0
     },
     {
@@ -70,7 +70,7 @@
     {
       "subject": "delegates_object_mutation_to",
       "source": "src/grpc/sekai_service.rs",
-      "locator": "guarded_create_object/guarded_update_object/guarded_delete_object mutation call sites",
+      "locator": "SekaiServiceImpl create_object/update_object/delete_object",
       "confidence": 1.0
     },
     {
