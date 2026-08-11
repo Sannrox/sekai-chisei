@@ -1,5 +1,16 @@
 # Domain context
 
+## Ontology definition
+
+The **Ontology definition lifecycle** creates and deletes runtime classes and
+relations through one private ordered path. It owns reference visibility,
+mapped schema-kind ensure, deterministic definition validation, audited
+persistence, and durable plus cached grant cleanup.
+
+The gRPC adapter owns caller authentication and protocol translation. Portable
+ontology import/export remains separate. Relation cardinality remains advisory,
+and ontology entailment remains bounded at query time.
+
 ## Semantic retrieval
 
 The **Semantic retrieval lifecycle** produces one authorization-filtered,

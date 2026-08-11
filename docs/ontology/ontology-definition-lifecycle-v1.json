@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "OntologyDefinitionLifecycle",
+      "description": "Deep private Sekai module that owns runtime ontology reference visibility, mapped schema-kind ensure, deterministic validation, audited persistence, and grant-cache cleanup.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiOntologyGrpcAdapter",
+      "description": "gRPC adapter that authenticates callers, translates runtime ontology class and relation messages, and delegates definition mutations.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_ontology_definition_to",
+      "description": "The authenticated runtime ontology gRPC adapter delegates class and relation mutations to the Ontology definition lifecycle.",
+      "domain": "SekaiOntologyGrpcAdapter",
+      "range": "OntologyDefinitionLifecycle"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "OntologyDefinitionLifecycle",
+      "source": "src/grpc/ontology_definition_lifecycle.rs",
+      "locator": "SekaiServiceImpl definition lifecycle methods",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiOntologyGrpcAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "ontology class and relation RPC methods",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_ontology_definition_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "create/delete ontology class/relation",
+      "confidence": 1.0
+    }
+  ]
+}
