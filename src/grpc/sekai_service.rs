@@ -49,12 +49,14 @@ use crate::sekai::action_work_lifecycle::{
 use crate::sekai::attestation;
 use crate::sekai::capability;
 use crate::sekai::evidence as evidence_domain;
-use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
+use crate::sekai::evidence_admission_lifecycle::{
+    EvidenceAdmissionLifecycle, EvidenceAdmissionLifecycleError, EvidenceAdmissionOutcome,
+};
 #[cfg(test)]
 use crate::sekai::evidence_store::EvidenceProducerCapability as DomainEvidenceProducerCapability;
 use crate::sekai::evidence_store::{
-    EvidenceAdmission, EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition,
-    EvidenceSubmissionFilter, EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
+    EvidenceSchemaDefinition as DomainEvidenceSchemaDefinition, EvidenceSubmissionFilter,
+    EvidenceSubmissionRecord as DomainEvidenceSubmissionRecord,
 };
 use crate::sekai::governed_facts as governed_fact_domain;
 use crate::sekai::handoff as handoff_domain;
@@ -664,62 +666,6 @@ impl SekaiServiceImpl {
                 )))
             }
         }
-    }
-    fn admit_and_project_evidence(
-        &self,
-        envelope: &evidence_domain::EvidenceEnvelope,
-        producer: &str,
-        now_ms: i64,
-    ) -> Result<EvidenceSubmissionResult, Status> {
-        let mut admission = self
-            .db
-            .submit_evidence(envelope, producer, now_ms)
-            .map_err(|_| Status::internal("evidence admission failed"))?;
-        if admission.accepted
-            && admission.submission.evidence_type
-                == crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE
-        {
-            if let Err(error) = self
-                .db
-                .validate_execution_evidence_envelope(envelope, producer)
-            {
-                admission = self
-                    .db
-                    .reject_evidence_submission(
-                        &admission.submission.id,
-                        now_ms,
-                        "invalid_execution_evidence",
-                        &error,
-                    )
-                    .map_err(|_| Status::internal("evidence rejection failed"))?;
-            }
-        }
-        let projection = if admission.accepted {
-            Some(
-                self.db
-                    .project_evidence_submission(&admission.submission.id, now_ms)
-                    .map_err(|_| Status::internal("evidence projection failed"))?,
-            )
-        } else {
-            None
-        };
-        if let Some(object_id) = projection
-            .as_ref()
-            .and_then(|projection| projection.evidence_object_id.as_deref())
-        {
-            for grant in self.db.list_grants(object_id).map_err(Status::internal)? {
-                self.security.add_grant(&grant);
-            }
-        }
-        if admission.accepted
-            && admission.submission.evidence_type
-                == crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE
-        {
-            self.db
-                .record_execution_evidence(&admission.submission.id)
-                .map_err(Status::failed_precondition)?;
-        }
-        evidence_submission_result(&self.db, admission, projection)
     }
 }
 
@@ -1396,21 +1342,35 @@ fn to_proto_epistemic_descriptor(descriptor: &DomainEpistemicDescriptor) -> Epis
     }
 }
 
-fn evidence_submission_result(
-    db: &RuntimeDb,
-    admission: EvidenceAdmission,
-    projection: Option<EvidenceProjectionOutcome>,
-) -> Result<EvidenceSubmissionResult, Status> {
-    let submission = db
-        .get_evidence_submission(&admission.submission.id)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::internal("evidence submission disappeared"))?;
-    Ok(EvidenceSubmissionResult {
-        submission: Some(to_proto_evidence_submission(&submission)),
-        admitted: admission.accepted,
-        deduplicated: admission.deduplicated,
-        projected: projection.is_some_and(|projection| projection.projected),
-    })
+fn to_proto_evidence_submission_result(
+    outcome: EvidenceAdmissionOutcome,
+) -> EvidenceSubmissionResult {
+    EvidenceSubmissionResult {
+        submission: Some(to_proto_evidence_submission(&outcome.submission)),
+        admitted: outcome.admitted,
+        deduplicated: outcome.deduplicated,
+        projected: outcome
+            .projection
+            .is_some_and(|projection| projection.projected),
+    }
+}
+
+fn map_evidence_admission_lifecycle_error(error: EvidenceAdmissionLifecycleError) -> Status {
+    match error {
+        EvidenceAdmissionLifecycleError::Admission(_) => {
+            Status::internal("evidence admission failed")
+        }
+        EvidenceAdmissionLifecycleError::Rejection(_) => {
+            Status::internal("evidence rejection failed")
+        }
+        EvidenceAdmissionLifecycleError::Projection(_) => {
+            Status::internal("evidence projection failed")
+        }
+        EvidenceAdmissionLifecycleError::ExecutionRecording(error) => {
+            Status::failed_precondition(error)
+        }
+        EvidenceAdmissionLifecycleError::ResultResolution(error) => Status::internal(error),
+    }
 }
 
 fn now_millis() -> i64 {
@@ -8144,10 +8104,20 @@ impl SekaiService for SekaiServiceImpl {
                 "authenticated producer must match envelope attribution",
             ));
         }
-        let result =
-            self.admit_and_project_evidence(&envelope, &envelope.producer_identity, now_millis())?;
+        let result = EvidenceAdmissionLifecycle::new(&self.db)
+            .admit(&envelope, &envelope.producer_identity, now_millis())
+            .map_err(map_evidence_admission_lifecycle_error)?;
+        if let Some(object_id) = result
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.evidence_object_id.as_deref())
+        {
+            for grant in self.db.list_grants(object_id).map_err(Status::internal)? {
+                self.security.add_grant(&grant);
+            }
+        }
         Ok(Response::new(SubmitEvidenceResponse {
-            result: Some(result),
+            result: Some(to_proto_evidence_submission_result(result)),
         }))
     }
 
@@ -16074,6 +16044,27 @@ mod tests {
             intent: "upsert".into(),
             causality: None,
         }
+    }
+
+    #[tokio::test]
+    async fn evidence_admission_lifecycle_projects_and_resolves_domain_outcome() {
+        let svc = configured_evidence_service(true).await;
+        let envelope = from_proto_evidence_envelope(proto_evidence("lifecycle-run", 1)).unwrap();
+
+        let outcome = EvidenceAdmissionLifecycle::new(&svc.db)
+            .admit(&envelope, "producer:checks", now_millis())
+            .unwrap();
+
+        assert!(outcome.admitted);
+        assert!(!outcome.deduplicated);
+        assert!(
+            outcome
+                .projection
+                .as_ref()
+                .is_some_and(|value| value.projected)
+        );
+        assert_eq!(outcome.submission.lifecycle_state.as_str(), "available");
+        assert!(!outcome.execution_recorded);
     }
 
     #[tokio::test]

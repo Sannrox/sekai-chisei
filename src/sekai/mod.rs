@@ -18,6 +18,7 @@ pub mod dataset;
 pub mod deduplication;
 pub mod escalation;
 pub mod evidence;
+pub(crate) mod evidence_admission_lifecycle;
 pub mod evidence_projection;
 pub mod evidence_store;
 pub mod execution_evidence;

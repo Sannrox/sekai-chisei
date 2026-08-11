@@ -13618,12 +13618,10 @@ mod tests {
             intent: EvidenceIntent::Upsert,
             causality: None,
         };
-        let admission = svc
-            .db
-            .submit_evidence(&envelope, &producer_identity, now)
-            .unwrap();
-        svc.db
-            .project_evidence_submission(&admission.submission.id, now)
+        crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(&svc.db)
+            .admit(&envelope, &producer_identity, now)
+            .unwrap()
+            .projection
             .unwrap()
             .evidence_object_id
             .unwrap()
@@ -16132,14 +16130,11 @@ mod tests {
             intent: EvidenceIntent::Upsert,
             causality: None,
         };
-        let admission = svc
-            .db
-            .submit_evidence(&envelope, producer_identity, now)
-            .unwrap();
-        svc.db
-            .project_evidence_submission(&admission.submission.id, now)
-            .unwrap();
-        admission.submission.id
+        crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(&svc.db)
+            .admit(&envelope, producer_identity, now)
+            .unwrap()
+            .submission
+            .id
     }
 
     #[tokio::test]

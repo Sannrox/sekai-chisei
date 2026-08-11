@@ -1,5 +1,17 @@
 # Domain context
 
+## Evidence admission
+
+The **Evidence admission lifecycle** admits externally produced Evidence
+through one private ordered path. It owns durable admission, execution-evidence
+validation and rejection, graph projection, execution recording, and final
+durable-state resolution.
+
+Producer adapters own caller authentication and protocol translation. The gRPC
+adapter also refreshes its process-local grant cache from the lifecycle outcome.
+PostgreSQL community rejection and execution recording remain explicitly
+unsupported rather than implying backend parity.
+
 ## Ontology definition
 
 The **Ontology definition lifecycle** creates and deletes runtime classes and

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "EvidenceAdmissionLifecycle",
+      "description": "Deep private Sekai module that owns durable evidence admission, execution-evidence validation and rejection, graph projection, execution recording, and final durable-state resolution.",
+      "superclasses": []
+    },
+    {
+      "name": "EvidenceProducerAdapter",
+      "description": "Authenticated producer adapter that translates evidence input, delegates durable admission, and projects the domain outcome to its caller.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_evidence_admission_to",
+      "description": "An authenticated Evidence producer adapter delegates ordered durable admission to the Evidence admission lifecycle.",
+      "domain": "EvidenceProducerAdapter",
+      "range": "EvidenceAdmissionLifecycle"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "EvidenceAdmissionLifecycle",
+      "source": "src/sekai/evidence_admission_lifecycle.rs",
+      "locator": "EvidenceAdmissionLifecycle::admit",
+      "confidence": 1.0
+    },
+    {
+      "subject": "EvidenceProducerAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SubmitEvidence RPC",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_evidence_admission_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "EvidenceAdmissionLifecycle invocation",
+      "confidence": 1.0
+    }
+  ]
+}
