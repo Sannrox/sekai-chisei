@@ -27,17 +27,18 @@ runtime claims, acknowledges terminal or parked outcomes, records host claim
 events, projects receipt harvest events, and records audit decisions after
 durable persistence.
 
-## Action execution admission
+## Action execution
 
-**Action execution admission** is the ordered, pre-effect phase of legacy
-governed Action execution. It resolves live targets, enforces target,
-classification, purpose, namespace, and schema constraints, and freezes the
-governed policy context before dry-run, approval, denial, limit checks, or
-effect execution can proceed.
+**Action execution** is the ordered lifecycle for one legacy governed Action.
+It resolves live targets; enforces target, classification, purpose, namespace,
+schema, policy, budget, and blast-radius constraints; and owns dry-run,
+approval hold, denial, effect execution, audit, metering, and Catalog invocation
+receipt completion.
 
 The gRPC adapter owns caller authentication, capability-catalog correlation,
-and protocol response metadata. Admission trusts the authenticated principals,
-not the actor supplied inside the protocol request.
+live capability visibility, and protocol response metadata. Action execution
+trusts the authenticated principals, not the actor supplied inside the protocol
+request.
 
 ## Catalog invocation receipt lifecycle
 

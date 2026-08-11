@@ -5,15 +5,18 @@
 //! classification, purpose, namespace, schema, and policy admission ordering
 //! that every direct Action execution must cross before an effect can run.
 
+use super::catalog_invocation::CatalogInvocation;
 use super::{
     ERASED_NAMESPACE, RequestEnterpriseContext, SekaiServiceImpl, action_policy_namespace,
     check_team_namespace, check_write, enforce_namespace_tenant_context,
     enforce_object_marking_access, ensure_action_schema_kinds_allowed, is_managed_team_principal,
-    record_marking_or_purpose_decision, resolve_principal_authority,
+    now_millis, record_marking_or_purpose_decision, redact_action_evidence, redact_action_outcome,
+    resolve_principal_authority, schema_restricted_action_property,
 };
-use crate::grpc::pb::sekai::ActionRequest;
-use crate::sekai::action_lifecycle::GovernedActionContext;
-use crate::sekai::markings;
+use crate::grpc::pb::sekai::{ActionRequest, ActionResult};
+use crate::sekai::action_lifecycle::{ActionAudit, ActionLimitExceeded, GovernedActionContext};
+use crate::sekai::action_policy::ActionDecision;
+use crate::sekai::{action_lifecycle, markings, security};
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLockReadGuard;
 use tonic::Status;
@@ -27,11 +30,11 @@ pub(super) struct AdmittedAction<'a> {
     pub actions: RwLockReadGuard<'a, crate::sekai::action::ActionExecutor>,
 }
 
-pub(super) struct ActionExecutionAdmission<'a> {
+pub(super) struct ActionExecution<'a> {
     service: &'a SekaiServiceImpl,
 }
 
-impl<'a> ActionExecutionAdmission<'a> {
+impl<'a> ActionExecution<'a> {
     pub(super) fn new(service: &'a SekaiServiceImpl) -> Self {
         Self { service }
     }
@@ -166,6 +169,225 @@ impl<'a> ActionExecutionAdmission<'a> {
         })
     }
 
+    /// Execute one admitted Action through every policy outcome.
+    ///
+    /// The transport adapter has already authenticated the caller and checked
+    /// live catalog visibility. This interface owns dry-run, approval, denial,
+    /// limits, schema validation, effect execution, audit, metering, and
+    /// catalog receipt completion in their required order.
+    pub(super) fn execute(
+        &self,
+        request: ActionRequest,
+        dry_run: bool,
+        admitted: AdmittedAction<'a>,
+        mut receipt: Option<&mut CatalogInvocation<'_>>,
+    ) -> Result<ActionResult, Status> {
+        let AdmittedAction {
+            target_ids,
+            sensitive_params,
+            schema_kinds,
+            actor,
+            lifecycle,
+            actions,
+        } = admitted;
+        let decision = lifecycle.decision;
+        if let Some(receipt) = receipt.as_deref_mut() {
+            receipt.mark_policy_decided(decision.as_str());
+        }
+
+        if dry_run {
+            let planned_ops = actions
+                .planned_ops(&request.action, &request.params)
+                .map_err(Status::invalid_argument)?;
+            let mut evidence = redact_action_evidence(&request.params, &sensitive_params, None);
+            evidence.insert("dry_run".into(), "true".into());
+            lifecycle
+                .record_outcome(
+                    &self.service.db,
+                    self.service.budget.as_deref(),
+                    audit(&actor, &request, &target_ids, evidence),
+                    "execute_action_dry_run",
+                    format!(
+                        "dry-run: {} planned op(s), decision={}",
+                        planned_ops.len(),
+                        decision.as_str()
+                    ),
+                    false,
+                )
+                .map_err(Status::internal)?;
+            finalize_receipt(receipt, decision, "dry_run")?;
+            return Ok(ActionResult {
+                action: request.action,
+                message: format!("dry run: {} planned op(s)", planned_ops.len()),
+                dry_run: true,
+                planned_ops,
+                decision: decision.as_str().into(),
+                approval_id: String::new(),
+            });
+        }
+
+        if decision == ActionDecision::RequireApproval {
+            let approval = action_lifecycle::hold_action(
+                &self.service.db,
+                &lifecycle,
+                &actor,
+                &request.action,
+                request.params.clone(),
+                target_ids.first().map(String::as_str).unwrap_or_default(),
+                redact_action_evidence(&request.params, &sensitive_params, None),
+                now_millis(),
+            )
+            .map_err(Status::internal)?;
+            finalize_receipt(
+                receipt,
+                decision,
+                &format!("approval_required:{}", approval.id),
+            )?;
+            return Ok(ActionResult {
+                action: request.action,
+                message: format!("action held for approval: {}", approval.id),
+                dry_run: false,
+                planned_ops: Vec::new(),
+                decision: decision.as_str().into(),
+                approval_id: approval.id,
+            });
+        }
+
+        if decision == ActionDecision::Deny {
+            finalize_receipt(receipt, decision, "denied")?;
+            lifecycle
+                .record_outcome(
+                    &self.service.db,
+                    self.service.budget.as_deref(),
+                    audit(
+                        &actor,
+                        &request,
+                        &target_ids,
+                        redact_action_evidence(&request.params, &sensitive_params, None),
+                    ),
+                    "action_policy_denied",
+                    format!(
+                        "{} by action policy {}",
+                        decision.as_str(),
+                        lifecycle.policy_scope
+                    ),
+                    false,
+                )
+                .map_err(Status::internal)?;
+            return Err(Status::permission_denied(format!(
+                "action {} denied by policy",
+                request.action
+            )));
+        }
+
+        if let Err(limit) = lifecycle.check_limits_and_record(
+            &self.service.db,
+            self.service.budget.as_deref(),
+            audit(
+                &actor,
+                &request,
+                &target_ids,
+                redact_action_evidence(&request.params, &sensitive_params, None),
+            ),
+        ) {
+            return Err(match limit {
+                ActionLimitExceeded::Internal(error) => Status::internal(error),
+                ActionLimitExceeded::BlastRadius { work_unit, .. } => Status::resource_exhausted(
+                    format!("blast-radius cap exceeded for work unit {work_unit}"),
+                ),
+                ActionLimitExceeded::Budget { subject, .. } => {
+                    if let Some(receipt) = receipt.as_deref_mut() {
+                        receipt.mark_budget_decided("budget_exceeded");
+                    }
+                    Status::resource_exhausted(format!("action budget exhausted for {subject}"))
+                }
+            });
+        }
+        if let Some(receipt) = receipt.as_deref_mut() {
+            receipt.mark_budget_decided(if self.service.budget.is_some() {
+                "allow"
+            } else {
+                "not_configured"
+            });
+        }
+
+        for kind in schema_kinds {
+            self.service.require_schema_kind_loaded(&kind)?;
+        }
+        let schema = self
+            .service
+            .schema
+            .read()
+            .map_err(|_| Status::internal("schema registry unavailable"))?;
+        actions
+            .validate_action_schema(&request.action, &schema)
+            .map_err(Status::invalid_argument)?;
+        let restricted_property =
+            schema_restricted_action_property(&self.service.db, &schema, &request.params);
+        let provisional_grant = (request.action == crate::sekai::learning::RECORD_LEARNING_ACTION)
+            .then(|| security::Grant {
+                id: String::new(),
+                object_id: request.params.get("id").cloned().unwrap_or_default(),
+                principal: actor.clone(),
+                role: security::Role::Admin,
+                created: now_millis(),
+            })
+            .filter(|grant| !grant.object_id.is_empty());
+        if let Some(grant) = &provisional_grant {
+            self.service.security.add_grant(grant);
+        }
+        let message = match actions.execute(
+            &self.service.db,
+            &schema,
+            &request.action,
+            &request.params,
+            &actor,
+        ) {
+            Ok(message) => message,
+            Err(error) => {
+                if let Some(grant) = &provisional_grant {
+                    self.service
+                        .security
+                        .remove_grant(&grant.object_id, &grant.principal);
+                }
+                return Err(Status::invalid_argument(error));
+            }
+        };
+        drop(actions);
+        drop(schema);
+        self.service
+            .refresh_security_after_action(&request.action, &request.params, &actor)?;
+        lifecycle
+            .record_outcome(
+                &self.service.db,
+                self.service.budget.as_deref(),
+                audit(
+                    &actor,
+                    &request,
+                    &target_ids,
+                    redact_action_evidence(&request.params, &sensitive_params, restricted_property),
+                ),
+                "execute_action",
+                redact_action_outcome(
+                    &request.action,
+                    &request.params,
+                    &message,
+                    restricted_property,
+                ),
+                true,
+            )
+            .map_err(Status::internal)?;
+        finalize_receipt(receipt, decision, "succeeded")?;
+        Ok(ActionResult {
+            action: request.action,
+            message,
+            dry_run: false,
+            planned_ops: Vec::new(),
+            decision: decision.as_str().into(),
+            approval_id: String::new(),
+        })
+    }
+
     fn validate_classification(
         &self,
         request: &ActionRequest,
@@ -256,6 +478,33 @@ impl<'a> ActionExecutionAdmission<'a> {
     }
 }
 
+fn audit(
+    actor: &str,
+    request: &ActionRequest,
+    target_ids: &[String],
+    evidence: HashMap<String, String>,
+) -> ActionAudit {
+    ActionAudit {
+        actor: actor.to_string(),
+        attestation_actor: actor.to_string(),
+        action: request.action.clone(),
+        target_id: target_ids.first().cloned().unwrap_or_default(),
+        evidence,
+        timestamp: now_millis(),
+    }
+}
+
+fn finalize_receipt(
+    receipt: Option<&mut CatalogInvocation<'_>>,
+    decision: ActionDecision,
+    outcome: &str,
+) -> Result<(), Status> {
+    receipt
+        .map(|receipt| receipt.finalize(decision.as_str(), outcome))
+        .transpose()
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +556,7 @@ mod tests {
     #[test]
     fn interface_admits_authorized_target_and_binds_authenticated_actor() {
         let service = admitted_service();
-        let admitted = ActionExecutionAdmission::new(&service)
+        let admitted = ActionExecution::new(&service)
             .admit(
                 &set_property_request("ready"),
                 &["alice".into()],
@@ -326,7 +575,7 @@ mod tests {
     #[test]
     fn interface_rejects_ungranted_target_before_policy_resolution() {
         let service = admitted_service();
-        let error = match ActionExecutionAdmission::new(&service).admit(
+        let error = match ActionExecution::new(&service).admit(
             &set_property_request("ready"),
             &["mallory".into()],
             None,
@@ -338,5 +587,31 @@ mod tests {
         };
 
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn interface_executes_admitted_action_and_returns_result() {
+        let service = admitted_service();
+        let request = set_property_request("ready");
+        let execution = ActionExecution::new(&service);
+        let admitted = execution
+            .admit(&request, &["alice".into()], None, "work-1", None)
+            .unwrap();
+
+        let result = execution.execute(request, false, admitted, None).unwrap();
+
+        assert_eq!(result.action, "set_property");
+        assert_eq!(result.decision, "allow");
+        assert_eq!(
+            service
+                .db
+                .get_object("target-1")
+                .unwrap()
+                .unwrap()
+                .properties
+                .get("status")
+                .map(String::as_str),
+            Some("ready")
+        );
     }
 }
