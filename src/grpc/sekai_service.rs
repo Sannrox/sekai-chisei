@@ -2,6 +2,8 @@
 
 #[path = "action_approval_execution.rs"]
 mod action_approval_execution;
+#[path = "action_definition_lifecycle.rs"]
+mod action_definition_lifecycle;
 #[path = "action_execution.rs"]
 mod action_execution;
 #[path = "catalog_invocation.rs"]
@@ -87,6 +89,9 @@ use crate::sekai::{
 };
 use uuid::Uuid;
 
+use self::action_definition_lifecycle::{
+    ActionDefinitionLifecycle, ActionDefinitionLifecycleError,
+};
 use self::catalog_invocation::CatalogInvocation;
 use self::object_mutation_lifecycle::{
     GuardedCreateObjectRequest, GuardedDeleteObjectRequest, GuardedUpdateObjectRequest,
@@ -108,10 +113,20 @@ fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) 
     }
 }
 
+fn map_action_definition_lifecycle_error(error: ActionDefinitionLifecycleError) -> Status {
+    match error {
+        ActionDefinitionLifecycleError::Unavailable(error)
+        | ActionDefinitionLifecycleError::Persistence(error) => Status::internal(error),
+        ActionDefinitionLifecycleError::InvalidDefinition(error)
+        | ActionDefinitionLifecycleError::ProtectedBuiltin(error) => {
+            Status::invalid_argument(error)
+        }
+    }
+}
+
 pub struct SekaiServiceImpl {
     db: Arc<RuntimeDb>,
-    actions: Arc<RwLock<ActionExecutor>>,
-    action_type_mutation: Arc<Mutex<()>>,
+    action_definitions: ActionDefinitionLifecycle,
     security: Arc<SecurityChecker>,
     schema_definitions: SchemaDefinitionLifecycle,
     budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
@@ -132,25 +147,11 @@ impl SekaiServiceImpl {
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
-        let action_types = match db.list_action_types() {
-            Ok(action_types) => action_types,
-            Err(error) => {
-                tracing::error!(%error, "failed to load action types");
-                Vec::new()
-            }
-        };
-        let actions = match ActionExecutor::from_action_types(action_types) {
-            Ok(actions) => actions,
-            Err(error) => {
-                tracing::error!(%error, "failed to initialize action registry");
-                ActionExecutor::new()
-            }
-        };
         let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
+        let action_definitions = ActionDefinitionLifecycle::load(db.clone());
         Self {
             db,
-            actions: Arc::new(RwLock::new(actions)),
-            action_type_mutation: Arc::new(Mutex::new(())),
+            action_definitions,
             security,
             schema_definitions,
             budget: None,
@@ -183,24 +184,6 @@ impl SekaiServiceImpl {
     pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
         self.site_id = site_id.into();
         self
-    }
-
-    /// Reload the graph-action registry from durable storage before a request
-    /// uses it. Action definitions are shared across service instances, so a
-    /// process-local registration update cannot be the source of truth.
-    fn refresh_action_registry(&self) -> Result<(), Status> {
-        let _mutation = self
-            .action_type_mutation
-            .lock()
-            .map_err(|_| Status::internal("action registry mutation unavailable"))?;
-        let action_types = self.db.list_action_types().map_err(Status::internal)?;
-        let refreshed = ActionExecutor::from_action_types(action_types)
-            .map_err(|error| Status::internal(format!("action registry unavailable: {error}")))?;
-        *self
-            .actions
-            .write()
-            .map_err(|_| Status::internal("action registry unavailable"))? = refreshed;
-        Ok(())
     }
 
     fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
@@ -286,7 +269,10 @@ impl SekaiServiceImpl {
         namespace: &str,
         principals: &[String],
     ) -> Result<Vec<CapabilityEntry>, Status> {
-        self.refresh_action_registry()?;
+        let actions = self
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(|_| Status::internal("capability catalog unavailable"))?;
         check_team_namespace(&self.db, principals, namespace, false)
             .map_err(|_| Status::permission_denied("capability discovery denied"))?;
         let can_write_namespace =
@@ -335,10 +321,6 @@ impl SekaiServiceImpl {
         let policy_delete_limit = resolved_policy
             .as_ref()
             .and_then(|policy| policy.max_deletes_per_work_unit);
-        let actions = self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("capability catalog unavailable"))?;
         for action_type in actions.capability_action_types() {
             if !can_write_namespace {
                 continue;
@@ -424,12 +406,11 @@ impl SekaiServiceImpl {
                 "enterprise action resumption requires a durable approval identity contract",
             ));
         }
-        self.refresh_action_registry()?;
-        let tenant_context: Option<RequestEnterpriseContext> = None;
         let actions = self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?;
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(map_action_definition_lifecycle_error)?;
+        let tenant_context: Option<RequestEnterpriseContext> = None;
         let mask_missing_link = actions.masks_missing_link(action_name);
         let sensitive_params = actions.sensitive_param_names(action_name);
         let target_ids = actions
@@ -507,7 +488,6 @@ impl SekaiServiceImpl {
                 return Err(Status::invalid_argument(error));
             }
         };
-        drop(actions);
         drop(schema);
         self.refresh_security_after_action(action_name, params, actor)?;
         self.db
@@ -5545,35 +5525,14 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::invalid_argument("action_type required"))?;
         let parsed = from_proto_action_type(&action_type)?;
         check_action_admin(&self.security, &parsed.name, &principals)?;
-        {
-            action::validate_action_type_definition(
-                &parsed,
-                ActionExecutor::new().has_action(&parsed.name),
-            )
-            .map_err(Status::invalid_argument)?;
-            let schema = self
-                .schema_definitions
-                .refresh_snapshot()
-                .map_err(map_schema_definition_lifecycle_error)?;
-            action::validate_action_type_against_schema(&parsed, &schema)
-                .map_err(Status::invalid_argument)?;
-        }
-        let stored = {
-            let _mutation = self
-                .action_type_mutation
-                .lock()
-                .map_err(|_| Status::internal("action registry mutation unavailable"))?;
-            let stored = self
-                .db
-                .upsert_action_type(&parsed)
-                .map_err(Status::internal)?;
-            self.actions
-                .write()
-                .map_err(|_| Status::internal("action registry unavailable"))?
-                .register_action_type(stored.clone())
-                .map_err(Status::invalid_argument)?;
-            stored
-        };
+        let schema = self
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        let stored = self
+            .action_definitions
+            .put_definition(parsed, &schema)
+            .map_err(map_action_definition_lifecycle_error)?;
         Ok(Response::new(CreateActionTypeResponse {
             action_type: Some(to_proto_action_type(&stored)),
         }))
@@ -5585,11 +5544,10 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListActionTypesResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
-        self.refresh_action_registry()?;
         let action_types = self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(map_action_definition_lifecycle_error)?
             .list_action_types()
             .iter()
             .filter(|action_type| {
@@ -5616,26 +5574,9 @@ impl SekaiService for SekaiServiceImpl {
             return Err(Status::invalid_argument("name required"));
         }
         check_action_admin(&self.security, &name, &principals)?;
-        let _mutation = self
-            .action_type_mutation
-            .lock()
-            .map_err(|_| Status::internal("action registry mutation unavailable"))?;
-        if self
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?
-            .has_action(&name)
-            && ActionExecutor::new().has_action(&name)
-        {
-            return Err(Status::invalid_argument("cannot delete builtin action"));
-        }
-        self.db
-            .delete_action_type(&name)
-            .map_err(Status::internal)?;
-        self.actions
-            .write()
-            .map_err(|_| Status::internal("action registry unavailable"))?
-            .remove_action_type(&name);
+        self.action_definitions
+            .delete_definition(&name)
+            .map_err(map_action_definition_lifecycle_error)?;
         Ok(Response::new(DeleteActionTypeResponse {}))
     }
 
@@ -6169,7 +6110,6 @@ impl SekaiService for SekaiServiceImpl {
         let r = inner
             .request
             .ok_or(Status::invalid_argument("request required"))?;
-        self.refresh_action_registry()?;
         let invocation_namespace = catalog_namespace.as_deref().unwrap_or_else(|| {
             r.params
                 .get("namespace")

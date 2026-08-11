@@ -58,10 +58,11 @@ impl<'a> ActionApprovalExecution<'a> {
         &self,
         approval: &crate::sekai::action_approval::ActionApproval,
     ) -> Result<ApprovalActionProfile, ApprovalLifecycleError> {
-        let actions =
-            self.service.actions.read().map_err(|_| {
-                ApprovalLifecycleError::Storage("action registry unavailable".into())
-            })?;
+        let actions = self
+            .service
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(|error| ApprovalLifecycleError::Storage(format!("{error:?}")))?;
         let target_ids = actions
             .target_ids(&self.service.db, &approval.action, &approval.params)
             .unwrap_or_default();
@@ -83,10 +84,11 @@ impl<'a> ActionApprovalExecution<'a> {
         if approval.action == crate::sekai::parked_work::RESOLVE_PARKED_WORK_ACTION {
             self.reauthorize_parked_work(approval, proposer)?;
         }
-        let actions =
-            self.service.actions.read().map_err(|_| {
-                ApprovalLifecycleError::Storage("action registry unavailable".into())
-            })?;
+        let actions = self
+            .service
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(|error| ApprovalLifecycleError::Storage(format!("{error:?}")))?;
         let resume_targets = actions
             .target_ids(&self.service.db, &approval.action, &approval.params)
             .map_err(ApprovalLifecycleError::InvalidArgument)?;
