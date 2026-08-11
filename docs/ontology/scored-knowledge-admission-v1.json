@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {"name":"ScoredKnowledgeAdmission","description":"Deep private Sekai module that admits bounded scoring outcomes as durable governed Learning records through KnowledgeWriter.","superclasses":[]},
+    {"name":"GovernedLearningRecord","description":"Durable candidate learning derived from a scored observation and bound to an authorized governed target.","superclasses":[]},
+    {"name":"KnowledgeWriter","description":"One-method interface used by scoring to request governed Knowledge admission without transport coupling.","superclasses":[]}
+  ],
+  "relations": [
+    {"name":"delegates_scored_knowledge_admission_to","description":"KnowledgeWriter delegates scored outcome admission to the private lifecycle module.","domain":"KnowledgeWriter","range":"ScoredKnowledgeAdmission"},
+    {"name":"creates_governed_learning_record","description":"Authorized scored Knowledge admission creates or replays a governed Learning record.","domain":"ScoredKnowledgeAdmission","range":"GovernedLearningRecord"}
+  ],
+  "provenance": [
+    {"subject":"ScoredKnowledgeAdmission","source":"src/grpc/scored_knowledge_admission.rs","locator":"admit","confidence":1.0},
+    {"subject":"GovernedLearningRecord","source":"src/sekai/learning.rs","locator":"record_learning","confidence":1.0},
+    {"subject":"KnowledgeWriter","source":"src/chisei/scoring.rs","locator":"KnowledgeWriter","confidence":1.0},
+    {"subject":"delegates_scored_knowledge_admission_to","source":"src/grpc/sekai_service.rs","locator":"KnowledgeWriter implementation","confidence":1.0},
+    {"subject":"creates_governed_learning_record","source":"src/grpc/scored_knowledge_admission.rs","locator":"record_learning call","confidence":1.0}
+  ]
+}

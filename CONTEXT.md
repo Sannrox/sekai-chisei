@@ -60,6 +60,18 @@ The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
 manufacturing transport requests.
 
+## Scored Knowledge admission
+
+The **Scored Knowledge admission module** turns bounded scoring outcomes into
+durable governed Learning records through the existing one-method
+`KnowledgeWriter` interface. It owns stable identity, governed-target
+resolution, writer authorization, Action Policy evaluation and audit, schema
+refresh, durable admission, allow audit, and ACL-cache convergence.
+
+The scoring job supplies only scored fields and never raw prompt or model
+output. The Sekai transport service implements the interface by delegating to
+the private admission module; no protocol request is manufactured.
+
 ## Native execution planning
 
 The **Native execution planning pipeline** produces one executable or denied
