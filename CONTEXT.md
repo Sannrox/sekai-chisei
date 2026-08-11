@@ -85,6 +85,19 @@ The gRPC adapter owns caller authentication, request preparation, future-time
 admission, and protocol projection. Resolution remains an internal
 deterministic phase, separate from deterministic and stochastic execution.
 
+## Governed Subject lifecycle
+
+The **Governed Subject lifecycle** evaluates one fixed-profile, payload-free
+subject envelope and exports situation-specific Tenkai provenance from the
+resulting canonical receipt. Its private interface owns namespace and
+administrator admission, replay binding, five-event receipt construction and
+collision recovery, authoritative receipt reconciliation, signing-key and TTL
+policy, envelope issuance and verification, and append-only export persistence.
+
+The gRPC adapter owns caller authentication and protobuf projection. This
+compact compiled-profile path remains separate from plan-backed Evaluation
+manifest resolution, and its provenance grants no execution authority.
+
 ## Evaluation execution
 
 The **Evaluation execution lifecycle** executes and cancels one resolved

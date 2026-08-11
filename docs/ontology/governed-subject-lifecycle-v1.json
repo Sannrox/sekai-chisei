@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "GovernedSubjectLifecycleModule",
+      "description": "Deep private Chisei module whose interface owns fixed-profile Governed Subject evaluation replay, canonical receipt ordering, receipt reconciliation, signing-key lifetime policy, Tenkai provenance issuance, and append-only export persistence.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedSubjectEvaluation",
+      "description": "Fixed-profile payload-free conformance evaluation that reconciles through one canonical operation receipt.",
+      "superclasses": []
+    },
+    {
+      "name": "GovernedSubjectProvenanceExport",
+      "description": "Situation-specific signed Tenkai provenance derived from one fresh authoritative Governed Subject allow receipt without granting execution authority.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Governed Subject callers, translates protobuf messages, and delegates evaluation and provenance behavior to the private lifecycle.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_governed_subject_lifecycle_to",
+      "description": "The Chisei gRPC transport delegates Governed Subject evaluation and provenance export to the lifecycle module.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "GovernedSubjectLifecycleModule"
+    },
+    {
+      "name": "governs_subject_evaluation_lifecycle",
+      "description": "The lifecycle owns canonical Governed Subject evaluation replay and receipt ordering.",
+      "domain": "GovernedSubjectLifecycleModule",
+      "range": "GovernedSubjectEvaluation"
+    },
+    {
+      "name": "governs_subject_provenance_export",
+      "description": "The lifecycle reconciles authoritative evaluation receipts into situation-specific signed provenance exports.",
+      "domain": "GovernedSubjectLifecycleModule",
+      "range": "GovernedSubjectProvenanceExport"
+    }
+  ],
+  "provenance": [
+    {"subject":"GovernedSubjectLifecycleModule","source":"src/grpc/chisei_service/governed_subject_lifecycle.rs","locator":"GovernedSubjectLifecycle/evaluate/export_provenance","confidence":1.0},
+    {"subject":"GovernedSubjectEvaluation","source":"src/chisei/governed_subject.rs","locator":"GovernedSubjectEnvelope/GovernedSubjectResult","confidence":1.0},
+    {"subject":"GovernedSubjectProvenanceExport","source":"src/chisei/governed_subject_provenance.rs","locator":"ExportRecord/ProvenanceEnvelope","confidence":1.0},
+    {"subject":"ChiseiGrpcTransportAdapter","source":"src/grpc/chisei_service.rs","locator":"evaluate_governed_subject/export_governed_subject_provenance","confidence":1.0},
+    {"subject":"delegates_governed_subject_lifecycle_to","source":"src/grpc/chisei_service.rs","locator":"GovernedSubjectLifecycle call sites","confidence":1.0},
+    {"subject":"governs_subject_evaluation_lifecycle","source":"src/grpc/chisei_service/governed_subject_lifecycle.rs","locator":"evaluate","confidence":1.0},
+    {"subject":"governs_subject_provenance_export","source":"src/grpc/chisei_service/governed_subject_lifecycle.rs","locator":"export_provenance","confidence":1.0}
+  ]
+}
