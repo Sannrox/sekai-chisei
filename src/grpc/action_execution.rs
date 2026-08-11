@@ -10,25 +10,25 @@ use super::{
     ERASED_NAMESPACE, RequestEnterpriseContext, SekaiServiceImpl, action_policy_namespace,
     check_team_namespace, check_write, enforce_namespace_tenant_context,
     enforce_object_marking_access, ensure_action_schema_kinds_allowed, is_managed_team_principal,
-    map_schema_definition_lifecycle_error, now_millis, record_marking_or_purpose_decision,
-    redact_action_evidence, redact_action_outcome, resolve_principal_authority,
-    schema_restricted_action_property,
+    map_action_definition_lifecycle_error, map_schema_definition_lifecycle_error, now_millis,
+    record_marking_or_purpose_decision, redact_action_evidence, redact_action_outcome,
+    resolve_principal_authority, schema_restricted_action_property,
 };
 use crate::grpc::pb::sekai::{ActionRequest, ActionResult};
 use crate::sekai::action_lifecycle::{ActionAudit, ActionLimitExceeded, GovernedActionContext};
 use crate::sekai::action_policy::ActionDecision;
 use crate::sekai::{action_lifecycle, markings, security};
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLockReadGuard;
+use std::sync::Arc;
 use tonic::Status;
 
-pub(super) struct AdmittedAction<'a> {
+pub(super) struct AdmittedAction {
     pub target_ids: Vec<String>,
     pub sensitive_params: HashSet<String>,
     pub schema_kinds: Vec<String>,
     pub actor: String,
     pub lifecycle: GovernedActionContext,
-    pub actions: RwLockReadGuard<'a, crate::sekai::action::ActionExecutor>,
+    pub actions: Arc<crate::sekai::action::ActionExecutor>,
 }
 
 pub(super) struct ActionExecution<'a> {
@@ -47,12 +47,12 @@ impl<'a> ActionExecution<'a> {
         tenant_context: Option<&RequestEnterpriseContext>,
         work_unit: &str,
         catalog_namespace: Option<&str>,
-    ) -> Result<AdmittedAction<'a>, Status> {
+    ) -> Result<AdmittedAction, Status> {
         let actions = self
             .service
-            .actions
-            .read()
-            .map_err(|_| Status::internal("action registry unavailable"))?;
+            .action_definitions
+            .fresh_snapshot()
+            .map_err(map_action_definition_lifecycle_error)?;
         let mask_missing_link = actions.masks_missing_link(&request.action);
         let sensitive_params = actions.sensitive_param_names(&request.action);
         let target_ids = actions
@@ -180,7 +180,7 @@ impl<'a> ActionExecution<'a> {
         &self,
         request: ActionRequest,
         dry_run: bool,
-        admitted: AdmittedAction<'a>,
+        admitted: AdmittedAction,
         mut receipt: Option<&mut CatalogInvocation<'_>>,
     ) -> Result<ActionResult, Status> {
         let AdmittedAction {
@@ -354,7 +354,6 @@ impl<'a> ActionExecution<'a> {
                 return Err(Status::invalid_argument(error));
             }
         };
-        drop(actions);
         drop(schema);
         self.service
             .refresh_security_after_action(&request.action, &request.params, &actor)?;

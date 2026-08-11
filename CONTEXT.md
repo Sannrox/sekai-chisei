@@ -123,6 +123,19 @@ live capability visibility, and protocol response metadata. Action execution
 trusts the authenticated principals, not the actor supplied inside the protocol
 request.
 
+## Legacy Action definition
+
+The **Legacy Action definition lifecycle** loads, validates, stores, removes,
+and refreshes the graph-mutation `ActionTypeDef` registry through one private
+interface. It owns builtin-name protection, schema validation, replay-time
+preservation, durable-before-cache ordering, registry rebuild failures, and
+cross-instance convergence. Consumers receive immutable, freshly rebuilt
+domain snapshots rather than registry lock guards.
+
+The gRPC adapter owns authentication, authorization, visibility filtering, and
+protocol projection. Legacy `ActionTypeDef` remains deliberately separate from
+versioned `GovernedActionType`; their execution semantics are not unified.
+
 ## Catalog invocation receipt lifecycle
 
 The **Catalog invocation receipt lifecycle** records one capability-catalog
