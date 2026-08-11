@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "NativeExecutionPlanningPipeline",
+      "description": "Deep private Chisei module whose interface produces one executable or denied native execution plan and owns Kioku enrichment, policy and provider resolution, budget and evaluation gates, routing, egress and privacy decisions, sampling, audit, and plan projection.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates native execution callers, binds an optional exact Gunshi allocation, translates protocol messages, and delegates to Native execution planning.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_native_execution_planning_to",
+      "description": "The gRPC transport delegates native planning after caller authentication and optional Gunshi allocation binding.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "NativeExecutionPlanningPipeline"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "NativeExecutionPlanningPipeline",
+      "source": "src/grpc/chisei_service/execution_planning.rs",
+      "locator": "ChiseiServiceImpl::plan_from_input",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "ChiseiService::plan_execution",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_native_execution_planning_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "plan_from_input call",
+      "confidence": 1.0
+    }
+  ]
+}
