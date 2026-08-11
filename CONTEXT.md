@@ -72,6 +72,18 @@ The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline.
 
+## Kioku candidate governance
+
+The **Kioku candidate governance lifecycle** owns authorized candidate
+discovery and human-governed state transitions. Its private interface enforces
+bounded keyset scanning, page-token filter binding, classification, retention,
+expiry and evidence-read admission, reassessment replay, successor lineage,
+promotion, rejection, supersession, disablement, and lifecycle-event readback.
+
+The gRPC adapter owns caller authentication, request parsing, and protocol
+projection. Reassessment creates a candidate successor and never mutates the
+active memory; promotion remains an explicit human review operation.
+
 ## Evaluation manifest resolution
 
 The **Evaluation manifest resolution lifecycle** freezes one authorized,

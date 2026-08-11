@@ -56,6 +56,7 @@ mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
 mod execution_planning;
 mod governed_subject_lifecycle;
+mod kioku_candidate_governance;
 mod policy_resolution;
 mod reported_operation_event_lifecycle;
 
@@ -865,21 +866,6 @@ fn require_team_namespace_actor_access(
         require_namespace_access(db, actor, namespace)?;
     }
     Ok(())
-}
-
-fn encode_kioku_candidate_page_token(
-    namespace: &str,
-    operation_class: &str,
-    cursor: &crate::chisei::kioku::KiokuCandidateCursor,
-) -> String {
-    let token = serde_json::json!({
-        "namespace": namespace,
-        "operation_class": operation_class,
-        "id": cursor.id,
-        "version": cursor.version,
-    });
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&token).expect("Kioku candidate page token is serializable"))
 }
 
 fn require_execution_namespace_access(
@@ -7222,136 +7208,23 @@ impl ChiseiService for ChiseiServiceImpl {
         };
         let operation_class = request.operation_class.trim().to_string();
         let page_token = request.page_token.trim();
-        let mut cursor = None;
-        if !page_token.is_empty() {
-            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(page_token)
-                .map_err(|_| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            let token: serde_json::Value = serde_json::from_slice(&decoded)
-                .map_err(|_| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            let token_namespace = token
-                .get("namespace")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            let token_operation_class = token
-                .get("operation_class")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            let token_id = token
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            let token_version = token
-                .get("version")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|version| u32::try_from(version).ok())
-                .filter(|version| *version > 0)
-                .ok_or_else(|| Status::invalid_argument("invalid Kioku candidate page token"))?;
-            if token_namespace != request.namespace.trim()
-                || token_operation_class != operation_class
-            {
-                return Err(Status::invalid_argument(
-                    "Kioku candidate page token does not match the request filters",
-                ));
-            }
-            cursor = Some(crate::chisei::kioku::KiokuCandidateCursor {
-                id: token_id.to_string(),
-                version: token_version,
-            });
-        }
-        const CANDIDATE_PAGE_SIZE: usize = 100;
-        const MAX_CANDIDATE_PAGES: usize = 4;
+        let cursor = kioku_candidate_governance::KiokuCandidateGovernance::decode_cursor(
+            request.namespace.trim(),
+            &operation_class,
+            page_token,
+        )?;
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let mut memories = Vec::new();
-        let mut seen = HashSet::new();
-        let classification_ceiling = self
-            .db
-            .kioku_authorized_classification_ceiling(&request.namespace, &actor)
-            .ok();
-        let mut has_more = false;
-        for _ in 0..MAX_CANDIDATE_PAGES {
-            let page = self
-                .db
-                .list_kioku_candidate_page(&request.namespace, CANDIDATE_PAGE_SIZE, cursor.as_ref())
-                .map_err(Status::internal)?;
-            let page_len = page.len();
-            if page_len == 0 {
-                break;
-            }
-            let page_last = page
-                .last()
-                .map(|memory| crate::chisei::kioku::KiokuCandidateCursor {
-                    id: memory.id.clone(),
-                    version: memory.version,
-                });
-            let mut last_examined = None;
-            let mut stopped_early = false;
-            for memory in page {
-                let current_cursor = crate::chisei::kioku::KiokuCandidateCursor {
-                    id: memory.id.clone(),
-                    version: memory.version,
-                };
-                last_examined = Some(current_cursor);
-                if !seen.insert((memory.id.clone(), memory.version)) {
-                    continue;
-                }
-                if !operation_class.is_empty()
-                    && !memory
-                        .operation_classes
-                        .iter()
-                        .any(|candidate| candidate == &operation_class)
-                {
-                    continue;
-                }
-                let authorized = classification_ceiling.is_some_and(|ceiling| {
-                    memory.classification <= ceiling
-                        && memory
-                            .retention_until_ms
-                            .is_none_or(|retention| retention > now_ms)
-                        && memory.expires_at_ms.is_none_or(|expires| expires > now_ms)
-                });
-                if !authorized {
-                    continue;
-                }
-                let evidence_authorized = memory.evidence_basis.iter().all(|basis| {
-                    basis.source_submission_id.is_empty()
-                        || self
-                            .db
-                            .authorize_kioku_evidence(
-                                &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest {
-                                    source_submission_id: basis.source_submission_id.clone(),
-                                    namespace: memory.namespace.clone(),
-                                    memory_classification: memory.classification,
-                                    evidence_digest: basis.evidence_digest.clone(),
-                                    lifecycle_state: basis.lifecycle_state,
-                                    observed_at_ms: basis.observed_at_ms,
-                                    actor: actor.clone(),
-                                    now_ms,
-                                },
-                            )
-                            .is_ok()
-                });
-                if evidence_authorized {
-                    memories.push(memory);
-                    if memories.len() >= limit {
-                        stopped_early = true;
-                        break;
-                    }
-                }
-            }
-            cursor = last_examined.or(page_last.clone());
-            has_more = if stopped_early {
-                cursor.as_ref() != page_last.as_ref() || page_len == CANDIDATE_PAGE_SIZE
-            } else {
-                page_len == CANDIDATE_PAGE_SIZE
-            };
-            if memories.len() >= limit || !has_more {
-                break;
-            }
-        }
-        let returned_count = memories.len();
-        let candidates = memories
+        let discovery = kioku_candidate_governance::KiokuCandidateGovernance::new(self.db.clone())
+            .discover(kioku_candidate_governance::CandidateDiscoveryCommand {
+                namespace: request.namespace.trim().to_string(),
+                operation_class: operation_class.clone(),
+                actor,
+                limit,
+                cursor,
+                now_ms,
+            })?;
+        let candidates = discovery
+            .memories
             .into_iter()
             .map(|memory| -> Result<KiokuCandidateRecord, Status> {
                 let evidence = self
@@ -7380,18 +7253,20 @@ impl ChiseiService for ChiseiServiceImpl {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let next_page_token = if has_more {
-            cursor.as_ref().map_or_else(String::new, |cursor| {
-                encode_kioku_candidate_page_token(
-                    request.namespace.trim(),
-                    &operation_class,
-                    cursor,
-                )
-            })
+        let next_page_token = if discovery.has_more {
+            discovery
+                .cursor
+                .as_ref()
+                .map_or_else(String::new, |cursor| {
+                    kioku_candidate_governance::KiokuCandidateGovernance::encode_cursor(
+                        request.namespace.trim(),
+                        &operation_class,
+                        cursor,
+                    )
+                })
         } else {
             String::new()
         };
-        debug_assert_eq!(returned_count, candidates.len());
         Ok(Response::new(ListKiokuCandidatesResponse {
             candidates,
             next_page_token,
@@ -7761,25 +7636,22 @@ impl ChiseiService for ChiseiServiceImpl {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let result = self
-                .db
-                .reassess_kioku_memory(crate::chisei::kioku::KiokuEvidenceReassessmentRequest {
-                    memory_id: request.memory_id,
-                    memory_version: request.memory_version,
-                    reassessment_key: request.reassessment_key,
-                    actor,
-                    evidence_basis,
-                    now_ms: chrono::Utc::now().timestamp_millis(),
-                })
-                .map_err(Status::failed_precondition)?;
-            let lifecycle_events = self
-                .db
-                .list_kioku_lifecycle_events(&result.candidate.id, result.candidate.version)
-                .map_err(Status::internal)?;
+            let result = kioku_candidate_governance::KiokuCandidateGovernance::new(self.db.clone())
+                .review(
+                    kioku_candidate_governance::CandidateReviewCommand::Reassess {
+                        memory_id: request.memory_id,
+                        memory_version: request.memory_version,
+                        reassessment_key: request.reassessment_key,
+                        actor,
+                        evidence_basis,
+                        now_ms: chrono::Utc::now().timestamp_millis(),
+                    },
+                )?;
             return Ok(Response::new(ReviewKiokuMemoryResponse {
-                memory_json: serde_json::to_string(&result.candidate)
+                memory_json: serde_json::to_string(&result.memory)
                     .map_err(|error| Status::internal(error.to_string()))?,
-                lifecycle_events_json: lifecycle_events
+                lifecycle_events_json: result
+                    .lifecycle_events
                     .iter()
                     .map(serde_json::to_string)
                     .collect::<Result<Vec<_>, _>>()
@@ -7796,66 +7668,31 @@ impl ChiseiService for ChiseiServiceImpl {
         if request.rationale.trim().is_empty() {
             return Err(Status::invalid_argument("review rationale is required"));
         }
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let memory = match request.action.as_str() {
-            "promote" | "reject" | "supersede" => {
-                let memory = self
-                    .db
-                    .get_kioku_memory(&request.memory_id, request.memory_version)
-                    .map_err(Status::internal)?
-                    .ok_or_else(|| Status::not_found("memory version not found"))?;
-                if request.action == "supersede" && memory.supersedes.is_none() {
-                    return Err(Status::failed_precondition(
-                        "supersede requires candidate lineage to an active memory",
-                    ));
-                }
-                self.db
-                    .review_kioku_candidate(
-                        &request.memory_id,
-                        request.memory_version,
-                        crate::chisei::kioku::HumanMemoryReview {
-                            action: if request.action == "reject" {
-                                crate::chisei::kioku::HumanReviewAction::Reject
-                            } else {
-                                crate::chisei::kioku::HumanReviewAction::Promote
-                            },
-                            reviewer: actor,
-                            rationale: request.rationale,
-                            reviewed_at_ms: now_ms,
-                        },
-                    )
-                    .map_err(Status::failed_precondition)?
-            }
-            "disable" => self
-                .db
-                .disable_kioku_memory(
-                    &request.memory_id,
-                    request.memory_version,
-                    &actor,
-                    &request.rationale,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "action must be promote, reject, supersede, or disable",
-                ));
-            }
-        };
-        let lifecycle_events = self
-            .db
-            .list_kioku_lifecycle_events(&memory.id, memory.version)
-            .map_err(Status::internal)?;
+        let result = kioku_candidate_governance::KiokuCandidateGovernance::new(self.db.clone())
+            .review(kioku_candidate_governance::CandidateReviewCommand::Human {
+                memory_id: request.memory_id,
+                memory_version: request.memory_version,
+                action: request.action,
+                actor,
+                rationale: request.rationale,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            })?;
         Ok(Response::new(ReviewKiokuMemoryResponse {
-            memory_json: serde_json::to_string(&memory)
+            memory_json: serde_json::to_string(&result.memory)
                 .map_err(|error| Status::internal(error.to_string()))?,
-            lifecycle_events_json: lifecycle_events
+            lifecycle_events_json: result
+                .lifecycle_events
                 .iter()
                 .map(serde_json::to_string)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| Status::internal(error.to_string()))?,
-            evidence_json: Vec::new(),
-            idempotent: false,
+            evidence_json: result
+                .evidence
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| Status::internal(error.to_string()))?,
+            idempotent: result.idempotent,
         }))
     }
 

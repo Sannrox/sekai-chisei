@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {"name":"KiokuCandidateGovernanceLifecycle","description":"Deep private Chisei module whose interface owns authorized Kioku candidate discovery, reassessment replay, successor lineage, and human lifecycle transitions.","superclasses":[]},
+    {"name":"KiokuMemoryCandidate","description":"A governed Kioku memory version awaiting or recording an explicit human lifecycle decision.","superclasses":[]},
+    {"name":"ChiseiGrpcTransportAdapter","description":"gRPC adapter that supplies authenticated caller context and translates Kioku candidate-governance requests and outcomes.","superclasses":[]}
+  ],
+  "relations": [
+    {"name":"delegates_kioku_candidate_governance_to","description":"The Chisei gRPC transport delegates authorized candidate discovery and review to the lifecycle module.","domain":"ChiseiGrpcTransportAdapter","range":"KiokuCandidateGovernanceLifecycle"},
+    {"name":"governs_kioku_memory_candidate","description":"The lifecycle discovers and transitions Kioku memory candidates while preserving reassessment lineage and human promotion authority.","domain":"KiokuCandidateGovernanceLifecycle","range":"KiokuMemoryCandidate"}
+  ],
+  "provenance": [
+    {"subject":"KiokuCandidateGovernanceLifecycle","source":"src/grpc/chisei_service/kioku_candidate_governance.rs","locator":"KiokuCandidateGovernance","confidence":1.0},
+    {"subject":"KiokuMemoryCandidate","source":"src/chisei/kioku.rs","locator":"KiokuMemory candidate lifecycle","confidence":1.0},
+    {"subject":"ChiseiGrpcTransportAdapter","source":"src/grpc/chisei_service.rs","locator":"list_kioku_candidates/review_kioku_memory","confidence":1.0},
+    {"subject":"delegates_kioku_candidate_governance_to","source":"src/grpc/chisei_service.rs","locator":"KiokuCandidateGovernance call sites","confidence":1.0},
+    {"subject":"governs_kioku_memory_candidate","source":"src/grpc/chisei_service/kioku_candidate_governance.rs","locator":"discover/review","confidence":1.0}
+  ]
+}
