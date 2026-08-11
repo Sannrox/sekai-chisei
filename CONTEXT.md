@@ -14,3 +14,15 @@ Revocation is creator- or administrator-authorized and idempotent.
 
 Resolution is separate: the receiver's current access is rechecked when a
 Handoff is resolved. See `docs/architecture.md#governed-context-handoffs`.
+
+## Action Work
+
+**Action Work** is runtime-dispatch work materialized from an admitted governed
+ActionInstance effect. Hosts claim it with a generation-fenced lease, heartbeat
+that claim, acknowledge completion or failure, or park it with checkpoint
+metadata until an authorized continuation is supplied.
+
+The **Action Work lifecycle** lists claimable work, claims and heartbeats
+runtime claims, acknowledges terminal or parked outcomes, records host claim
+events, projects receipt harvest events, and records audit decisions after
+durable persistence.

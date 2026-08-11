@@ -6,6 +6,7 @@ pub mod action_instance;
 pub mod action_instance_admission;
 pub mod action_lifecycle;
 pub mod action_policy;
+pub(crate) mod action_work_lifecycle;
 pub mod attestation;
 pub mod audit;
 pub mod capability;
