@@ -149,23 +149,6 @@ pub trait ChiseiKiokuBackend: Send + Sync {
             request.memory_version,
             &request.reassessment_key,
         );
-        if let Some(existing) = self.get_kioku_memory(&candidate_id, 1)? {
-            if existing.reassessment_key == request.reassessment_key
-                && existing.supersedes.as_ref().is_some_and(|supersedes| {
-                    supersedes.memory_id == request.memory_id
-                        && supersedes.version == request.memory_version
-                })
-                && existing.evidence_basis_digest == merged_basis_digest
-            {
-                let existing_evidence = self.list_kioku_evidence(&existing.id, existing.version)?;
-                return Ok(KiokuEvidenceReassessmentResult {
-                    candidate: existing,
-                    evidence: existing_evidence,
-                    idempotent: true,
-                });
-            }
-            return Err("reassessment key conflicts with a different evidence basis".into());
-        }
         let ceiling =
             self.kioku_authorized_classification_ceiling(&prior.namespace, &request.actor)?;
         if prior.classification > ceiling {
@@ -206,6 +189,26 @@ pub trait ChiseiKiokuBackend: Send + Sync {
                     now_ms: request.now_ms,
                 })?;
             }
+        }
+        // Replay is resolved only after current classification and evidence
+        // authorization. Idempotency must not preserve access that was later
+        // revoked or evidence that is no longer admissible.
+        if let Some(existing) = self.get_kioku_memory(&candidate_id, 1)? {
+            if existing.reassessment_key == request.reassessment_key
+                && existing.supersedes.as_ref().is_some_and(|supersedes| {
+                    supersedes.memory_id == request.memory_id
+                        && supersedes.version == request.memory_version
+                })
+                && existing.evidence_basis_digest == merged_basis_digest
+            {
+                let existing_evidence = self.list_kioku_evidence(&existing.id, existing.version)?;
+                return Ok(KiokuEvidenceReassessmentResult {
+                    candidate: existing,
+                    evidence: existing_evidence,
+                    idempotent: true,
+                });
+            }
+            return Err("reassessment key conflicts with a different evidence basis".into());
         }
         if prior.state != crate::chisei::kioku::MemoryLifecycleState::Active {
             return Err("only active memories can be reassessed".into());

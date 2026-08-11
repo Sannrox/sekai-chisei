@@ -3168,6 +3168,18 @@ mod tests {
         assert!(replay.idempotent);
         assert_eq!(replay.candidate, first.candidate);
 
+        db.delete_grant("grant-payments").unwrap();
+        let denied_replay = db.reassess_kioku_memory(request.clone()).unwrap_err();
+        assert!(denied_replay.contains("classification"));
+        db.create_grant(&Grant {
+            id: "grant-payments-restored".into(),
+            object_id: "namespace-payments".into(),
+            principal: "reviewer".into(),
+            role: Role::Admin,
+            created: 151,
+        })
+        .unwrap();
+
         let mut conflict = KiokuEvidenceReassessmentRequest {
             memory_id: prior.id,
             memory_version: 1,
