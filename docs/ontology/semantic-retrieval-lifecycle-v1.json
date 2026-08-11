@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "SemanticRetrievalLifecycle",
+      "description": "Deep private Sekai module that owns authorization-filtered ontology snapshots, bounded query-time reasoning, denial normalization, computed-property resolution, and canonical semantic retrieval projection.",
+      "superclasses": []
+    },
+    {
+      "name": "SekaiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates Sekai callers, attributes capability-catalog invocations, and translates semantic retrieval protocol messages.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_semantic_retrieval_to",
+      "description": "The authenticated gRPC transport delegates bounded retrieval to the Semantic retrieval lifecycle.",
+      "domain": "SekaiGrpcTransportAdapter",
+      "range": "SemanticRetrievalLifecycle"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "SemanticRetrievalLifecycle",
+      "source": "src/grpc/semantic_retrieval_lifecycle.rs",
+      "locator": "SekaiServiceImpl::execute_retrieve_context",
+      "confidence": 1.0
+    },
+    {
+      "subject": "SekaiGrpcTransportAdapter",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "SekaiService implementation",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_semantic_retrieval_to",
+      "source": "src/grpc/sekai_service.rs",
+      "locator": "retrieve_context, expand_relations, explain_derivation",
+      "confidence": 1.0
+    }
+  ]
+}

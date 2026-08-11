@@ -1,5 +1,17 @@
 # Domain context
 
+## Semantic retrieval
+
+The **Semantic retrieval lifecycle** produces one authorization-filtered,
+bounded context result from authenticated roots and reasoning constraints. Its
+private interface owns retrieval parsing, the immutable visible ontology
+snapshot, query-time entailment, denial normalization, computed-property
+resolution, epistemic descriptors, and canonical result projection.
+
+The gRPC adapter owns caller authentication, capability-catalog attribution,
+namespace-specific expansion and explanation projection, and protocol metadata.
+PostgreSQL community retrieval remains asserted-only.
+
 ## Policy resolution
 
 The **Policy resolution module** produces one permitted route or denial from
