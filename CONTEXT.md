@@ -1,5 +1,17 @@
 # Domain context
 
+## Native execution planning
+
+The **Native execution planning pipeline** produces one executable or denied
+plan from authenticated execution input. Its private interface owns Kioku
+context enrichment, policy and provider resolution, budget and evaluation
+gates, routing, egress and privacy decisions, sampling, audit, and plan
+projection.
+
+The gRPC adapter owns authentication, optional Gunshi allocation binding, and
+protocol translation. Gunshi allocation precedes planning; Kioku enrichment
+remains inside the planning pipeline.
+
 ## Object mutation
 
 The **Object mutation lifecycle** creates, updates, and deletes Objects through
