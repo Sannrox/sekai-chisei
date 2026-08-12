@@ -4,7 +4,7 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
 use crate::sekai::ontology::OntologyRegistry;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -524,19 +524,18 @@ where
                 add_truncation(&mut result, "source_rows");
                 break 'traversal;
             }
-            let adjacent = if let Some(adjacent) = adjacency_cache.get(&current_id) {
-                adjacent.clone()
-            } else {
-                let adjacent = load_bounded_adjacency(
+            // Cache adjacency once and borrow it; cloning the Vec<(Link, String)>
+            // on every revisit copied every edge for each frontier re-touch.
+            if let Entry::Vacant(entry) = adjacency_cache.entry(current_id.clone()) {
+                entry.insert(load_bounded_adjacency(
                     db,
                     &current_id,
                     query.direction,
                     &relations,
                     adjacency_scan_cap,
-                )?;
-                adjacency_cache.insert(current_id.clone(), adjacent.clone());
-                adjacent
-            };
+                )?);
+            }
+            let adjacent = &adjacency_cache[&current_id];
 
             for (link, target_id) in adjacent {
                 let Some(target) = load_object(db, &target_id, &mut object_cache)? else {
