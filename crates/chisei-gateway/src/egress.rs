@@ -1,6 +1,5 @@
 use crate::domain::Object;
 use sekai_proto::sekai::ObjectType;
-use std::collections::HashSet;
 
 pub const EXTERNAL_PROPERTIES_KEY: &str = "chisei.egress.external_properties";
 
@@ -18,17 +17,14 @@ pub fn include_identity(obj: &Object) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-fn allowed_external_properties(obj: &Object) -> HashSet<String> {
+fn external_property_is_allowed(obj: &Object, field: &str) -> bool {
     obj.properties
         .get(EXTERNAL_PROPERTIES_KEY)
-        .map(|raw| {
+        .is_some_and(|raw| {
             raw.split(',')
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
+                .any(|value| !value.is_empty() && value == field)
         })
-        .unwrap_or_default()
 }
 
 pub fn new_record(obj: &Object) -> ContextEgressRecord {
@@ -63,7 +59,7 @@ pub fn filter_property_with_schema(
         .get(field)
         .filter(|value| !value.is_empty())?;
     let permitted = !external
-        || (allowed_external_properties(obj).contains(field)
+        || (external_property_is_allowed(obj, field)
             && object_type
                 .and_then(|kind| {
                     kind.properties
@@ -84,5 +80,47 @@ pub fn filter_property_with_schema(
             .reasons
             .push(format!("{field} denied by default egress policy"));
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn object(properties: HashMap<String, String>) -> Object {
+        Object {
+            id: "obj-1".into(),
+            kind: "fixture".into(),
+            name: "Fixture".into(),
+            namespace: "benchmark".into(),
+            external_id: "fixture:1".into(),
+            properties,
+            created: 0,
+            updated: 0,
+        }
+    }
+
+    #[test]
+    fn external_allowlist_matches_exact_trimmed_entries() {
+        let obj = object(HashMap::from([
+            ("".into(), "empty key".into()),
+            ("score".into(), "90".into()),
+            ("score_detail".into(), "synthetic".into()),
+            (
+                EXTERNAL_PROPERTIES_KEY.into(),
+                " , verdict, score_detail, ".into(),
+            ),
+        ]));
+        let mut record = new_record(&obj);
+
+        assert_eq!(filter_property(&obj, "", &mut record, true), None);
+        assert_eq!(filter_property(&obj, "score", &mut record, true), None);
+        assert_eq!(
+            filter_property(&obj, "score_detail", &mut record, true),
+            Some("synthetic".into())
+        );
+        assert_eq!(record.redacted_fields, vec!["", "score"]);
+        assert_eq!(record.included_fields, vec!["score_detail"]);
     }
 }

@@ -32,6 +32,16 @@ pub fn include_identity(obj: &Object) -> bool {
         .unwrap_or(false)
 }
 
+fn external_property_is_allowed(obj: &Object, field: &str) -> bool {
+    obj.properties
+        .get(EXTERNAL_PROPERTIES_KEY)
+        .is_some_and(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .any(|value| !value.is_empty() && value == field)
+        })
+}
+
 pub fn allowed_external_properties(obj: &Object) -> HashSet<String> {
     obj.properties
         .get(EXTERNAL_PROPERTIES_KEY)
@@ -85,9 +95,9 @@ fn property_allows_external(obj: &Object, field: &str, object_type: Option<&Obje
             .find(|property| property.name == field)
     }) {
         return !schema::is_restricted_property_classification(&property.classification)
-            && allowed_external_properties(obj).contains(field);
+            && external_property_is_allowed(obj, field);
     }
-    allowed_external_properties(obj).contains(field)
+    external_property_is_allowed(obj, field)
 }
 
 pub fn new_record(obj: &Object) -> ContextEgressRecord {
@@ -155,6 +165,29 @@ mod tests {
             Some("bullish".into())
         );
         assert_eq!(record.included_fields, vec!["verdict"]);
+    }
+
+    #[test]
+    fn external_allowlist_matches_exact_trimmed_entries() {
+        let obj = object(HashMap::from([
+            ("".into(), "empty key".into()),
+            ("score".into(), "90".into()),
+            ("score_detail".into(), "synthetic".into()),
+            (
+                EXTERNAL_PROPERTIES_KEY.into(),
+                " , verdict, score_detail, ".into(),
+            ),
+        ]));
+        let mut record = new_record(&obj);
+
+        assert_eq!(filter_property(&obj, "", &mut record, true), None);
+        assert_eq!(filter_property(&obj, "score", &mut record, true), None);
+        assert_eq!(
+            filter_property(&obj, "score_detail", &mut record, true),
+            Some("synthetic".into())
+        );
+        assert_eq!(record.redacted_fields, vec!["", "score"]);
+        assert_eq!(record.included_fields, vec!["score_detail"]);
     }
 
     #[test]
