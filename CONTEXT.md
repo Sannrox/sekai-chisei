@@ -60,6 +60,18 @@ The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
 manufacturing transport requests.
 
+## Gateway decide
+
+The **Gateway decide lifecycle** produces one admit or deny decision from
+authenticated gateway execution input. Its private interface owns namespace
+admission, trusted-gateway scope checks, context-admission gates, token and
+request budget plus continuation degradation, policy resolution, sampling,
+audit, and decision projection.
+
+The gRPC adapter owns caller authentication and protocol translation. Policy
+resolution remains a separate private module. Native planning and plan
+execution remain distinct Chisei concepts.
+
 ## Scored Knowledge admission
 
 The **Scored Knowledge admission module** turns bounded scoring outcomes into
