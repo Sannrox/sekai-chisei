@@ -2743,6 +2743,7 @@ fn map_work_unit_lifecycle_error(error: WorkUnitLifecycleError) -> Status {
         WorkUnitLifecycleError::PermissionDenied(message) => Status::permission_denied(message),
         WorkUnitLifecycleError::InvalidArgument(message) => Status::invalid_argument(message),
         WorkUnitLifecycleError::FailedPrecondition(message) => Status::failed_precondition(message),
+        WorkUnitLifecycleError::AlreadyExists(message) => Status::already_exists(message),
         WorkUnitLifecycleError::Storage(message) => Status::internal(message),
     }
 }
@@ -5572,15 +5573,73 @@ impl SekaiService for SekaiServiceImpl {
         require_authenticated(&principals)?;
         let filter = req.into_inner().filter.unwrap_or_default();
         let limit = filter.limit;
-        let mut work_units = self
-            .db
-            .list_work_units(&from_proto_work_unit_filter(&filter))
-            .map_err(Status::internal)?
-            .into_iter()
-            .filter(|work_unit| {
-                check_work_unit_read(&self.db, &self.security, work_unit, &principals).is_ok()
-            })
-            .collect::<Vec<_>>();
+        let mut work_units = if limit > 0 {
+            // Paginate over *visible* rows. A single storage page can be mostly
+            // invisible after ACL filtering; continue the cursor scan so a short
+            // visible page does not look like end-of-storage.
+            let visible_limit = limit as usize;
+            let batch_size = visible_limit.clamp(50, 200);
+            let max_scan = visible_limit.saturating_mul(10).max(200);
+            let mut visible = Vec::with_capacity(visible_limit.saturating_add(1).min(batch_size));
+            let mut scanned = 0usize;
+            let mut page_token = filter.page_token.clone();
+            while visible.len() <= visible_limit && scanned < max_scan {
+                let mut batch_filter = from_proto_work_unit_filter(&filter);
+                batch_filter.limit = batch_size as i32;
+                batch_filter.offset = 0;
+                batch_filter.page_token = if page_token.is_empty() {
+                    None
+                } else {
+                    Some(page_token.clone())
+                };
+                let batch = self
+                    .db
+                    .list_work_units(&batch_filter)
+                    .map_err(Status::internal)?;
+                if batch.is_empty() {
+                    break;
+                }
+                // DB returns limit+1 when more raw rows may exist.
+                let has_more_raw = batch.len() > batch_size;
+                let rows = if has_more_raw {
+                    &batch[..batch_size]
+                } else {
+                    batch.as_slice()
+                };
+                scanned = scanned.saturating_add(rows.len());
+                if let Some(last) = rows.last() {
+                    page_token = coordination::make_page_token(last.created_at, &last.id);
+                }
+                for work_unit in rows {
+                    if check_work_unit_read(&self.db, &self.security, work_unit, &principals)
+                        .is_ok()
+                    {
+                        visible.push(work_unit.clone());
+                        if visible.len() > visible_limit {
+                            break;
+                        }
+                    }
+                }
+                if !has_more_raw {
+                    break;
+                }
+            }
+            if visible.len() <= visible_limit && scanned >= max_scan {
+                return Err(Status::resource_exhausted(
+                    "work unit visibility scan limit exceeded; refine filters",
+                ));
+            }
+            visible
+        } else {
+            self.db
+                .list_work_units(&from_proto_work_unit_filter(&filter))
+                .map_err(Status::internal)?
+                .into_iter()
+                .filter(|work_unit| {
+                    check_work_unit_read(&self.db, &self.security, work_unit, &principals).is_ok()
+                })
+                .collect::<Vec<_>>()
+        };
         let next_page_token = if limit > 0 && work_units.len() > limit as usize {
             let next = work_units
                 .get((limit as usize).saturating_sub(1))
@@ -11210,6 +11269,115 @@ mod tests {
             .work_unit
             .unwrap();
         assert_eq!(still_running.status, coordination::WORK_UNIT_STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn list_work_units_paginates_over_visible_rows_only() {
+        let svc = service();
+        svc.db
+            .create_contention_scope(&coordination::ContentionScope {
+                id: "scope-visible-page".into(),
+                name: "visible".into(),
+                parent_scope_id: String::new(),
+                max_concurrency: 4,
+                admission_policy: coordination::ADMISSION_POLICY_FIFO.into(),
+                heartbeat_ttl_seconds: 30,
+                timeout_seconds: 60,
+                owner_principal: "alice".into(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+
+        // Interleave alice-visible and bob-only units in storage order so a
+        // naive LIMIT+filter page would stop after alice's first unit.
+        for (id, owner, created_at) in [
+            ("wu-vis-1", "alice", 11),
+            ("wu-hid-1", "bob", 12),
+            ("wu-vis-2", "alice", 13),
+        ] {
+            svc.db
+                .create_work_unit(&coordination::WorkUnit {
+                    id: id.into(),
+                    kind: "build".into(),
+                    actor: owner.into(),
+                    target_object_id: String::new(),
+                    status: coordination::WORK_UNIT_STATUS_PENDING.into(),
+                    requested_spec: "{}".into(),
+                    scope_id: "scope-visible-page".into(),
+                    priority: 0,
+                    timeout_seconds: 60,
+                    heartbeat_ttl_seconds: 30,
+                    created_at,
+                    admitted_at: 0,
+                    started_at: 0,
+                    finished_at: 0,
+                    last_heartbeat_at: 0,
+                    failure_reason: String::new(),
+                    cancel_reason: String::new(),
+                    owner_principal: owner.into(),
+                    creator_principal: owner.into(),
+                    idempotency_key: format!("key-{id}"),
+                    updated_at: created_at,
+                })
+                .unwrap();
+        }
+
+        let first_page = svc
+            .list_work_units(with_named_principal(
+                ListWorkUnitsRequest {
+                    filter: Some(WorkUnitFilter {
+                        status: String::new(),
+                        actor: String::new(),
+                        scope_id: "scope-visible-page".into(),
+                        target_object_id: String::new(),
+                        owner_principal: String::new(),
+                        limit: 1,
+                        offset: 0,
+                        statuses: vec![],
+                        created_after: 0,
+                        updated_after: 0,
+                        creator_principal: String::new(),
+                        page_token: String::new(),
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_page.work_units.len(), 1);
+        assert_eq!(first_page.work_units[0].id, "wu-vis-1");
+        assert!(
+            !first_page.next_page_token.is_empty(),
+            "invisible rows must not make a short page look like end-of-storage"
+        );
+
+        let second_page = svc
+            .list_work_units(with_named_principal(
+                ListWorkUnitsRequest {
+                    filter: Some(WorkUnitFilter {
+                        status: String::new(),
+                        actor: String::new(),
+                        scope_id: "scope-visible-page".into(),
+                        target_object_id: String::new(),
+                        owner_principal: String::new(),
+                        limit: 1,
+                        offset: 0,
+                        statuses: vec![],
+                        created_after: 0,
+                        updated_after: 0,
+                        creator_principal: String::new(),
+                        page_token: first_page.next_page_token,
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second_page.work_units.len(), 1);
+        assert_eq!(second_page.work_units[0].id, "wu-vis-2");
     }
 
     #[tokio::test]

@@ -549,10 +549,13 @@ impl SekaiDb {
         local_site_id: &str,
     ) -> Result<(), String> {
         let chain = scope_chain(scope_id);
-        let conn = self.conn();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         if require_home_pin && delta > 0 {
             for scope in &chain {
-                let home: Option<String> = conn
+                let home: Option<String> = tx
                     .query_row(
                         "SELECT home_site_id FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                         params![scope, metric],
@@ -566,7 +569,7 @@ impl SekaiDb {
             }
         }
         for scope in &chain {
-            let period_type = conn
+            let period_type = tx
                 .query_row(
                     "SELECT period_type FROM chisei_budget_limits WHERE scope_id=?1 AND metric=?2",
                     params![scope, metric],
@@ -576,24 +579,17 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
                 .unwrap_or_else(|| "daily".to_string());
             let period_start = period_start_ms(&period_type, now_ms);
-            let used: i64 = conn
-                .query_row(
-                    "SELECT amount_used FROM chisei_budget_usage WHERE scope_id=?1 AND metric=?2 AND period_start=?3",
-                    params![scope, metric, period_start],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .unwrap_or(0);
-            let updated = (used + delta).max(0);
-            conn.execute(
+            // Relative update under Immediate txn (mirrors Postgres) so concurrent
+            // adjust/complete paths cannot lose usage via read-modify-write.
+            tx.execute(
                 "INSERT INTO chisei_budget_usage (scope_id, metric, period_start, amount_used)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET amount_used = excluded.amount_used",
-                params![scope, metric, period_start, updated],
+                 VALUES (?1, ?2, ?3, MAX(0, ?4))
+                 ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
+                    amount_used = MAX(0, amount_used + ?4)",
+                params![scope, metric, period_start, delta],
             )
             .map_err(|e| e.to_string())?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO chisei_budget_attributions
                    (source_scope_id,applied_scope_id,metric,period_start,amount_used)
                  VALUES (?1,?2,?3,?4,MAX(0,?5))
@@ -603,7 +599,7 @@ impl SekaiDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     #[allow(clippy::too_many_arguments)]

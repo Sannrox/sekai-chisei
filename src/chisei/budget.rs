@@ -1058,4 +1058,27 @@ mod tests {
         assert_eq!(admitted, 10);
         assert_eq!(t.get_usage("project:p").tokens_used, 100);
     }
+
+    #[test]
+    fn concurrent_adjusts_do_not_lose_usage_updates() {
+        use std::sync::Barrier;
+        use std::thread;
+        let t = Arc::new(tracker());
+        t.set_limit("project:p", 10_000, PeriodType::Daily).unwrap();
+        t.record("project:p", 0);
+        let barrier = Arc::new(Barrier::new(20));
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let t = t.clone();
+            let barrier = barrier.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                t.record("project:p", 5);
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(t.get_usage("project:p").tokens_used, 100);
+    }
 }
