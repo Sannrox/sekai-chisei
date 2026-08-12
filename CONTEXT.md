@@ -84,6 +84,18 @@ The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
 execution remain distinct Chisei concepts.
 
+## External action
+
+The **External action lifecycle** authorizes and transitions one host-executed
+action through a single private ordered path. Its private interface owns
+claim and idempotency, policy load, blast-radius and budget reservation,
+persist ordering, permit issuance, and approve/deny/cancel compare-and-swap
+transitions.
+
+The gRPC adapter owns caller authentication and protocol translation. Redeem,
+delegation, and kill-switch remain adapter operations over the permit store.
+Native plan execution and Action execution remain distinct concepts.
+
 ## Scored Knowledge admission
 
 The **Scored Knowledge admission module** turns bounded scoring outcomes into
