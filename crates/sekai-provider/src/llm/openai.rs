@@ -159,7 +159,9 @@ impl Provider for OpenAI {
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                 while let Some(index) = buffer.find("\n\n") {
                     let event = buffer[..index].to_string();
-                    buffer = buffer[index + 2..].to_string();
+                    // Drain in place so many small SSE frames do not copy the
+                    // unread tail into a fresh String on every event boundary.
+                    buffer.drain(..index + 2);
                     let parsed = parse_openai_sse_event(
                         &event,
                         &mut content,
