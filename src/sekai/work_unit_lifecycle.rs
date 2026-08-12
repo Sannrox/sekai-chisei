@@ -71,6 +71,7 @@ pub(crate) enum WorkUnitLifecycleError {
     PermissionDenied(String),
     InvalidArgument(String),
     FailedPrecondition(String),
+    AlreadyExists(String),
     Storage(String),
 }
 
@@ -100,8 +101,14 @@ impl<'a> WorkUnitLifecycle<'a> {
             .map_err(|error| {
                 CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::Storage(error))
             })?
-            .filter(|record| record.principal == command.principal)
         {
+            if record.principal != command.principal {
+                return Err(CreateWorkUnitError::Lifecycle(
+                    WorkUnitLifecycleError::AlreadyExists(
+                        "request_id already used for create_work_unit by another principal".into(),
+                    ),
+                ));
+            }
             return self
                 .load(&record.work_unit_id)
                 .map_err(CreateWorkUnitError::Lifecycle);
@@ -165,10 +172,14 @@ impl<'a> WorkUnitLifecycle<'a> {
             .db
             .get_dedup_request(command.request_id, "try_admit_work_unit")
             .map_err(WorkUnitLifecycleError::Storage)?
-            .filter(|record| {
-                record.work_unit_id == command.work_unit_id && record.principal == command.principal
-            })
         {
+            if record.work_unit_id != command.work_unit_id || record.principal != command.principal
+            {
+                return Err(WorkUnitLifecycleError::AlreadyExists(
+                    "request_id already used for try_admit_work_unit with a different binding"
+                        .into(),
+                ));
+            }
             let work_unit = self.load(&record.work_unit_id)?;
             let reservations = self
                 .db
@@ -206,12 +217,17 @@ impl<'a> WorkUnitLifecycle<'a> {
         command: TransitionWorkUnit<'_>,
     ) -> Result<WorkUnit, WorkUnitLifecycleError> {
         let operation = command.transition.operation();
-        if self
+        if let Some(record) = self
             .db
             .get_dedup_request(command.request_id, operation)
             .map_err(WorkUnitLifecycleError::Storage)?
-            .is_some_and(|record| record.work_unit_id == command.work_unit_id)
         {
+            if record.work_unit_id != command.work_unit_id || record.principal != command.principal
+            {
+                return Err(WorkUnitLifecycleError::AlreadyExists(format!(
+                    "request_id already used for {operation} with a different binding"
+                )));
+            }
             return self.load(command.work_unit_id);
         }
 
@@ -509,6 +525,90 @@ mod tests {
                 .created_at,
             10
         );
+    }
+
+    #[test]
+    fn create_rejects_request_id_reuse_across_principals() {
+        let db = empty_database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        let mut alice_unit = work_unit();
+        alice_unit.id = "work-alice".into();
+        alice_unit.idempotency_key = "key-alice".into();
+        lifecycle
+            .create(
+                CreateWorkUnit {
+                    work_unit: alice_unit,
+                    request_id: "shared-request",
+                    principal: "alice",
+                    now_ms: 10,
+                },
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap();
+
+        let mut bob_unit = work_unit();
+        bob_unit.id = "work-bob".into();
+        bob_unit.idempotency_key = "key-bob".into();
+        bob_unit.owner_principal = "bob".into();
+        bob_unit.creator_principal = "bob".into();
+        let err = lifecycle
+            .create(
+                CreateWorkUnit {
+                    work_unit: bob_unit.clone(),
+                    request_id: "shared-request",
+                    principal: "bob",
+                    now_ms: 20,
+                },
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::AlreadyExists(_))
+        ));
+        assert!(db.get_work_unit("work-bob").unwrap().is_none());
+
+        // Retries must keep failing closed — not mint additional units.
+        let retry = lifecycle
+            .create(
+                CreateWorkUnit {
+                    work_unit: bob_unit,
+                    request_id: "shared-request",
+                    principal: "bob",
+                    now_ms: 30,
+                },
+                |_| Ok::<_, ()>(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            retry,
+            CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn transition_rejects_request_id_reuse_across_principals() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        lifecycle
+            .transition(TransitionWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "cancel-shared",
+                principal: "alice",
+                transition: WorkUnitTransition::Cancel("alice-cancel"),
+                now_ms: 10,
+            })
+            .unwrap();
+        let err = lifecycle
+            .transition(TransitionWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "cancel-shared",
+                principal: "bob",
+                transition: WorkUnitTransition::Cancel("bob-cancel"),
+                now_ms: 20,
+            })
+            .unwrap_err();
+        assert!(matches!(err, WorkUnitLifecycleError::AlreadyExists(_)));
     }
 
     #[test]

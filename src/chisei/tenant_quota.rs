@@ -189,9 +189,14 @@ impl TenantQuotaGate {
             reserved.reserved_request = true;
         }
         if limits.max_tokens_per_period.is_some() && estimated_tokens > 0 {
-            self.tracker
-                .check_and_reserve_idempotent(&scope, estimated_tokens, idempotency_key)
-                .map_err(|_| exhausted(METRIC_TOKENS))?;
+            if let Err(err) =
+                self.tracker
+                    .check_and_reserve_idempotent(&scope, estimated_tokens, idempotency_key)
+            {
+                self.rollback_partial(&reserved);
+                let _ = err;
+                return Err(exhausted(METRIC_TOKENS));
+            }
             reserved.reserved_tokens = estimated_tokens;
         }
         if limits.max_concurrency.is_some() {
@@ -432,5 +437,29 @@ mod tests {
         assert_eq!(note.assignment_version, 3);
         assert!(note.exhausted_metric.is_none());
         assert!(note.admitted_metrics.contains(&METRIC_REQUESTS.into()));
+    }
+
+    #[test]
+    fn token_exhaustion_rolls_back_request_reservation() {
+        let gate = gate();
+        let lim = TenantQuotaLimits {
+            max_requests_per_period: Some(1),
+            max_tokens_per_period: Some(5),
+            max_concurrency: None,
+            ..limits(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let a = tenant_context("tenant-a", "alice");
+
+        let err = gate.admit(&a, &lim, 1, 10, "tok-over").unwrap_err();
+        assert!(matches!(
+            err,
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_TOKENS
+        ));
+
+        // Without rollback, the failed admit would consume the only request unit
+        // and this subsequent in-budget admit would fail as METRIC_REQUESTS.
+        let admitted = gate.admit(&a, &lim, 1, 5, "tok-ok").unwrap();
+        gate.complete(&admitted, 5).unwrap();
     }
 }
