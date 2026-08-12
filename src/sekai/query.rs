@@ -44,6 +44,13 @@ pub fn traverse(
     let depth = q.max_depth.clamp(1, MAX_DEPTH);
     let rel_set: HashSet<&str> = q.relations.iter().map(|s| s.as_str()).collect();
     let kind_set: HashSet<&str> = q.kind_filter.iter().map(|s| s.as_str()).collect();
+    // Relation set is query-stable; build the lookup list once instead of
+    // reallocating owned Strings on every frontier node.
+    let rels: Vec<&str> = if rel_set.is_empty() {
+        vec![""]
+    } else {
+        rel_set.iter().copied().collect()
+    };
 
     let mut visited = HashSet::new();
     visited.insert(start_id.clone());
@@ -54,11 +61,6 @@ pub fn traverse(
     for _ in 0..depth {
         let mut next = VecDeque::new();
         while let Some(node_id) = frontier.pop_front() {
-            let rels: Vec<String> = if rel_set.is_empty() {
-                vec!["".to_string()]
-            } else {
-                rel_set.iter().map(|s| s.to_string()).collect()
-            };
             for rel in &rels {
                 let links = db.get_links(&node_id, rel, &q.direction)?;
                 for link in links {
