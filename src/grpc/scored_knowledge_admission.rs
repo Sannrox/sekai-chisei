@@ -185,6 +185,16 @@ pub(super) async fn admit(
         .refresh_snapshot()
         .map_err(|error| format!("learning schema unavailable: {error:?}"))?;
     crate::sekai::learning::record_learning(&service.db, &schema, &params, "chisei.scoring")?;
+    // Refresh the process ACL cache before any post-commit audit work so a
+    // durable private Learning object cannot remain world-readable on cache miss
+    // if later bookkeeping fails.
+    let grants = service.db.list_grants(&learning_id)?;
+    if grants.is_empty() {
+        return Err("record_learning completed without a learning ACL".into());
+    }
+    for grant in &grants {
+        service.security.add_grant(grant);
+    }
     service.db.record_decision(&audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: now_millis(),
@@ -200,12 +210,5 @@ pub(super) async fn admit(
         target_id: target.id,
         outcome: "executed".into(),
     })?;
-    let grants = service.db.list_grants(&learning_id)?;
-    if grants.is_empty() {
-        return Err("record_learning completed without a learning ACL".into());
-    }
-    for grant in &grants {
-        service.security.add_grant(grant);
-    }
     Ok(KnowledgeWriteOutcome::Accepted)
 }

@@ -187,6 +187,10 @@ impl Provider for Anthropic {
                 }
             }
             if !buffer.trim().is_empty() {
+                // A non-empty unread tail after the byte stream ends is only
+                // acceptable when it is itself a complete terminal frame
+                // (for example `message_stop` without a trailing delimiter).
+                // Otherwise refuse to synthesize a successful completion.
                 let parsed = parse_anthropic_sse_event(
                     &buffer,
                     &mut content,
@@ -199,7 +203,13 @@ impl Provider for Anthropic {
                     &mut emitted_done,
                 );
                 let chunks = match parsed {
-                    Ok(chunks) => chunks,
+                    Ok(chunks) if emitted_done => chunks,
+                    Ok(_) => {
+                        yield Err(
+                            "anthropic stream ended with an incomplete SSE frame".into(),
+                        );
+                        return;
+                    }
                     Err(error) => {
                         yield Err(error);
                         return;
@@ -391,9 +401,11 @@ fn parse_anthropic_sse_event(
 ) -> Result<Vec<ChatStreamChunk>, String> {
     let mut chunks = Vec::new();
     for data in event_data_values(event) {
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        if data.trim().is_empty() {
             continue;
-        };
+        }
+        let value = serde_json::from_str::<Value>(&data)
+            .map_err(|error| format!("anthropic stream received malformed SSE JSON: {error}"))?;
         match value["type"].as_str().unwrap_or("") {
             "message_start" => {
                 *input_tokens = value["message"]["usage"]["input_tokens"]
@@ -682,6 +694,36 @@ mod tests {
         assert_eq!(chunks[0].input_tokens, 11);
         assert_eq!(chunks[0].output_tokens, 3);
         assert_eq!(chunks[0].stop_reason, "end_turn");
+    }
+
+    #[test]
+    fn rejects_malformed_sse_json_instead_of_silent_skip() {
+        let mut content = String::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut cache_read_input_tokens = 0;
+        let mut cache_creation_input_tokens = 0;
+        let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
+        let mut emitted_done = false;
+
+        let error = parse_anthropic_sse_event(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"\n",
+            &mut content,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut cache_read_input_tokens,
+            &mut cache_creation_input_tokens,
+            &mut stop_reason,
+            &mut tool_calls,
+            &mut emitted_done,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("malformed SSE JSON"),
+            "expected malformed SSE JSON error, got {error}"
+        );
+        assert!(!emitted_done);
     }
 
     #[test]

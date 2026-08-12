@@ -307,7 +307,19 @@ impl ChiseiServiceImpl {
                         task_class: &task_class,
                         response: &response,
                     };
-                    let _ = finish_streamed_execution(&execution);
+                    if let Err(error) = finish_streamed_execution(&execution) {
+                        if let Err(receipt_error) = record_failed_operation_on(
+                            &db,
+                            &receipt_plan,
+                            &actor,
+                            "stream_bookkeeping_failed",
+                        ) {
+                            yield Err(Status::internal(receipt_error));
+                            return;
+                        }
+                        yield Err(Status::internal(error));
+                        return;
+                    }
                     let completed_at_ms = chrono::Utc::now().timestamp_millis();
                     let answer_path = lookup_refusal
                         .as_ref()
@@ -372,7 +384,19 @@ impl ChiseiServiceImpl {
                     task_class: &task_class,
                     response: &response,
                 };
-                let _ = finish_streamed_execution(&execution);
+                if let Err(error) = finish_streamed_execution(&execution) {
+                    if let Err(receipt_error) = record_failed_operation_on(
+                        &db,
+                        &receipt_plan,
+                        &actor,
+                        "stream_bookkeeping_failed",
+                    ) {
+                        yield Err(Status::internal(receipt_error));
+                        return;
+                    }
+                    yield Err(Status::internal(error));
+                    return;
+                }
                 let completed_at_ms = chrono::Utc::now().timestamp_millis();
                 let answer_path = lookup_refusal
                     .as_ref()
