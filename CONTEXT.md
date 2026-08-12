@@ -48,6 +48,18 @@ The gRPC adapter owns caller authentication, capability-catalog attribution,
 namespace-specific expansion and explanation projection, and protocol metadata.
 PostgreSQL community retrieval remains asserted-only.
 
+## Authorized query
+
+The **Authorized query lifecycle** produces authorization-filtered graph and
+object reads through one private interface. It owns tenant and team-namespace
+admission, ACL read checks, marking visibility, reserved-kind hiding, computed
+property resolution, restricted-property redaction, and canonical projection
+for get, list, find, links, traverse, and lineage.
+
+The gRPC adapter owns caller authentication, catalog-invocation receipts, and
+protocol translation. Semantic retrieval remains a separate reasoning module.
+Object mutation remains write-only.
+
 ## Policy resolution
 
 The **Policy resolution module** produces one permitted route or denial from
