@@ -6082,7 +6082,7 @@ impl SekaiService for SekaiServiceImpl {
                     offset: query.offset,
                 },
             )
-            .map_err(Status::invalid_argument)?;
+            .map_err(Status::internal)?;
         Ok(Response::new(QueryRowsResponse {
             rows: rows.into_iter().map(|values| Row { values }).collect(),
         }))
@@ -7798,6 +7798,42 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(queried.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_rows_reports_corrupt_storage_as_internal() {
+        let svc = service();
+        svc.create_dataset(with_principal(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "corrupt-dataset".into(),
+                name: "corrupt".into(),
+                columns: vec![],
+                object_id: String::new(),
+                created: 1,
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.db
+            .with_sqlite_conn(|connection| {
+                connection.execute(
+                    "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
+                    rusqlite::params!["corrupt-dataset", "not-json"],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let error = svc
+            .query_rows(with_principal(QueryRowsRequest {
+                dataset_id: "corrupt-dataset".into(),
+                query: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(error.message().contains("corrupt dataset row"));
     }
 
     #[tokio::test]

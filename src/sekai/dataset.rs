@@ -285,7 +285,8 @@ impl SekaiDb {
         let mut skipped = 0;
         while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
             let data: String = row.get(0).map_err(|e| e.to_string())?;
-            let map: HashMap<String, String> = serde_json::from_str(&data).unwrap_or_default();
+            let map: HashMap<String, String> = serde_json::from_str(&data)
+                .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))?;
             if !matches_row_filters(&map, &q.filters) {
                 continue;
             }
@@ -549,6 +550,29 @@ mod tests {
             )
             .unwrap();
         assert!(projected[0].contains_key("val") && !projected[0].contains_key("ts"));
+    }
+
+    #[test]
+    fn query_rows_rejects_corrupt_stored_json() {
+        let db = setup();
+        db.create_dataset(&Dataset {
+            id: "corrupt".into(),
+            name: "corrupt".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
+                rusqlite::params!["corrupt", "not-json"],
+            )
+            .unwrap();
+
+        let error = db.query_rows("corrupt", &RowQuery::default()).unwrap_err();
+
+        assert!(error.contains("corrupt dataset row for \"corrupt\""));
     }
 
     #[test]
