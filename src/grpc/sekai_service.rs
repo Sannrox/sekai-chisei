@@ -2162,12 +2162,8 @@ fn from_proto_action_policy(policy: &ActionPolicy) -> Result<action_policy::Acti
     if scope.is_empty() {
         return Err(Status::invalid_argument("policy scope required"));
     }
-    let default_decision = if policy.default_decision.trim().is_empty() {
-        ActionDecision::Allow
-    } else {
-        ActionDecision::parse(&policy.default_decision)
-            .ok_or_else(|| Status::invalid_argument("invalid default_decision"))?
-    };
+    let default_decision = ActionDecision::parse(&policy.default_decision)
+        .ok_or_else(|| Status::invalid_argument("invalid or missing default_decision"))?;
     let mut action_overrides = HashMap::new();
     for (name, decision) in &policy.action_overrides {
         let decision = ActionDecision::parse(decision).ok_or_else(|| {

@@ -300,7 +300,10 @@ pub fn replay_decision(attestation: &PolicyAttestation) -> (bool, String) {
     else {
         return (false, "unparseable policy snapshot".to_string());
     };
-    let policy = ActionPolicy::from_properties(&attestation.policy_scope, &properties);
+    let policy = match ActionPolicy::from_properties(&attestation.policy_scope, &properties) {
+        Ok(policy) => policy,
+        Err(error) => return (false, error),
+    };
     let action = attestation
         .inputs
         .get("action")

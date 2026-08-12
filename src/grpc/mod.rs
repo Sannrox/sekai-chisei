@@ -262,7 +262,7 @@ impl LocalInterceptor {
 
 impl Default for LocalInterceptor {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(true)
     }
 }
 
@@ -384,7 +384,9 @@ pub fn run(
                 sekai_svc.clone(),
                 chisei_svc.clone(),
                 LocalOrTokenAuthInterceptor {
-                    local: LocalInterceptor::new(false),
+                    // Force transport identity on UDS (same as TCP insecure):
+                    // never trust client-supplied x-principal without a bearer.
+                    local: LocalInterceptor::new(true),
                     token: TokenAuthInterceptor::new(credential_store.clone(), db.clone()),
                 },
                 health_service.clone(),
@@ -597,7 +599,10 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    tracing::info!(socket_path, "gRPC server listening on UDS");
+    tracing::info!(
+        socket_path,
+        "gRPC server listening on UDS (mode 0600; unauthenticated callers are forced to principal local)"
+    );
 
     Ok(tonic::transport::Server::builder()
         .layer(MetricsLayer)
@@ -986,7 +991,7 @@ mod tests {
             .unwrap();
         store.load(&db.list_active_credentials().unwrap());
         let mut interceptor = LocalOrTokenAuthInterceptor {
-            local: LocalInterceptor::new(false),
+            local: LocalInterceptor::new(true),
             token: TokenAuthInterceptor::new(Arc::new(store), db),
         };
 
@@ -1008,6 +1013,38 @@ mod tests {
             "gateway-prod"
         );
         assert_eq!(request.metadata().get(AUTH_SOURCE_HEADER).unwrap(), "token");
+    }
+
+    #[test]
+    fn uds_interceptor_overwrites_client_principal_without_bearer() {
+        let db = in_memory_db();
+        let store = PrincipalCredentialStore::new();
+        let mut interceptor = LocalOrTokenAuthInterceptor {
+            local: LocalInterceptor::new(true),
+            token: TokenAuthInterceptor::new(Arc::new(store), db),
+        };
+
+        for forged in ["root", "local", "alice", "chisei-gateway"] {
+            let mut request = Request::new(());
+            request
+                .metadata_mut()
+                .insert("x-principal", MetadataValue::try_from(forged).unwrap());
+            request
+                .metadata_mut()
+                .insert(AUTH_SOURCE_HEADER, MetadataValue::from_static("token"));
+            let request = interceptor.call(request).unwrap();
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("x-principal")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "local",
+                "forged principal {forged:?} must be overwritten"
+            );
+            assert_eq!(request.metadata().get(AUTH_SOURCE_HEADER).unwrap(), "local");
+        }
     }
 
     #[test]

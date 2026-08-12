@@ -9,8 +9,15 @@ private vulnerability reporting.
 ### Local Unix socket
 
 The default `SEKAI_SOCKET=./data/sekai.sock` is the preferred local transport.
-The socket and database should live in a directory accessible only to the
-operator and intended local clients.
+The server binds the socket with mode `0600`. Keep the socket and database in a
+directory accessible only to the operator and intended local clients: socket
+filesystem permissions are the trust boundary for unauthenticated local access.
+
+Unauthenticated UDS callers receive the forced transport principal `local`
+(client `x-principal` is ignored), matching insecure TCP. Present
+`authorization: Bearer <token>` to act as a durable principal. `local` remains
+the reserved local-socket administrative principal used for first-run credential
+issuance; do not share the socket with untrusted local processes.
 
 ### Local insecure TCP
 

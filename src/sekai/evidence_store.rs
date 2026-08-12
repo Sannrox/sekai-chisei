@@ -956,13 +956,19 @@ impl SekaiDb {
                     SELECT 1 FROM sekai_objects team_namespace
                     WHERE team_namespace.kind='namespace'
                       AND team_namespace.external_id='namespace:' || s.namespace
-                      AND json_extract(team_namespace.properties, '$.team_managed')='true'
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed')='true'
+                      )
                  ) OR EXISTS (
                     SELECT 1 FROM sekai_objects team_namespace
                     JOIN sekai_grants team_grant ON team_grant.object_id=team_namespace.id
                     WHERE team_namespace.kind='namespace'
                       AND team_namespace.external_id='namespace:' || s.namespace
-                      AND json_extract(team_namespace.properties, '$.team_managed')='true'
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed')='true'
+                      )
                       AND team_grant.principal IN ({principal_placeholders})
                  ))"
             )

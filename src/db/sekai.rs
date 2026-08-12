@@ -1258,10 +1258,23 @@ impl SekaiDb {
 }
 
 pub(crate) fn row_to_object(row: &rusqlite::Row) -> rusqlite::Result<Object> {
+    let id: String = row.get(0)?;
     let props_str: String = row.get(5)?;
-    let properties: HashMap<String, String> = serde_json::from_str(&props_str).unwrap_or_default();
+    // Fail closed like Postgres: corrupt properties must not become `{}`
+    // (empty maps soften action_policy / namespace_policy / team_managed).
+    let properties: HashMap<String, String> =
+        serde_json::from_str(&props_str).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid properties for object {id}: {error}"),
+                )),
+            )
+        })?;
     Ok(Object {
-        id: row.get(0)?,
+        id,
         kind: row.get(1)?,
         name: row.get(2)?,
         namespace: row.get(3)?,
@@ -1366,7 +1379,10 @@ fn build_visibility_filter_internal(
                  SELECT 1 FROM sekai_objects team_namespace
                  WHERE team_namespace.kind = 'namespace'
                    AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
-                   AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                   AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                   )
              )"
             .to_string(),
             Vec::new(),
@@ -1388,20 +1404,28 @@ fn build_visibility_filter_internal(
     let team_namespace_filter = if privileged {
         String::new()
     } else {
+        // Corrupt boundary properties fail closed as team-managed so listing
+        // cannot treat a broken isolation marker as an open namespace.
         format!(
             " AND (
                 NOT EXISTS (
                     SELECT 1 FROM sekai_objects team_namespace
                     WHERE team_namespace.kind = 'namespace'
                       AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
-                      AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      )
                 )
                 OR EXISTS (
                     SELECT 1 FROM sekai_objects team_namespace
                     JOIN sekai_grants team_grant ON team_grant.object_id = team_namespace.id
                     WHERE team_namespace.kind = 'namespace'
                       AND team_namespace.external_id = 'namespace:' || sekai_objects.namespace
-                      AND json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      AND (
+                        json_valid(team_namespace.properties) = 0
+                        OR json_extract(team_namespace.properties, '$.team_managed') = 'true'
+                      )
                       AND team_grant.principal IN ({principal_placeholders})
                 )
             )"
@@ -1976,6 +2000,102 @@ mod tests {
 
         let good = db.get_object("good").unwrap().unwrap();
         assert_eq!(good.id, "good");
+    }
+
+    fn insert_corrupt_object_properties(db: &SekaiDb, id: &str, kind: &str, external_id: &str) {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO sekai_objects
+             (id, kind, name, namespace, external_id, properties, created, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (id, kind, id, "acme", external_id, "{not-json", 1_i64, 1_i64),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn corrupt_object_properties_fail_closed_with_object_id() {
+        let db = test_db();
+        insert_corrupt_object_properties(&db, "policy-bad", "action_policy", "action_policy:ns");
+        let err = db.get_object("policy-bad").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object policy-bad"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("{not-json"),
+            "error must not leak corrupt payload: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_action_policy_object_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(
+            &db,
+            "action-policy-bad",
+            "action_policy",
+            "action_policy:agent:codex",
+        );
+        let err = db.get_action_policy("agent:codex").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object action-policy-bad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_namespace_policy_object_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(
+            &db,
+            "ns-policy-bad",
+            "namespace_policy",
+            "namespace_policy:acme",
+        );
+        let err = db.find_by_external_id("namespace_policy:acme").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object ns-policy-bad"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_team_managed_namespace_properties_fail_closed() {
+        let db = test_db();
+        insert_corrupt_object_properties(&db, "ns-acme", "namespace", "namespace:acme");
+        db.create_object(&make_obj("secret", "note", "secret"))
+            .unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "UPDATE sekai_objects SET namespace = 'acme' WHERE id = 'secret'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let err = db.find_namespace_boundary("acme").unwrap_err();
+        assert!(
+            err.contains("invalid properties for object ns-acme"),
+            "unexpected error: {err}"
+        );
+
+        let (visible, _) = db
+            .list_objects_with_total_for_principals(
+                &ListFilter {
+                    kind: Some("note".into()),
+                    namespace: Some("acme".into()),
+                    ..Default::default()
+                },
+                &["alice"],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            visible.is_empty(),
+            "corrupt team boundary must not open namespace listing: {visible:?}"
+        );
     }
 
     #[test]
