@@ -11949,8 +11949,9 @@ mod tests {
         assert_eq!(grants[0].principal, "chisei.scoring");
         assert_eq!(grants[0].role, security::Role::Admin);
 
-        // The action inserted the fallback ACL directly in its transaction. The service refreshes
-        // its in-process checker before returning, so the learning is never left world-readable.
+        // The action inserted the fallback ACL directly in its transaction. Admission refreshes
+        // the in-process checker before post-commit audit so the learning is never left
+        // world-readable on a cache miss if later bookkeeping fails.
         let denied = svc
             .get_object(with_named_principal(
                 GetObjectRequest {
