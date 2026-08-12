@@ -65,26 +65,41 @@ pub struct VirtualTable {
     pub created: i64,
 }
 
-fn parse_columns(value: &str) -> Vec<ColumnDef> {
+fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
     if let Ok(columns) = serde_json::from_str::<Vec<(String, String, String)>>(value) {
-        return columns
+        return Ok(columns
             .into_iter()
             .map(|(name, col_type, classification)| ColumnDef {
                 name,
                 col_type,
                 classification,
             })
-            .collect();
+            .collect());
     }
-    serde_json::from_str::<Vec<(String, String)>>(value)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, col_type)| ColumnDef {
-            name,
-            col_type,
-            classification: crate::sekai::schema::default_property_classification(),
-        })
-        .collect()
+    match serde_json::from_str::<Vec<(String, String)>>(value) {
+        Ok(columns) => Ok(columns
+            .into_iter()
+            .map(|(name, col_type)| ColumnDef {
+                name,
+                col_type,
+                classification: crate::sekai::schema::default_property_classification(),
+            })
+            .collect()),
+        Err(error) => Err(format!("corrupt dataset columns: {error}")),
+    }
+}
+
+fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
+    let (Ok(left), Ok(right)) = (left.parse::<f64>(), right.parse::<f64>()) else {
+        return false;
+    };
+    match op {
+        "gt" => left > right,
+        "lt" => left < right,
+        "gte" => left >= right,
+        "lte" => left <= right,
+        _ => false,
+    }
 }
 
 impl SekaiDb {
@@ -116,7 +131,7 @@ impl SekaiDb {
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(stored) = stored {
-            let mut columns = parse_columns(&stored);
+            let mut columns = parse_columns(&stored)?;
             if !columns.iter().any(|column| column.name == "data_class") {
                 let insert_at = columns
                     .iter()
@@ -214,22 +229,32 @@ impl SekaiDb {
 
     pub fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
         let conn = self.conn();
-        conn.query_row(
-            "SELECT id,name,columns,object_id,created FROM sekai_datasets WHERE id=?1",
-            params![id],
-            |row| {
-                let cols_str: String = row.get(2)?;
-                Ok(Dataset {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    columns: parse_columns(&cols_str),
-                    object_id: row.get(3)?,
-                    created: row.get(4)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|e| e.to_string())
+        let row = conn
+            .query_row(
+                "SELECT id,name,columns,object_id,created FROM sekai_datasets WHERE id=?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        row.map(|(id, name, cols_str, object_id, created)| {
+            Ok(Dataset {
+                id,
+                name,
+                columns: parse_columns(&cols_str)?,
+                object_id,
+                created,
+            })
+        })
+        .transpose()
     }
 
     pub fn list_datasets(&self) -> Result<Vec<Dataset>, String> {
@@ -244,7 +269,7 @@ impl SekaiDb {
             results.push(Dataset {
                 id: row.get(0).map_err(|e| e.to_string())?,
                 name: row.get(1).map_err(|e| e.to_string())?,
-                columns: parse_columns(&cols_str),
+                columns: parse_columns(&cols_str)?,
                 object_id: row.get(3).map_err(|e| e.to_string())?,
                 created: row.get(4).map_err(|e| e.to_string())?,
             });
@@ -420,10 +445,11 @@ impl SekaiDb {
         let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             let filters_str: String = row.get(3).map_err(|e| e.to_string())?;
-            let filters: Vec<(String, String, String)> =
-                serde_json::from_str(&filters_str).unwrap_or_default();
+            let filters: Vec<(String, String, String)> = serde_json::from_str(&filters_str)
+                .map_err(|error| format!("corrupt virtual table filters: {error}"))?;
             let cols_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let columns: Vec<String> = serde_json::from_str(&cols_str).unwrap_or_default();
+            let columns: Vec<String> = serde_json::from_str(&cols_str)
+                .map_err(|error| format!("corrupt virtual table columns: {error}"))?;
             results.push(VirtualTable {
                 id: row.get(0).map_err(|e| e.to_string())?,
                 name: row.get(1).map_err(|e| e.to_string())?,
@@ -465,10 +491,7 @@ fn matches_row_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> 
         let ok = match f.op.as_str() {
             "eq" => val == &f.value,
             "neq" => val != &f.value,
-            "gt" => val.parse::<f64>().unwrap_or(0.0) > f.value.parse::<f64>().unwrap_or(0.0),
-            "lt" => val.parse::<f64>().unwrap_or(0.0) < f.value.parse::<f64>().unwrap_or(0.0),
-            "gte" => val.parse::<f64>().unwrap_or(0.0) >= f.value.parse::<f64>().unwrap_or(0.0),
-            "lte" => val.parse::<f64>().unwrap_or(0.0) <= f.value.parse::<f64>().unwrap_or(0.0),
+            "gt" | "lt" | "gte" | "lte" => compare_numeric(val, &f.value, f.op.as_str()),
             _ => false,
         };
         if !ok {
@@ -573,6 +596,78 @@ mod tests {
         let error = db.query_rows("corrupt", &RowQuery::default()).unwrap_err();
 
         assert!(error.contains("corrupt dataset row for \"corrupt\""));
+    }
+
+    #[test]
+    fn get_dataset_rejects_corrupt_column_metadata() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_datasets (id,name,columns,object_id,created)
+                 VALUES ('bad-cols','bad','not-json','',1)",
+                [],
+            )
+            .unwrap();
+
+        let error = db.get_dataset("bad-cols").unwrap_err();
+        assert!(error.contains("corrupt dataset columns"), "{error}");
+        let list_error = db.list_datasets().unwrap_err();
+        assert!(
+            list_error.contains("corrupt dataset columns"),
+            "{list_error}"
+        );
+    }
+
+    #[test]
+    fn numeric_filters_do_not_treat_non_numeric_as_zero() {
+        let db = setup();
+        db.create_dataset(&Dataset {
+            id: "nums".into(),
+            name: "nums".into(),
+            columns: vec![ColumnDef {
+                name: "val".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+        })
+        .unwrap();
+        db.append_rows("nums", &[HashMap::from([("val".into(), "N/A".into())])])
+            .unwrap();
+
+        let matched = db
+            .query_rows(
+                "nums",
+                &RowQuery {
+                    filters: vec![RowFilter {
+                        column: "val".into(),
+                        op: "lt".into(),
+                        value: "10".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            matched.is_empty(),
+            "non-numeric cells must not match lt via 0.0"
+        );
+    }
+
+    #[test]
+    fn list_virtual_tables_rejects_corrupt_filters() {
+        let db = setup();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_virtual_tables (id,name,dataset_id,filters,columns,created)
+                 VALUES ('vt1','vt1','ds1','not-json','[]',1)",
+                [],
+            )
+            .unwrap();
+
+        let error = db.list_virtual_tables().unwrap_err();
+        assert!(error.contains("corrupt virtual table filters"), "{error}");
     }
 
     #[test]

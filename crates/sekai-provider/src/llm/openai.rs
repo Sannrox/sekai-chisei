@@ -184,6 +184,10 @@ impl Provider for OpenAI {
                 }
             }
             if !buffer.trim().is_empty() {
+                // A non-empty unread tail after the byte stream ends is only
+                // acceptable when it is itself a complete terminal frame
+                // (for example `data: [DONE]` without a trailing delimiter).
+                // Otherwise refuse to synthesize a successful completion.
                 let parsed = parse_openai_sse_event(
                     &buffer,
                     &mut content,
@@ -194,7 +198,13 @@ impl Provider for OpenAI {
                     &mut emitted_done,
                 );
                 let chunks = match parsed {
-                    Ok(chunks) => chunks,
+                    Ok(chunks) if emitted_done => chunks,
+                    Ok(_) => {
+                        yield Err(
+                            "openai stream ended with an incomplete SSE frame".into(),
+                        );
+                        return;
+                    }
                     Err(error) => {
                         yield Err(error);
                         return;
@@ -341,9 +351,11 @@ fn parse_openai_sse_event(
             }
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+        if data.trim().is_empty() {
             continue;
-        };
+        }
+        let value = serde_json::from_str::<Value>(&data)
+            .map_err(|error| format!("openai stream received malformed SSE JSON: {error}"))?;
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             *input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
             *output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
@@ -579,6 +591,32 @@ mod tests {
         assert_eq!(chunks[0].content, "hello");
         assert_eq!(chunks[0].input_tokens, 7);
         assert_eq!(chunks[0].output_tokens, 5);
+    }
+
+    #[test]
+    fn rejects_malformed_sse_json_instead_of_silent_skip() {
+        let mut content = String::new();
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut stop_reason = String::new();
+        let mut tool_calls = BTreeMap::new();
+        let mut emitted_done = false;
+
+        let error = parse_openai_sse_event(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}\n",
+            &mut content,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut stop_reason,
+            &mut tool_calls,
+            &mut emitted_done,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("malformed SSE JSON"),
+            "expected malformed SSE JSON error, got {error}"
+        );
+        assert!(!emitted_done);
     }
 
     #[test]

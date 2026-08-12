@@ -328,15 +328,23 @@ fn matches_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> bool
         match filter.op.as_str() {
             "eq" => value == &filter.value,
             "neq" => value != &filter.value,
-            "gt" => numeric(value) > numeric(&filter.value),
-            "lt" => numeric(value) < numeric(&filter.value),
-            "gte" => numeric(value) >= numeric(&filter.value),
-            "lte" => numeric(value) <= numeric(&filter.value),
+            "gt" | "lt" | "gte" | "lte" => {
+                compare_numeric(value, &filter.value, filter.op.as_str())
+            }
             _ => false,
         }
     })
 }
 
-fn numeric(value: &str) -> f64 {
-    value.parse().unwrap_or(0.0)
+fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
+    let (Ok(left), Ok(right)) = (left.parse::<f64>(), right.parse::<f64>()) else {
+        return false;
+    };
+    match op {
+        "gt" => left > right,
+        "lt" => left < right,
+        "gte" => left >= right,
+        "lte" => left <= right,
+        _ => false,
+    }
 }
