@@ -538,7 +538,7 @@ where
             let adjacent = &adjacency_cache[&current_id];
 
             for (link, target_id) in adjacent {
-                let Some(target) = load_object(db, &target_id, &mut object_cache)? else {
+                let Some(target) = load_object(db, target_id, &mut object_cache)? else {
                     continue;
                 };
                 if is_forbidden(&target) || !can_read(&target) {
