@@ -199,6 +199,23 @@ impl OntologyRegistry {
         kind: &str,
         expected: &str,
     ) -> Option<Vec<(String, String, &'static str)>> {
+        // Reverse-equivalence edges used to rescan every class at each BFS
+        // node (O(|classes|) per hop). Index once up front so each hop is
+        // proportional to that class's declared edges.
+        let mut reverse_equivalence: HashMap<&str, Vec<&str>> = HashMap::new();
+        for class in self.classes.values() {
+            for equivalent in &class.equivalent_classes {
+                reverse_equivalence
+                    .entry(equivalent.as_str())
+                    .or_default()
+                    .push(class.name.as_str());
+            }
+        }
+        for names in reverse_equivalence.values_mut() {
+            names.sort_unstable();
+            names.dedup();
+        }
+
         let mut reachable = HashSet::new();
         let mut starts = self
             .classes
@@ -235,10 +252,11 @@ impl OntologyRegistry {
                         .map(|target| (target.clone(), "equivalence")),
                 )
                 .chain(
-                    self.classes
-                        .values()
-                        .filter(|candidate| candidate.equivalent_classes.contains(&current))
-                        .map(|candidate| (candidate.name.clone(), "equivalence")),
+                    reverse_equivalence
+                        .get(current.as_str())
+                        .into_iter()
+                        .flatten()
+                        .map(|name| ((*name).to_string(), "equivalence")),
                 )
                 .collect::<Vec<_>>();
             edges.sort();
