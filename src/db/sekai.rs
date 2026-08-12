@@ -1165,23 +1165,24 @@ impl SekaiDb {
         relation: &str,
         dir: &Direction,
     ) -> Result<Vec<Link>, String> {
+        // Static SQL variants keep statement text cacheable; prepare_cached avoids
+        // recompiling the same adjacency lookup on every traverse/lineage/retrieval hop.
+        let sql = match (dir, relation.is_empty()) {
+            (Direction::Outgoing, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1"
+            }
+            (Direction::Outgoing, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 AND relation = ?2"
+            }
+            (Direction::Incoming, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1"
+            }
+            (Direction::Incoming, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 AND relation = ?2"
+            }
+        };
         let conn = self.conn();
-        let col = match dir {
-            Direction::Outgoing => "from_id",
-            Direction::Incoming => "to_id",
-        };
-        let sql = if relation.is_empty() {
-            format!(
-                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {} = ?1",
-                col
-            )
-        } else {
-            format!(
-                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {} = ?1 AND relation = ?2",
-                col
-            )
-        };
-        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
         let mut results = Vec::new();
         let mut rows = if relation.is_empty() {
             stmt.query(params![object_id]).map_err(|e| e.to_string())?
@@ -1205,22 +1206,25 @@ impl SekaiDb {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let conn = self.conn();
-        let col = match dir {
-            Direction::Outgoing => "from_id",
-            Direction::Incoming => "to_id",
+        let sql = match (dir, relation.is_empty()) {
+            (Direction::Outgoing, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
+            }
+            (Direction::Outgoing, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE from_id = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
+            }
+            (Direction::Incoming, true) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
+            }
+            (Direction::Incoming, false) => {
+                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE to_id = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
+            }
         };
         let limit = limit.min(i64::MAX as usize) as i64;
-        let sql = if relation.is_empty() {
-            format!(
-                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {col} = ?1 ORDER BY relation, id, from_id, to_id LIMIT ?2"
-            )
-        } else {
-            format!(
-                "SELECT id, from_id, to_id, relation, created FROM sekai_links WHERE {col} = ?1 AND relation = ?2 ORDER BY relation, id, from_id, to_id LIMIT ?3"
-            )
-        };
-        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|error| error.to_string())?;
         let rows = if relation.is_empty() {
             stmt.query_map(params![object_id, limit], row_to_link)
                 .map_err(|error| error.to_string())?
@@ -2098,6 +2102,22 @@ mod tests {
             .unwrap();
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].to_id, "c1");
+
+        let all_outgoing = db.get_links("r1", "", &Direction::Outgoing).unwrap();
+        assert_eq!(all_outgoing.len(), 1);
+        assert_eq!(all_outgoing[0].relation, "contains");
+
+        let limited = db
+            .get_links_limited("r1", "contains", &Direction::Outgoing, 1)
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].to_id, "c1");
+
+        let limited_all = db
+            .get_links_limited("c1", "", &Direction::Incoming, 1)
+            .unwrap();
+        assert_eq!(limited_all.len(), 1);
+        assert_eq!(limited_all[0].from_id, "r1");
 
         let objs = db
             .get_linked_objects("r1", "contains", &Direction::Outgoing)
