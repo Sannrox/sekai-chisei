@@ -5990,15 +5990,21 @@ impl SekaiService for SekaiServiceImpl {
             .ok_or(Status::not_found("dataset not found"))?;
         check_dataset_access(&self.db, &self.security, &principals, &existing, true)?;
         if existing.object_id.is_empty() {
-            let root = principals.iter().any(|principal| principal == "root");
+            // Unbound system datasets are not ACL-bound. Allow reserved
+            // control-plane admins (`root` / UDS transport `local`) and the
+            // gateway service principal for `llm_calls` schema convergence.
+            // UDS force-local identity must not block sekaictl gateway setup.
+            let control_plane_admin = principals
+                .iter()
+                .any(|principal| matches!(principal.as_str(), "root" | "local"));
             let trusted_gateway = parsed.id == "llm_calls"
                 && principals.iter().any(|principal| {
                     principal == "chisei-gateway"
                         || self.gateway_schema_principals.contains(principal)
                 });
-            if !root && !trusted_gateway {
+            if !control_plane_admin && !trusted_gateway {
                 return Err(Status::permission_denied(
-                    "unbound dataset updates require the gateway service principal",
+                    "unbound dataset updates require control-plane administration or the gateway service principal",
                 ));
             }
         }
@@ -7918,7 +7924,7 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
 
         let updated = svc
-            .update_dataset(with_named_principal(update, "gateway-prod"))
+            .update_dataset(with_named_principal(update.clone(), "gateway-prod"))
             .await
             .unwrap()
             .into_inner()
@@ -7927,6 +7933,32 @@ mod tests {
         assert_eq!(updated.name, "updated");
         assert_eq!(updated.columns[0].name, "receipt_id");
         assert_eq!(updated.created, 1);
+
+        // Reserved UDS/local-socket admin can converge llm_calls without a
+        // spoofed gateway principal (matches force-local transport identity).
+        let local_updated = svc
+            .update_dataset(with_named_principal(
+                UpdateDatasetRequest {
+                    dataset: Some(Dataset {
+                        id: "llm_calls".into(),
+                        name: "local-admin".into(),
+                        columns: vec![ColumnDef {
+                            name: "receipt_id".into(),
+                            r#type: "string".into(),
+                            classification: "public".into(),
+                        }],
+                        object_id: String::new(),
+                        created: 1000,
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .dataset
+            .unwrap();
+        assert_eq!(local_updated.name, "local-admin");
 
         svc.create_dataset(with_principal(CreateDatasetRequest {
             dataset: Some(Dataset {
