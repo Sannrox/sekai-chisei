@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "NativePlanExecutionLifecycle",
+      "description": "Deep private Chisei module whose interface executes one cached native ExecutionPlan and owns lookup-first short-circuit, live evaluation regression gate, residency/privacy/egress rechecks, provider streaming, evolve/scoring bookkeeping, and terminal receipt completion.",
+      "superclasses": []
+    },
+    {
+      "name": "ChiseiGrpcTransportAdapter",
+      "description": "gRPC adapter that authenticates native plan execution callers, translates protocol messages, and delegates to Native plan execution.",
+      "superclasses": []
+    }
+  ],
+  "relations": [
+    {
+      "name": "delegates_native_plan_execution_to",
+      "description": "The gRPC transport delegates native plan execution after caller authentication and enterprise context extraction.",
+      "domain": "ChiseiGrpcTransportAdapter",
+      "range": "NativePlanExecutionLifecycle"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "NativePlanExecutionLifecycle",
+      "source": "src/grpc/chisei_service/native_execution_lifecycle.rs",
+      "locator": "ChiseiServiceImpl::execute_planned_stream",
+      "confidence": 1.0
+    },
+    {
+      "subject": "ChiseiGrpcTransportAdapter",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "ChiseiService::execute_plan_stream",
+      "confidence": 1.0
+    },
+    {
+      "subject": "delegates_native_plan_execution_to",
+      "source": "src/grpc/chisei_service.rs",
+      "locator": "execute_planned_stream call",
+      "confidence": 1.0
+    }
+  ]
+}

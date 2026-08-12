@@ -84,6 +84,17 @@ The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline.
 
+## Native plan execution
+
+The **Native plan execution lifecycle** runs one cached executable plan through
+a single private ordered path. It owns lookup-first short-circuit, the live
+evaluation regression gate, residency/privacy/egress rechecks, provider
+streaming, evolve/scoring bookkeeping, and terminal receipt completion.
+
+The gRPC adapter owns caller authentication and protocol translation. Planning
+remains a separate private pipeline; Action execution is a distinct Sekai
+concept and is not this lifecycle.
+
 ## Kioku candidate governance
 
 The **Kioku candidate governance lifecycle** owns authorized candidate
