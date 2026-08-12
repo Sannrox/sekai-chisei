@@ -6,6 +6,16 @@ TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/chisei-gateway-smoke.XXXXXX")"
 PIDS=()
 
 cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "gateway smoke failed (exit $status); dumping logs from $TMPDIR" >&2
+    for f in setup-codex.log setup-claude.log sekai.log gateway.log; do
+      if [ -f "$TMPDIR/$f" ]; then
+        echo "=== $f ===" >&2
+        sed -n '1,160p' "$TMPDIR/$f" >&2 || true
+      fi
+    done
+  fi
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done

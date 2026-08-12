@@ -36,7 +36,7 @@ impl PostgresDb {
                 let body: String = row.get(0);
                 let properties = serde_json::from_str(&body)
                     .map_err(|e| format!("corrupt action policy {scope}: {e}"))?;
-                Ok(ActionPolicy::from_properties(scope, &properties))
+                ActionPolicy::from_properties(scope, &properties)
             })
             .transpose()
     }
@@ -54,7 +54,7 @@ impl PostgresDb {
                 let body: String = row.get(1);
                 let properties = serde_json::from_str(&body)
                     .map_err(|e| format!("corrupt action policy {scope}: {e}"))?;
-                Ok(ActionPolicy::from_properties(&scope, &properties))
+                ActionPolicy::from_properties(&scope, &properties)
             })
             .collect()
     }

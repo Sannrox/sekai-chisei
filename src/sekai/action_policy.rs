@@ -128,58 +128,113 @@ impl ActionPolicy {
         properties
     }
 
-    /// Parse from a Sekai object property map. Unknown/invalid override tokens
-    /// are skipped rather than failing the whole policy load.
-    pub fn from_properties(scope: &str, properties: &HashMap<String, String>) -> Self {
-        let default_decision = properties
+    /// Parse from a Sekai object property map.
+    ///
+    /// Fail closed when a durable policy body is present but incomplete or
+    /// corrupted: missing/unknown `default_decision` and unparsable override
+    /// tokens are errors (never silently coerced to allow-all).
+    pub fn from_properties(
+        scope: &str,
+        properties: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        let Some(raw_default) = properties
             .get("default_decision")
-            .and_then(|value| ActionDecision::parse(value))
-            .unwrap_or(ActionDecision::Allow);
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(format!(
+                "action policy {scope:?} is missing default_decision"
+            ));
+        };
+        let Some(default_decision) = ActionDecision::parse(raw_default) else {
+            return Err(format!(
+                "action policy {scope:?} has invalid default_decision"
+            ));
+        };
 
         let mut action_overrides = HashMap::new();
         if let Some(raw) = properties.get("action_overrides") {
             for pair in raw.split(',').filter(|token| !token.trim().is_empty()) {
-                if let Some((name, decision)) = pair.split_once(':')
-                    && let Some(decision) = ActionDecision::parse(decision)
-                {
-                    action_overrides.insert(name.trim().to_string(), decision);
+                let Some((name, decision)) = pair.split_once(':') else {
+                    return Err(format!(
+                        "action policy {scope:?} has unparsable action override"
+                    ));
+                };
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(format!(
+                        "action policy {scope:?} has unparsable action override"
+                    ));
                 }
+                let Some(decision) = ActionDecision::parse(decision) else {
+                    return Err(format!(
+                        "action policy {scope:?} has invalid action override decision"
+                    ));
+                };
+                action_overrides.insert(name.to_string(), decision);
             }
         }
 
         let mut risk_overrides = HashMap::new();
         if let Some(raw) = properties.get("risk_overrides") {
             for pair in raw.split(',').filter(|token| !token.trim().is_empty()) {
-                if let Some((risk, decision)) = pair.split_once(':')
-                    && let (Some(risk), Some(decision)) =
-                        (RiskClass::parse(risk), ActionDecision::parse(decision))
-                {
-                    risk_overrides.insert(risk, decision);
-                }
+                let Some((risk, decision)) = pair.split_once(':') else {
+                    return Err(format!(
+                        "action policy {scope:?} has unparsable risk override"
+                    ));
+                };
+                let Some(risk) = RiskClass::parse(risk) else {
+                    return Err(format!(
+                        "action policy {scope:?} has invalid risk override class"
+                    ));
+                };
+                let Some(decision) = ActionDecision::parse(decision) else {
+                    return Err(format!(
+                        "action policy {scope:?} has invalid risk override decision"
+                    ));
+                };
+                risk_overrides.insert(risk, decision);
             }
         }
 
-        Self {
+        Ok(Self {
             scope: scope.to_string(),
             default_decision,
             action_overrides,
             risk_overrides,
             max_mutations_per_work_unit: parse_optional_u32(
+                scope,
+                "max_mutations_per_work_unit",
                 properties.get("max_mutations_per_work_unit"),
-            ),
+            )?,
             max_deletes_per_work_unit: parse_optional_u32(
+                scope,
+                "max_deletes_per_work_unit",
                 properties.get("max_deletes_per_work_unit"),
-            ),
-        }
+            )?,
+        })
     }
 }
 
-fn parse_optional_u32(value: Option<&String>) -> Option<u32> {
-    value
+fn parse_optional_u32(
+    scope: &str,
+    field: &str,
+    value: Option<&String>,
+) -> Result<Option<u32>, String> {
+    let Some(raw) = value
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0)
+    else {
+        return Ok(None);
+    };
+    let parsed = raw
+        .parse::<u32>()
+        .map_err(|_| format!("action policy {scope:?} has invalid {field}"))?;
+    if parsed == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
+    }
 }
 
 /// Candidate scopes for an action, most specific first: actor, then project
@@ -239,9 +294,9 @@ impl SekaiDb {
     /// Fetch the action policy for an exact scope, if one exists.
     pub fn get_action_policy(&self, scope: &str) -> Result<Option<ActionPolicy>, String> {
         let external_id = action_policy_external_id(scope);
-        Ok(self
-            .find_by_external_id(&external_id)?
-            .map(|object| ActionPolicy::from_properties(scope, &object.properties)))
+        self.find_by_external_id(&external_id)?
+            .map(|object| ActionPolicy::from_properties(scope, &object.properties))
+            .transpose()
     }
 
     /// List all stored action policies, ordered by scope.
@@ -265,7 +320,7 @@ impl SekaiDb {
                 };
                 ActionPolicy::from_properties(&scope, &object.properties)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         policies.sort_by(|a, b| a.scope.cmp(&b.scope));
         Ok(policies)
     }
@@ -397,32 +452,55 @@ mod tests {
     fn properties_round_trip() {
         let policy = policy_with_overrides();
         let properties = policy.to_properties();
-        let restored = ActionPolicy::from_properties("agent:codex-app", &properties);
+        let restored = ActionPolicy::from_properties("agent:codex-app", &properties).unwrap();
         assert_eq!(restored, policy);
     }
 
     #[test]
-    fn from_properties_defaults_to_allow_and_skips_bad_tokens() {
-        let mut properties = HashMap::new();
-        properties.insert(
-            "action_overrides".to_string(),
-            "good:deny,broken".to_string(),
+    fn from_properties_rejects_unknown_default_decision() {
+        let properties = HashMap::from([("default_decision".to_string(), "typo".to_string())]);
+        let err = ActionPolicy::from_properties("ns", &properties).unwrap_err();
+        assert!(
+            err.contains("invalid default_decision"),
+            "unexpected error: {err}"
         );
-        properties.insert(
-            "risk_overrides".to_string(),
-            "destructive:deny,notarisk:allow,write:bogus".to_string(),
+    }
+
+    #[test]
+    fn from_properties_rejects_missing_default_decision() {
+        let err = ActionPolicy::from_properties("ns", &HashMap::new()).unwrap_err();
+        assert!(
+            err.contains("missing default_decision"),
+            "unexpected error: {err}"
         );
-        let policy = ActionPolicy::from_properties("ns", &properties);
-        assert_eq!(policy.default_decision, ActionDecision::Allow);
-        assert_eq!(policy.action_overrides.len(), 1);
-        assert_eq!(
-            policy.action_overrides.get("good"),
-            Some(&ActionDecision::Deny)
+    }
+
+    #[test]
+    fn from_properties_rejects_unparsable_override_tokens() {
+        let properties = HashMap::from([
+            ("default_decision".to_string(), "allow".to_string()),
+            (
+                "action_overrides".to_string(),
+                "good:deny,broken".to_string(),
+            ),
+        ]);
+        let err = ActionPolicy::from_properties("ns", &properties).unwrap_err();
+        assert!(
+            err.contains("unparsable action override"),
+            "unexpected error: {err}"
         );
-        assert_eq!(policy.risk_overrides.len(), 1);
-        assert_eq!(
-            policy.risk_overrides.get(&RiskClass::Destructive),
-            Some(&ActionDecision::Deny)
+
+        let properties = HashMap::from([
+            ("default_decision".to_string(), "deny".to_string()),
+            (
+                "risk_overrides".to_string(),
+                "destructive:deny,write:bogus".to_string(),
+            ),
+        ]);
+        let err = ActionPolicy::from_properties("ns", &properties).unwrap_err();
+        assert!(
+            err.contains("invalid risk override decision"),
+            "unexpected error: {err}"
         );
     }
 

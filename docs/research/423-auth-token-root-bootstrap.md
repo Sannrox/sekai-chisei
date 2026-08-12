@@ -61,14 +61,15 @@ no structural claim for this decision.
 
 ### Local UDS
 
-The default server creates a local Unix socket. Requests without a bearer token
-receive local transport authority, and `sekaictl credential create` defaults to
-that socket. This is the supported first-run path for issuing durable
+The default server creates a local Unix socket (mode `0600`). Requests without a
+bearer token receive forced local transport authority (`x-principal` is
+overwritten to `local`), and `sekaictl credential create` defaults to that
+socket. This is the supported first-run path for issuing durable
 principal-scoped credentials.
 
 The socket and database therefore remain sensitive local operator boundaries.
-Removing the legacy TCP root token does not require weakening UDS identity or
-accepting caller-supplied principal authority over TCP.
+Removing the legacy TCP root token does not require accepting caller-supplied
+principal authority on UDS or over TCP.
 
 ### Managed local launch
 

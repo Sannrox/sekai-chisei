@@ -62,7 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(socket_path) = &config.sekai_socket {
-        tracing::info!(socket_path, "gRPC UDS listener enabled");
+        tracing::info!(
+            socket_path,
+            "gRPC UDS listener enabled (socket mode 0600; protect the socket directory; unauthenticated identity is forced to local)"
+        );
     }
     tracing::info!(
         db_path = %config.db_path,

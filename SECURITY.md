@@ -44,10 +44,12 @@ For network-accessible deployments, issue principal-scoped credentials with
 `SEKAI_CREDENTIAL`; the server does not accept an environment bootstrap token.
 `0.0.0.0` requires TLS (`SEKAI_TLS_CERT` + `SEKAI_TLS_KEY`) unless
 `SEKAI_ALLOW_PLAINTEXT=1` is explicitly set.
-On localhost socket paths and `SEKAI_INSECURE=1`, callers rely on local
-transport trust and may assert `x-principal` headers for compatibility. Protect
-the socket directory and do not treat this header as a network authentication
-mechanism.
+`SEKAI_INSECURE=1` TCP trusts local transport and forces the caller principal to
+`local` (client `x-principal` is ignored). The default Unix socket
+(`SEKAI_SOCKET`) uses the same forced-`local` identity when no bearer token is
+present; bearer credentials still overwrite the principal from the credential
+store. Protect the socket path and its directory (the server sets socket mode
+`0600`) and never treat client-supplied `x-principal` as authentication.
 
 Do not commit:
 
