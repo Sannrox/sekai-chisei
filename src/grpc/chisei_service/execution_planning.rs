@@ -8,6 +8,7 @@
 //! recorded after Gunshi stamps so allocation identity is present; they are
 //! not folded into `plan_from_input`.
 
+use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
 impl ChiseiServiceImpl {

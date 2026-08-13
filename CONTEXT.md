@@ -73,7 +73,8 @@ canonicalization, and fallback projection.
 
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
-manufacturing transport requests.
+manufacturing transport requests. Live-model resolution and final-runtime
+helpers are shared private implementation with native execution planning.
 
 ## Gateway decide
 
@@ -139,7 +140,8 @@ protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline. Plan receipts are recorded after Gunshi
 stamps so allocation identity is present on the receipt. Leak, privacy, and
 egress-audit helpers are shared private implementation with native plan
-execution.
+execution. Live-model resolution and final-runtime helpers are shared private
+implementation with policy resolution.
 
 ## Native plan execution
 
