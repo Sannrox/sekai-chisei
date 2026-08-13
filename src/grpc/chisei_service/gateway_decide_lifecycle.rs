@@ -409,4 +409,86 @@ impl ChiseiServiceImpl {
 
         Ok(response)
     }
+
+    pub(super) fn gateway_pipeline_decision(
+        &self,
+        input: GatewayPipelineInput<'_>,
+    ) -> Result<GatewayPipelineDecision, Status> {
+        let context_actor = execution_context_actor(
+            &self.db,
+            &self.config,
+            input.actor,
+            input.delegated_principal,
+            input.namespace,
+        )?;
+        let context_admission_policy = self
+            .policy
+            .context_admission_policy(input.namespace)
+            .map_err(Status::failed_precondition)?;
+        let mut request = pipe::PipelineRequest {
+            request_id: input.request_id.to_string(),
+            namespace: input.namespace.to_string(),
+            spec: input.spec.to_string(),
+            model: input.model.to_string(),
+            runtime: input.runtime.to_string(),
+            task_type: "gateway_llm_call".into(),
+            priority: 0,
+            risk_score: 0.0,
+            budget_pressure: self.budget.namespace_pressure(input.namespace),
+            review_model: String::new(),
+            egress_records: vec![],
+            external_egress: true,
+            template_only: TaskClass::parse(input.task_class) == TaskClass::TemplateOnly,
+            expanded_context_items: 0,
+            evidence_references: vec![],
+            memory_references: vec![],
+            memory_holdouts: vec![],
+            memory_actor: context_actor,
+            memory_assignment_id: String::new(),
+            memory_token_budget: 512,
+            allowed_evidence_classes: HashSet::new(),
+            context_admission_policy,
+            context_admission: pipe::ContextAdmissionSummary::default(),
+            risk_score_ready: false,
+            risk_signals: vec![],
+            operation_risk_override: None,
+        };
+        let context_expansion_gate = self.pipeline_context_expansion_gate(input.namespace);
+        let evidence_context_gates =
+            self.applicable_evidence_context_gates(&request, context_expansion_gate.allowed)?;
+        let allowed_evidence_classes = evidence_context_gates
+            .iter()
+            .filter(|class_gate| class_gate.effective_allowed)
+            .map(|class_gate| pipe::EvidenceContextClass {
+                source_type: class_gate.source_type.clone(),
+                evidence_type: class_gate.evidence_type.clone(),
+            })
+            .collect::<HashSet<_>>();
+        let run = self.pipeline.run_with_context_admission(
+            &mut request,
+            &self.db,
+            context_expansion_gate.allowed,
+            allowed_evidence_classes,
+        );
+        self.record_context_expansion_gate(
+            input.request_id,
+            input.namespace,
+            &context_expansion_gate,
+            run.expanded_context_items,
+        )?;
+        self.record_evidence_context_gates(
+            input.request_id,
+            input.namespace,
+            &evidence_context_gates,
+            &run.evidence_references,
+        )?;
+        let sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
+            crate::chisei::sampling::SamplingDecision {
+                sampled: false,
+                effective_rate: self.config.sample_rate,
+                reason: "not_sampled".into(),
+            },
+        );
+        Ok(GatewayPipelineDecision { run, sampling })
+    }
 }

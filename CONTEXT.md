@@ -80,7 +80,7 @@ The **Gateway decide lifecycle** produces one admit or deny decision from
 authenticated gateway execution input. Its private interface owns namespace
 admission, trusted-gateway scope checks, context-admission gates, token and
 request budget plus continuation degradation, policy resolution, sampling,
-audit, and decision projection.
+audit, decision projection, and admitted pipeline enrichment.
 
 The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
