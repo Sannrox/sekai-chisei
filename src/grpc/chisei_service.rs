@@ -63,6 +63,7 @@ mod gunshi_issuance_lifecycle;
 mod kioku_candidate_governance;
 mod native_execution_lifecycle;
 mod policy_resolution;
+mod privacy_egress;
 mod reported_operation_event_lifecycle;
 
 #[cfg(test)]
@@ -80,8 +81,6 @@ pub struct ChiseiServiceImpl {
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
-    evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
-    stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
     evaluation_execution_lifecycle: evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
     db: Arc<RuntimeDb>,
     config: Config,
@@ -2204,8 +2203,8 @@ impl ChiseiServiceImpl {
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
                 db.clone(),
                 budget.clone(),
-                evaluator_registry.clone(),
-                stochastic_evaluator_registry.clone(),
+                evaluator_registry,
+                stochastic_evaluator_registry,
                 crate::chisei::privacy::safe_providers(&config),
             );
         Self {
@@ -2218,75 +2217,11 @@ impl ChiseiServiceImpl {
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
-            evaluator_registry,
-            stochastic_evaluator_registry,
             evaluation_execution_lifecycle,
             db,
             config,
             provider_registry_state_path,
         }
-    }
-
-    fn ensure_external_evaluator_registered(
-        &self,
-        definition: &evaluation_plan_domain::EvaluatorDefinition,
-    ) {
-        if definition.execution_class != evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS {
-            return;
-        }
-        if let Err(error) = self.evaluator_registry.register_external_adapter(
-            &definition.namespace,
-            &definition.content_digest,
-            &definition.implementation_digest,
-            &definition.adapter_endpoint,
-        ) {
-            tracing::warn!(
-                namespace = %definition.namespace,
-                implementation_digest = %definition.implementation_digest,
-                error = %error,
-                "external evaluator adapter is not executable"
-            );
-        }
-    }
-
-    fn evaluator_capability(
-        &self,
-        definition: &evaluation_plan_domain::EvaluatorDefinition,
-    ) -> (bool, String) {
-        self.ensure_external_evaluator_registered(definition);
-        let executable = match definition.execution_class.as_str() {
-            evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS => self
-                .evaluator_registry
-                .contains(&definition.implementation_digest),
-            evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS => {
-                evaluation_execution_domain::external_adapter_secret_configured()
-                    && self.evaluator_registry.contains_external_adapter(
-                        &definition.namespace,
-                        &definition.content_digest,
-                        &definition.implementation_digest,
-                    )
-            }
-            evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS => self
-                .stochastic_evaluator_registry
-                .contains(&definition.implementation_digest),
-            _ => false,
-        };
-        (
-            executable,
-            if executable {
-                "executable"
-            } else if matches!(
-                definition.execution_class.as_str(),
-                evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS
-                    | evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
-                    | evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
-            ) {
-                "unavailable"
-            } else {
-                "unsupported"
-            }
-            .into(),
-        )
     }
 
     fn pipeline_context_expansion_gate(
@@ -2494,88 +2429,6 @@ impl ChiseiServiceImpl {
             .map_err(Status::internal)
     }
 
-    fn gateway_pipeline_decision(
-        &self,
-        input: GatewayPipelineInput<'_>,
-    ) -> Result<GatewayPipelineDecision, Status> {
-        let context_actor = execution_context_actor(
-            &self.db,
-            &self.config,
-            input.actor,
-            input.delegated_principal,
-            input.namespace,
-        )?;
-        let context_admission_policy = self
-            .policy
-            .context_admission_policy(input.namespace)
-            .map_err(Status::failed_precondition)?;
-        let mut request = pipe::PipelineRequest {
-            request_id: input.request_id.to_string(),
-            namespace: input.namespace.to_string(),
-            spec: input.spec.to_string(),
-            model: input.model.to_string(),
-            runtime: input.runtime.to_string(),
-            task_type: "gateway_llm_call".into(),
-            priority: 0,
-            risk_score: 0.0,
-            budget_pressure: self.budget.namespace_pressure(input.namespace),
-            review_model: String::new(),
-            egress_records: vec![],
-            external_egress: true,
-            template_only: TaskClass::parse(input.task_class) == TaskClass::TemplateOnly,
-            expanded_context_items: 0,
-            evidence_references: vec![],
-            memory_references: vec![],
-            memory_holdouts: vec![],
-            memory_actor: context_actor,
-            memory_assignment_id: String::new(),
-            memory_token_budget: 512,
-            allowed_evidence_classes: HashSet::new(),
-            context_admission_policy,
-            context_admission: pipe::ContextAdmissionSummary::default(),
-            risk_score_ready: false,
-            risk_signals: vec![],
-            operation_risk_override: None,
-        };
-        let context_expansion_gate = self.pipeline_context_expansion_gate(input.namespace);
-        let evidence_context_gates =
-            self.applicable_evidence_context_gates(&request, context_expansion_gate.allowed)?;
-        let allowed_evidence_classes = evidence_context_gates
-            .iter()
-            .filter(|class_gate| class_gate.effective_allowed)
-            .map(|class_gate| pipe::EvidenceContextClass {
-                source_type: class_gate.source_type.clone(),
-                evidence_type: class_gate.evidence_type.clone(),
-            })
-            .collect::<HashSet<_>>();
-        let run = self.pipeline.run_with_context_admission(
-            &mut request,
-            &self.db,
-            context_expansion_gate.allowed,
-            allowed_evidence_classes,
-        );
-        self.record_context_expansion_gate(
-            input.request_id,
-            input.namespace,
-            &context_expansion_gate,
-            run.expanded_context_items,
-        )?;
-        self.record_evidence_context_gates(
-            input.request_id,
-            input.namespace,
-            &evidence_context_gates,
-            &run.evidence_references,
-        )?;
-        let sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
-            crate::chisei::sampling::SamplingDecision {
-                sampled: false,
-                effective_rate: self.config.sample_rate,
-                reason: "not_sampled".into(),
-            },
-        );
-        Ok(GatewayPipelineDecision { run, sampling })
-    }
-
     /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
     /// and config — so emitted runs are visible to live regression checks immediately.
     pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
@@ -2599,48 +2452,6 @@ impl ChiseiServiceImpl {
     /// live routing.
     pub fn active_promotions(&self) -> Arc<ActivePromotions> {
         self.active_promotions.clone()
-    }
-
-    fn record_portfolio_shift(
-        &self,
-        scope: &str,
-        task_class: &str,
-        selection: &crate::chisei::portfolio::RouteSelection,
-        objective: &Objective,
-        outcome: &str,
-    ) {
-        if !selection.shifted {
-            return;
-        }
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.portfolio".into(),
-            action: "chisei.portfolio_route_shift".into(),
-            reason: selection.reason.clone(),
-            evidence: HashMap::from([
-                ("task_class".into(), task_class.to_string()),
-                ("previous_model".into(), selection.previous_model.clone()),
-                (
-                    "previous_prompt_variant".into(),
-                    selection.previous_prompt_variant.clone(),
-                ),
-                ("selected_model".into(), selection.model.clone()),
-                (
-                    "selected_prompt_variant".into(),
-                    selection.prompt_variant.clone(),
-                ),
-                ("objective_mode".into(), objective.mode.as_str().into()),
-                (
-                    "budget_usd_micros".into(),
-                    objective.budget_usd_micros.to_string(),
-                ),
-                ("quality_bar".into(), objective.quality_bar.to_string()),
-                ("min_samples".into(), objective.min_samples.to_string()),
-            ]),
-            target_id: scope.to_string(),
-            outcome: outcome.to_string(),
-        });
     }
 
     pub fn with_budget(db: Arc<RuntimeDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
@@ -2670,8 +2481,8 @@ impl ChiseiServiceImpl {
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
                 db.clone(),
                 budget.clone(),
-                evaluator_registry.clone(),
-                stochastic_evaluator_registry.clone(),
+                evaluator_registry,
+                stochastic_evaluator_registry,
                 crate::chisei::privacy::safe_providers(&config),
             );
         Self {
@@ -2684,8 +2495,6 @@ impl ChiseiServiceImpl {
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
-            evaluator_registry,
-            stochastic_evaluator_registry,
             evaluation_execution_lifecycle,
             db,
             config,
@@ -2837,325 +2646,6 @@ impl ChiseiServiceImpl {
             },
         );
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
-    }
-
-    fn data_class(&self, policy: Option<&crate::chisei::policy::Policy>) -> DataClass {
-        policy
-            .map(|policy| DataClass::parse(&policy.data_class))
-            .filter(|class| *class != DataClass::Unclassified)
-            .unwrap_or_else(|| DataClass::parse(&self.config.default_data_class))
-    }
-
-    fn leak_findings_for_payload(
-        &self,
-        namespace: &str,
-        provider: &str,
-        data_class: DataClass,
-        payload: &str,
-    ) -> Vec<LeakFinding> {
-        let safe = crate::chisei::privacy::safe_providers(&self.config);
-        if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
-            return vec![];
-        }
-        let rules = self.leak_rules(namespace);
-        let entities = if data_class == DataClass::Sensitive {
-            self.sensitive_entities(namespace)
-        } else {
-            vec![]
-        };
-        crate::chisei::privacy::check_payload(payload, &rules, &entities)
-    }
-
-    fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
-        let mut rules = Vec::new();
-        for ns in ["", namespace] {
-            let Ok(objects) = self.db.list_all_objects(&ListFilter {
-                kind: Some("leak_rule".into()),
-                namespace: Some(ns.to_string()),
-                ..Default::default()
-            }) else {
-                continue;
-            };
-            for obj in objects {
-                let Some(pattern) = obj.properties.get("pattern") else {
-                    continue;
-                };
-                let Ok(pattern) = Regex::new(pattern) else {
-                    continue;
-                };
-                rules.push(LeakRule {
-                    id: obj.id,
-                    label: obj
-                        .properties
-                        .get("label")
-                        .cloned()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or(obj.name),
-                    pattern,
-                    action: LeakAction::parse(
-                        obj.properties
-                            .get("action")
-                            .map(String::as_str)
-                            .unwrap_or("block"),
-                    ),
-                });
-            }
-        }
-        rules
-    }
-
-    fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
-        let objects = self
-            .db
-            .list_all_objects(&ListFilter {
-                namespace: Some(namespace.to_string()),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        crate::chisei::privacy::entity_scan_literals(&objects)
-    }
-
-    fn record_egress_audit(
-        &self,
-        action: &str,
-        request_id: &str,
-        provider: &str,
-        model: &str,
-        decisions: &[EgressDecision],
-    ) {
-        let included_count: usize = decisions.iter().map(|d| d.included.len()).sum();
-        let redacted_count: usize = decisions.iter().map(|d| d.redacted.len()).sum();
-        let mut evidence = std::collections::HashMap::new();
-        evidence.insert("provider".to_string(), provider.to_string());
-        evidence.insert("model".to_string(), model.to_string());
-        evidence.insert("decisions".to_string(), decisions.len().to_string());
-        evidence.insert("included_count".to_string(), included_count.to_string());
-        evidence.insert("redacted_count".to_string(), redacted_count.to_string());
-        evidence.insert(
-            "included_fields".to_string(),
-            serde_json::to_string(
-                &decisions
-                    .iter()
-                    .flat_map(|decision| decision.included.iter())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".into()),
-        );
-        evidence.insert(
-            "redacted_fields".to_string(),
-            serde_json::to_string(
-                &decisions
-                    .iter()
-                    .flat_map(|decision| decision.redacted.iter())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".into()),
-        );
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.egress".into(),
-            action: action.into(),
-            reason: "context egress policy applied".into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: if redacted_count > 0 {
-                "redacted".into()
-            } else {
-                "included".into()
-            },
-        });
-    }
-
-    fn record_privacy_audit(
-        &self,
-        outcome: &str,
-        request_id: &str,
-        provider: &str,
-        data_class: DataClass,
-        task_class: TaskClass,
-        reason: &str,
-    ) {
-        let mut evidence = std::collections::HashMap::new();
-        evidence.insert("provider".to_string(), provider.to_string());
-        evidence.insert("data_class".to_string(), data_class.as_str().to_string());
-        evidence.insert("task_class".to_string(), task_class.as_str().to_string());
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: "gate".into(),
-            reason: reason.into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: outcome.into(),
-        });
-    }
-
-    fn record_leak_audit(
-        &self,
-        action: &str,
-        request_id: &str,
-        provider: &str,
-        findings: &[LeakFinding],
-    ) {
-        let mut evidence = std::collections::HashMap::new();
-        evidence.insert("provider".to_string(), provider.to_string());
-        evidence.insert("finding_count".to_string(), findings.len().to_string());
-        evidence.insert(
-            "block_count".to_string(),
-            findings
-                .iter()
-                .filter(|finding| finding.action == LeakAction::Block)
-                .count()
-                .to_string(),
-        );
-        evidence.insert(
-            "labels".to_string(),
-            findings
-                .iter()
-                .map(|finding| format!("{}:{}", finding.rule_label, finding.match_count))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: action.into(),
-            reason: "leak checker evaluated outbound payload".into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: if findings
-                .iter()
-                .any(|finding| finding.action == LeakAction::Block)
-            {
-                "leak_blocked".into()
-            } else {
-                "leak_warned".into()
-            },
-        });
-    }
-
-    async fn run_leak_reviewer(
-        &self,
-        request_id: &str,
-        provider: &str,
-        abstract_task: &str,
-    ) -> Option<String> {
-        let model = self.config.leak_review_model.as_ref()?;
-        let safe = crate::chisei::privacy::safe_providers(&self.config);
-        let reviewer_provider = crate::llm::provider_name(model);
-        if !crate::chisei::privacy::provider_safe_to_send(reviewer_provider, &safe) {
-            self.record_leak_reviewer_audit(
-                request_id,
-                provider,
-                model,
-                "reviewer_error",
-                "reviewer model is not safe to send sensitive-review prompts",
-            );
-            return Some("local leak reviewer was skipped because its model is not safe".into());
-        }
-        let registry_state_path =
-            crate::provider_profile::provider_registry_state_path(&self.config.db_path);
-        let registry =
-            match crate::provider_resolution::snapshot_for_execution(Some(&registry_state_path))
-                .await
-            {
-                Ok(registry) => registry,
-                Err(_) => {
-                    self.record_leak_reviewer_audit(
-                        request_id,
-                        provider,
-                        model,
-                        "reviewer_error",
-                        "provider registry is unavailable",
-                    );
-                    return Some("local leak reviewer could not run".into());
-                }
-            };
-        let Ok(reviewer) = crate::llm::resolve_with_registry(
-            model,
-            &registry,
-            Some(&registry_state_path),
-            self.config.anthropic_api_key.as_deref(),
-            self.config.openai_api_key.as_deref(),
-            &self.config.ollama_url,
-            self.config.native_llm_url.as_deref(),
-        ) else {
-            self.record_leak_reviewer_audit(
-                request_id,
-                provider,
-                model,
-                "reviewer_error",
-                "reviewer provider is not configured",
-            );
-            return Some("local leak reviewer could not run".into());
-        };
-        let req = crate::llm::ChatRequest {
-            model: model.clone(),
-            system: "You are a local privacy reviewer. Answer only SAFE or RISK with one short reason. Does this abstract request reveal sector, position, timing, or proprietary intent?".into(),
-            messages: vec![crate::llm::Message {
-                role: "user".into(),
-                content: abstract_task.to_string(),
-                tool_call_id: String::new(),
-                tool_calls: vec![],
-            }],
-            tools: vec![],
-            max_tokens: 64,
-            prompt_cache: Default::default(),
-        };
-        match reviewer.chat(&req).await {
-            Ok(resp) => {
-                let lower = resp.content.to_ascii_lowercase();
-                let risky = lower.contains("risk") || lower.contains("unsafe");
-                self.record_leak_reviewer_audit(
-                    request_id,
-                    provider,
-                    model,
-                    if risky { "warn" } else { "pass" },
-                    if risky {
-                        "reviewer flagged template-inversion risk"
-                    } else {
-                        "reviewer did not flag template-inversion risk"
-                    },
-                );
-                risky.then(|| "local leak reviewer flagged template-inversion risk".into())
-            }
-            Err(_) => {
-                self.record_leak_reviewer_audit(
-                    request_id,
-                    provider,
-                    model,
-                    "reviewer_error",
-                    "reviewer call failed",
-                );
-                Some("local leak reviewer could not run".into())
-            }
-        }
-    }
-
-    fn record_leak_reviewer_audit(
-        &self,
-        request_id: &str,
-        provider: &str,
-        reviewer_model: &str,
-        outcome: &str,
-        reason: &str,
-    ) {
-        let mut evidence = std::collections::HashMap::new();
-        evidence.insert("provider".to_string(), provider.to_string());
-        evidence.insert("reviewer_model".to_string(), reviewer_model.to_string());
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: "leak_review".into(),
-            reason: reason.into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: outcome.into(),
-        });
     }
 
     async fn resolve_live_model(
@@ -5221,8 +4711,9 @@ impl ChiseiService for ChiseiServiceImpl {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .map_err(map_evaluation_resource_error)?;
-            let (implementation_executable, implementation_status) =
-                self.evaluator_capability(&definition);
+            let (implementation_executable, implementation_status) = self
+                .evaluation_execution_lifecycle
+                .evaluator_capability(&definition);
             return Ok(Response::new(PutEvaluatorDefinitionResponse {
                 record: Some(evaluator_record_with_availability(
                     &definition,
@@ -5243,8 +4734,9 @@ impl ChiseiService for ChiseiServiceImpl {
             .db
             .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
             .map_err(map_evaluation_resource_error)?;
-        let (implementation_executable, implementation_status) =
-            self.evaluator_capability(&definition);
+        let (implementation_executable, implementation_status) = self
+            .evaluation_execution_lifecycle
+            .evaluator_capability(&definition);
         Ok(Response::new(PutEvaluatorDefinitionResponse {
             record: Some(evaluator_record(
                 &self.db,
@@ -8783,7 +8275,9 @@ mod tests {
         let cancellation_replica = Arc::new(ChiseiServiceImpl::new_with_evaluator_registry(
             svc.db.clone(),
             svc.config.clone(),
-            svc.evaluator_registry.clone(),
+            svc.evaluation_execution_lifecycle
+                .evaluator_registry()
+                .clone(),
         ));
         let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
         let execute_request = ExecuteEvaluationManifestRequest {

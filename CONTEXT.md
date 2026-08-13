@@ -68,7 +68,7 @@ The **Policy resolution module** produces one permitted route or denial from
 authenticated routing input. Its private interface owns policy-scope
 precedence, regression and promoted-capable safeguards, privacy and capability
 gates, explicit route overrides, local-free, cheap, and portfolio selection,
-runtime canonicalization, and fallback projection.
+portfolio-shift audit, runtime canonicalization, and fallback projection.
 
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
@@ -80,7 +80,7 @@ The **Gateway decide lifecycle** produces one admit or deny decision from
 authenticated gateway execution input. Its private interface owns namespace
 admission, trusted-gateway scope checks, context-admission gates, token and
 request budget plus continuation degradation, policy resolution, sampling,
-audit, and decision projection.
+audit, decision projection, and admitted pipeline enrichment.
 
 The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
@@ -136,7 +136,9 @@ projection, and plan-receipt recording.
 The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline. Plan receipts are recorded after Gunshi
-stamps so allocation identity is present on the receipt.
+stamps so allocation identity is present on the receipt. Leak, privacy, and
+egress-audit helpers are shared private implementation with native plan
+execution.
 
 ## Native plan execution
 
@@ -147,7 +149,8 @@ streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 The gRPC adapter owns caller authentication and protocol translation. Planning
 remains a separate private pipeline; Action execution is a distinct Sekai
-concept and is not this lifecycle.
+concept and is not this lifecycle. Leak, privacy, and egress-audit helpers are
+shared private implementation with native execution planning.
 
 ## Kioku candidate governance
 
@@ -191,9 +194,10 @@ manifest resolution, and its provenance grants no execution authority.
 
 The **Evaluation execution lifecycle** executes and cancels one resolved
 Evaluation manifest through one private ordered path. It owns durable creation
-and replay, frozen execution budgets, evaluator availability, per-manifest
-serialization, cancellation state and persistence, worker dispatch, Evidence
-loading, step and gate receipt ordering, recovery, and terminal cleanup.
+and replay, frozen execution budgets, evaluator availability and capability
+projection, per-manifest serialization, cancellation state and persistence,
+worker dispatch, Evidence loading, step and gate receipt ordering, recovery,
+and terminal cleanup.
 
 The gRPC adapter owns caller authentication, namespace authorization, manifest
 lookup, and protocol translation. Deterministic and stochastic evaluators keep
