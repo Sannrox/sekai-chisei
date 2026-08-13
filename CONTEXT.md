@@ -60,7 +60,7 @@ nodes.
 
 The gRPC adapter owns caller authentication, catalog-invocation receipts, and
 protocol translation. Semantic retrieval remains a separate reasoning module.
-Object mutation remains write-only.
+Object mutation and link mutation remain write-only.
 
 ## Policy resolution
 
@@ -211,6 +211,17 @@ resolution.
 
 The gRPC adapter owns protocol request and response translation. The lifecycle
 selects the direct or guarded persistence adapter behind its private interface.
+
+## Authorized link mutation
+
+The **Authorized link mutation lifecycle** creates and deletes graph links
+through one private ordered path. It owns tenant and team-namespace admission,
+ACL write checks, marking enforcement, ontology domain/range validation on
+create, and persist ordering including fail-if-exists.
+
+The gRPC adapter owns caller authentication and protocol translation.
+Authorized query remains read-only. Object mutation remains a distinct write
+module.
 
 ## Handoff
 
