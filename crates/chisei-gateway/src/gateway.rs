@@ -13880,6 +13880,7 @@ mod tests {
     ) -> (String, Arc<RuntimeDb>) {
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), config);
+        chisei_svc.seed_allow_by_default_context_admission(&["default", "sekai-chisei"]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

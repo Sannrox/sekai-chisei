@@ -2108,6 +2108,18 @@ impl ChiseiServiceImpl {
         }))
     }
 
+    #[cfg(feature = "gateway-test-support")]
+    pub fn seed_allow_by_default_context_admission(&self, namespaces: &[&str]) {
+        for namespace in namespaces {
+            self.policy
+                .set_context_admission_policy(
+                    namespace,
+                    crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+                )
+                .expect("default context admission policy is valid");
+        }
+    }
+
     pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
         Self::new_with_evaluator_registries(
             db,
