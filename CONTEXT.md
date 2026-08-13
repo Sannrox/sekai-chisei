@@ -113,12 +113,13 @@ the private admission module; no protocol request is manufactured.
 The **Native execution planning pipeline** produces one executable or denied
 plan from authenticated execution input. Its private interface owns Kioku
 context enrichment, policy and provider resolution, budget and evaluation
-gates, routing, egress and privacy decisions, sampling, audit, and plan
-projection.
+gates, routing, egress and privacy decisions, sampling, audit, plan
+projection, and plan-receipt recording.
 
 The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
-remains inside the planning pipeline.
+remains inside the planning pipeline. Plan receipts are recorded after Gunshi
+stamps so allocation identity is present on the receipt.
 
 ## Native plan execution
 
