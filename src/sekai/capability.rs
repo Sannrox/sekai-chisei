@@ -1,6 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
+/// Native `DiscoverCapabilities` contract. Distinct from
+/// `chisei.provider-capabilities/v1` (HTTP provider-profile matrix).
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 200;

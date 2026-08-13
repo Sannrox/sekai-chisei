@@ -8,7 +8,10 @@ control plane.
 It exposes:
 
 - OpenAI-compatible `/v1/responses` and `/v1/chat/completions`;
-- Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens`; and
+- Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens`;
+- `GET /v1/chisei/models` (`chisei.available-models/v1`);
+- `GET /v1/chisei/capabilities` (`chisei.provider-capabilities/v1`, no grant
+  semantics; not `DiscoverCapabilities`); and
 - `/healthz`, `/readyz`, and `/statusz` operator endpoints.
 
 For each request, the gateway authenticates and attributes the caller,

@@ -68,7 +68,11 @@ cannot reconcile a connection lost before headers and is intended only for calle
 that accept that limitation.
 
 Authenticated clients discover the versioned provider matrix with
-`GET /v1/chisei/capabilities`. Chisei derives required streaming, tool,
+`GET /v1/chisei/capabilities`. The document version is
+`chisei.provider-capabilities/v1` (`x-chisei-capability-catalog` repeats it).
+`grant_semantics` is always `false`. This is not
+`SekaiService.DiscoverCapabilities` (native contract `1.0`). Chisei derives
+required streaming, tool,
 parallel-tool, structured-output, reasoning, modality, continuation, and built-in
 tool capabilities from each Responses request. A route that cannot preserve every
 requirement fails with `capability_unsupported` before upstream provider contact.

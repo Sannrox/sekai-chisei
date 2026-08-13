@@ -170,10 +170,14 @@ rules, credentials, or caller-supplied runtime capacity, and every request is
 checked against namespace read access.
 
 Native runtimes can use the namespace-scoped
-[capability catalog](capability-catalog.md) to discover visible object queries,
-bounded retrieval surfaces, and governed actions before invocation. Catalog
-visibility is filtered for the authenticated authorization context and never
-acts as an authorization token; invocation always rechecks live controls.
+[capability catalog](capability-catalog.md) (`DiscoverCapabilities` contract
+`1.0`) to discover visible object queries, bounded retrieval surfaces, and
+governed actions before invocation. Catalog visibility is filtered for the
+authenticated authorization context and never acts as an authorization token;
+invocation always rechecks live controls. Compatible HTTP clients use the
+separate provider-profile matrix `GET /v1/chisei/capabilities`
+(`chisei.provider-capabilities/v1`); that document has no grant semantics and
+must not be submitted as decide `capability_requirements_json`.
 
 `RetrieveContext` is asserted-only by default. Callers may opt into the fixed
 query-time entailment profile for class inheritance/equivalence and explicitly

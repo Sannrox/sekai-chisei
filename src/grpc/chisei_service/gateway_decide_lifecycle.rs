@@ -248,6 +248,9 @@ impl ChiseiServiceImpl {
                     )
                 }
                 Err(status) => {
+                    // Capability-document failures use FailedPrecondition so a
+                    // mixed native catalog or provider matrix is
+                    // capability_unsupported, not policy_denied.
                     let reason = match status.code() {
                         tonic::Code::ResourceExhausted => GatewayDecideDenyReason::BudgetDenied,
                         tonic::Code::FailedPrecondition => {

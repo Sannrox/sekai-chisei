@@ -14041,6 +14041,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
+        use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+        use crate::provider_profile::{
+            CAPABILITY_MATRIX_VERSION, CapabilityMatrix, CapabilityRequirements,
+            NATIVE_CAPABILITY_CATALOG_CONTRACT,
+        };
+
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "team-a",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+
+        let decide = |capability_requirements_json: Vec<u8>, correlation: &str| {
+            let mut request = Request::new(DecideGatewayExecutionRequest {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                namespace: "team-a".into(),
+                requested_model: "gpt-5.5".into(),
+                operation_class: "chat".into(),
+                estimated_cost_usd_micros: 0,
+                correlation_operation_id: correlation.into(),
+                correlation_attempt: 1,
+                estimated_tokens: 10,
+                task_class: "interactive".into(),
+                preferred_runtime: "openai".into(),
+                project: "team-a".into(),
+                agent: "local".into(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                local_free_available: false,
+                user_id: "local".into(),
+                route_override: String::new(),
+                capability_requirements_json,
+                expected_calls: 1,
+                pipeline_spec: String::new(),
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "local".parse().unwrap());
+            request
+        };
+
+        let native = serde_json::json!({
+            "capabilities": [{
+                "name": "sekai.semantic.expand_relations",
+                "product_tier": "core"
+            }],
+            "contract_version": NATIVE_CAPABILITY_CATALOG_CONTRACT,
+            "catalog_version": "sha256:deadbeef",
+            "cache_scope": "authorization_context"
+        });
+        let native_denied = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&native).unwrap(),
+                "op-mix-native",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!native_denied.admitted, "{native_denied:?}");
+        assert_eq!(native_denied.deny_reason, "capability_unsupported");
+        assert!(
+            native_denied
+                .deny_message
+                .contains("DiscoverCapabilities contract 1.0"),
+            "{native_denied:?}"
+        );
+
+        let matrix_denied = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&CapabilityMatrix::built_in()).unwrap(),
+                "op-mix-matrix",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!matrix_denied.admitted, "{matrix_denied:?}");
+        assert_eq!(matrix_denied.deny_reason, "capability_unsupported");
+        assert!(
+            matrix_denied
+                .deny_message
+                .contains(CAPABILITY_MATRIX_VERSION),
+            "{matrix_denied:?}"
+        );
+
+        let admitted = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&CapabilityRequirements {
+                    responses: true,
+                    ..CapabilityRequirements::default()
+                })
+                .unwrap(),
+                "op-mix-requirements",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(admitted.admitted, "{admitted:?}");
+        assert!(admitted.deny_reason.is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
         use crate::chisei::lookup_first;
         use crate::sekai::semantic;
