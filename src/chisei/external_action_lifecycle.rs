@@ -34,10 +34,16 @@ impl AuthorizationPlan {
     ) -> Result<Self, String> {
         let risk = RiskClass::parse(request.authoritative_risk_class()?)
             .ok_or_else(|| "invalid risk_class".to_string())?;
-        let mut policy_decision = policy
-            .map(|policy| policy.decide(&format!("external_action/{}", request.action_type), risk))
-            .unwrap_or(ActionDecision::Allow);
-        let mut reason = "external action satisfies current policy".to_string();
+        let mut policy_decision = match policy {
+            Some(policy) => {
+                policy.decide(&format!("external_action/{}", request.action_type), risk)
+            }
+            None => ActionDecision::Deny,
+        };
+        let mut reason = match policy {
+            Some(_) => "external action satisfies current policy".to_string(),
+            None => "external-action action policy is required".to_string(),
+        };
         if request.deadline_ms <= now_ms {
             policy_decision = ActionDecision::Deny;
             reason = "external-action request expired".into();
@@ -373,6 +379,24 @@ mod tests {
         .unwrap();
         assert_eq!(record.decision.decision, "deny");
         assert_eq!(record.approval_status, "stale");
+    }
+
+    #[test]
+    fn missing_policy_fails_closed() {
+        let plan = AuthorizationPlan::resolve(
+            request(),
+            "auth-1".into(),
+            "digest-1".into(),
+            "agent-1",
+            None,
+            100,
+        )
+        .unwrap();
+        assert_eq!(plan.policy_decision, ActionDecision::Deny);
+        let record = plan.finish();
+        assert_eq!(record.decision.decision, "deny");
+        assert!(record.decision.reason.contains("action policy is required"));
+        assert!(record.decision.policy_scope.is_empty());
     }
 
     #[test]
