@@ -23,6 +23,16 @@ The command is single-shot and local; it does not require a server or network.
   deduplicated and ordered by name.
 - Run `sekai --db <path> --json entity list`, `entity show <name>`, or
   `relation list` for direct deterministic inspection.
+- Run `sekai --db <path> --json find <text>` to discover matching classes and
+  relations by name, description, property, or endpoint.
+- Run `sekai --json diff <before> <after>` to compare raw ontology JSON,
+  `export --json` envelopes, or SQLite ontology databases.
+- Run `sekai --db <path> --json ask "<question>"` only for read-only,
+  template-shaped Natural Language queries. Supported forms compile to
+  `explain`, `query`, `find`, or `directory query`. Inspect the returned typed
+  plan; ambiguous or unsupported questions do not execute. `find` / `search
+  for` maps to `find`; a filesystem path maps to `directory query`; `depth N`
+  overrides the default traversal depth of 1.
 - Run `sekai --db <path> --json validate` before relying on an ontology whose
   definitions may have changed.
 - Run `sekai --db <path> --json export` to inspect or exchange the complete,

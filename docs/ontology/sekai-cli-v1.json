@@ -28,7 +28,7 @@
     },
     {
       "name": "OntologyAsk",
-      "description": "A read-only natural-language interpreter that compiles supported questions into bounded ontology explain or query plans.",
+      "description": "A read-only natural-language interpreter that compiles supported questions into bounded ontology explain, query, find, or directory-query plans.",
       "superclasses": ["Component"]
     },
     {

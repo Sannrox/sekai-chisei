@@ -235,6 +235,8 @@ pub enum AskStatus {
 pub enum AskOperation {
     Explain,
     Query,
+    Find,
+    DirectoryQuery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -496,9 +498,85 @@ pub fn interpret_question(
     if normalized.is_empty() {
         return Err(Error::Input("ask question must not be empty".into()));
     }
+    if has_signed_depth(question) {
+        return Ok(unsupported_interpretation(
+            question,
+            "the question names an invalid depth",
+            Vec::new(),
+        ));
+    }
+
+    if let Some(query) = extract_find_operand(question) {
+        let depth = match strip_depth(&normalized)? {
+            DepthStrip::Conflict => {
+                return Ok(unsupported_interpretation(
+                    question,
+                    "the question names more than one depth",
+                    Vec::new(),
+                ));
+            }
+            DepthStrip::Parsed { depth, .. } => depth,
+        };
+        if depth.is_some() {
+            return Ok(unsupported_interpretation(
+                question,
+                "find questions do not accept a depth",
+                Vec::new(),
+            ));
+        }
+        return find_interpretation(question, &query);
+    }
+
+    let path_resolution = resolve_path(question);
+    let working_text = match &path_resolution {
+        PathResolution::Unique(path) => remove_once(question, path),
+        PathResolution::None | PathResolution::Ambiguous(_) => question.to_string(),
+    };
+    let (normalized, depth) = match strip_depth(&normalize_text(&working_text))? {
+        DepthStrip::Conflict => {
+            return Ok(unsupported_interpretation(
+                question,
+                "the question names more than one depth",
+                Vec::new(),
+            ));
+        }
+        DepthStrip::Parsed { remainder, depth } => (remainder, depth),
+    };
+    if normalized.is_empty() {
+        return Ok(unsupported_interpretation(
+            question,
+            "supported forms are explain/describe, what is related to, what does, which classes, find/search, and directory path queries",
+            search_document(document, question)?.matches,
+        ));
+    }
+
+    match path_resolution {
+        PathResolution::Ambiguous(paths) => {
+            return Ok(ambiguous_interpretation(
+                question,
+                &format!(
+                    "more than one filesystem path matches the question: {}",
+                    paths.join(", ")
+                ),
+                Vec::new(),
+            ));
+        }
+        PathResolution::Unique(path) => {
+            return directory_interpretation(question, &normalized, path, depth);
+        }
+        PathResolution::None => {}
+    }
 
     let class_resolution = resolve_class(document, &normalized);
     let relation_resolution = resolve_relation(document, &normalized);
+    let depth = depth.unwrap_or(1);
+    if depth > MAX_QUERY_DEPTH {
+        return Ok(unsupported_interpretation(
+            question,
+            &format!("query depth {depth} exceeds maximum {MAX_QUERY_DEPTH}"),
+            Vec::new(),
+        ));
+    }
 
     for prefix in [
         "what is related to ",
@@ -513,6 +591,7 @@ pub fn interpret_question(
                 class_resolution,
                 None,
                 TraversalDirection::Both,
+                depth,
                 "a bounded bidirectional relation query",
             );
         }
@@ -520,6 +599,16 @@ pub fn interpret_question(
 
     for prefix in ["explain ", "describe ", "what is ", "tell me about "] {
         if normalized.starts_with(prefix) {
+            if depth != 1 {
+                return query_interpretation(
+                    question,
+                    class_resolution,
+                    None,
+                    TraversalDirection::Both,
+                    depth,
+                    "a bounded bidirectional relation query",
+                );
+            }
             return explain_interpretation(question, class_resolution);
         }
     }
@@ -562,6 +651,7 @@ pub fn interpret_question(
             class_resolution,
             relation,
             TraversalDirection::Outbound,
+            depth,
             "a bounded outbound relation query",
         );
     }
@@ -590,13 +680,14 @@ pub fn interpret_question(
             class_resolution,
             relation,
             TraversalDirection::Inbound,
+            depth,
             "a bounded inbound relation query",
         );
     }
 
     Ok(unsupported_interpretation(
         question,
-        "supported forms are explain/describe, what is related to, what does, and which classes",
+        "supported forms are explain/describe, what is related to, what does, which classes, find/search, and directory path queries",
         search_document(document, question)?.matches,
     ))
 }
@@ -606,6 +697,22 @@ enum NameResolution {
     Unique(String),
     Missing(Vec<SearchMatch>),
     Ambiguous(Vec<SearchMatch>),
+}
+
+#[derive(Debug)]
+enum PathResolution {
+    None,
+    Unique(String),
+    Ambiguous(Vec<String>),
+}
+
+#[derive(Debug)]
+enum DepthStrip {
+    Conflict,
+    Parsed {
+        remainder: String,
+        depth: Option<u32>,
+    },
 }
 
 #[derive(Debug)]
@@ -813,11 +920,322 @@ fn limit_search_matches(mut matches: Vec<SearchMatch>) -> Vec<SearchMatch> {
     matches
 }
 
+fn extract_find_operand(question: &str) -> Option<String> {
+    let trimmed = question.trim();
+    for prefix in [
+        "search for ",
+        "which classes mention ",
+        "which definitions mention ",
+        "which relations mention ",
+        "look up ",
+        "lookup ",
+        "search ",
+        "find ",
+    ] {
+        if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, prefix) {
+            let operand = rest.trim().trim_end_matches(['?', '!', '.', ',']).trim();
+            return (!operand.is_empty()).then(|| operand.to_string());
+        }
+    }
+    None
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = input.get(..prefix.len())?;
+    candidate
+        .eq_ignore_ascii_case(prefix)
+        .then_some(&input[prefix.len()..])
+}
+
+fn directory_plan_shape(
+    remainder: &str,
+) -> Option<(TraversalDirection, Option<String>, &'static str)> {
+    if remainder.starts_with("what contains")
+        || remainder.starts_with("which directories contain")
+        || contains_phrase(remainder, "parent of")
+    {
+        return Some((
+            TraversalDirection::Inbound,
+            Some(DIRECTORY_RELATION_CONTAINS.to_string()),
+            "a bounded inbound directory query",
+        ));
+    }
+    if contains_any_phrase(
+        remainder,
+        &["contain", "contains", "inside", "under", "what is in"],
+    ) {
+        return Some((
+            TraversalDirection::Outbound,
+            Some(DIRECTORY_RELATION_CONTAINS.to_string()),
+            "a bounded outbound directory query",
+        ));
+    }
+    if remainder.starts_with("what is related to")
+        || remainder.starts_with("what is connected to")
+        || remainder.starts_with("what is linked to")
+        || remainder.starts_with("what is associated with")
+        || remainder.starts_with("which directories are related to")
+    {
+        return Some((
+            TraversalDirection::Both,
+            None,
+            "a bounded bidirectional directory query",
+        ));
+    }
+    None
+}
+
+fn find_interpretation(question: &str, query: &str) -> Result<AskInterpretation, Error> {
+    if normalize_text(query).is_empty() {
+        return Ok(unsupported_interpretation(
+            question,
+            "the find question does not include search text",
+            Vec::new(),
+        ));
+    }
+    Ok(AskInterpretation {
+        question: question.to_string(),
+        status: AskStatus::Ready,
+        interpretation: format!("a deterministic definition search for '{query}'"),
+        plan: Some(AskPlan {
+            operation: AskOperation::Find,
+            name: query.to_string(),
+            options: None,
+        }),
+        candidates: Vec::new(),
+    })
+}
+
+fn directory_interpretation(
+    question: &str,
+    remainder: &str,
+    path: String,
+    depth: Option<u32>,
+) -> Result<AskInterpretation, Error> {
+    let path = match expand_user_path(&path) {
+        Ok(path) => path,
+        Err(message) => {
+            return Ok(unsupported_interpretation(question, &message, Vec::new()));
+        }
+    };
+    let depth = depth.unwrap_or(1);
+    if depth > MAX_DIRECTORY_DEPTH {
+        return Ok(unsupported_interpretation(
+            question,
+            &format!("directory query depth {depth} exceeds maximum {MAX_DIRECTORY_DEPTH}"),
+            Vec::new(),
+        ));
+    }
+    let Some((direction, relation, description)) = directory_plan_shape(remainder) else {
+        return Ok(unsupported_interpretation(
+            question,
+            "the question names a filesystem path but is not a supported directory query form",
+            Vec::new(),
+        ));
+    };
+    let relation_description = relation
+        .as_deref()
+        .map(|relation| format!(" via relation '{relation}'"))
+        .unwrap_or_default();
+    let depth_description = if depth == 1 {
+        String::new()
+    } else {
+        format!(" at depth {depth}")
+    };
+    Ok(AskInterpretation {
+        question: question.to_string(),
+        status: AskStatus::Ready,
+        interpretation: format!(
+            "{description}{relation_description}{depth_description} from path '{path}'"
+        ),
+        plan: Some(AskPlan {
+            operation: AskOperation::DirectoryQuery,
+            name: path,
+            options: Some(QueryOptions {
+                direction,
+                relation,
+                depth,
+            }),
+        }),
+        candidates: Vec::new(),
+    })
+}
+
+fn resolve_path(question: &str) -> PathResolution {
+    let (quoted, remainder) = extract_quoted_spans(question);
+    let mut matches = quoted
+        .into_iter()
+        .filter(|value| looks_like_path(value))
+        .collect::<Vec<_>>();
+    matches.extend(
+        remainder
+            .split_whitespace()
+            .map(|token| trim_path_token(token).to_string())
+            .filter(|token| looks_like_path(token)),
+    );
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => PathResolution::None,
+        [path] => PathResolution::Unique(path.clone()),
+        _ => PathResolution::Ambiguous(matches),
+    }
+}
+
+fn extract_quoted_spans(question: &str) -> (Vec<String>, String) {
+    let chars = question.chars().collect::<Vec<_>>();
+    let mut quoted = Vec::new();
+    let mut remainder = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        // Quotes starting a token delimit one path operand. Quote characters
+        // inside an unquoted path token stay part of that token.
+        if matches!(character, '"' | '\'')
+            && (index == 0 || chars[index - 1].is_whitespace())
+            && let Some(end) = chars[index + 1..]
+                .iter()
+                .position(|candidate| *candidate == character)
+        {
+            let value = chars[index + 1..index + 1 + end]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if !value.is_empty() {
+                quoted.push(value);
+            }
+            remainder.push(' ');
+            index += end + 2;
+            continue;
+        }
+        remainder.push(character);
+        index += 1;
+    }
+    (quoted, remainder)
+}
+
+fn trim_path_token(token: &str) -> &str {
+    let token = token.trim_end_matches(['?', '!', ',', ';', ':']);
+    if token.len() > 1
+        && token.ends_with('.')
+        && token != "."
+        && token != ".."
+        && !token.ends_with("/.")
+        && !token.ends_with("/..")
+    {
+        token.trim_end_matches('.')
+    } else {
+        token
+    }
+}
+
+fn expand_user_path(path: &str) -> Result<String, String> {
+    if path == "~" || path.starts_with("~/") {
+        let home = std::env::var("HOME").map_err(|_| {
+            "home-relative ask paths require the HOME environment variable".to_string()
+        })?;
+        if path == "~" {
+            return Ok(home);
+        }
+        return Ok(format!("{home}{}", &path[1..]));
+    }
+    Ok(path.to_string())
+}
+
+fn looks_like_path(value: &str) -> bool {
+    if value.is_empty() || value.contains("://") {
+        return false;
+    }
+    value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value == "~"
+        || value.starts_with("~/")
+}
+
+fn remove_once(haystack: &str, needle: &str) -> String {
+    match haystack.find(needle) {
+        Some(index) => {
+            let mut result = String::with_capacity(haystack.len().saturating_sub(needle.len()));
+            result.push_str(&haystack[..index]);
+            result.push_str(&haystack[index + needle.len()..]);
+            result
+        }
+        None => haystack.to_string(),
+    }
+}
+
+fn has_signed_depth(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    while let Some(index) = rest.find("depth") {
+        let after = rest[index + 5..].trim_start();
+        if after.starts_with('-') {
+            return true;
+        }
+        rest = &rest[index + 5..];
+    }
+    false
+}
+
+fn strip_depth(normalized: &str) -> Result<DepthStrip, Error> {
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let mut skip = vec![false; tokens.len()];
+    let mut depth = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        let digit_token = |offset: usize| {
+            tokens
+                .get(index + offset)
+                .filter(|token| {
+                    !token.is_empty() && token.chars().all(|character| character.is_ascii_digit())
+                })
+                .copied()
+        };
+        let parsed = if matches!(tokens.get(index).copied(), Some("to" | "at"))
+            && tokens.get(index + 1).copied() == Some("depth")
+        {
+            digit_token(2).map(|raw| (3, raw))
+        } else if tokens.get(index).copied() == Some("depth") {
+            digit_token(1).map(|raw| (2, raw))
+        } else {
+            None
+        };
+        if let Some((consumed, raw)) = parsed {
+            let parsed = raw
+                .parse::<u32>()
+                .map_err(|_| Error::Input(format!("invalid ask depth '{raw}'")))?;
+            if depth.is_some_and(|existing| existing != parsed) {
+                return Ok(DepthStrip::Conflict);
+            }
+            depth = Some(parsed);
+            for slot in &mut skip[index..index + consumed] {
+                *slot = true;
+            }
+            index += consumed;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(DepthStrip::Parsed {
+        remainder: tokens
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !skip[*index])
+            .map(|(_, token)| *token)
+            .collect::<Vec<_>>()
+            .join(" "),
+        depth,
+    })
+}
+
 fn query_interpretation(
     question: &str,
     class_resolution: NameResolution,
     relation: Option<String>,
     direction: TraversalDirection,
+    depth: u32,
     description: &str,
 ) -> Result<AskInterpretation, Error> {
     let name = match class_resolution {
@@ -841,17 +1259,24 @@ fn query_interpretation(
         .as_deref()
         .map(|relation| format!(" via relation '{relation}'"))
         .unwrap_or_default();
+    let depth_description = if depth == 1 {
+        String::new()
+    } else {
+        format!(" at depth {depth}")
+    };
     Ok(AskInterpretation {
         question: question.to_string(),
         status: AskStatus::Ready,
-        interpretation: format!("{description}{relation_description} from class '{name}'"),
+        interpretation: format!(
+            "{description}{relation_description}{depth_description} from class '{name}'"
+        ),
         plan: Some(AskPlan {
             operation: AskOperation::Query,
             name,
             options: Some(QueryOptions {
                 direction,
                 relation,
-                depth: 1,
+                depth,
             }),
         }),
         candidates: Vec::new(),
@@ -1807,6 +2232,115 @@ mod tests {
         let unsupported = interpret_question(&document, "Summarize the whole system").unwrap();
         assert_eq!(unsupported.status, AskStatus::Unsupported);
         assert!(unsupported.plan.is_none());
+    }
+
+    #[test]
+    fn ask_interpreter_compiles_find_directory_and_explicit_depth() {
+        let document = document();
+
+        let find = interpret_question(&document, "Find C++").unwrap();
+        assert_eq!(find.status, AskStatus::Ready);
+        let plan = find.plan.unwrap();
+        assert_eq!(plan.operation, AskOperation::Find);
+        assert_eq!(plan.name, "C++");
+        assert!(plan.options.is_none());
+
+        let slash_class = {
+            let mut slash_document = document.clone();
+            slash_document.classes.push(Class {
+                name: "Client/Server".into(),
+                description: String::new(),
+                superclasses: vec!["Component".into()],
+                properties: Vec::new(),
+            });
+            interpret_question(&slash_document, "What does Client/Server depend on?").unwrap()
+        };
+        assert_eq!(slash_class.status, AskStatus::Ready);
+        let plan = slash_class.plan.unwrap();
+        assert_eq!(plan.operation, AskOperation::Query);
+        assert_eq!(plan.name, "Client/Server");
+
+        let slash_find = interpret_question(&document, "find foo/bar").unwrap();
+        assert_eq!(slash_find.status, AskStatus::Ready);
+        assert_eq!(slash_find.plan.unwrap().name, "foo/bar");
+
+        let deep = interpret_question(&document, "What does Api depend on to depth 2?").unwrap();
+        assert_eq!(deep.status, AskStatus::Ready);
+        assert_eq!(
+            deep.plan.unwrap().options,
+            Some(QueryOptions {
+                direction: TraversalDirection::Outbound,
+                relation: Some("depends_on".into()),
+                depth: 2,
+            })
+        );
+
+        let directory =
+            interpret_question(&document, "What does /tmp/Projects contain to depth 2?").unwrap();
+        assert_eq!(directory.status, AskStatus::Ready);
+        let plan = directory.plan.unwrap();
+        assert_eq!(plan.operation, AskOperation::DirectoryQuery);
+        assert_eq!(plan.name, "/tmp/Projects");
+        assert_eq!(
+            plan.options,
+            Some(QueryOptions {
+                direction: TraversalDirection::Outbound,
+                relation: Some(DIRECTORY_RELATION_CONTAINS.into()),
+                depth: 2,
+            })
+        );
+
+        let find_with_depth = interpret_question(&document, "find language to depth 2").unwrap();
+        assert_eq!(find_with_depth.status, AskStatus::Unsupported);
+        assert!(find_with_depth.plan.is_none());
+
+        let ambiguous_paths =
+            interpret_question(&document, "What is related to /tmp/a and /var/projects?").unwrap();
+        assert_eq!(ambiguous_paths.status, AskStatus::Ambiguous);
+        assert!(ambiguous_paths.plan.is_none());
+
+        let quoted_and_unquoted =
+            interpret_question(&document, r#"What is related to "/tmp/a" and /var/b?"#).unwrap();
+        assert_eq!(quoted_and_unquoted.status, AskStatus::Ambiguous);
+        assert!(quoted_and_unquoted.plan.is_none());
+
+        let spaced = interpret_question(
+            &document,
+            r#"What does "/tmp/My Project" contain to depth 2?"#,
+        )
+        .unwrap();
+        assert_eq!(spaced.status, AskStatus::Ready);
+        assert_eq!(spaced.plan.unwrap().name, "/tmp/My Project");
+
+        let embedded_quotes =
+            interpret_question(&document, "What does /tmp/a'b'c contain?").unwrap();
+        assert_eq!(embedded_quotes.status, AskStatus::Ready);
+        assert_eq!(embedded_quotes.plan.unwrap().name, "/tmp/a'b'c");
+
+        let relative = interpret_question(&document, "What does ./src contain?").unwrap();
+        assert_eq!(relative.status, AskStatus::Ready);
+        assert_eq!(relative.plan.unwrap().name, "./src");
+
+        let trailing_period =
+            interpret_question(&document, "What is related to /tmp/project.").unwrap();
+        assert_eq!(trailing_period.status, AskStatus::Ready);
+        assert_eq!(trailing_period.plan.unwrap().name, "/tmp/project");
+
+        let negative_depth =
+            interpret_question(&document, "What does Api depend on to depth -2?").unwrap();
+        assert_eq!(negative_depth.status, AskStatus::Unsupported);
+        assert!(negative_depth.plan.is_none());
+
+        if let Ok(home) = std::env::var("HOME") {
+            let tilde =
+                interpret_question(&document, "What does ~/Projects contain to depth 2?").unwrap();
+            assert_eq!(tilde.status, AskStatus::Ready);
+            assert_eq!(tilde.plan.unwrap().name, format!("{home}/Projects"));
+        }
+
+        let unsupported_path = interpret_question(&document, "frobnicate /tmp/project").unwrap();
+        assert_eq!(unsupported_path.status, AskStatus::Unsupported);
+        assert!(unsupported_path.plan.is_none());
     }
 
     #[test]
