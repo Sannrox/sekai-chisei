@@ -2770,37 +2770,6 @@ impl ChiseiServiceImpl {
     }
 }
 
-fn choose_preferred_model(
-    explicit_model: &str,
-    recommended_model: &str,
-    route_bias: Option<&str>,
-    policy: Option<&crate::chisei::policy::Policy>,
-) -> String {
-    if !explicit_model.is_empty() {
-        return explicit_model.to_string();
-    }
-    let Some(route_bias) = route_bias else {
-        return recommended_model.to_string();
-    };
-    let alias = format!("ollama/{route_bias}");
-    if let Some(policy) = policy {
-        if policy.default_model == alias
-            || policy.allowed_models.iter().any(|model| model == &alias)
-        {
-            return alias;
-        }
-        if policy.default_model == route_bias
-            || policy
-                .allowed_models
-                .iter()
-                .any(|model| model == route_bias)
-        {
-            return route_bias.to_string();
-        }
-    }
-    recommended_model.to_string()
-}
-
 fn budget_metric(metric: &str) -> Result<&'static str, Status> {
     if metric.trim().eq_ignore_ascii_case(METRIC_REQUESTS) {
         Ok(METRIC_REQUESTS)
