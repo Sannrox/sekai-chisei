@@ -136,7 +136,9 @@ projection, and plan-receipt recording.
 The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline. Plan receipts are recorded after Gunshi
-stamps so allocation identity is present on the receipt.
+stamps so allocation identity is present on the receipt. Leak, privacy, and
+egress-audit helpers are shared private implementation with native plan
+execution.
 
 ## Native plan execution
 
@@ -147,7 +149,8 @@ streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 The gRPC adapter owns caller authentication and protocol translation. Planning
 remains a separate private pipeline; Action execution is a distinct Sekai
-concept and is not this lifecycle.
+concept and is not this lifecycle. Leak, privacy, and egress-audit helpers are
+shared private implementation with native execution planning.
 
 ## Kioku candidate governance
 
