@@ -3353,7 +3353,7 @@ impl ChiseiService for ChiseiServiceImpl {
         &self,
         req: Request<DecideGatewayExecutionRequest>,
     ) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
-        let actor = authenticated_actor(&req);
+        let actor = required_authenticated_actor(&req)?;
         let delegated_principal = req
             .metadata()
             .get(DELEGATED_PRINCIPAL_HEADER)
@@ -8797,6 +8797,11 @@ mod tests {
     #[tokio::test]
     async fn external_action_authorization_allows_and_replays_idempotently() {
         let svc = memory_service();
+        svc.db
+            .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+                "agent:local",
+            ))
+            .unwrap();
         let first = svc
             .authorize_external_action(external_action_request("local", "idem-allow"))
             .await
@@ -8878,6 +8883,44 @@ mod tests {
             .target_selectors = vec!["project:team-a/repo:other/repo".into()];
         let conflict = svc.authorize_external_action(conflict).await.unwrap_err();
         assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn external_action_authorization_denies_when_action_policy_is_missing() {
+        let svc = memory_service();
+        let denied = svc
+            .authorize_external_action(external_action_request("local", "idem-missing-policy"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(denied.decision.unwrap().decision, "deny");
+        assert!(denied.permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn external_action_permit_replay_re_evaluates_current_policy() {
+        let svc = memory_service();
+        svc.db
+            .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+                "agent:local",
+            ))
+            .unwrap();
+        let first = svc
+            .authorize_external_action(external_action_request("local", "idem-replay-policy"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.decision.unwrap().decision, "permit");
+        assert!(first.permit.is_some());
+
+        let mut deny = crate::sekai::action_policy::ActionPolicy::allow_all("agent:local");
+        deny.default_decision = ActionDecision::Deny;
+        svc.db.upsert_action_policy(&deny).unwrap();
+        let replay = svc
+            .authorize_external_action(external_action_request("local", "idem-replay-policy"))
+            .await
+            .unwrap_err();
+        assert_eq!(replay.code(), tonic::Code::PermissionDenied);
     }
 
     fn effective_summary_request(
@@ -12960,6 +13003,37 @@ mod tests {
             .into_inner();
         assert!(admitted.admitted, "{admitted:?}");
         assert!(admitted.deny_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_requires_authenticated_principal() {
+        use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+
+        let svc = memory_service();
+        let request = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: "op-decide-missing-principal".into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "mallory".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: false,
+            user_id: "mallory".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
+            pipeline_spec: String::new(),
+        });
+        let err = svc.decide_gateway_execution(request).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
