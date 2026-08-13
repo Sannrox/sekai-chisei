@@ -833,7 +833,7 @@ fn execution_context_actor(
     let Some(delegated) = delegated.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(actor.to_string());
     };
-    if actor != "chisei-gateway" {
+    if !matches!(actor, "root" | "local" | "chisei-gateway") {
         return Err(Status::permission_denied(
             "delegated execution identity requires a gateway service principal",
         ));
@@ -11273,6 +11273,14 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            execution_context_actor(&svc.db, &svc.config, "local", Some("alice"), "acme",).unwrap(),
+            "alice"
+        );
+        assert_eq!(
+            execution_context_actor(&svc.db, &svc.config, "root", Some("alice"), "acme",).unwrap(),
+            "alice"
         );
         let response = svc
             .gateway_pipeline_decision(GatewayPipelineInput {
