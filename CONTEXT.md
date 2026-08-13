@@ -54,7 +54,9 @@ The **Authorized query lifecycle** produces authorization-filtered graph and
 object reads through one private interface. It owns tenant and team-namespace
 admission, ACL read checks, marking visibility, reserved-kind hiding, computed
 property resolution, restricted-property redaction, and canonical projection
-for get, list, find, links, traverse, and lineage.
+for get, list, find, links, traverse, and lineage. Graph walks authorize the
+start object and do not return or traverse through reserved or unauthorized
+nodes.
 
 The gRPC adapter owns caller authentication, catalog-invocation receipts, and
 protocol translation. Semantic retrieval remains a separate reasoning module.

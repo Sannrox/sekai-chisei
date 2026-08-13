@@ -955,10 +955,121 @@ fn object_is_visible(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
 ) -> bool {
-    check_team_namespace(db, principals, &object.namespace, false).is_ok()
+    !is_reserved_governance_kind(&object.kind)
+        && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
         && object_passes_marking(db, object, principals).unwrap_or(false)
+}
+
+/// Single-object read root: reserved kinds are observationally missing, tenant
+/// mismatches are missing, and ACL/team/marking failures stay fail-closed.
+fn require_visible_read_root(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation_id: &str,
+) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
+    if is_reserved_governance_kind(&object.kind) {
+        return Err(Status::not_found("not found"));
+    }
+    enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false)
+        .map_err(|_| Status::not_found("not found"))?;
+    check_team_namespace(db, principals, &object.namespace, false)?;
+    check_read(security, &object.id, principals)?;
+    let marking = enforce_object_marking_access(db, &object, principals, operation_id)?;
+    Ok((object, marking))
+}
+
+fn retain_reachable_visible_objects(
+    start_id: &str,
+    direction: domain::Direction,
+    objects: &mut Vec<domain::Object>,
+    links: &mut Vec<domain::Link>,
+) {
+    let mut visible = objects
+        .iter()
+        .map(|object| object.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    visible.insert(start_id.to_string());
+    let mut adjacency = HashMap::<String, Vec<String>>::new();
+    for link in links.iter() {
+        if !visible.contains(&link.from_id) || !visible.contains(&link.to_id) {
+            continue;
+        }
+        match direction {
+            domain::Direction::Outgoing => adjacency
+                .entry(link.from_id.clone())
+                .or_default()
+                .push(link.to_id.clone()),
+            domain::Direction::Incoming => adjacency
+                .entry(link.to_id.clone())
+                .or_default()
+                .push(link.from_id.clone()),
+        }
+    }
+    let mut reachable = std::collections::HashSet::from([start_id.to_string()]);
+    let mut stack = vec![start_id.to_string()];
+    while let Some(id) = stack.pop() {
+        let Some(next) = adjacency.get(&id) else {
+            continue;
+        };
+        for neighbor in next {
+            if reachable.insert(neighbor.clone()) {
+                stack.push(neighbor.clone());
+            }
+        }
+    }
+    objects.retain(|object| reachable.contains(&object.id));
+    let object_ids = objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    links.retain(|link| {
+        object_ids.contains(link.from_id.as_str()) && object_ids.contains(link.to_id.as_str())
+    });
+}
+
+fn retain_reachable_visible_lineage(
+    start_id: &str,
+    nodes: &mut Vec<crate::sekai::lineage::LineageNode>,
+    edges: &mut Vec<crate::sekai::lineage::LineageEdge>,
+) {
+    let mut visible = nodes
+        .iter()
+        .map(|node| node.object.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    visible.insert(start_id.to_string());
+    let mut adjacency = HashMap::<String, Vec<String>>::new();
+    for edge in edges.iter() {
+        if !visible.contains(&edge.from) || !visible.contains(&edge.to) {
+            continue;
+        }
+        adjacency
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+        adjacency
+            .entry(edge.to.clone())
+            .or_default()
+            .push(edge.from.clone());
+    }
+    let mut reachable = std::collections::HashSet::from([start_id.to_string()]);
+    let mut stack = vec![start_id.to_string()];
+    while let Some(id) = stack.pop() {
+        let Some(next) = adjacency.get(&id) else {
+            continue;
+        };
+        for neighbor in next {
+            if reachable.insert(neighbor.clone()) {
+                stack.push(neighbor.clone());
+            }
+        }
+    }
+    nodes.retain(|node| reachable.contains(&node.object.id));
+    edges.retain(|edge| reachable.contains(&edge.from) && reachable.contains(&edge.to));
 }
 
 /// ACL-visible list with marking filter, exact marking-visible totals, and
@@ -11659,6 +11770,251 @@ mod tests {
             .into_inner();
         assert_eq!(listed.objects.len(), 0);
         assert_eq!(listed.total, 0);
+    }
+
+    async fn seed_authorized_query_visibility_graph(svc: &SekaiServiceImpl) {
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(widget_schema_type()),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        for (id, external_id) in [
+            ("context-root", "widget:context-root"),
+            ("context-allowed", "widget:context-allowed"),
+            ("context-denied", "widget:context-denied"),
+            ("behind-denied", "widget:behind-denied"),
+            ("behind-governance", "widget:behind-governance"),
+        ] {
+            let mut object = widget_object(id, HashMap::from([("name".into(), id.into())]));
+            object.external_id = external_id.into();
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(object),
+                    lease_precondition: None,
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        svc.db
+            .create_object(&domain::Object {
+                id: "internal-policy".into(),
+                kind: action_policy::ACTION_POLICY_KIND.into(),
+                name: "internal".into(),
+                namespace: String::new(),
+                external_id: "policy:internal".into(),
+                properties: HashMap::from([("default_decision".into(), "deny".into())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        for link in [
+            domain::Link {
+                id: "context-visible-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-allowed".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-denied-link".into(),
+                from_id: "context-root".into(),
+                to_id: "context-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-denied-link".into(),
+                from_id: "context-denied".into(),
+                to_id: "behind-denied".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-governance-link".into(),
+                from_id: "context-root".into(),
+                to_id: "internal-policy".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+            domain::Link {
+                id: "context-behind-governance-link".into(),
+                from_id: "internal-policy".into(),
+                to_id: "behind-governance".into(),
+                relation: "contains".into(),
+                created: 0,
+            },
+        ] {
+            svc.db.create_link(&link).unwrap();
+        }
+        grant_object_role(svc, "context-denied", "bob", security::Role::Viewer);
+    }
+
+    #[tokio::test]
+    async fn authorized_graph_queries_hide_reserved_kinds_and_objects_behind_hidden_nodes() {
+        let svc = service();
+        seed_authorized_query_visibility_graph(&svc).await;
+
+        let hidden = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "internal-policy".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code(), tonic::Code::NotFound);
+
+        let links = svc
+            .get_links(with_named_principal(
+                GetLinksRequest {
+                    object_id: "context-root".into(),
+                    relation: "contains".into(),
+                    direction: "outgoing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .links;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, "context-visible-link");
+
+        let linked_ids = svc
+            .get_linked_objects(with_named_principal(
+                GetLinkedObjectsRequest {
+                    object_id: "context-root".into(),
+                    relation: "contains".into(),
+                    direction: "outgoing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .objects
+            .into_iter()
+            .map(|object| object.id)
+            .collect::<Vec<_>>();
+        assert_eq!(linked_ids, vec!["context-allowed"]);
+
+        let traversed = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "context-root".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 3,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let traversed_ids = traversed
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(traversed_ids, vec!["context-allowed"]);
+        assert!(
+            traversed
+                .objects
+                .iter()
+                .all(|object| object.kind != action_policy::ACTION_POLICY_KIND)
+        );
+
+        let hidden_root = svc
+            .get_links(with_named_principal(
+                GetLinksRequest {
+                    object_id: "internal-policy".into(),
+                    relation: "contains".into(),
+                    direction: "outgoing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_root.code(), tonic::Code::NotFound);
+
+        let denied_root = svc
+            .get_links(with_named_principal(
+                GetLinksRequest {
+                    object_id: "context-denied".into(),
+                    relation: "contains".into(),
+                    direction: "outgoing".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied_root.code(), tonic::Code::PermissionDenied);
+
+        let traverse_hidden = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "internal-policy".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 2,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(traverse_hidden.code(), tonic::Code::NotFound);
+
+        let lineage = svc
+            .get_lineage(with_named_principal(
+                GetLineageRequest {
+                    object_id: "context-root".into(),
+                    max_nodes: 20,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let lineage_ids = lineage
+            .nodes
+            .iter()
+            .map(|node| node.object.as_ref().unwrap().id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(lineage_ids, vec!["context-root", "context-allowed"]);
+        assert!(
+            lineage
+                .nodes
+                .iter()
+                .all(|node| node.object.as_ref().unwrap().kind != action_policy::ACTION_POLICY_KIND)
+        );
+
+        let lineage_hidden = svc
+            .get_lineage(with_named_principal(
+                GetLineageRequest {
+                    object_id: "internal-policy".into(),
+                    max_nodes: 20,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(lineage_hidden.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
