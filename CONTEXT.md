@@ -265,6 +265,19 @@ The gRPC adapter supplies authenticated transport context and projects the
 result. Evaluation authority receipts remain internal-only, and the canonical
 Operation Receipt remains the durable authority.
 
+## Gateway receipt admission
+
+The **Gateway receipt admission lifecycle** admits one trusted gateway
+completion into a canonical Operation Receipt. Its private interface owns
+budget idempotency, completeness fail-closed, identity conflict, Kioku
+attribution preflight, durable put, auditable post-commit attribution
+failure, and optional sample persist.
+
+The gRPC adapter owns caller authentication, trusted-principal and
+negative-adjustment gates, and protocol translation. Reported Operation
+Receipt events remain a distinct append lifecycle. Dispatch claim and receipt
+lookup remain adapter reads over the same durable authority.
+
 ## Catalog invocation receipt lifecycle
 
 The **Catalog invocation receipt lifecycle** records one capability-catalog

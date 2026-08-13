@@ -57,6 +57,7 @@ mod evaluation_manifest_resolution;
 mod execution_planning;
 mod external_action_admission;
 mod gateway_decide_lifecycle;
+mod gateway_receipt_admission;
 mod governed_subject_lifecycle;
 mod gunshi_issuance_lifecycle;
 mod kioku_candidate_governance;
@@ -104,7 +105,6 @@ const POLICY_KIND: &str = "policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
-const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
@@ -584,100 +584,6 @@ fn external_host_context(
         observed_preconditions: preconditions.into_iter().collect(),
         host_capabilities: capabilities,
     }
-}
-
-fn persist_gateway_operation_receipt(
-    service: &ChiseiServiceImpl,
-    receipt_json: &str,
-    authenticated_principal: &str,
-) -> Result<(), Status> {
-    let receipt: OperationReceipt = serde_json::from_str(receipt_json)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let completeness = receipt.completeness();
-    if !completeness.complete {
-        return Err(Status::invalid_argument(format!(
-            "gateway receipt is incomplete: missing={:?} errors={:?}",
-            completeness.missing_surfaces, completeness.errors
-        )));
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    let has_kioku_context = receipt.events.iter().any(|receipt_event| {
-        receipt_event.kind == ReceiptEventKind::ContextGoverned
-            && receipt_event
-                .references
-                .iter()
-                .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
-    }) || !service
-        .db
-        .list_kioku_outcome_assignments(&receipt.operation_id)
-        .map_err(Status::internal)?
-        .is_empty();
-    let existing = service
-        .db
-        .get_operation_receipt(&receipt.operation_id)
-        .map_err(Status::internal)?;
-    if existing
-        .as_ref()
-        .is_some_and(|existing| existing != &receipt)
-    {
-        return Err(Status::already_exists(
-            "operation receipt already exists with different evidence",
-        ));
-    }
-    if existing.is_none() && has_kioku_context {
-        reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
-            &receipt,
-            authenticated_principal,
-            now,
-            false,
-            None,
-            true,
-        )
-        .map_err(|error| {
-            Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
-        })?;
-    }
-    service
-        .db
-        .put_operation_receipt(&receipt)
-        .map_err(Status::internal)?;
-    if existing.is_none()
-        && has_kioku_context
-        && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
-            &receipt,
-            authenticated_principal,
-            now,
-            false,
-            None,
-            false,
-        )
-    {
-        let _ = service.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: "chisei.kioku".into(),
-            action: "kioku.outcome_attribution".into(),
-            reason: error,
-            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
-            target_id: receipt.operation_id.clone(),
-            outcome: "failed".into(),
-        });
-    }
-    service
-        .db
-        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-            id: format!("{}:gateway-receipt", receipt.operation_id),
-            timestamp: now,
-            actor: authenticated_principal.into(),
-            action: GATEWAY_RECEIPT_ACTION.into(),
-            reason: "gateway operation completed".into(),
-            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
-            target_id: receipt.operation_id,
-            outcome: "recorded".into(),
-        }])
-        .map_err(Status::internal)
 }
 
 fn require_namespace_access(db: &RuntimeDb, actor: &str, namespace: &str) -> Result<(), Status> {
@@ -4517,74 +4423,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 "negative usage adjustments require control-plane administration",
             ));
         }
-        let metric = budget_metric(&r.metric)?;
-        let budget_subject = budget_subject(
-            &r.subject,
-            &r.project,
-            &r.agent,
-            &r.key_id,
-            &r.work_unit,
-            &r.user_id,
-        )?;
-        self.budget
-            .record_idempotent_with_metric(
-                &budget_subject,
-                r.tokens_used,
-                metric,
-                &r.idempotency_key,
-            )
-            .map_err(Status::internal)?;
-        if !r.operation_receipt_json.trim().is_empty() {
-            persist_gateway_operation_receipt(self, &r.operation_receipt_json, &actor)?;
-        }
-        let sample_recorded = if let Some(observation) = r.sample_observation {
-            if observation.request_id.trim().is_empty()
-                || observation.namespace.trim().is_empty()
-                || observation.spec.trim().is_empty()
-                || observation.output_content.trim().is_empty()
-            {
-                return Err(Status::invalid_argument(
-                    "sample observation requires request_id, namespace, spec, and output_content",
-                ));
-            }
-            if self.config.scoring_enabled {
-                self.db
-                    .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                        request_id: observation.request_id,
-                        namespace: observation.namespace,
-                        spec: observation.spec,
-                        resolved_model: observation.resolved_model,
-                        output_content: observation.output_content,
-                        sample_reason: observation.sample_reason,
-                        input_tokens: observation.input_tokens,
-                        output_tokens: observation.output_tokens,
-                        stop_reason: observation.stop_reason,
-                        timestamp: observation.timestamp,
-                        scored: false,
-                        task_class: crate::chisei::scoring::normalize_task_class(
-                            &observation.task_class,
-                        ),
-                        cost_usd_micros: observation.cost_usd_micros,
-                    })
-                    .map_err(Status::internal)?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
-        Ok(Response::new(RecordUsageResponse {
-            usage: Some(BudgetUsage {
-                user_id: u.user_id,
-                tokens_used: u.tokens_used,
-                max_tokens: u.max_tokens,
-                period_type: u.period_type.as_str().into(),
-                period_start: u.period_start,
-            }),
-            sample_recorded,
-        }))
+        let response = self.record_usage_from_authenticated(actor, r)?;
+        Ok(Response::new(response))
     }
 
     async fn set_budget_limit(
