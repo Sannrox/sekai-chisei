@@ -2520,48 +2520,6 @@ impl ChiseiServiceImpl {
         self.active_promotions.clone()
     }
 
-    fn record_portfolio_shift(
-        &self,
-        scope: &str,
-        task_class: &str,
-        selection: &crate::chisei::portfolio::RouteSelection,
-        objective: &Objective,
-        outcome: &str,
-    ) {
-        if !selection.shifted {
-            return;
-        }
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.portfolio".into(),
-            action: "chisei.portfolio_route_shift".into(),
-            reason: selection.reason.clone(),
-            evidence: HashMap::from([
-                ("task_class".into(), task_class.to_string()),
-                ("previous_model".into(), selection.previous_model.clone()),
-                (
-                    "previous_prompt_variant".into(),
-                    selection.previous_prompt_variant.clone(),
-                ),
-                ("selected_model".into(), selection.model.clone()),
-                (
-                    "selected_prompt_variant".into(),
-                    selection.prompt_variant.clone(),
-                ),
-                ("objective_mode".into(), objective.mode.as_str().into()),
-                (
-                    "budget_usd_micros".into(),
-                    objective.budget_usd_micros.to_string(),
-                ),
-                ("quality_bar".into(), objective.quality_bar.to_string()),
-                ("min_samples".into(), objective.min_samples.to_string()),
-            ]),
-            target_id: scope.to_string(),
-            outcome: outcome.to_string(),
-        });
-    }
-
     pub fn with_budget(db: Arc<RuntimeDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
