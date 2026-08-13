@@ -30,7 +30,7 @@ use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::lookup_first;
 use crate::chisei::pipeline as pipe;
-use crate::chisei::policy::{ContextAdmissionAction, Policy, PolicyResolver};
+use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
 use crate::chisei::promotion::CandidateStore;
@@ -68,6 +68,8 @@ mod policy_resolution;
 mod privacy_egress;
 mod reported_operation_event_lifecycle;
 
+#[cfg(test)]
+use crate::chisei::policy::ContextAdmissionAction;
 #[cfg(test)]
 use context_expansion::{
     evidence_context_config_ref, evidence_context_profile_key,
