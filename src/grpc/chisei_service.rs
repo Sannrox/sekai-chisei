@@ -49,6 +49,7 @@ use crate::sekai::action_policy::ActionDecision;
 use crate::sekai::governed_facts::{self as governed_fact_domain, GovernedFactType};
 use crate::sekai::markings;
 
+mod budget_identity;
 mod context_expansion;
 mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
@@ -80,6 +81,8 @@ use native_execution_lifecycle::{
 };
 #[cfg(test)]
 use policy_resolution::{local_free_runtime_for_model, portfolio_runtime_for_model};
+
+use budget_identity::{budget_metric, budget_subject};
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -2378,58 +2381,6 @@ impl ChiseiServiceImpl {
         );
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
     }
-}
-
-fn budget_metric(metric: &str) -> Result<&'static str, Status> {
-    if metric.trim().eq_ignore_ascii_case(METRIC_REQUESTS) {
-        Ok(METRIC_REQUESTS)
-    } else if metric.trim().is_empty() || metric.trim().eq_ignore_ascii_case(METRIC_TOKENS) {
-        Ok(METRIC_TOKENS)
-    } else {
-        Err(Status::invalid_argument(
-            "unsupported budget metric; use tokens or requests",
-        ))
-    }
-}
-
-/// Builds the budget scope id for a request. An explicit `subject` bypasses
-/// hierarchy construction entirely (kept for legacy/direct callers and any
-/// caller that wants a flat, non-nested scope) and chains only through the
-/// unset `global` root. Otherwise the scope is built from whichever of
-/// project/agent/work_unit are present, in that nesting order, so that
-/// Canonical gateway decisions and `RecordUsage` walk and deduct the whole ancestor chain
-/// (project -> agent -> work_unit) atomically — see `db::chisei_budget`.
-fn budget_subject(
-    subject: &str,
-    project: &str,
-    agent: &str,
-    key_id: &str,
-    work_unit: &str,
-    legacy_user_id: &str,
-) -> Result<String, Status> {
-    if !subject.trim().is_empty() {
-        return Ok(subject.trim().to_string());
-    }
-    let mut segments = Vec::new();
-    if !project.trim().is_empty() {
-        segments.push(format!("project:{}", project.trim()));
-    }
-    if !agent.trim().is_empty() {
-        segments.push(format!("agent:{}", agent.trim()));
-    }
-    if !work_unit.trim().is_empty() {
-        segments.push(format!("work_unit:{}", work_unit.trim()));
-    }
-    if !segments.is_empty() {
-        return Ok(segments.join("/"));
-    }
-    if !key_id.trim().is_empty() {
-        return Ok(format!("gateway_key:{}", key_id.trim()));
-    }
-    if !legacy_user_id.trim().is_empty() {
-        return Ok(legacy_user_id.trim().to_string());
-    }
-    Err(Status::invalid_argument("budget subject required"))
 }
 
 /// Internal policy-resolution request used by the canonical fat-decide path.
