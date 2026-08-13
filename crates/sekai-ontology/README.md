@@ -14,6 +14,8 @@ sekai --db knowledge.db --json explain Api
 sekai --db knowledge.db --json query Api --direction outbound --depth 2
 sekai --db knowledge.db --json find interface
 sekai --db knowledge.db --json ask "What does Api depend on?"
+sekai --db knowledge.db --json ask "find language"
+sekai --db knowledge.db --json ask "What does Api depend on to depth 2?"
 sekai --json diff before.json after.json
 sekai --db knowledge.db --json entity list
 sekai --db knowledge.db --json relation list
@@ -108,18 +110,25 @@ sekai --json diff before.json after.json
 
 `ask <question>` is a conservative Natural Language frontend over the existing
 typed operations. It does not call a model, access the network, or mutate the
-database. Supported forms compile to one bounded `explain` or `query` plan:
+database. Supported forms compile to one bounded `explain`, `query`, `find`,
+or `directory query` plan:
 
 ```bash
 sekai --db knowledge.db ask "What is Api?"
 sekai --db knowledge.db ask "What does Api depend on?"
 sekai --db knowledge.db ask "What depends on Database?"
 sekai --db knowledge.db ask "What is related to Api?"
+sekai --db knowledge.db ask "find language"
+sekai --db knowledge.db ask "What does Api depend on to depth 2?"
+sekai --db knowledge.db ask "What does /tmp/Projects contain to depth 2?"
 ```
 
 The JSON response always exposes the interpretation and typed plan before the
-answer. Ambiguous or unsupported questions return candidates without executing
-a plan and exit 2. Mutations such as `import` remain explicit commands.
+answer. `find` / `search for` questions compile to `find`. Questions that name
+a filesystem path compile to `directory query`. An explicit `depth N` applies
+to class and directory traversals; the default remains 1. Ambiguous or
+unsupported questions return candidates without executing a plan and exit 2.
+Mutations such as `import` remain explicit commands.
 
 ## Process contract
 

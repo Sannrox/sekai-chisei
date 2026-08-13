@@ -41,6 +41,8 @@ struct ValidationResult {
 enum AskAnswer {
     Explain(sekai_ontology::ExplainResult),
     Query(sekai_ontology::QueryResult),
+    Find(sekai_ontology::SearchResult),
+    DirectoryQuery(sekai_ontology::DirectoryQueryResult),
 }
 
 #[derive(Serialize)]
@@ -303,6 +305,15 @@ fn run_ask(arguments: &Arguments) -> Result<ExitCode, Error> {
                     Error::Input("ask query interpretation did not include options".into())
                 })?;
                 AskAnswer::Query(ontology.query(&plan.name, options)?)
+            }
+            AskOperation::Find => AskAnswer::Find(ontology.find(&plan.name)?),
+            AskOperation::DirectoryQuery => {
+                let options = plan.options.clone().ok_or_else(|| {
+                    Error::Input(
+                        "ask directory query interpretation did not include options".into(),
+                    )
+                })?;
+                AskAnswer::DirectoryQuery(ontology.query_directories(&plan.name, options)?)
             }
         });
     }
@@ -657,6 +668,22 @@ fn print_ask_human(response: &AskResponse) {
                 println!("  reached: {}", class.name);
             }
         }
+        Some(AskAnswer::Find(result)) => {
+            if result.matches.is_empty() {
+                println!("no definitions matched '{}'", result.query);
+            } else {
+                for matched in &result.matches {
+                    println!(
+                        "{} {} (score {}; matched {})",
+                        definition_kind_name(matched.kind),
+                        matched.name,
+                        matched.score,
+                        matched.matched_fields.join(", ")
+                    );
+                }
+            }
+        }
+        Some(AskAnswer::DirectoryQuery(result)) => print_directory_query(result),
         None => {}
     }
 }
@@ -1300,7 +1327,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  directory init\n  directory index <root> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]\n  directory export <root> [--max-depth <0..64>]\n  directory tree <root> [--max-depth <0..64>]\n  directory import <path|->\n  directory query <path> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..64>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. nearest existing .sekai/knowledge.db from the current directory upward\n  4. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  5. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain/query plans.\nDirectory indexing never follows symlinks; `--prune` removes stale indexed facts under the selected root.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  directory init\n  directory index <root> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]\n  directory export <root> [--max-depth <0..64>]\n  directory tree <root> [--max-depth <0..64>]\n  directory import <path|->\n  directory query <path> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..64>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. nearest existing .sekai/knowledge.db from the current directory upward\n  4. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  5. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain, query, find, and directory-query plans.\nDirectory indexing never follows symlinks; `--prune` removes stale indexed facts under the selected root.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {

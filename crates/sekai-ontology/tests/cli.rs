@@ -118,6 +118,38 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         "Database"
     );
 
+    let find_ask = sekai(&["--db", database, "--json", "ask", "find language"]);
+    assert!(
+        find_ask.status.success(),
+        "{}",
+        String::from_utf8_lossy(&find_ask.stderr)
+    );
+    let find_ask: Value = serde_json::from_slice(&find_ask.stdout).unwrap();
+    assert_eq!(
+        find_ask["data"]["interpretation"]["plan"]["operation"],
+        "find"
+    );
+    assert_eq!(find_ask["data"]["answer"]["kind"], "find");
+    assert_eq!(
+        find_ask["data"]["answer"]["data"]["matches"][0]["name"],
+        "Api"
+    );
+
+    let deep = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "ask",
+        "What does Api depend on to depth 2?",
+    ]);
+    assert!(deep.status.success());
+    let deep: Value = serde_json::from_slice(&deep.stdout).unwrap();
+    assert_eq!(
+        deep["data"]["interpretation"]["plan"]["options"]["depth"],
+        2
+    );
+    assert_eq!(deep["data"]["answer"]["kind"], "query");
+
     let unsupported = sekai(&[
         "--db",
         database,
@@ -339,6 +371,36 @@ fn directory_commands_index_query_export_import_and_prune() {
     let query: Value = serde_json::from_slice(&query.stdout).unwrap();
     assert_eq!(query["command"], "directory.query");
     assert_eq!(query["data"]["entities"].as_array().unwrap().len(), 2);
+
+    let ask_directory = sekai(&[
+        "--db",
+        database,
+        "--json",
+        "ask",
+        &format!("What does {root} contain to depth 2?"),
+    ]);
+    assert!(
+        ask_directory.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ask_directory.stderr)
+    );
+    let ask_directory: Value = serde_json::from_slice(&ask_directory.stdout).unwrap();
+    assert_eq!(
+        ask_directory["data"]["interpretation"]["plan"]["operation"],
+        "directory_query"
+    );
+    assert_eq!(
+        ask_directory["data"]["interpretation"]["plan"]["options"]["depth"],
+        2
+    );
+    assert_eq!(ask_directory["data"]["answer"]["kind"], "directory_query");
+    assert_eq!(
+        ask_directory["data"]["answer"]["data"]["entities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     let exported = sekai(&["--db", database, "directory", "export", root]);
     assert!(exported.status.success());
