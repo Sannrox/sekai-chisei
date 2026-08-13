@@ -606,6 +606,27 @@ impl ChiseiServiceImpl {
         }
         Ok(())
     }
+
+    pub(super) fn record_evolve_task(
+        &self,
+        request_id: &str,
+        namespace: &str,
+        spec: &str,
+        status: &str,
+        tokens_used: i32,
+    ) -> Result<(), String> {
+        record_evolve_task_on(
+            &self.db,
+            &self.evolve_history,
+            EvolveTaskRecord {
+                request_id,
+                namespace,
+                spec,
+                status,
+                tokens_used,
+            },
+        )
+    }
 }
 
 /// Complete an operation that was fully answered by structured lookup (#281).
@@ -1067,4 +1088,39 @@ pub(super) fn native_cacheable_message_count(
     } else {
         prepared.len().saturating_sub(1)
     }
+}
+
+struct EvolveTaskRecord<'a> {
+    request_id: &'a str,
+    namespace: &'a str,
+    spec: &'a str,
+    status: &'a str,
+    tokens_used: i32,
+}
+
+fn record_evolve_task_on(
+    db: &RuntimeDb,
+    evolve_history: &Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
+    task: EvolveTaskRecord<'_>,
+) -> Result<(), String> {
+    if task.request_id.is_empty() {
+        return Ok(());
+    }
+    let mut history = evolve_history.lock().expect("evolve history poisoned");
+    let entry = history
+        .entry(task.request_id.to_string())
+        .or_insert_with(|| crate::chisei::evolve::TaskRecord {
+            id: task.request_id.to_string(),
+            spec: task.spec.to_string(),
+            status: task.status.to_string(),
+            namespace: task.namespace.to_string(),
+            tokens_used: task.tokens_used,
+            created: chrono::Utc::now().timestamp(),
+        });
+    entry.namespace = task.namespace.to_string();
+    entry.spec = task.spec.to_string();
+    entry.status = task.status.to_string();
+    entry.tokens_used = task.tokens_used;
+    db.put_evolve_task(entry)?;
+    Ok(())
 }

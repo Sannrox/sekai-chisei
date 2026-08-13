@@ -46,7 +46,9 @@ resolution, epistemic descriptors, and canonical result projection.
 
 The gRPC adapter owns caller authentication, capability-catalog attribution,
 namespace-specific expansion and explanation projection, and protocol metadata.
-PostgreSQL community retrieval remains asserted-only.
+Computed-property response helpers are shared private implementation with
+authorized query and object mutation. PostgreSQL community retrieval remains
+asserted-only.
 
 ## Authorized query
 
@@ -60,7 +62,9 @@ nodes.
 
 The gRPC adapter owns caller authentication, catalog-invocation receipts, and
 protocol translation. Semantic retrieval remains a separate reasoning module.
-Object mutation and link mutation remain write-only.
+Object mutation and link mutation remain write-only. Computed-property response
+helpers are shared private implementation with object mutation and semantic
+retrieval.
 
 ## Policy resolution
 
@@ -73,8 +77,9 @@ canonicalization, and fallback projection.
 
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
-manufacturing transport requests. Live-model resolution and final-runtime
-helpers are shared private implementation with native execution planning.
+manufacturing transport requests. Live-model resolution, final-runtime
+helpers, and provider-registry refresh are shared private implementation with
+native execution planning.
 
 ## Gateway decide
 
@@ -141,9 +146,10 @@ protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline. Plan receipts are recorded after Gunshi
 stamps so allocation identity is present on the receipt. Leak, privacy, and
 egress-audit helpers are shared private implementation with native plan
-execution. Live-model resolution and final-runtime helpers are shared private
-implementation with policy resolution. Context-expansion gate helpers are
-shared private implementation with Gateway decide.
+execution. Live-model resolution, final-runtime helpers, and provider-registry
+refresh are shared private implementation with policy resolution.
+Context-expansion gate helpers are shared private implementation with Gateway
+decide.
 
 ## Native plan execution
 
@@ -154,7 +160,8 @@ streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 The gRPC adapter owns caller authentication and protocol translation. Planning
 remains a separate private pipeline; Action execution is a distinct Sekai
-concept and is not this lifecycle. Leak, privacy, and egress-audit helpers are
+concept and is not this lifecycle. The plan RPC records evolve tasks through
+this same bookkeeping helper. Leak, privacy, and egress-audit helpers are
 shared private implementation with native execution planning.
 
 ## Kioku candidate governance
@@ -220,6 +227,8 @@ principal-profile grants, and response resolution.
 
 The gRPC adapter owns protocol request and response translation. The lifecycle
 selects the direct or guarded persistence adapter behind its private interface.
+Computed-property response helpers are shared private implementation with
+authorized query and semantic retrieval.
 
 ## Authorized link mutation
 
