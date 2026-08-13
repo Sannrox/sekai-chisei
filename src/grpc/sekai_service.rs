@@ -167,12 +167,6 @@ impl SekaiServiceImpl {
         self
     }
 
-    fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
-        self.schema_definitions
-            .ensure_kind_loaded(kind)
-            .map_err(map_schema_definition_lifecycle_error)
-    }
-
     fn catalog_metadata_value(req: &Request<impl prost::Message>, key: &str) -> Option<String> {
         req.metadata()
             .get(key)

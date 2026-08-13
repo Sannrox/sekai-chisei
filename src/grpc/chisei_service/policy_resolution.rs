@@ -2,9 +2,10 @@
 //!
 //! The gRPC adapter owns caller authentication and protocol translation. This
 //! module owns ordered policy scope selection, regression handling, privacy and
-//! capability gates, cost-tier and portfolio routing, runtime canonicalization,
-//! and fallback projection.
+//! capability gates, cost-tier and portfolio routing, exclusive local-free and
+//! portfolio runtime helpers, runtime canonicalization, and fallback projection.
 
+use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
 impl ChiseiServiceImpl {
@@ -481,5 +482,52 @@ impl ChiseiServiceImpl {
             target_id: scope.to_string(),
             outcome: outcome.to_string(),
         });
+    }
+}
+
+pub(super) fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
+    policy.is_none_or(|policy| {
+        policy.allowed_models.is_empty()
+            || policy.allowed_models.iter().any(|allowed| allowed == model)
+    })
+}
+
+pub(super) fn portfolio_runtime_for_model(
+    policy: Option<&Policy>,
+    current_runtime: &str,
+    model: &str,
+) -> Option<String> {
+    let model_runtime = crate::llm::provider_name(model);
+    if model_runtime == current_runtime.trim() {
+        return Some(model_runtime.to_string());
+    }
+    policy
+        .filter(|policy| {
+            policy.allowed_runtimes.is_empty()
+                || policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == model_runtime)
+        })
+        .map(|_| model_runtime.to_string())
+}
+
+pub(super) fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str) -> Option<String> {
+    let runtime = crate::llm::provider_name(model);
+    if runtime != "ollama" {
+        return None;
+    }
+    match policy {
+        None => Some(runtime.to_string()),
+        Some(policy)
+            if policy.allowed_runtimes.is_empty()
+                || policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == runtime) =>
+        {
+            Some(runtime.to_string())
+        }
+        Some(_) => None,
     }
 }

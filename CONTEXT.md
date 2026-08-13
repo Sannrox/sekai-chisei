@@ -67,12 +67,14 @@ Object mutation and link mutation remain write-only.
 The **Policy resolution module** produces one permitted route or denial from
 authenticated routing input. Its private interface owns policy-scope
 precedence, regression and promoted-capable safeguards, privacy and capability
-gates, explicit route overrides, local-free, cheap, and portfolio selection,
-portfolio-shift audit, runtime canonicalization, and fallback projection.
+gates, explicit route overrides, local-free, cheap, and portfolio selection
+including exclusive runtime helpers, portfolio-shift audit, runtime
+canonicalization, and fallback projection.
 
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
-manufacturing transport requests.
+manufacturing transport requests. Live-model resolution and final-runtime
+helpers are shared private implementation with native execution planning.
 
 ## Gateway decide
 
@@ -129,16 +131,17 @@ operation.
 
 The **Native execution planning pipeline** produces one executable or denied
 plan from authenticated execution input. Its private interface owns Kioku
-context enrichment, policy and provider resolution, budget and evaluation
-gates, routing, egress and privacy decisions, sampling, audit, plan
-projection, and plan-receipt recording.
+context enrichment, policy and provider resolution, preferred-model selection,
+budget and evaluation gates, routing, egress and privacy decisions, sampling,
+audit, plan projection, and plan-receipt recording.
 
 The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
 remains inside the planning pipeline. Plan receipts are recorded after Gunshi
 stamps so allocation identity is present on the receipt. Leak, privacy, and
 egress-audit helpers are shared private implementation with native plan
-execution.
+execution. Live-model resolution and final-runtime helpers are shared private
+implementation with policy resolution.
 
 ## Native plan execution
 
@@ -209,9 +212,9 @@ durable authority.
 
 The **Object mutation lifecycle** creates, updates, and deletes Objects through
 one private ordered path. It owns tenant and namespace admission, optional
-generation-fenced lease validation and replay, marking and schema enforcement,
-direct or guarded persistence, principal-profile grants, and response
-resolution.
+generation-fenced lease validation and replay, marking and schema enforcement
+including per-kind load before write, direct or guarded persistence,
+principal-profile grants, and response resolution.
 
 The gRPC adapter owns protocol request and response translation. The lifecycle
 selects the direct or guarded persistence adapter behind its private interface.
