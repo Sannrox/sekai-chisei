@@ -20,18 +20,13 @@ impl SekaiServiceImpl {
             .get_object(&id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, false)
-            .map_err(|_| Status::not_found("not found"))?;
-        check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
-        check_read(&self.security, &id, &principals)?;
-        if is_reserved_governance_kind(&obj.kind) {
-            return Err(Status::not_found("not found"));
-        }
-        let marking = enforce_object_marking_access(
+        let (obj, marking) = require_visible_read_root(
             &self.db,
-            &obj,
+            &self.security,
+            obj,
             &principals,
-            &format!("get_object:{}", obj.id),
+            tenant_context.as_ref(),
+            &format!("get_object:{id}"),
         )?;
         if marking.decision != markings::MarkingDecision::NotApplicable {
             let actor = principals.first().cloned().unwrap_or_default();
@@ -211,7 +206,7 @@ impl SekaiServiceImpl {
                         candidate,
                         &principals,
                         tenant_context.as_ref(),
-                    ) && !is_reserved_governance_kind(&candidate.kind)
+                    )
                 })
         } else {
             self.db
@@ -219,17 +214,12 @@ impl SekaiServiceImpl {
                 .map_err(Status::internal)?
         }
         .ok_or(Status::not_found("not found"))?;
-        if is_reserved_governance_kind(&obj.kind) {
-            return Err(Status::not_found("not found"));
-        }
-        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &obj.namespace, false)
-            .map_err(|_| Status::not_found("not found"))?;
-        check_team_namespace(&self.db, &principals, &obj.namespace, false)?;
-        check_read(&self.security, &obj.id, &principals)?;
-        enforce_object_marking_access(
+        let (obj, _) = require_visible_read_root(
             &self.db,
-            &obj,
+            &self.security,
+            obj,
             &principals,
+            tenant_context.as_ref(),
             &format!("find_by_external_id:{}", obj.id),
         )?;
         let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
@@ -298,15 +288,13 @@ impl SekaiServiceImpl {
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &root.namespace, false)
-            .map_err(|_| Status::not_found("not found"))?;
-        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
-        check_read(&self.security, &root.id, &principals)?;
-        enforce_object_marking_access(
+        let (root, _) = require_visible_read_root(
             &self.db,
-            &root,
+            &self.security,
+            root,
             &principals,
-            &format!("get_links:{}", root.id),
+            tenant_context.as_ref(),
+            &format!("get_links:{}", r.object_id),
         )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
@@ -315,7 +303,7 @@ impl SekaiServiceImpl {
         };
         let links = self
             .db
-            .get_links(&r.object_id, &r.relation, &dir)
+            .get_links(&root.id, &r.relation, &dir)
             .map_err(Status::internal)?;
         let links = links
             .into_iter()
@@ -353,15 +341,13 @@ impl SekaiServiceImpl {
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &root.namespace, false)
-            .map_err(|_| Status::not_found("not found"))?;
-        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
-        check_read(&self.security, &root.id, &principals)?;
-        enforce_object_marking_access(
+        let (root, _) = require_visible_read_root(
             &self.db,
-            &root,
+            &self.security,
+            root,
             &principals,
-            &format!("get_linked_objects:{}", root.id),
+            tenant_context.as_ref(),
+            &format!("get_linked_objects:{}", r.object_id),
         )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
@@ -370,7 +356,7 @@ impl SekaiServiceImpl {
         };
         let objs = self
             .db
-            .get_linked_objects(&r.object_id, &r.relation, &dir)
+            .get_linked_objects(&root.id, &r.relation, &dir)
             .map_err(Status::internal)?;
         let objs = objs
             .into_iter()
@@ -400,7 +386,7 @@ impl SekaiServiceImpl {
             .into_inner()
             .query
             .ok_or(Status::invalid_argument("query required"))?;
-        let gq = crate::sekai::query::GraphQuery {
+        let mut gq = crate::sekai::query::GraphQuery {
             start_id: q.start_id,
             start_external_id: q.start_external_id,
             relations: q.relations,
@@ -414,6 +400,49 @@ impl SekaiServiceImpl {
             interface_filter: q.interface_filter,
             property_filter: q.property_filter,
         };
+        let start = if !gq.start_id.is_empty() {
+            self.db
+                .get_object(&gq.start_id)
+                .map_err(Status::internal)?
+                .ok_or(Status::not_found("not found"))?
+        } else if !gq.start_external_id.is_empty() {
+            let external_id = gq.start_external_id.clone();
+            if tenant_context.is_some() {
+                self.db
+                    .find_all_by_external_id(&external_id)
+                    .map_err(Status::internal)?
+                    .into_iter()
+                    .find(|candidate| {
+                        object_is_visible(
+                            &self.db,
+                            &self.security,
+                            candidate,
+                            &principals,
+                            tenant_context.as_ref(),
+                        )
+                    })
+            } else {
+                self.db
+                    .find_by_external_id(&external_id)
+                    .map_err(Status::internal)?
+            }
+            .ok_or(Status::not_found("not found"))?
+        } else {
+            return Err(Status::invalid_argument(
+                "start_id or start_external_id required",
+            ));
+        };
+        let start_operation = format!("traverse:{}", start.id);
+        let (start, _) = require_visible_read_root(
+            &self.db,
+            &self.security,
+            start,
+            &principals,
+            tenant_context.as_ref(),
+            &start_operation,
+        )?;
+        gq.start_id = start.id.clone();
+        gq.start_external_id.clear();
         let schema = self
             .schema_definitions
             .snapshot()
@@ -443,14 +472,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
             )
         });
-        let visible_ids = res
-            .objects
-            .iter()
-            .map(|object| object.id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        res.links.retain(|link| {
-            visible_ids.contains(link.from_id.as_str()) && visible_ids.contains(link.to_id.as_str())
-        });
+        retain_reachable_visible_objects(&start.id, gq.direction, &mut res.objects, &mut res.links);
         res.objects =
             self.resolve_computed_for_responses(res.objects, &principals, tenant_context.as_ref())?;
         Ok(Response::new(TraverseResponse {
@@ -465,40 +487,42 @@ impl SekaiServiceImpl {
         req: Request<GetLineageRequest>,
     ) -> Result<Response<GetLineageResponse>, Status> {
         let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
             .get_object(&r.object_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        check_team_namespace(&self.db, &principals, &root.namespace, false)?;
-        check_read(&self.security, &root.id, &principals)?;
-        enforce_object_marking_access(
+        let (root, _) = require_visible_read_root(
             &self.db,
-            &root,
+            &self.security,
+            root,
             &principals,
-            &format!("get_lineage:{}", root.id),
+            tenant_context.as_ref(),
+            &format!("get_lineage:{}", r.object_id),
         )?;
-        let res = self
+        let mut res = self
             .db
-            .get_lineage(&r.object_id, r.max_nodes as usize)
+            .get_lineage(&root.id, r.max_nodes as usize)
             .map_err(Status::internal)?;
-        let visible_nodes = res
-            .nodes
-            .iter()
-            .filter(|node| {
-                object_is_visible(&self.db, &self.security, &node.object, &principals, None)
-            })
-            .collect::<Vec<_>>();
+        res.nodes.retain(|node| {
+            object_is_visible(
+                &self.db,
+                &self.security,
+                &node.object,
+                &principals,
+                tenant_context.as_ref(),
+            )
+        });
+        retain_reachable_visible_lineage(&root.id, &mut res.nodes, &mut res.edges);
         let objects = self.resolve_computed_for_responses(
-            visible_nodes
-                .iter()
-                .map(|node| node.object.clone())
-                .collect(),
+            res.nodes.iter().map(|node| node.object.clone()).collect(),
             &principals,
-            None,
+            tenant_context.as_ref(),
         )?;
-        let nodes = visible_nodes
+        let nodes = res
+            .nodes
             .iter()
             .zip(objects.iter())
             .map(|(n, object)| LineageNode {
@@ -507,16 +531,9 @@ impl SekaiServiceImpl {
                 ephemeral: n.ephemeral,
             })
             .collect::<Vec<_>>();
-        let visible_ids = nodes
-            .iter()
-            .filter_map(|node| node.object.as_ref().map(|object| object.id.as_str()))
-            .collect::<std::collections::HashSet<_>>();
         let edges = res
             .edges
             .iter()
-            .filter(|edge| {
-                visible_ids.contains(edge.from.as_str()) && visible_ids.contains(edge.to.as_str())
-            })
             .map(|e| LineageEdge {
                 from: e.from.clone(),
                 to: e.to.clone(),
