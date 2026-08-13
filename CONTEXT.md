@@ -9,9 +9,10 @@ function validation, durable writes, and cache repair.
 
 Object mutation, Action execution, ontology mapped-kind ensure, capability
 discovery, and the gRPC adapter consume domain snapshots rather than registry
-locks. Definitions are refreshed before schema-governed writes so multiple
-runtime instances converge on durable state. Schema history and implicit
-versioning remain outside this lifecycle.
+locks. Discoverable capability assembly is shared private implementation for
+authorized query and catalog RPCs. Definitions are refreshed before
+schema-governed writes so multiple runtime instances converge on durable state.
+Schema history and implicit versioning remain outside this lifecycle.
 
 ## Evidence admission
 
@@ -47,8 +48,9 @@ resolution, epistemic descriptors, and canonical result projection.
 The gRPC adapter owns caller authentication, capability-catalog attribution,
 namespace-specific expansion and explanation projection, and protocol metadata.
 Computed-property response helpers are shared private implementation with
-authorized query and object mutation. PostgreSQL community retrieval remains
-asserted-only.
+authorized query and object mutation. Discoverable capability helpers are
+shared private implementation with authorized query and catalog discovery.
+PostgreSQL community retrieval remains asserted-only.
 
 ## Authorized query
 
@@ -64,7 +66,8 @@ The gRPC adapter owns caller authentication, catalog-invocation receipts, and
 protocol translation. Semantic retrieval remains a separate reasoning module.
 Object mutation and link mutation remain write-only. Computed-property response
 helpers are shared private implementation with object mutation and semantic
-retrieval.
+retrieval. Discoverable capability helpers are shared private implementation
+with catalog discovery.
 
 ## Policy resolution
 
