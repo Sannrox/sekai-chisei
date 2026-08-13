@@ -154,7 +154,8 @@ streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 The gRPC adapter owns caller authentication and protocol translation. Planning
 remains a separate private pipeline; Action execution is a distinct Sekai
-concept and is not this lifecycle. Leak, privacy, and egress-audit helpers are
+concept and is not this lifecycle. The plan RPC records evolve tasks through
+this same bookkeeping helper. Leak, privacy, and egress-audit helpers are
 shared private implementation with native execution planning.
 
 ## Kioku candidate governance
