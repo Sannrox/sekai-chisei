@@ -86,7 +86,8 @@ audit, decision projection, and admitted pipeline enrichment.
 
 The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
-execution remain distinct Chisei concepts.
+execution remain distinct Chisei concepts. Context-expansion gate helpers are
+shared private implementation with native execution planning.
 
 ## External action
 
@@ -141,7 +142,8 @@ remains inside the planning pipeline. Plan receipts are recorded after Gunshi
 stamps so allocation identity is present on the receipt. Leak, privacy, and
 egress-audit helpers are shared private implementation with native plan
 execution. Live-model resolution and final-runtime helpers are shared private
-implementation with policy resolution.
+implementation with policy resolution. Context-expansion gate helpers are
+shared private implementation with Gateway decide.
 
 ## Native plan execution
 
