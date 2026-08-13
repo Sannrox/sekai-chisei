@@ -2367,17 +2367,6 @@ impl ChiseiServiceImpl {
         );
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
     }
-
-    async fn refresh_provider_registry_for_resolution(
-        &self,
-    ) -> Result<crate::provider_profile::ProviderRegistry, Status> {
-        let Some(path) = self.provider_registry_state_path.as_deref() else {
-            return Ok(crate::provider_profile::provider_registry_snapshot());
-        };
-        crate::provider_resolution::snapshot_for_execution(Some(path))
-            .await
-            .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
-    }
 }
 
 fn budget_metric(metric: &str) -> Result<&'static str, Status> {

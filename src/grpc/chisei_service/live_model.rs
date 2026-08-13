@@ -1,4 +1,5 @@
-//! Shared live-model and runtime helpers for policy resolution and planning.
+//! Shared live-model, runtime, and provider-registry helpers for policy
+//! resolution and planning.
 //!
 //! These are private implementation used by already-deep modules. They are not a
 //! new ordered lifecycle.
@@ -91,6 +92,17 @@ impl ChiseiServiceImpl {
         crate::chisei::model_routing::resolve_model(crate::chisei::model_routing::RoutingContext {
             ..base_context
         })
+    }
+
+    pub(super) async fn refresh_provider_registry_for_resolution(
+        &self,
+    ) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+        let Some(path) = self.provider_registry_state_path.as_deref() else {
+            return Ok(crate::provider_profile::provider_registry_snapshot());
+        };
+        crate::provider_resolution::snapshot_for_execution(Some(path))
+            .await
+            .map_err(|error| Status::unavailable(format!("provider registry unavailable: {error}")))
     }
 }
 
