@@ -2420,7 +2420,10 @@ fn prune_excess_plans(
 }
 
 fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver) {
-    for kind in ["policy", "namespace_policy"] {
+    // Canonical `policy:` objects must win. Leftover `namespace_policy` rows
+    // still exist in older stores; applying them last restored a JSON-null
+    // context-admission clear (and any later canonical revision) on restart.
+    for kind in ["namespace_policy", "policy"] {
         let Ok(objects) = db.list_all_objects(&ListFilter {
             kind: Some(kind.into()),
             ..Default::default()
@@ -10353,6 +10356,106 @@ mod tests {
         assert_eq!(
             context_policy.unknown_action,
             ContextAdmissionAction::Qualify
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy() {
+        let path = std::env::temp_dir()
+            .join(format!("sekai-policy-null-{}.db", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .to_string();
+        let include_json = serde_json::json!({
+            "contract_version": crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION,
+            "default_action": "include",
+            "unknown_action": "hold_out",
+            "rules": []
+        })
+        .to_string();
+        {
+            let mut cfg = config(&path);
+            cfg.gateway_provided_providers = vec!["openai".into()];
+            let svc = ChiseiServiceImpl::new(
+                Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+                    SekaiDb::new(&path).unwrap(),
+                ))),
+                cfg,
+            );
+            svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+                namespace: "team-a".into(),
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+                context_admission_policy_json: include_json.clone(),
+            }))
+            .await
+            .unwrap();
+            svc.db
+                .create_object(&crate::domain::Object {
+                    id: "legacy-ns-policy-team-a".into(),
+                    kind: "namespace_policy".into(),
+                    name: "team-a".into(),
+                    namespace: "team-a".into(),
+                    external_id: "namespace_policy:team-a".into(),
+                    properties: std::collections::HashMap::from([
+                        ("allowed_runtimes".into(), "openai".into()),
+                        ("allowed_models".into(), "gpt-5.5".into()),
+                        ("default_runtime".into(), "openai".into()),
+                        ("default_model".into(), "gpt-5.5".into()),
+                        ("data_class".into(), "internal".into()),
+                        ("context_admission_policy_json".into(), include_json),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+            svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
+                namespace: "team-a".into(),
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+                context_admission_policy_json: "null".into(),
+            }))
+            .await
+            .unwrap();
+            assert!(
+                svc.policy
+                    .context_admission_policy("team-a")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut cfg = config(&path);
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(
+            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+                SekaiDb::new(&path).unwrap(),
+            ))),
+            cfg,
+        );
+        assert!(
+            svc.policy
+                .context_admission_policy("team-a")
+                .unwrap()
+                .is_none(),
+            "legacy namespace_policy must not restore a JSON-null context-admission clear"
+        );
+        let denied = svc
+            .decide_gateway_execution(decide_request("op-json-null-reload", "summarize team-a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "policy_denied");
+        assert_eq!(
+            denied.context_admission_reasons,
+            vec!["context_admission:missing"]
         );
         let _ = fs::remove_file(path);
     }
