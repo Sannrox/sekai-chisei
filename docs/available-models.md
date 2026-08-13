@@ -27,7 +27,9 @@ Gateway clients use `GET /v1/chisei/models`; an optional `provider` query
 parameter filters the result. This route uses the gateway's existing
 authentication and caller scope. It is distinct from the upstream-compatible
 `GET /v1/models` passthrough and from the larger
-`GET /v1/chisei/capabilities` matrix.
+`GET /v1/chisei/capabilities` matrix (`chisei.provider-capabilities/v1`).
+That HTTP document is a provider-profile matrix with no grant semantics; it is
+not `SekaiService.DiscoverCapabilities`.
 
 All three surfaces use the versioned `chisei.available-models/v1` projection and
 sort records by provider and canonical model identifier.

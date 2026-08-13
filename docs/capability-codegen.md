@@ -8,8 +8,10 @@ that credentials must not exceed.
 
 ## Generate → authenticate → invoke
 
-1. **Discover** the live catalog with `DiscoverCapabilities` for the
+1. **Discover** the live **native** catalog with `DiscoverCapabilities` for the
    authenticated principal and namespace (see `docs/capability-catalog.md`).
+   Do not use `GET /v1/chisei/capabilities`; that HTTP document is the
+   provider-profile matrix `chisei.provider-capabilities/v1`.
 2. **Project** entries with `capability_projection` (or export the same JSON
    contract).
 3. **Select** capability names the client is allowed to call.

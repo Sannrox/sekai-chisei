@@ -84,6 +84,8 @@ const X_CHISEI_PARENT_OPERATION_ID: HeaderName =
     HeaderName::from_static("x-chisei-parent-operation-id");
 const X_CHISEI_REQUEST_ID: HeaderName = HeaderName::from_static("x-chisei-request-id");
 const X_CHISEI_CALLER_SCOPE: HeaderName = HeaderName::from_static("x-chisei-caller-scope");
+const X_CHISEI_CAPABILITY_CATALOG: HeaderName =
+    HeaderName::from_static("x-chisei-capability-catalog");
 const X_CHISEI_TURN_ID: HeaderName = HeaderName::from_static("x-chisei-turn-id");
 const X_CHISEI_ATTEMPT: HeaderName = HeaderName::from_static("x-chisei-attempt");
 const X_CHISEI_CYCLE_ID: HeaderName = HeaderName::from_static("x-chisei-cycle-id");
@@ -1524,7 +1526,7 @@ async fn proxy_gateway_inner_scoped(
             return json_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "invalid_request_error",
-                "capability discovery requires GET",
+                "provider capability matrix requires GET",
             );
         }
         let discovery = sekai_provider::model_availability::ModelDiscoveryConfig {
@@ -1543,13 +1545,18 @@ async fn proxy_gateway_inner_scoped(
             sekai_provider::model_availability::refresh_model_availability(&discovery, false).await;
         let mut response = json_response(
             StatusCode::OK,
-            serde_json::to_value(CapabilityMatrix::with_model_availability(availability))
-                .expect("built-in capability matrix is serializable"),
+            serde_json::to_value(CapabilityMatrix::public_discovery(availability))
+                .expect("provider capability matrix is serializable"),
         );
         insert_header(
             response.headers_mut(),
             &X_CHISEI_CALLER_SCOPE,
             &correlation.caller_scope,
+        );
+        insert_header(
+            response.headers_mut(),
+            &X_CHISEI_CAPABILITY_CATALOG,
+            CAPABILITY_MATRIX_VERSION,
         );
         return response;
     }
@@ -10901,6 +10908,7 @@ mod tests {
             matrix.version,
             crate::provider_profile::CAPABILITY_MATRIX_VERSION
         );
+        assert!(!matrix.grant_semantics);
         assert!(matrix.capabilities("openai").unwrap().parallel_tools);
         assert!(!matrix.capabilities("openai").unwrap().provider_continuation);
         assert!(!matrix.capabilities("ollama").unwrap().parallel_tools);
@@ -16059,6 +16067,56 @@ mod tests {
         assert!(!body.contains("real-openai-key"));
         assert!(!body.contains("real-anthropic-key"));
         assert!(!body.contains("discovery_source"));
+    }
+
+    #[tokio::test]
+    async fn provider_capability_matrix_endpoint_is_versioned_and_does_not_dump_unentitled_profiles()
+     {
+        let (upstream_base, _) =
+            spawn_fake_upstream(r#"{"data":[{"id":"gpt-5.5"}]}"#, "application/json").await;
+        let gateway_base = spawn_gateway(upstream_base).await;
+        let client = reqwest::Client::new();
+
+        let unauthenticated = client
+            .get(format!("{gateway_base}/v1/chisei/capabilities"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = client
+            .get(format!("{gateway_base}/v1/chisei/capabilities"))
+            .bearer_auth("sk-chisei-codex-app")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-chisei-capability-catalog")
+                .and_then(|value| value.to_str().ok()),
+            Some(CAPABILITY_MATRIX_VERSION)
+        );
+        let body = response.text().await.unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["version"], CAPABILITY_MATRIX_VERSION);
+        assert_eq!(value["grant_semantics"], false);
+        let providers = value["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|profile| profile["provider"].as_str())
+            .collect::<Vec<_>>();
+        assert!(providers.contains(&"openai"), "{providers:?}");
+        assert!(
+            !providers.contains(&"meta"),
+            "experimental unconfigured meta must not appear: {providers:?}"
+        );
+        assert!(!body.contains("real-openai-key"));
+        assert!(!body.contains("real-anthropic-key"));
+        assert!(!body.contains("sekai.semantic."));
+        assert!(!body.contains("authorization_context"));
     }
 
     #[tokio::test]
