@@ -96,6 +96,7 @@ The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
 execution remain distinct Chisei concepts. Context-expansion gate helpers are
 shared private implementation with native execution planning.
+Continuation-allocation lookup is exclusive to this lifecycle.
 
 ## External action
 

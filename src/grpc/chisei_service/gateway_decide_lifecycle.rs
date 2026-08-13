@@ -10,6 +10,9 @@ use crate::chisei::gateway_decide::{
     GATEWAY_DECIDE_CONTRACT_VERSION, GatewayDecideDenyReason, GatewayDecideInputs,
     GatewayDecideOutcome, GatewayDecideRequest, budget_grant_id, compose_gateway_decide,
 };
+use crate::sekai::coordination::{
+    RESERVATION_STATUS_ACTIVE, ReservationFilter, WORK_UNIT_STATUS_RUNNING,
+};
 
 impl ChiseiServiceImpl {
     pub(super) async fn decide_from_authenticated_request(
@@ -490,4 +493,36 @@ impl ChiseiServiceImpl {
             .map_err(Status::failed_precondition)?;
         Ok(GatewayPipelineDecision { run, sampling })
     }
+}
+
+fn active_continuation_allocation(
+    db: &RuntimeDb,
+    work_unit_id: &str,
+    budget_identities: &[&str],
+    now_ms: i64,
+) -> bool {
+    let Ok(Some(work_unit)) = db.get_work_unit(work_unit_id) else {
+        return false;
+    };
+    if work_unit.status != WORK_UNIT_STATUS_RUNNING
+        || !budget_identities.iter().any(|identity| {
+            *identity == work_unit.owner_principal || *identity == work_unit.creator_principal
+        })
+    {
+        return false;
+    }
+    db.list_reservations(&ReservationFilter {
+        work_unit_id: Some(work_unit_id.to_string()),
+        status: Some(RESERVATION_STATUS_ACTIVE.to_string()),
+        ..Default::default()
+    })
+    .is_ok_and(|reservations| {
+        reservations.iter().any(|reservation| {
+            reservation.released_at == 0
+                && reservation.expires_at > now_ms
+                && budget_identities
+                    .iter()
+                    .any(|identity| *identity == reservation.lease_owner)
+        })
+    })
 }

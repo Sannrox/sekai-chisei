@@ -46,9 +46,6 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{ListFilter, Object};
 #[cfg(test)]
 use crate::sekai::action_policy::ActionDecision;
-use crate::sekai::coordination::{
-    RESERVATION_STATUS_ACTIVE, ReservationFilter, WORK_UNIT_STATUS_RUNNING,
-};
 use crate::sekai::governed_facts::{self as governed_fact_domain, GovernedFactType};
 use crate::sekai::markings;
 
@@ -2433,38 +2430,6 @@ fn budget_subject(
         return Ok(legacy_user_id.trim().to_string());
     }
     Err(Status::invalid_argument("budget subject required"))
-}
-
-fn active_continuation_allocation(
-    db: &RuntimeDb,
-    work_unit_id: &str,
-    budget_identities: &[&str],
-    now_ms: i64,
-) -> bool {
-    let Ok(Some(work_unit)) = db.get_work_unit(work_unit_id) else {
-        return false;
-    };
-    if work_unit.status != WORK_UNIT_STATUS_RUNNING
-        || !budget_identities.iter().any(|identity| {
-            *identity == work_unit.owner_principal || *identity == work_unit.creator_principal
-        })
-    {
-        return false;
-    }
-    db.list_reservations(&ReservationFilter {
-        work_unit_id: Some(work_unit_id.to_string()),
-        status: Some(RESERVATION_STATUS_ACTIVE.to_string()),
-        ..Default::default()
-    })
-    .is_ok_and(|reservations| {
-        reservations.iter().any(|reservation| {
-            reservation.released_at == 0
-                && reservation.expires_at > now_ms
-                && budget_identities
-                    .iter()
-                    .any(|identity| *identity == reservation.lease_owner)
-        })
-    })
 }
 
 /// Internal policy-resolution request used by the canonical fat-decide path.
