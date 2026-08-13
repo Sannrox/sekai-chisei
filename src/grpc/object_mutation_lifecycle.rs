@@ -1,9 +1,9 @@
 //! Object mutation admission and persistence ordering behind one private interface.
 //!
 //! The tonic adapter forwards create, update, and delete requests here. This
-//! module owns tenant, namespace, lease, marking, schema, replay, persistence,
-//! grant, and response-resolution ordering for both direct and guarded object
-//! mutations.
+//! module owns tenant, namespace, lease, marking, schema including per-kind
+//! load before write, replay, persistence, grant, and response-resolution
+//! ordering for both direct and guarded object mutations.
 
 use super::*;
 
@@ -459,5 +459,11 @@ impl SekaiServiceImpl {
             .delete(&input.id, expected.as_ref(), actor, now_millis())
             .map_err(map_mutation_persistence_error)?;
         Ok(Response::new(GuardedDeleteObjectResponse {}))
+    }
+
+    pub(super) fn require_schema_kind_loaded(&self, kind: &str) -> Result<(), Status> {
+        self.schema_definitions
+            .ensure_kind_loaded(kind)
+            .map_err(map_schema_definition_lifecycle_error)
     }
 }
