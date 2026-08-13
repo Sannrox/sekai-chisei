@@ -82,7 +82,8 @@ The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
 manufacturing transport requests. Live-model resolution, final-runtime
 helpers, and provider-registry refresh are shared private implementation with
-native execution planning.
+native execution planning. Policy-scope and cheap-route helpers are exclusive
+to this module.
 
 ## Gateway decide
 
