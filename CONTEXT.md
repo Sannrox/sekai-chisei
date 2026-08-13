@@ -96,7 +96,8 @@ The gRPC adapter owns caller authentication and protocol translation. Policy
 resolution remains a separate private module. Native planning and plan
 execution remain distinct Chisei concepts. Context-expansion gate helpers are
 shared private implementation with native execution planning.
-Continuation-allocation lookup is exclusive to this lifecycle.
+Continuation-allocation lookup is exclusive to this lifecycle. Budget identity
+helpers are shared private implementation with Gateway receipt admission.
 
 ## External action
 
@@ -311,7 +312,8 @@ failure, and optional sample persist.
 The gRPC adapter owns caller authentication, trusted-principal and
 negative-adjustment gates, and protocol translation. Reported Operation
 Receipt events remain a distinct append lifecycle. Dispatch claim and receipt
-lookup remain adapter reads over the same durable authority.
+lookup remain adapter reads over the same durable authority. Budget identity
+helpers are shared private implementation with Gateway decide.
 
 ## Catalog invocation receipt lifecycle
 
