@@ -46,7 +46,9 @@ resolution, epistemic descriptors, and canonical result projection.
 
 The gRPC adapter owns caller authentication, capability-catalog attribution,
 namespace-specific expansion and explanation projection, and protocol metadata.
-PostgreSQL community retrieval remains asserted-only.
+Computed-property response helpers are shared private implementation with
+authorized query and object mutation. PostgreSQL community retrieval remains
+asserted-only.
 
 ## Authorized query
 
@@ -60,7 +62,9 @@ nodes.
 
 The gRPC adapter owns caller authentication, catalog-invocation receipts, and
 protocol translation. Semantic retrieval remains a separate reasoning module.
-Object mutation and link mutation remain write-only.
+Object mutation and link mutation remain write-only. Computed-property response
+helpers are shared private implementation with object mutation and semantic
+retrieval.
 
 ## Policy resolution
 
@@ -223,6 +227,8 @@ principal-profile grants, and response resolution.
 
 The gRPC adapter owns protocol request and response translation. The lifecycle
 selects the direct or guarded persistence adapter behind its private interface.
+Computed-property response helpers are shared private implementation with
+authorized query and semantic retrieval.
 
 ## Authorized link mutation
 
