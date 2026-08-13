@@ -214,13 +214,14 @@ impl SekaiServiceImpl {
                 .map_err(Status::internal)?
         }
         .ok_or(Status::not_found("not found"))?;
+        let find_operation = format!("find_by_external_id:{}", obj.id);
         let (obj, _) = require_visible_read_root(
             &self.db,
             &self.security,
             obj,
             &principals,
             tenant_context.as_ref(),
-            &format!("find_by_external_id:{}", obj.id),
+            &find_operation,
         )?;
         let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
         Ok(Response::new(GetObjectResponse {
