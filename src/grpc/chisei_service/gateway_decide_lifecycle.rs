@@ -65,7 +65,17 @@ impl ChiseiServiceImpl {
             });
         }
         let context_admission_policy = match self.policy.context_admission_policy(namespace) {
-            Ok(policy) => policy,
+            Ok(Some(policy)) => policy,
+            Ok(None) => {
+                return Ok(DecideGatewayExecutionResponse {
+                    contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                    admitted: false,
+                    deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
+                    deny_message: "context admission policy is required".into(),
+                    context_admission_reasons: vec!["context_admission:missing".into()],
+                    ..Default::default()
+                });
+            }
             Err(_error) => {
                 return Ok(DecideGatewayExecutionResponse {
                     contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
@@ -77,33 +87,26 @@ impl ChiseiServiceImpl {
                 });
             }
         };
-        let context_admission_policy_version = context_admission_policy
-            .as_ref()
-            .map(crate::chisei::policy::ContextAdmissionPolicy::version)
-            .unwrap_or_default();
+        let context_admission_policy_version = context_admission_policy.version();
         let context_admission_descriptor_version =
             crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION.to_string();
         let operation_risk =
             crate::chisei::policy::OperationRisk::from_labels(&r.operation_class, &r.task_class);
         let operation_context_gate = context_admission_policy
-            .as_ref()
-            .map(|policy| policy.operation_gate(operation_risk))
-            .transpose()
-            .map_err(Status::failed_precondition)?
-            .flatten();
-        if let Some(gate) = operation_context_gate
-            .as_ref()
-            .filter(|gate| gate.blocks_provider())
-        {
+            .operation_admission(operation_risk)
+            .map_err(Status::failed_precondition)?;
+        if operation_context_gate.blocks_provider() {
             return Ok(DecideGatewayExecutionResponse {
                 contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
                 admitted: false,
                 deny_reason: GatewayDecideDenyReason::PolicyDenied.as_str().into(),
                 deny_message: "context admission policy requires review or verification".into(),
-                context_admission_policy_version: gate.policy_version.clone(),
-                context_admission_descriptor_version: gate.descriptor_version.clone(),
-                context_admission_decision: gate.action.as_str().into(),
-                context_admission_reasons: vec![gate.reason_code.clone()],
+                context_admission_policy_version: operation_context_gate.policy_version.clone(),
+                context_admission_descriptor_version: operation_context_gate
+                    .descriptor_version
+                    .clone(),
+                context_admission_decision: operation_context_gate.action.as_str().into(),
+                context_admission_reasons: vec![operation_context_gate.reason_code.clone()],
                 ..Default::default()
             });
         }
@@ -314,19 +317,8 @@ impl ChiseiServiceImpl {
                 .unwrap_or_default(),
             context_admission_policy_version: context_admission_policy_version.clone(),
             context_admission_descriptor_version: context_admission_descriptor_version.clone(),
-            context_admission_decision: operation_context_gate
-                .as_ref()
-                .map(|gate| gate.action.as_str().to_string())
-                .unwrap_or_else(|| {
-                    context_admission_policy
-                        .as_ref()
-                        .map(|_| ContextAdmissionAction::Include.as_str().to_string())
-                        .unwrap_or_default()
-                }),
-            context_admission_reasons: operation_context_gate
-                .as_ref()
-                .map(|gate| vec![gate.reason_code.clone()])
-                .unwrap_or_default(),
+            context_admission_decision: operation_context_gate.action.as_str().to_string(),
+            context_admission_reasons: vec![operation_context_gate.reason_code.clone()],
             sampling_evaluated: false,
             sampled: false,
             sample_rate: 0.0,
@@ -364,7 +356,19 @@ impl ChiseiServiceImpl {
                     response.prepared_spec = decision.run.prepared_spec;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "gateway sampling decision unavailable");
+                    response.admitted = false;
+                    response.deny_reason = GatewayDecideDenyReason::PolicyDenied.as_str().into();
+                    response.deny_message =
+                        format!("gateway pipeline decision unavailable: {error}");
+                    response.resolved_runtime.clear();
+                    response.resolved_model.clear();
+                    response.policy_version.clear();
+                    response.budget_grant_id.clear();
+                    response.sampling_evaluated = false;
+                    response.sampled = false;
+                    response.sample_rate = 0.0;
+                    response.sample_reason.clear();
+                    response.prepared_spec.clear();
                 }
             }
         }
@@ -482,13 +486,8 @@ impl ChiseiServiceImpl {
             &evidence_context_gates,
             &run.evidence_references,
         )?;
-        let sampling = crate::chisei::sampling::decode_sampling(&run.steps).unwrap_or(
-            crate::chisei::sampling::SamplingDecision {
-                sampled: false,
-                effective_rate: self.config.sample_rate,
-                reason: "not_sampled".into(),
-            },
-        );
+        let sampling = crate::chisei::sampling::require_sampling(&run.steps)
+            .map_err(Status::failed_precondition)?;
         Ok(GatewayPipelineDecision { run, sampling })
     }
 }

@@ -126,6 +126,12 @@ pub fn decode_sampling(steps: &[StepDecision]) -> Option<SamplingDecision> {
     })
 }
 
+/// Gateway fat-decide must not continue after a pipeline run that omitted or
+/// corrupted the sampling step.
+pub fn require_sampling(steps: &[StepDecision]) -> Result<SamplingDecision, String> {
+    decode_sampling(steps).ok_or_else(|| "gateway sampling decision unavailable".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +227,10 @@ mod tests {
         let decoded = decode_sampling(std::slice::from_ref(&decision)).unwrap();
         assert!(decoded.sampled);
         assert_eq!(decoded.reason, "base");
+        assert_eq!(
+            require_sampling(std::slice::from_ref(&decision)).unwrap(),
+            decoded
+        );
+        assert!(require_sampling(&[]).is_err());
     }
 }

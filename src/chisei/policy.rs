@@ -35,6 +35,10 @@ impl ContextAdmissionAction {
             Self::RequireVerification => "require_verification",
         }
     }
+
+    pub const fn blocks_provider(self) -> bool {
+        matches!(self, Self::RequireReview | Self::RequireVerification)
+    }
 }
 
 /// Domain-neutral operation risk used only for policy matching. A numeric risk
@@ -166,10 +170,7 @@ impl ContextAdmissionDecision {
     }
 
     pub fn blocks_provider(&self) -> bool {
-        matches!(
-            self.action,
-            ContextAdmissionAction::RequireReview | ContextAdmissionAction::RequireVerification
-        )
+        self.action.blocks_provider()
     }
 }
 
@@ -269,6 +270,44 @@ impl ContextAdmissionPolicy {
             }
         }
         Ok(None)
+    }
+
+    /// Gateway fat-decide has no context descriptor. Matching operation-level
+    /// rules still win; otherwise apply `unknown_action` / `default_action`.
+    /// A blocking fallback denies instead of silently treating the gap as
+    /// `include`.
+    pub fn operation_admission(
+        &self,
+        operation_risk: OperationRisk,
+    ) -> Result<ContextAdmissionDecision, String> {
+        if let Some(decision) = self.operation_gate(operation_risk)? {
+            return Ok(decision);
+        }
+        let unknown = EpistemicDescriptor::unknown();
+        let action = [self.unknown_action, self.default_action]
+            .into_iter()
+            .max_by_key(|action| {
+                (
+                    action.blocks_provider(),
+                    *action == ContextAdmissionAction::RequireVerification,
+                )
+            })
+            .unwrap_or(self.default_action);
+        Ok(ContextAdmissionDecision {
+            action,
+            policy_version: self.version(),
+            descriptor_version: unknown.contract_version,
+            reason_code: format!("context_admission:{}", action.as_str()),
+        })
+    }
+
+    pub fn allow_by_default() -> Self {
+        Self {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![],
+        }
     }
 }
 
@@ -946,6 +985,58 @@ mod tests {
         let decision = policy.operation_gate(OperationRisk::High).unwrap().unwrap();
         assert_eq!(decision.action, ContextAdmissionAction::RequireReview);
         assert!(policy.operation_gate(OperationRisk::Low).unwrap().is_none());
+        let low = policy.operation_admission(OperationRisk::Low).unwrap();
+        assert_eq!(low.action, ContextAdmissionAction::Include);
+        assert!(!low.blocks_provider());
+    }
+
+    #[test]
+    fn operation_admission_denies_when_fallback_action_blocks_provider() {
+        let default_blocks = ContextAdmissionPolicy {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::RequireReview,
+            unknown_action: ContextAdmissionAction::HoldOut,
+            rules: vec![],
+        };
+        let default_decision = default_blocks
+            .operation_admission(OperationRisk::Low)
+            .unwrap();
+        assert_eq!(
+            default_decision.action,
+            ContextAdmissionAction::RequireReview
+        );
+        assert!(default_decision.blocks_provider());
+
+        let unknown_blocks = ContextAdmissionPolicy {
+            contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+            default_action: ContextAdmissionAction::Include,
+            unknown_action: ContextAdmissionAction::RequireVerification,
+            rules: vec![],
+        };
+        let unknown_decision = unknown_blocks
+            .operation_admission(OperationRisk::Low)
+            .unwrap();
+        assert_eq!(
+            unknown_decision.action,
+            ContextAdmissionAction::RequireVerification
+        );
+        assert!(unknown_decision.blocks_provider());
+    }
+
+    #[test]
+    fn allow_by_default_matches_seeded_gateway_json() {
+        let policy: ContextAdmissionPolicy = serde_json::from_str(
+            r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(policy, ContextAdmissionPolicy::allow_by_default());
+        assert!(policy.validate().is_ok());
+        assert!(
+            !policy
+                .operation_admission(OperationRisk::Low)
+                .unwrap()
+                .blocks_provider()
+        );
     }
 
     #[test]

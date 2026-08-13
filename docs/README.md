@@ -70,8 +70,9 @@ If you want to deploy or operate the control plane:
 - [Epistemic metadata conformance](epistemic-metadata-conformance.md) —
   black-box non-disclosure evidence across graph, receipt, and
   descriptor projections.
-- [Context admission policy](context-admission-policy.md) — opt-in,
-  versioned rules for using or holding out epistemically qualified context.
+- [Context admission policy](context-admission-policy.md) — versioned rules
+  for using or holding out epistemically qualified context. Gateway fat-decide
+  requires a policy and fails closed when it is missing or unavailable.
 - [Governed requirement and invariant facts](governed-facts.md) — immutable,
   domain-neutral normative facts, waivers, and authorized invariant sets.
 
