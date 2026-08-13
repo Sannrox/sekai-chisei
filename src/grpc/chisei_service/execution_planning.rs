@@ -2,10 +2,11 @@
 //!
 //! The gRPC adapter authenticates the caller, binds an optional Gunshi allocation,
 //! and translates protocol messages. This module owns the ordered planning lifecycle:
-//! Kioku context enrichment, policy and routing resolution, budget and evaluation
-//! gates, egress and privacy decisions, sampling, audit, plan projection, and
-//! plan-receipt recording. Receipts are recorded after Gunshi stamps so allocation
-//! identity is present; they are not folded into `plan_from_input`.
+//! Kioku context enrichment, policy and routing resolution, preferred-model
+//! selection, budget and evaluation gates, egress and privacy decisions,
+//! sampling, audit, plan projection, and plan-receipt recording. Receipts are
+//! recorded after Gunshi stamps so allocation identity is present; they are
+//! not folded into `plan_from_input`.
 
 use super::*;
 
@@ -928,4 +929,35 @@ impl ChiseiServiceImpl {
             .map_err(Status::permission_denied)?;
         Ok((runtime, model, preferred_runtime, preferred_model))
     }
+}
+
+pub(super) fn choose_preferred_model(
+    explicit_model: &str,
+    recommended_model: &str,
+    route_bias: Option<&str>,
+    policy: Option<&crate::chisei::policy::Policy>,
+) -> String {
+    if !explicit_model.is_empty() {
+        return explicit_model.to_string();
+    }
+    let Some(route_bias) = route_bias else {
+        return recommended_model.to_string();
+    };
+    let alias = format!("ollama/{route_bias}");
+    if let Some(policy) = policy {
+        if policy.default_model == alias
+            || policy.allowed_models.iter().any(|model| model == &alias)
+        {
+            return alias;
+        }
+        if policy.default_model == route_bias
+            || policy
+                .allowed_models
+                .iter()
+                .any(|model| model == route_bias)
+        {
+            return route_bias.to_string();
+        }
+    }
+    recommended_model.to_string()
 }
