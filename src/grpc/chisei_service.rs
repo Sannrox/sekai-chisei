@@ -70,6 +70,8 @@ mod reported_operation_event_lifecycle;
 use native_execution_lifecycle::{
     ExecuteLookupFirst, evaluate_execute_lookup_first, native_execution_cost,
 };
+#[cfg(test)]
+use policy_resolution::{local_free_runtime_for_model, portfolio_runtime_for_model};
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -2957,13 +2959,6 @@ fn is_registry_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic" | "ollama" | "native")
 }
 
-fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
-    policy.is_none_or(|policy| {
-        policy.allowed_models.is_empty()
-            || policy.allowed_models.iter().any(|allowed| allowed == model)
-    })
-}
-
 fn route_override_allowed(policy: Option<&Policy>, model: &str) -> bool {
     policy.is_none_or(|policy| {
         policy.allowed_models.is_empty()
@@ -2972,46 +2967,6 @@ fn route_override_allowed(policy: Option<&Policy>, model: &str) -> bool {
                 .iter()
                 .any(|allowed| models_have_same_identity(allowed, model))
     })
-}
-
-fn portfolio_runtime_for_model(
-    policy: Option<&Policy>,
-    current_runtime: &str,
-    model: &str,
-) -> Option<String> {
-    let model_runtime = crate::llm::provider_name(model);
-    if model_runtime == current_runtime.trim() {
-        return Some(model_runtime.to_string());
-    }
-    policy
-        .filter(|policy| {
-            policy.allowed_runtimes.is_empty()
-                || policy
-                    .allowed_runtimes
-                    .iter()
-                    .any(|allowed| allowed == model_runtime)
-        })
-        .map(|_| model_runtime.to_string())
-}
-
-fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str) -> Option<String> {
-    let runtime = crate::llm::provider_name(model);
-    if runtime != "ollama" {
-        return None;
-    }
-    match policy {
-        None => Some(runtime.to_string()),
-        Some(policy)
-            if policy.allowed_runtimes.is_empty()
-                || policy
-                    .allowed_runtimes
-                    .iter()
-                    .any(|allowed| allowed == runtime) =>
-        {
-            Some(runtime.to_string())
-        }
-        Some(_) => None,
-    }
 }
 
 fn final_runtime_for_model(

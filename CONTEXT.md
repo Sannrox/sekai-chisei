@@ -67,8 +67,9 @@ Object mutation and link mutation remain write-only.
 The **Policy resolution module** produces one permitted route or denial from
 authenticated routing input. Its private interface owns policy-scope
 precedence, regression and promoted-capable safeguards, privacy and capability
-gates, explicit route overrides, local-free, cheap, and portfolio selection,
-portfolio-shift audit, runtime canonicalization, and fallback projection.
+gates, explicit route overrides, local-free, cheap, and portfolio selection
+including exclusive runtime helpers, portfolio-shift audit, runtime
+canonicalization, and fallback projection.
 
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
