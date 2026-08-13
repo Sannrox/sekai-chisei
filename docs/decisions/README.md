@@ -39,3 +39,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0016: Publish a dedicated versioned Rust core-loop client](0016-versioned-rust-core-loop-client.md)
 - [ADR 0017: Return the repository to Apache 2.0](0017-return-to-apache-2.0.md)
 - [ADR 0018: Keep ontology relation cardinality advisory in 1.x](0018-ontology-relation-cardinality.md)
+- [ADR 0019: Keep native discovery and the HTTP provider matrix as separate catalogs](0019-dual-capability-catalogs.md)
