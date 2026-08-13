@@ -10546,6 +10546,8 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<Body> 
 mod tests {
     use super::*;
 
+    const DEFAULT_CONTEXT_ADMISSION_POLICY_JSON: &str = r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#;
+
     #[test]
     fn only_registered_gateway_identities_can_delegate_principals() {
         let registered = GatewayIdentity {
@@ -13878,6 +13880,7 @@ mod tests {
     ) -> (String, Arc<RuntimeDb>) {
         let sekai_svc = SekaiServiceImpl::new(db.clone());
         let chisei_svc = ChiseiServiceImpl::new(db.clone(), config);
+        chisei_svc.seed_allow_by_default_context_admission(&["default", "sekai-chisei"]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -13934,7 +13937,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
             }))
             .await
             .unwrap();
@@ -14550,7 +14553,7 @@ mod tests {
                 default_runtime: "anthropic".to_string(),
                 default_model: "claude-sonnet-4-6".to_string(),
                 data_class: "open".to_string(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
             }))
             .await
             .unwrap();
@@ -14859,7 +14862,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
             }))
             .await
             .unwrap();
@@ -15178,7 +15181,7 @@ mod tests {
                 default_runtime: "openai".to_string(),
                 default_model: "gpt-5.5".to_string(),
                 data_class: String::new(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
             }))
             .await
             .unwrap();
@@ -15317,7 +15320,7 @@ mod tests {
                 default_runtime: runtime.to_string(),
                 default_model: default_model.to_string(),
                 data_class: String::new(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string(),
             }))
             .await
             .unwrap();
