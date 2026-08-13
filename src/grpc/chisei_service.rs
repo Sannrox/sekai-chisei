@@ -81,8 +81,6 @@ pub struct ChiseiServiceImpl {
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
-    evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
-    stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
     evaluation_execution_lifecycle: evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
     db: Arc<RuntimeDb>,
     config: Config,
@@ -2205,8 +2203,8 @@ impl ChiseiServiceImpl {
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
                 db.clone(),
                 budget.clone(),
-                evaluator_registry.clone(),
-                stochastic_evaluator_registry.clone(),
+                evaluator_registry,
+                stochastic_evaluator_registry,
                 crate::chisei::privacy::safe_providers(&config),
             );
         Self {
@@ -2219,75 +2217,11 @@ impl ChiseiServiceImpl {
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
-            evaluator_registry,
-            stochastic_evaluator_registry,
             evaluation_execution_lifecycle,
             db,
             config,
             provider_registry_state_path,
         }
-    }
-
-    fn ensure_external_evaluator_registered(
-        &self,
-        definition: &evaluation_plan_domain::EvaluatorDefinition,
-    ) {
-        if definition.execution_class != evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS {
-            return;
-        }
-        if let Err(error) = self.evaluator_registry.register_external_adapter(
-            &definition.namespace,
-            &definition.content_digest,
-            &definition.implementation_digest,
-            &definition.adapter_endpoint,
-        ) {
-            tracing::warn!(
-                namespace = %definition.namespace,
-                implementation_digest = %definition.implementation_digest,
-                error = %error,
-                "external evaluator adapter is not executable"
-            );
-        }
-    }
-
-    fn evaluator_capability(
-        &self,
-        definition: &evaluation_plan_domain::EvaluatorDefinition,
-    ) -> (bool, String) {
-        self.ensure_external_evaluator_registered(definition);
-        let executable = match definition.execution_class.as_str() {
-            evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS => self
-                .evaluator_registry
-                .contains(&definition.implementation_digest),
-            evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS => {
-                evaluation_execution_domain::external_adapter_secret_configured()
-                    && self.evaluator_registry.contains_external_adapter(
-                        &definition.namespace,
-                        &definition.content_digest,
-                        &definition.implementation_digest,
-                    )
-            }
-            evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS => self
-                .stochastic_evaluator_registry
-                .contains(&definition.implementation_digest),
-            _ => false,
-        };
-        (
-            executable,
-            if executable {
-                "executable"
-            } else if matches!(
-                definition.execution_class.as_str(),
-                evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS
-                    | evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
-                    | evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
-            ) {
-                "unavailable"
-            } else {
-                "unsupported"
-            }
-            .into(),
-        )
     }
 
     fn pipeline_context_expansion_gate(
@@ -2547,8 +2481,8 @@ impl ChiseiServiceImpl {
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
                 db.clone(),
                 budget.clone(),
-                evaluator_registry.clone(),
-                stochastic_evaluator_registry.clone(),
+                evaluator_registry,
+                stochastic_evaluator_registry,
                 crate::chisei::privacy::safe_providers(&config),
             );
         Self {
@@ -2561,8 +2495,6 @@ impl ChiseiServiceImpl {
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
-            evaluator_registry,
-            stochastic_evaluator_registry,
             evaluation_execution_lifecycle,
             db,
             config,
@@ -4779,8 +4711,9 @@ impl ChiseiService for ChiseiServiceImpl {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .map_err(map_evaluation_resource_error)?;
-            let (implementation_executable, implementation_status) =
-                self.evaluator_capability(&definition);
+            let (implementation_executable, implementation_status) = self
+                .evaluation_execution_lifecycle
+                .evaluator_capability(&definition);
             return Ok(Response::new(PutEvaluatorDefinitionResponse {
                 record: Some(evaluator_record_with_availability(
                     &definition,
@@ -4801,8 +4734,9 @@ impl ChiseiService for ChiseiServiceImpl {
             .db
             .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
             .map_err(map_evaluation_resource_error)?;
-        let (implementation_executable, implementation_status) =
-            self.evaluator_capability(&definition);
+        let (implementation_executable, implementation_status) = self
+            .evaluation_execution_lifecycle
+            .evaluator_capability(&definition);
         Ok(Response::new(PutEvaluatorDefinitionResponse {
             record: Some(evaluator_record(
                 &self.db,
@@ -8341,7 +8275,9 @@ mod tests {
         let cancellation_replica = Arc::new(ChiseiServiceImpl::new_with_evaluator_registry(
             svc.db.clone(),
             svc.config.clone(),
-            svc.evaluator_registry.clone(),
+            svc.evaluation_execution_lifecycle
+                .evaluator_registry()
+                .clone(),
         ));
         let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
         let execute_request = ExecuteEvaluationManifestRequest {
