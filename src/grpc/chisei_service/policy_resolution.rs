@@ -39,14 +39,10 @@ impl ChiseiServiceImpl {
             None
         } else {
             Some(
-                serde_json::from_slice::<crate::provider_profile::CapabilityRequirements>(
+                crate::provider_profile::CapabilityRequirements::parse_json(
                     &r.capability_requirements_json,
                 )
-                .map_err(|error| {
-                    Status::invalid_argument(format!(
-                        "invalid capability requirements: {error}"
-                    ))
-                })?,
+                .map_err(|error| Status::failed_precondition(error.to_string()))?,
             )
         };
         let scopes = policy_scopes(&r);

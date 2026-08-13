@@ -1,4 +1,24 @@
-# Capability catalog
+# Capability catalogs
+
+Sekai Chisei publishes **two** capability documents. They share the word
+"capability" and nothing else: different owners, versions, authorization
+posture, and decide inputs. Mixing them is unsupported.
+
+| Catalog | Contract | Who calls it | What it describes | Authorization | Grant? |
+| --- | --- | --- | --- | --- | --- |
+| Native governed-surface catalog | `DiscoverCapabilities` contract `1.0` | Native gRPC runtimes and SDKs | Namespace-visible object queries, retrieval, and governed actions | Authenticated principal + canonical namespace + schema ACL + `product_tier` | No. Visibility is descriptive; invocation rechecks live controls. |
+| Provider-profile matrix | `chisei.provider-capabilities/v1` | Compatible HTTP gateway clients | Provider protocol features (streaming, tools, Responses, …) the **current gateway** can route | Authenticated gateway identity; profiles limited to configured, routable, non-experimental providers | No. `grant_semantics` is always `false`. |
+
+`ChiseiService.DecideGatewayExecution.capability_requirements_json` accepts only
+the provider-profile **requirements** shape derived from a request body
+(`CapabilityRequirements` in `chisei.provider-capabilities/v1`). A native
+`DiscoverCapabilities` response or the HTTP matrix document in that field is a
+catalog mix and fails closed as `capability_unsupported`, not `policy_denied`.
+
+There is no OpenAPI description of the HTTP matrix. The versioned JSON document
+and the `x-chisei-capability-catalog` response header are the contract.
+
+# Native capability catalog
 
 The native capability catalog lets an authenticated runtime learn which
 governed Sekai and Chisei surfaces are visible in one namespace without
@@ -209,8 +229,28 @@ not a credential or authorization token. Shared conformance fixtures verify
 that Rust, TypeScript, and Python preserve authority, error codes, attribution,
 and operation correlation.
 
-`GET /v1/chisei/capabilities` describes effective provider protocol features
-for the compatible gateway. It is distinct from this namespace-scoped native
-ontology catalog. Provider-owned tools are not projected into the native
-catalog unless a future contract can prove both an effective provider profile
-and explicit policy permission.
+### Provider-profile matrix (`chisei.provider-capabilities/v1`)
+
+`GET /v1/chisei/capabilities` is **not** `DiscoverCapabilities`. It returns the
+versioned provider-profile matrix for the compatible HTTP gateway:
+
+- document `version` is `chisei.provider-capabilities/v1`;
+- response header `x-chisei-capability-catalog` repeats that version;
+- `grant_semantics` is always `false`;
+- `paths` and `profiles` include only providers the current gateway snapshot
+  can route (configured, routable, and not disabled or unpromoted
+  experimental);
+- `available_models` is the routable subset of that same snapshot.
+
+The matrix describes provider protocol features so a host can see which
+Responses, Chat Completions, or Messages fields the gateway can preserve. It
+does not decide a route, mint a grant, or list native governed surfaces.
+Decide consumes `CapabilityRequirements` derived from the request body, never
+this discovery document and never a native catalog page. Provider-owned tools
+are not projected into the native catalog unless a future contract can prove
+both an effective provider profile and explicit policy permission.
+
+See [Available models](available-models.md) for the compact routable-model
+view (`chisei.available-models/v1`) and [Responses harness
+profile](responses-harness-profile.md) for how the matrix is consumed on
+`POST /v1/responses`.

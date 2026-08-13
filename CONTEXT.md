@@ -110,17 +110,33 @@ The scoring job supplies only scored fields and never raw prompt or model
 output. The Sekai transport service implements the interface by delegating to
 the private admission module; no protocol request is manufactured.
 
+## Gunshi issuance
+
+The **Gunshi issuance lifecycle** issues advisory allocations, mutates
+namespace allocation policy, and reads status plus scorecard through one
+private interface. It owns canonical issuance identity, governed Kioku
+evidence load, advisory recommendation, durable issuance recording,
+auto-dispatch authorization, residency attributes, install/promote/rollback
+and opt-in/kill-switch/feedback mutations, and status projection.
+
+The gRPC adapter owns caller authentication and protocol translation.
+Binding an issued allocation onto native planning remains an adapter
+operation and precedes `plan_from_input`. Offline CLI recommendation stays
+offline. Permit kill-switch remains a distinct External action adapter
+operation.
+
 ## Native execution planning
 
 The **Native execution planning pipeline** produces one executable or denied
 plan from authenticated execution input. Its private interface owns Kioku
 context enrichment, policy and provider resolution, budget and evaluation
-gates, routing, egress and privacy decisions, sampling, audit, and plan
-projection.
+gates, routing, egress and privacy decisions, sampling, audit, plan
+projection, and plan-receipt recording.
 
 The gRPC adapter owns authentication, optional Gunshi allocation binding, and
 protocol translation. Gunshi allocation precedes planning; Kioku enrichment
-remains inside the planning pipeline.
+remains inside the planning pipeline. Plan receipts are recorded after Gunshi
+stamps so allocation identity is present on the receipt.
 
 ## Native plan execution
 
@@ -250,6 +266,19 @@ append ordering, and auditable post-commit attribution failure.
 The gRPC adapter supplies authenticated transport context and projects the
 result. Evaluation authority receipts remain internal-only, and the canonical
 Operation Receipt remains the durable authority.
+
+## Gateway receipt admission
+
+The **Gateway receipt admission lifecycle** admits one trusted gateway
+completion into a canonical Operation Receipt. Its private interface owns
+budget idempotency, completeness fail-closed, identity conflict, Kioku
+attribution preflight, durable put, auditable post-commit attribution
+failure, and optional sample persist.
+
+The gRPC adapter owns caller authentication, trusted-principal and
+negative-adjustment gates, and protocol translation. Reported Operation
+Receipt events remain a distinct append lifecycle. Dispatch claim and receipt
+lookup remain adapter reads over the same durable authority.
 
 ## Catalog invocation receipt lifecycle
 

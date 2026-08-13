@@ -17,8 +17,10 @@ If you want to build an agent or SDK integration:
 
 1. Read the [architecture overview](architecture.md) to understand the Sekai,
    Chisei, interface, and runtime boundaries.
-2. Use the [capability catalog](capability-catalog.md) and native
-   [`proto/`](../proto/) contract.
+2. Use the [capability catalogs](capability-catalog.md) — native
+   `DiscoverCapabilities` contract `1.0` for governed surfaces, and
+   `chisei.provider-capabilities/v1` for the HTTP provider-profile matrix —
+   together with the native [`proto/`](../proto/) contract.
 3. Check the [available-model discovery contract](available-models.md) when the
    integration executes model calls.
 
@@ -38,8 +40,9 @@ If you want to deploy or operate the control plane:
   and governed entry paths.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
   provenance, and validation.
-- [Capability catalog](capability-catalog.md) — discover governed queries,
-  retrieval, and actions.
+- [Capability catalogs](capability-catalog.md) — native governed-surface
+  discovery (`DiscoverCapabilities` `1.0`) and the HTTP provider-profile
+  matrix (`chisei.provider-capabilities/v1`).
 - [Governed actions](governed-action-types.md) — start of the action type,
   instance, effect, runtime claim, and evidence lifecycle.
 - [External-action execution](external-action-execution.md) — permits,

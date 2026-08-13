@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
 pub const CAPABILITY_MATRIX_VERSION: &str = "chisei.provider-capabilities/v1";
+/// Native `DiscoverCapabilities` contract version. Distinct from
+/// [`CAPABILITY_MATRIX_VERSION`]; the two documents are not interchangeable.
+pub const NATIVE_CAPABILITY_CATALOG_CONTRACT: &str = "1.0";
 pub const PROVIDER_REGISTRY_VERSION: &str = "chisei.provider-registry/v3";
 const PROVIDER_REGISTRY_FRESH_LOCK: &str = "chisei.provider-registry-lock/v2:fresh";
 const PROVIDER_REGISTRY_PUBLICATION_STALE_AFTER: std::time::Duration =
@@ -1434,6 +1437,9 @@ pub struct CapabilityPath {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityMatrix {
     pub version: String,
+    /// Discovery data only. A visible profile is never an authorization grant.
+    #[serde(default)]
+    pub grant_semantics: bool,
     pub paths: Vec<CapabilityPath>,
     pub registry_version: String,
     pub registry_state_version: u64,
@@ -1468,6 +1474,7 @@ impl CapabilityMatrix {
             .collect();
         Self {
             version: CAPABILITY_MATRIX_VERSION.into(),
+            grant_semantics: false,
             paths,
             registry_version: registry.version,
             registry_state_version: registry.state_version,
@@ -1481,12 +1488,137 @@ impl CapabilityMatrix {
         }
     }
 
+    /// HTTP discovery view of [`CAPABILITY_MATRIX_VERSION`].
+    ///
+    /// Includes only providers the current gateway snapshot can actually route
+    /// to. Disabled and unpromoted experimental profiles are omitted so the
+    /// document cannot be mistaken for a grant of every registered provider.
+    pub fn public_discovery(
+        availability: crate::model_availability::ModelAvailabilitySnapshot,
+    ) -> Self {
+        let mut matrix = Self::with_model_availability(availability.clone());
+        let entitled = public_discovery_providers(&matrix, &availability);
+        matrix
+            .profiles
+            .retain(|profile| entitled.contains(&profile.provider));
+        matrix
+            .paths
+            .retain(|path| entitled.contains(&path.provider));
+        matrix
+            .available_models
+            .retain(|model| model.routable && entitled.contains(&model.provider));
+        let entitled_profile_versions = matrix
+            .profiles
+            .iter()
+            .map(|profile| profile.profile_version.clone())
+            .collect::<HashSet<_>>();
+        matrix.lifecycle_overrides.retain(|lifecycle_override| {
+            lifecycle_override_is_public(lifecycle_override, &entitled, &entitled_profile_versions)
+        });
+        matrix
+    }
+
     pub fn capabilities(&self, provider: &str) -> Option<&ProviderCapabilities> {
         self.paths
             .iter()
             .find(|path| path.provider == provider)
             .map(|path| &path.capabilities)
     }
+}
+
+fn public_discovery_providers(
+    matrix: &CapabilityMatrix,
+    availability: &crate::model_availability::ModelAvailabilitySnapshot,
+) -> HashSet<String> {
+    let configured = availability
+        .models_by_provider
+        .keys()
+        .cloned()
+        .chain(availability.authoritative_providers.iter().cloned())
+        .collect::<HashSet<_>>();
+    matrix
+        .profiles
+        .iter()
+        .filter(|profile| {
+            configured.contains(&profile.provider)
+                && provider_lifecycle_is_publicly_discoverable(&profile.lifecycle)
+        })
+        .map(|profile| profile.provider.clone())
+        .collect()
+}
+
+fn provider_lifecycle_is_publicly_discoverable(lifecycle: &str) -> bool {
+    match lifecycle {
+        "enabled" | "degraded" | "retiring" => true,
+        "canary" => REQUEST_CANARY_ADMISSION
+            .try_with(|allowed| *allowed)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn lifecycle_override_is_public(
+    lifecycle_override: &RegistryLifecycleOverride,
+    entitled_providers: &HashSet<String>,
+    entitled_profile_versions: &HashSet<String>,
+) -> bool {
+    match lifecycle_override.target_kind.as_str() {
+        "provider" => entitled_providers.contains(&lifecycle_override.target),
+        "capability" => lifecycle_override
+            .target
+            .split_once(':')
+            .is_some_and(|(provider, _)| entitled_providers.contains(provider)),
+        "model" => lifecycle_override
+            .target
+            .split('/')
+            .next()
+            .is_some_and(|provider| entitled_providers.contains(provider)),
+        "profile" => entitled_profile_versions.contains(&lifecycle_override.target),
+        _ => false,
+    }
+}
+
+fn json_string_field<'a>(
+    value: &'a serde_json::Value,
+    snake: &str,
+    camel: &str,
+) -> Option<&'a str> {
+    value
+        .get(snake)
+        .or_else(|| value.get(camel))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn json_has_field(value: &serde_json::Value, snake: &str, camel: &str) -> bool {
+    value.get(snake).is_some() || value.get(camel).is_some()
+}
+
+/// Identify a capability document that is not [`CapabilityRequirements`].
+fn foreign_capability_catalog(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| json_string_field(value, "contract_version", "contractVersion"));
+    let cache_scope = json_string_field(value, "cache_scope", "cacheScope");
+    let has_catalog_version = json_has_field(value, "catalog_version", "catalogVersion");
+    let capabilities_is_array = object
+        .get("capabilities")
+        .is_some_and(serde_json::Value::is_array);
+    let has_matrix_shape = object.contains_key("paths") || object.contains_key("profiles");
+
+    if cache_scope == Some("authorization_context")
+        || (has_catalog_version && capabilities_is_array)
+        || (version == Some(NATIVE_CAPABILITY_CATALOG_CONTRACT) && capabilities_is_array)
+    {
+        return Some(format!(
+            "DiscoverCapabilities contract {NATIVE_CAPABILITY_CATALOG_CONTRACT}"
+        ));
+    }
+    if version == Some(CAPABILITY_MATRIX_VERSION) && has_matrix_shape {
+        return Some(format!("{CAPABILITY_MATRIX_VERSION} matrix"));
+    }
+    None
 }
 
 fn public_lifecycle_overrides(
@@ -1790,7 +1922,42 @@ pub struct CapabilityRequirements {
     pub max_output_tokens: Option<u64>,
 }
 
+/// Failure to interpret `capability_requirements_json` as provider-profile
+/// requirements. Mixed native/provider catalogs are unsupported capabilities,
+/// not policy denials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityRequirementsError {
+    MixedCatalog { found: String },
+    Invalid(String),
+}
+
+impl std::fmt::Display for CapabilityRequirementsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MixedCatalog { found } => write!(
+                f,
+                "capability_unsupported: {found} cannot be used as {CAPABILITY_MATRIX_VERSION} capability requirements"
+            ),
+            Self::Invalid(message) => write!(
+                f,
+                "capability_unsupported: invalid capability requirements: {message}"
+            ),
+        }
+    }
+}
+
 impl CapabilityRequirements {
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, CapabilityRequirementsError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            CapabilityRequirementsError::Invalid(format!("invalid JSON: {error}"))
+        })?;
+        if let Some(found) = foreign_capability_catalog(&value) {
+            return Err(CapabilityRequirementsError::MixedCatalog { found });
+        }
+        serde_json::from_value(value)
+            .map_err(|error| CapabilityRequirementsError::Invalid(error.to_string()))
+    }
+
     pub fn from_responses_body(body: &[u8]) -> Result<Self, String> {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|error| format!("invalid JSON: {error}"))?;
@@ -2393,6 +2560,8 @@ mod tests {
     fn capability_matrix_is_derived_from_the_profile_registry() {
         let matrix = CapabilityMatrix::built_in();
         assert_eq!(matrix.registry_version, PROVIDER_REGISTRY_VERSION);
+        assert_eq!(matrix.version, CAPABILITY_MATRIX_VERSION);
+        assert!(!matrix.grant_semantics);
         assert_eq!(matrix.paths.len(), matrix.profiles.len());
         for profile in &matrix.profiles {
             assert_eq!(
@@ -2400,6 +2569,124 @@ mod tests {
                 Some(&profile.capabilities)
             );
         }
+        assert!(
+            matrix
+                .profiles
+                .iter()
+                .any(|profile| profile.provider == "meta" && profile.lifecycle == "experimental")
+        );
+    }
+
+    #[test]
+    fn public_discovery_omits_unconfigured_and_experimental_profiles() {
+        let availability = crate::model_availability::ModelAvailabilitySnapshot {
+            refreshed_at: None,
+            models_by_provider: std::collections::BTreeMap::from([(
+                "openai".into(),
+                vec![crate::model_availability::AvailableModel {
+                    provider: "openai".into(),
+                    upstream_model: "gpt-5.5".into(),
+                    canonical_model: "openai/gpt-5.5".into(),
+                    lifecycle: "enabled".into(),
+                    routable: true,
+                    discovery_source: "provider_catalog".into(),
+                    capabilities: None,
+                    pricing: None,
+                    cost_rank: None,
+                    capability_rank: None,
+                }],
+            )]),
+            authoritative_providers: vec!["openai".into()],
+        };
+        let matrix = CapabilityMatrix::public_discovery(availability);
+        assert_eq!(matrix.version, CAPABILITY_MATRIX_VERSION);
+        assert!(!matrix.grant_semantics);
+        assert_eq!(
+            matrix
+                .profiles
+                .iter()
+                .map(|profile| profile.provider.as_str())
+                .collect::<Vec<_>>(),
+            vec!["openai"]
+        );
+        assert!(matrix.capabilities("anthropic").is_none());
+        assert!(matrix.capabilities("meta").is_none());
+        assert!(
+            matrix
+                .available_models
+                .iter()
+                .all(|model| model.provider == "openai" && model.routable)
+        );
+    }
+
+    #[test]
+    fn public_discovery_is_empty_when_no_provider_is_configured() {
+        let matrix = CapabilityMatrix::public_discovery(
+            crate::model_availability::ModelAvailabilitySnapshot::default(),
+        );
+        assert!(matrix.profiles.is_empty());
+        assert!(matrix.paths.is_empty());
+        assert!(matrix.available_models.is_empty());
+        assert!(!matrix.grant_semantics);
+    }
+
+    #[test]
+    fn capability_requirements_reject_mixed_catalogs() {
+        let native = serde_json::json!({
+            "capabilities": [{
+                "name": "sekai.semantic.expand_relations",
+                "product_tier": "core"
+            }],
+            "contract_version": NATIVE_CAPABILITY_CATALOG_CONTRACT,
+            "catalog_version": "sha256:deadbeef",
+            "cache_scope": "authorization_context",
+            "total_size": 1
+        });
+        let native_error =
+            CapabilityRequirements::parse_json(&serde_json::to_vec(&native).unwrap()).unwrap_err();
+        assert!(
+            matches!(
+                native_error,
+                CapabilityRequirementsError::MixedCatalog { .. }
+            ),
+            "{native_error}"
+        );
+        assert!(
+            native_error
+                .to_string()
+                .contains("DiscoverCapabilities contract 1.0")
+        );
+
+        let camel = serde_json::json!({
+            "capabilities": [],
+            "contractVersion": NATIVE_CAPABILITY_CATALOG_CONTRACT,
+            "catalogVersion": "sha256:abcd",
+            "cacheScope": "authorization_context"
+        });
+        assert!(matches!(
+            CapabilityRequirements::parse_json(&serde_json::to_vec(&camel).unwrap()),
+            Err(CapabilityRequirementsError::MixedCatalog { .. })
+        ));
+
+        let matrix = serde_json::to_vec(&CapabilityMatrix::built_in()).unwrap();
+        let matrix_error = CapabilityRequirements::parse_json(&matrix).unwrap_err();
+        assert!(matches!(
+            matrix_error,
+            CapabilityRequirementsError::MixedCatalog { found } if found.contains(CAPABILITY_MATRIX_VERSION)
+        ));
+
+        let required = CapabilityRequirements {
+            responses: true,
+            ..CapabilityRequirements::default()
+        };
+        assert_eq!(
+            CapabilityRequirements::parse_json(&serde_json::to_vec(&required).unwrap()).unwrap(),
+            required
+        );
+
+        let invalid = CapabilityRequirements::parse_json(br#"{"responses":"yes"}"#).unwrap_err();
+        assert!(matches!(invalid, CapabilityRequirementsError::Invalid(_)));
+        assert!(invalid.to_string().starts_with("capability_unsupported:"));
     }
 
     #[test]

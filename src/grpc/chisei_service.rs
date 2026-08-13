@@ -57,11 +57,18 @@ mod evaluation_manifest_resolution;
 mod execution_planning;
 mod external_action_admission;
 mod gateway_decide_lifecycle;
+mod gateway_receipt_admission;
 mod governed_subject_lifecycle;
+mod gunshi_issuance_lifecycle;
 mod kioku_candidate_governance;
 mod native_execution_lifecycle;
 mod policy_resolution;
 mod reported_operation_event_lifecycle;
+
+#[cfg(test)]
+use native_execution_lifecycle::{
+    ExecuteLookupFirst, evaluate_execute_lookup_first, native_execution_cost,
+};
 
 pub struct ChiseiServiceImpl {
     budget: Arc<BudgetTracker>,
@@ -98,7 +105,6 @@ const POLICY_KIND: &str = "policy";
 const PIPELINE_CONTEXT_EXPANSION_PROFILE_VERSION: &str = "pipeline-v1";
 const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
-const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
@@ -578,100 +584,6 @@ fn external_host_context(
         observed_preconditions: preconditions.into_iter().collect(),
         host_capabilities: capabilities,
     }
-}
-
-fn persist_gateway_operation_receipt(
-    service: &ChiseiServiceImpl,
-    receipt_json: &str,
-    authenticated_principal: &str,
-) -> Result<(), Status> {
-    let receipt: OperationReceipt = serde_json::from_str(receipt_json)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
-    let completeness = receipt.completeness();
-    if !completeness.complete {
-        return Err(Status::invalid_argument(format!(
-            "gateway receipt is incomplete: missing={:?} errors={:?}",
-            completeness.missing_surfaces, completeness.errors
-        )));
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    let has_kioku_context = receipt.events.iter().any(|receipt_event| {
-        receipt_event.kind == ReceiptEventKind::ContextGoverned
-            && receipt_event
-                .references
-                .iter()
-                .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
-    }) || !service
-        .db
-        .list_kioku_outcome_assignments(&receipt.operation_id)
-        .map_err(Status::internal)?
-        .is_empty();
-    let existing = service
-        .db
-        .get_operation_receipt(&receipt.operation_id)
-        .map_err(Status::internal)?;
-    if existing
-        .as_ref()
-        .is_some_and(|existing| existing != &receipt)
-    {
-        return Err(Status::already_exists(
-            "operation receipt already exists with different evidence",
-        ));
-    }
-    if existing.is_none() && has_kioku_context {
-        reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
-            &receipt,
-            authenticated_principal,
-            now,
-            false,
-            None,
-            true,
-        )
-        .map_err(|error| {
-            Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
-        })?;
-    }
-    service
-        .db
-        .put_operation_receipt(&receipt)
-        .map_err(Status::internal)?;
-    if existing.is_none()
-        && has_kioku_context
-        && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
-            &receipt,
-            authenticated_principal,
-            now,
-            false,
-            None,
-            false,
-        )
-    {
-        let _ = service.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: "chisei.kioku".into(),
-            action: "kioku.outcome_attribution".into(),
-            reason: error,
-            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
-            target_id: receipt.operation_id.clone(),
-            outcome: "failed".into(),
-        });
-    }
-    service
-        .db
-        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-            id: format!("{}:gateway-receipt", receipt.operation_id),
-            timestamp: now,
-            actor: authenticated_principal.into(),
-            action: GATEWAY_RECEIPT_ACTION.into(),
-            reason: "gateway operation completed".into(),
-            evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
-            target_id: receipt.operation_id,
-            outcome: "recorded".into(),
-        }])
-        .map_err(Status::internal)
 }
 
 fn require_namespace_access(db: &RuntimeDb, actor: &str, namespace: &str) -> Result<(), Status> {
@@ -1210,383 +1122,6 @@ fn receipt_event(
     }
 }
 
-/// Complete an operation that was fully answered by structured lookup (#281).
-/// Records `answer_path=lookup_hit`, zero provider tokens, and no billable model call.
-#[allow(clippy::too_many_arguments)]
-fn record_completed_lookup_operation_on(
-    db: &RuntimeDb,
-    plan: &ExecutionPlan,
-    actor: &str,
-    response: &PlannedChatResponse,
-    attempt_started_at_ms: i64,
-    completed_at_ms: i64,
-    capability: &str,
-    provenance: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    db.update_operation_receipt(&plan.plan_id, |receipt| {
-        if receipt.completed_at_ms.is_some() {
-            return Err("operation receipt already has a terminal outcome".into());
-        }
-        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
-        let parent = if receipt.events.iter().any(|event| {
-            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
-        }) {
-            "egress"
-        } else {
-            "budget"
-        };
-        let mut artifact_attrs = BTreeMap::from([
-            ("artifact_type".into(), "structured_lookup".into()),
-            ("content_hash".into(), planned_response_hash(response)),
-            ("content_stored".into(), "false".into()),
-            (
-                crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
-            ),
-            ("capability".into(), capability.into()),
-            (
-                "provider".into(),
-                crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
-            ),
-            ("input_tokens".into(), "0".into()),
-            ("output_tokens".into(), "0".into()),
-        ]);
-        for (key, value) in provenance {
-            artifact_attrs.insert(format!("provenance_{key}"), value.clone());
-        }
-        receipt.events.extend([
-            receipt_event(
-                &receipt.operation_id,
-                "attempt-1",
-                Some(parent),
-                attempt_started_at_ms,
-                ReceiptEventKind::AttemptStarted,
-                actor,
-                BTreeMap::from([("attempt".into(), "1".into())]),
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "artifact-1",
-                Some("attempt-1"),
-                completed_at_ms,
-                ReceiptEventKind::ArtifactProduced,
-                "chisei.lookup_first",
-                artifact_attrs,
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "verification",
-                Some("artifact-1"),
-                completed_at_ms,
-                ReceiptEventKind::VerificationRecorded,
-                "chisei.execution",
-                BTreeMap::from([("status".into(), "not_requested".into())]),
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "outcome",
-                Some("verification"),
-                completed_at_ms,
-                ReceiptEventKind::OutcomeRecorded,
-                actor,
-                BTreeMap::from([
-                    ("status".into(), "succeeded".into()),
-                    (
-                        "completion_reason".into(),
-                        crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
-                    ),
-                    (
-                        crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                        crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
-                    ),
-                    ("provider_tokens".into(), "0".into()),
-                    (
-                        "latency_ms".into(),
-                        completed_at_ms
-                            .saturating_sub(receipt.started_at_ms)
-                            .to_string(),
-                    ),
-                ]),
-            ),
-        ]);
-        receipt.completed_at_ms = Some(completed_at_ms);
-        // ModelCall remains uncovered by design: zero provider tokens, no adapter call.
-        receipt.uncovered_surfaces = vec![UncoveredSurface {
-            surface: ReceiptSurface::ModelCall,
-            reason: "answered by structured lookup without a provider model call".into(),
-        }];
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_completed_operation_on_with_path(
-    db: &RuntimeDb,
-    plan: &ExecutionPlan,
-    actor: &str,
-    response: &PlannedChatResponse,
-    attempt_started_at_ms: i64,
-    completed_at_ms: i64,
-    answer_path: Option<&str>,
-    lookup_refusal: Option<&str>,
-) -> Result<(), String> {
-    let cost_usd_micros = crate::cost_estimate::pricing_from_env()
-        .ok()
-        .and_then(|pricing| native_execution_cost(plan, response, &pricing));
-    db.update_operation_receipt(&plan.plan_id, |receipt| {
-        if receipt.completed_at_ms.is_some() {
-            return Err("operation receipt already has a terminal outcome".into());
-        }
-        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
-        let parent = if receipt.events.iter().any(|event| {
-            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
-        }) {
-            "egress"
-        } else {
-            "budget"
-        };
-        receipt.events.extend([
-            receipt_event(
-                &receipt.operation_id,
-                "attempt-1",
-                Some(parent),
-                attempt_started_at_ms,
-                ReceiptEventKind::AttemptStarted,
-                actor,
-                BTreeMap::from([("attempt".into(), "1".into())]),
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "model-call-1",
-                Some("attempt-1"),
-                completed_at_ms,
-                ReceiptEventKind::ModelCalled,
-                "chisei.llm",
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("provider".into(), response.provider.clone()),
-                        ("model".into(), plan.resolved_model.clone()),
-                        ("input_tokens".into(), response.input_tokens.to_string()),
-                        ("output_tokens".into(), response.output_tokens.to_string()),
-                    ]);
-                    if let Some(cost_usd_micros) = cost_usd_micros {
-                        attributes.insert("cost_usd_micros".into(), cost_usd_micros.to_string());
-                    }
-                    if let Some(path) = answer_path {
-                        attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                            path.into(),
-                        );
-                    }
-                    if let Some(reason) = lookup_refusal {
-                        attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
-                            reason.into(),
-                        );
-                    }
-                    attributes
-                },
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "artifact-1",
-                Some("model-call-1"),
-                completed_at_ms,
-                ReceiptEventKind::ArtifactProduced,
-                "chisei.llm",
-                BTreeMap::from([
-                    ("artifact_type".into(), "model_response".into()),
-                    ("content_hash".into(), planned_response_hash(response)),
-                    ("content_stored".into(), "false".into()),
-                ]),
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "verification",
-                Some("artifact-1"),
-                completed_at_ms,
-                ReceiptEventKind::VerificationRecorded,
-                "chisei.execution",
-                BTreeMap::from([("status".into(), "not_requested".into())]),
-            ),
-            receipt_event(
-                &receipt.operation_id,
-                "outcome",
-                Some("verification"),
-                completed_at_ms,
-                ReceiptEventKind::OutcomeRecorded,
-                actor,
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("status".into(), "succeeded".into()),
-                        ("completion_reason".into(), response.stop_reason.clone()),
-                        (
-                            "latency_ms".into(),
-                            completed_at_ms
-                                .saturating_sub(receipt.started_at_ms)
-                                .to_string(),
-                        ),
-                    ]);
-                    if let Some(path) = answer_path {
-                        attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                            path.into(),
-                        );
-                    }
-                    if let Some(reason) = lookup_refusal {
-                        attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
-                            reason.into(),
-                        );
-                    }
-                    attributes
-                },
-            ),
-        ]);
-        receipt.completed_at_ms = Some(completed_at_ms);
-        receipt.uncovered_surfaces.clear();
-        Ok(())
-    })?;
-    Ok(())
-}
-
-/// Result of the post-authz lookup-first attempt on ExecutePlanStream.
-#[derive(Debug)]
-enum ExecuteLookupFirst {
-    /// Full structured answer; caller must return without a provider call.
-    Hit {
-        response: PlannedChatResponse,
-        capability: String,
-        provenance: BTreeMap<String, String>,
-    },
-    /// Fail closed to the model path; record `lookup_refusal` on the receipt.
-    ModelPath { lookup_refusal: Option<String> },
-}
-
-/// After namespace authz, try allow-listed structured lookup before provider routing.
-fn evaluate_execute_lookup_first(
-    db: &RuntimeDb,
-    input: &ExecutionInput,
-    actor: &str,
-) -> ExecuteLookupFirst {
-    if !crate::chisei::lookup_first::is_lookup_first_capability(&input.task_type) {
-        return ExecuteLookupFirst::ModelPath {
-            lookup_refusal: None,
-        };
-    }
-    match crate::chisei::lookup_first::try_lookup_first(
-        &input.task_type,
-        &input.namespace,
-        actor,
-        &input.spec,
-        db,
-    ) {
-        Ok(crate::chisei::lookup_first::LookupDecision::Hit {
-            answer_json,
-            capability,
-            provenance,
-        }) => {
-            crate::chisei::lookup_first::record_lookup_hit();
-            ExecuteLookupFirst::Hit {
-                response: PlannedChatResponse {
-                    content: answer_json,
-                    tool_calls: Vec::new(),
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    stop_reason: crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
-                    provider: crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
-                    cache_read_input_tokens: 0,
-                    cache_creation_input_tokens: 0,
-                },
-                capability,
-                provenance,
-            }
-        }
-        Ok(crate::chisei::lookup_first::LookupDecision::Refusal { reason, .. }) => {
-            crate::chisei::lookup_first::record_model_path(true);
-            ExecuteLookupFirst::ModelPath {
-                lookup_refusal: Some(reason),
-            }
-        }
-        Ok(crate::chisei::lookup_first::LookupDecision::NotEligible) => {
-            ExecuteLookupFirst::ModelPath {
-                lookup_refusal: None,
-            }
-        }
-        Err(error) => {
-            crate::chisei::lookup_first::record_model_path(true);
-            ExecuteLookupFirst::ModelPath {
-                lookup_refusal: Some(format!("storage_error:{error}")),
-            }
-        }
-    }
-}
-
-fn native_execution_cost(
-    plan: &ExecutionPlan,
-    response: &PlannedChatResponse,
-    pricing: &HashMap<String, crate::pricing::ModelPricing>,
-) -> Option<i64> {
-    let (priced_model, rates) =
-        crate::pricing::lookup_pricing_entry(pricing, &plan.resolved_model)?;
-    crate::cost_estimate::cost_usd_micros(
-        priced_model,
-        rates,
-        i64::from(response.input_tokens),
-        i64::from(response.output_tokens),
-        i64::from(response.cache_read_input_tokens),
-        i64::from(response.cache_creation_input_tokens),
-    )
-}
-
-fn record_failed_operation_on(
-    db: &RuntimeDb,
-    plan: &ExecutionPlan,
-    actor: &str,
-    completion_reason: &str,
-) -> Result<(), String> {
-    if db.get_operation_receipt(&plan.plan_id)?.is_none() {
-        return Ok(());
-    }
-    let completed_at_ms = chrono::Utc::now().timestamp_millis();
-    db.update_operation_receipt(&plan.plan_id, |receipt| {
-        if receipt.completed_at_ms.is_some() {
-            return Ok(());
-        }
-        let canonical_egress_id = format!("{}:egress", receipt.operation_id);
-        let parent = if receipt.events.iter().any(|event| {
-            event.event_id == canonical_egress_id && event.kind == ReceiptEventKind::EgressDecided
-        }) {
-            "egress"
-        } else {
-            "budget"
-        };
-        receipt.events.push(receipt_event(
-            &receipt.operation_id,
-            "outcome",
-            Some(parent),
-            completed_at_ms,
-            ReceiptEventKind::OutcomeRecorded,
-            actor,
-            BTreeMap::from([
-                ("status".into(), "denied".into()),
-                ("completion_reason".into(), completion_reason.into()),
-                (
-                    "latency_ms".into(),
-                    completed_at_ms
-                        .saturating_sub(receipt.started_at_ms)
-                        .to_string(),
-                ),
-            ]),
-        ));
-        receipt.completed_at_ms = Some(completed_at_ms);
-        receipt.uncovered_surfaces.clear();
-        Ok(())
-    })?;
-    Ok(())
-}
-
 fn pipeline_context_expansion_profile_key(namespace: &str) -> String {
     format!(
         "context-expansion:{}:{}",
@@ -1653,21 +1188,6 @@ struct GatewayPipelineDecision {
     sampling: crate::chisei::sampling::SamplingDecision,
 }
 
-struct FinishStreamedExecution<'a> {
-    db: &'a RuntimeDb,
-    evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
-    request_id: &'a str,
-    namespace: &'a str,
-    enriched_spec: &'a str,
-    resolved_model: &'a str,
-    sampled: bool,
-    sample_rate: f64,
-    sample_reason: &'a str,
-    scoring_enabled: bool,
-    task_class: &'a str,
-    response: &'a PlannedChatResponse,
-}
-
 struct EvolveTaskRecord<'a> {
     request_id: &'a str,
     namespace: &'a str,
@@ -1700,69 +1220,6 @@ fn record_evolve_task_on(
     entry.status = task.status.to_string();
     entry.tokens_used = task.tokens_used;
     db.put_evolve_task(entry)?;
-    Ok(())
-}
-fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), String> {
-    record_evolve_task_on(
-        execution.db,
-        execution.evolve_history,
-        EvolveTaskRecord {
-            request_id: execution.request_id,
-            namespace: execution.namespace,
-            spec: execution.enriched_spec,
-            status: "done",
-            tokens_used: execution.response.input_tokens + execution.response.output_tokens,
-        },
-    )?;
-    if execution.sampled {
-        let mut evidence = HashMap::new();
-        evidence.insert("model".to_string(), execution.resolved_model.to_string());
-        evidence.insert(
-            "input_tokens".to_string(),
-            execution.response.input_tokens.to_string(),
-        );
-        evidence.insert(
-            "output_tokens".to_string(),
-            execution.response.output_tokens.to_string(),
-        );
-        evidence.insert(
-            "stop_reason".to_string(),
-            execution.response.stop_reason.clone(),
-        );
-        evidence.insert("sample_rate".to_string(), execution.sample_rate.to_string());
-        let _ = execution
-            .db
-            .record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: "chisei.sampling".into(),
-                action: "sample_observed".into(),
-                reason: execution.sample_reason.to_string(),
-                evidence,
-                target_id: execution.request_id.to_string(),
-                outcome: "observed".into(),
-            });
-        if execution.scoring_enabled {
-            let _ =
-                execution
-                    .db
-                    .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                        request_id: execution.request_id.to_string(),
-                        namespace: execution.namespace.to_string(),
-                        spec: execution.enriched_spec.to_string(),
-                        resolved_model: execution.resolved_model.to_string(),
-                        output_content: execution.response.content.clone(),
-                        sample_reason: execution.sample_reason.to_string(),
-                        input_tokens: execution.response.input_tokens,
-                        output_tokens: execution.response.output_tokens,
-                        stop_reason: execution.response.stop_reason.clone(),
-                        timestamp: chrono::Utc::now().timestamp_millis(),
-                        scored: false,
-                        task_class: execution.task_class.to_string(),
-                        cost_usd_micros: 0,
-                    });
-        }
-    }
     Ok(())
 }
 
@@ -3382,604 +2839,11 @@ impl ChiseiServiceImpl {
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
     }
 
-    fn record_execution_memory_injections(
-        &self,
-        operation_id: &str,
-        actor: &str,
-        references: &[MemoryContextReference],
-    ) -> Result<(), Status> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        for reference in references {
-            let memory = self
-                .db
-                .get_kioku_memory(&reference.memory_id, reference.memory_version)
-                .map_err(Status::internal)?
-                .ok_or_else(|| Status::failed_precondition("planned memory version not found"))?;
-            if !memory_lifecycle_allows_execution(
-                memory.state,
-                memory.expires_at_ms,
-                memory.retention_until_ms,
-                now_ms,
-            ) {
-                return Err(Status::failed_precondition(
-                    "planned memory version is no longer active",
-                ));
-            }
-            let authorized_ceiling = self
-                .db
-                .kioku_authorized_classification_ceiling(&memory.namespace, actor)
-                .map_err(|_| {
-                    Status::permission_denied(
-                        "executing actor is not authorized for planned memory",
-                    )
-                })?;
-            if memory.classification > authorized_ceiling {
-                return Err(Status::permission_denied(
-                    "planned memory classification exceeds executing actor grant",
-                ));
-            }
-            if crate::chisei::kioku::memory_claim_digest(&memory) != reference.content_digest {
-                return Err(Status::failed_precondition(
-                    "planned memory digest no longer matches the cached reference",
-                ));
-            }
-        }
-        for reference in references {
-            self.db
-                .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
-                    memory_id: reference.memory_id.clone(),
-                    memory_version: reference.memory_version,
-                    action: "injected".into(),
-                    from_state: Some("active".into()),
-                    to_state: "active".into(),
-                    actor: actor.into(),
-                    reason: format!("pipeline operation {operation_id}"),
-                    recorded_at_ms: now_ms,
-                })
-                .map_err(Status::internal)?;
-        }
-        Ok(())
-    }
-
-    fn invalidate_ineligible_execution_memory_holdouts(
-        &self,
-        operation_id: &str,
-        actor: &str,
-        references: &[super::pb::chisei::MemoryHoldoutReference],
-    ) -> Result<(), Status> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        for reference in references {
-            let Some(memory) = self
-                .db
-                .get_kioku_memory(&reference.memory_id, reference.memory_version)
-                .map_err(Status::internal)?
-            else {
-                continue;
-            };
-            let authorized = self
-                .db
-                .kioku_authorized_classification_ceiling(&memory.namespace, actor)
-                .is_ok_and(|ceiling| memory.classification <= ceiling);
-            let eligible = memory_lifecycle_allows_execution(
-                memory.state,
-                memory.expires_at_ms,
-                memory.retention_until_ms,
-                now_ms,
-            ) && authorized
-                && memory.classification.as_str() == reference.classification
-                && crate::chisei::kioku::memory_claim_digest(&memory) == reference.content_digest;
-            if !eligible {
-                self.db
-                    .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
-                        memory_id: reference.memory_id.clone(),
-                        memory_version: reference.memory_version,
-                        action: "holdout_invalidated".into(),
-                        from_state: Some(memory.state.as_str().into()),
-                        to_state: memory.state.as_str().into(),
-                        actor: actor.into(),
-                        reason: format!("pipeline operation {operation_id}"),
-                        recorded_at_ms: now_ms,
-                    })
-                    .map_err(Status::internal)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn record_planned_operation(&self, plan: &ExecutionPlan, actor: &str) -> Result<(), String> {
-        let input = plan
-            .input
-            .as_ref()
-            .ok_or_else(|| "plan input required".to_string())?;
-        let operation_id = plan.plan_id.clone();
-        let policy_version = self
-            .policy
-            .effective_policy(&input.namespace)
-            .map(|policy| policy.version())
-            .unwrap_or_else(|| "implicit-allow/v1".to_string());
-        let started = plan.created_at;
-        let mut events = vec![
-            receipt_event(
-                &operation_id,
-                "intent",
-                None,
-                started,
-                ReceiptEventKind::IntentRecorded,
-                actor,
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("request_id".into(), input.request_id.clone()),
-                        ("task_type".into(), input.task_type.clone()),
-                        ("intent_hash".into(), content_hash([input.spec.as_bytes()])),
-                        // Effective pre-policy preference (request, override,
-                        // recommendation, bias, or runtime fallback).
-                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                        ("preferred_model".into(), input.preferred_model.clone()),
-                    ]);
-                    if !input.logical_operation_id.trim().is_empty() {
-                        attributes.insert(
-                            "logical_operation_id".into(),
-                            input.logical_operation_id.trim().into(),
-                        );
-                    }
-                    if !input.attempt_id.trim().is_empty() {
-                        attributes.insert("attempt_id".into(), input.attempt_id.trim().into());
-                    }
-                    if !plan.gunshi_allocation_id.is_empty() {
-                        attributes.extend([
-                            ("gunshi_issuance_id".into(), plan.gunshi_issuance_id.clone()),
-                            (
-                                "gunshi_allocation_id".into(),
-                                plan.gunshi_allocation_id.clone(),
-                            ),
-                            ("gunshi_agent_id".into(), plan.gunshi_agent_id.clone()),
-                            (
-                                "gunshi_policy_version".into(),
-                                plan.gunshi_policy_version.clone(),
-                            ),
-                            (
-                                "gunshi_input_fingerprint".into(),
-                                plan.gunshi_input_fingerprint.clone(),
-                            ),
-                        ]);
-                    }
-                    attributes
-                },
-            ),
-            receipt_event(
-                &operation_id,
-                "context",
-                Some("intent"),
-                started,
-                ReceiptEventKind::ContextGoverned,
-                "chisei.pipeline",
-                {
-                    let mut attributes = BTreeMap::from([
-                        (
-                            "prepared_context_hash".into(),
-                            content_hash(
-                                std::iter::once(plan.prepared_system.as_bytes()).chain(
-                                    plan.prepared_messages
-                                        .iter()
-                                        .map(|message| message.content.as_bytes()),
-                                ),
-                            ),
-                        ),
-                        ("raw_context_stored".into(), "false".into()),
-                    ]);
-                    attributes.extend(epistemic_descriptor_receipt_attributes(plan));
-                    attributes
-                },
-            ),
-            receipt_event(
-                &operation_id,
-                "policy",
-                Some("context"),
-                started,
-                ReceiptEventKind::PolicyDecided,
-                "chisei.policy",
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("policy_version".into(), policy_version.clone()),
-                        ("executable".into(), plan.executable.to_string()),
-                        ("risk_score".into(), plan.risk_score.to_string()),
-                        (
-                            "route_policy_decision".into(),
-                            if plan.resolved_runtime.is_empty() && plan.resolved_model.is_empty() {
-                                "deny".into()
-                            } else {
-                                "allow".into()
-                            },
-                        ),
-                    ]);
-                    if !plan.context_admission_policy_version.is_empty() {
-                        attributes.insert(
-                            "context_admission_policy_version".into(),
-                            plan.context_admission_policy_version.clone(),
-                        );
-                        attributes.insert(
-                            "context_admission_descriptor_version".into(),
-                            plan.context_admission_descriptor_version.clone(),
-                        );
-                        attributes.insert(
-                            "context_admission_decision".into(),
-                            plan.context_admission_decision.clone(),
-                        );
-                        attributes.insert(
-                            "context_admission_reasons".into(),
-                            plan.context_admission_reasons.join(","),
-                        );
-                        attributes.insert(
-                            "context_admission_source_digests".into(),
-                            plan.context_admission_source_digests.join(","),
-                        );
-                    }
-                    attributes
-                },
-            ),
-            receipt_event(
-                &operation_id,
-                "route",
-                Some("policy"),
-                started,
-                ReceiptEventKind::RouteSelected,
-                "chisei.routing",
-                {
-                    let mut attributes = BTreeMap::from([
-                        ("runtime".into(), plan.resolved_runtime.clone()),
-                        ("model".into(), plan.resolved_model.clone()),
-                        // Effective pre-policy preference (also on Intent) for dry-run.
-                        ("preferred_runtime".into(), input.preferred_runtime.clone()),
-                        ("preferred_model".into(), input.preferred_model.clone()),
-                        (
-                            "route_override".into(),
-                            if input.route_override.trim().is_empty() {
-                                String::new()
-                            } else {
-                                input.route_override.trim().into()
-                            },
-                        ),
-                        (
-                            "bias_bypassed".into(),
-                            (!input.route_override.trim().is_empty()).to_string(),
-                        ),
-                    ]);
-                    if !plan.gunshi_allocation_id.is_empty() {
-                        attributes.insert(
-                            "gunshi_allocation_id".into(),
-                            plan.gunshi_allocation_id.clone(),
-                        );
-                        attributes.insert("gunshi_agent_id".into(), plan.gunshi_agent_id.clone());
-                    }
-                    attributes
-                },
-            ),
-            receipt_event(
-                &operation_id,
-                "budget",
-                Some("route"),
-                started,
-                ReceiptEventKind::BudgetDecided,
-                "chisei.budget",
-                {
-                    let mut attributes = BTreeMap::from([
-                        (
-                            "allowed".into(),
-                            plan.budget
-                                .as_ref()
-                                .is_some_and(|budget| budget.allowed)
-                                .to_string(),
-                        ),
-                        (
-                            "estimated_tokens".into(),
-                            input.estimated_tokens.to_string(),
-                        ),
-                    ]);
-                    if !plan.gunshi_allocation_id.is_empty() {
-                        attributes.insert(
-                            "gunshi_budget_ceiling_usd_micros".into(),
-                            plan.gunshi_budget_ceiling_usd_micros.to_string(),
-                        );
-                        attributes.insert(
-                            "gunshi_max_attempts".into(),
-                            plan.gunshi_max_attempts.to_string(),
-                        );
-                        attributes.insert(
-                            "gunshi_human_review_required".into(),
-                            plan.gunshi_human_review_required.to_string(),
-                        );
-                    }
-                    attributes
-                },
-            ),
-        ];
-        let mut context = GovernedReference {
-            kind: "execution_context".into(),
-            reference: format!("operation:{operation_id}:context"),
-            content_hash: events[1].attributes.get("prepared_context_hash").cloned(),
-            disclosed_fields: vec!["system".into(), "messages.content".into()],
-            omitted: true,
-            omission_reason: Some("raw private context is not copied into receipts".into()),
-        };
-        context.disclosed_fields.sort();
-        events[1].references.push(context);
-        events[1]
-            .references
-            .extend(
-                plan.evidence_references
-                    .iter()
-                    .map(|reference| GovernedReference {
-                        kind: "external_evidence".into(),
-                        reference: format!(
-                            "evidence:{}@{}",
-                            reference.submission_id, reference.source_version
-                        ),
-                        content_hash: Some(reference.content_digest.clone()),
-                        disclosed_fields: reference.disclosed_fields.clone(),
-                        omitted: false,
-                        omission_reason: None,
-                    }),
-            );
-        events[1]
-            .references
-            .extend(
-                plan.memory_references
-                    .iter()
-                    .map(|reference| GovernedReference {
-                        kind: "kioku_memory".into(),
-                        reference: format!(
-                            "memory:{}@{}",
-                            reference.memory_id, reference.memory_version
-                        ),
-                        content_hash: Some(reference.content_digest.clone()),
-                        disclosed_fields: vec!["claim".into()],
-                        omitted: false,
-                        omission_reason: None,
-                    }),
-            );
-        if !plan.egress_decisions.is_empty() {
-            events.push(receipt_event(
-                &operation_id,
-                "egress",
-                Some("budget"),
-                started,
-                ReceiptEventKind::EgressDecided,
-                "chisei.egress",
-                BTreeMap::from([
-                    (
-                        "decision_count".into(),
-                        plan.egress_decisions.len().to_string(),
-                    ),
-                    (
-                        "redacted_field_count".into(),
-                        plan.egress_decisions
-                            .iter()
-                            .map(|decision| decision.redacted.len())
-                            .sum::<usize>()
-                            .to_string(),
-                    ),
-                ]),
-            ));
-        }
-        let (completed_at_ms, uncovered_surfaces) = if plan.executable {
-            (
-                None,
-                vec![
-                    UncoveredSurface {
-                        surface: ReceiptSurface::Attempt,
-                        reason: "operation is planned but has not started".into(),
-                    },
-                    UncoveredSurface {
-                        surface: ReceiptSurface::ModelCall,
-                        reason: "operation is planned but has not called a model".into(),
-                    },
-                    UncoveredSurface {
-                        surface: ReceiptSurface::Outcome,
-                        reason: "operation is planned but has no terminal outcome".into(),
-                    },
-                ],
-            )
-        } else {
-            let parent = if plan.egress_decisions.is_empty() {
-                "budget"
-            } else {
-                "egress"
-            };
-            events.push(receipt_event(
-                &operation_id,
-                "outcome",
-                Some(parent),
-                started,
-                ReceiptEventKind::OutcomeRecorded,
-                actor,
-                BTreeMap::from([
-                    ("status".into(), "denied".into()),
-                    ("completion_reason".into(), "plan_not_executable".into()),
-                    ("warning_count".into(), plan.warnings.len().to_string()),
-                ]),
-            ));
-            (Some(started), Vec::new())
-        };
-        let receipt = OperationReceipt {
-            version: OPERATION_RECEIPT_VERSION.into(),
-            operation_id,
-            parent_operation_id: None,
-            namespace: input.namespace.clone(),
-            operation_class: if input.task_type.trim().is_empty() {
-                "model_inference".into()
-            } else {
-                input.task_type.trim().into()
-            },
-            initiating_actor: actor.to_string(),
-            schema_version: EXECUTION_SCHEMA_VERSION.into(),
-            policy_version,
-            started_at_ms: started,
-            completed_at_ms,
-            events,
-            uncovered_surfaces,
-            reporter_grants: Vec::new(),
-        };
-        let holdouts = plan
-            .memory_holdouts
-            .iter()
-            .map(|holdout| (holdout.memory_id.clone(), holdout.memory_version))
-            .collect::<Vec<_>>();
-        self.db
-            .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
-        Ok(())
-    }
-
-    /// Resolve runtime/model and return the effective pre-policy preference
-    /// that was fed into policy resolution: `(resolved_runtime, resolved_model,
-    /// preferred_runtime, preferred_model)`.
-    async fn resolve_model_for_run(
-        &self,
-        input: &ExecutionInput,
-        fallback_runtime: &str,
-        run: &pipe::RunResult,
-        policy: Option<&crate::chisei::policy::Policy>,
-        safe_only: bool,
-        safe_providers: &std::collections::HashSet<String>,
-    ) -> Result<(String, String, String, String), Status> {
-        let route_override = input.route_override.trim();
-        if !route_override.is_empty() && !route_override_allowed(policy, route_override) {
-            return Err(Status::invalid_argument(format!(
-                "route override {route_override:?} is not allowed by namespace policy"
-            )));
-        }
-        let recommended_model = run
-            .recommended_model()
-            .map(|(model, _)| model.to_string())
-            .unwrap_or_else(|| input.preferred_model.clone());
-        let route_bias_value =
-            crate::chisei::model_routing::route_bias(&run.steps).map(str::to_string);
-        let route_bias = route_bias_value.as_deref();
-        let preferred_model = if route_override.is_empty() {
-            choose_preferred_model(
-                &input.preferred_model,
-                &recommended_model,
-                route_bias,
-                policy,
-            )
-        } else {
-            route_override.to_string()
-        };
-        let override_runtime = (!route_override.is_empty())
-            .then(|| crate::provider_resolution::resolve_model(route_override))
-            .transpose()
-            .map_err(Status::invalid_argument)?
-            .map(|model| model.provider);
-        let preferred_runtime = if let Some(runtime) = override_runtime.as_deref() {
-            runtime.to_string()
-        } else if input.preferred_runtime.is_empty() {
-            fallback_runtime.to_string()
-        } else {
-            input.preferred_runtime.clone()
-        };
-        let (runtime, model) = self
-            .policy
-            .resolve(&input.namespace, &preferred_runtime, &preferred_model)
-            .map_err(Status::invalid_argument)?;
-        let model = self
-            .resolve_live_model_with_override(
-                &model,
-                policy,
-                if route_override.is_empty() {
-                    route_bias
-                } else {
-                    None
-                },
-                safe_only,
-                safe_providers,
-                None,
-                !route_override.is_empty(),
-            )
-            .await
-            .map_err(Status::failed_precondition)?;
-        let runtime = final_runtime_for_model(policy, &runtime, &model)
-            .map_err(Status::failed_precondition)?;
-        // Single-plane residency (#289): fail closed before any provider contact.
-        let data_class = policy
-            .map(|policy| policy.data_class.as_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("unclassified");
-        let provider = crate::llm::provider_name(&model);
-        self.policy
-            .enforce_residency(&input.namespace, provider, &model, data_class)
-            .map_err(Status::permission_denied)?;
-        Ok((runtime, model, preferred_runtime, preferred_model))
-    }
-
     fn data_class(&self, policy: Option<&crate::chisei::policy::Policy>) -> DataClass {
         policy
             .map(|policy| DataClass::parse(&policy.data_class))
             .filter(|class| *class != DataClass::Unclassified)
             .unwrap_or_else(|| DataClass::parse(&self.config.default_data_class))
-    }
-
-    fn enforce_execution_provider_privacy(
-        &self,
-        plan: &ExecutionPlan,
-        input: &ExecutionInput,
-        actor: &str,
-        provider: &str,
-        data_class: DataClass,
-    ) -> Result<(), Status> {
-        let task_class = TaskClass::parse(&plan.task_class);
-        let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
-        let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
-        if safe_only && !crate::chisei::privacy::provider_safe_to_send(provider, &safe_providers) {
-            self.record_privacy_audit(
-                "blocked",
-                &input.request_id,
-                provider,
-                data_class,
-                task_class,
-                "cached_plan_unsafe_provider",
-            );
-            record_failed_operation_on(&self.db, plan, actor, "provider_became_unsafe")
-                .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                crate::chisei::privacy::gate_reason(data_class, task_class, provider),
-            ));
-        }
-        Ok(())
-    }
-
-    fn enforce_execution_payload_privacy(
-        &self,
-        plan: &ExecutionPlan,
-        input: &ExecutionInput,
-        actor: &str,
-        provider: &str,
-        data_class: DataClass,
-    ) -> Result<(), Status> {
-        let payload =
-            payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
-        let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload);
-        if leak_findings
-            .iter()
-            .any(|finding| finding.action == LeakAction::Block)
-        {
-            self.record_leak_audit(
-                "execute_leak_check",
-                &input.request_id,
-                provider,
-                &leak_findings,
-            );
-            record_failed_operation_on(
-                &self.db,
-                plan,
-                actor,
-                "privacy_leak_detected_after_planning",
-            )
-            .map_err(Status::internal)?;
-            return Err(Status::failed_precondition(
-                "privacy leak checker blocked outbound payload",
-            ));
-        }
-        Ok(())
     }
 
     fn leak_findings_for_payload(
@@ -5195,21 +4059,6 @@ fn build_prepared_messages(input: &ExecutionInput, enriched_spec: &str) -> Vec<C
     messages
 }
 
-fn native_cacheable_message_count(input: &ExecutionInput, prepared: &[ChatMessage]) -> usize {
-    let has_dynamic_spec = !input.spec.is_empty() || prepared.len() > input.messages.len();
-    if has_dynamic_spec
-        && prepared
-            .first()
-            .is_some_and(|message| message.content.starts_with("[Task spec]\n"))
-    {
-        0
-    } else if has_dynamic_spec {
-        input.messages.len().min(prepared.len())
-    } else {
-        prepared.len().saturating_sub(1)
-    }
-}
-
 fn subject_reference_from_proto(
     value: GovernedSubjectReference,
 ) -> subject::GovernedSubjectReference {
@@ -5574,74 +4423,8 @@ impl ChiseiService for ChiseiServiceImpl {
                 "negative usage adjustments require control-plane administration",
             ));
         }
-        let metric = budget_metric(&r.metric)?;
-        let budget_subject = budget_subject(
-            &r.subject,
-            &r.project,
-            &r.agent,
-            &r.key_id,
-            &r.work_unit,
-            &r.user_id,
-        )?;
-        self.budget
-            .record_idempotent_with_metric(
-                &budget_subject,
-                r.tokens_used,
-                metric,
-                &r.idempotency_key,
-            )
-            .map_err(Status::internal)?;
-        if !r.operation_receipt_json.trim().is_empty() {
-            persist_gateway_operation_receipt(self, &r.operation_receipt_json, &actor)?;
-        }
-        let sample_recorded = if let Some(observation) = r.sample_observation {
-            if observation.request_id.trim().is_empty()
-                || observation.namespace.trim().is_empty()
-                || observation.spec.trim().is_empty()
-                || observation.output_content.trim().is_empty()
-            {
-                return Err(Status::invalid_argument(
-                    "sample observation requires request_id, namespace, spec, and output_content",
-                ));
-            }
-            if self.config.scoring_enabled {
-                self.db
-                    .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-                        request_id: observation.request_id,
-                        namespace: observation.namespace,
-                        spec: observation.spec,
-                        resolved_model: observation.resolved_model,
-                        output_content: observation.output_content,
-                        sample_reason: observation.sample_reason,
-                        input_tokens: observation.input_tokens,
-                        output_tokens: observation.output_tokens,
-                        stop_reason: observation.stop_reason,
-                        timestamp: observation.timestamp,
-                        scored: false,
-                        task_class: crate::chisei::scoring::normalize_task_class(
-                            &observation.task_class,
-                        ),
-                        cost_usd_micros: observation.cost_usd_micros,
-                    })
-                    .map_err(Status::internal)?;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let u = self.budget.get_usage_with_metric(&budget_subject, metric);
-        Ok(Response::new(RecordUsageResponse {
-            usage: Some(BudgetUsage {
-                user_id: u.user_id,
-                tokens_used: u.tokens_used,
-                max_tokens: u.max_tokens,
-                period_type: u.period_type.as_str().into(),
-                period_start: u.period_start,
-            }),
-            sample_recorded,
-        }))
+        let response = self.record_usage_from_authenticated(actor, r)?;
+        Ok(Response::new(response))
     }
 
     async fn set_budget_limit(
@@ -6089,151 +4872,8 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<IssueGunshiRecommendationsRequest>,
     ) -> Result<Response<IssueGunshiRecommendationsResponse>, Status> {
         let actor = authenticated_actor(&req);
-        let issuance_id = req.get_ref().issuance_id.trim();
-        if issuance_id.is_empty()
-            || issuance_id.len() > 128
-            || issuance_id != req.get_ref().issuance_id
-            || !issuance_id
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || "-_.:".contains(character))
-        {
-            return Err(Status::invalid_argument(
-                "issuance_id must be a canonical identifier of at most 128 characters",
-            ));
-        }
-        let issuance_id = issuance_id.to_string();
-        let mut input: crate::chisei::gunshi::RecommendationInput =
-            serde_json::from_str(&req.get_ref().input_json).map_err(|error| {
-                Status::invalid_argument(format!("invalid recommendation input: {error}"))
-            })?;
-        if input.contract_version != crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION {
-            return Err(Status::invalid_argument(format!(
-                "unsupported recommendation input contract {}",
-                input.contract_version
-            )));
-        }
-        if !input.kioku_evidence.is_empty() {
-            return Err(Status::invalid_argument(
-                "server-issued recommendations load governed Kioku evidence; inline evidence is not accepted",
-            ));
-        }
-        if input.request.operations.is_empty() {
-            return Err(Status::invalid_argument(
-                "server-issued recommendations require at least one operation",
-            ));
-        }
-        let mut scopes = input
-            .request
-            .operations
-            .iter()
-            .map(|operation| {
-                (
-                    operation.namespace.clone(),
-                    operation.operation_class.clone(),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        for (namespace, _) in &scopes {
-            require_namespace_write_access(&self.db, &actor, namespace)?;
-        }
-        for (namespace, operation_class) in std::mem::take(&mut scopes) {
-            input.kioku_evidence.extend(
-                crate::chisei::gunshi::load_kioku_evidence(&self.db, &namespace, &operation_class)
-                    .map_err(Status::internal)?,
-            );
-        }
-        input
-            .kioku_evidence
-            .sort_by(|left, right| left.memory_id.cmp(&right.memory_id));
-        input
-            .kioku_evidence
-            .dedup_by(|left, right| left.memory_id == right.memory_id);
-        let request_digest = {
-            use sha2::Digest;
-            let input_json =
-                serde_json::to_vec(&input).map_err(|error| Status::internal(error.to_string()))?;
-            format!("{:x}", sha2::Sha256::digest(input_json))
-        };
-        let allocation = crate::chisei::gunshi::recommend_advisory(
-            &input.request,
-            &input.kioku_evidence,
-            &input.advisory_policy,
-        )
-        .map_err(Status::failed_precondition)?;
-        crate::chisei::gunshi_feedback::record_issued_recommendations(
-            &self.db,
-            &actor,
-            &issuance_id,
-            &request_digest,
-            &allocation.plans,
-            chrono::Utc::now().timestamp_millis(),
-            input.request.capacity.captured_at_ms,
-        )
-        .map_err(Status::failed_precondition)?;
-        let operations = input
-            .request
-            .operations
-            .iter()
-            .map(|operation| (operation.operation_id.as_str(), operation))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut auto_dispatch_authorization_json = Vec::with_capacity(allocation.plans.len());
-        let mut receipt_attributes_json = Vec::with_capacity(allocation.plans.len());
-        for plan in &allocation.plans {
-            let operation = operations.get(plan.operation_id.as_str()).ok_or_else(|| {
-                Status::internal("Gunshi allocation references an unknown operation")
-            })?;
-            let (mut authorization, mut attributes) =
-                crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
-                    &self.db,
-                    &plan.namespace,
-                    plan,
-                    operation,
-                    &input.request.capacity,
-                )
-                .map_err(Status::failed_precondition)?;
-            let data_class = self
-                .policy
-                .effective_policy(&plan.namespace)
-                .map(|policy| policy.data_class)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "unclassified".into());
-            let provider = crate::llm::provider_name(&plan.selection.model);
-            match self.policy.enforce_residency(
-                &plan.namespace,
-                provider,
-                &plan.selection.model,
-                &data_class,
-            ) {
-                Ok(decision) => {
-                    attributes.extend(self.policy.residency_receipt_attributes(&decision));
-                }
-                Err(error) => {
-                    authorization.authorized = false;
-                    authorization.mode = crate::chisei::gunshi_dispatch::DispatchMode::AdvisoryOnly;
-                    authorization.reasons.push(error);
-                    attributes.insert("residency_allowed".into(), "false".into());
-                    attributes.insert(
-                        "residency_denial_reasons".into(),
-                        authorization.reasons.last().cloned().unwrap_or_default(),
-                    );
-                }
-            }
-            auto_dispatch_authorization_json.push(
-                serde_json::to_string(&authorization)
-                    .map_err(|error| Status::internal(error.to_string()))?,
-            );
-            receipt_attributes_json.push(
-                serde_json::to_string(&attributes)
-                    .map_err(|error| Status::internal(error.to_string()))?,
-            );
-        }
-        Ok(Response::new(IssueGunshiRecommendationsResponse {
-            allocation_json: serde_json::to_string(&allocation)
-                .map_err(|error| Status::internal(error.to_string()))?,
-            issuance_id,
-            auto_dispatch_authorization_json,
-            receipt_attributes_json,
-        }))
+        let response = self.issue_recommendations_from_authenticated(actor, req.into_inner())?;
+        Ok(Response::new(response))
     }
 
     async fn set_gunshi_allocation_policy(
@@ -6241,155 +4881,8 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<SetGunshiAllocationPolicyRequest>,
     ) -> Result<Response<SetGunshiAllocationPolicyResponse>, Status> {
         let actor = authenticated_actor(&req);
-        let input = req.into_inner();
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let status = match input.operation.as_str() {
-            "install" => {
-                let snapshot = serde_json::from_str(&input.snapshot_json).map_err(|error| {
-                    Status::invalid_argument(format!("invalid allocation snapshot: {error}"))
-                })?;
-                let gate = serde_json::from_str(&input.gate_json).map_err(|error| {
-                    Status::invalid_argument(format!("invalid evaluation gate: {error}"))
-                })?;
-                let status = crate::chisei::gunshi_auto::install_baseline(
-                    &self.db,
-                    &actor,
-                    &input.namespace,
-                    snapshot,
-                    gate,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?;
-                serde_json::to_value(status).map_err(|error| Status::internal(error.to_string()))?
-            }
-            "promote" => {
-                let candidate = serde_json::from_str(&input.candidate_json).map_err(|error| {
-                    Status::invalid_argument(format!("invalid candidate snapshot: {error}"))
-                })?;
-                let baseline =
-                    serde_json::from_str(&input.baseline_evaluation_json).map_err(|error| {
-                        Status::invalid_argument(format!("invalid baseline evaluation: {error}"))
-                    })?;
-                let candidate_evaluation = serde_json::from_str(&input.candidate_evaluation_json)
-                    .map_err(|error| {
-                    Status::invalid_argument(format!("invalid candidate evaluation: {error}"))
-                })?;
-                let status = crate::chisei::gunshi_auto::promote(
-                    &self.db,
-                    crate::chisei::gunshi_auto::PromoteRequest {
-                        actor,
-                        namespace: input.namespace,
-                        candidate,
-                        baseline,
-                        candidate_evaluation,
-                        expected_revision: input.expected_revision,
-                        now_ms,
-                    },
-                )
-                .map_err(Status::failed_precondition)?;
-                serde_json::to_value(status).map_err(|error| Status::internal(error.to_string()))?
-            }
-            "rollback" => serde_json::to_value(
-                crate::chisei::gunshi_auto::rollback(
-                    &self.db,
-                    &actor,
-                    &input.namespace,
-                    &input.expected_revision,
-                    &input.reason,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?,
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-            "auto_opt_in" => serde_json::to_value(
-                crate::chisei::gunshi_auto::set_auto_opt_in(
-                    &self.db,
-                    &actor,
-                    &input.namespace,
-                    input.enabled,
-                    &input.expected_revision,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?,
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-            "kill_switch" => serde_json::to_value(
-                crate::chisei::gunshi_auto::set_kill_switch(
-                    &self.db,
-                    &actor,
-                    &input.namespace,
-                    input.enabled,
-                    &input.reason,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?,
-            )
-            .map_err(|error| Status::internal(error.to_string()))?,
-            "feedback" => {
-                let plan: crate::chisei::gunshi::AllocationPlan =
-                    serde_json::from_str(&input.allocation_json).map_err(|error| {
-                        Status::invalid_argument(format!("invalid allocation plan: {error}"))
-                    })?;
-                if plan.namespace != input.namespace {
-                    return Err(Status::invalid_argument(
-                        "feedback allocation namespace does not match the policy namespace",
-                    ));
-                }
-                let choice = serde_json::from_str(&input.choice_json).map_err(|error| {
-                    Status::invalid_argument(format!("invalid operator choice: {error}"))
-                })?;
-                let outcome = (!input.outcome_json.trim().is_empty())
-                    .then(|| serde_json::from_str(&input.outcome_json))
-                    .transpose()
-                    .map_err(|error| {
-                        Status::invalid_argument(format!("invalid observed outcome: {error}"))
-                    })?;
-                serde_json::to_value(
-                    crate::chisei::gunshi_feedback::record_feedback(
-                        &self.db,
-                        &actor,
-                        &input.issuance_id,
-                        &plan,
-                        &choice,
-                        outcome.as_ref(),
-                    )
-                    .map_err(Status::failed_precondition)?,
-                )
-                .map_err(|error| Status::internal(error.to_string()))?
-            }
-            "promote_feedback" => {
-                let result = crate::chisei::gunshi_feedback_eval::promote_feedback_to_eval(
-                    &self.db,
-                    &actor,
-                    &input.suite_id,
-                    &input.issuance_id,
-                    &input.allocation_id,
-                    &input.namespace,
-                    now_ms,
-                )
-                .map_err(Status::failed_precondition)?;
-                if let Err(error) = self.eval.put_suite(result.suite.clone())
-                    && self.eval.get_suite(&result.suite_id).as_ref() != Some(&result.suite)
-                {
-                    tracing::warn!(
-                        %error,
-                        suite_id = %result.suite_id,
-                        "eval store sync after feedback promotion"
-                    );
-                }
-                serde_json::to_value(result).map_err(|error| Status::internal(error.to_string()))?
-            }
-            _ => {
-                return Err(Status::invalid_argument(
-                    "operation must be install, promote, rollback, auto_opt_in, kill_switch, feedback, or promote_feedback",
-                ));
-            }
-        };
-        Ok(Response::new(SetGunshiAllocationPolicyResponse {
-            status_json: serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
+        let response = self.set_allocation_policy_from_authenticated(actor, req.into_inner())?;
+        Ok(Response::new(response))
     }
 
     async fn get_gunshi_allocation_status(
@@ -6397,22 +4890,8 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<GetGunshiAllocationStatusRequest>,
     ) -> Result<Response<GetGunshiAllocationStatusResponse>, Status> {
         let actor = authenticated_actor(&req);
-        let namespace = req.get_ref().namespace.clone();
-        require_namespace_access(&self.db, &actor, &namespace)?;
-        let status = crate::chisei::gunshi_auto::get_status(&self.db, &namespace)
-            .map_err(Status::internal)?;
-        let status_json = match status {
-            Some(status) => serde_json::to_string(&status)
-                .map_err(|error| Status::internal(error.to_string()))?,
-            None => "{}".into(),
-        };
-        let scorecard = crate::chisei::gunshi_feedback::advisory_scorecard(&self.db, &namespace)
-            .map_err(Status::internal)?;
-        Ok(Response::new(GetGunshiAllocationStatusResponse {
-            status_json,
-            scorecard_json: serde_json::to_string(&scorecard)
-                .map_err(|error| Status::internal(error.to_string()))?,
-        }))
+        let response = self.allocation_status_from_authenticated(actor, req.into_inner())?;
+        Ok(Response::new(response))
     }
 
     async fn review_kioku_memory(
@@ -15399,6 +13878,119 @@ mod tests {
             .into_inner();
         assert!(!denied.admitted, "{denied:?}");
         assert_eq!(denied.deny_reason, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
+        use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+        use crate::provider_profile::{
+            CAPABILITY_MATRIX_VERSION, CapabilityMatrix, CapabilityRequirements,
+            NATIVE_CAPABILITY_CATALOG_CONTRACT,
+        };
+
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "team-a",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+
+        let decide = |capability_requirements_json: Vec<u8>, correlation: &str| {
+            let mut request = Request::new(DecideGatewayExecutionRequest {
+                contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                namespace: "team-a".into(),
+                requested_model: "gpt-5.5".into(),
+                operation_class: "chat".into(),
+                estimated_cost_usd_micros: 0,
+                correlation_operation_id: correlation.into(),
+                correlation_attempt: 1,
+                estimated_tokens: 10,
+                task_class: "interactive".into(),
+                preferred_runtime: "openai".into(),
+                project: "team-a".into(),
+                agent: "local".into(),
+                key_id: String::new(),
+                work_unit: String::new(),
+                local_free_available: false,
+                user_id: "local".into(),
+                route_override: String::new(),
+                capability_requirements_json,
+                expected_calls: 1,
+                pipeline_spec: String::new(),
+            });
+            request
+                .metadata_mut()
+                .insert("x-principal", "local".parse().unwrap());
+            request
+        };
+
+        let native = serde_json::json!({
+            "capabilities": [{
+                "name": "sekai.semantic.expand_relations",
+                "product_tier": "core"
+            }],
+            "contract_version": NATIVE_CAPABILITY_CATALOG_CONTRACT,
+            "catalog_version": "sha256:deadbeef",
+            "cache_scope": "authorization_context"
+        });
+        let native_denied = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&native).unwrap(),
+                "op-mix-native",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!native_denied.admitted, "{native_denied:?}");
+        assert_eq!(native_denied.deny_reason, "capability_unsupported");
+        assert!(
+            native_denied
+                .deny_message
+                .contains("DiscoverCapabilities contract 1.0"),
+            "{native_denied:?}"
+        );
+
+        let matrix_denied = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&CapabilityMatrix::built_in()).unwrap(),
+                "op-mix-matrix",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!matrix_denied.admitted, "{matrix_denied:?}");
+        assert_eq!(matrix_denied.deny_reason, "capability_unsupported");
+        assert!(
+            matrix_denied
+                .deny_message
+                .contains(CAPABILITY_MATRIX_VERSION),
+            "{matrix_denied:?}"
+        );
+
+        let admitted = svc
+            .decide_gateway_execution(decide(
+                serde_json::to_vec(&CapabilityRequirements {
+                    responses: true,
+                    ..CapabilityRequirements::default()
+                })
+                .unwrap(),
+                "op-mix-requirements",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(admitted.admitted, "{admitted:?}");
+        assert!(admitted.deny_reason.is_empty());
     }
 
     #[tokio::test]

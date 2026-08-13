@@ -8,8 +8,9 @@ lives in the separate [research index](research/README.md).
 
 - [Ontology definitions](ontology.md) — define a domain, seed governed facts,
   run an operation, and inspect its receipt.
-- [Capability catalog](capability-catalog.md) — discover core governed
-  capabilities for agents and SDKs.
+- [Capability catalogs](capability-catalog.md) — native `DiscoverCapabilities`
+  contract `1.0` for agents and SDKs, and HTTP
+  `chisei.provider-capabilities/v1` for the gateway provider-profile matrix.
 - [Native gRPC protocol](../proto/) — service and message definitions.
 - [Sample observation readback](sample-observation-readback.md) — authenticated,
   redacted telemetry admission projection.
@@ -60,8 +61,8 @@ lives in the separate [research index](research/README.md).
   provenance, and validation boundaries.
 - [Standalone ontology crate](../crates/sekai-ontology/README.md) — embedded
   library and local `sekai` CLI.
-- [Capability catalog](capability-catalog.md) — capability discovery and
-  invocation boundaries.
+- [Capability catalogs](capability-catalog.md) — native discovery and the HTTP
+  provider-profile matrix, including invocation and decide-input boundaries.
 - [Capability code generation](capability-codegen.md) — namespace-scoped
   generated client surfaces.
 
