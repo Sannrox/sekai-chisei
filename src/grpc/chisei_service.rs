@@ -12761,6 +12761,12 @@ mod tests {
                 data_class: "internal".into(),
             },
         );
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+            )
+            .unwrap();
 
         let mut admit = Request::new(DecideGatewayExecutionRequest {
             contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
@@ -12806,6 +12812,7 @@ mod tests {
         assert!(!admitted.budget_grant_id.is_empty());
         assert!(admitted.sampling_evaluated);
         assert!(!admitted.prepared_spec.is_empty());
+        assert_eq!(admitted.context_admission_decision, "include");
 
         svc.policy
             .set_context_admission_policy(
@@ -12869,7 +12876,12 @@ mod tests {
             context_denied.deny_message,
             "context admission policy requires review or verification"
         );
-        svc.policy.clear_context_admission_policy("team-a");
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+            )
+            .unwrap();
 
         svc.budget
             .set_limit_with_metric(
@@ -12948,6 +12960,154 @@ mod tests {
         assert_eq!(denied.deny_reason, "unauthorized");
     }
 
+    fn openai_team_a_service() -> ChiseiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let mut cfg = config(":memory:");
+        cfg.gateway_provided_providers = vec!["openai".into()];
+        let svc = ChiseiServiceImpl::new(db, cfg);
+        svc.policy.set_namespace_policy(
+            "team-a",
+            crate::chisei::policy::Policy {
+                allowed_runtimes: vec!["openai".into()],
+                allowed_models: vec!["gpt-5.5".into()],
+                default_runtime: "openai".into(),
+                default_model: "gpt-5.5".into(),
+                data_class: "internal".into(),
+            },
+        );
+        svc
+    }
+
+    fn decide_request(
+        correlation: &str,
+        pipeline_spec: &str,
+    ) -> Request<DecideGatewayExecutionRequest> {
+        use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
+        let mut request = Request::new(DecideGatewayExecutionRequest {
+            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            requested_model: "gpt-5.5".into(),
+            operation_class: "chat".into(),
+            estimated_cost_usd_micros: 0,
+            correlation_operation_id: correlation.into(),
+            correlation_attempt: 1,
+            estimated_tokens: 10,
+            task_class: "interactive".into(),
+            preferred_runtime: "openai".into(),
+            project: "team-a".into(),
+            agent: "local".into(),
+            key_id: String::new(),
+            work_unit: String::new(),
+            local_free_available: false,
+            user_id: "local".into(),
+            route_override: String::new(),
+            capability_requirements_json: Vec::new(),
+            expected_calls: 1,
+            pipeline_spec: pipeline_spec.into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_denies_missing_context_admission_policy() {
+        let svc = openai_team_a_service();
+        let denied = svc
+            .decide_gateway_execution(decide_request("op-missing-context-policy", ""))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "policy_denied");
+        assert_eq!(denied.deny_message, "context admission policy is required");
+        assert_ne!(denied.context_admission_decision, "include");
+        assert_eq!(
+            denied.context_admission_reasons,
+            vec!["context_admission:missing"]
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_denies_corrupt_context_admission_policy() {
+        let svc = openai_team_a_service();
+        svc.policy
+            .set_context_admission_error("team-a", "corrupt context admission policy");
+        let denied = svc
+            .decide_gateway_execution(decide_request("op-corrupt-context-policy", ""))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "policy_denied");
+        assert_eq!(denied.deny_message, "context admission policy unavailable");
+        assert_ne!(denied.context_admission_decision, "include");
+        assert_eq!(
+            denied.context_admission_reasons,
+            vec!["context_admission:unavailable"]
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_denies_when_fallback_action_blocks_provider() {
+        let svc = openai_team_a_service();
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy {
+                    contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION
+                        .into(),
+                    default_action: ContextAdmissionAction::RequireReview,
+                    unknown_action: ContextAdmissionAction::HoldOut,
+                    rules: vec![],
+                },
+            )
+            .unwrap();
+        let denied = svc
+            .decide_gateway_execution(decide_request("op-fallback-blocks", ""))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "policy_denied");
+        assert_eq!(denied.context_admission_decision, "require_review");
+        assert_eq!(
+            denied.context_admission_reasons,
+            vec!["context_admission:require_review"]
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_gateway_execution_denies_pipeline_error_after_admit() {
+        let mut svc = openai_team_a_service();
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+            )
+            .unwrap();
+        svc.pipeline = pipe::Pipeline::new(vec![]);
+        let denied = svc
+            .decide_gateway_execution(decide_request("op-pipeline-error", "summarize team-a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!denied.admitted, "{denied:?}");
+        assert_eq!(denied.deny_reason, "policy_denied");
+        assert!(
+            denied
+                .deny_message
+                .contains("gateway pipeline decision unavailable"),
+            "{denied:?}"
+        );
+        assert!(!denied.sampling_evaluated);
+        assert!(denied.prepared_spec.is_empty());
+        assert!(denied.resolved_model.is_empty());
+    }
+
     #[tokio::test]
     async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
         use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
@@ -12972,6 +13132,12 @@ mod tests {
                 data_class: "internal".into(),
             },
         );
+        svc.policy
+            .set_context_admission_policy(
+                "team-a",
+                crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+            )
+            .unwrap();
 
         let decide = |capability_requirements_json: Vec<u8>, correlation: &str| {
             let mut request = Request::new(DecideGatewayExecutionRequest {

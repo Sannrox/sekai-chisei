@@ -1,15 +1,25 @@
 # Context admission policy
 
-`chisei.context-admission/v1` is an opt-in, namespace-scoped policy for
-deciding how already-authorized context projections may participate in native
-planning and gateway execution. It governs use; it does not adjudicate truth,
-rewrite an epistemic descriptor, or mutate evidence.
+`chisei.context-admission/v1` is a namespace-scoped policy for deciding how
+already-authorized context projections may participate in native planning and
+gateway execution. It governs use; it does not adjudicate truth, rewrite an
+epistemic descriptor, or mutate evidence.
 
 The policy is supplied as canonical JSON in
 `SetNamespacePolicyRequest.context_admission_policy_json`. An empty value keeps
 the currently stored policy, and the JSON value `null` clears it. A malformed
 or unsupported policy is rejected; it never falls back to a weaker policy.
-Namespaces without a policy preserve the existing enrichment behavior.
+
+Gateway fat-decide fails closed when the namespace has no context-admission
+policy, when the stored policy is corrupt or unavailable, and when no matching
+operation-level rule exists and `default_action` or `unknown_action` blocks
+provider execution. Native enrichment without a policy still preserves the
+existing include behavior. Gateway setup seeds a default include/hold-out
+policy so a configured gateway namespace can admit.
+
+If a fat-decide request includes `pipeline_spec` after admission, a pipeline or
+sampling error denies the request. The control plane does not continue with
+`sampling_evaluated=false` and an empty prepared spec.
 
 ## Policy shape
 

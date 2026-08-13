@@ -21,7 +21,9 @@ default, budget/policy preflight uses the control-plane
 `DecideGatewayExecution` RPC using `gateway.decide/v2` (Issues #163 and #418).
 The same decision also runs the internal sampling pipeline when request text is
 available; there is no separate pipeline RPC or gateway sampling mode.
-A configured gateway has no legacy
+A missing, corrupt, or blocking context-admission policy denies admission.
+A pipeline or sampling error after admission also denies when `pipeline_spec`
+was set. A configured gateway has no legacy
 multi-RPC fallback: denial or control-plane unavailability stops the request
 before provider contact. The control plane owns policy, budget, lifecycle,
 evaluation, capability, and route decisions; the gateway translates supported

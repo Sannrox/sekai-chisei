@@ -18,6 +18,8 @@ use sekai_proto::sekai::{
 };
 use sekai_provider::gateway_keys::{default_virtual_key, hash_gateway_key};
 
+const DEFAULT_CONTEXT_ADMISSION_POLICY_JSON: &str = r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewaySetupConfig {
     pub chisei_grpc_target: String,
@@ -286,6 +288,12 @@ pub async fn run_setup(
             .await?;
     }
 
+    let context_admission_policy_json = if config.merge_into_existing {
+        String::new()
+    } else {
+        DEFAULT_CONTEXT_ADMISSION_POLICY_JSON.to_string()
+    };
+
     chisei
         .set_namespace_policy(GrpcRequest::new(SetNamespacePolicyRequest {
             namespace: config.project.clone(),
@@ -294,7 +302,7 @@ pub async fn run_setup(
             default_runtime: default_runtime.clone(),
             default_model: default_model.clone(),
             data_class: String::new(),
-            context_admission_policy_json: String::new(),
+            context_admission_policy_json: context_admission_policy_json.clone(),
         }))
         .await?;
 
@@ -310,7 +318,7 @@ pub async fn run_setup(
                 default_runtime: scope_default_runtime.clone(),
                 default_model: scope_default_model.clone(),
                 data_class: String::new(),
-                context_admission_policy_json: String::new(),
+                context_admission_policy_json: context_admission_policy_json.clone(),
             }))
             .await?;
     }
@@ -1152,6 +1160,13 @@ mod tests {
         assert_eq!(
             policy.properties.get("default_model").map(String::as_str),
             Some("gpt-5.5")
+        );
+        assert!(
+            policy
+                .properties
+                .get("context_admission_policy_json")
+                .is_some_and(|value| value.contains("chisei.context-admission/v1")),
+            "gateway setup must seed a context-admission policy"
         );
         assert!(db.get_dataset("llm_calls").unwrap().is_some());
         let key = db
