@@ -6472,7 +6472,7 @@ fn credential_admin_actor(
 type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
 fn request_tenant_context(
-    _db: &RuntimeDb,
+    db: &RuntimeDb,
     req: &Request<impl std::any::Any>,
 ) -> Result<Option<RequestEnterpriseContext>, Status> {
     if let Some(context) = req
@@ -6480,6 +6480,11 @@ fn request_tenant_context(
         .get::<crate::enterprise::AuthenticatedContext>()
     {
         return Ok(Some(context.clone()));
+    }
+    if db.enterprise_extension().is_some() {
+        return Err(Status::unauthenticated(
+            "enterprise authenticated context required",
+        ));
     }
     Ok(None)
 }
@@ -6494,7 +6499,9 @@ fn enforce_namespace_tenant_context(
         return Ok(());
     };
     let Some(context) = tenant_context else {
-        return Ok(());
+        return Err(Status::unauthenticated(
+            "enterprise authenticated context required",
+        ));
     };
     let action = if write {
         crate::enterprise::NamespaceAction::Write
@@ -6765,6 +6772,174 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn missing_authenticated_context_is_ok_without_enterprise_extension() {
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let request = Request::new(());
+        assert!(request_tenant_context(&db, &request).unwrap().is_none());
+        assert!(enforce_namespace_tenant_context(&db, None, "anything", false).is_ok());
+    }
+
+    #[test]
+    fn missing_authenticated_context_fails_closed_when_enterprise_is_enabled() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        ));
+        let request = Request::new(());
+        assert_eq!(
+            request_tenant_context(&db, &request).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            enforce_namespace_tenant_context(&db, None, "allowed", false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+
+    fn enterprise_service() -> SekaiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        )));
+        SekaiServiceImpl::new(db)
+    }
+
+    fn test_tenant_context() -> crate::enterprise::AuthenticatedContext {
+        crate::enterprise::AuthenticatedContext {
+            contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+            principal: crate::enterprise::AuthenticatedPrincipal {
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+            },
+            credential_kind: crate::enterprise::CredentialKind::HumanSession,
+            tenant: Some(crate::enterprise::TenantContext {
+                tenant_id: "tenant-test".into(),
+                subject: "subject-a".into(),
+            }),
+            scopes: vec!["sekai.read".into()],
+            issuer: "https://issuer.test".into(),
+            resource: "https://sekai.test".into(),
+            expires_at: 100,
+        }
+    }
+
+    fn with_tenant_context<T>(payload: T) -> Request<T> {
+        let mut req = with_named_principal(payload, "subject-a");
+        req.extensions_mut().insert(test_tenant_context());
+        req
+    }
+
+    fn seed_lineage_object(svc: &SekaiServiceImpl, id: &str, namespace: &str) {
+        svc.db
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "widget".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: format!("widget:{id}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_object_without_authenticated_context_fails_closed_when_enterprise_is_enabled() {
+        let svc = enterprise_service();
+        seed_lineage_object(&svc, "tenant-object", "allowed");
+        let err = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "tenant-object".into(),
+                },
+                "subject-a",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn get_lineage_loads_tenant_context_and_hides_unauthorized_root() {
+        let svc = enterprise_service();
+        seed_lineage_object(&svc, "denied-root", "denied");
+        let get_err = svc
+            .get_object(with_tenant_context(GetObjectRequest {
+                id: "denied-root".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(get_err.code(), tonic::Code::NotFound);
+        let lineage_err = svc
+            .get_lineage(with_tenant_context(GetLineageRequest {
+                object_id: "denied-root".into(),
+                max_nodes: 10,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(lineage_err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_lineage_without_authenticated_context_fails_closed_when_enterprise_is_enabled() {
+        let svc = enterprise_service();
+        seed_lineage_object(&svc, "lineage-root", "allowed");
+        let err = svc
+            .get_lineage(with_named_principal(
+                GetLineageRequest {
+                    object_id: "lineage-root".into(),
+                    max_nodes: 10,
+                },
+                "subject-a",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn get_lineage_filters_nodes_outside_tenant_namespace() {
+        let svc = enterprise_service();
+        seed_lineage_object(&svc, "lineage-root", "allowed");
+        seed_lineage_object(&svc, "other-tenant-node", "denied");
+        svc.db
+            .create_link(&domain::Link {
+                id: "lineage-edge".into(),
+                from_id: "lineage-root".into(),
+                to_id: "other-tenant-node".into(),
+                relation: "derived_from".into(),
+                created: 0,
+            })
+            .unwrap();
+        let result = svc
+            .get_lineage(with_tenant_context(GetLineageRequest {
+                object_id: "lineage-root".into(),
+                max_nodes: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let ids = result
+            .nodes
+            .iter()
+            .filter_map(|node| node.object.as_ref().map(|object| object.id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["lineage-root"]);
+        assert!(result.edges.is_empty());
     }
 
     fn with_principal<T>(payload: T) -> Request<T> {

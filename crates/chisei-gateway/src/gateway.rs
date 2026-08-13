@@ -15352,7 +15352,7 @@ mod tests {
             match tokio::time::timeout(
                 Duration::from_secs(5),
                 ChiseiServiceClient::new(channel)
-                    .decide_gateway_execution(GrpcRequest::new(request.clone())),
+                    .decide_gateway_execution(gateway_request(request.clone())),
             )
             .await
             {

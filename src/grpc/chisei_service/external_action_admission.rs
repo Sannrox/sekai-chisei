@@ -80,6 +80,49 @@ impl ChiseiServiceImpl {
             })
     }
 
+    fn require_current_policy_allows_permit_replay(
+        &self,
+        actor: &str,
+        existing: &external::AuthorizationRecord,
+        now_ms: i64,
+    ) -> Result<(), Status> {
+        if existing.decision.policy_scope.trim().is_empty()
+            || existing.decision.policy_version.trim().is_empty()
+        {
+            return Err(Status::failed_precondition(
+                "external-action permit replay requires a policy snapshot",
+            ));
+        }
+        let policy = self
+            .db
+            .resolve_action_policy(
+                actor,
+                &existing.request.namespace,
+                &existing.request.policy_project,
+            )
+            .map_err(Status::internal)?;
+        let Some(policy) = policy.as_ref() else {
+            return Err(Status::failed_precondition(
+                "external-action permit replay requires a current action policy",
+            ));
+        };
+        let plan = external_lifecycle::AuthorizationPlan::resolve(
+            existing.request.clone(),
+            existing.decision.authorization_id.clone(),
+            existing.decision.request_digest.clone(),
+            actor,
+            Some(policy),
+            now_ms,
+        )
+        .map_err(Status::invalid_argument)?;
+        if plan.policy_decision != crate::sekai::action_policy::ActionDecision::Allow {
+            return Err(Status::permission_denied(
+                "external-action permit replay denied by current policy",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn authorize_from_authenticated(
         &self,
         actor: String,
@@ -120,6 +163,9 @@ impl ChiseiServiceImpl {
             }
             external::AuthorizationClaim::Existing(existing) => {
                 external_lifecycle::ensure_audit(&self.db, &existing).map_err(Status::internal)?;
+                if existing.decision.decision == "permit" {
+                    self.require_current_policy_allows_permit_replay(&actor, &existing, now)?;
+                }
                 let permit = (existing.decision.decision == "permit")
                     .then(|| {
                         self.issue_external_permit(

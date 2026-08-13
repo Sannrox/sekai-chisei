@@ -327,8 +327,7 @@ impl SekaiDb {
 
     /// Resolve the effective policy for an actor/namespace/project, honoring
     /// agent-then-project-then-namespace precedence. Returns `None` when no
-    /// policy applies (caller treats that as allow-all for backward
-    /// compatibility).
+    /// policy applies. Admission callers must fail closed on `None`.
     pub fn resolve_action_policy(
         &self,
         actor: &str,
