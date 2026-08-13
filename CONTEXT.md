@@ -48,6 +48,18 @@ The gRPC adapter owns caller authentication, capability-catalog attribution,
 namespace-specific expansion and explanation projection, and protocol metadata.
 PostgreSQL community retrieval remains asserted-only.
 
+## Authorized query
+
+The **Authorized query lifecycle** produces authorization-filtered graph and
+object reads through one private interface. It owns tenant and team-namespace
+admission, ACL read checks, marking visibility, reserved-kind hiding, computed
+property resolution, restricted-property redaction, and canonical projection
+for get, list, find, links, traverse, and lineage.
+
+The gRPC adapter owns caller authentication, catalog-invocation receipts, and
+protocol translation. Semantic retrieval remains a separate reasoning module.
+Object mutation remains write-only.
+
 ## Policy resolution
 
 The **Policy resolution module** produces one permitted route or denial from
@@ -59,6 +71,30 @@ runtime canonicalization, and fallback projection.
 The gRPC adapter owns caller authentication and protocol translation. Gateway
 execution and other authenticated callers cross the same domain seam without
 manufacturing transport requests.
+
+## Gateway decide
+
+The **Gateway decide lifecycle** produces one admit or deny decision from
+authenticated gateway execution input. Its private interface owns namespace
+admission, trusted-gateway scope checks, context-admission gates, token and
+request budget plus continuation degradation, policy resolution, sampling,
+audit, and decision projection.
+
+The gRPC adapter owns caller authentication and protocol translation. Policy
+resolution remains a separate private module. Native planning and plan
+execution remain distinct Chisei concepts.
+
+## External action
+
+The **External action lifecycle** authorizes and transitions one host-executed
+action through a single private ordered path. Its private interface owns
+claim and idempotency, policy load, blast-radius and budget reservation,
+persist ordering, permit issuance, and approve/deny/cancel compare-and-swap
+transitions.
+
+The gRPC adapter owns caller authentication and protocol translation. Redeem,
+delegation, and kill-switch remain adapter operations over the permit store.
+Native plan execution and Action execution remain distinct concepts.
 
 ## Scored Knowledge admission
 
