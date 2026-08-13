@@ -9,6 +9,9 @@ The policy is supplied as canonical JSON in
 `SetNamespacePolicyRequest.context_admission_policy_json`. An empty value keeps
 the currently stored policy, and the JSON value `null` clears it. A malformed
 or unsupported policy is rejected; it never falls back to a weaker policy.
+The durable `policy:<namespace>` object is authoritative on reload: a JSON
+`null` clear is not restored by a leftover `namespace_policy` object that still
+holds the previous JSON.
 
 Gateway fat-decide fails closed when the namespace has no context-admission
 policy, when the stored policy is corrupt or unavailable, and when no matching

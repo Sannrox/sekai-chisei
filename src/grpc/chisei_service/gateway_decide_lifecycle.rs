@@ -429,10 +429,15 @@ impl ChiseiServiceImpl {
             input.delegated_principal,
             input.namespace,
         )?;
-        let context_admission_policy = self
-            .policy
-            .context_admission_policy(input.namespace)
-            .map_err(Status::failed_precondition)?;
+        let context_admission_policy = match self.policy.context_admission_policy(input.namespace) {
+            Ok(Some(policy)) => Some(policy),
+            Ok(None) => {
+                return Err(Status::failed_precondition(
+                    "context admission policy is required",
+                ));
+            }
+            Err(error) => return Err(Status::failed_precondition(error)),
+        };
         let mut request = pipe::PipelineRequest {
             request_id: input.request_id.to_string(),
             namespace: input.namespace.to_string(),
