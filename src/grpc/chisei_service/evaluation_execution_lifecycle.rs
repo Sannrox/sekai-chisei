@@ -2,8 +2,9 @@
 //!
 //! The gRPC adapter authenticates callers and translates protocol messages.
 //! This module owns execution creation and replay, frozen-budget recovery,
-//! evaluator availability, per-manifest serialization, cancellation, worker
-//! dispatch, durable step and gate ordering, and terminal process-state cleanup.
+//! evaluator availability and capability projection, per-manifest
+//! serialization, cancellation, worker dispatch, durable step and gate
+//! ordering, and terminal process-state cleanup.
 
 use super::*;
 use std::sync::{
@@ -41,6 +42,13 @@ impl EvaluationExecutionLifecycle {
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             safe_providers,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn evaluator_registry(
+        &self,
+    ) -> Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry> {
+        self.evaluator_registry.clone()
     }
 
     pub(super) async fn execute(
@@ -138,6 +146,46 @@ impl EvaluationExecutionLifecycle {
                 "external evaluator adapter is not executable"
             );
         }
+    }
+
+    pub(super) fn evaluator_capability(
+        &self,
+        definition: &evaluation_plan_domain::EvaluatorDefinition,
+    ) -> (bool, String) {
+        self.ensure_external_evaluator_registered(definition);
+        let executable = match definition.execution_class.as_str() {
+            evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS => self
+                .evaluator_registry
+                .contains(&definition.implementation_digest),
+            evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS => {
+                evaluation_execution_domain::external_adapter_secret_configured()
+                    && self.evaluator_registry.contains_external_adapter(
+                        &definition.namespace,
+                        &definition.content_digest,
+                        &definition.implementation_digest,
+                    )
+            }
+            evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS => self
+                .stochastic_evaluator_registry
+                .contains(&definition.implementation_digest),
+            _ => false,
+        };
+        (
+            executable,
+            if executable {
+                "executable"
+            } else if matches!(
+                definition.execution_class.as_str(),
+                evaluation_plan_domain::DETERMINISTIC_EXECUTION_CLASS
+                    | evaluation_plan_domain::EXTERNAL_ADAPTER_EXECUTION_CLASS
+                    | evaluation_plan_domain::STOCHASTIC_EXECUTION_CLASS
+            ) {
+                "unavailable"
+            } else {
+                "unsupported"
+            }
+            .into(),
+        )
     }
 
     fn ensure_execution(

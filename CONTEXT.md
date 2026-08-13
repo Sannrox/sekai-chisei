@@ -194,9 +194,10 @@ manifest resolution, and its provenance grants no execution authority.
 
 The **Evaluation execution lifecycle** executes and cancels one resolved
 Evaluation manifest through one private ordered path. It owns durable creation
-and replay, frozen execution budgets, evaluator availability, per-manifest
-serialization, cancellation state and persistence, worker dispatch, Evidence
-loading, step and gate receipt ordering, recovery, and terminal cleanup.
+and replay, frozen execution budgets, evaluator availability and capability
+projection, per-manifest serialization, cancellation state and persistence,
+worker dispatch, Evidence loading, step and gate receipt ordering, recovery,
+and terminal cleanup.
 
 The gRPC adapter owns caller authentication, namespace authorization, manifest
 lookup, and protocol translation. Deterministic and stochastic evaluators keep
