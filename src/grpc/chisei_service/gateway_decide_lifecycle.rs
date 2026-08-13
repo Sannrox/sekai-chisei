@@ -5,6 +5,7 @@
 //! scope checks, context-admission gates, token/request budget and continuation
 //! degradation, policy resolution, sampling, audit, and decision projection.
 
+use super::policy_resolution::ResolvePolicyRequest;
 use super::*;
 use crate::chisei::gateway_decide::{
     GATEWAY_DECIDE_CONTRACT_VERSION, GatewayDecideDenyReason, GatewayDecideInputs,

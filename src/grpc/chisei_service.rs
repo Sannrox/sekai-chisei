@@ -80,7 +80,10 @@ use native_execution_lifecycle::{
     ExecuteLookupFirst, evaluate_execute_lookup_first, native_execution_cost,
 };
 #[cfg(test)]
-use policy_resolution::{local_free_runtime_for_model, portfolio_runtime_for_model};
+use policy_resolution::{
+    ResolvePolicyRequest, cheap_route_bias, local_free_runtime_for_model,
+    portfolio_runtime_for_model,
+};
 
 use budget_identity::{budget_metric, budget_subject};
 
@@ -2381,83 +2384,6 @@ impl ChiseiServiceImpl {
         );
         prune_excess_plans(&mut plans, Some(&inserted_plan_id));
     }
-}
-
-/// Internal policy-resolution request used by the canonical fat-decide path.
-/// It deliberately is not a public protobuf message or RPC.
-#[derive(Clone, Debug, Default)]
-struct ResolvePolicyRequest {
-    namespace: String,
-    preferred_runtime: String,
-    preferred_model: String,
-    subject: String,
-    project: String,
-    agent: String,
-    key_id: String,
-    task_class: String,
-    #[allow(dead_code)]
-    user_id: String,
-    expected_calls: i64,
-    budget_route_bias: String,
-    route_override: String,
-    capability_requirements_json: Vec<u8>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-struct ResolvePolicyResponse {
-    resolution: Option<PolicyResolution>,
-}
-
-fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
-    let mut scopes = Vec::new();
-    push_scope(&mut scopes, req.subject.trim());
-    if !req.agent.trim().is_empty() {
-        push_scope(&mut scopes, &format!("agent:{}", req.agent.trim()));
-    }
-    if !req.key_id.trim().is_empty() {
-        push_scope(&mut scopes, &format!("gateway_key:{}", req.key_id.trim()));
-    }
-    push_scope(&mut scopes, req.namespace.trim());
-    push_scope(&mut scopes, req.project.trim());
-    if !req.project.trim().is_empty() {
-        push_scope(&mut scopes, &format!("project:{}", req.project.trim()));
-    }
-    scopes
-}
-
-/// Map a request's task class to a cost-tier route bias. Only explicit bulk
-/// task classes route to the cheaper tier, and only while no eval regression is
-/// active for the scope — a regression fails safe back to the capable tier.
-/// Unknown or primary classes never bias to cheap.
-fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option<&'static str> {
-    if eval_regressed {
-        return None;
-    }
-    if crate::chisei::model_routing::is_cheap_eligible_task_class(task_class) {
-        Some("cheap")
-    } else {
-        None
-    }
-}
-
-/// Whether a runtime supports automatic cheap-tier routing. Limited to the
-/// hosted providers whose model tiers are reliably ordered by
-/// `named_model_cost_rank` (the metric the demotion gate compares). Ollama and
-/// native models are excluded: their cost depends on installed parameter size,
-/// not the model name, so the name-based gate cannot tell tiers apart and would
-/// silently discard the cheaper choice. Cost tiering for those runtimes is a
-/// follow-up. This also guards against non-provider runtimes (e.g. the "kiro"
-/// default) producing a bogus alias or a runtime/model mismatch.
-fn is_known_provider_runtime(runtime: &str) -> bool {
-    matches!(runtime.trim(), "openai" | "anthropic")
-}
-
-fn push_scope(scopes: &mut Vec<String>, scope: &str) {
-    if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
-        return;
-    }
-    scopes.push(scope.to_string());
 }
 
 fn prune_cached_plans(plans: &mut HashMap<String, CachedExecutionPlan>) {
