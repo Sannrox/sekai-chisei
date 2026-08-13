@@ -5,6 +5,7 @@
 //! capability gates, cost-tier and portfolio routing, exclusive local-free and
 //! portfolio runtime helpers, runtime canonicalization, and fallback projection.
 
+use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
 impl ChiseiServiceImpl {
