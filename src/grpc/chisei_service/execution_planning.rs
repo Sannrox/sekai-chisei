@@ -840,6 +840,7 @@ impl ChiseiServiceImpl {
             uncovered_surfaces,
             reporter_grants: Vec::new(),
             ontology_digest: None,
+            artifact: None,
         };
         let holdouts = plan
             .memory_holdouts

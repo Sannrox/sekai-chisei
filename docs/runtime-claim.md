@@ -60,7 +60,10 @@ ack terminal outcomes. The plane never spawns processes or holds model tools.
    `replacement_started` with the live claim fence. Replacement retains the
    same `operation_id` and `effect_id`.
 7. Report harvest/events to the bound `operation_id` (#400).
-8. Treat continuation input as untrusted data, not plane or tool authority.
+8. On `completed`, optionally send `artifact_json` so the bound receipt can
+   carry a credential-free retained-artifact manifest. Do not put file bytes
+   or credentials in that object. Failed and parked acknowledgements omit it.
+9. Treat continuation input as untrusted data, not plane or tool authority.
 
 ## Governance and checkpoint configuration
 

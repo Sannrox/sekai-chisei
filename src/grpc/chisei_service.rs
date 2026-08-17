@@ -1792,6 +1792,7 @@ fn initial_evaluation_receipt(
         uncovered_surfaces: Vec::new(),
         reporter_grants: Vec::new(),
         ontology_digest: None,
+        artifact: None,
     })
 }
 
@@ -9963,6 +9964,7 @@ mod tests {
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
             ontology_digest: None,
+            artifact: None,
         };
         assert!(receipt.completeness().complete);
         let usage = RecordUsageRequest {

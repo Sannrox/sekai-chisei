@@ -466,6 +466,7 @@ pub fn operation_receipt(
         .collect(),
         reporter_grants: Vec::new(),
         ontology_digest: None,
+        artifact: None,
     };
     let completeness = receipt.completeness();
     if !completeness.errors.is_empty() {

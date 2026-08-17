@@ -823,6 +823,7 @@ fn complete_receipt_at(
         uncovered_surfaces: Vec::new(),
         reporter_grants: Vec::new(),
         ontology_digest: None,
+        artifact: None,
     }
 }
 

@@ -21,10 +21,20 @@ Admission: [governed-action-instances.md](governed-action-instances.md).
 3. `AckActionWork` with `completed` / `failed` appends `ActionPerformed` + `OutcomeRecorded`
    on the operation receipt when missing (ack-without-prior-harvest still lands a
    reconstructible outcome; hosts should still emit finer harvest events).
-4. Consistency helper `evaluate_action_lifecycle` flags:
+4. A completed acknowledgement may include `artifact_json`: a credential-free
+   retained-artifact object (`artifact_id`, `digest`, `tree_digest`, optional
+   `files` with path/kind/digest). The plane persists it on the receipt as
+   `artifact` and records `ArtifactProduced` when missing. It does not invent
+   files, accept file bytes, or attach an artifact to failed or parked acks.
+   A matching artifact is idempotent; a different artifact is rejected.
+   A new artifact may be bound only when the request presents the live claim
+   fence, including a fenced retry after harvest failed and the case where
+   harvest already recorded `OutcomeRecorded`. Unfenced completed-ack replay
+   cannot bind a missing artifact.
+5. Consistency helper `evaluate_action_lifecycle` flags:
    - terminal effect without receipt outcome (ack without harvest spine)
    - receipt outcome while effect still claimed/pending (harvest without ack)
-5. Notifications and external_mutate do not use this claim/harvest binding.
+6. Notifications and external_mutate do not use this claim/harvest binding.
 
 ## Conflict preference
 

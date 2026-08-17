@@ -828,6 +828,11 @@ message AckActionWorkRequest {
   string checkpoint_ref = 9;
   // sha256:<64 lowercase hex>
   string checkpoint_digest = 10;
+  // Optional credential-free retained-artifact manifest JSON. Empty means
+  // omitted. Completed acknowledgements may persist it on the operation
+  // receipt as `artifact`. Failed and parked acknowledgements must omit it.
+  // The plane rejects file bytes and other payload keys; hosts retain content.
+  string artifact_json = 11;
 }
 message AckActionWorkResponse {
   ActionEffect effect = 1;

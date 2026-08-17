@@ -7794,6 +7794,7 @@ fn build_gateway_operation_receipt(
         uncovered_surfaces: Vec::<UncoveredSurface>::new(),
         reporter_grants: Vec::new(),
         ontology_digest: None,
+        artifact: None,
     }
 }
 

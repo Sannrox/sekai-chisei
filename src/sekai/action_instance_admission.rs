@@ -390,6 +390,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
             ontology_digest,
+            artifact: None,
         };
         self.db
             .put_operation_receipt(&receipt)

@@ -46,8 +46,9 @@ receipt / harvest spine.
    Routing is recorded as `route_selected` with `route=not_applicable` so
    completeness does not leave `routing` uncovered. A pending
    `runtime_dispatch` leaves `completed_at_ms` unset and omits outcome so
-   `AckActionWork` can finish the harvest spine. Notify-only admits stay
-   complete at admit time.
+   `AckActionWork` can finish the harvest spine. A completed acknowledgement
+   may persist a credential-free `artifact` on that receipt; the plane does
+   not invent one. Notify-only admits stay complete at admit time.
 
 After a durable admit, allowed `runtime_dispatch` and `notify` effects are
 materialized as typed child records (#398). Parameter validation completes
