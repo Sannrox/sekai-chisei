@@ -41,10 +41,13 @@ receipt / harvest spine.
 8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
    when a `BudgetTracker` is configured. Exhausted → `status=denied`.
 9. Persist instance; write operation receipt events (intent, policy, a
-   not-applicable routing decision, budget, outcome); audit decision. On
-   admit, record one budget unit. Routing is recorded as `route_selected`
-   with `route=not_applicable` so completeness does not leave `routing`
-   uncovered.
+   not-applicable routing decision, budget, and—when no claimable work
+   remains—outcome); audit decision. On admit, record one budget unit.
+   Routing is recorded as `route_selected` with `route=not_applicable` so
+   completeness does not leave `routing` uncovered. A pending
+   `runtime_dispatch` leaves `completed_at_ms` unset and omits outcome so
+   `AckActionWork` can finish the harvest spine. Notify-only admits stay
+   complete at admit time.
 
 After a durable admit, allowed `runtime_dispatch` and `notify` effects are
 materialized as typed child records (#398). Parameter validation completes

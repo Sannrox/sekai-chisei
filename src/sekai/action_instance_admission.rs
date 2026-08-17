@@ -317,6 +317,60 @@ impl<'a> ActionInstanceAdmission<'a> {
         if !stored.deny_reason.is_empty() {
             outcome_attributes.insert("deny_reason".into(), stored.deny_reason.clone());
         }
+        // Denied admits never plan effects. Gate on admitted status so a
+        // terminal denial cannot stay incomplete if a planner later passes
+        // leftover pending dispatch.
+        let await_runtime_dispatch =
+            stored.status == STATUS_ADMITTED && has_pending_runtime_dispatch(planned_effects);
+        let mut events = vec![
+            event(
+                "intent",
+                None,
+                ReceiptEventKind::IntentRecorded,
+                intent_attributes,
+            ),
+            event(
+                "policy",
+                Some(format!("{operation_id}:intent")),
+                ReceiptEventKind::PolicyDecided,
+                BTreeMap::from([
+                    ("decision".into(), stored.policy_decision.clone()),
+                    ("action".into(), SUBMIT_POLICY_ACTION.into()),
+                ]),
+            ),
+            event(
+                "routing",
+                Some(format!("{operation_id}:policy")),
+                ReceiptEventKind::RouteSelected,
+                BTreeMap::from([
+                    ("route".into(), "not_applicable".into()),
+                    (
+                        "reason".into(),
+                        "routing not applicable to action instance admission".into(),
+                    ),
+                ]),
+            ),
+            event(
+                "budget",
+                Some(format!("{operation_id}:routing")),
+                ReceiptEventKind::BudgetDecided,
+                BTreeMap::from([
+                    ("decision".into(), stored.budget_decision.clone()),
+                    ("subject".into(), budget_subject.into()),
+                ]),
+            ),
+        ];
+        let completed_at_ms = if await_runtime_dispatch {
+            None
+        } else {
+            events.push(event(
+                "outcome",
+                Some(format!("{operation_id}:budget")),
+                ReceiptEventKind::OutcomeRecorded,
+                outcome_attributes,
+            ));
+            Some(now)
+        };
         let receipt = OperationReceipt {
             version: OPERATION_RECEIPT_VERSION.into(),
             operation_id: operation_id.clone(),
@@ -331,51 +385,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                 policy_scope.into()
             },
             started_at_ms: now,
-            completed_at_ms: Some(now),
-            events: vec![
-                event(
-                    "intent",
-                    None,
-                    ReceiptEventKind::IntentRecorded,
-                    intent_attributes,
-                ),
-                event(
-                    "policy",
-                    Some(format!("{operation_id}:intent")),
-                    ReceiptEventKind::PolicyDecided,
-                    BTreeMap::from([
-                        ("decision".into(), stored.policy_decision.clone()),
-                        ("action".into(), SUBMIT_POLICY_ACTION.into()),
-                    ]),
-                ),
-                event(
-                    "routing",
-                    Some(format!("{operation_id}:policy")),
-                    ReceiptEventKind::RouteSelected,
-                    BTreeMap::from([
-                        ("route".into(), "not_applicable".into()),
-                        (
-                            "reason".into(),
-                            "routing not applicable to action instance admission".into(),
-                        ),
-                    ]),
-                ),
-                event(
-                    "budget",
-                    Some(format!("{operation_id}:routing")),
-                    ReceiptEventKind::BudgetDecided,
-                    BTreeMap::from([
-                        ("decision".into(), stored.budget_decision.clone()),
-                        ("subject".into(), budget_subject.into()),
-                    ]),
-                ),
-                event(
-                    "outcome",
-                    Some(format!("{operation_id}:budget")),
-                    ReceiptEventKind::OutcomeRecorded,
-                    outcome_attributes,
-                ),
-            ],
+            completed_at_ms,
+            events,
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
             ontology_digest,
@@ -456,6 +467,13 @@ fn resolve_operation_id(request_id: &str) -> Result<String, ActionInstanceAdmiss
     Ok(request_id.to_string())
 }
 
+fn has_pending_runtime_dispatch(effects: Option<&[action_effect::ActionEffect]>) -> bool {
+    effects.unwrap_or(&[]).iter().any(|effect| {
+        effect.kind == crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH
+            && effect.status == action_effect::EFFECT_STATUS_PENDING
+    })
+}
+
 fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmissionError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -480,7 +498,9 @@ fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
+    use crate::sekai::governed_action_type::{
+        EFFECT_KIND_NOTIFY, EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType,
+    };
 
     fn setup() -> RuntimeDb {
         let db = RuntimeDb::memory();
@@ -542,16 +562,22 @@ mod tests {
         assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
         let completeness = receipt.completeness();
         assert!(
-            completeness.complete,
-            "action-instance receipt must be complete: {completeness:?}"
+            !completeness.complete,
+            "pending runtime_dispatch must leave the receipt open: {completeness:?}"
         );
-        assert!(completeness.missing_surfaces.is_empty());
+        assert_eq!(receipt.completed_at_ms, None);
         assert!(receipt.uncovered_surfaces.is_empty());
         assert!(
             receipt
                 .events
                 .iter()
                 .any(|event| event.kind == ReceiptEventKind::RouteSelected)
+        );
+        assert!(
+            !receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
         );
 
         let mut replay = request(r#"{"runtime":"shikigami"}"#);
@@ -572,6 +598,94 @@ mod tests {
             error,
             ActionInstanceAdmissionError::AlreadyExists(_)
         ));
+    }
+
+    #[test]
+    fn notify_only_admission_completes_the_receipt() {
+        let db = setup();
+        db.put_governed_action_type(
+            GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "notify".into(),
+                version: "1".into(),
+                description: "notify only".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"definition_digest":{"type":"string"}},"required":["definition_digest"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let admitted = admission
+            .admit(
+                ActionInstanceAdmissionRequest {
+                    namespace: "acme".into(),
+                    type_id: "notify".into(),
+                    version: "1".into(),
+                    parameters_json: r#"{"definition_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.into(),
+                    idempotency_key: "notify-1".into(),
+                    evidence_submission_ids: Vec::new(),
+                    request_id: "operation-notify".into(),
+                    ontology_digest: ONTOLOGY_DIGEST.into(),
+                },
+                "alice",
+                10,
+            )
+            .unwrap();
+        let receipt = db
+            .get_operation_receipt(&admitted.instance.operation_id)
+            .unwrap()
+            .expect("receipt");
+        let completeness = receipt.completeness();
+        assert!(
+            completeness.complete,
+            "notify-only admission must complete: {completeness:?}"
+        );
+        assert_eq!(receipt.completed_at_ms, Some(10));
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        );
+    }
+
+    #[test]
+    fn denied_dispatch_admission_completes_the_receipt() {
+        let db = setup();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut denied = request(r#"{"runtime":"shikigami"}"#);
+        denied.request_id = "operation-denied".into();
+        denied.ontology_digest = ONTOLOGY_DIGEST.into();
+        let outcome = admission.admit(denied, "alice", 10).unwrap();
+        assert_eq!(outcome.instance.status, STATUS_DENIED);
+        let receipt = db
+            .get_operation_receipt(&outcome.instance.operation_id)
+            .unwrap()
+            .expect("receipt");
+        let completeness = receipt.completeness();
+        assert!(
+            completeness.complete,
+            "denied dispatch admission must complete: {completeness:?}"
+        );
+        assert_eq!(receipt.completed_at_ms, Some(10));
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        );
     }
 
     #[test]
