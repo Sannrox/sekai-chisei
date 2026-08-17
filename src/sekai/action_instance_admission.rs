@@ -317,7 +317,11 @@ impl<'a> ActionInstanceAdmission<'a> {
         if !stored.deny_reason.is_empty() {
             outcome_attributes.insert("deny_reason".into(), stored.deny_reason.clone());
         }
-        let await_runtime_dispatch = has_pending_runtime_dispatch(planned_effects);
+        // Denied admits never plan effects. Gate on admitted status so a
+        // terminal denial cannot stay incomplete if a planner later passes
+        // leftover pending dispatch.
+        let await_runtime_dispatch = stored.status == STATUS_ADMITTED
+            && has_pending_runtime_dispatch(planned_effects);
         let mut events = vec![
             event(
                 "intent",
@@ -644,6 +648,36 @@ mod tests {
         assert!(
             completeness.complete,
             "notify-only admission must complete: {completeness:?}"
+        );
+        assert_eq!(receipt.completed_at_ms, Some(10));
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        );
+    }
+
+    #[test]
+    fn denied_dispatch_admission_completes_the_receipt() {
+        let db = setup();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut denied = request(r#"{"runtime":"shikigami"}"#);
+        denied.request_id = "operation-denied".into();
+        denied.ontology_digest = ONTOLOGY_DIGEST.into();
+        let outcome = admission.admit(denied, "alice", 10).unwrap();
+        assert_eq!(outcome.instance.status, STATUS_DENIED);
+        let receipt = db
+            .get_operation_receipt(&outcome.instance.operation_id)
+            .unwrap()
+            .expect("receipt");
+        let completeness = receipt.completeness();
+        assert!(
+            completeness.complete,
+            "denied dispatch admission must complete: {completeness:?}"
         );
         assert_eq!(receipt.completed_at_ms, Some(10));
         assert!(
