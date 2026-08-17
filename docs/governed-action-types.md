@@ -41,7 +41,7 @@ file; do not invent types from submit traffic.
 ```text
 sekaictl admin governance action type put --file <type.json|->
 sekaictl admin governance action type get --namespace <ns> --type-id <id> --version <ver>
-sekaictl admin governance action type list [--namespace <ns>] [--enabled-only]
+sekaictl admin governance action type list --namespace <ns> [--type-id <id>] [--enabled-only]
 ```
 
 `parameter_schema_json` in the file may be a JSON object or a JSON-object

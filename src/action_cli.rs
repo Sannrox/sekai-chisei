@@ -28,7 +28,7 @@ pub fn usage() -> String {
         "sekaictl admin governance action policy list",
         "sekaictl admin governance action type put --file <type.json|-> [--request-id <id>]",
         "sekaictl admin governance action type get --namespace <ns> --type-id <id> --version <ver>",
-        "sekaictl admin governance action type list [--namespace <ns>] [--type-id <id>] [--enabled-only]",
+        "sekaictl admin governance action type list --namespace <ns> [--type-id <id>] [--enabled-only]",
     ]
     .join("\n")
 }
@@ -104,10 +104,16 @@ fn schema_json(value: &Value) -> Result<String, BoxErr> {
             if trimmed.is_empty() {
                 return Err(std::io::Error::other("parameter_schema_json is required").into());
             }
-            serde_json::from_str::<Value>(trimmed).map_err(|error| {
+            let parsed = serde_json::from_str::<Value>(trimmed).map_err(|error| {
                 std::io::Error::other(format!("parameter_schema_json: {error}"))
             })?;
-            Ok(trimmed.to_string())
+            if !parsed.is_object() {
+                return Err(std::io::Error::other(
+                    "parameter_schema_json must be a JSON object or a JSON object string",
+                )
+                .into());
+            }
+            Ok(serde_json::to_string(&parsed)?)
         }
         Value::Object(_) => Ok(serde_json::to_string(value)?),
         _ => Err(std::io::Error::other(
@@ -368,9 +374,11 @@ async fn run_type(args: Vec<String>) -> Result<(), BoxErr> {
         }
         "list" => {
             let rest = &args[1..];
+            let namespace = flag_value(rest, "--namespace")
+                .ok_or_else(|| std::io::Error::other("--namespace required"))?;
             let types = sekai
                 .list_governed_action_types(ListGovernedActionTypesRequest {
-                    namespace: flag_value(rest, "--namespace").unwrap_or_default(),
+                    namespace,
                     type_id: flag_value(rest, "--type-id").unwrap_or_default(),
                     enabled_only: has_flag(rest, "--enabled-only"),
                 })
@@ -473,8 +481,28 @@ mod tests {
         assert!(!type_def.enabled);
         assert_eq!(request_id, "seed-1");
         assert_eq!(
-            type_def.parameter_schema_json,
-            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#
+            serde_json::from_str::<Value>(&type_def.parameter_schema_json).unwrap(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            })
         );
+    }
+
+    #[test]
+    fn type_file_rejects_non_object_string_schema() {
+        let parsed: TypeFile = serde_json::from_str(
+            r#"{
+              "namespace": "workshop",
+              "type_id": "customer-product-definition.propose",
+              "version": "v1",
+              "parameter_schema_json": "[]"
+            }"#,
+        )
+        .unwrap();
+        let error = type_from_file(parsed).expect_err("non-object schema must fail");
+        assert!(error.to_string().contains("JSON object"));
     }
 }
