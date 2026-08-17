@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add `sekaictl admin governance action type put|get|list` so composition hosts
+  can publish governed action types over the control-plane socket.
+
 ## 1.0.0
 
 ### Stable contract

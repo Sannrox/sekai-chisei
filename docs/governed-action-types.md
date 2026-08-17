@@ -31,6 +31,22 @@ row for history.
 | `policy_scope` / `budget_scope` | Empty = use namespace defaults |
 | `enabled` | Fail-closed gate for submit ([#397](governed-action-instances.md) uses `require_enabled`) |
 
+## Operator CLI
+
+`sekaictl admin governance action type` publishes and inspects registry rows
+over the control-plane socket. UDS callers act as `local` and therefore have
+action-admin. Composition hosts should put an exact type body from a pinned
+file; do not invent types from submit traffic.
+
+```text
+sekaictl admin governance action type put --file <type.json|->
+sekaictl admin governance action type get --namespace <ns> --type-id <id> --version <ver>
+sekaictl admin governance action type list [--namespace <ns>] [--enabled-only]
+```
+
+`parameter_schema_json` in the file may be a JSON object or a JSON-object
+string. An exact idempotent re-put returns the stored row.
+
 ## Authz
 
 Mutations require namespace write + action-admin. Reads require authentication,
