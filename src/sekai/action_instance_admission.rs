@@ -9,7 +9,6 @@
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-    ReceiptSurface, UncoveredSurface,
 };
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
@@ -350,8 +349,20 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ]),
                 ),
                 event(
-                    "budget",
+                    "routing",
                     Some(format!("{operation_id}:policy")),
+                    ReceiptEventKind::RouteSelected,
+                    BTreeMap::from([
+                        ("route".into(), "not_applicable".into()),
+                        (
+                            "reason".into(),
+                            "routing not applicable to action instance admission".into(),
+                        ),
+                    ]),
+                ),
+                event(
+                    "budget",
+                    Some(format!("{operation_id}:routing")),
                     ReceiptEventKind::BudgetDecided,
                     BTreeMap::from([
                         ("decision".into(), stored.budget_decision.clone()),
@@ -365,10 +376,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     outcome_attributes,
                 ),
             ],
-            uncovered_surfaces: vec![UncoveredSurface {
-                surface: ReceiptSurface::Routing,
-                reason: "routing not applicable to action instance admission".into(),
-            }],
+            uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
             ontology_digest,
         };
@@ -532,6 +540,19 @@ mod tests {
             .unwrap()
             .expect("receipt");
         assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+        let completeness = receipt.completeness();
+        assert!(
+            completeness.complete,
+            "action-instance receipt must be complete: {completeness:?}"
+        );
+        assert!(completeness.missing_surfaces.is_empty());
+        assert!(receipt.uncovered_surfaces.is_empty());
+        assert!(
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::RouteSelected)
+        );
 
         let mut replay = request(r#"{"runtime":"shikigami"}"#);
         replay.request_id = "operation-other".into();
