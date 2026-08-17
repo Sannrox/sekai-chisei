@@ -511,6 +511,7 @@ mod tests {
             uncovered_surfaces: vec![],
             reporter_grants: vec![],
             ontology_digest: None,
+            artifact: None,
         };
         ctl.db
             .project_usage_from_receipt("tenant-a", &receipt)

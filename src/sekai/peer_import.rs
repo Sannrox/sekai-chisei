@@ -297,6 +297,7 @@ mod tests {
             uncovered_surfaces: Vec::new(),
             reporter_grants: vec![],
             ontology_digest: None,
+            artifact: None,
         }
     }
 

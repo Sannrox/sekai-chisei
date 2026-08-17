@@ -189,6 +189,7 @@ mod tests {
             uncovered_surfaces: vec![],
             reporter_grants: vec![],
             ontology_digest: None,
+            artifact: None,
         };
         let rendered = render_receipt(&receipt);
         assert!(rendered.find("intent [").unwrap() < rendered.find("outcome [").unwrap());

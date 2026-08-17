@@ -46,6 +46,7 @@ fn exercise(db: &dyn GatewayAuditHarness, prefix: &str) {
         uncovered_surfaces: vec![],
         reporter_grants: vec![],
         ontology_digest: None,
+        artifact: None,
     })
     .unwrap();
 

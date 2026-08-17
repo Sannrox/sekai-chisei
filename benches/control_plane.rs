@@ -433,6 +433,7 @@ fn receipt_benchmark(dataset_size: usize) -> Benchmark {
         uncovered_surfaces: vec![],
         reporter_grants: vec![],
         ontology_digest: None,
+        artifact: None,
     };
     Box::new(move || {
         let completeness = receipt.completeness();

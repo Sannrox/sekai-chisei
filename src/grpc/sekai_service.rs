@@ -4413,6 +4413,7 @@ impl SekaiService for SekaiServiceImpl {
                     checkpoint_store_id: &inner.checkpoint_store_id,
                     checkpoint_ref: &inner.checkpoint_ref,
                     checkpoint_digest: &inner.checkpoint_digest,
+                    artifact_json: &inner.artifact_json,
                 },
                 &actor,
                 now,

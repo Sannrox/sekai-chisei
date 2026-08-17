@@ -194,6 +194,28 @@ pub struct OperationReceipt {
     pub reporter_grants: Vec<OperationReporterGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ReceiptArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptArtifact {
+    pub artifact_id: String,
+    pub digest: String,
+    pub tree_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ReceiptArtifactFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptArtifactFile {
+    pub path: String,
+    pub kind: String,
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub immutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +434,7 @@ mod tests {
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
             ontology_digest: None,
+            artifact: None,
         }
     }
 
@@ -485,5 +508,13 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("requires surface"))
         );
+    }
+
+    #[test]
+    fn missing_artifact_field_deserializes_as_none() {
+        let mut value = serde_json::to_value(complete_receipt()).unwrap();
+        value.as_object_mut().unwrap().remove("artifact");
+        let receipt: OperationReceipt = serde_json::from_value(value).unwrap();
+        assert!(receipt.artifact.is_none());
     }
 }

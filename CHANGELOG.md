@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Persist an optional credential-free artifact manifest from `AckActionWork`
+  onto the bound operation receipt.
 - Record a not-applicable routing event on governed action-instance receipts so
   exported completeness no longer lists `routing` as missing or uncovered.
 
