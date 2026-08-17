@@ -192,6 +192,8 @@ pub struct OperationReceipt {
     pub uncovered_surfaces: Vec<UncoveredSurface>,
     #[serde(default)]
     pub reporter_grants: Vec<OperationReporterGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +411,7 @@ mod tests {
             ],
             uncovered_surfaces: Vec::new(),
             reporter_grants: Vec::new(),
+            ontology_digest: None,
         }
     }
 

@@ -1225,6 +1225,7 @@ mod tests {
                 reason: "host execution evidence is not independent outcome verification".into(),
             }],
             reporter_grants: vec![],
+            ontology_digest: None,
         };
         let mut bundle = AttestationBundle::unsigned(receipt).unwrap();
         attach_to_shomei_bundle(&mut bundle, &permit, &report, "submission-1").unwrap();

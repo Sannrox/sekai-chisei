@@ -344,6 +344,7 @@ mod tests {
             events,
             uncovered_surfaces: vec![],
             reporter_grants: vec![],
+            ontology_digest: None,
         }
     }
 

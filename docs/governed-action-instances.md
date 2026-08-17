@@ -47,6 +47,20 @@ After a durable admit, allowed `runtime_dispatch` and `notify` effects are
 materialized as typed child records (#398). Parameter validation completes
 before either the instance or its effects are admitted.
 
+## Caller-bound operation identity
+
+`SubmitActionInstanceRequest.request_id` is the caller-chosen operation spine
+when it is non-empty. Admission copies that value onto `ActionInstance.operation_id`
+and the canonical `operation.receipt/v1` record. Empty `request_id` still mints
+`op-gai-<uuid>`. A second distinct idempotency key may not reuse an occupied
+`request_id`. Idempotent replay keeps the original bound `operation_id` even if
+a later attempt sends a different `request_id`.
+
+`ontology_digest` is an optional first-class binding, not parameter data. When
+present it must be `sha256:` plus 64 lowercase hex characters and is copied
+onto the operation receipt. The plane does not invent a digest or copy one
+from `parameters_json`.
+
 ## Producer contract
 
 - **Parameters are data.** `parameters_json` is untrusted producer/user content.

@@ -4131,6 +4131,8 @@ impl SekaiService for SekaiServiceImpl {
                 parameters_json: inner.parameters_json,
                 idempotency_key: inner.idempotency_key,
                 evidence_submission_ids: inner.evidence_submission_ids,
+                request_id: inner.request_id,
+                ontology_digest: inner.ontology_digest,
             },
             &actor,
             now_millis(),
@@ -8643,6 +8645,7 @@ mod tests {
                 idempotency_key: "idem-1".into(),
                 evidence_submission_ids: vec!["ev-1".into()],
                 request_id: "req-1".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -8650,8 +8653,8 @@ mod tests {
         assert!(!admit.replay);
         let inst = admit.instance.unwrap();
         assert_eq!(inst.status, STATUS_ADMITTED);
+        assert_eq!(inst.operation_id, "req-1");
         assert!(!inst.instance_id.is_empty());
-        assert!(!inst.operation_id.is_empty());
         assert!(!inst.request_digest.is_empty());
         assert_eq!(inst.evidence_submission_ids, vec!["ev-1".to_string()]);
 
@@ -8663,6 +8666,7 @@ mod tests {
             .expect("operation receipt");
         assert_eq!(receipt.operation_class, "governed_action_instance");
         assert_eq!(receipt.namespace, "acme");
+        assert_eq!(receipt.ontology_digest, None);
 
         // Idempotent replay
         let replay = svc
@@ -8674,6 +8678,7 @@ mod tests {
                 idempotency_key: "idem-1".into(),
                 evidence_submission_ids: vec!["ev-1".into()],
                 request_id: "req-2".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -8691,6 +8696,7 @@ mod tests {
                 idempotency_key: "idem-1".into(),
                 evidence_submission_ids: vec![],
                 request_id: "req-3".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap_err();
@@ -8733,6 +8739,7 @@ mod tests {
                 idempotency_key: "idem-budget".into(),
                 evidence_submission_ids: vec![],
                 request_id: "req-budget".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -8766,6 +8773,7 @@ mod tests {
                 idempotency_key: "idem-policy".into(),
                 evidence_submission_ids: vec![],
                 request_id: "req-policy".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -8858,6 +8866,7 @@ mod tests {
                     idempotency_key: key.into(),
                     evidence_submission_ids: vec![],
                     request_id: format!("request-{key}"),
+                    ontology_digest: String::new(),
                 }))
                 .await
                 .unwrap_err();
@@ -8882,6 +8891,7 @@ mod tests {
                 idempotency_key: "duplicate-key".into(),
                 evidence_submission_ids: vec![],
                 request_id: "request-duplicate-key".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap_err();
@@ -8904,6 +8914,7 @@ mod tests {
                 idempotency_key: "valid".into(),
                 evidence_submission_ids: vec![],
                 request_id: "request-valid".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap()
@@ -8956,6 +8967,7 @@ mod tests {
                 idempotency_key: "nul-admission".into(),
                 evidence_submission_ids: vec![],
                 request_id: "req-nul".into(),
+                ontology_digest: String::new(),
             }))
             .await
             .unwrap_err();

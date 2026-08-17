@@ -42,6 +42,7 @@ fn intent_receipt(
         }],
         uncovered_surfaces: vec![],
         reporter_grants: vec![],
+        ontology_digest: None,
     }
 }
 
