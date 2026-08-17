@@ -196,26 +196,21 @@ impl<'a> ActionWorkLifecycle<'a> {
         }
         // Fail closed before releasing the claim when a different artifact is
         // already bound. The locked harvest re-checks before writing.
-        if let Some(incoming) = artifact.as_ref() {
-            if let Some(effect) = self
+        if let Some(incoming) = artifact.as_ref()
+            && let Some(effect) = self
                 .db
                 .get_action_effect(command.effect_id)
                 .map_err(ActionWorkLifecycleError::Internal)?
-            {
-                if let Some(receipt) = self
-                    .db
-                    .get_operation_receipt(&effect.operation_id)
-                    .map_err(ActionWorkLifecycleError::Internal)?
-                {
-                    if let Some(existing) = receipt.artifact.as_ref() {
-                        if existing != incoming {
-                            return Err(ActionWorkLifecycleError::InvalidArgument(
-                                "invalid artifact: receipt already has a different artifact".into(),
-                            ));
-                        }
-                    }
-                }
-            }
+            && let Some(receipt) = self
+                .db
+                .get_operation_receipt(&effect.operation_id)
+                .map_err(ActionWorkLifecycleError::Internal)?
+            && let Some(existing) = receipt.artifact.as_ref()
+            && existing != incoming
+        {
+            return Err(ActionWorkLifecycleError::InvalidArgument(
+                "invalid artifact: receipt already has a different artifact".into(),
+            ));
         }
 
         let stored = self
