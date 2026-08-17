@@ -1,14 +1,21 @@
-//! `sekaictl admin governance action` CLI: manage governed-action policy.
+//! `sekaictl admin governance action` CLI: manage governed-action policy
+//! and the governed-action type registry.
 //!
 //! Connects to the sekai control plane (via `CHISEI_GRPC_URL` or `SEKAI_SOCKET`,
-//! defaulting to the local UDS) and drives the action-policy RPCs.
+//! defaulting to the local UDS) and drives the action-policy and type RPCs.
 
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
-    ActionPolicy, GetActionPolicyRequest, ListActionPoliciesRequest, SetActionPolicyRequest,
+    ActionPolicy, GetActionPolicyRequest, GetGovernedActionTypeRequest, GovernedActionType,
+    ListActionPoliciesRequest, ListGovernedActionTypesRequest, PutGovernedActionTypeRequest,
+    SetActionPolicyRequest,
 };
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -19,6 +26,9 @@ pub fn usage() -> String {
         "                           [--max-mutations <n>] [--max-deletes <n>]",
         "sekaictl admin governance action policy get --scope <scope>",
         "sekaictl admin governance action policy list",
+        "sekaictl admin governance action type put --file <type.json|-> [--request-id <id>]",
+        "sekaictl admin governance action type get --namespace <ns> --type-id <id> --version <ver>",
+        "sekaictl admin governance action type list [--namespace <ns>] [--type-id <id>] [--enabled-only]",
     ]
     .join("\n")
 }
@@ -48,6 +58,10 @@ fn multi_flag(args: &[String], flag: &str) -> Vec<String> {
     out
 }
 
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
 fn parse_pairs(raw: &[String]) -> Result<HashMap<String, String>, BoxErr> {
     let mut map = HashMap::new();
     for token in raw {
@@ -59,6 +73,118 @@ fn parse_pairs(raw: &[String]) -> Result<HashMap<String, String>, BoxErr> {
     Ok(map)
 }
 
+#[derive(Debug, Deserialize)]
+struct TypeFile {
+    namespace: String,
+    type_id: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    parameter_schema_json: Value,
+    #[serde(default)]
+    allowed_effect_kinds: Vec<String>,
+    #[serde(default)]
+    policy_scope: String,
+    #[serde(default)]
+    budget_scope: String,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    request_id: String,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn schema_json(value: &Value) -> Result<String, BoxErr> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(std::io::Error::other("parameter_schema_json is required").into());
+            }
+            serde_json::from_str::<Value>(trimmed).map_err(|error| {
+                std::io::Error::other(format!("parameter_schema_json: {error}"))
+            })?;
+            Ok(trimmed.to_string())
+        }
+        Value::Object(_) => Ok(serde_json::to_string(value)?),
+        _ => Err(std::io::Error::other(
+            "parameter_schema_json must be a JSON object or a JSON object string",
+        )
+        .into()),
+    }
+}
+
+fn load_type_file(path: &str) -> Result<TypeFile, BoxErr> {
+    let raw = if path == "-" {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        buffer
+    } else {
+        std::fs::read_to_string(Path::new(path))?
+    };
+    let parsed: TypeFile = serde_json::from_str(raw.trim()).map_err(|error| {
+        std::io::Error::other(format!("governed action type file {path}: {error}"))
+    })?;
+    if parsed.namespace.trim().is_empty()
+        || parsed.type_id.trim().is_empty()
+        || parsed.version.trim().is_empty()
+    {
+        return Err(std::io::Error::other("namespace, type_id, and version are required").into());
+    }
+    Ok(parsed)
+}
+
+fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxErr> {
+    let request_id = if parsed.request_id.trim().is_empty() {
+        format!(
+            "put-{}-{}-{}",
+            parsed.namespace.trim(),
+            parsed.type_id.trim(),
+            parsed.version.trim()
+        )
+    } else {
+        parsed.request_id.trim().to_string()
+    };
+    Ok((
+        GovernedActionType {
+            namespace: parsed.namespace.trim().to_string(),
+            type_id: parsed.type_id.trim().to_string(),
+            version: parsed.version.trim().to_string(),
+            description: parsed.description,
+            parameter_schema_json: schema_json(&parsed.parameter_schema_json)?,
+            allowed_effect_kinds: parsed.allowed_effect_kinds,
+            policy_scope: parsed.policy_scope,
+            budget_scope: parsed.budget_scope,
+            enabled: parsed.enabled,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+        },
+        request_id,
+    ))
+}
+
+fn print_type(type_def: &GovernedActionType) {
+    let mut effects = type_def.allowed_effect_kinds.clone();
+    effects.sort();
+    println!(
+        "{}/{}@{} enabled={} effects={}",
+        type_def.namespace,
+        type_def.type_id,
+        type_def.version,
+        type_def.enabled,
+        if effects.is_empty() {
+            "-".to_string()
+        } else {
+            effects.join(",")
+        }
+    );
+}
+
 pub async fn run_action_command(args: Vec<String>) -> Result<(), BoxErr> {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", usage());
@@ -66,6 +192,7 @@ pub async fn run_action_command(args: Vec<String>) -> Result<(), BoxErr> {
     }
     match args[0].as_str() {
         "policy" => run_policy(args.into_iter().skip(1).collect()).await,
+        "type" => run_type(args.into_iter().skip(1).collect()).await,
         other => {
             eprintln!("unknown action command {other:?}");
             println!("{}", usage());
@@ -190,6 +317,82 @@ async fn run_policy(args: Vec<String>) -> Result<(), BoxErr> {
     Ok(())
 }
 
+async fn run_type(args: Vec<String>) -> Result<(), BoxErr> {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", usage());
+        return Ok(());
+    }
+    let channel = connect_sekai(&target()).await?;
+    let mut sekai = SekaiServiceClient::new(channel);
+
+    match args[0].as_str() {
+        "put" => {
+            let rest = &args[1..];
+            let path = flag_value(rest, "--file")
+                .ok_or_else(|| std::io::Error::other("--file required"))?;
+            let parsed = load_type_file(&path)?;
+            let (type_def, default_request_id) = type_from_file(parsed)?;
+            let request_id = flag_value(rest, "--request-id").unwrap_or(default_request_id);
+            let stored = sekai
+                .put_governed_action_type(PutGovernedActionTypeRequest {
+                    r#type: Some(type_def),
+                    request_id,
+                })
+                .await?
+                .into_inner()
+                .r#type
+                .ok_or_else(|| std::io::Error::other("PutGovernedActionType returned no type"))?;
+            print_type(&stored);
+        }
+        "get" => {
+            let rest = &args[1..];
+            let namespace = flag_value(rest, "--namespace")
+                .ok_or_else(|| std::io::Error::other("--namespace required"))?;
+            let type_id = flag_value(rest, "--type-id")
+                .ok_or_else(|| std::io::Error::other("--type-id required"))?;
+            let version = flag_value(rest, "--version")
+                .ok_or_else(|| std::io::Error::other("--version required"))?;
+            match sekai
+                .get_governed_action_type(GetGovernedActionTypeRequest {
+                    namespace,
+                    type_id,
+                    version,
+                })
+                .await?
+                .into_inner()
+                .r#type
+            {
+                Some(type_def) => print_type(&type_def),
+                None => println!("governed action type not found"),
+            }
+        }
+        "list" => {
+            let rest = &args[1..];
+            let types = sekai
+                .list_governed_action_types(ListGovernedActionTypesRequest {
+                    namespace: flag_value(rest, "--namespace").unwrap_or_default(),
+                    type_id: flag_value(rest, "--type-id").unwrap_or_default(),
+                    enabled_only: has_flag(rest, "--enabled-only"),
+                })
+                .await?
+                .into_inner()
+                .types;
+            if types.is_empty() {
+                println!("no governed action types");
+            }
+            for type_def in types {
+                print_type(&type_def);
+            }
+        }
+        other => {
+            eprintln!("unknown action type command {other:?}");
+            println!("{}", usage());
+            return Err(std::io::Error::other("unknown action type command").into());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +422,59 @@ mod tests {
         let args = vec!["--scope".to_string(), "agent:x".to_string()];
         assert_eq!(flag_value(&args, "--scope"), Some("agent:x".to_string()));
         assert_eq!(flag_value(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn type_file_accepts_object_schema() {
+        let parsed: TypeFile = serde_json::from_str(
+            r#"{
+              "namespace": "workshop",
+              "type_id": "customer-product-definition.propose",
+              "version": "v1",
+              "parameter_schema_json": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["definition_digest"],
+                "properties": {"definition_digest": {"type": "string"}}
+              },
+              "allowed_effect_kinds": ["notify"]
+            }"#,
+        )
+        .unwrap();
+        let (type_def, request_id) = type_from_file(parsed).unwrap();
+        assert_eq!(type_def.namespace, "workshop");
+        assert_eq!(type_def.type_id, "customer-product-definition.propose");
+        assert_eq!(type_def.version, "v1");
+        assert!(type_def.enabled);
+        assert_eq!(type_def.allowed_effect_kinds, vec!["notify"]);
+        assert!(type_def.parameter_schema_json.contains("definition_digest"));
+        assert!(!type_def.parameter_schema_json.contains('\n'));
+        assert_eq!(
+            request_id,
+            "put-workshop-customer-product-definition.propose-v1"
+        );
+    }
+
+    #[test]
+    fn type_file_accepts_string_schema() {
+        let parsed: TypeFile = serde_json::from_str(
+            r#"{
+              "namespace": "workshop",
+              "type_id": "customer-product-definition.propose",
+              "version": "v1",
+              "parameter_schema_json": "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+              "allowed_effect_kinds": ["notify"],
+              "enabled": false,
+              "request_id": "seed-1"
+            }"#,
+        )
+        .unwrap();
+        let (type_def, request_id) = type_from_file(parsed).unwrap();
+        assert!(!type_def.enabled);
+        assert_eq!(request_id, "seed-1");
+        assert_eq!(
+            type_def.parameter_schema_json,
+            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#
+        );
     }
 }
