@@ -320,8 +320,8 @@ impl<'a> ActionInstanceAdmission<'a> {
         // Denied admits never plan effects. Gate on admitted status so a
         // terminal denial cannot stay incomplete if a planner later passes
         // leftover pending dispatch.
-        let await_runtime_dispatch = stored.status == STATUS_ADMITTED
-            && has_pending_runtime_dispatch(planned_effects);
+        let await_runtime_dispatch =
+            stored.status == STATUS_ADMITTED && has_pending_runtime_dispatch(planned_effects);
         let mut events = vec![
             event(
                 "intent",
