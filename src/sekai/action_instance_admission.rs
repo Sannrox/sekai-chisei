@@ -28,6 +28,8 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub parameters_json: String,
     pub idempotency_key: String,
     pub evidence_submission_ids: Vec<String>,
+    pub request_id: String,
+    pub ontology_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,8 @@ impl<'a> ActionInstanceAdmission<'a> {
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
 
+        let ontology_digest = parse_ontology_digest(&request.ontology_digest)?;
+
         if let Some(existing) = self
             .db
             .get_action_instance_by_idempotency(&namespace, &request.idempotency_key)
@@ -150,7 +154,17 @@ impl<'a> ActionInstanceAdmission<'a> {
         };
 
         let instance_id = format!("gai-{}", uuid::Uuid::new_v4().simple());
-        let operation_id = format!("op-gai-{}", uuid::Uuid::new_v4().simple());
+        let operation_id = resolve_operation_id(&request.request_id)?;
+        if let Some(existing) = self
+            .db
+            .get_action_instance_by_operation_id(&operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            return Err(ActionInstanceAdmissionError::AlreadyExists(format!(
+                "operation_id {} is already bound to action instance {}",
+                existing.operation_id, existing.instance_id
+            )));
+        }
         let mut status = STATUS_ADMITTED.to_string();
         let mut deny_reason = String::new();
         let mut policy_decision_text = policy_decision.as_str().to_string();
@@ -245,6 +259,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &budget_subject,
                 &evidence_ids,
                 planned_effects.as_deref(),
+                ontology_digest,
                 now,
             )?;
         }
@@ -263,6 +278,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         budget_subject: &str,
         evidence_ids: &[String],
         planned_effects: Option<&[action_effect::ActionEffect]>,
+        ontology_digest: Option<String>,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
         let operation_id = &stored.operation_id;
@@ -354,6 +370,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 reason: "routing not applicable to action instance admission".into(),
             }],
             reporter_grants: Vec::new(),
+            ontology_digest,
         };
         self.db
             .put_operation_receipt(&receipt)
@@ -418,6 +435,40 @@ fn require_value(name: &str, value: &str) -> Result<(), ActionInstanceAdmissionE
     }
 }
 
+fn resolve_operation_id(request_id: &str) -> Result<String, ActionInstanceAdmissionError> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Ok(format!("op-gai-{}", uuid::Uuid::new_v4().simple()));
+    }
+    if request_id.chars().any(char::is_whitespace) {
+        return Err(ActionInstanceAdmissionError::InvalidArgument(
+            "request_id must not contain whitespace".into(),
+        ));
+    }
+    Ok(request_id.to_string())
+}
+
+fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmissionError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let Some(hex) = raw.strip_prefix("sha256:") else {
+        return Err(ActionInstanceAdmissionError::InvalidArgument(
+            "ontology_digest must be sha256:<64 lowercase hex chars>".into(),
+        ));
+    };
+    if hex.len() != 64
+        || hex.chars().any(|character| !character.is_ascii_hexdigit())
+        || hex != hex.to_ascii_lowercase()
+    {
+        return Err(ActionInstanceAdmissionError::InvalidArgument(
+            "ontology_digest must be sha256:<64 lowercase hex chars>".into(),
+        ));
+    }
+    Ok(Some(raw.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +499,9 @@ mod tests {
         db
     }
 
+    const ONTOLOGY_DIGEST: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn request(parameters_json: &str) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
             namespace: "acme".into(),
@@ -456,7 +510,65 @@ mod tests {
             parameters_json: parameters_json.into(),
             idempotency_key: "idem-1".into(),
             evidence_submission_ids: vec!["evidence-2".into(), "evidence-1".into()],
+            request_id: String::new(),
+            ontology_digest: String::new(),
         }
+    }
+
+    #[test]
+    fn caller_request_id_and_ontology_digest_bind_the_receipt() {
+        let db = setup();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut first = request(r#"{"runtime":"shikigami"}"#);
+        first.request_id = "operation-delivery-exception".into();
+        first.ontology_digest = ONTOLOGY_DIGEST.into();
+        let admitted = admission.admit(first, "alice", 10).unwrap();
+        assert_eq!(
+            admitted.instance.operation_id,
+            "operation-delivery-exception"
+        );
+        let receipt = db
+            .get_operation_receipt("operation-delivery-exception")
+            .unwrap()
+            .expect("receipt");
+        assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+
+        let mut replay = request(r#"{"runtime":"shikigami"}"#);
+        replay.request_id = "operation-other".into();
+        replay.ontology_digest = ONTOLOGY_DIGEST.into();
+        let replayed = admission.admit(replay, "alice", 20).unwrap();
+        assert!(replayed.replay);
+        assert_eq!(
+            replayed.instance.operation_id,
+            "operation-delivery-exception"
+        );
+
+        let mut conflict = request(r#"{"runtime":"shikigami"}"#);
+        conflict.idempotency_key = "idem-2".into();
+        conflict.request_id = "operation-delivery-exception".into();
+        let error = admission.admit(conflict, "alice", 30).unwrap_err();
+        assert!(matches!(
+            error,
+            ActionInstanceAdmissionError::AlreadyExists(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_ontology_digest_is_rejected_before_admit() {
+        let db = setup();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut invalid = request(r#"{"runtime":"shikigami"}"#);
+        invalid.ontology_digest = "sha256:ontology".into();
+        let error = admission.admit(invalid, "alice", 10).unwrap_err();
+        assert!(matches!(
+            error,
+            ActionInstanceAdmissionError::InvalidArgument(_)
+        ));
+        assert!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -334,6 +334,7 @@ fn record(
         events,
         uncovered_surfaces,
         reporter_grants: Vec::new(),
+        ontology_digest: None,
     };
     if insert_only {
         db.insert_operation_receipt(&receipt).map_err(|error| {

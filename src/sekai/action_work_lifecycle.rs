@@ -490,6 +490,7 @@ mod tests {
                 reason: "not applicable".into(),
             }],
             reporter_grants: Vec::new(),
+            ontology_digest: None,
         })
         .unwrap();
         let claimed = ActionWorkLifecycle::new(&db)

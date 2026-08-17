@@ -720,7 +720,10 @@ message SubmitActionInstanceRequest {
   string parameters_json = 4;
   string idempotency_key = 5;
   repeated string evidence_submission_ids = 6;
+  // When set, becomes the bound operation_id and receipt spine. Empty mints op-gai-*.
   string request_id = 7;
+  // Optional ontology binding copied onto operation.receipt/v1. Not parameter data.
+  string ontology_digest = 8;
 }
 message SubmitActionInstanceResponse {
   ActionInstance instance = 1;

@@ -106,6 +106,7 @@ fn execution(
             events: vec![intent],
             uncovered_surfaces: vec![],
             reporter_grants: vec![],
+            ontology_digest: None,
         },
     )
 }

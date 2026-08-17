@@ -192,6 +192,31 @@ impl SekaiDb {
         .transpose()
     }
 
+    pub fn get_action_instance_by_operation_id(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<ActionInstance>, String> {
+        self.migrate_action_instances()?;
+        if operation_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT body_json FROM sekai_action_instances WHERE operation_id = ?1",
+            params![operation_id],
+            |row| {
+                let body: String = row.get(0)?;
+                Ok(body)
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .map(|body| {
+            serde_json::from_str(&body).map_err(|e| format!("corrupt action instance body: {e}"))
+        })
+        .transpose()
+    }
+
     pub fn get_action_instance(&self, instance_id: &str) -> Result<Option<ActionInstance>, String> {
         self.migrate_action_instances()?;
         let conn = self.conn();

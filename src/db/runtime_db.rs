@@ -1996,6 +1996,16 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_action_instance_by_operation_id(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_action_instance_by_operation_id(operation_id),
+            Self::Postgres(db) => db.get_action_instance_by_operation_id(operation_id),
+        }
+    }
+
     pub fn get_action_instance_by_idempotency(
         &self,
         namespace: &str,
