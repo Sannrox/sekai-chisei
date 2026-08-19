@@ -45,5 +45,5 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-sekai-chisei = { version = "1.0.0", path = "../..", features = ["gateway-test-support"] }
+sekai-chisei = { version = "1.0.1", path = "../..", features = ["gateway-test-support"] }
 tempfile = "3"

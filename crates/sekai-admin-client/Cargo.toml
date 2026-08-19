@@ -18,6 +18,6 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 
 [dev-dependencies]
-sekai-chisei = { version = "1.0.0", path = "../..", features = ["gateway-test-support"] }
+sekai-chisei = { version = "1.0.1", path = "../..", features = ["gateway-test-support"] }
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
