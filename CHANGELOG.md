@@ -17,6 +17,8 @@
   exported completeness no longer lists `routing` as missing or uncovered.
 - Require namespace and object schemas when authoring action types, and add
   `sekaictl` put/get/list for governed action types.
+- Update `h2` to `0.4.16` to close `RUSTSEC-2026-0258` (unbounded empty DATA
+  frames).
 
 ## 1.0.0
 
