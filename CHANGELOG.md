@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1
+
 - Hosted and community Chisei use one operator-supplied process key per
   provider (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`) for every
   caller. An enterprise tenant row still wins when present;
@@ -9,8 +11,14 @@
   closed.
 - Persist an optional credential-free artifact manifest from `AckActionWork`
   onto the bound operation receipt.
+- Keep `runtime_dispatch` receipts open until `AckActionWork` and skip
+  replay writes on already-complete receipts.
 - Record a not-applicable routing event on governed action-instance receipts so
   exported completeness no longer lists `routing` as missing or uncovered.
+- Require namespace and object schemas when authoring action types, and add
+  `sekaictl` put/get/list for governed action types.
+- Update `h2` to `0.4.16` to close `RUSTSEC-2026-0258` (unbounded empty DATA
+  frames).
 
 ## 1.0.0
 
