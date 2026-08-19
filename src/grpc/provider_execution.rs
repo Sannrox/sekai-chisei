@@ -12,6 +12,9 @@ use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
 use crate::llm;
 use crate::obs::correlation::Stage;
+use crate::provider_credentials::{
+    ProcessEnvProviderCredentialResolver, TenantProviderCredentialResolver,
+};
 use tracing::{Instrument, info_span};
 
 #[derive(Clone, Debug, Default)]
@@ -206,20 +209,39 @@ fn execution_provider_credential(
     if profile.endpoint.api_key_env.is_none() {
         return Ok(None);
     }
-    let extension = authentication
-        .db
-        .enterprise_extension()
-        .ok_or_else(|| Status::unavailable("provider credential unavailable"))?;
-    let credential = extension
-        .resolve_provider_credential(context, &resolved.provider)
-        .map_err(|_| Status::unavailable("provider credential unavailable"))?;
+    let credential = match authentication.db.enterprise_extension() {
+        Some(extension) => match extension.resolve_provider_credential(context, &resolved.provider)
+        {
+            Ok(credential) => credential,
+            Err(crate::enterprise::ExtensionError::CredentialNotFound) => {
+                ProcessEnvProviderCredentialResolver
+                    .resolve(context, &resolved.provider)
+                    .map_err(|_| Status::unavailable("provider credential unavailable"))?
+            }
+            Err(_) => return Err(Status::unavailable("provider credential unavailable")),
+        },
+        None => ProcessEnvProviderCredentialResolver
+            .resolve(context, &resolved.provider)
+            .map_err(|_| Status::unavailable("provider credential unavailable"))?,
+    };
     if credential.provider != resolved.provider
-        || credential.tenant_id.as_deref() != expected_tenant_id
+        || !instance_or_matching_tenant(credential.tenant_id.as_deref(), expected_tenant_id)
         || credential.secret.expose().trim().is_empty()
     {
         return Err(Status::unavailable("provider credential unavailable"));
     }
     Ok(Some(credential))
+}
+
+fn instance_or_matching_tenant(
+    credential_tenant: Option<&str>,
+    expected_tenant: Option<&str>,
+) -> bool {
+    match (credential_tenant, expected_tenant) {
+        (None, _) => true,
+        (Some(actual), Some(expected)) => actual == expected,
+        (Some(_), None) => false,
+    }
 }
 
 fn provider_error_status(error: String) -> Status {
@@ -615,6 +637,67 @@ mod tests {
 
         assert!(credential.tenant_id.is_none());
         assert_eq!(credential.secret.expose(), "synthetic-unscoped-secret");
+    }
+
+    fn with_env(name: &str, value: &str, body: impl FnOnce()) {
+        let previous = std::env::var(name).ok();
+        unsafe { std::env::set_var(name, value) };
+        body();
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var(name, previous),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn community_runtime_uses_instance_key_for_tenant_callers() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
+        ));
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        with_env("OPENAI_API_KEY", "sk-community-instance", || {
+            let credential = execution_provider_credential(
+                Some(ExecutionAuthentication {
+                    db: &db,
+                    context: Some(&tenant_context("tenant-a")),
+                }),
+                &registry,
+                "openai/gpt-5.5",
+            )
+            .unwrap()
+            .unwrap();
+            assert!(credential.tenant_id.is_none());
+            assert_eq!(credential.secret.expose(), "sk-community-instance");
+            assert_eq!(credential.credential_id, "env:OPENAI_API_KEY");
+        });
+    }
+
+    #[test]
+    fn enterprise_missing_row_falls_back_to_instance_key() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TenantCredentialExtension)),
+            )
+            .unwrap(),
+        ));
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        with_env("OPENAI_API_KEY", "sk-enterprise-fallback", || {
+            let credential = execution_provider_credential(
+                Some(ExecutionAuthentication {
+                    db: &db,
+                    context: Some(&tenant_context("tenant-c")),
+                }),
+                &registry,
+                "openai/gpt-5.5",
+            )
+            .unwrap()
+            .unwrap();
+            assert!(credential.tenant_id.is_none());
+            assert_eq!(credential.secret.expose(), "sk-enterprise-fallback");
+        });
     }
 
     #[test]

@@ -1,9 +1,12 @@
 # Tenant-scoped provider credential resolver (#118)
 
-Backend-neutral contract for resolving **model-provider** API credentials under
-an authenticated tenant. Enrollment, encryption-at-rest, rotation workflows, and
-tenant administration remain enterprise-owned. The community runtime does not
-store tenant provider secrets.
+Backend-neutral contract for resolving **model-provider** API credentials.
+Enrollment, encryption-at-rest, rotation, and tenant administration remain
+enterprise-owned. The community runtime does not store tenant provider secrets.
+
+Hosted Aldunis supplies **one process key per Chisei instance**
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `XAI_API_KEY`). Customers do not
+paste keys. A tenant-specific enterprise row still wins when one exists.
 
 ## Contract
 
@@ -12,7 +15,7 @@ store tenant provider secrets.
 | Version | `sekai.provider-credential-resolver/v1` |
 | Types | `src/provider_credentials.rs` |
 | Enterprise hook | `EnterpriseExtension::resolve_provider_credential` |
-| Community fallback | `ProcessEnvProviderCredentialResolver` (process env only, unscoped) |
+| Instance key | `ProcessEnvProviderCredentialResolver` (process env; tenant ignored) |
 | Deterministic fake | `MemoryTenantProviderCredentialResolver` |
 
 Resolution input is always an [`AuthenticatedContext`](enterprise-identity-extension.md)
@@ -21,14 +24,14 @@ caller-selected tenant ids.
 
 ## Behavior
 
-- **Two tenants, same provider name** → isolated secrets (see memory-resolver tests).
+- **Two tenants, same provider name** → isolated secrets when enterprise rows
+  exist (see memory-resolver tests).
 - **Rotation** → generation increments; active resolve returns the new secret.
-- **Revocation / missing** → fail closed with a non-disclosing error string
-  (`provider credential unavailable`); no existence leak across tenants.
-- **Tenant-scoped request on community binary without enterprise resolver** →
-  `Unavailable` (does not invent per-tenant secrets from env).
-- **Unscoped community callers** → `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` /
-  `XAI_API_KEY` via process environment.
+- **Revocation / missing tenant row** → fall back to the instance process key.
+  Auth failures (`Unauthenticated`, forged-tenant mismatch) do not fall back.
+- **Instance env key** → `tenant_id` is `None`; `credential_id` is
+  `env:OPENAI_API_KEY` (or the matching env name). Any authenticated caller may
+  use it.
 - **Secrets** → `SecretValue` / `ResolvedProviderCredential` Debug is redacted;
   never place secrets in receipts, audit, logs, metrics, or exports.
 
@@ -42,21 +45,18 @@ env resolution is process-local by definition.
 ## Gateway / Chisei consumption
 
 `PlanExecution` and `ExecutePlanStream` carry the trusted
-authenticated context through the native Chisei path. For tenant-scoped
-execution, Chisei resolves the provider credential from the enterprise
-extension after policy selects the provider and immediately before constructing
-the LLM adapter. Credential resolution happens before budget reservation and
-failure is non-disclosing.
+authenticated context through the native Chisei path. After policy selects the
+provider, Chisei asks the enterprise extension (when present) and then the
+instance env key. An enterprise secret wins. `CredentialNotFound` or a
+community binary without an extension uses the process key. A tenant-scoped
+enterprise secret must match the authenticated tenant; an instance key
+(`tenant_id: None`) is accepted for any caller.
 
-An unscoped enterprise context also resolves through its extension and requires
-an unscoped returned credential; it does not inherit community process keys.
-
-Unscoped community launches continue to use process-wide configuration or
-environment keys. A tenant-scoped request without an enterprise extension
-fails closed rather than falling back to a process key.
+Resolution happens before budget reservation. Failure remains non-disclosing.
 
 ## Non-goals
 
 - Tenant admin RPCs for credential enrollment (enterprise authority).
 - Provider billing / invoice state.
 - Storing secrets in community SQLite.
+- Customer-facing BYOK. The instance key is operator-owned.

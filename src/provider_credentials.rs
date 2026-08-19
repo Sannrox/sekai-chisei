@@ -91,23 +91,18 @@ pub trait TenantProviderCredentialResolver: Send + Sync {
     ) -> Result<ResolvedProviderCredential, ExtensionError>;
 }
 
-/// Fail-closed community resolver: process-wide environment credentials only
-/// when the caller has **no** tenant binding. Tenant-scoped requests without an
-/// enterprise resolver fail closed.
+/// Instance-wide environment credentials: one process key per provider.
+///
+/// Tenant context is ignored. Hosted Chisei uses the operator-supplied
+/// `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `XAI_API_KEY` for every caller.
 pub struct ProcessEnvProviderCredentialResolver;
 
 impl TenantProviderCredentialResolver for ProcessEnvProviderCredentialResolver {
     fn resolve(
         &self,
-        context: &AuthenticatedContext,
+        _context: &AuthenticatedContext,
         provider: &str,
     ) -> Result<ResolvedProviderCredential, ExtensionError> {
-        if context.tenant.is_some() {
-            // Community binary never invents tenant-scoped provider secrets.
-            return Err(ExtensionError::Unavailable(
-                "tenant-scoped provider credentials require an enterprise resolver".into(),
-            ));
-        }
         let env_name = env_name_for_provider(provider).ok_or(ExtensionError::CredentialNotFound)?;
         let value = std::env::var(env_name).map_err(|_| ExtensionError::CredentialNotFound)?;
         if value.trim().is_empty() {
@@ -208,8 +203,10 @@ impl TenantProviderCredentialResolver for MemoryTenantProviderCredentialResolver
     }
 }
 
-/// Resolve using an optional enterprise/memory resolver, falling back to env
-/// only for unscoped (community) callers.
+/// Resolve through an optional enterprise resolver, then the instance env key.
+///
+/// A tenant-specific secret wins when the enterprise resolver returns one.
+/// `CredentialNotFound` and a missing resolver fall back to the process key.
 pub fn resolve_provider_credential(
     resolver: Option<&dyn TenantProviderCredentialResolver>,
     context: &AuthenticatedContext,
@@ -219,7 +216,10 @@ pub fn resolve_provider_credential(
         return Err(ExtensionError::CredentialNotFound);
     }
     if let Some(resolver) = resolver {
-        return resolver.resolve(context, provider);
+        match resolver.resolve(context, provider) {
+            Err(ExtensionError::CredentialNotFound) => {}
+            result => return result,
+        }
     }
     ProcessEnvProviderCredentialResolver.resolve(context, provider)
 }
@@ -310,13 +310,29 @@ mod tests {
         assert!(!msg.contains("sk-"));
     }
 
+    fn with_env(name: &str, value: &str, body: impl FnOnce()) {
+        let previous = std::env::var(name).ok();
+        unsafe { std::env::set_var(name, value) };
+        body();
+        unsafe {
+            match previous {
+                Some(previous) => std::env::set_var(name, previous),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
     #[test]
-    fn community_env_resolver_rejects_tenant_scoped_requests() {
+    fn community_env_resolver_uses_instance_key_for_tenant_callers() {
         let resolver = ProcessEnvProviderCredentialResolver;
-        let err = resolver
-            .resolve(&tenant_context("tenant-a", "alice"), "openai")
-            .unwrap_err();
-        assert!(matches!(err, ExtensionError::Unavailable(_)));
+        with_env("OPENAI_API_KEY", "sk-instance-test", || {
+            let resolved = resolver
+                .resolve(&tenant_context("tenant-a", "alice"), "openai")
+                .unwrap();
+            assert_eq!(resolved.secret.expose(), "sk-instance-test");
+            assert!(resolved.tenant_id.is_none());
+            assert_eq!(resolved.credential_id, "env:OPENAI_API_KEY");
+        });
     }
 
     #[test]
@@ -330,6 +346,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.secret.expose(), "ant-secret");
+    }
+
+    #[test]
+    fn resolve_helper_falls_back_to_instance_key_when_enterprise_has_no_row() {
+        let store = MemoryTenantProviderCredentialResolver::new();
+        with_env("OPENAI_API_KEY", "sk-instance-fallback", || {
+            let resolved = resolve_provider_credential(
+                Some(&store),
+                &tenant_context("tenant-a", "alice"),
+                "openai",
+            )
+            .unwrap();
+            assert_eq!(resolved.secret.expose(), "sk-instance-fallback");
+            assert!(resolved.tenant_id.is_none());
+        });
     }
 
     #[test]
