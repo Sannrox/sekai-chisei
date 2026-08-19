@@ -348,6 +348,12 @@ impl RuntimeDb {
     }
 
     /// List operation receipts for a namespace overlapping `[start, end)`.
+    ///
+    /// Open receipts (`completed_at_ms` unset) overlap only while
+    /// `started_at_ms` is within
+    /// [`OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS`](crate::db::chisei_receipt::OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS)
+    /// of `start`. That keeps in-flight harvest visible without letting
+    /// abandoned opens accumulate across every later window.
     pub fn list_operation_receipts_in_window(
         &self,
         namespace: &str,
@@ -3602,15 +3608,7 @@ impl RuntimeDb {
     {
         match self {
             Self::Sqlite(db) => db.update_operation_receipt(operation_id, update),
-            Self::Postgres(_) => {
-                // Read-modify-write using dual-backend get/put.
-                let mut receipt = self
-                    .get_operation_receipt(operation_id)?
-                    .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
-                update(&mut receipt)?;
-                self.put_operation_receipt(&receipt)?;
-                Ok(receipt)
-            }
+            Self::Postgres(db) => db.update_operation_receipt(operation_id, update),
         }
     }
 
