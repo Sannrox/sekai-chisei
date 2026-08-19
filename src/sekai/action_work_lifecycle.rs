@@ -300,6 +300,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                     | ActionWorkLifecycleError::Internal(message) => message,
                     other => format!("{other:?}"),
                 })
+                .map(|_| ())
             }) {
             Ok(_) => Ok(()),
             Err(error) if error.contains("operation receipt") && error.contains("not found") => {
@@ -383,7 +384,8 @@ fn apply_ack_harvest(
     artifact: Option<&ReceiptArtifact>,
     allow_artifact_bind: bool,
     now_ms: i64,
-) -> Result<(), ActionWorkLifecycleError> {
+) -> Result<bool, ActionWorkLifecycleError> {
+    let mut changed = false;
     if let Some(incoming) = artifact {
         match &receipt.artifact {
             Some(existing) if existing != incoming => {
@@ -392,7 +394,10 @@ fn apply_ack_harvest(
                 ));
             }
             Some(_) => {}
-            None if allow_artifact_bind => receipt.artifact = Some(incoming.clone()),
+            None if allow_artifact_bind => {
+                receipt.artifact = Some(incoming.clone());
+                changed = true;
+            }
             None => {
                 return Err(ActionWorkLifecycleError::InvalidArgument(
                     "invalid artifact: completed work cannot bind an artifact after the claim is released".into(),
@@ -462,6 +467,7 @@ fn apply_ack_harvest(
             ]),
         });
         receipt.completed_at_ms = Some(now_ms);
+        changed = true;
     } else if receipt.artifact.is_some() && !has_artifact_event {
         let parent = receipt
             .events
@@ -482,8 +488,9 @@ fn apply_ack_harvest(
                 ("source".into(), "ack_action_work".into()),
             ]),
         });
+        changed = true;
     }
-    Ok(())
+    Ok(changed)
 }
 
 const ACK_ARTIFACT_JSON_MAX_BYTES: usize = 64 * 1024;
@@ -1320,5 +1327,190 @@ mod tests {
             classify_claim_error("action effect not found".into()),
             ActionWorkLifecycleError::NotFound(_)
         ));
+    }
+
+    fn receipt_updated_at(db: &RuntimeDb, operation_id: &str) -> i64 {
+        db.with_sqlite_conn(|conn| {
+            conn.query_row(
+                "SELECT updated_at FROM chisei_operation_receipts WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .unwrap()
+    }
+
+    fn set_receipt_updated_at(db: &RuntimeDb, operation_id: &str, updated_at: i64) {
+        db.with_sqlite_conn(|conn| {
+            conn.execute(
+                "UPDATE chisei_operation_receipts SET updated_at=?1 WHERE operation_id=?2",
+                rusqlite::params![updated_at, operation_id],
+            )
+            .unwrap()
+        })
+        .unwrap();
+    }
+
+    fn ack_completed<'a>(
+        effect_id: &'a str,
+        claimed: &'a ActionEffect,
+        artifact_json: &'a str,
+    ) -> AckActionWork<'a> {
+        AckActionWork {
+            effect_id,
+            runtime_id: "shikigami",
+            claim_generation: claimed.claim_generation,
+            fencing_token: &claimed.claim_fencing_token,
+            outcome: ACK_OUTCOME_COMPLETED,
+            reason: "done",
+            request_id: "",
+            checkpoint_store_id: "",
+            checkpoint_ref: "",
+            checkpoint_digest: "",
+            artifact_json,
+        }
+    }
+
+    #[test]
+    fn first_artifact_bind_writes_and_same_outcome_replay_does_not() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        seed_open_receipt(&db, &effect);
+        let claimed = claim_effect(&db, &effect);
+        let artifact_json = sample_artifact_json();
+
+        ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, &artifact_json),
+                "operator",
+                200,
+            )
+            .unwrap();
+        set_receipt_updated_at(&db, &effect.operation_id, 1);
+        assert_eq!(receipt_updated_at(&db, &effect.operation_id), 1);
+        let bound = db
+            .get_operation_receipt(&effect.operation_id)
+            .unwrap()
+            .unwrap();
+        assert!(bound.artifact.is_some());
+        assert_eq!(bound.completed_at_ms, Some(200));
+
+        ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, &artifact_json),
+                "operator",
+                300,
+            )
+            .unwrap();
+        assert_eq!(receipt_updated_at(&db, &effect.operation_id), 1);
+        let replayed = db
+            .get_operation_receipt(&effect.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed, bound);
+    }
+
+    #[test]
+    fn apply_ack_harvest_is_noop_when_outcome_and_artifact_already_match() {
+        let effect = plan_effects_for_admit(
+            "ai-1",
+            "acme",
+            "op-1",
+            &[EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            r#"{"runtime":"shikigami"}"#,
+            10,
+            false,
+        )
+        .unwrap()
+        .remove(0);
+        let artifact: ReceiptArtifact = serde_json::from_str(&sample_artifact_json()).unwrap();
+        let mut receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: effect.operation_id.clone(),
+            parent_operation_id: None,
+            namespace: effect.namespace.clone(),
+            operation_class: "action_work".into(),
+            initiating_actor: "operator".into(),
+            schema_version: "action-work-lifecycle-test/v1".into(),
+            policy_version: "not_applicable".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(50),
+            events: vec![
+                OperationReceiptEvent {
+                    event_id: format!("{}:outcome", effect.operation_id),
+                    operation_id: effect.operation_id.clone(),
+                    parent_event_id: None,
+                    timestamp_ms: 50,
+                    kind: ReceiptEventKind::OutcomeRecorded,
+                    surface: ReceiptEventKind::OutcomeRecorded.surface(),
+                    actor: "operator".into(),
+                    references: Vec::new(),
+                    attributes: BTreeMap::new(),
+                },
+                OperationReceiptEvent {
+                    event_id: format!("{}:artifact", effect.operation_id),
+                    operation_id: effect.operation_id.clone(),
+                    parent_event_id: None,
+                    timestamp_ms: 50,
+                    kind: ReceiptEventKind::ArtifactProduced,
+                    surface: ReceiptEventKind::ArtifactProduced.surface(),
+                    actor: "operator".into(),
+                    references: Vec::new(),
+                    attributes: BTreeMap::new(),
+                },
+            ],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: Some(artifact.clone()),
+        };
+        let before = receipt.clone();
+        let mut completed = effect.clone();
+        completed.status = EFFECT_STATUS_COMPLETED.into();
+        assert!(
+            !apply_ack_harvest(
+                &mut receipt,
+                &completed,
+                "shikigami",
+                Some(&artifact),
+                true,
+                300,
+            )
+            .unwrap()
+        );
+        assert_eq!(receipt, before);
+    }
+
+    #[test]
+    fn recent_open_receipt_stays_listable_until_ack() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        seed_open_receipt(&db, &effect);
+        let listed = db
+            .list_operation_receipts_in_window(&effect.namespace, 0, 50, 16)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].completed_at_ms, None);
+
+        let claimed = claim_effect(&db, &effect);
+        ActionWorkLifecycle::new(&db)
+            .ack(
+                ack_completed(&effect.effect_id, &claimed, ""),
+                "operator",
+                200,
+            )
+            .unwrap();
+        let completed = db
+            .get_operation_receipt(&effect.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.completed_at_ms, Some(200));
+        assert!(
+            completed
+                .events
+                .iter()
+                .any(|event| event.kind == ReceiptEventKind::OutcomeRecorded)
+        );
     }
 }

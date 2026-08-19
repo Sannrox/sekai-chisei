@@ -46,9 +46,15 @@ receipt / harvest spine.
    Routing is recorded as `route_selected` with `route=not_applicable` so
    completeness does not leave `routing` uncovered. A pending
    `runtime_dispatch` leaves `completed_at_ms` unset and omits outcome so
-   `AckActionWork` can finish the harvest spine. A completed acknowledgement
+   `AckActionWork` can finish the harvest spine. Windowed receipt lists treat
+   an open receipt as overlapping only while `started_at_ms` is within 24h
+   (max claim TTL) of the window start, so abandoned generates cannot fill
+   every later stats, export, console, or dry-run list. GET and ack still
+   see the open receipt until acknowledgement. A completed acknowledgement
    may persist a credential-free `artifact` on that receipt; the plane does
-   not invent one. Notify-only admits stay complete at admit time.
+   not invent one. Same-outcome ack replay does not rewrite the receipt row
+   when outcome and artifact are unchanged. Notify-only admits stay complete
+   at admit time.
 
 After a durable admit, allowed `runtime_dispatch` and `notify` effects are
 materialized as typed child records (#398). Parameter validation completes

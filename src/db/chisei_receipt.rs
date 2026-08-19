@@ -3,6 +3,38 @@
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 
+/// How long an open (`completed_at_ms = None`) receipt continues to overlap
+/// windowed lists. Matches max action-work claim TTL so in-flight harvest
+/// stays visible in current windows while abandoned Workshop generate
+/// receipts cannot accumulate across every later stats/export/console list.
+///
+/// GET and `AckActionWork` still see the open receipt until a real ack.
+/// This bound is list-only; it does not invent a harvest timeout outcome.
+pub const OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+pub fn open_receipt_min_started_at_ms(window_start_ms: i64) -> i64 {
+    window_start_ms.saturating_sub(OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS)
+}
+
+/// Overlap for `[window_start_ms, window_end_ms)` used by both receipt stores.
+/// Completed receipts overlap when they close on or after the start.
+/// Open receipts overlap only while `started_at_ms` is still within the TTL
+/// lookback of the window start.
+pub fn operation_receipt_overlaps_window(
+    started_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    window_start_ms: i64,
+    window_end_ms: i64,
+) -> bool {
+    if started_at_ms >= window_end_ms {
+        return false;
+    }
+    match completed_at_ms {
+        Some(completed_at_ms) => completed_at_ms >= window_start_ms,
+        None => started_at_ms >= open_receipt_min_started_at_ms(window_start_ms),
+    }
+}
+
 pub(crate) fn validate_evaluation_receipt_event_order(
     receipt: &OperationReceipt,
     event: &OperationReceiptEvent,
@@ -266,5 +298,40 @@ mod tests {
         assert!(
             validate_evaluation_receipt_event_order(&completed_receipt, &late_cancellation).is_ok()
         );
+    }
+
+    #[test]
+    fn open_receipts_overlap_recent_windows_and_age_out_of_later_ones() {
+        let started = 1_000;
+        assert!(operation_receipt_overlaps_window(
+            started,
+            None,
+            started,
+            started + 10
+        ));
+        assert!(operation_receipt_overlaps_window(
+            started,
+            None,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 10
+        ));
+        assert!(!operation_receipt_overlaps_window(
+            started,
+            None,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 1,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 11
+        ));
+        assert!(!operation_receipt_overlaps_window(
+            started,
+            Some(started + 5),
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 1,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 11
+        ));
+        assert!(operation_receipt_overlaps_window(
+            started,
+            Some(started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 2),
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 1,
+            started + OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS + 11
+        ));
     }
 }

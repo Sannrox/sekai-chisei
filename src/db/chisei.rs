@@ -10,7 +10,9 @@ use crate::chisei::{
 use crate::db::chisei_eval_backend::{
     EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
 };
-use crate::db::chisei_receipt::validate_evaluation_receipt_event_order;
+use crate::db::chisei_receipt::{
+    open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+};
 
 fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, bool)>, String> {
     if !matches!(
@@ -526,6 +528,10 @@ impl SekaiDb {
     ) -> Result<Vec<OperationReceipt>, String> {
         // Callers may pass max+1 to detect overflow; allow that sentinel.
         let limit = limit.min(5_001) as i64;
+        // Open receipts stay harvestable until ack (#645). Windowed lists still
+        // drop abandoned opens whose start is older than the overlap TTL so
+        // narrowing a window actually shrinks the result set.
+        let open_min_started_at_ms = open_receipt_min_started_at_ms(start_timestamp_ms);
         let conn = self.conn();
         let mut statement = conn
             .prepare(
@@ -533,8 +539,14 @@ impl SekaiDb {
                  WHERE namespace=?1
                    AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?3
                    AND (
-                     json_extract(receipt_json, '$.completed_at_ms') IS NULL
-                     OR CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?2
+                     (
+                       json_extract(receipt_json, '$.completed_at_ms') IS NOT NULL
+                       AND CAST(json_extract(receipt_json, '$.completed_at_ms') AS INTEGER) >= ?2
+                     )
+                     OR (
+                       json_extract(receipt_json, '$.completed_at_ms') IS NULL
+                       AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) >= ?5
+                     )
                    )
                  ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
                  LIMIT ?4",
@@ -542,7 +554,13 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(
-                params![namespace, start_timestamp_ms, end_timestamp_ms, limit],
+                params![
+                    namespace,
+                    start_timestamp_ms,
+                    end_timestamp_ms,
+                    limit,
+                    open_min_started_at_ms
+                ],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|error| error.to_string())?;
@@ -984,7 +1002,11 @@ impl SekaiDb {
             .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
         let mut receipt: OperationReceipt =
             serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+        let original = receipt.clone();
         update(&mut receipt)?;
+        if receipt == original {
+            return Ok(receipt);
+        }
         let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
         conn.execute(
             "UPDATE chisei_operation_receipts SET receipt_json=?1, updated_at=?2 WHERE operation_id=?3",
@@ -2088,6 +2110,111 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retired, 1);
+    }
+
+    fn window_receipt(
+        operation_id: &str,
+        started_at_ms: i64,
+        completed_at_ms: Option<i64>,
+    ) -> OperationReceipt {
+        OperationReceipt {
+            version: crate::chisei::receipt::OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.into(),
+            parent_operation_id: None,
+            namespace: "acme".into(),
+            operation_class: "governed_action_instance".into(),
+            initiating_actor: "alice".into(),
+            schema_version: "action-instance/v1".into(),
+            policy_version: "implicit-allow".into(),
+            started_at_ms,
+            completed_at_ms,
+            events: Vec::new(),
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: None,
+        }
+    }
+
+    fn receipt_updated_at(db: &SekaiDb, operation_id: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT updated_at FROM chisei_operation_receipts WHERE operation_id=?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn windowed_lists_keep_recent_opens_and_drop_stale_opens() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let ttl = crate::db::chisei_receipt::OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS;
+        let recent_started = ttl + 100;
+        let later_start = recent_started + ttl + 10;
+        db.put_operation_receipt(&window_receipt("open-recent", recent_started, None))
+            .unwrap();
+        db.put_operation_receipt(&window_receipt("open-stale", 1, None))
+            .unwrap();
+        db.put_operation_receipt(&window_receipt(
+            "completed-in-later-window",
+            later_start,
+            Some(later_start + 50),
+        ))
+        .unwrap();
+
+        let recent_ids = db
+            .list_operation_receipts_in_window("acme", recent_started, recent_started + 100, 16)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(recent_ids, vec!["open-recent".to_string()]);
+
+        let later_ids = db
+            .list_operation_receipts_in_window("acme", later_start, later_start + 100, 16)
+            .unwrap()
+            .into_iter()
+            .map(|receipt| receipt.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(later_ids, vec!["completed-in-later-window".to_string()]);
+        assert!(
+            db.get_operation_receipt("open-stale")
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_none(),
+            "stale opens stay harvestable until ack"
+        );
+    }
+
+    #[test]
+    fn update_operation_receipt_skips_write_when_unchanged() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.put_operation_receipt(&window_receipt("op-skip", 1, None))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE chisei_operation_receipts SET updated_at=1 WHERE operation_id='op-skip'",
+                [],
+            )
+            .unwrap();
+        db.update_operation_receipt("op-skip", |_| Ok(())).unwrap();
+        assert_eq!(receipt_updated_at(&db, "op-skip"), 1);
+
+        db.update_operation_receipt("op-skip", |receipt| {
+            receipt.completed_at_ms = Some(2);
+            Ok(())
+        })
+        .unwrap();
+        assert_ne!(receipt_updated_at(&db, "op-skip"), 1);
+        assert_eq!(
+            db.get_operation_receipt("op-skip")
+                .unwrap()
+                .unwrap()
+                .completed_at_ms,
+            Some(2)
+        );
     }
 
     #[test]

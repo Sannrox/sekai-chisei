@@ -3,7 +3,9 @@
 use crate::chisei::receipt::{
     OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind,
 };
-use crate::db::chisei_receipt::validate_evaluation_receipt_event_order;
+use crate::db::chisei_receipt::{
+    open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+};
 use crate::db::postgres::PostgresDb;
 
 impl PostgresDb {
@@ -102,6 +104,9 @@ impl PostgresDb {
     ) -> Result<Vec<OperationReceipt>, String> {
         // Callers may pass max+1 to detect overflow; allow that sentinel.
         let limit = i64::try_from(limit.min(5_001)).unwrap_or(5_001);
+        // Keep #645 harvest semantics for recent opens; drop abandoned NULLs
+        // that started before the window's open-receipt overlap TTL.
+        let open_min_started_at_ms = open_receipt_min_started_at_ms(start_timestamp_ms);
         let rows = self
             .connection()?
             .query(
@@ -109,12 +114,24 @@ impl PostgresDb {
                  WHERE namespace=$1
                    AND ((receipt_json::jsonb->>'started_at_ms')::bigint) < $3
                    AND (
-                     receipt_json::jsonb->>'completed_at_ms' IS NULL
-                     OR NULLIF(receipt_json::jsonb->>'completed_at_ms', '')::bigint >= $2
+                     (
+                       receipt_json::jsonb->>'completed_at_ms' IS NOT NULL
+                       AND NULLIF(receipt_json::jsonb->>'completed_at_ms', '')::bigint >= $2
+                     )
+                     OR (
+                       receipt_json::jsonb->>'completed_at_ms' IS NULL
+                       AND ((receipt_json::jsonb->>'started_at_ms')::bigint) >= $5
+                     )
                    )
                  ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint), operation_id
                  LIMIT $4",
-                &[&namespace, &start_timestamp_ms, &end_timestamp_ms, &limit],
+                &[
+                    &namespace,
+                    &start_timestamp_ms,
+                    &end_timestamp_ms,
+                    &limit,
+                    &open_min_started_at_ms,
+                ],
             )
             .map_err(|error| error.to_string())?;
         let mut receipts = Vec::with_capacity(rows.len());
@@ -520,6 +537,57 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())?;
         record_durability_lag(produced_at_ms, durable_at_ms);
         Ok((receipt, true))
+    }
+
+    pub fn update_operation_receipt<F>(
+        &self,
+        operation_id: &str,
+        update: F,
+    ) -> Result<OperationReceipt, String>
+    where
+        F: FnOnce(&mut OperationReceipt) -> Result<(), String>,
+    {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!("receipt:{operation_id}")],
+            )
+            .map_err(|error| format!("lock operation receipt {operation_id}: {error}"))?;
+        let receipt_json: String = transaction
+            .query_opt(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id = $1",
+                &[&operation_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0))
+            .ok_or_else(|| format!("operation receipt {operation_id} not found"))?;
+        let mut receipt: OperationReceipt =
+            serde_json::from_str(&receipt_json).map_err(|error| error.to_string())?;
+        let original = receipt.clone();
+        update(&mut receipt)?;
+        if receipt == original {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(receipt);
+        }
+        let updated_json = serde_json::to_string(&receipt).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE chisei_operation_receipts
+                 SET receipt_json = $1, updated_at = $2
+                 WHERE operation_id = $3",
+                &[
+                    &updated_json,
+                    &chrono::Utc::now().timestamp_millis(),
+                    &operation_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(receipt)
     }
 
     pub fn authorize_operation_reporter(
