@@ -102,10 +102,10 @@
     {
       "id": "community_runtime_remains_tenant_free",
       "class": "negative",
-      "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets.",
+      "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets. Tenant callers use the unscoped instance process key.",
       "evidence_tests": [
         "src/grpc/chisei_service.rs#community_machine_context_keeps_legacy_execution_authorization",
-        "src/provider_credentials.rs#community_env_resolver_rejects_tenant_scoped_requests"
+        "src/provider_credentials.rs#community_env_resolver_uses_instance_key_for_tenant_callers"
       ]
     }
   ]
