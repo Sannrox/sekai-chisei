@@ -1052,7 +1052,7 @@ fn decode_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], Strin
         return Err(format!("{field} must contain {} hexadecimal bytes", N));
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).map_err(|_| format!("{field} is not hexadecimal"))?;
         decoded[index] =
             u8::from_str_radix(pair, 16).map_err(|_| format!("{field} is not hexadecimal"))?;

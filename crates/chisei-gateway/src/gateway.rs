@@ -3752,6 +3752,7 @@ struct PreparedUpstreamRequest {
     cross_provider: bool,
 }
 
+#[allow(clippy::result_large_err)]
 async fn prepare_upstream_request(
     config: &GatewayConfig,
     identity: &GatewayIdentity,

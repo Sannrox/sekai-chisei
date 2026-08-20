@@ -157,7 +157,7 @@ pub fn signing_key_from_hex(value: &str) -> Result<ed25519_dalek::SigningKey, St
         return Err("provenance signing key must be a 32-byte hexadecimal Ed25519 seed".into());
     }
     let mut seed = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         seed[index] = u8::from_str_radix(
             std::str::from_utf8(pair).map_err(|_| "invalid signing key encoding")?,
             16,

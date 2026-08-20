@@ -378,7 +378,7 @@ fn decode_hex_key(field: &str, value: &str) -> Result<[u8; 32], String> {
         return Err(format!("{field} must contain exactly 32 hexadecimal bytes"));
     }
     let mut decoded = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(pair).map_err(|_| format!("{field} is not hexadecimal"))?;
         decoded[index] =
             u8::from_str_radix(pair, 16).map_err(|_| format!("{field} is not hexadecimal"))?;
