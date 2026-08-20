@@ -926,7 +926,7 @@ fn decode_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N], Artif
         )));
     }
     let mut decoded = [0u8; N];
-    for (pair, byte) in encoded.chunks_exact(2).zip(decoded.iter_mut()) {
+    for (pair, byte) in encoded.as_chunks::<2>().0.iter().zip(decoded.iter_mut()) {
         *byte = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
     }
     Ok(decoded)
