@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tower::{Layer, Service};
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 #[derive(Clone, Default)]
 pub struct MetricsLayer;
@@ -363,8 +363,10 @@ fn record_rpc(grpc_service: &str, grpc_method: &str, grpc_code: &str, elapsed: D
     .record(elapsed.as_secs_f64());
 
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+    // Successful unaries are already in metrics. Logging each one at INFO
+    // floods operators when clients poll claim/heartbeat/receipt RPCs.
     if grpc_code == "ok" {
-        info!(
+        debug!(
             grpc_service,
             grpc_method, grpc_code, elapsed_ms, "gRPC request completed"
         );
@@ -402,6 +404,66 @@ mod tests {
                 ("sekai.SekaiService".into(), method.into())
             );
         }
+    }
+
+    #[test]
+    fn successful_completion_is_silent_at_info() {
+        let logs = capture_completion_logs(tracing::Level::INFO, "ok");
+        assert!(
+            !logs.contains("gRPC request completed"),
+            "ok completions must stay off the default info stream: {logs}"
+        );
+    }
+
+    #[test]
+    fn successful_completion_is_visible_at_debug() {
+        let logs = capture_completion_logs(tracing::Level::DEBUG, "ok");
+        assert!(
+            logs.contains("gRPC request completed"),
+            "ok completions remain available at debug: {logs}"
+        );
+    }
+
+    #[test]
+    fn non_ok_completion_is_warned_at_info() {
+        let logs = capture_completion_logs(tracing::Level::INFO, "unknown");
+        assert!(
+            logs.contains("gRPC request completed"),
+            "non-ok completions must remain visible at info: {logs}"
+        );
+        assert!(
+            logs.contains("WARN"),
+            "non-ok completions must remain WARN: {logs}"
+        );
+    }
+
+    fn capture_completion_logs(max_level: tracing::Level, grpc_code: &str) -> String {
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log buffer").write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            super::record_rpc("unknown", "unknown", grpc_code, Duration::from_millis(1));
+        });
+        String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs")
     }
 }
 

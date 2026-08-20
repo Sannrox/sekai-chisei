@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Log successful gRPC request completions at DEBUG instead of INFO so default
+  operator logs stay quiet under poll traffic. Non-ok completions remain WARN.
+  Metrics are unchanged.
+
 ## 1.0.1
 
 - Hosted and community Chisei use one operator-supplied process key per
