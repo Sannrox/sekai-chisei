@@ -130,6 +130,23 @@ impl PostgresDb {
         Ok(Some(before))
     }
 
+    pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute("DELETE FROM sekai_objects WHERE id = $1", &[&id])
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM sekai_object_changes WHERE object_id = $1",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn delete_object_with_audit(
         &self,
         id: &str,

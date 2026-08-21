@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub const EFFECT_KIND_RUNTIME_DISPATCH: &str = "runtime_dispatch";
 pub const EFFECT_KIND_NOTIFY: &str = "notify";
 pub const EFFECT_KIND_EXTERNAL_MUTATE: &str = "external_mutate";
+pub const OBJECT_MUTATION_CREATE: &str = "create";
+pub const OBJECT_MUTATION_UPDATE: &str = "update";
 
 const KNOWN_EFFECT_KINDS: &[&str] = &[
     EFFECT_KIND_RUNTIME_DISPATCH,
@@ -32,6 +34,12 @@ pub struct GovernedActionType {
     pub policy_scope: String,
     /// Empty means use namespace budget defaults.
     pub budget_scope: String,
+    /// Admitted object kind this type may create or update. Empty means admit-only.
+    #[serde(default)]
+    pub object_kind: String,
+    /// `create` or `update` when `object_kind` is set. Empty means admit-only.
+    #[serde(default)]
+    pub object_mutation: String,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -80,8 +88,65 @@ impl GovernedActionType {
                 return Err(format!("duplicate effect kind {kind:?}"));
             }
         }
+        validate_object_binding(
+            &self.object_kind,
+            &self.object_mutation,
+            &self.parameter_schema_json,
+        )?;
         Ok(())
     }
+}
+
+fn validate_object_binding(
+    object_kind: &str,
+    object_mutation: &str,
+    parameter_schema_json: &str,
+) -> Result<(), String> {
+    let object_kind = object_kind.trim();
+    let object_mutation = object_mutation.trim();
+    if object_kind.is_empty() && object_mutation.is_empty() {
+        return Ok(());
+    }
+    if object_kind.is_empty() || object_mutation.is_empty() {
+        return Err("object_kind and object_mutation must be set together".into());
+    }
+    if object_kind.chars().any(char::is_whitespace) {
+        return Err("object_kind must not contain whitespace".into());
+    }
+    if object_mutation != OBJECT_MUTATION_CREATE && object_mutation != OBJECT_MUTATION_UPDATE {
+        return Err(format!(
+            "object_mutation must be {OBJECT_MUTATION_CREATE} or {OBJECT_MUTATION_UPDATE}"
+        ));
+    }
+    let schema: serde_json::Value = serde_json::from_str(parameter_schema_json)
+        .map_err(|error| format!("parameter_schema_json must be JSON: {error}"))?;
+    let object_id = schema
+        .get("properties")
+        .and_then(|properties| properties.get("object_id"))
+        .ok_or_else(|| "object binding requires parameter object_id".to_string())?;
+    if object_id.get("type").and_then(|value| value.as_str()) != Some("string") {
+        return Err("object_id parameter must be a string".into());
+    }
+    let required = schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "object_id must be a required parameter".to_string())?;
+    if !required
+        .iter()
+        .any(|value| value.as_str() == Some("object_id"))
+    {
+        return Err("object_id must be a required parameter".into());
+    }
+    if schema
+        .get("properties")
+        .and_then(|properties| properties.get("notify_delivery"))
+        .is_some()
+    {
+        return Err(
+            "notify_delivery is an action-effect control and cannot be an object property".into(),
+        );
+    }
+    Ok(())
 }
 
 fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
@@ -93,6 +158,8 @@ fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "allowed_effect_kinds": t.allowed_effect_kinds,
         "policy_scope": t.policy_scope,
         "budget_scope": t.budget_scope,
+        "object_kind": t.object_kind,
+        "object_mutation": t.object_mutation,
     });
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
@@ -348,6 +415,8 @@ mod tests {
             ],
             policy_scope: String::new(),
             budget_scope: String::new(),
+            object_kind: String::new(),
+            object_mutation: String::new(),
             enabled,
             created_by: String::new(),
             created_at_ms: 0,
@@ -426,5 +495,29 @@ mod tests {
         bad.parameter_schema_json = r#"{"type":"object"}"#.into();
         let error = db.put_governed_action_type(bad, "op", 1).unwrap_err();
         assert!(error.contains("closed v1 subset"), "{error}");
+    }
+
+    #[test]
+    fn object_binding_requires_object_id_and_known_mutation() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut missing = sample(true);
+        missing.object_kind = "customer_record".into();
+        missing.object_mutation = OBJECT_MUTATION_CREATE.into();
+        let error = db.put_governed_action_type(missing, "op", 1).unwrap_err();
+        assert!(error.contains("object_id"), "{error}");
+
+        let mut bound = sample(true);
+        bound.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into();
+        bound.object_kind = "customer_record".into();
+        bound.object_mutation = OBJECT_MUTATION_CREATE.into();
+        db.put_governed_action_type(bound, "op", 1).unwrap();
+
+        let mut notify = sample(true);
+        notify.type_id = "review.notify".into();
+        notify.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"notify_delivery":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into();
+        notify.object_kind = "customer_record".into();
+        notify.object_mutation = OBJECT_MUTATION_CREATE.into();
+        let error = db.put_governed_action_type(notify, "op", 1).unwrap_err();
+        assert!(error.contains("notify_delivery"), "{error}");
     }
 }

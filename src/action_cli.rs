@@ -87,6 +87,10 @@ struct TypeFile {
     policy_scope: String,
     #[serde(default)]
     budget_scope: String,
+    #[serde(default)]
+    object_kind: String,
+    #[serde(default)]
+    object_mutation: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -164,6 +168,8 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
             allowed_effect_kinds: parsed.allowed_effect_kinds,
             policy_scope: parsed.policy_scope,
             budget_scope: parsed.budget_scope,
+            object_kind: parsed.object_kind,
+            object_mutation: parsed.object_mutation,
             enabled: parsed.enabled,
             created_by: String::new(),
             created_at_ms: 0,

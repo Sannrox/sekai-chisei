@@ -16,7 +16,10 @@ use crate::sekai::action_instance::{
     ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION, compute_request_digest,
     submit_budget_subject, validate_parameters_json,
 };
-use crate::sekai::{action_effect, action_policy, audit};
+use crate::sekai::action_object_mutation::{
+    ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
+};
+use crate::sekai::{action_effect, action_object_mutation, action_policy, audit};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
@@ -103,10 +106,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     "idempotency key conflict: same key with different request digest".into(),
                 ));
             }
-            return Ok(ActionInstanceAdmissionOutcome {
-                instance: existing,
-                replay: true,
-            });
+            return self.completed_replay(existing);
         }
 
         let type_def = self
@@ -240,6 +240,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             None
         };
 
+        // Reserve the instance before mutating so concurrent same-key submits
+        // replay at the idempotency insert instead of racing the object write.
         let stored = self.db.put_action_instance(&instance).map_err(|error| {
             if error.contains("conflict") {
                 ActionInstanceAdmissionError::AlreadyExists(error)
@@ -250,21 +252,87 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
         })?;
         let replay = stored.instance_id != instance_id;
-        if !replay {
-            self.record_admission(
-                &stored,
-                actor,
-                &policy_scope_label,
-                &budget_subject,
-                &evidence_ids,
-                planned_effects.as_deref(),
-                ontology_digest,
-                now,
-            )?;
+        if replay {
+            return self.completed_replay(stored);
+        }
+
+        // Same-key replay already returned above. Plan only a fresh admit so a
+        // prior create cannot block retry or a durable deny. Submit policy on
+        // the type is the write authority; this path does not re-check
+        // CreateObject/UpdateObject grants.
+        let applied_object = if status == STATUS_ADMITTED {
+            match plan_object_mutation(
+                self.db,
+                &type_def,
+                &stored.namespace,
+                &stored.parameters_json,
+            ) {
+                Ok(None) => None,
+                Ok(Some(planned)) => {
+                    match action_object_mutation::apply(self.db, planned, actor, now) {
+                        Ok(applied) => Some(applied),
+                        Err(error) => {
+                            let _ = self.db.delete_action_instance(&stored.instance_id);
+                            return Err(map_object_mutation_error(error));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    return Err(map_object_mutation_error(error));
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.record_admission(
+            &stored,
+            actor,
+            &policy_scope_label,
+            &budget_subject,
+            &evidence_ids,
+            planned_effects.as_deref(),
+            applied_object.as_ref(),
+            ontology_digest,
+            now,
+        ) {
+            let receipt_exists = self
+                .db
+                .get_operation_receipt(&stored.operation_id)
+                .ok()
+                .flatten()
+                .is_some();
+            if !receipt_exists {
+                if let Some(applied) = &applied_object {
+                    action_object_mutation::compensate(self.db, applied, actor);
+                }
+                let _ = self.db.delete_action_instance(&stored.instance_id);
+            }
+            return Err(error);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: stored,
             replay,
+        })
+    }
+
+    fn completed_replay(
+        &self,
+        existing: ActionInstance,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        if self
+            .db
+            .get_operation_receipt(&existing.operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .is_none()
+        {
+            return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                "action instance admission is still in progress".into(),
+            ));
+        }
+        Ok(ActionInstanceAdmissionOutcome {
+            instance: existing,
+            replay: true,
         })
     }
 
@@ -277,6 +345,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         budget_subject: &str,
         evidence_ids: &[String],
         planned_effects: Option<&[action_effect::ActionEffect]>,
+        applied_object: Option<&AppliedObjectMutation>,
         ontology_digest: Option<String>,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
@@ -290,6 +359,11 @@ impl<'a> ActionInstanceAdmission<'a> {
         ]);
         if !evidence_ids.is_empty() {
             intent_attributes.insert("evidence_submission_ids".into(), evidence_ids.join(","));
+        }
+        if let Some(applied) = applied_object {
+            intent_attributes.insert("object_id".into(), applied.object_id.clone());
+            intent_attributes.insert("object_kind".into(), applied.object_kind.clone());
+            intent_attributes.insert("object_mutation".into(), applied.mutation.clone());
         }
         let event =
             |suffix: &str,
@@ -408,6 +482,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             ("budget_decision".into(), stored.budget_decision.clone()),
             ("parameters_untrusted".into(), "true".into()),
         ]);
+        if let Some(applied) = applied_object {
+            evidence.insert("object_id".into(), applied.object_id.clone());
+            evidence.insert("object_kind".into(), applied.object_kind.clone());
+            evidence.insert("object_mutation".into(), applied.mutation.clone());
+        }
         if !stored.deny_reason.is_empty() {
             evidence.insert("deny_reason".into(), stored.deny_reason.clone());
         }
@@ -442,6 +521,20 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(())
+    }
+}
+
+fn map_object_mutation_error(error: ActionObjectMutationError) -> ActionInstanceAdmissionError {
+    match error {
+        ActionObjectMutationError::InvalidArgument(message) => {
+            ActionInstanceAdmissionError::InvalidArgument(message)
+        }
+        ActionObjectMutationError::FailedPrecondition(message) => {
+            ActionInstanceAdmissionError::FailedPrecondition(message)
+        }
+        ActionObjectMutationError::Internal(message) => {
+            ActionInstanceAdmissionError::Internal(message)
+        }
     }
 }
 
@@ -515,6 +608,8 @@ mod tests {
                 allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
                 policy_scope: String::new(),
                 budget_scope: String::new(),
+                object_kind: String::new(),
+                object_mutation: String::new(),
                 enabled: true,
                 created_by: String::new(),
                 created_at_ms: 0,
@@ -614,6 +709,8 @@ mod tests {
                 allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
                 policy_scope: String::new(),
                 budget_scope: String::new(),
+                object_kind: String::new(),
+                object_mutation: String::new(),
                 enabled: true,
                 created_by: String::new(),
                 created_at_ms: 0,
@@ -754,5 +851,306 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn record_schema() -> &'static str {
+        r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#
+    }
+
+    fn ensure_record_kind(db: &RuntimeDb) {
+        db.upsert_object_type(&crate::sekai::schema::ObjectType {
+            kind: "customer_record".into(),
+            description: "Fixture customer record kind".into(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec![],
+        })
+        .unwrap();
+    }
+
+    fn record_type(mutation: &str) -> GovernedActionType {
+        GovernedActionType {
+            namespace: "acme".into(),
+            type_id: format!("customer.record.{mutation}"),
+            version: "1".into(),
+            description: "create or update one customer record".into(),
+            parameter_schema_json: record_schema().into(),
+            allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            object_kind: "customer_record".into(),
+            object_mutation: mutation.into(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+        }
+    }
+
+    fn record_request(type_id: &str, parameters_json: &str) -> ActionInstanceAdmissionRequest {
+        ActionInstanceAdmissionRequest {
+            namespace: "acme".into(),
+            type_id: type_id.into(),
+            version: "1".into(),
+            parameters_json: parameters_json.into(),
+            idempotency_key: "record-1".into(),
+            evidence_submission_ids: Vec::new(),
+            request_id: "operation-record".into(),
+            ontology_digest: ONTOLOGY_DIGEST.into(),
+        }
+    }
+
+    #[test]
+    fn submit_creates_one_admitted_record_and_binds_the_receipt() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let admitted = admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-1","name":"Acme","title":"first"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap();
+        assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+        let stored = db.get_object("rec-1").unwrap().expect("created record");
+        assert_eq!(stored.kind, "customer_record");
+        assert_eq!(stored.namespace, "acme");
+        assert_eq!(stored.name, "Acme");
+        assert_eq!(
+            stored.properties.get("title").map(String::as_str),
+            Some("first")
+        );
+        let receipt = db
+            .get_operation_receipt("operation-record")
+            .unwrap()
+            .expect("receipt");
+        assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+        let intent = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::IntentRecorded)
+            .expect("intent");
+        assert_eq!(
+            intent.attributes.get("object_id").map(String::as_str),
+            Some("rec-1")
+        );
+        assert_eq!(
+            intent.attributes.get("object_kind").map(String::as_str),
+            Some("customer_record")
+        );
+        assert!(!intent.attributes.values().any(|value| value == "first"));
+
+        let replay = admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-1","name":"Acme","title":"first"}"#,
+                ),
+                "alice",
+                20,
+            )
+            .unwrap();
+        assert!(replay.replay);
+        assert_eq!(replay.instance.instance_id, admitted.instance.instance_id);
+        assert_eq!(db.get_object("rec-1").unwrap().unwrap().name, "Acme");
+    }
+
+    #[test]
+    fn submit_updates_one_admitted_record() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        db.put_governed_action_type(record_type("update"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-2","title":"first"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap();
+        let mut update = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-2","title":"second"}"#,
+        );
+        update.idempotency_key = "record-2".into();
+        update.request_id = "operation-record-update".into();
+        admission.admit(update, "alice", 20).unwrap();
+        let stored = db.get_object("rec-2").unwrap().expect("updated record");
+        assert_eq!(
+            stored.properties.get("title").map(String::as_str),
+            Some("second")
+        );
+        assert_eq!(stored.name, "rec-2");
+    }
+
+    #[test]
+    fn missing_kind_fails_closed_before_a_success_receipt() {
+        let db = setup();
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let error = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-3"}"#),
+                "alice",
+                10,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ActionInstanceAdmissionError::FailedPrecondition(_)
+        ));
+        assert!(db.get_object("rec-3").unwrap().is_none());
+        assert!(
+            db.get_operation_receipt("operation-record")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn distinct_key_cannot_create_the_same_record_twice() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-5"}"#),
+                "alice",
+                10,
+            )
+            .unwrap();
+        let mut second = record_request("customer.record.create", r#"{"object_id":"rec-5"}"#);
+        second.idempotency_key = "record-5b".into();
+        second.request_id = "operation-record-5b".into();
+        let error = admission.admit(second, "alice", 20).unwrap_err();
+        assert!(matches!(
+            error,
+            ActionInstanceAdmissionError::FailedPrecondition(_)
+        ));
+        assert_eq!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn policy_deny_does_not_write_the_record() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let outcome = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-4"}"#),
+                "alice",
+                10,
+            )
+            .unwrap();
+        assert_eq!(outcome.instance.status, STATUS_DENIED);
+        assert!(db.get_object("rec-4").unwrap().is_none());
+        assert!(
+            db.get_operation_receipt("operation-record")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn policy_deny_still_persists_when_the_record_already_exists() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-6"}"#),
+                "alice",
+                10,
+            )
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut denied = record_request("customer.record.create", r#"{"object_id":"rec-6"}"#);
+        denied.idempotency_key = "record-6-deny".into();
+        denied.request_id = "operation-record-6-deny".into();
+        let outcome = admission.admit(denied, "alice", 20).unwrap();
+        assert_eq!(outcome.instance.status, STATUS_DENIED);
+        assert_eq!(
+            db.get_object("rec-6").unwrap().unwrap().kind,
+            "customer_record"
+        );
+    }
+
+    #[test]
+    fn incomplete_reservation_is_not_replayed_as_success() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let reserved = crate::sekai::action_instance::ActionInstance {
+            instance_id: "gai-incomplete".into(),
+            namespace: "acme".into(),
+            type_id: "customer.record.create".into(),
+            version: "1".into(),
+            principal: "alice".into(),
+            parameters_json: r#"{"object_id":"rec-7"}"#.into(),
+            request_digest: crate::sekai::action_instance::compute_request_digest(
+                "acme",
+                "customer.record.create",
+                "1",
+                r#"{"object_id":"rec-7"}"#,
+                &[],
+            )
+            .unwrap(),
+            idempotency_key: "record-7".into(),
+            operation_id: "operation-record-7".into(),
+            status: STATUS_ADMITTED.into(),
+            deny_reason: String::new(),
+            evidence_submission_ids: vec![],
+            policy_decision: "allow".into(),
+            budget_decision: "not_configured".into(),
+            created_at_ms: 10,
+            decided_at_ms: 10,
+        };
+        db.put_action_instance(&reserved).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut retry = record_request("customer.record.create", r#"{"object_id":"rec-7"}"#);
+        retry.idempotency_key = "record-7".into();
+        retry.request_id = "operation-record-7".into();
+        let error = admission.admit(retry, "alice", 20).unwrap_err();
+        assert!(matches!(
+            error,
+            ActionInstanceAdmissionError::FailedPrecondition(_)
+        ));
+        assert!(db.get_object("rec-7").unwrap().is_none());
     }
 }

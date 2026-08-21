@@ -40,7 +40,20 @@ receipt / harvest spine.
    `status=denied` (not a hard gRPC error so clients can inspect the receipt).
 8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
    when a `BudgetTracker` is configured. Exhausted → `status=denied`.
-9. Persist instance; write operation receipt events (intent, policy, a
+9. When the type binds `object_kind` and `object_mutation`, plan one
+   `CreateObject` or `UpdateObject` of that admitted kind. Unknown kind,
+   reserved kind, schema-invalid record, missing update target, or
+   create-id conflict fail closed
+   before a durable success receipt. Policy or budget deny persists a `denied`
+   instance and does not write the record.
+10. Persist instance first so same-key replay wins the idempotency insert.
+    Replay returns only after that instance has a receipt; an in-flight
+    reservation fails closed as still in progress. On a fresh admit the plane
+    then applies the planned mutation. Mutation or receipt failure deletes
+    that reserved instance and, for a create, the record plus its aborted
+    change history so retry can reserve again. A failed update restores the
+    prior record. If a receipt was already written, the reservation and
+    record stay so same-key retry can replay. Write operation receipt events (intent, policy, a
    not-applicable routing decision, budget, and—when no claimable work
    remains—outcome); audit decision. On admit, record one budget unit.
    Routing is recorded as `route_selected` with `route=not_applicable` so
@@ -73,6 +86,10 @@ a later attempt sends a different `request_id`.
 present it must be `sha256:` plus 64 lowercase hex characters and is copied
 onto the operation receipt. The plane does not invent a digest or copy one
 from `parameters_json`.
+
+When a bound create or update succeeds, receipt intent attributes and the
+admission audit record `object_id`, `object_kind`, and `object_mutation`.
+Parameter values stay out of audit and receipt evidence.
 
 ## Producer contract
 

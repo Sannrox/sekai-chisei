@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Governed Action types can bind one admitted object kind and apply one
+  create or update on `SubmitActionInstance`, sharing the caller `request_id`
+  and optional `ontology_digest` receipt spine. `external_mutate` stays
+  skipped. Domain kinds stay in schemas and fixtures, not the core contract.
 - Log successful gRPC request completions at DEBUG instead of INFO so default
   operator logs stay quiet under poll traffic. Non-ok completions remain WARN.
   Metrics are unchanged.

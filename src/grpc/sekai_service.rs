@@ -2856,6 +2856,8 @@ fn from_proto_governed_action_type(
         allowed_effect_kinds: proto.allowed_effect_kinds,
         policy_scope: proto.policy_scope,
         budget_scope: proto.budget_scope,
+        object_kind: proto.object_kind,
+        object_mutation: proto.object_mutation,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -2877,6 +2879,8 @@ fn to_proto_governed_action_type(
         allowed_effect_kinds: domain.allowed_effect_kinds.clone(),
         policy_scope: domain.policy_scope.clone(),
         budget_scope: domain.budget_scope.clone(),
+        object_kind: domain.object_kind.clone(),
+        object_mutation: domain.object_mutation.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -4011,6 +4015,10 @@ impl SekaiService for SekaiServiceImpl {
                     || e.contains("duplicate effect")
                     || e.contains("parameter_schema_json")
                     || e.contains("must not contain whitespace")
+                    || e.contains("object_kind")
+                    || e.contains("object_mutation")
+                    || e.contains("object binding")
+                    || e.contains("object_id")
                 {
                     Status::invalid_argument(e)
                 } else {
@@ -8506,6 +8514,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            object_kind: String::new(),
+            object_mutation: String::new(),
         };
         let put = svc
             .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -8628,6 +8638,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            object_kind: String::new(),
+            object_mutation: String::new(),
         };
         svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
             r#type: Some(type_def),
@@ -8819,6 +8831,8 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
+                object_kind: String::new(),
+                object_mutation: String::new(),
             }),
             request_id: "put-validated-action".into(),
         }))
@@ -8953,6 +8967,8 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
+                object_kind: String::new(),
+                object_mutation: String::new(),
             }),
             request_id: "put-nul".into(),
         }))
@@ -9141,6 +9157,80 @@ mod tests {
         }))
         .await
         .expect("object create after kind ensure");
+    }
+
+    #[tokio::test]
+    async fn submit_action_instance_creates_record_of_ensured_kind() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        grant_action_admin(&svc);
+
+        let mut class = ontology_class("CustomerRecord");
+        class.mapped_kind = "customer_record".into();
+        class.description = "Fixture customer record".into();
+        svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+            class: Some(class),
+        }))
+        .await
+        .unwrap();
+
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "customer.record.create".into(),
+                version: "1".into(),
+                description: "Create one customer record".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+                object_kind: "customer_record".into(),
+                object_mutation: "create".into(),
+            }),
+            request_id: "put-record".into(),
+        }))
+        .await
+        .unwrap();
+
+        let digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let admit = svc
+            .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+                namespace: "acme".into(),
+                type_id: "customer.record.create".into(),
+                version: "1".into(),
+                parameters_json:
+                    r#"{"object_id":"rec-grpc-1","name":"Northwind","title":"account"}"#.into(),
+                idempotency_key: "record-grpc-1".into(),
+                evidence_submission_ids: Vec::new(),
+                request_id: "operation-record-grpc".into(),
+                ontology_digest: digest.into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!admit.replay);
+        let instance = admit.instance.unwrap();
+        assert_eq!(instance.operation_id, "operation-record-grpc");
+        let stored = svc
+            .db
+            .get_object("rec-grpc-1")
+            .unwrap()
+            .expect("created record");
+        assert_eq!(stored.kind, "customer_record");
+        assert_eq!(stored.namespace, "acme");
+        assert_eq!(stored.name, "Northwind");
+        let receipt = svc
+            .db
+            .get_operation_receipt("operation-record-grpc")
+            .unwrap()
+            .expect("receipt");
+        assert_eq!(receipt.ontology_digest.as_deref(), Some(digest));
+        assert!(receipt.completeness().complete);
     }
 
     #[tokio::test]

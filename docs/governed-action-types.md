@@ -29,6 +29,8 @@ row for history.
 | `parameter_schema_json` | Immutable closed parameter schema validated at `SubmitActionInstance` admission |
 | `allowed_effect_kinds` | Subset of `runtime_dispatch`, `notify`, `external_mutate` |
 | `policy_scope` / `budget_scope` | Empty = use namespace defaults |
+| `object_kind` | Admitted schema kind this type may create or update. Empty means admit-only |
+| `object_mutation` | `create` or `update` when `object_kind` is set. Empty means admit-only |
 | `enabled` | Fail-closed gate for submit ([#397](governed-action-instances.md) uses `require_enabled`) |
 
 ## Operator CLI
@@ -83,10 +85,20 @@ definition.
 - Running agent turns or hosting runtimes
 - Domain webhook / GitHub type packs in core
 - An in-process graph-mutation action DSL
+- Binding more than one kind or more than one create/update per type version
+
+A type that sets `object_kind` must require a string `object_id` parameter.
+Kind identity is type metadata, not a parameter. Bound schemas cannot declare
+`notify_delivery`; that name stays an action-effect control and is not copied
+onto the record. `name` sets the object name and is not stored as a property.
+`SubmitActionInstance` applies at most one existing object create or update
+after policy and budget gates; `external_mutate` stays skipped. See
+[governed-action-instances.md](governed-action-instances.md).
 
 ## Dual-backend
 
 SQLite and PostgreSQL both persist the registry through the existing
-`0020_governed_action_types` schema (SQLite migrates on first use). No schema
+`0020_governed_action_types` schema (SQLite migrates on first use). `object_kind`
+and `object_mutation` live in the existing type body JSON. No schema
 migration or data rewrite is required for admission enforcement; both backends
 validate the stored closed schema at the service boundary.

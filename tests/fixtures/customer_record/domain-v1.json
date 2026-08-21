@@ -1,0 +1,13 @@
+{
+  "version": "sekai.ontology-product/v1",
+  "classes": [
+    {
+      "name": "CustomerRecord",
+      "description": "Fixture customer record for governed create or update",
+      "mapped_kind": "customer_record",
+      "ensure_kind": true,
+      "kind_description": "Customer record object kind for Action submit fixtures"
+    }
+  ],
+  "relations": []
+}

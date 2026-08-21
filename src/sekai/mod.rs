@@ -2,6 +2,7 @@ pub mod action;
 pub mod action_effect;
 pub mod action_instance;
 pub mod action_instance_admission;
+pub(crate) mod action_object_mutation;
 pub mod action_policy;
 pub(crate) mod action_work_lifecycle;
 pub mod attestation;
