@@ -4,8 +4,13 @@
 
 - Governed Action types can bind one admitted object kind and apply one
   create or update on `SubmitActionInstance`, sharing the caller `request_id`
-  and optional `ontology_digest` receipt spine. `external_mutate` stays
-  skipped. Domain kinds stay in schemas and fixtures, not the core contract.
+  and optional `ontology_digest` receipt spine. Domain kinds stay in schemas
+  and fixtures, not the core contract.
+- `external_mutate` is `pending` when an admitted ActionInstance carries
+  `permit_id`, and stays `skipped` without a permit.
+- Bounded GitHub object sync onto shared type revisions, with refresh,
+  tombstone, and identity-conflict rules.
+- Dataset-backed object lineage from source record to write-back effect.
 - Log successful gRPC request completions at DEBUG instead of INFO so default
   operator logs stay quiet under poll traffic. Non-ok completions remain WARN.
   Metrics are unchanged.

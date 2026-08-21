@@ -46,7 +46,12 @@ const MAX_CLAIM_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DEFAULT_CLAIM_TTL_MS: i64 = 60_000;
 
 /// Effect kinds that #398 materializes on admit.
-pub const MATERIALIZED_EFFECT_KINDS: &[&str] = &[EFFECT_KIND_RUNTIME_DISPATCH, EFFECT_KIND_NOTIFY];
+pub const MATERIALIZED_EFFECT_KINDS: &[&str] = &[
+    EFFECT_KIND_RUNTIME_DISPATCH,
+    EFFECT_KIND_NOTIFY,
+    EFFECT_KIND_EXTERNAL_MUTATE,
+];
+pub const EFFECT_STATUS_COMPENSATING: &str = "compensating";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionEffect {
@@ -378,6 +383,7 @@ impl ActionEffect {
             | EFFECT_STATUS_FAILED
             | EFFECT_STATUS_SKIPPED
             | EFFECT_STATUS_COMPLETED
+            | EFFECT_STATUS_COMPENSATING
             | EFFECT_STATUS_PARKED
             | EFFECT_STATUS_DEAD_LETTERED
             | EFFECT_STATUS_SUPERSEDED => {}
@@ -649,20 +655,51 @@ pub fn plan_effects_for_admit(
                 });
             }
             EFFECT_KIND_EXTERNAL_MUTATE => {
+                let permit_id = params
+                    .get("permit_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let source_id = params
+                    .get("source_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let (status, lifecycle, reason, payload) = if permit_id.is_empty() {
+                    (
+                        EFFECT_STATUS_SKIPPED,
+                        EFFECT_STATUS_SKIPPED,
+                        String::new(),
+                        serde_json::json!({
+                            "reason": "external_mutate requires permit_id; skipped fail-closed",
+                            "instance_id": instance_id,
+                            "operation_id": operation_id,
+                        }),
+                    )
+                } else {
+                    (
+                        EFFECT_STATUS_PENDING,
+                        EFFECT_LIFECYCLE_READY,
+                        String::new(),
+                        serde_json::json!({
+                            "permit_id": permit_id,
+                            "source_id": source_id,
+                            "instance_id": instance_id,
+                            "operation_id": operation_id,
+                            "path": "permit",
+                        }),
+                    )
+                };
                 effects.push(ActionEffect {
                     effect_id: format!("gax-{}", uuid::Uuid::new_v4().simple()),
                     instance_id: instance_id.into(),
                     namespace: namespace.into(),
                     operation_id: operation_id.into(),
                     kind: EFFECT_KIND_EXTERNAL_MUTATE.into(),
-                    status: EFFECT_STATUS_SKIPPED.into(),
-                    payload_json: serde_json::json!({
-                        "reason": "external_mutate uses permit path; not claimable here",
-                        "instance_id": instance_id,
-                        "operation_id": operation_id,
-                    })
-                    .to_string(),
-                    failure_reason: String::new(),
+                    status: status.into(),
+                    payload_json: payload.to_string(),
+                    failure_reason: reason,
                     created_at_ms: now_ms,
                     updated_at_ms: now_ms,
                     claim_owner: String::new(),
@@ -675,7 +712,7 @@ pub fn plan_effects_for_admit(
                     claim_attempt_count: 0,
                     lease_expiry_count: 0,
                     park_count: 0,
-                    lifecycle_state: EFFECT_STATUS_SKIPPED.into(),
+                    lifecycle_state: lifecycle.into(),
                     retry_policy_version: String::new(),
                     retry_policy_digest: String::new(),
                     max_claim_attempts: 0,
@@ -692,6 +729,43 @@ pub fn plan_effects_for_admit(
         effect.validate()?;
     }
     Ok(effects)
+}
+
+/// Record a permit-backed write-back outcome. Pending effects only.
+pub fn resolve_external_mutate(
+    effect: &ActionEffect,
+    outcome: &str,
+    now_ms: i64,
+) -> Result<ActionEffect, String> {
+    if effect.kind != EFFECT_KIND_EXTERNAL_MUTATE {
+        return Err("effect is not external_mutate".into());
+    }
+    if effect.status != EFFECT_STATUS_PENDING {
+        return Err("external_mutate is not pending".into());
+    }
+    let payload: serde_json::Value = serde_json::from_str(&effect.payload_json)
+        .map_err(|error| format!("payload_json must be JSON: {error}"))?;
+    if payload
+        .get("permit_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Err("external_mutate resolve requires permit_id".into());
+    }
+    let (status, lifecycle) = match outcome {
+        "succeeded" | ACK_OUTCOME_COMPLETED => {
+            (EFFECT_STATUS_COMPLETED, EFFECT_LIFECYCLE_COMPLETED)
+        }
+        ACK_OUTCOME_FAILED => (EFFECT_STATUS_FAILED, EFFECT_LIFECYCLE_FAILED),
+        "compensating" => (EFFECT_STATUS_COMPENSATING, EFFECT_STATUS_COMPENSATING),
+        other => return Err(format!("unknown external_mutate outcome {other:?}")),
+    };
+    let mut resolved = effect.clone();
+    resolved.status = status.into();
+    resolved.lifecycle_state = lifecycle.into();
+    resolved.updated_at_ms = now_ms;
+    Ok(resolved)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2200,6 +2274,38 @@ mod tests {
         assert_eq!(effects[0].status, EFFECT_STATUS_PENDING);
         assert_eq!(effects[1].kind, EFFECT_KIND_NOTIFY);
         assert_eq!(effects[1].status, EFFECT_STATUS_SENT);
+    }
+
+    #[test]
+    fn external_mutate_pending_requires_permit() {
+        let skipped = plan_effects_for_admit(
+            "ai-1",
+            "acme",
+            "op-1",
+            &[EFFECT_KIND_EXTERNAL_MUTATE.into()],
+            r#"{}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        assert_eq!(skipped[0].status, EFFECT_STATUS_SKIPPED);
+
+        let pending = plan_effects_for_admit(
+            "ai-1",
+            "acme",
+            "op-1",
+            &[EFFECT_KIND_EXTERNAL_MUTATE.into()],
+            r#"{"permit_id":"permit-1","source_id":"github:acme/ops#12"}"#,
+            10,
+            false,
+        )
+        .unwrap();
+        assert_eq!(pending[0].status, EFFECT_STATUS_PENDING);
+        assert!(pending[0].payload_json.contains("permit-1"));
+        let completed = resolve_external_mutate(&pending[0], "succeeded", 20).unwrap();
+        assert_eq!(completed.status, EFFECT_STATUS_COMPLETED);
+        let compensating = resolve_external_mutate(&pending[0], "compensating", 21).unwrap();
+        assert_eq!(compensating.status, EFFECT_STATUS_COMPENSATING);
     }
 
     #[test]
