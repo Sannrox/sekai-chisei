@@ -10,6 +10,8 @@ fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "allowed_effect_kinds": t.allowed_effect_kinds,
         "policy_scope": t.policy_scope,
         "budget_scope": t.budget_scope,
+        "object_kind": t.object_kind,
+        "object_mutation": t.object_mutation,
     });
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }

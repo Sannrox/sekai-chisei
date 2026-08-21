@@ -1992,6 +1992,13 @@ impl RuntimeDb {
         }
     }
 
+    pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_action_instance(instance_id),
+            Self::Postgres(db) => db.delete_action_instance(instance_id),
+        }
+    }
+
     pub fn get_action_instance(
         &self,
         instance_id: &str,
@@ -3458,10 +3465,12 @@ impl RuntimeDb {
     ) -> Result<Option<Object>, String> {
         match self {
             Self::Sqlite(db) => db.update_object_with_audit(object, actor),
-            Self::Postgres(_) => Err(
-                "update_object_with_audit is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => {
+                let Some(existing) = db.get_object(&object.id)? else {
+                    return Ok(None);
+                };
+                db.update_object_with_audit_if_revision(object, actor, existing.updated)
+            }
         }
     }
 
@@ -4293,6 +4302,13 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.delete_object(id),
             Self::Postgres(db) => db.delete_object(id),
+        }
+    }
+
+    pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.abort_unreceipted_object_create(id),
+            Self::Postgres(db) => db.abort_unreceipted_object_create(id),
         }
     }
 

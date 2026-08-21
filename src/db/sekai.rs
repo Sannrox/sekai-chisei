@@ -717,6 +717,20 @@ impl SekaiDb {
         Ok(())
     }
 
+    /// Remove an object and its change rows so an aborted create can reuse the id.
+    pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_object_changes WHERE object_id = ?1",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn delete_object_with_existing(&self, id: &str) -> Result<Option<Object>, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;

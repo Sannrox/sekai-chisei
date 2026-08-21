@@ -389,6 +389,17 @@ impl SekaiDb {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
+        self.migrate_action_instances()?;
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM sekai_action_instances WHERE instance_id = ?1",
+            params![instance_id],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]

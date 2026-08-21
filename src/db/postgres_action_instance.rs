@@ -168,4 +168,14 @@ impl PostgresDb {
             Err(e) => Err(e.to_string()),
         }
     }
+
+    pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM sekai_action_instances WHERE instance_id = $1",
+                &[&instance_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
