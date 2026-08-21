@@ -16,7 +16,7 @@ lines; they have lifecycle status and bounded JSON payloads.
 | --- | --- | --- |
 | `runtime_dispatch` | `pending` / semantic `ready` | Claimable by runtime hosts; intentional park waits for governed continuation (#399, #412) |
 | `notify` | best-effort `sent` or `failed` | Failure **does not** un-admit the instance |
-| `external_mutate` | `skipped` | Mutations stay on the existing **permit** path |
+| `external_mutate` | `pending` when `permit_id` is present; otherwise `skipped` | Permit-backed write-back; completion, failure, and compensation stay on the permit path |
 
 Unknown kinds are rejected at type registry time (#396) and at materialization.
 
@@ -26,8 +26,9 @@ Unknown kinds are rejected at type registry time (#396) and at materialization.
    before effects are written.
 2. Effects are children of the admitted instance; they never replace the
    operation receipt spine.
-3. **External-first** mutate/writeback is reserved for later permit-backed
-   work — not performed as a free-form side effect of admit.
+3. **Permit-backed** mutate/write-back materializes `external_mutate` as
+   `pending` only when parameters include `permit_id`. Plane-side mutation
+   without a permit remains forbidden.
 
 ## Wire
 

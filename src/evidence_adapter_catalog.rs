@@ -105,6 +105,21 @@ pub fn built_in_evidence_adapters() -> Vec<EvidenceAdapterProfile> {
             reference_example: "evidence_social_reply".into(),
             description: "Single social reply observation with untrusted remote text.".into(),
         },
+        EvidenceAdapterProfile {
+            adapter_id: "adapter.github.object_sync".into(),
+            family: "source_control.object_sync".into(),
+            evidence_type: "source_control.object_sync".into(),
+            schema_id: "adapter.github.object_sync".into(),
+            schema_version: "1.0.0".into(),
+            source_type: "github_issue_or_pull_request".into(),
+            signal: "object_sync".into(),
+            delivery: "webhook".into(),
+            requires_expiry: false,
+            reference_example: String::new(),
+            description:
+                "GitHub Issue or PullRequest observation mapped onto a shared type-revision object."
+                    .into(),
+        },
     ]
 }
 
@@ -146,6 +161,10 @@ fn family_metadata(family: &str) -> (&'static str, &'static str) {
         "social.observation" => (
             "Social observation",
             "Fixed-window post metrics and reply observations.",
+        ),
+        "source_control.object_sync" => (
+            "Source-control object sync",
+            "GitHub Issue and PullRequest records upserted onto shared type revisions.",
         ),
         _ => ("Adapter family", "External evidence adapter family."),
     }

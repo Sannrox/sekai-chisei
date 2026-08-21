@@ -40,3 +40,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0017: Return the repository to Apache 2.0](0017-return-to-apache-2.0.md)
 - [ADR 0018: Keep ontology relation cardinality advisory in 1.x](0018-ontology-relation-cardinality.md)
 - [ADR 0019: Keep native discovery and the HTTP provider matrix as separate catalogs](0019-dual-capability-catalogs.md)
+- [ADR 0020: Keep shared type revisions, inbound object sync, and permit-backed external mutation separate](0020-shared-type-revisions-and-object-sync.md)
