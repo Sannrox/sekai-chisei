@@ -179,12 +179,6 @@
       "description": "An admitted external evidence submission or retained evidence projection whose lifecycle and source identity remain authoritative outside the descriptor.",
       "superclasses": [],
       "properties": []
-    },
-    {
-      "name": "SekaiScenarioHypothesisReference",
-      "description": "A request-scoped, non-durable scenario impact projection that remains a hypothesis and cannot promote evidence status.",
-      "superclasses": [],
-      "properties": []
     }
   ],
   "relations": [
@@ -215,17 +209,6 @@
       "description": "Associates a descriptor with an existing admitted evidence submission projection while preserving source lifecycle and identity.",
       "domain": "ChiseiEpistemicDescriptor",
       "range": "SekaiEvidenceProjectionReference",
-      "cardinality": {
-        "min": 0,
-        "max": 1
-      },
-      "transitive": false
-    },
-    {
-      "name": "projects_scenario_hypothesis_reference",
-      "description": "Associates a descriptor with an existing request-scoped scenario hypothesis projection.",
-      "domain": "ChiseiEpistemicDescriptor",
-      "range": "SekaiScenarioHypothesisReference",
       "cardinality": {
         "min": 0,
         "max": 1
@@ -360,18 +343,6 @@
       "subject": "SekaiEvidenceProjectionReference",
       "source": "sekai-chisei",
       "locator": "src/sekai/evidence_store.rs",
-      "confidence": 1.0
-    },
-    {
-      "subject": "SekaiScenarioHypothesisReference",
-      "source": "sekai-chisei",
-      "locator": "src/sekai/scenario.rs",
-      "confidence": 1.0
-    },
-    {
-      "subject": "SekaiScenarioHypothesisReference",
-      "source": "sekai-chisei",
-      "locator": "docs/epistemic-descriptor.md",
       "confidence": 1.0
     }
   ]

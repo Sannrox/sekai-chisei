@@ -32,7 +32,7 @@ resource would otherwise duplicate:
 | External evidence identity, content digest, and lifecycle | `EvidenceSubmissionRecord` and the evidence store | Authorized evidence responses and `EpistemicDescriptor::from_external_evidence` |
 | Governed derived memory and reassessment | Versioned `KiokuMemory` plus evidence basis and lifecycle events | `EpistemicDescriptor::from_kioku` |
 | Evaluation definition, plan, manifest, and step evidence | Chisei evaluation resources and the canonical operation receipt | Evaluation and receipt projections; step evidence has no independent lifecycle |
-| Request-scoped hypotheses | Scenario evaluation | `EpistemicDescriptor::from_hypothesis`; no durable assertion is minted |
+| Request-scoped hypotheses | No live `EvaluateScenario` producer after 1.0; see [#660](660-hypothetical-overlay.md) | `EpistemicDescriptor::from_hypothesis` remains a test and vocabulary helper; no durable assertion is minted |
 | Cross-source status metadata | `chisei.epistemic-descriptor/v1` | Additive, bounded, source-neutral fields with explicit `unknown` values |
 
 The descriptor constructors take values from already-authorized source

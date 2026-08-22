@@ -9,7 +9,7 @@ reference pages.
 | Topic | Status or current documentation |
 | --- | --- |
 | [Semantic pattern-query surface](145-semantic-pattern-query.md) | Retired from the 1.0 runtime surface; retained as design history |
-| [Governed what-if simulation](148-what-if-simulation.md) | Retired from the 1.0 runtime surface; retained as design history |
+| [Governed what-if simulation](148-what-if-simulation.md) | Retired from the 1.0 runtime surface; [#660](660-hypothetical-overlay.md) kept the removal |
 | [Governed hybrid retrieval](152-hybrid-retrieval.md) | Retired from the 1.0 runtime surface; retained as design history |
 | [Gateway PEP fat-decide](163-gateway-pep-fat-decide.md) | Design freeze; see [Gateway and clients](../gateway.md) |
 | [Lookup versus model call](175-lookup-vs-model-call.md) | Recommendation complete; see [Capability catalog](../capability-catalog.md) |
@@ -32,6 +32,7 @@ reference pages.
 | [Epistemic RDF/OWL/PROV-O boundary](501-epistemic-rdf-owl-prov-o.md) | Small edge projection with explicit loss metadata; no RDF parser or reasoner in core; see the conformance fixture |
 | [Durable `EpistemicAssertion` resource decision](502-epistemic-assertion-resource.md) | Projection remains sufficient; no new core resource, endpoint, or persistence family without independent unmet requirements |
 | [Next query-time entailment constructs](658-query-time-entailment-constructs.md) | Keep the ADR 0001 profile; inverse and disjointness stay metadata; reopen only with unmet demand and PostgreSQL advertising the same profile |
+| [Governed hypothetical overlay after 1.0](660-hypothetical-overlay.md) | Keep the EvaluateScenario removal; hypothesis remains vocabulary, not a live overlay |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
