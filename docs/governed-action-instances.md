@@ -89,7 +89,9 @@ from `parameters_json`.
 
 When a bound create or update succeeds, receipt intent attributes and the
 admission audit record `object_id`, `object_kind`, and `object_mutation`.
-Parameter values stay out of audit and receipt evidence.
+Those writes are asserted objects of an admitted kind, not derived-fact
+admission. Parameter values stay out of audit and receipt evidence. See
+[derived-fact admission](research/659-derived-fact-admission.md).
 
 ## Producer contract
 

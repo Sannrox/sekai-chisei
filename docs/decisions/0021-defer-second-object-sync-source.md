@@ -66,9 +66,9 @@ feed is not a second source.
 
 ## Consequences
 
-#657 closes with an explicit no-second-source result. #659 may treat that
-result as the delivered dependency: there is no second inbound source to bind
-derived-fact admission to.
+#657 closes with an explicit no-second-source result. #659 treats that
+result as the delivered dependency and closes with no persisted derived
+facts: there is no second inbound source to bind derived-fact admission to.
 
 Composition products must not assume GitLab, Jira, incident, or deployment
 objects can be upserted through `source_control.object_sync`. Check-run

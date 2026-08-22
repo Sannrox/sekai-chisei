@@ -42,6 +42,9 @@ authoring document.
 - Composition products attach sync and write-back to type revisions.
 - Evidence adapters remain observations; object sync is a distinct family.
 - Plane-side mutation without a permit remains forbidden.
+- Governed functions stay read-only. Derived views are not persisted onto a
+  type revision; see
+  [derived-fact admission](../research/659-derived-fact-admission.md).
 
 ## Validation
 
