@@ -82,6 +82,8 @@ lives in the separate [research index](research/README.md).
   operation correlation.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
+- [Inbound object sync](object-sync.md) — GitHub Issue and PullRequest
+  identity, refresh, tombstone, and the deferred second source.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

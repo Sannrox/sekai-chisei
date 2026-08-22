@@ -44,7 +44,7 @@ use sekai_chisei::evidence_adapter_catalog::{
 | `operations.health` | HTTP health snapshot |
 | `ontology.concept_catalog` | Concept catalog document |
 | `social.observation` | `social.post_snapshot`, `social.reply` |
-| `source_control.object_sync` | GitHub Issue / PullRequest object upsert |
+| `source_control.object_sync` | GitHub Issue / PullRequest object upsert (webhook is transport, not a second source) |
 
 ## Non-goals
 

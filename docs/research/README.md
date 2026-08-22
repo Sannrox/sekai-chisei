@@ -31,6 +31,7 @@ reference pages.
 | [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
 | [Epistemic RDF/OWL/PROV-O boundary](501-epistemic-rdf-owl-prov-o.md) | Small edge projection with explicit loss metadata; no RDF parser or reasoner in core; see the conformance fixture |
 | [Durable `EpistemicAssertion` resource decision](502-epistemic-assertion-resource.md) | Projection remains sufficient; no new core resource, endpoint, or persistence family without independent unmet requirements |
+| [Second object-sync source](../decisions/0021-defer-second-object-sync-source.md) | No second source; GitHub Issue/PR identity stays the only inbound sync contract; streaming is transport |
 | [Next query-time entailment constructs](658-query-time-entailment-constructs.md) | Keep the ADR 0001 profile; inverse and disjointness stay metadata; reopen only with unmet demand and PostgreSQL advertising the same profile |
 | [Governed hypothetical overlay after 1.0](660-hypothetical-overlay.md) | Keep the EvaluateScenario removal; hypothesis remains vocabulary, not a live overlay |
 
