@@ -34,6 +34,7 @@ reference pages.
 | [Second object-sync source](../decisions/0021-defer-second-object-sync-source.md) | No second source; GitHub Issue/PR identity stays the only inbound sync contract; streaming is transport |
 | [Next query-time entailment constructs](658-query-time-entailment-constructs.md) | Keep the ADR 0001 profile; inverse and disjointness stay metadata; reopen only with unmet demand and PostgreSQL advertising the same profile |
 | [Governed hypothetical overlay after 1.0](660-hypothetical-overlay.md) | Keep the EvaluateScenario removal; hypothesis remains vocabulary, not a live overlay |
+| [Type-bound derived-fact admission](659-derived-fact-admission.md) | Functions stay read-only; derived views stay query-time; no derived-fact kind or digest |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).

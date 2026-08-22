@@ -23,3 +23,6 @@ Rules:
 Write-back uses permit-backed `external_mutate`. Dataset lineage records
 source → dataset → object → action → write-back without a second object
 identity. See [ADR 0020](decisions/0020-shared-type-revisions-and-object-sync.md).
+Governed functions and computed properties do not write derived objects onto
+a type revision and must not invent a sync source id. See
+[derived-fact admission](research/659-derived-fact-admission.md).

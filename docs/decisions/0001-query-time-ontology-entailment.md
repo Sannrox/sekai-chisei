@@ -68,7 +68,11 @@ must never become authoritative facts.
 Issue [#144](https://github.com/Sannrox/sekai-chisei/issues/144) owns the first
 vertical implementation. Research
 [#658](../research/658-query-time-entailment-constructs.md) later kept this
-profile and recorded the reopening test for any additional construct. A future
+profile and recorded the reopening test for any additional construct.
+Research [#659](../research/659-derived-fact-admission.md) kept the same
+no-persisted-derived-facts rule for governed functions and type revisions:
+function pipelines and computed properties stay read-time overlays, and
+Action object mutations remain asserted writes. A future
 proposal for materialization or additional rule profiles requires new
 measurements and a superseding decision.
 

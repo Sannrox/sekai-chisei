@@ -16,7 +16,10 @@ The bounded interoperability research in [#501](research/501-epistemic-rdf-owl-p
 defines what a future edge projection may preserve without changing that
 boundary. Research [#658](research/658-query-time-entailment-constructs.md)
 keeps the ADR 0001 evaluation profile; inverse and disjointness stay
-authoring and inspection metadata.
+authoring and inspection metadata. Research
+[#659](research/659-derived-fact-admission.md) keeps governed functions
+read-only; computed properties and other derived views stay query-time
+overlays and are not persisted onto a type revision.
 
 ## First-run product loop (`sekaictl`)
 
