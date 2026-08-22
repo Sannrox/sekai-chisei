@@ -7,9 +7,10 @@ Related: [#143](https://github.com/Sannrox/sekai-chisei/issues/143) (closed → 
 [#282](https://github.com/Sannrox/sekai-chisei/issues/282) (closed policy dry-run),
 [#362](https://github.com/Sannrox/sekai-chisei/issues/362) (shipped scenario overlay)
 Date: 2026-07-27
-Status: **recommendation complete — shipped via #362**
-The scenario-overlay operator guide was retired with the 1.0 runtime removal;
-this document remains design history.
+Status: **recommendation complete — shipped via #362, retired for 1.0**
+The scenario-overlay operator guide was retired with the 1.0 runtime removal.
+[#660](660-hypothetical-overlay.md) later kept that removal. This document
+remains design history.
 
 ## Decision question
 

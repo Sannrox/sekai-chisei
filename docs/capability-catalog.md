@@ -140,8 +140,8 @@ Asserted graph retrieval is available on both reusable community backends.
 Query-time ontology entailment is currently SQLite-only; PostgreSQL advertises
 the unsupported backend value and the RPC fails closed with
 `FAILED_PRECONDITION` rather than returning a partial ontology snapshot.
-Scenario graph reads advertise both backends while remaining request-scoped
-and non-durable.
+The experimental scenario overlay was removed in 1.0; see
+[#660](research/660-hypothetical-overlay.md).
 
 ## Lookup-first answers (S1 / #281)
 
