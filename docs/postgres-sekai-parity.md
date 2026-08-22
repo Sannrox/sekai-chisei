@@ -13,6 +13,10 @@ or are explicit computed/query paths with named durable dependencies.
 treat inventory “complete” as dual-backend for these RPCs):
 
 - audited ontology mutations (`upsert_*_with_audit`);
+- query-time ontology entailment (`RetrieveContext`, `ExpandRelations`, and
+  lookup-first expansion in `entailment` mode; see
+  [ADR 0001](decisions/0001-query-time-ontology-entailment.md) and
+  [capability catalog](capability-catalog.md));
 - multi-control-plane federation site/peer tables (see
   [federation-profile.md](federation-profile.md));
 

@@ -14,7 +14,9 @@ identifiers suitable for mapping in future RDF or OWL adapters; this release
 does not claim RDF, OWL, GraphQL, SPARQL, or Cypher compatibility.
 The bounded interoperability research in [#501](research/501-epistemic-rdf-owl-prov-o.md)
 defines what a future edge projection may preserve without changing that
-boundary.
+boundary. Research [#658](research/658-query-time-entailment-constructs.md)
+keeps the ADR 0001 evaluation profile; inverse and disjointness stay
+authoring and inspection metadata.
 
 ## First-run product loop (`sekaictl`)
 
