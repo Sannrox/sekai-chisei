@@ -41,3 +41,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0018: Keep ontology relation cardinality advisory in 1.x](0018-ontology-relation-cardinality.md)
 - [ADR 0019: Keep native discovery and the HTTP provider matrix as separate catalogs](0019-dual-capability-catalogs.md)
 - [ADR 0020: Keep shared type revisions, inbound object sync, and permit-backed external mutation separate](0020-shared-type-revisions-and-object-sync.md)
+- [ADR 0021: Defer a second object-sync source until GitHub Issue/PR admission is live](0021-defer-second-object-sync-source.md)

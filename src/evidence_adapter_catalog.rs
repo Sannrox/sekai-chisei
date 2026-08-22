@@ -117,7 +117,7 @@ pub fn built_in_evidence_adapters() -> Vec<EvidenceAdapterProfile> {
             requires_expiry: false,
             reference_example: String::new(),
             description:
-                "GitHub Issue or PullRequest observation mapped onto a shared type-revision object."
+                "GitHub Issue or PullRequest observation mapped onto a shared type-revision object. Webhook delivery is transport into that identity, not a second source."
                     .into(),
         },
     ]
@@ -164,7 +164,7 @@ fn family_metadata(family: &str) -> (&'static str, &'static str) {
         ),
         "source_control.object_sync" => (
             "Source-control object sync",
-            "GitHub Issue and PullRequest records upserted onto shared type revisions.",
+            "GitHub Issue and PullRequest records upserted onto shared type revisions. No second source; delivery is transport.",
         ),
         _ => ("Adapter family", "External evidence adapter family."),
     }

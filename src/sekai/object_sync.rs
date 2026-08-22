@@ -52,6 +52,11 @@ pub fn object_id_for(type_digest: &str, source_id: &str) -> String {
 }
 
 /// Map one GitHub issue or pull-request observation onto a sync decision.
+///
+/// Transport (webhook, document, or poll) is out of scope. Callers feed one
+/// `SourceRecord`. GitHub Issues and pull requests share a number space, so
+/// `source_id` omits `type_name`. Other GitHub kinds and other hosts stay
+/// rejected until a later identity decision.
 pub fn sync_github_record(record: SourceRecord, type_digest: &str) -> SyncDecision {
     if record.source != SOURCE_GITHUB {
         return SyncDecision::Reject {
@@ -155,6 +160,35 @@ mod tests {
         record.source = "jira".into();
         match sync_github_record(record, "sha256:types") {
             SyncDecision::Reject { reason } => assert!(reason.contains("GitHub")),
+            other => panic!("expected reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_and_pull_request_share_github_number_identity() {
+        let issue_object = match sync_github_record(issue(), "sha256:types") {
+            SyncDecision::Upsert(object) => object,
+            other => panic!("expected upsert, got {other:?}"),
+        };
+        let mut pull = issue();
+        pull.type_name = "PullRequest".into();
+        let pull_object = match sync_github_record(pull, "sha256:types") {
+            SyncDecision::Upsert(object) => object,
+            other => panic!("expected upsert, got {other:?}"),
+        };
+        assert_eq!(issue_object.object_id, pull_object.object_id);
+        assert_eq!(issue_object.source_id, pull_object.source_id);
+        assert_eq!(issue_object.source_id, "github:acme/ops#12");
+    }
+
+    #[test]
+    fn additional_github_kinds_are_rejected() {
+        let mut record = issue();
+        record.type_name = "Discussion".into();
+        match sync_github_record(record, "sha256:types") {
+            SyncDecision::Reject { reason } => {
+                assert!(reason.contains("Issue and PullRequest only"));
+            }
             other => panic!("expected reject, got {other:?}"),
         }
     }
