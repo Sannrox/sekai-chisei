@@ -1239,6 +1239,133 @@ message CreateHandoffResponse { HandoffManifest manifest = 1; }
 message RevokeHandoffRequest { string manifest_id = 1; string reason = 2; string request_id = 3; }
 message RevokeHandoffResponse { HandoffManifest manifest = 1; }
 
+// Bounded, adapter-normalized source records. No raw source payload or
+// credentials cross this contract.
+message SourceRecord {
+  string source = 1;
+  string source_instance = 2;
+  string external_id = 3;
+  string source_version = 4;
+  string type_name = 5;
+  string display_name = 6;
+  string payload_digest = 7;
+  map<string, string> properties = 8;
+  bool deleted = 9;
+  int64 observed_at_ms = 10;
+}
+
+message SourceBatch {
+  string contract_version = 1;
+  string namespace = 2;
+  // Rebound to the single authenticated transport principal by the server.
+  string producer_identity = 3;
+  string source = 4;
+  string source_instance = 5;
+  string family = 6;
+  string adapter_id = 7;
+  string adapter_version = 8;
+  string type_digest = 9;
+  string current_cursor = 10;
+  string proposed_next_cursor = 11;
+  string idempotency_key = 12;
+  string batch_digest = 13;
+  int64 collected_at_ms = 14;
+  repeated SourceRecord records = 15;
+}
+
+message SourceBinding {
+  string binding_id = 1;
+  string namespace = 2;
+  string producer_identity = 3;
+  string source = 4;
+  string source_instance = 5;
+  string family = 6;
+  string adapter_id = 7;
+  string adapter_version = 8;
+  string type_digest = 9;
+  int64 created_at_ms = 10;
+  bool active = 11;
+}
+
+message SourceBatchTransaction {
+  string transaction_id = 1;
+  string binding_id = 2;
+  string namespace = 3;
+  string producer_identity = 4;
+  string idempotency_key = 5;
+  string batch_digest = 6;
+  string current_cursor = 7;
+  string proposed_next_cursor = 8;
+  string status = 9; // OPEN | COMMITTED | ABORTED
+  string outcome = 10; // success | denial | unavailable | partial | unknown
+  int64 opened_at_ms = 11;
+  optional int64 closed_at_ms = 12;
+  string reason = 13;
+}
+
+message SourceCheckpoint {
+  string binding_id = 1;
+  string namespace = 2;
+  string cursor = 3;
+  string committed_batch_digest = 4;
+  int64 advanced_at_ms = 5;
+}
+
+message SyncedObject {
+  string object_id = 1;
+  string type_name = 2;
+  string source_id = 3;
+  string source_version = 4;
+  string payload_digest = 5;
+  map<string, string> properties = 6;
+  bool tombstoned = 7;
+  string type_digest = 8;
+}
+
+message SourceRecordLineage {
+  string type_digest = 1;
+  string source_id = 2;
+  string dataset_id = 3;
+  string object_id = 4;
+}
+
+message SourceRecordResult {
+  string transaction_id = 1;
+  string source_id = 2;
+  string source_version = 3;
+  string decision = 4; // upsert | tombstone | conflict | reject
+  string outcome = 5; // success | denial | unavailable | partial | unknown
+  string reason = 6;
+  SyncedObject object = 7;
+  SourceRecordLineage lineage = 8;
+}
+
+message SourceBatchResult {
+  SourceBatchTransaction transaction = 1;
+  repeated SourceRecordResult records = 2;
+  bool checkpoint_advanced = 3;
+}
+
+message SourceSyncState {
+  SourceBinding binding = 1;
+  SourceCheckpoint checkpoint = 2;
+  SourceBatchTransaction open_transaction = 3;
+  SourceBatchResult last_result = 4;
+  int64 updated_at_ms = 5;
+}
+
+message ApplySourceBatchRequest { SourceBatch batch = 1; }
+message ApplySourceBatchResponse { SourceBatchResult result = 1; }
+message GetSourceSyncStateRequest {
+  string namespace = 1;
+  string source_instance = 2;
+  string type_digest = 3;
+}
+message GetSourceSyncStateResponse {
+  bool found = 1;
+  SourceSyncState state = 2;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1313,6 +1440,8 @@ service SekaiService {
   rpc RefreshLease(RefreshLeaseRequest) returns (RefreshLeaseResponse);
   rpc ReleaseLease(ReleaseLeaseRequest) returns (ReleaseLeaseResponse);
   rpc TakeoverExpiredLease(TakeoverExpiredLeaseRequest) returns (TakeoverExpiredLeaseResponse);
+  rpc ApplySourceBatch(ApplySourceBatchRequest) returns (ApplySourceBatchResponse);
+  rpc GetSourceSyncState(GetSourceSyncStateRequest) returns (GetSourceSyncStateResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);

@@ -63,6 +63,9 @@ If you want to deploy or operate the control plane:
   digest-bound, bounded evidence for release gates.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
+- [Inbound object sync](object-sync.md) — bounded source batches, durable
+  commit/abort, plane-owned checkpoints, and fixed GitHub Issue/PullRequest
+  identity.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,

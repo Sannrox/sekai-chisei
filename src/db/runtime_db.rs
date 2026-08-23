@@ -21,6 +21,7 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
+use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::attestation::{AttestationVerification, PolicyAttestation};
@@ -39,6 +40,7 @@ use crate::sekai::function::Function;
 use crate::sekai::handoff::*;
 use crate::sekai::lease::{Lease, LeaseError};
 use crate::sekai::ledger::*;
+use crate::sekai::object_sync::{SourceBatch, SourceBatchResult, SourceSyncState};
 use crate::sekai::observation::{TaskObservation, TaskObservationBaseline, *};
 use crate::sekai::ontology::*;
 use crate::sekai::retention::*;
@@ -268,6 +270,50 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.ping(),
             Self::Postgres(db) => db.ping(),
+        }
+    }
+
+    pub fn apply_source_batch(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+    ) -> Result<SourceBatchResult, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSyncBackend::apply_source_batch(
+                db.as_ref(),
+                batch,
+                authenticated_producer,
+                now_ms,
+            ),
+            Self::Postgres(db) => ObjectSyncBackend::apply_source_batch(
+                db.as_ref(),
+                batch,
+                authenticated_producer,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn get_source_sync_state(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        type_digest: &str,
+    ) -> Result<Option<SourceSyncState>, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSyncBackend::get_source_sync_state(
+                db.as_ref(),
+                namespace,
+                source_instance,
+                type_digest,
+            ),
+            Self::Postgres(db) => ObjectSyncBackend::get_source_sync_state(
+                db.as_ref(),
+                namespace,
+                source_instance,
+                type_digest,
+            ),
         }
     }
 

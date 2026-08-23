@@ -79,6 +79,7 @@ use crate::sekai::markings;
 use crate::sekai::object_mutation::{
     LeasePrecondition as MutationLeasePrecondition, MutationPersistenceError, ObjectMutation,
 };
+use crate::sekai::object_sync as source_sync_domain;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
 use crate::sekai::work_unit_lifecycle::{
@@ -2985,6 +2986,314 @@ fn to_proto_action_work_continuation(
     }
 }
 
+fn require_single_source_principal(principals: &[String]) -> Result<&str, Status> {
+    require_authenticated(principals)?;
+    if principals.len() != 1 || principals[0] == "anonymous" {
+        return Err(Status::permission_denied(
+            "source sync requires exactly one authenticated principal",
+        ));
+    }
+    Ok(&principals[0])
+}
+
+fn require_canonical_source_namespace(namespace: &str) -> Result<(), Status> {
+    if namespace.is_empty()
+        || namespace.len() > source_sync_domain::MAX_SOURCE_IDENTIFIER_BYTES
+        || namespace.trim() != namespace
+        || namespace.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument("canonical namespace required"));
+    }
+    Ok(())
+}
+
+fn validate_source_sync_lookup(input: &GetSourceSyncStateRequest) -> Result<(), Status> {
+    require_canonical_source_namespace(&input.namespace)?;
+    if input.source_instance.is_empty()
+        || input.source_instance.len() > source_sync_domain::MAX_SOURCE_IDENTIFIER_BYTES
+        || input.source_instance.trim() != input.source_instance
+        || input.source_instance.chars().any(char::is_control)
+    {
+        return Err(Status::invalid_argument(
+            "canonical source instance required",
+        ));
+    }
+    if input.type_digest != source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Err(Status::failed_precondition(
+            "source type revision is not bound",
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_source_sync_namespace(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    require_canonical_source_namespace(namespace)?;
+    enforce_namespace_tenant_context(&service.db, tenant_context, namespace, write)?;
+    check_team_namespace(&service.db, principals, namespace, write)?;
+    let boundary_id = service
+        .db
+        .find_namespace_boundary(namespace)
+        .map_err(|_| Status::internal("namespace authorization unavailable"))?
+        .map_or_else(|| format!("namespace:{namespace}"), |object| object.id);
+    if write {
+        check_write(&service.security, &boundary_id, principals)
+    } else {
+        check_read(&service.security, &boundary_id, principals)
+    }
+}
+
+fn from_proto_source_batch(batch: SourceBatch) -> source_sync_domain::SourceBatch {
+    source_sync_domain::SourceBatch {
+        contract_version: batch.contract_version,
+        namespace: batch.namespace,
+        producer_identity: batch.producer_identity,
+        source: batch.source,
+        source_instance: batch.source_instance,
+        family: batch.family,
+        adapter_id: batch.adapter_id,
+        adapter_version: batch.adapter_version,
+        type_digest: batch.type_digest,
+        current_cursor: batch.current_cursor,
+        proposed_next_cursor: batch.proposed_next_cursor,
+        idempotency_key: batch.idempotency_key,
+        batch_digest: batch.batch_digest,
+        collected_at_ms: batch.collected_at_ms,
+        records: batch
+            .records
+            .into_iter()
+            .map(|record| source_sync_domain::SourceRecord {
+                source: record.source,
+                source_instance: record.source_instance,
+                external_id: record.external_id,
+                source_version: record.source_version,
+                type_name: record.type_name,
+                display_name: record.display_name,
+                payload_digest: record.payload_digest,
+                properties: record.properties.into_iter().collect(),
+                deleted: record.deleted,
+                observed_at_ms: record.observed_at_ms,
+            })
+            .collect(),
+    }
+}
+
+fn source_batch_status(status: source_sync_domain::SourceBatchStatus) -> &'static str {
+    match status {
+        source_sync_domain::SourceBatchStatus::Open => "OPEN",
+        source_sync_domain::SourceBatchStatus::Committed => "COMMITTED",
+        source_sync_domain::SourceBatchStatus::Aborted => "ABORTED",
+    }
+}
+
+fn source_operation_outcome(outcome: source_sync_domain::OperationOutcome) -> &'static str {
+    match outcome {
+        source_sync_domain::OperationOutcome::Success => "success",
+        source_sync_domain::OperationOutcome::Denial => "denial",
+        source_sync_domain::OperationOutcome::Unavailable => "unavailable",
+        source_sync_domain::OperationOutcome::Partial => "partial",
+        source_sync_domain::OperationOutcome::Unknown => "unknown",
+    }
+}
+
+fn to_proto_source_binding(binding: &source_sync_domain::SourceBinding) -> SourceBinding {
+    SourceBinding {
+        binding_id: binding.binding_id.clone(),
+        namespace: binding.namespace.clone(),
+        producer_identity: binding.producer_identity.clone(),
+        source: binding.source.clone(),
+        source_instance: binding.source_instance.clone(),
+        family: binding.family.clone(),
+        adapter_id: binding.adapter_id.clone(),
+        adapter_version: binding.adapter_version.clone(),
+        type_digest: binding.type_digest.clone(),
+        created_at_ms: binding.created_at_ms,
+        active: binding.active,
+    }
+}
+
+fn to_proto_source_transaction(
+    transaction: &source_sync_domain::SourceBatchTransaction,
+) -> SourceBatchTransaction {
+    SourceBatchTransaction {
+        transaction_id: transaction.transaction_id.clone(),
+        binding_id: transaction.binding_id.clone(),
+        namespace: transaction.namespace.clone(),
+        producer_identity: transaction.producer_identity.clone(),
+        idempotency_key: transaction.idempotency_key.clone(),
+        batch_digest: transaction.batch_digest.clone(),
+        current_cursor: transaction.current_cursor.clone(),
+        proposed_next_cursor: transaction.proposed_next_cursor.clone(),
+        status: source_batch_status(transaction.status).into(),
+        outcome: source_operation_outcome(transaction.outcome).into(),
+        opened_at_ms: transaction.opened_at_ms,
+        closed_at_ms: transaction.closed_at_ms,
+        reason: transaction.reason.clone(),
+    }
+}
+
+fn to_proto_source_checkpoint(
+    checkpoint: &source_sync_domain::SourceCheckpoint,
+) -> SourceCheckpoint {
+    SourceCheckpoint {
+        binding_id: checkpoint.binding_id.clone(),
+        namespace: checkpoint.namespace.clone(),
+        cursor: checkpoint.cursor.clone(),
+        committed_batch_digest: checkpoint.committed_batch_digest.clone(),
+        advanced_at_ms: checkpoint.advanced_at_ms,
+    }
+}
+
+fn to_proto_synced_object(object: &source_sync_domain::SyncedObject) -> SyncedObject {
+    SyncedObject {
+        object_id: object.object_id.clone(),
+        type_name: object.type_name.clone(),
+        source_id: object.source_id.clone(),
+        source_version: object.source_version.clone(),
+        payload_digest: object.payload_digest.clone(),
+        properties: object.properties.clone().into_iter().collect(),
+        tombstoned: object.tombstoned,
+        type_digest: object.type_digest.clone(),
+    }
+}
+
+fn to_proto_source_record_result(
+    result: &source_sync_domain::SourceRecordResult,
+) -> SourceRecordResult {
+    let (decision, object) = match &result.decision {
+        source_sync_domain::SyncDecision::Upsert(object) => ("upsert", Some(object)),
+        source_sync_domain::SyncDecision::Tombstone(object) => ("tombstone", Some(object)),
+        source_sync_domain::SyncDecision::Conflict { .. } => ("conflict", None),
+        source_sync_domain::SyncDecision::Reject { .. } => ("reject", None),
+    };
+    let lineage = object.map(|object| SourceRecordLineage {
+        type_digest: object.type_digest.clone(),
+        source_id: object.source_id.clone(),
+        dataset_id: crate::sekai::object_lineage::dataset_id_for(
+            &object.type_digest,
+            &object.type_name,
+        ),
+        object_id: object.object_id.clone(),
+    });
+    SourceRecordResult {
+        transaction_id: result.transaction_id.clone(),
+        source_id: result.source_id.clone(),
+        source_version: result.source_version.clone(),
+        decision: decision.into(),
+        outcome: source_operation_outcome(result.outcome).into(),
+        reason: result.reason.clone(),
+        object: object.map(to_proto_synced_object),
+        lineage,
+    }
+}
+
+fn to_proto_source_batch_result(
+    result: &source_sync_domain::SourceBatchResult,
+) -> SourceBatchResult {
+    SourceBatchResult {
+        transaction: Some(to_proto_source_transaction(&result.transaction)),
+        records: result
+            .records
+            .iter()
+            .map(to_proto_source_record_result)
+            .collect(),
+        checkpoint_advanced: result.checkpoint_advanced,
+    }
+}
+
+fn to_proto_source_sync_state(state: &source_sync_domain::SourceSyncState) -> SourceSyncState {
+    SourceSyncState {
+        binding: Some(to_proto_source_binding(&state.binding)),
+        checkpoint: state.checkpoint.as_ref().map(to_proto_source_checkpoint),
+        open_transaction: state
+            .open_transaction
+            .as_ref()
+            .map(to_proto_source_transaction),
+        last_result: state.last_result.as_ref().map(to_proto_source_batch_result),
+        updated_at_ms: state.updated_at_ms,
+    }
+}
+
+fn ensure_authoritative_source_result(
+    result: &source_sync_domain::SourceBatchResult,
+) -> Result<(), Status> {
+    if result.transaction.status != source_sync_domain::SourceBatchStatus::Committed
+        || result.transaction.outcome != source_sync_domain::OperationOutcome::Success
+        || result.records.iter().any(|record| {
+            record.outcome != source_sync_domain::OperationOutcome::Success
+                || matches!(
+                    record.decision,
+                    source_sync_domain::SyncDecision::Conflict { .. }
+                        | source_sync_domain::SyncDecision::Reject { .. }
+                )
+        })
+    {
+        return Err(Status::internal(
+            "source sync returned a non-authoritative execution result",
+        ));
+    }
+    Ok(())
+}
+
+fn map_source_sync_apply_error(error: String) -> Status {
+    let code = error
+        .split_once(':')
+        .map_or(error.as_str(), |(code, _)| code)
+        .trim();
+    match code {
+        "producer_identity_mismatch" | "binding_producer_conflict" => {
+            Status::permission_denied("source producer identity denied")
+        }
+        "unsupported_version" | "unsupported_adapter" => {
+            Status::failed_precondition("source sync contract version is unsupported")
+        }
+        "unbound_type_revision" => Status::failed_precondition("source type revision is not bound"),
+        "idempotency_conflict" | "replay_identity_conflict" | "source_identity_conflict" => {
+            Status::already_exists("source sync identity conflict")
+        }
+        "stale_cursor" | "foreign_cursor" | "open_transaction_conflict" => {
+            Status::aborted("source checkpoint conflict")
+        }
+        "batch_aborted"
+        | "inactive_binding"
+        | "binding_source_conflict"
+        | "binding_type_conflict"
+        | "binding_contract_conflict"
+        | "type_identity_conflict"
+        | "source_revision_conflict"
+        | "ambiguous_identity_state"
+        | "orphaned_open_transaction"
+        | "missing_open_transaction" => Status::failed_precondition("source sync state conflict"),
+        "canonicalization_failed"
+        | "foreign_source"
+        | "foreign_family"
+        | "invalid_timestamp"
+        | "record_bounds"
+        | "ambiguous_record_identity"
+        | "batch_digest_mismatch"
+        | "mixed_source_identity"
+        | "unsupported_record_type"
+        | "property_bounds"
+        | "invalid_property_key"
+        | "secret_like_text"
+        | "invalid_identifier"
+        | "invalid_source_instance"
+        | "invalid_external_id"
+        | "cursor_bounds"
+        | "text_bounds"
+        | "invalid_digest"
+        | "reserved_property"
+        | "invalid_record" => Status::invalid_argument("invalid source batch"),
+        "storage_error" => Status::internal("source sync storage failure"),
+        _ => Status::internal("source sync unavailable"),
+    }
+}
+
 fn authorize_action_instance_submit(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -3167,6 +3476,65 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(map_lease_lifecycle_error)?;
         Ok(Response::new(TakeoverExpiredLeaseResponse {
             lease: Some(to_proto_lease(&lease)),
+        }))
+    }
+
+    async fn apply_source_batch(
+        &self,
+        req: Request<ApplySourceBatchRequest>,
+    ) -> Result<Response<ApplySourceBatchResponse>, Status> {
+        let principals = caller_principals(&req);
+        let principal = require_single_source_principal(&principals)?.to_string();
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let proto = req
+            .into_inner()
+            .batch
+            .ok_or_else(|| Status::invalid_argument("source batch required"))?;
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &proto.namespace,
+            true,
+        )?;
+        if proto.producer_identity != principal {
+            return Err(Status::permission_denied("source producer identity denied"));
+        }
+        let mut batch = from_proto_source_batch(proto);
+        batch.producer_identity = principal.clone();
+        let result = self
+            .db
+            .apply_source_batch(&batch, &principal, now_millis())
+            .map_err(map_source_sync_apply_error)?;
+        ensure_authoritative_source_result(&result)?;
+        Ok(Response::new(ApplySourceBatchResponse {
+            result: Some(to_proto_source_batch_result(&result)),
+        }))
+    }
+
+    async fn get_source_sync_state(
+        &self,
+        req: Request<GetSourceSyncStateRequest>,
+    ) -> Result<Response<GetSourceSyncStateResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_single_source_principal(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        validate_source_sync_lookup(&input)?;
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let state = self
+            .db
+            .get_source_sync_state(&input.namespace, &input.source_instance, &input.type_digest)
+            .map_err(|_| Status::internal("source sync state unavailable"))?;
+        Ok(Response::new(GetSourceSyncStateResponse {
+            found: state.is_some(),
+            state: state.as_ref().map(to_proto_source_sync_state),
         }))
     }
 
@@ -6619,6 +6987,370 @@ mod tests {
         req.metadata_mut()
             .insert("x-principal", MetadataValue::try_from(principal).unwrap());
         req
+    }
+
+    const SOURCE_TYPE_DIGEST: &str = source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST;
+    const SOURCE_PAYLOAD_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn grant_source_namespace(
+        svc: &SekaiServiceImpl,
+        namespace: &str,
+        principal: &str,
+        role: security::Role,
+    ) {
+        let (_, grants) = svc
+            .db
+            .ensure_team_namespace(namespace, principal, role, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+    }
+
+    fn source_batch(
+        namespace: &str,
+        producer: &str,
+        current_cursor: &str,
+        proposed_next_cursor: &str,
+        idempotency_key: &str,
+    ) -> SourceBatch {
+        let source_instance = "acme/ops".to_string();
+        let mut domain = source_sync_domain::SourceBatch {
+            contract_version: source_sync_domain::SOURCE_BATCH_VERSION.into(),
+            namespace: namespace.into(),
+            producer_identity: producer.into(),
+            source: source_sync_domain::SOURCE_GITHUB.into(),
+            source_instance: source_instance.clone(),
+            family: source_sync_domain::FAMILY_OBJECT_SYNC.into(),
+            adapter_id: source_sync_domain::ADAPTER_GITHUB_OBJECT_SYNC.into(),
+            adapter_version: source_sync_domain::ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+            type_digest: SOURCE_TYPE_DIGEST.into(),
+            current_cursor: current_cursor.into(),
+            proposed_next_cursor: proposed_next_cursor.into(),
+            idempotency_key: idempotency_key.into(),
+            batch_digest: String::new(),
+            collected_at_ms: 20,
+            records: vec![source_sync_domain::SourceRecord {
+                source: source_sync_domain::SOURCE_GITHUB.into(),
+                source_instance,
+                external_id: "12".into(),
+                source_version: "node-v1".into(),
+                type_name: "Issue".into(),
+                display_name: "Bounded sync".into(),
+                payload_digest: SOURCE_PAYLOAD_DIGEST.into(),
+                properties: std::collections::BTreeMap::from([
+                    ("state".into(), "open".into()),
+                    ("title".into(), "Bounded sync".into()),
+                ]),
+                deleted: false,
+                observed_at_ms: 10,
+            }],
+        };
+        domain.batch_digest = domain.canonical_digest().unwrap();
+        SourceBatch {
+            contract_version: domain.contract_version,
+            namespace: domain.namespace,
+            producer_identity: domain.producer_identity,
+            source: domain.source,
+            source_instance: domain.source_instance,
+            family: domain.family,
+            adapter_id: domain.adapter_id,
+            adapter_version: domain.adapter_version,
+            type_digest: domain.type_digest,
+            current_cursor: domain.current_cursor,
+            proposed_next_cursor: domain.proposed_next_cursor,
+            idempotency_key: domain.idempotency_key,
+            batch_digest: domain.batch_digest,
+            collected_at_ms: domain.collected_at_ms,
+            records: domain
+                .records
+                .into_iter()
+                .map(|record| SourceRecord {
+                    source: record.source,
+                    source_instance: record.source_instance,
+                    external_id: record.external_id,
+                    source_version: record.source_version,
+                    type_name: record.type_name,
+                    display_name: record.display_name,
+                    payload_digest: record.payload_digest,
+                    properties: record.properties.into_iter().collect(),
+                    deleted: record.deleted,
+                    observed_at_ms: record.observed_at_ms,
+                })
+                .collect(),
+        }
+    }
+
+    fn redigest_source_batch(batch: &mut SourceBatch) {
+        let mut domain = from_proto_source_batch(batch.clone());
+        domain.batch_digest.clear();
+        batch.batch_digest = domain.canonical_digest().unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_sync_authorized_success_replay_and_state_are_exact() {
+        let svc = service();
+        let namespace = "sync-authorized";
+        let producer = "connector/github-primary";
+        grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+        let batch = source_batch(namespace, producer, "", "cursor:1", "batch-1");
+
+        let first = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(batch.clone()),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let transaction = first.transaction.as_ref().unwrap();
+        assert_eq!(transaction.status, "COMMITTED");
+        assert_eq!(transaction.outcome, "success");
+        assert_eq!(transaction.producer_identity, producer);
+        assert!(first.checkpoint_advanced);
+        assert_eq!(first.records[0].decision, "upsert");
+        assert_eq!(first.records[0].outcome, "success");
+        let object = first.records[0].object.as_ref().unwrap();
+        let lineage = first.records[0].lineage.as_ref().unwrap();
+        assert_eq!(lineage.object_id, object.object_id);
+        assert_eq!(lineage.source_id, object.source_id);
+        assert_eq!(object.properties["title"], "Bounded sync");
+
+        let mut replay = batch;
+        replay.collected_at_ms += 1_000;
+        let replayed = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(replay),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(replayed, first);
+
+        let state = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(state.found);
+        let state = state.state.unwrap();
+        assert_eq!(state.checkpoint.unwrap().cursor, "cursor:1");
+        assert!(state.open_transaction.is_none());
+        assert_eq!(state.last_result.unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn source_sync_rejects_anonymous_ambiguous_and_unauthorized_principals() {
+        let svc = service();
+        let namespace = "sync-authority";
+        let producer = "connector/github-primary";
+        grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+        let batch = source_batch(namespace, producer, "", "cursor:1", "batch-1");
+
+        let anonymous = svc
+            .apply_source_batch(Request::new(ApplySourceBatchRequest {
+                batch: Some(batch.clone()),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(anonymous.code(), tonic::Code::Unauthenticated);
+
+        let ambiguous = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(batch.clone()),
+                },
+                "connector/github-primary,connector/other",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(ambiguous.code(), tonic::Code::PermissionDenied);
+
+        let mut mismatch = batch.clone();
+        mismatch.producer_identity = "connector/other".into();
+        redigest_source_batch(&mut mismatch);
+        let mismatch = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(mismatch),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::PermissionDenied);
+
+        let unauthorized = "connector/no-authority";
+        let unauthorized_batch = source_batch(
+            namespace,
+            unauthorized,
+            "",
+            "cursor:1",
+            "batch-unauthorized",
+        );
+        let denied = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(unauthorized_batch),
+                },
+                unauthorized,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+
+        let read_denied = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                unauthorized,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(read_denied.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn source_sync_maps_version_cursor_and_secret_failures() {
+        let svc = service();
+        let namespace = "sync-failures";
+        let producer = "connector/github-primary";
+        grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+
+        let mut unknown_version =
+            source_batch(namespace, producer, "", "cursor:ignored", "batch-version");
+        unknown_version.contract_version = "sekai.source-batch/v2".into();
+        redigest_source_batch(&mut unknown_version);
+        let version_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(unknown_version),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(version_error.code(), tonic::Code::FailedPrecondition);
+        assert!(!version_error.message().contains("v2"));
+
+        let mut unbound_revision =
+            source_batch(namespace, producer, "", "cursor:ignored", "batch-unbound");
+        unbound_revision.type_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        redigest_source_batch(&mut unbound_revision);
+        let revision_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(unbound_revision),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(revision_error.code(), tonic::Code::FailedPrecondition);
+        assert!(!revision_error.message().contains("sha256"));
+
+        let lookup_error = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(lookup_error.code(), tonic::Code::FailedPrecondition);
+
+        let first = source_batch(namespace, producer, "", "cursor:1", "batch-1");
+        svc.apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest { batch: Some(first) },
+            producer,
+        ))
+        .await
+        .unwrap();
+
+        let mut source_revision_conflict = source_batch(
+            namespace,
+            producer,
+            "cursor:1",
+            "cursor:blocked",
+            "batch-revision-conflict",
+        );
+        source_revision_conflict.records[0].payload_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
+        redigest_source_batch(&mut source_revision_conflict);
+        let source_revision_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(source_revision_conflict),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            source_revision_error.code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(!source_revision_error.message().contains("cccc"));
+
+        let stale = source_batch(
+            namespace,
+            producer,
+            "cursor:foreign",
+            "cursor:2",
+            "batch-stale",
+        );
+        let cursor_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest { batch: Some(stale) },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(cursor_error.code(), tonic::Code::Aborted);
+        assert!(!cursor_error.message().contains("foreign"));
+
+        let mut secret = source_batch(namespace, producer, "cursor:1", "cursor:2", "batch-secret");
+        secret.records[0]
+            .properties
+            .insert("access_token".into(), "redacted".into());
+        redigest_source_batch(&mut secret);
+        let secret_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(secret),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(secret_error.code(), tonic::Code::InvalidArgument);
+        assert!(!secret_error.message().contains("access_token"));
     }
 
     fn widget_schema_type() -> ObjectType {

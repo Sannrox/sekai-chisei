@@ -25,6 +25,7 @@
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
+    "sekai.object-sync",
     "sekai.ontology-definitions",
     "sekai.reconciliation",
     "sekai.retention",

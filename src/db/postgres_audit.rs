@@ -208,7 +208,7 @@ impl PostgresDb {
     }
 }
 
-fn lock_object_lifecycle(
+pub(crate) fn lock_object_lifecycle(
     transaction: &mut postgres::Transaction<'_>,
     object_id: &str,
 ) -> Result<(), String> {
@@ -230,7 +230,7 @@ fn validate_namespace_identity(object: &Object) -> Result<(), String> {
     Ok(())
 }
 
-fn insert_changes(
+pub(crate) fn insert_changes(
     transaction: &mut postgres::Transaction<'_>,
     changes: &[ObjectChange],
 ) -> Result<(), String> {

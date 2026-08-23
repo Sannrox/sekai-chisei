@@ -1,4 +1,4 @@
-# External evidence reference adapters
+# External reference adapters
 
 Discovery of built-in adapter profiles and families is available through gRPC
 `SekaiService.ListEvidenceAdapters` and
@@ -24,7 +24,7 @@ the Sekai core:
   outside the control plane; see
   [social-evidence-adapters.md](../docs/social-evidence-adapters.md).
 
-All three use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
+The evidence adapters use `sdk.rs` to build the canonical `sekai.evidence/v1` envelope, calculate
 the content digest and replay key, persist the exact delivery in a durable local
 outbox, and call `SubmitEvidence`. Unknown-outcome retries reload the same
 envelope and idempotency key; a returned Sekai result acknowledges the outbox
@@ -90,6 +90,68 @@ cargo run --example evidence_social_reply \
 
 Conformance fixtures live in `adapters/fixtures/` and run without network access
 through `cargo test --test evidence_adapters`.
+
+## GitHub object sync
+
+`github_object_sync.rs` is the fixed source adapter for normalized GitHub Issue
+and PullRequest fixtures. It is not an evidence adapter and does not appear in
+`ListEvidenceAdapters`. Issues and pull requests share the repository number
+identity `github:<owner>/<repository>#<number>`. The normalizer rejects other
+kinds, foreign repositories, invalid revisions or numbers, secret-like
+properties, raw/unknown fixture fields, and oversized input.
+The content digest excludes `observed_at_ms`, so polling the same immutable
+source revision later does not manufacture a source-content conflict.
+
+`object_sync_sdk.rs` builds and serializes `sekai.source-batch/v1`. Its local
+outbox writes the exact normalized batch under a cross-process lock with
+no-replace publication and directory fsync before calling a transport. The SDK
+accepts only the code-owned `sekai.source-type-revision/v1` GitHub
+Issue/PullRequest digest
+`sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
+Replay order is deterministic, and only one distinct unresolved batch may
+exist for a namespace/source-instance/type-revision binding; exact re-enqueue
+remains idempotent.
+Unknown delivery outcomes and mismatched commit replies stay pending; only an
+exact committed batch digest, idempotency key, and checkpoint cursor remove an
+entry. Rejected batches may move to a bounded quarantine with a value-free
+reason code. The SDK has no credential or bearer-metadata fields and persists
+neither source payload bodies nor remote response bodies.
+
+A transport maps the dependency-light callbacks to
+`SekaiService.ApplySourceBatch` and `SekaiService.GetSourceSyncState`:
+
+```rust
+let record = github_object_sync::translate(fixture, "sannrox/sekai-chisei")?;
+let batch = object_sync_sdk::build_source_batch(
+    &config,
+    &committed_cursor,
+    &proposed_cursor,
+    collected_at_ms,
+    vec![record],
+)?;
+let outbox = object_sync_sdk::SourceOutbox::open(
+    "data/source-adapter-outbox",
+    object_sync_sdk::OutboxLimits::default(),
+)?;
+outbox.enqueue(&batch)?;                 // durable write before RPC
+outbox.flush(&mut rpc_transport, true)?; // callback applies the source batch
+let state = rpc_transport.get_source_sync_state(
+    &object_sync_sdk::GetSourceSyncStateInput {
+        namespace: config.namespace.clone(),
+        source_instance: config.source_instance.clone(),
+        type_digest: config.type_digest.clone(),
+    },
+)?;
+```
+
+The surrounding process injects authentication into its RPC client in memory;
+it must not pass credentials to the adapter config or outbox. Snapshot,
+change-feed, and webhook collection transports remain separate follow-up work.
+Offline conformance runs through:
+
+```sh
+cargo test --test object_sync_adapters
+```
 
 Authorized consumers can inspect one admitted submission by ID through
 `GetEvidenceSubmission`. The response is bounded metadata and lifecycle

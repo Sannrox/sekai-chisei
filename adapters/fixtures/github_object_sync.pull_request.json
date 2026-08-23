@@ -1,0 +1,14 @@
+{
+  "repository": "sannrox/sekai-chisei",
+  "kind": "PullRequest",
+  "number": 665,
+  "revision": "PR_kwDOTF6jc86-source-sync-v4",
+  "title": "Publish the bounded connector SDK",
+  "state": "open",
+  "deleted": false,
+  "observed_at_ms": 1787510460000,
+  "properties": {
+    "author": "Sannrox",
+    "draft": "false"
+  }
+}

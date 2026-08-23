@@ -64,6 +64,32 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ApplySourceBatch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/object_sync_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetSourceSyncState",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/object_sync_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "CreateObject",
       "kind": "persistent",
       "surfaces": [
@@ -1222,6 +1248,7 @@
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
+    "sekai.object-sync",
     "sekai.ontology-definitions",
     "sekai.reconciliation",
     "sekai.retention",
@@ -1248,6 +1275,7 @@
     "tests/evidence_backend_conformance.rs",
     "tests/graph_backend_conformance.rs",
     "tests/guarded_mutation_backend_conformance.rs",
+    "tests/object_sync_backend_conformance.rs",
     "tests/retention_dedup_backend_conformance.rs",
     "tests/reusable_sekai_backend_conformance.rs",
     "tests/sekai_postgres_inventory_conformance.rs",

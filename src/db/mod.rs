@@ -27,6 +27,7 @@ pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;
 pub mod lease;
+pub mod object_sync;
 pub mod ontology;
 mod peer_import_store;
 #[cfg(test)]
@@ -59,6 +60,7 @@ mod postgres_guarded_mutation;
 mod postgres_handoff;
 mod postgres_kioku;
 mod postgres_lease;
+mod postgres_object_sync;
 mod postgres_objects;
 mod postgres_ontology;
 mod postgres_portfolio;
