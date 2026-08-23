@@ -1925,12 +1925,7 @@ fn evaluation_cancellation_event(
 }
 
 fn evaluation_cancellation_requested(receipt: &OperationReceipt) -> bool {
-    receipt.events.iter().any(|event| {
-        event
-            .attributes
-            .get("evaluation_cancel_requested")
-            .is_some_and(|value| value == "true")
-    })
+    evaluation_execution_domain::cancellation_requested(receipt)
 }
 
 fn order_parent_event_id(
@@ -1949,67 +1944,7 @@ fn evaluation_projection_from_receipt(
     index: &evaluation_execution_domain::EvaluationExecutionIndex,
     receipt: &OperationReceipt,
 ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, String> {
-    if receipt.operation_id != index.operation_id
-        || receipt.namespace != index.namespace
-        || receipt.operation_class != evaluation_execution_domain::EXECUTION_OPERATION_CLASS
-    {
-        return Err("evaluation execution receipt binding is invalid".into());
-    }
-    let mut steps = receipt
-        .events
-        .iter()
-        .filter_map(|event| event.attributes.get("evaluation_step_receipt"))
-        .map(|json| {
-            serde_json::from_str::<evaluation_execution_domain::EvaluationStepReceipt>(json)
-                .map_err(|error| format!("invalid evaluation step receipt: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    steps.sort_by(|left, right| left.node_id.cmp(&right.node_id));
-    let decision = receipt
-        .events
-        .iter()
-        .find_map(|event| event.attributes.get("evaluation_gate_decision"))
-        .map(|json| {
-            serde_json::from_str::<evaluation_execution_domain::EvaluationGateDecision>(json)
-                .map_err(|error| format!("invalid evaluation gate decision: {error}"))
-        })
-        .transpose()?;
-    let cancellation_requested = evaluation_cancellation_requested(receipt);
-    if let Some(decision) = &decision
-        && (decision.reason_code == evaluation_execution_domain::REASON_EXECUTION_CANCELLED)
-            != cancellation_requested
-    {
-        return Err("evaluation cancellation and terminal decision are inconsistent".into());
-    }
-    let status = decision
-        .as_ref()
-        .map(|decision| decision.verdict.clone())
-        .unwrap_or_else(|| {
-            if cancellation_requested {
-                evaluation_execution_domain::STATUS_CANCELLED.into()
-            } else {
-                evaluation_execution_domain::STATUS_RUNNING.into()
-            }
-        });
-    let projection = evaluation_execution_domain::EvaluationExecutionProjection {
-        manifest_digest: manifest.manifest_digest.clone(),
-        operation_id: index.operation_id.clone(),
-        namespace: index.namespace.clone(),
-        status,
-        steps,
-        decision,
-    };
-    evaluation_execution_domain::validate_projection(manifest, &projection)?;
-    if projection.decision.is_some() {
-        let completeness = receipt.completeness();
-        if !completeness.complete {
-            return Err(format!(
-                "terminal evaluation receipt is incomplete: {:?}",
-                completeness.errors
-            ));
-        }
-    }
-    Ok(projection)
+    evaluation_execution_domain::projection_from_receipt(manifest, index, receipt)
 }
 
 fn map_evaluation_resource_error(error: String) -> Status {
@@ -7528,6 +7463,21 @@ mod tests {
             event.kind == ReceiptEventKind::OutcomeRecorded
                 && event.attributes.contains_key("evaluation_gate_decision")
         }));
+        let quality = crate::quality_trend::query_quality_trends(
+            &svc.db,
+            "local",
+            "acme",
+            receipt.started_at_ms.saturating_sub(1),
+            receipt
+                .completed_at_ms
+                .unwrap_or(receipt.started_at_ms)
+                .saturating_add(1),
+        )
+        .unwrap();
+        assert_eq!(quality.totals.evaluation_receipts, 1);
+        assert_eq!(quality.totals.valid_executions, 1);
+        assert_eq!(quality.totals.allow, 1);
+        assert_eq!(quality.totals.baseline_missing, 1);
     }
 
     #[tokio::test]
@@ -7592,6 +7542,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cancellation.actor, "first-writer");
+        let quality = crate::quality_trend::query_quality_trends(
+            &svc.db,
+            "local",
+            "acme",
+            receipt.started_at_ms.saturating_sub(1),
+            receipt.started_at_ms.saturating_add(1),
+        )
+        .unwrap();
+        assert_eq!(quality.totals.cancelled, 1);
+        assert_eq!(quality.totals.partial_executions, 1);
+        assert_eq!(quality.totals.allow, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

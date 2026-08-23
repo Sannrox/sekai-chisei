@@ -202,6 +202,11 @@ Retention must preserve every referenced definition, manifest, evidence item,
 and receipt for as long as the execution or a downstream governed decision is
 retained. Physical deletion is not a v1 API.
 
+The read-only [evaluation quality trend](evaluation-quality-trends.md)
+projection reconstructs these receipts into authorized quality, variance,
+regression, and exact-baseline series. It adds no analytics table and never
+changes an execution verdict.
+
 Rollback stops new execution RPC traffic or deploys a prior server containing
 the required compiled implementation. It does not edit immutable manifests or
 receipts. Partially completed receipts remain resumable by a compatible

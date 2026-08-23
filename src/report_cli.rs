@@ -8,10 +8,13 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report substitution --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
+    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report quality --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report substitution --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
 }
 
 pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
+    if args.first().is_some_and(|arg| arg == "quality") {
+        return quality_report(&args[1..]);
+    }
     if args.first().is_some_and(|arg| arg == "substitution") {
         return substitution_report(&args[1..]);
     }
@@ -55,6 +58,42 @@ pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
         println!("{json}");
     } else {
         print!("{}", render_report(&report));
+    }
+    Ok(())
+}
+
+fn quality_report(args: &[String]) -> Result<(), BoxErr> {
+    let namespace = flag(args, "--namespace")
+        .ok_or_else(|| std::io::Error::other("--namespace is required"))?;
+    let since_ms = flag(args, "--since-ms")
+        .ok_or_else(|| std::io::Error::other("--since-ms is required"))?
+        .parse::<i64>()?;
+    let until_ms = flag(args, "--until-ms")
+        .ok_or_else(|| std::io::Error::other("--until-ms is required"))?
+        .parse::<i64>()?;
+    let config = crate::config::Config::from_env();
+    let backend_config = crate::runtime_backend::RuntimeBackendConfig::from_env(&config.db_path)
+        .map_err(std::io::Error::other)?;
+    let backend = crate::runtime_backend::RuntimeBackend::initialize(backend_config)
+        .map_err(std::io::Error::other)?;
+    let database = backend.database();
+    let principal = report_principal(args, database.as_ref())?;
+    let report = crate::quality_trend::query_quality_trends(
+        database.as_ref(),
+        &principal,
+        &namespace,
+        since_ms,
+        until_ms,
+    )
+    .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(output) = flag(args, "--output") {
+        std::fs::write(&output, format!("{json}\n"))?;
+        println!("created {output}");
+    } else if args.iter().any(|arg| arg == "--json") {
+        println!("{json}");
+    } else {
+        print!("{}", render_quality_report(&report));
     }
     Ok(())
 }
@@ -136,6 +175,64 @@ fn report_principal(
         .into());
     }
     Ok(authenticated.principal)
+}
+
+fn render_quality_report(report: &crate::quality_trend::QualityTrendReport) -> String {
+    let totals = &report.totals;
+    let mut out = format!(
+        "namespace: {}\nwindow: [{}..{})\nauthority: {}\nsemantic_digest: {}\nreceipts_scanned: {}\nevaluation_receipts: {}\nbaseline_history_receipts: {}\nbaseline_history_valid_executions: {}\nbaseline_history_missing_dependencies: {}\nbaseline_history_invalid_executions: {}\nvalid_executions: {}\nmissing_dependencies: {}\ninvalid_executions: {}\nallow: {}\ndeny: {}\nunknown: {}\nunavailable: {}\ncancelled: {}\nrunning: {}\npartial_executions: {}\nlow_sample_populations: {}\nbaseline_compared: {}\nbaseline_missing: {}\nbaseline_incomparable: {}\nregressed: {}\nimproved: {}\nunchanged: {}\n",
+        text_value(&report.namespace),
+        report.since_ms,
+        report.until_ms,
+        text_value(&report.authority),
+        text_value(&report.semantic_digest),
+        totals.receipts_scanned,
+        totals.evaluation_receipts,
+        totals.baseline_history_receipts,
+        totals.baseline_history_valid_executions,
+        totals.baseline_history_missing_dependencies,
+        totals.baseline_history_invalid_executions,
+        totals.valid_executions,
+        totals.missing_dependencies,
+        totals.invalid_executions,
+        totals.allow,
+        totals.deny,
+        totals.unknown,
+        totals.unavailable,
+        totals.cancelled,
+        totals.running,
+        totals.partial_executions,
+        totals.stochastic_low_sample_populations,
+        totals.baseline_compared,
+        totals.baseline_missing,
+        totals.baseline_incomparable,
+        totals.regressed,
+        totals.improved,
+        totals.unchanged,
+    );
+    for series in &report.series {
+        out.push_str(&format!(
+            "series: node={} provider={} model={} agent={} points={}\n",
+            text_value(&series.key.node_id),
+            text_value(&series.key.provider),
+            text_value(&series.key.model),
+            text_value(&series.key.agent),
+            series.points.len(),
+        ));
+        for point in &series.points {
+            out.push_str(&format!(
+                "  point: operation={} at={} execution={} step={} population={} baseline={} regression={}\n",
+                text_value(&point.operation_id),
+                point.evaluation_time_ms,
+                text_value(&point.execution_status),
+                text_value(&point.step_status),
+                text_value(&point.population_state),
+                text_value(&point.baseline_state),
+                text_value(&point.regression),
+            ));
+        }
+    }
+    out
 }
 
 fn render_substitution_report(report: &crate::substitution_report::SubstitutionReport) -> String {
@@ -538,6 +635,33 @@ mod tests {
             attest_args(vec!["verify".into(), "bundle.json".into()]).unwrap(),
             vec!["verify", "bundle.json"]
         );
+    }
+
+    #[test]
+    fn quality_report_usage_and_empty_state_are_explicit() {
+        assert!(usage().contains("sekaictl report quality"));
+        let report = crate::quality_trend::QualityTrendReport {
+            version: crate::quality_trend::QUALITY_TREND_VERSION.into(),
+            source_receipt_version: "operation.receipt/v1".into(),
+            authority: "canonical_operation_receipt".into(),
+            namespace: "acme\nallow: 999".into(),
+            since_ms: 1,
+            until_ms: 2,
+            totals: Default::default(),
+            series: vec![],
+            semantic_digest: "sha256:test".into(),
+        };
+        let rendered = render_quality_report(&report);
+        assert!(rendered.contains(r#"namespace: "acme\nallow: 999""#));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("allow:"))
+                .count(),
+            1
+        );
+        assert!(rendered.contains("evaluation_receipts: 0"));
+        assert!(rendered.contains("baseline_missing: 0"));
     }
 
     #[test]

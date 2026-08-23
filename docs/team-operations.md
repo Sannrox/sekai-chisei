@@ -1,5 +1,29 @@
 # Team operations
 
+## Evaluation quality trend report
+
+Project authorized model and agent quality evidence from canonical evaluation
+receipts:
+
+```sh
+sekaictl report quality \
+  --namespace acme \
+  --since-ms 1783900800000 \
+  --until-ms 1784505600000 \
+  --json \
+  --output reports/acme-quality.json
+```
+
+The report keeps allow, deny, unknown, unavailable, cancelled, running,
+partial-population, missing-dependency, and invalid-receipt states distinct.
+Its totals reconcile to the selected receipt window. Baselines require an
+earlier closed point with the same exact evaluator and canonical input digest,
+including the subject revision, direct evidence, dependency results, and
+population contract; otherwise the baseline is explicitly missing or
+incomparable. See
+[Evaluation quality trends](evaluation-quality-trends.md) for denominator,
+freshness, redaction, recovery, retention, and rollback semantics.
+
 ## Lookup-first substitution report
 
 Inspect realized lookup-first and model-path evidence from the configured local

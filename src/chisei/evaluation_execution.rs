@@ -18,6 +18,7 @@ use crate::chisei::evaluation_plan::{
     NODE_REQUIRED, STOCHASTIC_EXECUTION_CLASS, StochasticEvaluatorPolicy,
     validate_runtime_adapter_endpoint,
 };
+use crate::chisei::receipt::OperationReceipt;
 use base64::Engine as _;
 use futures_util::FutureExt;
 use hmac::{Hmac, Mac};
@@ -1013,6 +1014,84 @@ pub struct EvaluationExecutionIndex {
     pub executor_version: String,
     pub started_by: String,
     pub created_at_ms: i64,
+}
+
+pub fn cancellation_requested(receipt: &OperationReceipt) -> bool {
+    receipt.events.iter().any(|event| {
+        event
+            .attributes
+            .get("evaluation_cancel_requested")
+            .is_some_and(|value| value == "true")
+    })
+}
+
+/// Reconstruct one execution exclusively from its canonical receipt and
+/// immutable manifest/index bindings.
+pub fn projection_from_receipt(
+    manifest: &ResolvedEvaluationManifest,
+    index: &EvaluationExecutionIndex,
+    receipt: &OperationReceipt,
+) -> Result<EvaluationExecutionProjection, String> {
+    if receipt.operation_id != index.operation_id
+        || receipt.namespace != index.namespace
+        || receipt.operation_class != EXECUTION_OPERATION_CLASS
+    {
+        return Err("evaluation execution receipt binding is invalid".into());
+    }
+    let mut steps = receipt
+        .events
+        .iter()
+        .filter_map(|event| event.attributes.get("evaluation_step_receipt"))
+        .map(|json| {
+            serde_json::from_str::<EvaluationStepReceipt>(json)
+                .map_err(|error| format!("invalid evaluation step receipt: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    steps.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    let decision = receipt
+        .events
+        .iter()
+        .find_map(|event| event.attributes.get("evaluation_gate_decision"))
+        .map(|json| {
+            serde_json::from_str::<EvaluationGateDecision>(json)
+                .map_err(|error| format!("invalid evaluation gate decision: {error}"))
+        })
+        .transpose()?;
+    let cancellation_requested = cancellation_requested(receipt);
+    if let Some(decision) = &decision
+        && (decision.reason_code == REASON_EXECUTION_CANCELLED) != cancellation_requested
+    {
+        return Err("evaluation cancellation and terminal decision are inconsistent".into());
+    }
+    let status = decision
+        .as_ref()
+        .map(|decision| decision.verdict.clone())
+        .unwrap_or_else(|| {
+            if cancellation_requested {
+                STATUS_CANCELLED.into()
+            } else {
+                STATUS_RUNNING.into()
+            }
+        });
+    let projection = EvaluationExecutionProjection {
+        manifest_digest: manifest.manifest_digest.clone(),
+        operation_id: index.operation_id.clone(),
+        namespace: index.namespace.clone(),
+        status,
+        steps,
+        decision,
+    };
+    validate_projection(manifest, &projection)?;
+    if projection.decision.is_some() {
+        let completeness = receipt.completeness();
+        if !completeness.complete {
+            return Err(format!(
+                "terminal evaluation receipt is incomplete: {:?}",
+                completeness.errors
+            ));
+        }
+    }
+    Ok(projection)
 }
 
 #[derive(Debug, Clone, PartialEq)]
