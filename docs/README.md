@@ -57,6 +57,8 @@ If you want to deploy or operate the control plane:
   content-bound pre-execution inputs and historical replay.
 - [Evaluation execution](evaluation-execution.md) — bounded,
   receipt-authoritative deterministic and stochastic execution.
+- [Evaluation quality trends](evaluation-quality-trends.md) — authorized,
+  receipt-reconciled quality, variance, regression, and baseline projections.
 - [Evaluation gate evidence](evaluation-gate-evidence.md) — server-owned,
   digest-bound, bounded evidence for release gates.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
