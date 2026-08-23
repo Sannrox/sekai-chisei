@@ -265,40 +265,63 @@ impl SourceOutbox {
         let _lock = self.lock_exclusive()?;
         let mut report = FlushReport::default();
         for batch in self.pending()? {
-            let key = batch.idempotency_key.clone();
-            match transport.apply_source_batch(&batch) {
-                Ok(ApplySourceBatchReply::Committed {
-                    idempotency_key,
-                    batch_digest,
-                    committed_cursor,
-                }) if idempotency_key == batch.idempotency_key
-                    && batch_digest == batch.batch_digest
-                    && committed_cursor == batch.proposed_next_cursor =>
-                {
-                    self.remove_pending(&batch.idempotency_key)?;
-                    report.entries.push(FlushEntry {
-                        idempotency_key: key,
-                        disposition: FlushDisposition::Committed,
-                    });
-                }
-                Ok(ApplySourceBatchReply::Rejected { reason_code }) if quarantine_rejections => {
-                    self.quarantine(&batch, normalize_reason_code(&reason_code))?;
-                    report.entries.push(FlushEntry {
-                        idempotency_key: key,
-                        disposition: FlushDisposition::Quarantined,
-                    });
-                }
-                Ok(ApplySourceBatchReply::Rejected { .. })
-                | Ok(ApplySourceBatchReply::Committed { .. })
-                | Err(_) => {
-                    report.entries.push(FlushEntry {
-                        idempotency_key: key,
-                        disposition: FlushDisposition::Pending,
-                    });
-                }
-            }
+            report.entries.push(self.flush_batch_locked(
+                &batch,
+                transport,
+                quarantine_rejections,
+            )?);
         }
         Ok(report)
+    }
+
+    /// Deliver one exact pending entry without touching other source bindings.
+    pub fn flush_idempotency_key<T: SourceSyncTransport>(
+        &self,
+        idempotency_key: &str,
+        transport: &mut T,
+        quarantine_rejections: bool,
+    ) -> Result<FlushEntry, String> {
+        validate_outbox_key(idempotency_key)?;
+        let _lock = self.lock_exclusive()?;
+        let path = self.pending_path(idempotency_key);
+        if !path.exists() {
+            return Err("source outbox entry does not exist".into());
+        }
+        let batch = self.read_pending(&path)?;
+        self.flush_batch_locked(&batch, transport, quarantine_rejections)
+    }
+
+    fn flush_batch_locked<T: SourceSyncTransport>(
+        &self,
+        batch: &SourceBatch,
+        transport: &mut T,
+        quarantine_rejections: bool,
+    ) -> Result<FlushEntry, String> {
+        let idempotency_key = batch.idempotency_key.clone();
+        let disposition = match transport.apply_source_batch(batch) {
+            Ok(ApplySourceBatchReply::Committed {
+                idempotency_key,
+                batch_digest,
+                committed_cursor,
+            }) if idempotency_key == batch.idempotency_key
+                && batch_digest == batch.batch_digest
+                && committed_cursor == batch.proposed_next_cursor =>
+            {
+                self.remove_pending(&batch.idempotency_key)?;
+                FlushDisposition::Committed
+            }
+            Ok(ApplySourceBatchReply::Rejected { reason_code }) if quarantine_rejections => {
+                self.quarantine(batch, normalize_reason_code(&reason_code))?;
+                FlushDisposition::Quarantined
+            }
+            Ok(ApplySourceBatchReply::Rejected { .. })
+            | Ok(ApplySourceBatchReply::Committed { .. })
+            | Err(_) => FlushDisposition::Pending,
+        };
+        Ok(FlushEntry {
+            idempotency_key,
+            disposition,
+        })
     }
 
     fn lock_exclusive(&self) -> Result<OutboxLock, String> {

@@ -200,6 +200,8 @@ GitHub object-sync adapter supported by this release. It names
 Issue/PullRequest record kinds. It also publishes the only code-owned v1 type
 revision, `sekai.source-type-revision/v1` at digest
 `sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
+The adapter SDK can resume bounded snapshot pages from the plane-owned opaque
+checkpoint without adding a third RPC or another catalog contract.
 This is static integration metadata, not an
 authorization grant, plugin marketplace, native capability entry, provider
 profile, or evidence adapter. Live RPC authentication, namespace access, source

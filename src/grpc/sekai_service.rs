@@ -7094,12 +7094,12 @@ mod tests {
         let namespace = "sync-authorized";
         let producer = "connector/github-primary";
         grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
-        let batch = source_batch(namespace, producer, "", "cursor:1", "batch-1");
+        let page_1 = source_batch(namespace, producer, "", "cursor:1", "batch-1");
 
         let first = svc
             .apply_source_batch(with_named_principal(
                 ApplySourceBatchRequest {
-                    batch: Some(batch.clone()),
+                    batch: Some(page_1.clone()),
                 },
                 producer,
             ))
@@ -7120,8 +7120,75 @@ mod tests {
         assert_eq!(lineage.object_id, object.object_id);
         assert_eq!(lineage.source_id, object.source_id);
         assert_eq!(object.properties["title"], "Bounded sync");
+        let object_id = object.object_id.clone();
 
-        let mut replay = batch;
+        let page_1_state = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(page_1_state.found);
+        let page_1_state = page_1_state.state.unwrap();
+        let page_1_cursor = page_1_state.checkpoint.as_ref().unwrap().cursor.clone();
+        assert_eq!(page_1_cursor, "cursor:1");
+        assert!(page_1_state.open_transaction.is_none());
+        assert_eq!(page_1_state.last_result.unwrap(), first);
+
+        let mut page_2 = source_batch(namespace, producer, &page_1_cursor, "cursor:2", "batch-2");
+        page_2.collected_at_ms = 30;
+        page_2.records[0].source_version = "node-v2".into();
+        page_2.records[0].payload_digest =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
+        page_2.records[0].display_name = "Bounded sync, page 2".into();
+        page_2.records[0]
+            .properties
+            .insert("title".into(), "Bounded sync, page 2".into());
+        page_2.records[0].observed_at_ms = 20;
+        redigest_source_batch(&mut page_2);
+
+        let second = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(page_2),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(second.checkpoint_advanced);
+        let second_object = second.records[0].object.as_ref().unwrap();
+        assert_eq!(second_object.object_id, object_id);
+        assert_eq!(second_object.source_version, "node-v2");
+        assert_eq!(second_object.properties["title"], "Bounded sync, page 2");
+
+        let page_2_state = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .state
+            .unwrap();
+        assert_eq!(page_2_state.checkpoint.as_ref().unwrap().cursor, "cursor:2");
+        assert_eq!(page_2_state.last_result.as_ref(), Some(&second));
+
+        let mut replay = page_1;
         replay.collected_at_ms += 1_000;
         let replayed = svc
             .apply_source_batch(with_named_principal(
@@ -7137,7 +7204,7 @@ mod tests {
             .unwrap();
         assert_eq!(replayed, first);
 
-        let state = svc
+        let state_after_older_replay = svc
             .get_source_sync_state(with_named_principal(
                 GetSourceSyncStateRequest {
                     namespace: namespace.into(),
@@ -7148,12 +7215,14 @@ mod tests {
             ))
             .await
             .unwrap()
-            .into_inner();
-        assert!(state.found);
-        let state = state.state.unwrap();
-        assert_eq!(state.checkpoint.unwrap().cursor, "cursor:1");
-        assert!(state.open_transaction.is_none());
-        assert_eq!(state.last_result.unwrap(), first);
+            .into_inner()
+            .state
+            .unwrap();
+        assert_eq!(
+            state_after_older_replay.checkpoint.as_ref().unwrap().cursor,
+            "cursor:2"
+        );
+        assert_eq!(state_after_older_replay.last_result.as_ref(), Some(&second));
     }
 
     #[tokio::test]
@@ -7163,6 +7232,59 @@ mod tests {
         let producer = "connector/github-primary";
         grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
         let batch = source_batch(namespace, producer, "", "cursor:1", "batch-1");
+        let viewer = "connector/github-viewer";
+        let boundary_id = svc
+            .db
+            .find_namespace_boundary(namespace)
+            .unwrap()
+            .unwrap()
+            .id;
+        grant_object_role(&svc, &boundary_id, viewer, security::Role::Viewer);
+
+        let viewer_state = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                viewer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!viewer_state.found);
+
+        let viewer_batch = source_batch(
+            namespace,
+            viewer,
+            "",
+            "cursor:viewer",
+            "batch-viewer-denied",
+        );
+        let viewer_denied = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(viewer_batch),
+                },
+                viewer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(viewer_denied.code(), tonic::Code::PermissionDenied);
+        let viewer_state_after_denial = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                viewer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!viewer_state_after_denial.found);
 
         let anonymous = svc
             .apply_source_batch(Request::new(ApplySourceBatchRequest {
@@ -7228,6 +7350,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(read_denied.code(), tonic::Code::PermissionDenied);
+
+        let editor_result = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest { batch: Some(batch) },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(editor_result.transaction.unwrap().status, "COMMITTED");
+        assert!(editor_result.checkpoint_advanced);
+
+        let viewer_state_after_commit = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                viewer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(viewer_state_after_commit.found);
+        assert_eq!(
+            viewer_state_after_commit
+                .state
+                .unwrap()
+                .checkpoint
+                .unwrap()
+                .cursor,
+            "cursor:1"
+        );
     }
 
     #[tokio::test]
@@ -7284,14 +7442,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(lookup_error.code(), tonic::Code::FailedPrecondition);
+        assert!(!lookup_error.message().contains("aaaa"));
+
+        let empty_state = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!empty_state.found);
 
         let first = source_batch(namespace, producer, "", "cursor:1", "batch-1");
-        svc.apply_source_batch(with_named_principal(
-            ApplySourceBatchRequest { batch: Some(first) },
-            producer,
-        ))
-        .await
-        .unwrap();
+        let first_result = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest { batch: Some(first) },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
 
         let mut source_revision_conflict = source_batch(
             namespace,
@@ -7351,6 +7528,29 @@ mod tests {
             .unwrap_err();
         assert_eq!(secret_error.code(), tonic::Code::InvalidArgument);
         assert!(!secret_error.message().contains("access_token"));
+
+        let state_after_failures = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .state
+            .unwrap();
+        assert_eq!(
+            state_after_failures.checkpoint.as_ref().unwrap().cursor,
+            "cursor:1"
+        );
+        assert_eq!(
+            state_after_failures.last_result.as_ref(),
+            Some(&first_result)
+        );
     }
 
     fn widget_schema_type() -> ObjectType {

@@ -25,6 +25,43 @@ The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
 perform no GitHub network requests.
 
+## Checkpointed snapshots
+
+The reference snapshot runner pages a bounded source snapshot through the same
+batch contract. It does not add a snapshot RPC or persistence schema, and the
+control plane never decodes snapshot cursors:
+
+1. Flush an exact pending outbox page before collecting anything new.
+2. Stop as `pending` when delivery is unavailable or ambiguous. A later
+   invocation must replay that exact persisted page.
+3. Call `GetSourceSyncState` and pass only its committed opaque cursor to the
+   page source. Local page counters are not resume authority.
+4. Refuse new collection when the plane reports an `OPEN` transaction but the
+   outbox has no exact page to replay; this is `recovery_required`.
+5. Normalize a non-empty page, persist it, and apply it. Only an exact committed
+   response followed by state whose checkpoint cursor and committed batch digest
+   match that page permits the next page. A historical exact replay is not
+   current checkpoint advancement.
+6. Return `in_progress` at the configured page bound. Return `complete` only
+   after the final non-empty page commits, or when a restarted source confirms
+   that an already committed final cursor has no later page.
+
+One invocation processes at most 32 pages by default, and every page remains
+subject to the 500-record batch maximum. The page source may lower either
+bound. A next cursor must be non-empty, different from the current cursor, and
+pass the existing cursor bounds and secret-like-text checks. Invalid pages fail
+before outbox publication. A cursor copied from another binding is still
+foreign or stale under the plane's exact binding-local checkpoint comparison.
+When one outbox contains multiple bindings, the runner flushes only the exact
+pending entry for its configured binding.
+
+The final page commits a non-empty opaque cursor just like every other page;
+there is no empty completion batch. An empty source has no durable completion
+representation in version 1. Snapshot completion does not imply
+tombstone-by-absence: deletions must remain explicit `deleted: true` records.
+Across pages, a later revision of the same source identity refreshes the same
+derived object id.
+
 ## Batch contract
 
 A batch binds one namespace, authenticated producer, source instance, adapter
@@ -144,13 +181,16 @@ backup instead of deleting or editing individual sync rows.
 Retain committed batch/result and identity/lineage evidence while the projected
 object or downstream decisions remain retained. The current retention runner
 does not independently purge object-sync tables.
+Snapshot pages have no separate retention or rollback unit. Restore the graph,
+source-sync tables, and final checkpoint from the same database snapshot, then
+let the adapter resume from that restored plane-owned cursor.
 
 ## Non-goals
 
-Webhook, snapshot, and change-feed collection remain separate transports into
-this contract. This foundation adds no pipeline, transform language, plugin
-runtime, connector marketplace, credential store, unrestricted write-back, or
-second source.
+Webhook and change-feed collection remain separate transports into this
+contract. Checkpointed snapshots add no pipeline, transform language, plugin
+runtime, connector marketplace, credential store, tombstone-by-absence,
+unrestricted write-back, or second source.
 
 Governed functions and computed properties do not write derived objects onto a
 type revision and must not invent a sync source id. See

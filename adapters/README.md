@@ -117,6 +117,27 @@ entry. Rejected batches may move to a bounded quarantine with a value-free
 reason code. The SDK has no credential or bearer-metadata fields and persists
 neither source payload bodies nor remote response bodies.
 
+`object_sync_snapshot.rs` adds bounded snapshot paging without changing the
+source-batch wire contract. A credential-free page source receives only the
+last plane-committed opaque cursor and returns normalized records, a proposed
+opaque next cursor, collection time, and local completion knowledge. The runner
+first replays any exact pending outbox page, then reads
+`GetSourceSyncState`; it never resumes from an in-memory page number.
+
+An unavailable or ambiguous apply remains `pending`. A server-side `OPEN`
+transaction without a matching durable outbox page is `recovery_required`, not
+success. The runner stops as `in_progress` at its configured page bound and
+reports `complete` only after a final non-empty page commits or a restarted page
+source confirms an already committed final cursor. It rejects an empty page, a
+non-advancing cursor, records above the configured or 500-record bound, and any
+cursor rejected by the existing source-batch validation before publication.
+Snapshot completion does not tombstone absent records.
+After an exact committed reply, the runner re-reads plane state and requires
+both the checkpoint cursor and committed batch digest to match that page. This
+prevents an old exact replay in a cursor cycle from being mistaken for new
+progress. A shared outbox is safe across bindings because snapshot recovery
+flushes only the configured binding's exact idempotency key.
+
 A transport maps the dependency-light callbacks to
 `SekaiService.ApplySourceBatch` and `SekaiService.GetSourceSyncState`:
 
@@ -144,9 +165,28 @@ let state = rpc_transport.get_source_sync_state(
 )?;
 ```
 
+For a paged snapshot, the surrounding adapter implements
+`object_sync_snapshot::SnapshotPageSource` and runs:
+
+```rust
+let outcome = object_sync_snapshot::run_snapshot(
+    &config,
+    &outbox,
+    &mut rpc_transport,
+    &mut page_source,
+    object_sync_snapshot::SnapshotRunLimits::default(),
+)?;
+```
+
+Call the runner again after `in_progress` or once pending transport state can be
+retried. Keep the same outbox directory across restarts. `recovery_required`
+needs the exact missing normalized page or database repair from authoritative
+evidence; the adapter must not skip the open transaction.
+
 The surrounding process injects authentication into its RPC client in memory;
-it must not pass credentials to the adapter config or outbox. Snapshot,
-change-feed, and webhook collection transports remain separate follow-up work.
+it must not pass credentials to the adapter config, page source output, or
+outbox. Change-feed and webhook collection transports remain separate follow-up
+work.
 Offline conformance runs through:
 
 ```sh
