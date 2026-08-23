@@ -43,9 +43,9 @@ pub fn built_in_source_adapters() -> Vec<SourceAdapterProfile> {
             .collect(),
         apply_rpc: "SekaiService.ApplySourceBatch".into(),
         state_rpc: "SekaiService.GetSourceSyncState".into(),
-        description:
-            "GitHub Issue and PullRequest records mapped onto one repository number identity."
-                .into(),
+        description: "GitHub Issue and PullRequest records mapped onto one repository number \
+                      identity with opaque-checkpoint snapshot paging."
+            .into(),
     }]
 }
 

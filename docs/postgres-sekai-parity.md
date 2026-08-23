@@ -11,7 +11,9 @@ or are explicit computed/query paths with named durable dependencies. The
 reusable `sekai.object-sync` surface and public `ApplySourceBatch` and
 `GetSourceSyncState` RPCs also have shared conformance for source binding,
 durable batch transactions, identities, results, graph/audit application, and
-plane-owned checkpoints.
+plane-owned checkpoints. The same backend harness covers two-page snapshot
+resume, cross-page stable object identity, old-page replay, stale cursors, and
+foreign binding isolation.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
@@ -45,7 +47,7 @@ Evidence is checked in as:
 | #259 | Action policy and approval |
 | #261–#265 | Guarded mutations, definition lifecycle, decisions, team namespaces |
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
-| #665 | Bounded source-batch object sync and checkpoint transactions |
+| #665, #671 | Bounded source-batch transactions and checkpointed snapshot paging |
 
 ## Still outside this parent
 

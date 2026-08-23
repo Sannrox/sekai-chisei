@@ -1,0 +1,14 @@
+{
+  "repository": "sannrox/sekai-chisei",
+  "kind": "Issue",
+  "number": 672,
+  "revision": "I_kwDOTF6jc86-change-feed-v1",
+  "title": "Admit ordered source change feeds",
+  "state": "open",
+  "deleted": false,
+  "observed_at_ms": 1787511001000,
+  "properties": {
+    "author": "Sannrox",
+    "locked": "false"
+  }
+}

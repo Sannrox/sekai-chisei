@@ -1,0 +1,14 @@
+{
+  "repository": "sannrox/sekai-chisei",
+  "kind": "Issue",
+  "number": 671,
+  "revision": "I_kwDOTF6jc86-snapshot-v2",
+  "title": "Admit checkpointed batch snapshots",
+  "state": "closed",
+  "deleted": false,
+  "observed_at_ms": 1787511060000,
+  "properties": {
+    "author": "Sannrox",
+    "locked": "false"
+  }
+}

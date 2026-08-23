@@ -4,14 +4,20 @@ mod github_object_sync;
 mod object_sync_conformance;
 #[path = "../adapters/object_sync_sdk.rs"]
 mod object_sync_sdk;
+#[path = "../adapters/object_sync_snapshot.rs"]
+mod object_sync_snapshot;
 
 use object_sync_sdk::{
     ApplySourceBatchReply, GetSourceSyncStateInput, OutboxLimits, SourceAdapterConfig,
     SourceOutbox, SourceSyncStateView, SourceSyncTransport, TransportFailure, build_source_batch,
     serialize_source_batch,
 };
+use object_sync_snapshot::{
+    SnapshotPage, SnapshotPageSource, SnapshotRead, SnapshotRunError, SnapshotRunLimits,
+    SnapshotRunOutcome, SnapshotSourceFailure, run_snapshot,
+};
 use sekai_chisei::sekai::object_sync::{GITHUB_OBJECT_SYNC_TYPE_DIGEST, SourceBatch, SourceRecord};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
@@ -42,6 +48,36 @@ fn issue() -> SourceRecord {
         "sannrox/sekai-chisei",
     )
     .unwrap()
+}
+
+fn snapshot_record(input: &[u8]) -> SourceRecord {
+    github_object_sync::translate(
+        github_object_sync::parse(input).unwrap(),
+        "sannrox/sekai-chisei",
+    )
+    .unwrap()
+}
+
+fn snapshot_page_one() -> Vec<SourceRecord> {
+    vec![
+        snapshot_record(include_bytes!(
+            "../adapters/fixtures/github_object_sync.snapshot.page1.issue-671.json"
+        )),
+        snapshot_record(include_bytes!(
+            "../adapters/fixtures/github_object_sync.snapshot.page1.issue-672.json"
+        )),
+    ]
+}
+
+fn snapshot_page_two() -> Vec<SourceRecord> {
+    vec![
+        snapshot_record(include_bytes!(
+            "../adapters/fixtures/github_object_sync.snapshot.page2.issue-671.json"
+        )),
+        snapshot_record(include_bytes!(
+            "../adapters/fixtures/github_object_sync.snapshot.page2.pull-request-673.json"
+        )),
+    ]
 }
 
 fn batch(records: Vec<SourceRecord>) -> SourceBatch {
@@ -78,6 +114,134 @@ impl SourceSyncTransport for ScriptedTransport {
         _input: &GetSourceSyncStateInput,
     ) -> Result<SourceSyncStateView, TransportFailure> {
         self.state.clone().ok_or(TransportFailure::Unavailable)
+    }
+}
+
+struct ScriptedPageSource {
+    reads: VecDeque<(Option<String>, Result<SnapshotRead, SnapshotSourceFailure>)>,
+    observed: Vec<Option<String>>,
+}
+
+impl Default for ScriptedPageSource {
+    fn default() -> Self {
+        Self::new(std::iter::empty())
+    }
+}
+
+impl ScriptedPageSource {
+    fn new(
+        reads: impl IntoIterator<
+            Item = (
+                Option<&'static str>,
+                Result<SnapshotRead, SnapshotSourceFailure>,
+            ),
+        >,
+    ) -> Self {
+        Self {
+            reads: reads
+                .into_iter()
+                .map(|(cursor, result)| (cursor.map(str::to_string), result))
+                .collect(),
+            observed: Vec::new(),
+        }
+    }
+}
+
+impl SnapshotPageSource for ScriptedPageSource {
+    fn read_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        _max_records: usize,
+    ) -> Result<SnapshotRead, SnapshotSourceFailure> {
+        self.observed.push(committed_cursor.map(ToOwned::to_owned));
+        let (expected_cursor, result) = self
+            .reads
+            .pop_front()
+            .expect("unexpected snapshot page read");
+        assert_eq!(committed_cursor, expected_cursor.as_deref());
+        result
+    }
+}
+
+struct CheckpointTransport {
+    state: SourceSyncStateView,
+    failures: VecDeque<TransportFailure>,
+    applied: Vec<SourceBatch>,
+    committed: HashMap<String, (String, ApplySourceBatchReply)>,
+    state_reads: usize,
+}
+
+impl Default for CheckpointTransport {
+    fn default() -> Self {
+        Self {
+            state: SourceSyncStateView {
+                found: false,
+                current_cursor: None,
+                open_transaction: false,
+                last_committed_batch_digest: None,
+            },
+            failures: VecDeque::new(),
+            applied: Vec::new(),
+            committed: HashMap::new(),
+            state_reads: 0,
+        }
+    }
+}
+
+impl SourceSyncTransport for CheckpointTransport {
+    fn apply_source_batch(
+        &mut self,
+        batch: &SourceBatch,
+    ) -> Result<ApplySourceBatchReply, TransportFailure> {
+        self.applied.push(batch.clone());
+        if let Some(failure) = self.failures.pop_front() {
+            return Err(failure);
+        }
+        if let Some((batch_digest, reply)) = self.committed.get(&batch.idempotency_key) {
+            return if batch_digest == &batch.batch_digest {
+                Ok(reply.clone())
+            } else {
+                Ok(ApplySourceBatchReply::Rejected {
+                    reason_code: "idempotency_conflict".into(),
+                })
+            };
+        }
+        let expected_cursor = self.state.current_cursor.as_deref().unwrap_or_default();
+        if (!self.state.found && !batch.current_cursor.is_empty())
+            || (self.state.found && batch.current_cursor != expected_cursor)
+        {
+            return Ok(ApplySourceBatchReply::Rejected {
+                reason_code: if self.state.found {
+                    "stale_cursor".into()
+                } else {
+                    "foreign_cursor".into()
+                },
+            });
+        }
+        self.state = SourceSyncStateView {
+            found: true,
+            current_cursor: Some(batch.proposed_next_cursor.clone()),
+            open_transaction: false,
+            last_committed_batch_digest: Some(batch.batch_digest.clone()),
+        };
+        let reply = ApplySourceBatchReply::Committed {
+            idempotency_key: batch.idempotency_key.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            committed_cursor: batch.proposed_next_cursor.clone(),
+        };
+        self.committed.insert(
+            batch.idempotency_key.clone(),
+            (batch.batch_digest.clone(), reply.clone()),
+        );
+        Ok(reply)
+    }
+
+    fn get_source_sync_state(
+        &mut self,
+        _input: &GetSourceSyncStateInput,
+    ) -> Result<SourceSyncStateView, TransportFailure> {
+        self.state_reads += 1;
+        Ok(self.state.clone())
     }
 }
 
@@ -321,6 +485,468 @@ fn outbox_enforces_file_and_entry_bounds() {
     .unwrap();
     assert!(tiny.enqueue(&first).unwrap_err().contains("byte limit"));
     std::fs::remove_dir_all(tiny_root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_pages_from_plane_state_and_preserves_cross_page_identity() {
+    let root = temporary_root("snapshot-pages");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let page_one_cursor = "opaque:snapshot-a:page-1";
+    let complete_cursor = "opaque:snapshot-a:complete";
+    let mut source = ScriptedPageSource::new([
+        (
+            None,
+            Ok(SnapshotRead::Page(SnapshotPage {
+                records: snapshot_page_one(),
+                proposed_next_cursor: page_one_cursor.into(),
+                collected_at_ms: 1_787_511_100_000,
+                complete: false,
+            })),
+        ),
+        (
+            Some(page_one_cursor),
+            Ok(SnapshotRead::Page(SnapshotPage {
+                records: snapshot_page_two(),
+                proposed_next_cursor: complete_cursor.into(),
+                collected_at_ms: 1_787_511_160_000,
+                complete: true,
+            })),
+        ),
+    ]);
+    let mut transport = CheckpointTransport::default();
+
+    let outcome = run_snapshot(
+        &config(),
+        &outbox,
+        &mut transport,
+        &mut source,
+        SnapshotRunLimits {
+            max_pages_per_run: 4,
+            max_records_per_page: 2,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        SnapshotRunOutcome::Complete {
+            pages_committed: 2,
+            committed_cursor: complete_cursor.into(),
+        }
+    );
+    object_sync_conformance::assert_snapshot_chain(&transport.applied).unwrap();
+    object_sync_conformance::assert_cross_page_identity(
+        &transport.applied[0],
+        &transport.applied[1],
+        "github:sannrox/sekai-chisei#671",
+    )
+    .unwrap();
+    assert_eq!(source.observed, [None, Some(page_one_cursor.to_string())]);
+    assert_eq!(
+        transport.state.current_cursor.as_deref(),
+        Some(complete_cursor)
+    );
+    assert!(transport.state_reads >= 2);
+    assert!(outbox.pending().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_restart_uses_durable_plane_checkpoint_not_local_page_state() {
+    let root = temporary_root("snapshot-checkpoint-restart");
+    let page_one_cursor = "opaque:snapshot-b:page-1";
+    let complete_cursor = "opaque:snapshot-b:complete";
+    let mut transport = CheckpointTransport::default();
+    let mut first_process = ScriptedPageSource::new([(
+        None,
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: snapshot_page_one(),
+            proposed_next_cursor: page_one_cursor.into(),
+            collected_at_ms: 1_787_511_100_000,
+            complete: false,
+        })),
+    )]);
+    let first_outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let first = run_snapshot(
+        &config(),
+        &first_outbox,
+        &mut transport,
+        &mut first_process,
+        SnapshotRunLimits {
+            max_pages_per_run: 1,
+            max_records_per_page: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        first,
+        SnapshotRunOutcome::InProgress {
+            pages_committed: 1,
+            committed_cursor: Some(page_one_cursor.into()),
+        }
+    );
+    drop(first_outbox);
+
+    let restarted_outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut restarted_process = ScriptedPageSource::new([(
+        Some(page_one_cursor),
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: snapshot_page_two(),
+            proposed_next_cursor: complete_cursor.into(),
+            collected_at_ms: 1_787_511_160_000,
+            complete: true,
+        })),
+    )]);
+    let restarted = run_snapshot(
+        &config(),
+        &restarted_outbox,
+        &mut transport,
+        &mut restarted_process,
+        SnapshotRunLimits {
+            max_pages_per_run: 1,
+            max_records_per_page: 2,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        restarted,
+        SnapshotRunOutcome::Complete {
+            pages_committed: 1,
+            committed_cursor: complete_cursor.into(),
+        }
+    );
+    assert_eq!(
+        restarted_process.observed,
+        [Some(page_one_cursor.to_string())]
+    );
+    object_sync_conformance::assert_snapshot_chain(&transport.applied).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_retains_ambiguous_page_and_replays_it_before_collecting_more() {
+    let root = temporary_root("snapshot-ambiguous");
+    let complete_cursor = "opaque:snapshot-c:complete";
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut source = ScriptedPageSource::new([(
+        None,
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: snapshot_page_one(),
+            proposed_next_cursor: complete_cursor.into(),
+            collected_at_ms: 1_787_511_100_000,
+            complete: true,
+        })),
+    )]);
+    let mut transport = CheckpointTransport {
+        failures: VecDeque::from([TransportFailure::Ambiguous]),
+        ..Default::default()
+    };
+    let pending = run_snapshot(
+        &config(),
+        &outbox,
+        &mut transport,
+        &mut source,
+        SnapshotRunLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        pending,
+        SnapshotRunOutcome::Pending {
+            pages_committed: 0,
+            committed_cursor: None,
+        }
+    );
+    assert_eq!(outbox.pending().unwrap().len(), 1);
+    drop(outbox);
+
+    let restarted_outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut restarted_source =
+        ScriptedPageSource::new([(Some(complete_cursor), Ok(SnapshotRead::Complete))]);
+    let complete = run_snapshot(
+        &config(),
+        &restarted_outbox,
+        &mut transport,
+        &mut restarted_source,
+        SnapshotRunLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        complete,
+        SnapshotRunOutcome::Complete {
+            pages_committed: 0,
+            committed_cursor: complete_cursor.into(),
+        }
+    );
+    assert_eq!(transport.applied.len(), 2);
+    assert_eq!(
+        transport.applied[0].batch_digest,
+        transport.applied[1].batch_digest
+    );
+    assert!(restarted_outbox.pending().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_never_flushes_another_binding_from_a_shared_outbox() {
+    let root = temporary_root("snapshot-binding-scope");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let target_cursor = "opaque:snapshot-target:complete";
+    let target = build_source_batch(
+        &config(),
+        "",
+        target_cursor,
+        1_787_511_100_000,
+        snapshot_page_one(),
+    )
+    .unwrap();
+    outbox.enqueue(&target).unwrap();
+
+    let mut other_config = config();
+    other_config.source_instance = "sannrox/other-repository".into();
+    let mut other_records = snapshot_page_two();
+    for record in &mut other_records {
+        record.source_instance = other_config.source_instance.clone();
+    }
+    let other = build_source_batch(
+        &other_config,
+        "",
+        "opaque:snapshot-other:complete",
+        1_787_511_160_000,
+        other_records,
+    )
+    .unwrap();
+    outbox.enqueue(&other).unwrap();
+
+    let mut transport = CheckpointTransport::default();
+    let mut source = ScriptedPageSource::new([(Some(target_cursor), Ok(SnapshotRead::Complete))]);
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &outbox,
+            &mut transport,
+            &mut source,
+            SnapshotRunLimits::default(),
+        )
+        .unwrap(),
+        SnapshotRunOutcome::Complete {
+            pages_committed: 0,
+            committed_cursor: target_cursor.into(),
+        }
+    );
+    assert_eq!(transport.applied.as_slice(), std::slice::from_ref(&target));
+    assert_eq!(outbox.pending().unwrap(), [other]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_does_not_treat_historical_replay_as_checkpoint_advance() {
+    let root = temporary_root("snapshot-historical-replay");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let cursor_a = "opaque:snapshot-cycle:a";
+    let cursor_b = "opaque:snapshot-cycle:b";
+    let mut transport = CheckpointTransport::default();
+    let mut initial_source = ScriptedPageSource::new([
+        (
+            None,
+            Ok(SnapshotRead::Page(SnapshotPage {
+                records: snapshot_page_one(),
+                proposed_next_cursor: cursor_a.into(),
+                collected_at_ms: 1_787_511_100_000,
+                complete: false,
+            })),
+        ),
+        (
+            Some(cursor_a),
+            Ok(SnapshotRead::Page(SnapshotPage {
+                records: snapshot_page_two(),
+                proposed_next_cursor: cursor_b.into(),
+                collected_at_ms: 1_787_511_160_000,
+                complete: false,
+            })),
+        ),
+    ]);
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &outbox,
+            &mut transport,
+            &mut initial_source,
+            SnapshotRunLimits {
+                max_pages_per_run: 2,
+                max_records_per_page: 2,
+            },
+        )
+        .unwrap(),
+        SnapshotRunOutcome::InProgress {
+            pages_committed: 2,
+            committed_cursor: Some(cursor_b.into()),
+        }
+    );
+
+    let mut cycle_records = snapshot_page_one();
+    for record in &mut cycle_records {
+        record.source_version.push_str("-cycle");
+        record.payload_digest = format!("sha256:{}", "d".repeat(64));
+    }
+    let cycle = build_source_batch(
+        &config(),
+        cursor_b,
+        cursor_a,
+        1_787_511_220_000,
+        cycle_records,
+    )
+    .unwrap();
+    assert!(matches!(
+        transport.apply_source_batch(&cycle).unwrap(),
+        ApplySourceBatchReply::Committed { .. }
+    ));
+    assert_eq!(transport.state.current_cursor.as_deref(), Some(cursor_a));
+
+    let mut replayed_source = ScriptedPageSource::new([(
+        Some(cursor_a),
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: snapshot_page_two(),
+            proposed_next_cursor: cursor_b.into(),
+            collected_at_ms: 1_787_511_160_000,
+            complete: true,
+        })),
+    )]);
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &outbox,
+            &mut transport,
+            &mut replayed_source,
+            SnapshotRunLimits::default(),
+        )
+        .unwrap(),
+        SnapshotRunOutcome::RecoveryRequired {
+            pages_committed: 0,
+            committed_cursor: Some(cursor_a.into()),
+        }
+    );
+    assert_eq!(transport.state.current_cursor.as_deref(), Some(cursor_a));
+    assert!(outbox.pending().unwrap().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_fails_closed_for_open_foreign_and_invalid_progress() {
+    let open_root = temporary_root("snapshot-open");
+    let open_outbox = SourceOutbox::open(&open_root, OutboxLimits::default()).unwrap();
+    let mut open_transport = CheckpointTransport {
+        state: SourceSyncStateView {
+            found: true,
+            current_cursor: Some("opaque:snapshot-d:page-1".into()),
+            open_transaction: true,
+            last_committed_batch_digest: Some(format!("sha256:{}", "a".repeat(64))),
+        },
+        ..Default::default()
+    };
+    let mut unread = ScriptedPageSource::default();
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &open_outbox,
+            &mut open_transport,
+            &mut unread,
+            SnapshotRunLimits::default(),
+        )
+        .unwrap(),
+        SnapshotRunOutcome::RecoveryRequired {
+            pages_committed: 0,
+            committed_cursor: Some("opaque:snapshot-d:page-1".into()),
+        }
+    );
+    assert!(unread.observed.is_empty());
+    std::fs::remove_dir_all(open_root).unwrap();
+
+    let foreign_root = temporary_root("snapshot-foreign");
+    let foreign_outbox = SourceOutbox::open(&foreign_root, OutboxLimits::default()).unwrap();
+    let mut foreign_transport = CheckpointTransport {
+        state: SourceSyncStateView {
+            found: false,
+            current_cursor: Some("opaque:copied-from-another-binding".into()),
+            open_transaction: false,
+            last_committed_batch_digest: None,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &foreign_outbox,
+            &mut foreign_transport,
+            &mut unread,
+            SnapshotRunLimits::default(),
+        )
+        .unwrap(),
+        SnapshotRunOutcome::RecoveryRequired {
+            pages_committed: 0,
+            committed_cursor: Some("opaque:copied-from-another-binding".into()),
+        }
+    );
+    assert!(foreign_transport.applied.is_empty());
+    std::fs::remove_dir_all(foreign_root).unwrap();
+
+    let invalid_root = temporary_root("snapshot-invalid");
+    let invalid_outbox = SourceOutbox::open(&invalid_root, OutboxLimits::default()).unwrap();
+    let mut invalid_transport = CheckpointTransport::default();
+    let mut invalid_source = ScriptedPageSource::new([(
+        None,
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: snapshot_page_one(),
+            proposed_next_cursor: "ghp_not-a-checkpoint".into(),
+            collected_at_ms: 1_787_511_100_000,
+            complete: false,
+        })),
+    )]);
+    assert_eq!(
+        run_snapshot(
+            &config(),
+            &invalid_outbox,
+            &mut invalid_transport,
+            &mut invalid_source,
+            SnapshotRunLimits::default(),
+        )
+        .unwrap_err(),
+        SnapshotRunError::InvalidPage
+    );
+    assert!(invalid_transport.applied.is_empty());
+    assert!(invalid_outbox.pending().unwrap().is_empty());
+    std::fs::remove_dir_all(invalid_root).unwrap();
+}
+
+#[test]
+fn snapshot_runner_distinguishes_source_unavailable_from_invalid_input() {
+    for (failure, expected) in [
+        (
+            SnapshotSourceFailure::Unavailable,
+            SnapshotRunError::SourceUnavailable,
+        ),
+        (
+            SnapshotSourceFailure::Invalid,
+            SnapshotRunError::InvalidPage,
+        ),
+    ] {
+        let root = temporary_root("snapshot-source-failure");
+        let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+        let mut transport = CheckpointTransport::default();
+        let mut source = ScriptedPageSource::new([(None, Err(failure))]);
+        assert_eq!(
+            run_snapshot(
+                &config(),
+                &outbox,
+                &mut transport,
+                &mut source,
+                SnapshotRunLimits::default(),
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert!(transport.applied.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

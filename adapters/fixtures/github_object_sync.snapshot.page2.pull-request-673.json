@@ -1,0 +1,14 @@
+{
+  "repository": "sannrox/sekai-chisei",
+  "kind": "PullRequest",
+  "number": 673,
+  "revision": "PR_kwDOTF6jc86-webhook-v1",
+  "title": "Admit authenticated source webhooks",
+  "state": "open",
+  "deleted": false,
+  "observed_at_ms": 1787511061000,
+  "properties": {
+    "author": "Sannrox",
+    "draft": "false"
+  }
+}

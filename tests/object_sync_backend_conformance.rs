@@ -6,15 +6,18 @@ use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_VERSION, SOURCE_GITHUB,
-    SourceBatch, SourceBatchStatus, SourceRecord, SyncDecision,
+    SourceBatch, SourceBatchStatus, SourceRecord, SourceSyncState, SyncDecision,
 };
 
 const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
+const SOURCE_INSTANCE: &str = "sekai-project/sekai-chisei";
 const PAYLOAD_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const REFRESHED_PAYLOAD_DIGEST: &str =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 fn batch(prefix: &str, current_cursor: &str, next_cursor: &str, key: &str) -> SourceBatch {
-    let source_instance = format!("{prefix}/ops");
+    let source_instance = SOURCE_INSTANCE.to_string();
     let mut batch = SourceBatch {
         contract_version: SOURCE_BATCH_VERSION.into(),
         namespace: format!("{prefix}-namespace"),
@@ -55,33 +58,29 @@ fn redigest(batch: &mut SourceBatch) {
 }
 
 fn checkpoint(db: &dyn ObjectSyncBackend, prefix: &str) -> Option<String> {
-    db.get_source_sync_state(
-        &format!("{prefix}-namespace"),
-        &format!("{prefix}/ops"),
-        TYPE_DIGEST,
-    )
-    .unwrap()
-    .and_then(|state| state.checkpoint.map(|checkpoint| checkpoint.cursor))
+    source_sync_state(db, prefix)
+        .and_then(|state| state.checkpoint.map(|checkpoint| checkpoint.cursor))
+}
+
+fn source_sync_state(db: &dyn ObjectSyncBackend, prefix: &str) -> Option<SourceSyncState> {
+    db.get_source_sync_state(&format!("{prefix}-namespace"), SOURCE_INSTANCE, TYPE_DIGEST)
+        .unwrap()
 }
 
 fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     let producer = format!("connector/{prefix}");
-    let first_batch = batch(prefix, "", "cursor:1", "batch-1");
-    let first = db.apply_source_batch(&first_batch, &producer, 100).unwrap();
-    assert_eq!(first.transaction.status, SourceBatchStatus::Committed);
-    assert_eq!(first.transaction.outcome, OperationOutcome::Success);
-    assert!(first.checkpoint_advanced);
-    let object_id = match &first.records[0].decision {
+    let page_one_batch = batch(prefix, "", "cursor:1", "snapshot-page-1");
+    let page_one = db
+        .apply_source_batch(&page_one_batch, &producer, 100)
+        .unwrap();
+    assert_eq!(page_one.transaction.status, SourceBatchStatus::Committed);
+    assert_eq!(page_one.transaction.outcome, OperationOutcome::Success);
+    assert!(page_one.checkpoint_advanced);
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
+    let object_id = match &page_one.records[0].decision {
         SyncDecision::Upsert(object) => object.object_id.clone(),
         other => panic!("expected upsert, got {other:?}"),
     };
-
-    let mut replay = first_batch.clone();
-    replay.collected_at_ms += 1_000;
-    assert_eq!(
-        db.apply_source_batch(&replay, &producer, 200).unwrap(),
-        first
-    );
 
     let mut revision_conflict = batch(
         prefix,
@@ -89,8 +88,7 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
         "cursor:blocked",
         "batch-revision-conflict",
     );
-    revision_conflict.records[0].payload_digest =
-        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
+    revision_conflict.records[0].payload_digest = REFRESHED_PAYLOAD_DIGEST.into();
     redigest(&mut revision_conflict);
     assert!(
         db.apply_source_batch(&revision_conflict, &producer, 300)
@@ -99,29 +97,84 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
 
-    let same_revision = batch(prefix, "cursor:1", "cursor:2", "batch-same-revision");
-    let same_revision_result = db
-        .apply_source_batch(&same_revision, &producer, 400)
+    let mut page_two_batch = batch(prefix, "cursor:1", "cursor:2", "snapshot-page-2");
+    page_two_batch.records[0].source_version = "node-v2".into();
+    page_two_batch.records[0].display_name = "Bounded sync refreshed".into();
+    page_two_batch.records[0].payload_digest = REFRESHED_PAYLOAD_DIGEST.into();
+    page_two_batch.records[0]
+        .properties
+        .insert("state".into(), "closed".into());
+    page_two_batch.records[0]
+        .properties
+        .insert("title".into(), "Bounded sync refreshed".into());
+    redigest(&mut page_two_batch);
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
+    let page_two = db
+        .apply_source_batch(&page_two_batch, &producer, 400)
         .unwrap();
-    assert_eq!(
-        same_revision_result.records[0].source_version,
-        first.records[0].source_version
-    );
+    assert_eq!(page_two.transaction.status, SourceBatchStatus::Committed);
+    assert_eq!(page_two.transaction.outcome, OperationOutcome::Success);
+    assert!(page_two.checkpoint_advanced);
+    let refreshed = match &page_two.records[0].decision {
+        SyncDecision::Upsert(object) => object,
+        other => panic!("expected refreshed upsert, got {other:?}"),
+    };
+    assert_eq!(refreshed.object_id, object_id);
+    assert_eq!(refreshed.source_id, "github:sekai-project/sekai-chisei#12");
+    assert_eq!(refreshed.source_version, "node-v2");
+    assert_eq!(refreshed.payload_digest, REFRESHED_PAYLOAD_DIGEST);
+    assert_eq!(refreshed.properties["state"], "closed");
+    assert_eq!(refreshed.properties["title"], "Bounded sync refreshed");
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:2"));
+    let page_two_state = source_sync_state(db, prefix).unwrap();
+    assert_eq!(
+        page_two_state
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.committed_batch_digest.as_str()),
+        Some(page_two_batch.batch_digest.as_str())
+    );
+    assert_eq!(page_two_state.last_result.as_ref(), Some(&page_two));
 
-    let stale = batch(prefix, "cursor:foreign", "cursor:3", "batch-stale");
+    let mut page_one_replay = page_one_batch.clone();
+    page_one_replay.collected_at_ms += 1_000;
+    assert_eq!(
+        db.apply_source_batch(&page_one_replay, &producer, 500)
+            .unwrap(),
+        page_one
+    );
+    assert_eq!(source_sync_state(db, prefix).unwrap(), page_two_state);
+
+    let stale = batch(prefix, "cursor:1", "cursor:3", "stale-page");
     assert!(
-        db.apply_source_batch(&stale, &producer, 500)
+        db.apply_source_batch(&stale, &producer, 600)
             .unwrap_err()
             .starts_with("stale_cursor:")
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:2"));
+    assert_eq!(source_sync_state(db, prefix).unwrap(), page_two_state);
 
-    let mut tombstone = batch(prefix, "cursor:2", "cursor:3", "batch-2");
+    let empty_prefix = format!("{prefix}-empty-binding");
+    let empty_producer = format!("connector/{empty_prefix}");
+    let copied_cursor = page_two_state.checkpoint.as_ref().unwrap().cursor.clone();
+    let foreign = batch(
+        &empty_prefix,
+        &copied_cursor,
+        "cursor:foreign-next",
+        "foreign-cursor",
+    );
+    assert!(
+        db.apply_source_batch(&foreign, &empty_producer, 700)
+            .unwrap_err()
+            .starts_with("foreign_cursor:")
+    );
+    assert!(source_sync_state(db, &empty_prefix).is_none());
+
+    let mut tombstone = batch(prefix, "cursor:2", "cursor:3", "batch-tombstone");
     tombstone.records[0].deleted = true;
-    tombstone.records[0].source_version = "node-v2".into();
+    tombstone.records[0].source_version = "node-v3".into();
     redigest(&mut tombstone);
-    let tombstone_result = db.apply_source_batch(&tombstone, &producer, 600).unwrap();
+    let tombstone_result = db.apply_source_batch(&tombstone, &producer, 800).unwrap();
     let tombstoned = match &tombstone_result.records[0].decision {
         SyncDecision::Tombstone(object) => object,
         other => panic!("expected tombstone, got {other:?}"),
@@ -129,23 +182,19 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     assert_eq!(tombstoned.object_id, object_id);
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:3"));
 
-    let mut conflict = batch(prefix, "cursor:3", "cursor:4", "batch-3");
+    let mut conflict = batch(prefix, "cursor:3", "cursor:4", "batch-type-conflict");
     conflict.records[0].type_name = "PullRequest".into();
-    conflict.records[0].source_version = "node-v3".into();
+    conflict.records[0].source_version = "node-v4".into();
     redigest(&mut conflict);
     assert!(
-        db.apply_source_batch(&conflict, &producer, 700)
+        db.apply_source_batch(&conflict, &producer, 900)
             .unwrap_err()
             .starts_with("type_identity_conflict:")
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:3"));
 
     let state = db
-        .get_source_sync_state(
-            &format!("{prefix}-namespace"),
-            &format!("{prefix}/ops"),
-            TYPE_DIGEST,
-        )
+        .get_source_sync_state(&format!("{prefix}-namespace"), SOURCE_INSTANCE, TYPE_DIGEST)
         .unwrap()
         .unwrap();
     assert_eq!(state.binding.producer_identity, producer);

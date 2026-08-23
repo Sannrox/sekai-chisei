@@ -15,6 +15,46 @@ pub fn assert_deterministic_batch(first: &SourceBatch, second: &SourceBatch) -> 
     Ok(())
 }
 
+pub fn assert_snapshot_chain(batches: &[SourceBatch]) -> Result<(), String> {
+    if batches.is_empty() || !batches[0].current_cursor.is_empty() {
+        return Err("snapshot chain did not start without a committed checkpoint".into());
+    }
+    for pair in batches.windows(2) {
+        if pair[0].proposed_next_cursor != pair[1].current_cursor {
+            return Err("snapshot page did not resume from the prior committed cursor".into());
+        }
+        if pair[0].idempotency_key == pair[1].idempotency_key
+            || pair[0].batch_digest == pair[1].batch_digest
+        {
+            return Err("distinct snapshot pages reused batch identity".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn assert_cross_page_identity(
+    first: &SourceBatch,
+    second: &SourceBatch,
+    source_id: &str,
+) -> Result<(), String> {
+    let first_record = first
+        .records
+        .iter()
+        .find(|record| record.source_id() == source_id)
+        .ok_or_else(|| "snapshot page one is missing the shared source identity".to_string())?;
+    let second_record = second
+        .records
+        .iter()
+        .find(|record| record.source_id() == source_id)
+        .ok_or_else(|| "snapshot page two is missing the shared source identity".to_string())?;
+    if first_record.type_name != second_record.type_name
+        || first_record.source_version == second_record.source_version
+    {
+        return Err("cross-page source identity was not a compatible refresh".into());
+    }
+    Ok(())
+}
+
 pub fn run_restart_and_commit<T: SourceSyncTransport>(
     root: &Path,
     batch: &SourceBatch,
