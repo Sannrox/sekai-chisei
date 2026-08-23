@@ -21,8 +21,8 @@ lives in the separate [research index](research/README.md).
 - [Responses harness profile](responses-harness-profile.md) — supported
   request, streaming, and error behavior.
 - [Examples](../examples/README.md) — runnable, domain-neutral integrations.
-- [External evidence adapters](../adapters/README.md) — versioned evidence
-  submission contract and reference adapters.
+- [External reference adapters](../adapters/README.md) — separate versioned
+  evidence and source-sync contracts, durable outboxes, and offline fixtures.
 - [Social observation evidence adapters](social-evidence-adapters.md) —
   stdin funnel for `social.post_snapshot` and `social.reply`.
 - [Evidence adapter catalog](evidence-adapter-catalog.md) —
@@ -84,8 +84,9 @@ lives in the separate [research index](research/README.md).
   operation correlation.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
-- [Inbound object sync](object-sync.md) — GitHub Issue and PullRequest
-  identity, refresh, tombstone, and the deferred second source.
+- [Inbound object sync](object-sync.md) — authenticated source batches,
+  plane-owned checkpoints, GitHub Issue/PullRequest identity, replay, recovery,
+  tombstones, retention, and rollback.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

@@ -192,6 +192,19 @@ either form of authority.
 
 ## Related capability surfaces
 
+### Source adapter profile
+
+`source_adapter_catalog::built_in_source_adapters` describes the one fixed
+GitHub object-sync adapter supported by this release. It names
+`sekai.source-batch/v1`, `ApplySourceBatch`, `GetSourceSyncState`, and the
+Issue/PullRequest record kinds. It also publishes the only code-owned v1 type
+revision, `sekai.source-type-revision/v1` at digest
+`sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
+This is static integration metadata, not an
+authorization grant, plugin marketplace, native capability entry, provider
+profile, or evidence adapter. Live RPC authentication, namespace access, source
+binding, type revision, cursor, and batch validation still decide every call.
+
 ### MCP and SDK projections
 
 `ProjectedCapability` is the replaceable projection boundary for MCP tools and

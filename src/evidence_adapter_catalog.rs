@@ -105,21 +105,6 @@ pub fn built_in_evidence_adapters() -> Vec<EvidenceAdapterProfile> {
             reference_example: "evidence_social_reply".into(),
             description: "Single social reply observation with untrusted remote text.".into(),
         },
-        EvidenceAdapterProfile {
-            adapter_id: "adapter.github.object_sync".into(),
-            family: "source_control.object_sync".into(),
-            evidence_type: "source_control.object_sync".into(),
-            schema_id: "adapter.github.object_sync".into(),
-            schema_version: "1.0.0".into(),
-            source_type: "github_issue_or_pull_request".into(),
-            signal: "object_sync".into(),
-            delivery: "webhook".into(),
-            requires_expiry: false,
-            reference_example: String::new(),
-            description:
-                "GitHub Issue or PullRequest observation mapped onto a shared type-revision object. Webhook delivery is transport into that identity, not a second source."
-                    .into(),
-        },
     ]
 }
 
@@ -162,10 +147,6 @@ fn family_metadata(family: &str) -> (&'static str, &'static str) {
             "Social observation",
             "Fixed-window post metrics and reply observations.",
         ),
-        "source_control.object_sync" => (
-            "Source-control object sync",
-            "GitHub Issue and PullRequest records upserted onto shared type revisions. No second source; delivery is transport.",
-        ),
         _ => ("Adapter family", "External evidence adapter family."),
     }
 }
@@ -190,8 +171,14 @@ mod tests {
         assert_eq!(ids.len(), adapters.len());
         assert!(ids.contains("adapter.social.post_snapshot"));
         assert!(ids.contains("adapter.social.reply"));
+        assert!(!ids.contains("adapter.github.object_sync"));
         let families = built_in_evidence_adapter_families();
         assert!(families.iter().any(|f| f.family == "social.observation"));
+        assert!(
+            !families
+                .iter()
+                .any(|f| f.family == "source_control.object_sync")
+        );
         let social = families
             .iter()
             .find(|f| f.family == "social.observation")

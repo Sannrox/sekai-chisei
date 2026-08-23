@@ -35,4 +35,5 @@ __pycache__/
 data/logs/
 data/local-credential.json
 data/evidence-adapter-outbox/
+data/source-adapter-outbox/
 docs/plans/

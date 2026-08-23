@@ -46,6 +46,7 @@ const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluatio
 const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0027_governed_subject_provenance.sql");
 const REMOVE_LEGACY_ACTIONS_SCHEMA: &str = include_str!("postgres/0028_remove_legacy_actions.sql");
+const OBJECT_SYNC_SCHEMA: &str = include_str!("postgres/0029_object_sync.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -189,6 +190,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 27,
         name: "remove_legacy_actions",
         sql: REMOVE_LEGACY_ACTIONS_SCHEMA,
+    },
+    Migration {
+        version: 28,
+        name: "object_sync",
+        sql: OBJECT_SYNC_SCHEMA,
     },
 ];
 
@@ -652,6 +658,22 @@ mod tests {
         );
         assert!(!CONTROL_PLANE_SCHEMA.contains("AUTOINCREMENT"));
         assert!(!CONTROL_PLANE_SCHEMA.contains("INSERT OR"));
+        for table in [
+            "sekai_source_bindings",
+            "sekai_source_batch_transactions",
+            "sekai_source_identities",
+            "sekai_source_record_results",
+            "sekai_source_checkpoints",
+        ] {
+            assert!(
+                OBJECT_SYNC_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL object-sync table {table}"
+            );
+        }
+        assert!(OBJECT_SYNC_SCHEMA.contains("status IN ('OPEN', 'COMMITTED', 'ABORTED')"));
+        assert!(OBJECT_SYNC_SCHEMA.contains("outcome IN ('success', 'denial', 'unavailable')"));
+        assert!(!OBJECT_SYNC_SCHEMA.contains("unknown"));
+        assert!(!OBJECT_SYNC_SCHEMA.contains("partial"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
         assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));

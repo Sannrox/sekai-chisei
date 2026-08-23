@@ -7,7 +7,11 @@ PostgreSQL runtime selection is activated by #238.
 
 Most tenant-free `SekaiService` operations required by the public reusable
 runtime have PostgreSQL persistence with shared SQLite/PostgreSQL conformance,
-or are explicit computed/query paths with named durable dependencies.
+or are explicit computed/query paths with named durable dependencies. The
+reusable `sekai.object-sync` surface and public `ApplySourceBatch` and
+`GetSourceSyncState` RPCs also have shared conformance for source binding,
+durable batch transactions, identities, results, graph/audit application, and
+plane-owned checkpoints.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
@@ -41,6 +45,7 @@ Evidence is checked in as:
 | #259 | Action policy and approval |
 | #261–#265 | Guarded mutations, definition lifecycle, decisions, team namespaces |
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
+| #665 | Bounded source-batch object sync and checkpoint transactions |
 
 ## Still outside this parent
 
@@ -56,3 +61,12 @@ SQLite remains the default community backend. Select PostgreSQL with
 plane when you need shared multi-replica authority for the dual-backend
 surfaces above (see [configuration.md](configuration.md) and #238). Prefer
 SQLite when you need the SQLite-only paths listed under Outcome.
+
+Normal CI exercises the object-sync contract against SQLite. Run the ignored
+PostgreSQL conformance and concurrent exact-replay fixtures with an isolated TLS
+database:
+
+```sh
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test --test object_sync_backend_conformance -- --ignored
+```

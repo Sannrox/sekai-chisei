@@ -50,6 +50,7 @@ pub mod runtime_backend;
 pub mod secrets;
 pub mod sekai;
 pub mod shomei;
+pub mod source_adapter_catalog;
 pub mod substitution_report;
 pub mod team_cli;
 pub mod weekly_report;

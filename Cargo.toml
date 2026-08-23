@@ -87,6 +87,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
 sekai-proto = { version = "1.0.0", path = "crates/sekai-proto" }
+fs2 = "0.4.3"
 
 [dev-dependencies]
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
