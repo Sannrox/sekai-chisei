@@ -6,6 +6,7 @@ pub mod chisei;
 pub mod compliance_cli;
 pub mod compliance_export;
 pub mod config;
+pub use sekai_provider::content;
 pub mod federation_cli;
 pub use sekai_provider::cost_estimate;
 pub mod credential_cli;

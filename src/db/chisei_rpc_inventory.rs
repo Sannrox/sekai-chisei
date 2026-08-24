@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = ChiseiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 29);
+        assert_eq!(inventory.entries.len(), 31);
         assert!(inventory.entry("EvaluateGovernedSubject").is_some());
         assert!(inventory.entry("ExportGovernedSubjectProvenance").is_some());
         assert!(
@@ -345,7 +345,9 @@ mod tests {
                 .entry("GetGovernedSubjectProvenanceTrustRoot")
                 .is_none()
         );
-        assert_eq!(inventory.by_kind()["persistent"], 22);
+        assert_eq!(inventory.by_kind()["persistent"], 23);
+        assert!(inventory.entry("PlanContentExecution").is_some());
+        assert!(inventory.entry("ExecuteContentPlanStream").is_some());
         assert!(inventory.entry("GetOperationReceipt").is_some());
         assert!(inventory.entry("GetEvaluationGateEvidence").is_some());
         assert!(inventory.entry("RunLookupFirstPromotionGate").is_some());
@@ -373,7 +375,7 @@ mod tests {
         assert!(inventory.entry("IssueExternalActionPermit").is_none());
         assert!(inventory.entry("RecordGunshiFeedback").is_none());
         let tiers = inventory.by_product_tier();
-        assert_eq!(tiers["core"], 9, "unexpected core chisei pack: {tiers:?}");
+        assert_eq!(tiers["core"], 11, "unexpected core chisei pack: {tiers:?}");
         assert_eq!(
             inventory.entries_for_tier(ProductTier::Core).count(),
             tiers["core"]

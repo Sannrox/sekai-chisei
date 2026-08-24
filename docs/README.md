@@ -23,6 +23,8 @@ If you want to build an agent or SDK integration:
    together with the native [`proto/`](../proto/) contract.
 3. Check the [available-model discovery contract](available-models.md) when the
    integration executes model calls.
+4. Use [bounded content execution](content-execution.md) for ordered text,
+   image, audio, or document descriptors without changing the text RPC.
 
 To connect an existing Codex, Claude Code, OpenAI-compatible, or
 Anthropic-compatible client, use the optional [compatibility gateway](gateway.md).
@@ -49,6 +51,8 @@ If you want to deploy or operate the control plane:
   execution observations, and reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free
   evaluation of externally owned immutable subjects.
+- [Bounded content execution](content-execution.md) — content-specific native
+  planning, transient payload verification, and provider capability denial.
 - [Evaluation plans and evaluator definitions](evaluation-plans.md) —
   situation-specific deterministic and bounded stochastic contracts.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — author,

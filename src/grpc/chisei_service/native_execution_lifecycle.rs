@@ -994,18 +994,18 @@ pub(super) fn record_failed_operation_on(
 }
 
 pub(super) struct FinishStreamedExecution<'a> {
-    db: &'a RuntimeDb,
-    evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
-    request_id: &'a str,
-    namespace: &'a str,
-    enriched_spec: &'a str,
-    resolved_model: &'a str,
-    sampled: bool,
-    sample_rate: f64,
-    sample_reason: &'a str,
-    scoring_enabled: bool,
-    task_class: &'a str,
-    response: &'a PlannedChatResponse,
+    pub(super) db: &'a RuntimeDb,
+    pub(super) evolve_history: &'a Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
+    pub(super) request_id: &'a str,
+    pub(super) namespace: &'a str,
+    pub(super) enriched_spec: &'a str,
+    pub(super) resolved_model: &'a str,
+    pub(super) sampled: bool,
+    pub(super) sample_rate: f64,
+    pub(super) sample_reason: &'a str,
+    pub(super) scoring_enabled: bool,
+    pub(super) task_class: &'a str,
+    pub(super) response: &'a PlannedChatResponse,
 }
 
 pub(super) fn finish_streamed_execution(execution: &FinishStreamedExecution) -> Result<(), String> {

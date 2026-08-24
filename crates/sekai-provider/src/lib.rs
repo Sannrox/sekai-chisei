@@ -1,3 +1,4 @@
+pub mod content;
 pub mod cost_estimate;
 pub mod gateway_contract;
 pub mod gateway_keys;

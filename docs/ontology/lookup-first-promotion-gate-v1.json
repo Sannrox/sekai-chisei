@@ -3,7 +3,7 @@
   "classes": [
     {
       "name": "ChiseiPublicApiV1",
-      "description": "The clean-break Sekai Chisei 1.0 public gRPC surface: 29 Chisei operations. The surface keeps four external-action lifecycle operations, three Gunshi allocation operations, three gateway-coordination operations, and the strict lookup-first promotion gate. Native execution is a PlanExecution -> ExecutePlanStream pipeline with Kioku enrichment and optional Gunshi allocation provenance. Gateway admission is canonicalized in DecideGatewayExecution; standalone budget checks and policy resolution are internal. Evaluation read/analytics facades, plan-backed governed-subject evaluation, operation statistics, and public policy dry-run are removed; receipts remain the authoritative query path.",
+      "description": "The clean-break Sekai Chisei 1.0 public gRPC surface: 31 Chisei operations. The surface keeps four external-action lifecycle operations, three Gunshi allocation operations, three gateway-coordination operations, and the strict lookup-first promotion gate. Native text execution is a PlanExecution -> ExecutePlanStream pipeline with Kioku enrichment and optional Gunshi allocation provenance; bounded ordered content uses the separate PlanContentExecution -> ExecuteContentPlanStream pipeline so older servers fail explicitly. Gateway admission is canonicalized in DecideGatewayExecution; standalone budget checks and policy resolution are internal. Evaluation read/analytics facades, plan-backed governed-subject evaluation, operation statistics, and public policy dry-run are removed; receipts remain the authoritative query path.",
       "superclasses": [],
       "properties": []
     },

@@ -50,6 +50,7 @@ use crate::sekai::governed_facts::{self as governed_fact_domain, GovernedFactTyp
 use crate::sekai::markings;
 
 mod budget_identity;
+mod content_execution;
 mod context_expansion;
 mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
@@ -94,6 +95,7 @@ pub struct ChiseiServiceImpl {
     eval: Arc<EvalStore>,
     portfolio: Arc<PortfolioStore>,
     planned_executions: Arc<Mutex<HashMap<String, CachedExecutionPlan>>>,
+    planned_content_executions: Arc<Mutex<HashMap<String, CachedContentExecutionPlan>>>,
     evolve_history: Arc<Mutex<HashMap<String, crate::chisei::evolve::TaskRecord>>>,
     candidates: Arc<CandidateStore>,
     active_promotions: Arc<ActivePromotions>,
@@ -106,6 +108,12 @@ pub struct ChiseiServiceImpl {
 #[derive(Clone)]
 struct CachedExecutionPlan {
     plan: ExecutionPlan,
+    enterprise_authority: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedContentExecutionPlan {
+    plan: ContentExecutionPlanV1,
     enterprise_authority: Option<String>,
 }
 
@@ -2093,6 +2101,7 @@ impl ChiseiServiceImpl {
             eval,
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
+            planned_content_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
@@ -2166,6 +2175,7 @@ impl ChiseiServiceImpl {
             eval,
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
+            planned_content_executions: Arc::new(Mutex::new(HashMap::new())),
             evolve_history,
             candidates: Arc::new(CandidateStore::new()),
             active_promotions: Arc::new(ActivePromotions::new()),
@@ -2898,6 +2908,9 @@ fn subject_provenance_response(
 impl ChiseiService for ChiseiServiceImpl {
     type ExecutePlanStreamStream =
         Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
+    type ExecuteContentPlanStreamStream = Pin<
+        Box<dyn futures_util::Stream<Item = Result<ExecuteContentPlanStreamEvent, Status>> + Send>,
+    >;
 
     async fn evaluate_governed_subject(
         &self,
@@ -3531,6 +3544,122 @@ impl ChiseiService for ChiseiServiceImpl {
             .ok_or(Status::invalid_argument("plan required"))?;
         let stream = self
             .execute_planned_stream(actor, context, requested_plan)
+            .await?;
+        Ok(Response::new(stream))
+    }
+
+    async fn plan_content_execution(
+        &self,
+        req: Request<PlanContentExecutionRequest>,
+    ) -> Result<Response<PlanContentExecutionResponse>, Status> {
+        let registry = self.refresh_provider_registry_for_resolution().await?;
+        crate::provider_profile::with_provider_registry_snapshot(registry, async {
+            let actor = authenticated_actor(&req);
+            let context = enterprise_authenticated_context(&req)?.cloned();
+            let request = req.into_inner();
+            let mut input = request
+                .input
+                .ok_or_else(|| Status::invalid_argument("content input required"))?;
+            let mut execution = input
+                .execution
+                .take()
+                .ok_or_else(|| Status::invalid_argument("content execution input required"))?;
+            if context.is_some()
+                && (!execution.route_override.trim().is_empty()
+                    || request.gunshi_allocation.is_some())
+            {
+                return Err(Status::permission_denied(
+                    "enterprise execution route override or Gunshi allocation binding denied",
+                ));
+            }
+            require_execution_namespace_access_with_context(
+                &self.db,
+                &self.config,
+                &actor,
+                context.as_ref(),
+                &execution.namespace,
+            )?;
+            let bound_allocation = if let Some(binding) = request.gunshi_allocation {
+                let (bound_input, allocation) = self.bind_gunshi_allocation(execution, binding)?;
+                execution = bound_input;
+                Some(allocation)
+            } else {
+                None
+            };
+            input.execution = Some(execution);
+            let mut plan = self.plan_content_from_input(input, &actor).await?;
+            let execution_plan = plan
+                .execution
+                .as_mut()
+                .ok_or_else(|| Status::internal("content execution plan missing"))?;
+            if let Some(allocation) = bound_allocation {
+                let live_policy_version = self
+                    .policy
+                    .effective_policy(&allocation.plan.namespace)
+                    .map(|policy| policy.version())
+                    .unwrap_or_else(|| "implicit-allow/v1".into());
+                if live_policy_version != allocation.plan.policy_version {
+                    return Err(Status::failed_precondition(
+                        "Gunshi allocation policy changed while planning",
+                    ));
+                }
+                if execution_plan.resolved_runtime != allocation.plan.selection.runtime
+                    || execution_plan.resolved_model != allocation.plan.selection.model
+                {
+                    return Err(Status::failed_precondition(
+                        "live policy or provider state no longer permits the Gunshi allocation",
+                    ));
+                }
+                execution_plan.gunshi_issuance_id = allocation.issuance_id;
+                execution_plan.gunshi_allocation_id = allocation.plan.allocation_id;
+                execution_plan.gunshi_agent_id = allocation.plan.selection.agent_id;
+                execution_plan.gunshi_policy_version = allocation.plan.policy_version;
+                execution_plan.gunshi_input_fingerprint = allocation.plan.input_fingerprint;
+                execution_plan.gunshi_budget_ceiling_usd_micros =
+                    allocation.plan.budget_ceiling_usd_micros;
+                execution_plan.gunshi_max_attempts = allocation.plan.attempts.max_attempts;
+                execution_plan.gunshi_human_review_required =
+                    allocation.plan.verification.human_review_required;
+            }
+            if let Some(plan_input) = &execution_plan.input {
+                self.record_evolve_task(
+                    &plan_input.request_id,
+                    plan_input.namespace.trim(),
+                    &execution_plan.enriched_spec,
+                    if execution_plan.executable {
+                        "planned"
+                    } else {
+                        "failed"
+                    },
+                    plan_input.estimated_tokens,
+                )
+                .map_err(Status::internal)?;
+            }
+            self.record_planned_operation(execution_plan, &actor)
+                .map_err(Status::internal)?;
+            self.cache_content_plan(
+                plan.clone(),
+                enterprise_execution_authority(context.as_ref()),
+            )?;
+            Ok(Response::new(PlanContentExecutionResponse {
+                plan: Some(plan),
+            }))
+        })
+        .await
+    }
+
+    async fn execute_content_plan_stream(
+        &self,
+        req: Request<ExecuteContentPlanRequest>,
+    ) -> Result<Response<Self::ExecuteContentPlanStreamStream>, Status> {
+        let actor = authenticated_actor(&req);
+        let context = enterprise_authenticated_context(&req)?.cloned();
+        let request = req.into_inner();
+        let requested_plan = request
+            .plan
+            .ok_or_else(|| Status::invalid_argument("content execution plan required"))?;
+        let stream = self
+            .execute_content_planned_stream(actor, context, requested_plan, request.resolved_parts)
             .await?;
         Ok(Response::new(stream))
     }

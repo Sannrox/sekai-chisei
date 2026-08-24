@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tracing::warn;
 
+use crate::content::{ContentChatRequest, ContentKind, validate_resolved_part};
 use futures_util::{Stream, StreamExt, stream};
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
@@ -296,6 +297,21 @@ impl From<String> for ProviderError {
 pub trait Provider: Send + Sync {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, String>;
 
+    /// Additive provider-neutral bounded content path. Providers must override
+    /// this method explicitly; unsupported content never falls back to text.
+    async fn content_chat(&self, _req: &ContentChatRequest) -> Result<ChatResponse, String> {
+        Err(encode_provider_error(ProviderError::Precondition(
+            "provider does not implement bounded content input".into(),
+        )))
+    }
+
+    async fn content_chat_stream(&self, req: &ContentChatRequest) -> Result<ChatStream, String> {
+        let resp = self.content_chat(req).await?;
+        Ok(Box::pin(stream::once(async move {
+            Ok(ChatStreamChunk::from_response(resp))
+        })))
+    }
+
     /// Additive provider-neutral sampling path used by governed stochastic
     /// evaluation. Existing callers and providers retain `chat` unchanged.
     async fn chat_with_sampling(
@@ -344,6 +360,24 @@ impl Provider for ResolvedModelProvider {
         self.inner.chat_with_sampling(&request, sampling).await
     }
 
+    async fn content_chat(&self, req: &ContentChatRequest) -> Result<ChatResponse, String> {
+        self.enforce_current_content_capabilities(req, false)
+            .await
+            .map_err(encode_provider_error)?;
+        let mut request = req.clone();
+        request.model.clone_from(&self.upstream_model);
+        self.inner.content_chat(&request).await
+    }
+
+    async fn content_chat_stream(&self, req: &ContentChatRequest) -> Result<ChatStream, String> {
+        self.enforce_current_content_capabilities(req, true)
+            .await
+            .map_err(encode_provider_error)?;
+        let mut request = req.clone();
+        request.model.clone_from(&self.upstream_model);
+        self.inner.content_chat_stream(&request).await
+    }
+
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
         self.enforce_current_capabilities(req, true)
             .await
@@ -379,6 +413,31 @@ impl ResolvedModelProvider {
         enforce_chat_capabilities(request, streaming, &capabilities)
             .map_err(ProviderError::Precondition)
     }
+
+    async fn enforce_current_content_capabilities(
+        &self,
+        request: &ContentChatRequest,
+        streaming: bool,
+    ) -> Result<(), ProviderError> {
+        let registry =
+            crate::provider_resolution::snapshot_for_execution(self.registry_state_path.as_deref())
+                .await
+                .map_err(ProviderError::Unavailable)?;
+        let resolved = registry
+            .resolve_model(&self.canonical_model)
+            .map_err(ProviderError::Precondition)?;
+        let capabilities = registry
+            .effective_profile(&resolved.provider)
+            .ok_or_else(|| {
+                ProviderError::Precondition(format!(
+                    "provider profile {:?} is not registered",
+                    resolved.provider
+                ))
+            })?
+            .capabilities;
+        enforce_content_capabilities(request, streaming, &capabilities)
+            .map_err(ProviderError::Precondition)
+    }
 }
 
 fn enforce_chat_capabilities(
@@ -403,6 +462,57 @@ fn enforce_chat_capabilities(
     } else {
         Err(format!(
             "provider cannot preserve required capabilities: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn enforce_content_capabilities(
+    request: &ContentChatRequest,
+    streaming: bool,
+    capabilities: &crate::provider_profile::ProviderCapabilities,
+) -> Result<(), String> {
+    let mut modalities = Vec::new();
+    for part in request.messages.iter().flat_map(|message| &message.parts) {
+        validate_resolved_part(part)?;
+        let modality = part.descriptor.kind.modality().to_string();
+        if !modalities.contains(&modality) {
+            modalities.push(modality);
+        }
+    }
+    if modalities.is_empty() {
+        return Err("content request requires at least one accepted resolved part".into());
+    }
+    if request
+        .messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .any(|part| {
+            matches!(
+                part.descriptor.kind,
+                ContentKind::Audio | ContentKind::Document
+            )
+        })
+    {
+        return Err("provider does not support audio or document content input".into());
+    }
+    let requirements = crate::provider_profile::CapabilityRequirements {
+        streaming,
+        tools: !request.tools.is_empty()
+            || request
+                .messages
+                .iter()
+                .any(|message| !message.tool_calls.is_empty() || !message.tool_call_id.is_empty()),
+        modalities,
+        max_output_tokens: (request.max_tokens > 0).then_some(request.max_tokens as u64),
+        ..Default::default()
+    };
+    let missing = requirements.unsupported_by(capabilities);
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider cannot preserve required content capabilities: {}",
             missing.join(", ")
         ))
     }
@@ -546,6 +656,7 @@ pub fn provider_name(model: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -663,6 +774,54 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("tools"));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_blocks_unsupported_image_before_contact() {
+        let captured = Arc::new(Mutex::new(String::new()));
+        let provider = ResolvedModelProvider {
+            inner: Box::new(CapturingProvider(captured.clone())),
+            upstream_model: "mistral".into(),
+            canonical_model: "native/mistral".into(),
+            registry_state_path: None,
+        };
+        let payload = b"png";
+        let error = provider
+            .content_chat(&crate::content::ContentChatRequest {
+                model: "native/mistral".into(),
+                system: String::new(),
+                messages: vec![crate::content::ContentMessage {
+                    role: "user".into(),
+                    parts: vec![crate::content::ResolvedContentPart {
+                        descriptor: crate::content::ContentDescriptor {
+                            part_id: "image-1".into(),
+                            kind: crate::content::ContentKind::Image,
+                            media_type: "image/png".into(),
+                            byte_length: payload.len() as u64,
+                            sha256_digest: format!("sha256:{:x}", sha2::Sha256::digest(payload)),
+                            reference: "fixture:image-1".into(),
+                            provenance: crate::content::ContentProvenance {
+                                source: "fixture".into(),
+                                source_id: "provider-capability".into(),
+                                source_version: "v1".into(),
+                                observed_at_ms: 1,
+                            },
+                            disclosure_state: crate::content::DisclosureState::Accepted,
+                            disclosure_reason: String::new(),
+                        },
+                        payload: crate::content::ResolvedPayload::Bytes(payload.to_vec()),
+                    }],
+                    tool_call_id: String::new(),
+                    tool_calls: Vec::new(),
+                }],
+                tools: Vec::new(),
+                max_tokens: 1,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("modality:image"));
         assert!(captured.lock().unwrap().is_empty());
     }
 
