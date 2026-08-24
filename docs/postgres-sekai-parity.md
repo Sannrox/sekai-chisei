@@ -11,9 +11,14 @@ or are explicit computed/query paths with named durable dependencies. The
 reusable `sekai.object-sync` surface and public `ApplySourceBatch` and
 `GetSourceSyncState` RPCs also have shared conformance for source binding,
 durable batch transactions, identities, results, graph/audit application, and
-plane-owned checkpoints. The same backend harness covers two-page snapshot
-resume, cross-page stable object identity, old-page replay, stale cursors, and
-foreign binding isolation.
+control-plane-owned checkpoints. Version 2 coverage additionally includes
+generation transitions, snapshot/feed handoff, exact replay, contiguous offset
+advancement, reordered and overlapping range aborts, missing-range recovery,
+and next-generation snapshot reset. Every accepted generation and offset change
+shares the transaction that commits objects, object-change audit, identities,
+lineage, results, and the checkpoint. The same backend harness covers two-page
+snapshot resume, cross-page stable object identity, old-page replay, stale
+cursors, and foreign binding isolation.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
@@ -47,7 +52,7 @@ Evidence is checked in as:
 | #259 | Action policy and approval |
 | #261–#265 | Guarded mutations, definition lifecycle, decisions, team namespaces |
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
-| #665, #671 | Bounded source-batch transactions and checkpointed snapshot paging |
+| #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 
 ## Still outside this parent
 
@@ -72,3 +77,23 @@ database:
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test --test object_sync_backend_conformance -- --ignored
 ```
+
+The ordered-feed migration is additive and one-way on both backends. Version 1
+transactions and checkpoints remain readable and exactly replayable, but new v1
+batches cannot advance a binding after v2 generation state begins. Retain batch
+and record-result history with generation and offset state; object-change audit
+alone is not continuity evidence and may have a different retention window.
+
+Before enabling v2 on a binding, take one consistent backup containing graph,
+object-change audit, source binding, transaction, generation, identity, lineage,
+result, and checkpoint tables. Rolling back the binary does not reverse a
+committed generation or offset. A binary that cannot read v2 state requires
+restoring the complete pre-v2 backup; do not delete or edit individual source
+sync rows.
+
+PostgreSQL does not weaken the trust boundary: `GetSourceSyncState` still
+requires namespace read authority, `ApplySourceBatch` and recovery snapshots
+require namespace write authority from the bound authenticated producer, and
+delivery metadata does not grant access. Diagnostics remain bounded and must
+not expose source payloads, feed epochs, cursors, credentials, authorization
+metadata, SQL text, or database details.

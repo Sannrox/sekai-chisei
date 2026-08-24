@@ -195,17 +195,34 @@ either form of authority.
 ### Source adapter profile
 
 `source_adapter_catalog::built_in_source_adapters` describes the one fixed
-GitHub object-sync adapter supported by this release. It names
-`sekai.source-batch/v1`, `ApplySourceBatch`, `GetSourceSyncState`, and the
-Issue/PullRequest record kinds. It also publishes the only code-owned v1 type
+GitHub object-sync profile supported by this release. It names
+`ApplySourceBatch`, `GetSourceSyncState`, the Issue/PullRequest record kinds,
+and the exact batch contracts and delivery modes the adapter can produce.
+`sekai.source-batch/v1` remains replay-compatible for opaque-checkpoint
+snapshots. `sekai.source-batch/v2` adds control-plane-owned synchronization
+generations, `snapshot` / `change_feed` delivery, a stable feed epoch, and
+contiguous offsets. The profile also publishes the only code-owned v1 type
 revision, `sekai.source-type-revision/v1` at digest
 `sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
-The adapter SDK can resume bounded snapshot pages from the plane-owned opaque
-checkpoint without adding a third RPC or another catalog contract.
-This is static integration metadata, not an
-authorization grant, plugin marketplace, native capability entry, provider
-profile, or evidence adapter. Live RPC authentication, namespace access, source
-binding, type revision, cursor, and batch validation still decide every call.
+The adapter SDK resumes bounded snapshot pages or ordered ranges from the
+control-plane-owned checkpoint without adding a third RPC or another catalog
+contract.
+
+Ordered capability is explicit, not inferred from `source = "github"`. An
+adapter may advertise `change_feed` only when its source transport provides a
+stable epoch, contiguous monotonic source sequence, and authoritative
+snapshot/feed consistency barrier. GitHub's public Events API is not represented
+as a supported gapless feed. The fixed fixture normalizer and v1 snapshot path
+remain snapshot-only unless a deployment-specific transport can prove all v2
+ordering guarantees; timestamps, pagination positions, and locally generated
+counters do not qualify.
+
+This is static integration metadata, not an authorization grant, plugin
+marketplace, native capability entry, provider profile, or evidence adapter.
+Live RPC authentication, namespace access, source binding, type revision,
+cursor, generation, epoch, offset, and batch validation still decide every
+call. Discovery data must not include credentials, source payloads, cursors, or
+feed-epoch values.
 
 ### MCP and SDK projections
 

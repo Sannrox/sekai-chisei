@@ -10,9 +10,10 @@ use crate::domain::Object;
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 use crate::sekai::object_lineage::{ObjectLineage, bind_sync_lineage};
 use crate::sekai::object_sync::{
-    OperationOutcome, SourceBatch, SourceBatchResult, SourceBatchStatus, SourceBatchTransaction,
-    SourceBinding, SourceCheckpoint, SourceRecordResult, SourceSyncState, SyncDecision,
-    SyncedObject, sync_github_record,
+    OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
+    SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
+    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
+    SyncDecision, SyncedObject, sync_github_record,
 };
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
@@ -27,6 +28,8 @@ const SOURCE_IDENTITIES_TABLE: &str = "sekai_source_identities";
 const SOURCE_RESULTS_TABLE: &str = "sekai_source_record_results";
 #[cfg(test)]
 const SOURCE_CHECKPOINTS_TABLE: &str = "sekai_source_checkpoints";
+#[cfg(test)]
+const SOURCE_GENERATIONS_TABLE: &str = "sekai_source_sync_generations";
 
 const RESERVED_SYNC_PROPERTIES: &[&str] = &[
     "sync_source",
@@ -112,6 +115,13 @@ impl ApplyError {
         matches!(self, Self::Denied { .. })
     }
 
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Denied { code, .. } => Some(code),
+            Self::Storage(_) => None,
+        }
+    }
+
     pub(crate) fn storage(error: impl std::fmt::Display) -> Self {
         Self::Storage(error.to_string())
     }
@@ -125,6 +135,8 @@ impl std::fmt::Display for ApplyError {
         }
     }
 }
+
+impl std::error::Error for ApplyError {}
 
 impl From<rusqlite::Error> for ApplyError {
     fn from(error: rusqlite::Error) -> Self {
@@ -147,6 +159,7 @@ pub(crate) struct PreparedRecord {
     pub(crate) display_name: String,
     pub(crate) observed_at_ms: i64,
     pub(crate) properties_json: String,
+    pub(crate) source_sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -209,6 +222,7 @@ impl PreparedBatch {
                 display_name: record.display_name.clone(),
                 observed_at_ms: record.observed_at_ms,
                 properties_json,
+                source_sequence: record.source_sequence,
             });
         }
 
@@ -302,6 +316,13 @@ impl SekaiDb {
                     closed_at_ms INTEGER,
                     reason TEXT NOT NULL,
                     result_json TEXT NOT NULL DEFAULT '',
+                    contract_version TEXT NOT NULL DEFAULT 'sekai.source-batch/v1',
+                    delivery_mode TEXT,
+                    sync_generation INTEGER,
+                    feed_epoch TEXT,
+                    offset_start INTEGER,
+                    offset_end INTEGER,
+                    snapshot_complete INTEGER,
                     UNIQUE(namespace, producer_identity, idempotency_key),
                     FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
                 );
@@ -355,6 +376,7 @@ impl SekaiDb {
                     outcome TEXT NOT NULL CHECK(outcome IN ('success', 'denial', 'unavailable')),
                     reason TEXT NOT NULL,
                     lineage_json TEXT NOT NULL,
+                    source_sequence INTEGER,
                     PRIMARY KEY(transaction_id, source_id),
                     FOREIGN KEY(transaction_id)
                         REFERENCES sekai_source_batch_transactions(transaction_id)
@@ -366,12 +388,71 @@ impl SekaiDb {
                     cursor TEXT NOT NULL,
                     committed_batch_digest TEXT NOT NULL,
                     advanced_at_ms INTEGER NOT NULL,
+                    contract_version TEXT NOT NULL DEFAULT 'sekai.source-batch/v1',
+                    delivery_mode TEXT,
+                    sync_generation INTEGER,
+                    feed_epoch TEXT,
+                    committed_offset INTEGER,
                     FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_sekai_source_checkpoints_namespace
-                    ON sekai_source_checkpoints(namespace);",
+                    ON sekai_source_checkpoints(namespace);
+
+                CREATE TABLE IF NOT EXISTS sekai_source_sync_generations (
+                    binding_id TEXT NOT NULL,
+                    sync_generation INTEGER NOT NULL CHECK(sync_generation > 0),
+                    status TEXT NOT NULL CHECK(
+                        status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED', 'SUPERSEDED')
+                    ),
+                    delivery_mode TEXT NOT NULL CHECK(
+                        delivery_mode IN ('snapshot', 'change_feed')
+                    ),
+                    feed_epoch TEXT,
+                    committed_offset INTEGER,
+                    reason TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(binding_id, sync_generation),
+                    CHECK(committed_offset IS NULL OR committed_offset >= 0),
+                    FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_source_generations_one_current
+                    ON sekai_source_sync_generations(binding_id)
+                    WHERE status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED');",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for statement in [
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN contract_version TEXT NOT NULL DEFAULT 'sekai.source-batch/v1'",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN delivery_mode TEXT",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN sync_generation INTEGER",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN feed_epoch TEXT",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN offset_start INTEGER",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN offset_end INTEGER",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN snapshot_complete INTEGER",
+            "ALTER TABLE sekai_source_record_results ADD COLUMN source_sequence INTEGER",
+            "ALTER TABLE sekai_source_checkpoints ADD COLUMN contract_version TEXT NOT NULL DEFAULT 'sekai.source-batch/v1'",
+            "ALTER TABLE sekai_source_checkpoints ADD COLUMN delivery_mode TEXT",
+            "ALTER TABLE sekai_source_checkpoints ADD COLUMN sync_generation INTEGER",
+            "ALTER TABLE sekai_source_checkpoints ADD COLUMN feed_epoch TEXT",
+            "ALTER TABLE sekai_source_checkpoints ADD COLUMN committed_offset INTEGER",
+        ] {
+            match self.conn().execute(statement, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.conn()
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_sekai_source_batches_generation
+                 ON sekai_source_batch_transactions(
+                    binding_id, sync_generation, opened_at_ms
+                 )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn apply_source_batch(
@@ -502,7 +583,9 @@ impl SekaiDb {
             }
         };
 
-        preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)?;
+        if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+            preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)?;
+        }
 
         let open_exists: bool = transaction.query_row(
             "SELECT EXISTS(
@@ -523,9 +606,12 @@ impl SekaiDb {
             "INSERT INTO sekai_source_batch_transactions (
                 transaction_id, binding_id, namespace, producer_identity, idempotency_key,
                 batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
-                outcome, opened_at_ms, closed_at_ms, reason, result_json
+                outcome, opened_at_ms, closed_at_ms, reason, result_json, contract_version,
+                delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
+                snapshot_complete
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'OPEN',
-                       'unavailable', ?10, NULL, 'awaiting atomic commit', '')",
+                       'unavailable', ?10, NULL, 'awaiting atomic commit', '', ?11,
+                       ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 prepared.transaction_id,
                 prepared.binding_id,
@@ -537,6 +623,33 @@ impl SekaiDb {
                 batch.current_cursor,
                 batch.proposed_next_cursor,
                 now_ms,
+                batch.contract_version,
+                batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery_mode_db(delivery.mode)),
+                batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.sync_generation as i64),
+                batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.source_feed_epoch.as_deref()),
+                batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.offset_start)
+                    .map(|value| value as i64),
+                batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.offset_end)
+                    .map(|value| value as i64),
+                batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.snapshot_complete),
             ],
         )?;
         transaction.commit()?;
@@ -593,6 +706,14 @@ impl SekaiDb {
         if let Err(error) = preflight {
             if !error.is_denial() {
                 return Err(error);
+            }
+            if error.code() == Some("missing_range") {
+                mark_generation_recovery_required(
+                    &transaction,
+                    &prepared.binding_id,
+                    batch,
+                    now_ms,
+                )?;
             }
             transaction.execute(
                 "UPDATE sekai_source_batch_transactions
@@ -680,6 +801,7 @@ impl SekaiDb {
                 decision: prepared_record.decision.clone(),
                 outcome: OperationOutcome::Success,
                 reason: reason.into(),
+                source_sequence: prepared_record.source_sequence,
             };
             let synced_object_json = serde_json::to_string(&prepared_record.object)
                 .map_err(|error| ApplyError::Storage(error.to_string()))?;
@@ -720,8 +842,8 @@ impl SekaiDb {
             transaction.execute(
                 "INSERT INTO sekai_source_record_results (
                     transaction_id, source_id, source_version, decision_json,
-                    outcome, reason, lineage_json
-                 ) VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)",
+                    outcome, reason, lineage_json, source_sequence
+                 ) VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6, ?7)",
                 params![
                     prepared.transaction_id,
                     prepared_record.source_id,
@@ -729,6 +851,7 @@ impl SekaiDb {
                     decision_json,
                     reason,
                     lineage_json,
+                    prepared_record.source_sequence.map(|value| value as i64),
                 ],
             )?;
             record_results.push(record_result);
@@ -748,6 +871,28 @@ impl SekaiDb {
             opened_at_ms: stored.transaction.opened_at_ms,
             closed_at_ms: Some(now_ms),
             reason: "committed".into(),
+            contract_version: batch.contract_version.clone(),
+            delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
+            sync_generation: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.sync_generation),
+            source_feed_epoch: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.source_feed_epoch.clone()),
+            offset_start: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_start),
+            offset_end: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_end),
+            snapshot_complete: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.snapshot_complete),
         };
         let result = SourceBatchResult {
             transaction: committed_transaction,
@@ -768,21 +913,50 @@ impl SekaiDb {
                 "open source batch changed during atomic commit".into(),
             ));
         }
+        commit_generation_state(&transaction, &prepared.binding_id, batch, now_ms)?;
         transaction.execute(
             "INSERT INTO sekai_source_checkpoints (
-                binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms,
+                contract_version, delivery_mode, sync_generation, feed_epoch,
+                committed_offset
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(binding_id) DO UPDATE SET
                 namespace=excluded.namespace,
                 cursor=excluded.cursor,
                 committed_batch_digest=excluded.committed_batch_digest,
-                advanced_at_ms=excluded.advanced_at_ms",
+                advanced_at_ms=excluded.advanced_at_ms,
+                contract_version=excluded.contract_version,
+                delivery_mode=excluded.delivery_mode,
+                sync_generation=excluded.sync_generation,
+                feed_epoch=excluded.feed_epoch,
+                committed_offset=excluded.committed_offset",
             params![
                 prepared.binding_id,
                 batch.namespace,
                 batch.proposed_next_cursor,
                 batch.batch_digest,
                 now_ms,
+                batch.contract_version,
+                batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery_mode_db(delivery.mode)),
+                batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.sync_generation as i64),
+                batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.source_feed_epoch.as_deref()),
+                batch.delivery.as_ref().and_then(|delivery| {
+                    match delivery.mode {
+                        SourceDeliveryMode::Snapshot if !delivery.snapshot_complete => None,
+                        SourceDeliveryMode::Snapshot | SourceDeliveryMode::ChangeFeed => {
+                            delivery.offset_end.map(|value| value as i64)
+                        }
+                    }
+                }),
             ],
         )?;
         transaction.execute(
@@ -832,6 +1006,11 @@ impl SekaiDb {
             .map(parse_stored_result)
             .transpose()
             .map_err(|error| error.to_string())?;
+        let current_generation = load_current_generation(&conn, &binding.binding.binding_id)
+            .map_err(|error| error.to_string())?;
+        let latest_transaction = load_latest_transaction_any(&conn, &binding.binding.binding_id)
+            .map_err(|error| error.to_string())?
+            .map(|stored| stored.transaction);
         let mut updated_at_ms = binding.updated_at_ms;
         if let Some(checkpoint) = &checkpoint {
             updated_at_ms = updated_at_ms.max(checkpoint.advanced_at_ms);
@@ -847,11 +1026,20 @@ impl SekaiDb {
                     .unwrap_or(stored.transaction.opened_at_ms),
             );
         }
+        if let Some(generation) = &current_generation {
+            updated_at_ms = updated_at_ms.max(generation.updated_at_ms);
+        }
+        if let Some(transaction) = &latest_transaction {
+            updated_at_ms =
+                updated_at_ms.max(transaction.closed_at_ms.unwrap_or(transaction.opened_at_ms));
+        }
         Ok(Some(SourceSyncState {
             binding: binding.binding,
             checkpoint,
             open_transaction,
             last_result,
+            current_generation,
+            latest_transaction,
             updated_at_ms,
         }))
     }
@@ -864,6 +1052,46 @@ fn stable_id(prefix: &str, parts: &[&str]) -> String {
         digest.update(b"\n");
     }
     format!("{prefix}-{:x}", digest.finalize())
+}
+
+fn delivery_mode_db(mode: SourceDeliveryMode) -> &'static str {
+    match mode {
+        SourceDeliveryMode::Snapshot => "snapshot",
+        SourceDeliveryMode::ChangeFeed => "change_feed",
+    }
+}
+
+fn delivery_mode_from_db(value: &str) -> Result<SourceDeliveryMode, ApplyError> {
+    match value {
+        "snapshot" => Ok(SourceDeliveryMode::Snapshot),
+        "change_feed" => Ok(SourceDeliveryMode::ChangeFeed),
+        _ => Err(ApplyError::Storage("invalid source delivery mode".into())),
+    }
+}
+
+fn generation_status_from_db(value: &str) -> Result<SourceSyncGenerationStatus, ApplyError> {
+    match value {
+        "SNAPSHOTTING" => Ok(SourceSyncGenerationStatus::Snapshotting),
+        "ACTIVE" => Ok(SourceSyncGenerationStatus::Active),
+        "RECOVERY_REQUIRED" => Ok(SourceSyncGenerationStatus::RecoveryRequired),
+        "SUPERSEDED" => Ok(SourceSyncGenerationStatus::Superseded),
+        _ => Err(ApplyError::Storage(
+            "invalid source sync generation status".into(),
+        )),
+    }
+}
+
+fn u64_from_i64(value: i64) -> Result<u64, ApplyError> {
+    u64::try_from(value)
+        .map_err(|_| ApplyError::Storage("negative persisted delivery position".into()))
+}
+
+fn optional_u64_from_i64(value: Option<i64>) -> Result<Option<u64>, ApplyError> {
+    value.map(u64_from_i64).transpose()
+}
+
+fn to_sqlite_conversion_error(error: ApplyError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
 }
 
 pub(crate) fn validate_binding(
@@ -931,6 +1159,7 @@ fn preflight_commit_state(
         }
         Some(_) | None => {}
     }
+    preflight_delivery_state(conn, binding, batch)?;
 
     for record in records {
         let identity = load_identity(conn, &batch.namespace, &record.source_id)?;
@@ -990,6 +1219,235 @@ fn preflight_commit_state(
     Ok(())
 }
 
+fn preflight_delivery_state(
+    conn: &Connection,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+) -> Result<(), ApplyError> {
+    let current = load_current_generation(conn, &binding.binding_id)?;
+    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        if current.is_some() {
+            return Err(ApplyError::denied(
+                "legacy_batch_after_v2",
+                "legacy source batches cannot advance a generation-enabled binding",
+            ));
+        }
+        return Ok(());
+    }
+    let delivery = batch.delivery.as_ref().ok_or_else(|| {
+        ApplyError::denied(
+            "missing_delivery_metadata",
+            "v2 source batches require delivery metadata",
+        )
+    })?;
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot => match current {
+            None => {
+                if delivery.sync_generation != 1 {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "the first snapshot generation must be one",
+                    ));
+                }
+            }
+            Some(generation) => match generation.status {
+                SourceSyncGenerationStatus::Snapshotting
+                    if generation.sync_generation == delivery.sync_generation => {}
+                SourceSyncGenerationStatus::RecoveryRequired
+                    if generation
+                        .sync_generation
+                        .checked_add(1)
+                        .is_some_and(|next| next == delivery.sync_generation) => {}
+                SourceSyncGenerationStatus::Active => {
+                    return Err(ApplyError::denied(
+                        "phase_conflict",
+                        "an active generation cannot be proactively reset",
+                    ));
+                }
+                SourceSyncGenerationStatus::RecoveryRequired => {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "recovery snapshot generation is not the required successor",
+                    ));
+                }
+                SourceSyncGenerationStatus::Snapshotting
+                | SourceSyncGenerationStatus::Superseded => {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "snapshot generation does not match current state",
+                    ));
+                }
+            },
+        },
+        SourceDeliveryMode::ChangeFeed => {
+            let generation = current.ok_or_else(|| {
+                ApplyError::denied(
+                    "phase_conflict",
+                    "a change feed cannot create a synchronization generation",
+                )
+            })?;
+            if generation.status == SourceSyncGenerationStatus::RecoveryRequired {
+                return Err(ApplyError::denied(
+                    "recovery_required",
+                    "the current generation requires a recovery snapshot",
+                ));
+            }
+            if generation.status != SourceSyncGenerationStatus::Active {
+                return Err(ApplyError::denied(
+                    "phase_conflict",
+                    "change feed requires an active synchronization generation",
+                ));
+            }
+            if generation.sync_generation != delivery.sync_generation {
+                return Err(ApplyError::denied(
+                    "generation_conflict",
+                    "change feed generation does not match current state",
+                ));
+            }
+            if generation.source_feed_epoch != delivery.source_feed_epoch {
+                return Err(ApplyError::denied(
+                    "feed_epoch_conflict",
+                    "change feed epoch does not match current state",
+                ));
+            }
+            let committed_offset = generation.committed_offset.ok_or_else(|| {
+                ApplyError::denied(
+                    "phase_conflict",
+                    "active generation has no committed handoff offset",
+                )
+            })?;
+            let offset_start = delivery.offset_start.ok_or_else(|| {
+                ApplyError::denied(
+                    "missing_delivery_range",
+                    "change feed requires a delivery range",
+                )
+            })?;
+            if offset_start < committed_offset {
+                return Err(ApplyError::denied(
+                    "overlapping_range",
+                    "change feed overlaps the committed delivery position",
+                ));
+            }
+            if offset_start > committed_offset {
+                return Err(ApplyError::denied(
+                    "missing_range",
+                    "change feed starts after the committed delivery position",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_generation_recovery_required(
+    conn: &Connection,
+    binding_id: &str,
+    batch: &SourceBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    let Some(delivery) = &batch.delivery else {
+        return Ok(());
+    };
+    let updated = conn.execute(
+        "UPDATE sekai_source_sync_generations
+         SET status='RECOVERY_REQUIRED', reason='missing_range', updated_at_ms=?1
+         WHERE binding_id=?2 AND sync_generation=?3 AND status='ACTIVE'",
+        params![now_ms, binding_id, delivery.sync_generation as i64],
+    )?;
+    if updated != 1 {
+        return Err(ApplyError::Storage(
+            "missing-range recovery transition lost current generation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn commit_generation_state(
+    conn: &Connection,
+    binding_id: &str,
+    batch: &SourceBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        return Ok(());
+    }
+    let delivery = batch
+        .delivery
+        .as_ref()
+        .ok_or_else(|| ApplyError::Storage("validated v2 batch has no delivery metadata".into()))?;
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot => {
+            conn.execute(
+                "UPDATE sekai_source_sync_generations
+                 SET status='SUPERSEDED', reason='recovered_by_successor', updated_at_ms=?1
+                 WHERE binding_id=?2 AND status='RECOVERY_REQUIRED'
+                   AND sync_generation<>?3",
+                params![now_ms, binding_id, delivery.sync_generation as i64],
+            )?;
+            let (status, mode, epoch, committed_offset, reason) = if delivery.snapshot_complete {
+                (
+                    "ACTIVE",
+                    "change_feed",
+                    delivery.source_feed_epoch.as_deref(),
+                    delivery.offset_end.map(|value| value as i64),
+                    "snapshot_handoff_committed",
+                )
+            } else {
+                (
+                    "SNAPSHOTTING",
+                    "snapshot",
+                    None,
+                    None,
+                    "snapshot_in_progress",
+                )
+            };
+            conn.execute(
+                "INSERT INTO sekai_source_sync_generations (
+                    binding_id, sync_generation, status, delivery_mode, feed_epoch,
+                    committed_offset, reason, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+                 ON CONFLICT(binding_id, sync_generation) DO UPDATE SET
+                    status=excluded.status,
+                    delivery_mode=excluded.delivery_mode,
+                    feed_epoch=excluded.feed_epoch,
+                    committed_offset=excluded.committed_offset,
+                    reason=excluded.reason,
+                    updated_at_ms=excluded.updated_at_ms",
+                params![
+                    binding_id,
+                    delivery.sync_generation as i64,
+                    status,
+                    mode,
+                    epoch,
+                    committed_offset,
+                    reason,
+                    now_ms,
+                ],
+            )?;
+        }
+        SourceDeliveryMode::ChangeFeed => {
+            let updated = conn.execute(
+                "UPDATE sekai_source_sync_generations
+                 SET delivery_mode='change_feed', committed_offset=?1,
+                     reason='change_feed_committed', updated_at_ms=?2
+                 WHERE binding_id=?3 AND sync_generation=?4 AND status='ACTIVE'",
+                params![
+                    delivery.offset_end.map(|value| value as i64),
+                    now_ms,
+                    binding_id,
+                    delivery.sync_generation as i64,
+                ],
+            )?;
+            if updated != 1 {
+                return Err(ApplyError::Storage(
+                    "active generation changed during atomic commit".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_object(conn: &Connection, object_id: &str) -> Result<Option<Object>, ApplyError> {
     conn.query_row(
         "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -1030,7 +1488,8 @@ fn load_checkpoint(
     binding_id: &str,
 ) -> Result<Option<SourceCheckpoint>, ApplyError> {
     conn.query_row(
-        "SELECT binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms
+        "SELECT binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms,
+                contract_version, delivery_mode, sync_generation, feed_epoch, committed_offset
          FROM sekai_source_checkpoints WHERE binding_id=?1",
         params![binding_id],
         |row| {
@@ -1040,6 +1499,54 @@ fn load_checkpoint(
                 cursor: row.get(2)?,
                 committed_batch_digest: row.get(3)?,
                 advanced_at_ms: row.get(4)?,
+                contract_version: row.get(5)?,
+                delivery_mode: row
+                    .get::<_, Option<String>>(6)?
+                    .map(|value| delivery_mode_from_db(&value))
+                    .transpose()
+                    .map_err(to_sqlite_conversion_error)?,
+                sync_generation: optional_u64_from_i64(row.get(7)?)
+                    .map_err(to_sqlite_conversion_error)?,
+                source_feed_epoch: row.get(8)?,
+                committed_offset: optional_u64_from_i64(row.get(9)?)
+                    .map_err(to_sqlite_conversion_error)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(ApplyError::from)
+}
+
+fn load_current_generation(
+    conn: &Connection,
+    binding_id: &str,
+) -> Result<Option<SourceSyncGeneration>, ApplyError> {
+    conn.query_row(
+        "SELECT binding_id, sync_generation, status, delivery_mode, feed_epoch,
+                committed_offset, reason, created_at_ms, updated_at_ms
+         FROM sekai_source_sync_generations
+         WHERE binding_id=?1
+           AND status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED')
+         ORDER BY sync_generation DESC LIMIT 1",
+        params![binding_id],
+        |row| {
+            let generation = u64_from_i64(row.get(1)?).map_err(to_sqlite_conversion_error)?;
+            let status = generation_status_from_db(&row.get::<_, String>(2)?)
+                .map_err(to_sqlite_conversion_error)?;
+            let delivery_mode = delivery_mode_from_db(&row.get::<_, String>(3)?)
+                .map_err(to_sqlite_conversion_error)?;
+            let committed_offset =
+                optional_u64_from_i64(row.get(5)?).map_err(to_sqlite_conversion_error)?;
+            Ok(SourceSyncGeneration {
+                binding_id: row.get(0)?,
+                sync_generation: generation,
+                status,
+                delivery_mode,
+                source_feed_epoch: row.get(4)?,
+                committed_offset,
+                reason: row.get(6)?,
+                created_at_ms: row.get(7)?,
+                updated_at_ms: row.get(8)?,
             })
         },
     )
@@ -1150,6 +1657,13 @@ type RawBatch = (
     Option<i64>,
     String,
     String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<bool>,
 );
 
 fn raw_batch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBatch> {
@@ -1168,6 +1682,13 @@ fn raw_batch_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBatch> {
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
+        row.get(20)?,
     ))
 }
 
@@ -1199,6 +1720,13 @@ fn stored_batch_from_raw(raw: RawBatch) -> Result<StoredBatch, ApplyError> {
             opened_at_ms: raw.10,
             closed_at_ms: raw.11,
             reason: raw.12,
+            contract_version: raw.14,
+            delivery_mode: raw.15.as_deref().map(delivery_mode_from_db).transpose()?,
+            sync_generation: optional_u64_from_i64(raw.16)?,
+            source_feed_epoch: raw.17,
+            offset_start: optional_u64_from_i64(raw.18)?,
+            offset_end: optional_u64_from_i64(raw.19)?,
+            snapshot_complete: raw.20,
         },
         result_json: raw.13,
     })
@@ -1207,7 +1735,9 @@ fn stored_batch_from_raw(raw: RawBatch) -> Result<StoredBatch, ApplyError> {
 const BATCH_SELECT: &str =
     "SELECT transaction_id, binding_id, namespace, producer_identity, idempotency_key,
             batch_digest, current_cursor, proposed_next_cursor, status, outcome,
-            opened_at_ms, closed_at_ms, reason, result_json
+            opened_at_ms, closed_at_ms, reason, result_json, contract_version,
+            delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
+            snapshot_complete
      FROM sekai_source_batch_transactions";
 
 fn load_batch_by_key(
@@ -1244,6 +1774,20 @@ fn load_latest_transaction(
         .transpose()
 }
 
+fn load_latest_transaction_any(
+    conn: &Connection,
+    binding_id: &str,
+) -> Result<Option<StoredBatch>, ApplyError> {
+    let sql = format!(
+        "{BATCH_SELECT} WHERE binding_id=?1
+         ORDER BY COALESCE(closed_at_ms, opened_at_ms) DESC, transaction_id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![binding_id], raw_batch_from_row)
+        .optional()?
+        .map(stored_batch_from_raw)
+        .transpose()
+}
+
 fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
     if stored.transaction.status != SourceBatchStatus::Committed || stored.result_json.is_empty() {
         return Err(ApplyError::Storage(
@@ -1266,7 +1810,9 @@ mod tests {
     use crate::db::runtime_db::RuntimeDb;
     use crate::sekai::object_sync::{
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-        GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceRecord,
+        GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
+        SOURCE_GITHUB, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+        SourceSyncGenerationStatus,
     };
 
     const PRODUCER: &str = "connector/github-primary";
@@ -1291,6 +1837,7 @@ mod tests {
             ]),
             deleted: false,
             observed_at_ms: 10,
+            source_sequence: None,
         }
     }
 
@@ -1311,6 +1858,7 @@ mod tests {
             batch_digest: String::new(),
             collected_at_ms: 20,
             records: vec![record()],
+            delivery: None,
         };
         redigest(&mut batch);
         batch
@@ -1318,6 +1866,50 @@ mod tests {
 
     fn redigest(batch: &mut SourceBatch) {
         batch.batch_digest = batch.canonical_digest().unwrap();
+    }
+
+    fn snapshot_batch(
+        current_cursor: &str,
+        next_cursor: &str,
+        key: &str,
+        generation: u64,
+        complete: bool,
+        handoff_offset: Option<u64>,
+    ) -> SourceBatch {
+        let mut batch = batch(current_cursor, next_cursor, key);
+        batch.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        batch.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Snapshot,
+            sync_generation: generation,
+            source_feed_epoch: complete.then(|| "epoch-1".into()),
+            offset_start: None,
+            offset_end: handoff_offset,
+            snapshot_complete: complete,
+        });
+        redigest(&mut batch);
+        batch
+    }
+
+    fn change_batch(
+        current_cursor: &str,
+        next_cursor: &str,
+        key: &str,
+        generation: u64,
+        offset_start: u64,
+    ) -> SourceBatch {
+        let mut batch = batch(current_cursor, next_cursor, key);
+        batch.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        batch.records[0].source_sequence = Some(offset_start + 1);
+        batch.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: generation,
+            source_feed_epoch: Some("epoch-1".into()),
+            offset_start: Some(offset_start),
+            offset_end: Some(offset_start + 1),
+            snapshot_complete: false,
+        });
+        redigest(&mut batch);
+        batch
     }
 
     fn db() -> SekaiDb {
@@ -1398,6 +1990,181 @@ mod tests {
     }
 
     #[test]
+    fn ordered_feed_gap_aborts_and_successor_snapshot_recovers() {
+        let db = db();
+        let snapshot = snapshot_batch("", "cursor:snapshot", "snapshot-1", 1, true, Some(40));
+        let snapshot_result = db.apply_source_batch(&snapshot, PRODUCER, 100).unwrap();
+        let active = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            active.current_generation.as_ref().unwrap().status,
+            SourceSyncGenerationStatus::Active
+        );
+        assert_eq!(
+            active.current_generation.as_ref().unwrap().committed_offset,
+            Some(40)
+        );
+
+        let mut feed = change_batch("cursor:snapshot", "cursor:41", "feed-41", 1, 40);
+        feed.records[0].source_version = "node-v2".into();
+        redigest(&mut feed);
+        db.apply_source_batch(&feed, PRODUCER, 200).unwrap();
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:41"));
+
+        let overlap = change_batch("cursor:41", "cursor:overlap", "overlap", 1, 40);
+        assert!(
+            db.apply_source_batch(&overlap, PRODUCER, 300)
+                .unwrap_err()
+                .starts_with("overlapping_range:")
+        );
+        let after_overlap = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_overlap.latest_transaction.unwrap().status,
+            SourceBatchStatus::Aborted
+        );
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:41"));
+
+        let missing = change_batch("cursor:41", "cursor:missing", "missing", 1, 50);
+        assert!(
+            db.apply_source_batch(&missing, PRODUCER, 400)
+                .unwrap_err()
+                .starts_with("missing_range:")
+        );
+        let recovery_required = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovery_required
+                .current_generation
+                .as_ref()
+                .unwrap()
+                .status,
+            SourceSyncGenerationStatus::RecoveryRequired
+        );
+        assert_eq!(
+            recovery_required
+                .latest_transaction
+                .as_ref()
+                .unwrap()
+                .status,
+            SourceBatchStatus::Aborted
+        );
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:41"));
+
+        let mut recovery = snapshot_batch(
+            "cursor:41",
+            "cursor:recovered",
+            "snapshot-2",
+            2,
+            true,
+            Some(80),
+        );
+        recovery.records[0].source_version = "node-v3".into();
+        redigest(&mut recovery);
+        db.apply_source_batch(&recovery, PRODUCER, 500).unwrap();
+        let recovered = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.current_generation.as_ref().unwrap().status,
+            SourceSyncGenerationStatus::Active
+        );
+        assert_eq!(
+            recovered
+                .current_generation
+                .as_ref()
+                .unwrap()
+                .sync_generation,
+            2
+        );
+        let superseded: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM sekai_source_sync_generations
+                 WHERE binding_id=?1 AND sync_generation=1",
+                params![recovered.binding.binding_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded, "SUPERSEDED");
+
+        let replay = db.apply_source_batch(&snapshot, PRODUCER, 600).unwrap();
+        assert_eq!(replay, snapshot_result);
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:recovered"));
+    }
+
+    #[test]
+    fn v2_open_resumes_after_restart_and_migration_is_idempotent() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("ordered-sync.sqlite");
+        let snapshot = snapshot_batch("", "cursor:snapshot", "snapshot-1", 1, true, Some(40));
+        {
+            let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+            let prepared = PreparedBatch::new(&snapshot).unwrap();
+            assert!(matches!(
+                db.persist_source_batch_open(&snapshot, &prepared, 100)
+                    .unwrap(),
+                OpenDisposition::Open
+            ));
+            db.migrate_object_sync().unwrap();
+        }
+        let reopened = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let result = reopened
+            .apply_source_batch(&snapshot, PRODUCER, 200)
+            .unwrap();
+        assert_eq!(result.transaction.opened_at_ms, 100);
+        assert_eq!(
+            reopened
+                .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+                .unwrap()
+                .unwrap()
+                .current_generation
+                .unwrap()
+                .status,
+            SourceSyncGenerationStatus::Active
+        );
+    }
+
+    #[test]
+    fn v1_checkpoint_can_seed_generation_one_but_cannot_advance_afterward() {
+        let db = db();
+        let legacy = batch("", "cursor:legacy", "legacy-1");
+        let legacy_result = db.apply_source_batch(&legacy, PRODUCER, 100).unwrap();
+        let mut snapshot = snapshot_batch(
+            "cursor:legacy",
+            "cursor:snapshot",
+            "snapshot-1",
+            1,
+            true,
+            Some(40),
+        );
+        snapshot.records[0].source_version = "node-v2".into();
+        redigest(&mut snapshot);
+        db.apply_source_batch(&snapshot, PRODUCER, 200).unwrap();
+
+        let mut later_legacy = batch("cursor:snapshot", "cursor:legacy-2", "legacy-2");
+        later_legacy.records[0].source_version = "node-v3".into();
+        redigest(&mut later_legacy);
+        assert!(
+            db.apply_source_batch(&later_legacy, PRODUCER, 300)
+                .unwrap_err()
+                .starts_with("legacy_batch_after_v2:")
+        );
+        assert_eq!(
+            db.apply_source_batch(&legacy, PRODUCER, 400).unwrap(),
+            legacy_result
+        );
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:snapshot"));
+    }
+
+    #[test]
     fn durable_open_batch_resumes_after_restart() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("sync.sqlite");
@@ -1462,8 +2229,7 @@ mod tests {
             },
             {
                 let mut batch = batch("", "cursor:1", "batch-1");
-                batch.contract_version = "sekai.source-batch/v2".into();
-                redigest(&mut batch);
+                batch.contract_version = "sekai.source-batch/v3".into();
                 (batch, PRODUCER, "unsupported_version:")
             },
             {
@@ -1744,6 +2510,7 @@ mod tests {
             SOURCE_IDENTITIES_TABLE,
             SOURCE_RESULTS_TABLE,
             SOURCE_CHECKPOINTS_TABLE,
+            SOURCE_GENERATIONS_TABLE,
         ] {
             let exists: bool = db
                 .conn()
@@ -1756,6 +2523,26 @@ mod tests {
                 )
                 .unwrap();
             assert!(exists, "missing migration table {table}");
+        }
+        for (table, column) in [
+            (SOURCE_BATCHES_TABLE, "sync_generation"),
+            (SOURCE_BATCHES_TABLE, "offset_start"),
+            (SOURCE_BATCHES_TABLE, "offset_end"),
+            (SOURCE_RESULTS_TABLE, "source_sequence"),
+            (SOURCE_CHECKPOINTS_TABLE, "sync_generation"),
+            (SOURCE_CHECKPOINTS_TABLE, "committed_offset"),
+        ] {
+            let exists: bool = db
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info(?1) WHERE name=?2
+                     )",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing migration column {table}.{column}");
         }
     }
 }

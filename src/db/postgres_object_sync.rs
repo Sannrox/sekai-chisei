@@ -8,8 +8,9 @@ use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
 use crate::domain::Object;
 use crate::sekai::audit::object_diff_changes;
 use crate::sekai::object_sync::{
-    OperationOutcome, SOURCE_GITHUB, SourceBatch, SourceBatchResult, SourceBatchStatus,
-    SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceRecordResult, SourceSyncState,
+    OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_GITHUB, SourceBatch, SourceBatchResult,
+    SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
+    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
     SyncDecision,
 };
 
@@ -178,7 +179,9 @@ impl PostgresDb {
             }
         };
 
-        preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)?;
+        if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+            preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)?;
+        }
         let open_exists: bool = transaction
             .query_one(
                 "SELECT EXISTS(
@@ -199,10 +202,13 @@ impl PostgresDb {
             "INSERT INTO sekai_source_batch_transactions (
                 transaction_id, binding_id, namespace, producer_identity, idempotency_key,
                 batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
-                outcome, opened_at_ms, closed_at_ms, reason, result_json
+                outcome, opened_at_ms, closed_at_ms, reason, result_json, contract_version,
+                delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
+                snapshot_complete
              ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'OPEN',
-                'unavailable', $10, NULL, 'awaiting atomic commit', ''
+                'unavailable', $10, NULL, 'awaiting atomic commit', '', $11,
+                $12, $13, $14, $15, $16, $17
              )",
             &[
                 &prepared.transaction_id,
@@ -215,6 +221,33 @@ impl PostgresDb {
                 &batch.current_cursor,
                 &batch.proposed_next_cursor,
                 &now_ms,
+                &batch.contract_version,
+                &batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery_mode_db(delivery.mode)),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.sync_generation as i64),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.source_feed_epoch.as_deref()),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.offset_start)
+                    .map(|value| value as i64),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.offset_end)
+                    .map(|value| value as i64),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.snapshot_complete),
             ],
         )?;
         transaction.commit()?;
@@ -278,6 +311,14 @@ impl PostgresDb {
         if let Err(error) = preflight {
             if !error.is_denial() {
                 return Err(error);
+            }
+            if error.code() == Some("missing_range") {
+                mark_generation_recovery_required(
+                    &mut transaction,
+                    &prepared.binding_id,
+                    batch,
+                    now_ms,
+                )?;
             }
             transaction.execute(
                 "UPDATE sekai_source_batch_transactions
@@ -370,6 +411,7 @@ impl PostgresDb {
                 decision: prepared_record.decision.clone(),
                 outcome: OperationOutcome::Success,
                 reason: reason.into(),
+                source_sequence: prepared_record.source_sequence,
             };
             let synced_object_json =
                 serde_json::to_string(&prepared_record.object).map_err(ApplyError::storage)?;
@@ -412,8 +454,8 @@ impl PostgresDb {
             transaction.execute(
                 "INSERT INTO sekai_source_record_results (
                     transaction_id, source_id, source_version, decision_json,
-                    outcome, reason, lineage_json
-                 ) VALUES ($1, $2, $3, $4, 'success', $5, $6)",
+                    outcome, reason, lineage_json, source_sequence
+                 ) VALUES ($1, $2, $3, $4, 'success', $5, $6, $7)",
                 &[
                     &prepared.transaction_id,
                     &prepared_record.source_id,
@@ -421,6 +463,7 @@ impl PostgresDb {
                     &decision_json,
                     &reason,
                     &lineage_json,
+                    &prepared_record.source_sequence.map(|value| value as i64),
                 ],
             )?;
             record_results.push(record_result);
@@ -440,6 +483,28 @@ impl PostgresDb {
             opened_at_ms: stored.transaction.opened_at_ms,
             closed_at_ms: Some(now_ms),
             reason: "committed".into(),
+            contract_version: batch.contract_version.clone(),
+            delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
+            sync_generation: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.sync_generation),
+            source_feed_epoch: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.source_feed_epoch.clone()),
+            offset_start: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_start),
+            offset_end: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_end),
+            snapshot_complete: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.snapshot_complete),
         };
         let result = SourceBatchResult {
             transaction: committed_transaction,
@@ -459,21 +524,51 @@ impl PostgresDb {
                 "open source batch changed during atomic commit",
             ));
         }
+        commit_generation_state(&mut transaction, &prepared.binding_id, batch, now_ms)?;
         transaction.execute(
             "INSERT INTO sekai_source_checkpoints (
-                binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms
-             ) VALUES ($1, $2, $3, $4, $5)
+                binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms,
+                contract_version, delivery_mode, sync_generation, feed_epoch,
+                committed_offset
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              ON CONFLICT(binding_id) DO UPDATE SET
                 namespace = EXCLUDED.namespace,
                 cursor = EXCLUDED.cursor,
                 committed_batch_digest = EXCLUDED.committed_batch_digest,
-                advanced_at_ms = EXCLUDED.advanced_at_ms",
+                advanced_at_ms = EXCLUDED.advanced_at_ms,
+                contract_version = EXCLUDED.contract_version,
+                delivery_mode = EXCLUDED.delivery_mode,
+                sync_generation = EXCLUDED.sync_generation,
+                feed_epoch = EXCLUDED.feed_epoch,
+                committed_offset = EXCLUDED.committed_offset",
             &[
                 &prepared.binding_id,
                 &batch.namespace,
                 &batch.proposed_next_cursor,
                 &batch.batch_digest,
                 &now_ms,
+                &batch.contract_version,
+                &batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery_mode_db(delivery.mode)),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .map(|delivery| delivery.sync_generation as i64),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| delivery.source_feed_epoch.as_deref()),
+                &batch
+                    .delivery
+                    .as_ref()
+                    .and_then(|delivery| match delivery.mode {
+                        SourceDeliveryMode::Snapshot if !delivery.snapshot_complete => None,
+                        SourceDeliveryMode::Snapshot | SourceDeliveryMode::ChangeFeed => {
+                            delivery.offset_end.map(|value| value as i64)
+                        }
+                    }),
             ],
         )?;
         transaction.execute(
@@ -518,6 +613,13 @@ impl PostgresDb {
             .map(parse_stored_result)
             .transpose()
             .map_err(|error| error.to_string())?;
+        let current_generation =
+            load_current_generation(&mut transaction, &binding.binding.binding_id)
+                .map_err(|error| error.to_string())?;
+        let latest_transaction =
+            load_latest_transaction_any(&mut transaction, &binding.binding.binding_id)
+                .map_err(|error| error.to_string())?
+                .map(|stored| stored.transaction);
         let mut updated_at_ms = binding.updated_at_ms;
         if let Some(checkpoint) = &checkpoint {
             updated_at_ms = updated_at_ms.max(checkpoint.advanced_at_ms);
@@ -533,11 +635,20 @@ impl PostgresDb {
                     .unwrap_or(stored.transaction.opened_at_ms),
             );
         }
+        if let Some(generation) = &current_generation {
+            updated_at_ms = updated_at_ms.max(generation.updated_at_ms);
+        }
+        if let Some(transaction) = &latest_transaction {
+            updated_at_ms =
+                updated_at_ms.max(transaction.closed_at_ms.unwrap_or(transaction.opened_at_ms));
+        }
         let state = SourceSyncState {
             binding: binding.binding,
             checkpoint,
             open_transaction,
             last_result,
+            current_generation,
+            latest_transaction,
             updated_at_ms,
         };
         transaction.commit().map_err(|error| error.to_string())?;
@@ -590,6 +701,7 @@ fn preflight_commit_state(
         }
         Some(_) | None => {}
     }
+    preflight_delivery_state(transaction, binding, batch)?;
 
     let mut object_ids = records
         .iter()
@@ -664,6 +776,233 @@ fn preflight_commit_state(
     Ok(())
 }
 
+fn preflight_delivery_state(
+    transaction: &mut postgres::Transaction<'_>,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+) -> Result<(), ApplyError> {
+    let current = load_current_generation(transaction, &binding.binding_id)?;
+    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        if current.is_some() {
+            return Err(ApplyError::denied(
+                "legacy_batch_after_v2",
+                "legacy source batches cannot advance a generation-enabled binding",
+            ));
+        }
+        return Ok(());
+    }
+    let delivery = batch.delivery.as_ref().ok_or_else(|| {
+        ApplyError::denied(
+            "missing_delivery_metadata",
+            "v2 source batches require delivery metadata",
+        )
+    })?;
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot => match current {
+            None => {
+                if delivery.sync_generation != 1 {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "the first snapshot generation must be one",
+                    ));
+                }
+            }
+            Some(generation) => match generation.status {
+                SourceSyncGenerationStatus::Snapshotting
+                    if generation.sync_generation == delivery.sync_generation => {}
+                SourceSyncGenerationStatus::RecoveryRequired
+                    if generation
+                        .sync_generation
+                        .checked_add(1)
+                        .is_some_and(|next| next == delivery.sync_generation) => {}
+                SourceSyncGenerationStatus::Active => {
+                    return Err(ApplyError::denied(
+                        "phase_conflict",
+                        "an active generation cannot be proactively reset",
+                    ));
+                }
+                SourceSyncGenerationStatus::RecoveryRequired => {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "recovery snapshot generation is not the required successor",
+                    ));
+                }
+                SourceSyncGenerationStatus::Snapshotting
+                | SourceSyncGenerationStatus::Superseded => {
+                    return Err(ApplyError::denied(
+                        "generation_conflict",
+                        "snapshot generation does not match current state",
+                    ));
+                }
+            },
+        },
+        SourceDeliveryMode::ChangeFeed => {
+            let generation = current.ok_or_else(|| {
+                ApplyError::denied(
+                    "phase_conflict",
+                    "a change feed cannot create a synchronization generation",
+                )
+            })?;
+            if generation.status == SourceSyncGenerationStatus::RecoveryRequired {
+                return Err(ApplyError::denied(
+                    "recovery_required",
+                    "the current generation requires a recovery snapshot",
+                ));
+            }
+            if generation.status != SourceSyncGenerationStatus::Active {
+                return Err(ApplyError::denied(
+                    "phase_conflict",
+                    "change feed requires an active synchronization generation",
+                ));
+            }
+            if generation.sync_generation != delivery.sync_generation {
+                return Err(ApplyError::denied(
+                    "generation_conflict",
+                    "change feed generation does not match current state",
+                ));
+            }
+            if generation.source_feed_epoch != delivery.source_feed_epoch {
+                return Err(ApplyError::denied(
+                    "feed_epoch_conflict",
+                    "change feed epoch does not match current state",
+                ));
+            }
+            let committed_offset = generation.committed_offset.ok_or_else(|| {
+                ApplyError::denied(
+                    "phase_conflict",
+                    "active generation has no committed handoff offset",
+                )
+            })?;
+            let offset_start = delivery.offset_start.ok_or_else(|| {
+                ApplyError::denied(
+                    "missing_delivery_range",
+                    "change feed requires a delivery range",
+                )
+            })?;
+            if offset_start < committed_offset {
+                return Err(ApplyError::denied(
+                    "overlapping_range",
+                    "change feed overlaps the committed delivery position",
+                ));
+            }
+            if offset_start > committed_offset {
+                return Err(ApplyError::denied(
+                    "missing_range",
+                    "change feed starts after the committed delivery position",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_generation_recovery_required(
+    transaction: &mut postgres::Transaction<'_>,
+    binding_id: &str,
+    batch: &SourceBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    let Some(delivery) = &batch.delivery else {
+        return Ok(());
+    };
+    let generation = delivery.sync_generation as i64;
+    let updated = transaction.execute(
+        "UPDATE sekai_source_sync_generations
+         SET status='RECOVERY_REQUIRED', reason='missing_range', updated_at_ms=$1
+         WHERE binding_id=$2 AND sync_generation=$3 AND status='ACTIVE'",
+        &[&now_ms, &binding_id, &generation],
+    )?;
+    if updated != 1 {
+        return Err(ApplyError::storage(
+            "missing-range recovery transition lost current generation",
+        ));
+    }
+    Ok(())
+}
+
+fn commit_generation_state(
+    transaction: &mut postgres::Transaction<'_>,
+    binding_id: &str,
+    batch: &SourceBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        return Ok(());
+    }
+    let delivery = batch
+        .delivery
+        .as_ref()
+        .ok_or_else(|| ApplyError::storage("validated v2 batch has no delivery metadata"))?;
+    let generation = delivery.sync_generation as i64;
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot => {
+            transaction.execute(
+                "UPDATE sekai_source_sync_generations
+                 SET status='SUPERSEDED', reason='recovered_by_successor', updated_at_ms=$1
+                 WHERE binding_id=$2 AND status='RECOVERY_REQUIRED'
+                   AND sync_generation<>$3",
+                &[&now_ms, &binding_id, &generation],
+            )?;
+            let (status, mode, epoch, committed_offset, reason) = if delivery.snapshot_complete {
+                (
+                    "ACTIVE",
+                    "change_feed",
+                    delivery.source_feed_epoch.as_deref(),
+                    delivery.offset_end.map(|value| value as i64),
+                    "snapshot_handoff_committed",
+                )
+            } else {
+                (
+                    "SNAPSHOTTING",
+                    "snapshot",
+                    None,
+                    None,
+                    "snapshot_in_progress",
+                )
+            };
+            transaction.execute(
+                "INSERT INTO sekai_source_sync_generations (
+                    binding_id, sync_generation, status, delivery_mode, feed_epoch,
+                    committed_offset, reason, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                 ON CONFLICT(binding_id, sync_generation) DO UPDATE SET
+                    status=EXCLUDED.status,
+                    delivery_mode=EXCLUDED.delivery_mode,
+                    feed_epoch=EXCLUDED.feed_epoch,
+                    committed_offset=EXCLUDED.committed_offset,
+                    reason=EXCLUDED.reason,
+                    updated_at_ms=EXCLUDED.updated_at_ms",
+                &[
+                    &binding_id,
+                    &generation,
+                    &status,
+                    &mode,
+                    &epoch,
+                    &committed_offset,
+                    &reason,
+                    &now_ms,
+                ],
+            )?;
+        }
+        SourceDeliveryMode::ChangeFeed => {
+            let committed_offset = delivery.offset_end.map(|value| value as i64);
+            let updated = transaction.execute(
+                "UPDATE sekai_source_sync_generations
+                 SET delivery_mode='change_feed', committed_offset=$1,
+                     reason='change_feed_committed', updated_at_ms=$2
+                 WHERE binding_id=$3 AND sync_generation=$4 AND status='ACTIVE'",
+                &[&committed_offset, &now_ms, &binding_id, &generation],
+            )?;
+            if updated != 1 {
+                return Err(ApplyError::storage(
+                    "active generation changed during atomic commit",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn load_object(
     client: &mut impl GenericClient,
     object_id: &str,
@@ -727,19 +1066,63 @@ fn load_checkpoint(
     client: &mut impl GenericClient,
     binding_id: &str,
 ) -> Result<Option<SourceCheckpoint>, ApplyError> {
-    Ok(client
+    client
         .query_opt(
-            "SELECT binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms
+            "SELECT binding_id, namespace, cursor, committed_batch_digest, advanced_at_ms,
+                    contract_version, delivery_mode, sync_generation, feed_epoch,
+                    committed_offset
              FROM sekai_source_checkpoints WHERE binding_id = $1",
             &[&binding_id],
         )?
-        .map(|row| SourceCheckpoint {
-            binding_id: row.get(0),
-            namespace: row.get(1),
-            cursor: row.get(2),
-            committed_batch_digest: row.get(3),
-            advanced_at_ms: row.get(4),
-        }))
+        .map(|row| {
+            Ok(SourceCheckpoint {
+                binding_id: row.get(0),
+                namespace: row.get(1),
+                cursor: row.get(2),
+                committed_batch_digest: row.get(3),
+                advanced_at_ms: row.get(4),
+                contract_version: row.get(5),
+                delivery_mode: row
+                    .get::<_, Option<String>>(6)
+                    .as_deref()
+                    .map(delivery_mode_from_db)
+                    .transpose()?,
+                sync_generation: optional_u64_from_i64(row.get(7))?,
+                source_feed_epoch: row.get(8),
+                committed_offset: optional_u64_from_i64(row.get(9))?,
+            })
+        })
+        .transpose()
+}
+
+fn load_current_generation(
+    client: &mut impl GenericClient,
+    binding_id: &str,
+) -> Result<Option<SourceSyncGeneration>, ApplyError> {
+    client
+        .query_opt(
+            "SELECT binding_id, sync_generation, status, delivery_mode, feed_epoch,
+                    committed_offset, reason, created_at_ms, updated_at_ms
+             FROM sekai_source_sync_generations
+             WHERE binding_id=$1
+               AND status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED')
+             ORDER BY sync_generation DESC LIMIT 1",
+            &[&binding_id],
+        )?
+        .map(|row| {
+            Ok(SourceSyncGeneration {
+                binding_id: row.get(0),
+                sync_generation: u64_from_i64(row.get(1))?,
+                status: generation_status_from_db(&row.get::<_, String>(2))?,
+                delivery_mode: delivery_mode_from_db(&row.get::<_, String>(3))?,
+                source_feed_epoch: row.get(4),
+                committed_offset: optional_u64_from_i64(row.get(5))?,
+                reason: row.get(6),
+                created_at_ms: row.get(7),
+                updated_at_ms: row.get(8),
+            })
+        })
+        .transpose()
 }
 
 fn load_binding_by_source(
@@ -828,7 +1211,9 @@ fn stored_binding_from_row(row: Row) -> Result<StoredBinding, ApplyError> {
 const BATCH_SELECT: &str =
     "SELECT transaction_id, binding_id, namespace, producer_identity, idempotency_key,
             batch_digest, current_cursor, proposed_next_cursor, status, outcome,
-            opened_at_ms, closed_at_ms, reason, result_json
+            opened_at_ms, closed_at_ms, reason, result_json, contract_version,
+            delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
+            snapshot_complete
      FROM sekai_source_batch_transactions";
 
 fn load_batch_by_key(
@@ -870,6 +1255,24 @@ fn load_latest_transaction(
         .transpose()
 }
 
+fn load_latest_transaction_any(
+    client: &mut impl GenericClient,
+    binding_id: &str,
+) -> Result<Option<StoredBatch>, ApplyError> {
+    client
+        .query_opt(
+            &format!(
+                "{BATCH_SELECT}
+                 WHERE binding_id = $1
+                 ORDER BY COALESCE(closed_at_ms, opened_at_ms) DESC, transaction_id DESC
+                 LIMIT 1"
+            ),
+            &[&binding_id],
+        )?
+        .map(stored_batch_from_row)
+        .transpose()
+}
+
 fn stored_batch_from_row(row: Row) -> Result<StoredBatch, ApplyError> {
     let status: String = row.get(8);
     let status = match status.as_str() {
@@ -900,9 +1303,53 @@ fn stored_batch_from_row(row: Row) -> Result<StoredBatch, ApplyError> {
             opened_at_ms: row.get(10),
             closed_at_ms: row.get(11),
             reason: row.get(12),
+            contract_version: row.get(14),
+            delivery_mode: row
+                .get::<_, Option<String>>(15)
+                .as_deref()
+                .map(delivery_mode_from_db)
+                .transpose()?,
+            sync_generation: optional_u64_from_i64(row.get(16))?,
+            source_feed_epoch: row.get(17),
+            offset_start: optional_u64_from_i64(row.get(18))?,
+            offset_end: optional_u64_from_i64(row.get(19))?,
+            snapshot_complete: row.get(20),
         },
         result_json: row.get(13),
     })
+}
+
+fn delivery_mode_db(mode: SourceDeliveryMode) -> &'static str {
+    match mode {
+        SourceDeliveryMode::Snapshot => "snapshot",
+        SourceDeliveryMode::ChangeFeed => "change_feed",
+    }
+}
+
+fn delivery_mode_from_db(value: &str) -> Result<SourceDeliveryMode, ApplyError> {
+    match value {
+        "snapshot" => Ok(SourceDeliveryMode::Snapshot),
+        "change_feed" => Ok(SourceDeliveryMode::ChangeFeed),
+        _ => Err(ApplyError::storage("invalid source delivery mode")),
+    }
+}
+
+fn generation_status_from_db(value: &str) -> Result<SourceSyncGenerationStatus, ApplyError> {
+    match value {
+        "SNAPSHOTTING" => Ok(SourceSyncGenerationStatus::Snapshotting),
+        "ACTIVE" => Ok(SourceSyncGenerationStatus::Active),
+        "RECOVERY_REQUIRED" => Ok(SourceSyncGenerationStatus::RecoveryRequired),
+        "SUPERSEDED" => Ok(SourceSyncGenerationStatus::Superseded),
+        _ => Err(ApplyError::storage("invalid source sync generation status")),
+    }
+}
+
+fn u64_from_i64(value: i64) -> Result<u64, ApplyError> {
+    u64::try_from(value).map_err(|_| ApplyError::storage("negative persisted delivery position"))
+}
+
+fn optional_u64_from_i64(value: Option<i64>) -> Result<Option<u64>, ApplyError> {
+    value.map(u64_from_i64).transpose()
 }
 
 fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {

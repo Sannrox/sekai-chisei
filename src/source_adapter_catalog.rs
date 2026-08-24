@@ -24,6 +24,8 @@ pub struct SourceAdapterProfile {
     pub record_types: Vec<String>,
     pub apply_rpc: String,
     pub state_rpc: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub description: String,
 }
 
@@ -43,8 +45,14 @@ pub fn built_in_source_adapters() -> Vec<SourceAdapterProfile> {
             .collect(),
         apply_rpc: "SekaiService.ApplySourceBatch".into(),
         state_rpc: "SekaiService.GetSourceSyncState".into(),
-        description: "GitHub Issue and PullRequest records mapped onto one repository number \
-                      identity with opaque-checkpoint snapshot paging."
+        capabilities: vec![
+            "opaque_checkpoint_snapshot_v1".into(),
+            "generation_snapshot_v2".into(),
+            "direct_change_feed_unsupported_ordering".into(),
+        ],
+        description: "GitHub Issue and PullRequest fixture normalization with stable repository \
+                      number identity, v1 opaque-checkpoint snapshots, and v2 generation snapshot \
+                      handoff. Direct GitHub collection does not provide contiguous feed ordering."
             .into(),
     }]
 }
@@ -66,5 +74,15 @@ mod tests {
         );
         assert_eq!(profile.type_digest, GITHUB_OBJECT_SYNC_TYPE_DIGEST);
         assert_eq!(profile.record_types, ["Issue", "PullRequest"]);
+        assert!(
+            profile
+                .capabilities
+                .contains(&"generation_snapshot_v2".to_string())
+        );
+        assert!(
+            profile
+                .capabilities
+                .contains(&"direct_change_feed_unsupported_ordering".to_string())
+        );
     }
 }

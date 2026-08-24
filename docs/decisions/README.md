@@ -43,3 +43,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0020: Keep shared type revisions, inbound object sync, and permit-backed external mutation separate](0020-shared-type-revisions-and-object-sync.md)
 - [ADR 0021: Defer a second object-sync source until GitHub Issue/PR admission is live](0021-defer-second-object-sync-source.md)
 - [ADR 0022: Admit inbound records as plane-committed source batches](0022-source-batch-transactions.md)
+- [ADR 0023: Fence ordered source change feeds by synchronization generation](0023-generation-fenced-source-change-feeds.md)

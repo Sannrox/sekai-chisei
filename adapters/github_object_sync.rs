@@ -13,6 +13,17 @@ use std::collections::BTreeMap;
 
 pub const MAX_GITHUB_FIXTURE_BYTES: usize = 256 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectFeedCapability {
+    UnsupportedOrdering,
+}
+
+/// Public GitHub collection does not provide the contiguous ordered feed that
+/// v2 requires. Fixture normalization remains snapshot-only.
+pub fn direct_feed_capability() -> DirectFeedCapability {
+    DirectFeedCapability::UnsupportedOrdering
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitHubObjectFixture {
@@ -116,6 +127,7 @@ pub fn translate(
         properties,
         deleted: fixture.deleted,
         observed_at_ms: fixture.observed_at_ms,
+        source_sequence: None,
     };
     Ok(record)
 }

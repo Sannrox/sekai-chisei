@@ -102,11 +102,13 @@ properties, raw/unknown fixture fields, and oversized input.
 The content digest excludes `observed_at_ms`, so polling the same immutable
 source revision later does not manufacture a source-content conflict.
 
-`object_sync_sdk.rs` builds and serializes `sekai.source-batch/v1`. Its local
-outbox writes the exact normalized batch under a cross-process lock with
-no-replace publication and directory fsync before calling a transport. The SDK
-accepts only the code-owned `sekai.source-type-revision/v1` GitHub
-Issue/PullRequest digest
+`object_sync_sdk.rs` builds and serializes replay-compatible
+`sekai.source-batch/v1` snapshots and the version 2 delivery envelope used by
+generation-fenced snapshots and ordered feeds. Its local outbox writes the
+exact normalized batch, including generation, epoch, offset range, and source
+sequences when present, under a cross-process lock with no-replace publication
+and directory fsync before calling a transport. The SDK accepts only the
+code-owned `sekai.source-type-revision/v1` GitHub Issue/PullRequest digest
 `sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
 Replay order is deterministic, and only one distinct unresolved batch may
 exist for a namespace/source-instance/type-revision binding; exact re-enqueue
@@ -179,14 +181,42 @@ let outcome = object_sync_snapshot::run_snapshot(
 ```
 
 Call the runner again after `in_progress` or once pending transport state can be
-retried. Keep the same outbox directory across restarts. `recovery_required`
-needs the exact missing normalized page or database repair from authoritative
-evidence; the adapter must not skip the open transaction.
+retried. Keep the same outbox directory across restarts. Follow
+[Inbound object sync](../docs/object-sync.md#transaction-lifecycle-and-recovery)
+for the authoritative retry and recovery procedure.
+
+### Ordered-feed adapter requirements
+
+A version 2 adapter starts a control-plane-owned synchronization generation with
+snapshot pages. The terminal page must provide both a stable source feed epoch
+and the source's consistency-barrier offset. Change-feed batches then retain
+that generation and epoch and provide one contiguous `(offset_start,
+offset_end]` range. Each normalized record carries its exact source sequence;
+the adapter must preserve source order and must not sort change-feed records by
+object identity. The source reader supplies `offset_start`; when its next
+available contiguous page starts ahead of the plane-owned committed offset, the
+runner submits that valid source range so the plane can durably record the gap
+and require recovery.
+
+The adapter must serialize these values exactly and leave generation
+transitions, checkpoint advancement, and recovery decisions to the control
+plane. The authoritative v2 collection and recovery procedure is
+[Version 2 ordered synchronization](../docs/object-sync.md#version-2-ordered-synchronization).
+
+Do not claim ordered-feed capability unless the source supplies a stable epoch,
+contiguous monotonic sequence, and authoritative snapshot/feed handoff. GitHub's
+public Events API does not meet that contract and is not a supported gapless
+feed. The fixed GitHub fixture normalizer and v1 snapshot runner remain valid
+for checkpointed snapshots; neither timestamps nor public pagination positions
+may be converted into v2 offsets. Snapshot completion never tombstones absent
+objects. Emit explicit `deleted: true` records instead.
 
 The surrounding process injects authentication into its RPC client in memory;
 it must not pass credentials to the adapter config, page source output, or
-outbox. Change-feed and webhook collection transports remain separate follow-up
-work.
+outbox. Quarantine and transport diagnostics must remain bounded and value-free:
+do not echo credentials, source payloads, feed epochs, cursors, authorization
+metadata, remote response bodies, or outbox contents. Webhook and ordered-feed
+collection remain separate transports.
 Offline conformance runs through:
 
 ```sh

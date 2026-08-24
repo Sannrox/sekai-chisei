@@ -10,6 +10,16 @@
   `permit_id`, and stays `skipped` without a permit.
 - Bounded GitHub object sync onto shared type revisions, with refresh,
   tombstone, and identity-conflict rules.
+- Add `sekai.source-batch/v2` generation-fenced snapshot and ordered-feed
+  delivery. Terminal snapshots bind a stable source epoch and consistency
+  barrier; change batches advance only contiguous offset ranges atomically with
+  objects, audit, lineage, results, and the checkpoint. Exact replay is
+  idempotent, reordered or overlapping ranges abort, and missing ranges require
+  a next-generation recovery snapshot.
+- Preserve exact `sekai.source-batch/v1` replay and add one-way additive SQLite
+  and PostgreSQL generation/offset migrations. Sources without authoritative
+  epoch, sequence, and snapshot/feed handoff support remain explicitly
+  unsupported; snapshot absence never implies deletion.
 - Dataset-backed object lineage from source record to write-back effect.
 - Log successful gRPC request completions at DEBUG instead of INFO so default
   operator logs stay quiet under poll traffic. Non-ok completions remain WARN.

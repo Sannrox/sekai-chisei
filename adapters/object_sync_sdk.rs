@@ -7,8 +7,9 @@
 use fs2::FileExt;
 use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, SOURCE_BATCH_VERSION, SOURCE_GITHUB,
-    SourceBatch, SourceRecord,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, SOURCE_BATCH_V2_VERSION,
+    SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow,
+    SourceRecord, SourceSyncGenerationStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,6 +46,23 @@ struct StableBatchIdentity<'a> {
     type_digest: &'a str,
     current_cursor: &'a str,
     proposed_next_cursor: &'a str,
+    records: &'a [SourceRecord],
+}
+
+#[derive(Debug, Serialize)]
+struct StableBatchIdentityV2<'a> {
+    contract_version: &'static str,
+    namespace: &'a str,
+    producer_identity: &'a str,
+    source: &'static str,
+    source_instance: &'a str,
+    family: &'static str,
+    adapter_id: &'static str,
+    adapter_version: &'static str,
+    type_digest: &'a str,
+    current_cursor: &'a str,
+    proposed_next_cursor: &'a str,
+    delivery: &'a SourceDeliveryWindow,
     records: &'a [SourceRecord],
 }
 
@@ -107,6 +125,70 @@ pub fn build_source_batch(
         batch_digest: String::new(),
         collected_at_ms,
         records,
+        delivery: None,
+    };
+    batch.batch_digest = batch
+        .canonical_digest()
+        .map_err(|error| format!("source batch canonicalization failed: {}", error.code))?;
+    batch
+        .validate()
+        .map_err(|error| format!("source batch rejected: {}", error.code))?;
+    Ok(batch)
+}
+
+/// Builds one deterministic v2 snapshot or change-feed batch.
+///
+/// Unlike the v1 builder, record order is source-significant and is preserved.
+/// Delivery metadata and source sequences participate in the stable identity.
+pub fn build_source_batch_v2(
+    config: &SourceAdapterConfig,
+    current_cursor: &str,
+    proposed_next_cursor: &str,
+    collected_at_ms: i64,
+    records: Vec<SourceRecord>,
+    delivery: SourceDeliveryWindow,
+) -> Result<SourceBatch, String> {
+    if config.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Err("source adapter rejected: unbound_type_revision".into());
+    }
+    if records.len() > MAX_SOURCE_BATCH_RECORDS {
+        return Err("source adapter record count exceeds the batch limit".into());
+    }
+    let identity = StableBatchIdentityV2 {
+        contract_version: SOURCE_BATCH_V2_VERSION,
+        namespace: &config.namespace,
+        producer_identity: &config.producer_identity,
+        source: SOURCE_GITHUB,
+        source_instance: &config.source_instance,
+        family: FAMILY_OBJECT_SYNC,
+        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC,
+        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION,
+        type_digest: &config.type_digest,
+        current_cursor,
+        proposed_next_cursor,
+        delivery: &delivery,
+        records: &records,
+    };
+    let identity_bytes = serde_json::to_vec(&identity)
+        .map_err(|_| "source batch identity cannot be serialized".to_string())?;
+    let idempotency_key = format!("sync-{:x}", Sha256::digest(identity_bytes));
+    let mut batch = SourceBatch {
+        contract_version: SOURCE_BATCH_V2_VERSION.into(),
+        namespace: config.namespace.clone(),
+        producer_identity: config.producer_identity.clone(),
+        source: SOURCE_GITHUB.into(),
+        source_instance: config.source_instance.clone(),
+        family: FAMILY_OBJECT_SYNC.into(),
+        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC.into(),
+        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+        type_digest: config.type_digest.clone(),
+        current_cursor: current_cursor.into(),
+        proposed_next_cursor: proposed_next_cursor.into(),
+        idempotency_key,
+        batch_digest: String::new(),
+        collected_at_ms,
+        records,
+        delivery: Some(delivery),
     };
     batch.batch_digest = batch
         .canonical_digest()
@@ -510,12 +592,58 @@ pub struct GetSourceSyncStateInput {
     pub type_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type SourceGenerationStatus = SourceSyncGenerationStatus;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SourceSyncStateView {
     pub found: bool,
     pub current_cursor: Option<String>,
     pub open_transaction: bool,
     pub last_committed_batch_digest: Option<String>,
+    pub generation_status: Option<SourceGenerationStatus>,
+    pub delivery_mode: Option<SourceDeliveryMode>,
+    pub sync_generation: Option<u64>,
+    pub source_feed_epoch: Option<String>,
+    pub committed_offset: Option<u64>,
+    pub latest_transaction_idempotency_key: Option<String>,
+    pub latest_transaction_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRunDisposition {
+    CaughtUp,
+    InProgress,
+    Pending,
+    RecoveryRequired,
+    SnapshotRequired,
+    UnsupportedOrdering,
+    Rejected,
+    InvalidInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRunReport {
+    pub disposition: SourceRunDisposition,
+    pub batches_committed: usize,
+    pub committed_cursor: Option<String>,
+    pub sync_generation: Option<u64>,
+    pub committed_offset: Option<u64>,
+}
+
+impl SourceRunReport {
+    pub fn from_state(
+        disposition: SourceRunDisposition,
+        batches_committed: usize,
+        state: &SourceSyncStateView,
+    ) -> Self {
+        Self {
+            disposition,
+            batches_committed,
+            committed_cursor: state.current_cursor.clone(),
+            sync_generation: state.sync_generation,
+            committed_offset: state.committed_offset,
+        }
+    }
 }
 
 /// RPC seam implemented by an out-of-process client.
