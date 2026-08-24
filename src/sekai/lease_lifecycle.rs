@@ -90,6 +90,7 @@ pub(crate) struct LeaseLifecycle<'a> {
     db: &'a RuntimeDb,
     security: &'a SecurityChecker,
     site_id: &'a str,
+    policy_context: crate::sekai::object_security::PrincipalPolicyContext,
 }
 
 impl<'a> LeaseLifecycle<'a> {
@@ -98,7 +99,16 @@ impl<'a> LeaseLifecycle<'a> {
             db,
             security,
             site_id,
+            policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
         }
+    }
+
+    pub(crate) fn with_policy_context(
+        mut self,
+        policy_context: crate::sekai::object_security::PrincipalPolicyContext,
+    ) -> Self {
+        self.policy_context = policy_context;
+        self
     }
 
     pub(crate) fn acquire(&self, command: AcquireLease<'_>) -> Result<Lease, LeaseLifecycleError> {
@@ -311,7 +321,41 @@ impl<'a> LeaseLifecycle<'a> {
                 "object-bound lease namespace must match the target object namespace".into(),
             ));
         }
+        if !object_security_allows(self.db, &object, principals, &self.policy_context, write)
+            .map_err(LeaseLifecycleError::Storage)?
+        {
+            return Err(LeaseLifecycleError::NotFound(format!(
+                "object-bound lease target {object_id} not found"
+            )));
+        }
         Ok(())
+    }
+}
+
+fn object_security_allows(
+    db: &crate::db::runtime_db::RuntimeDb,
+    object: &crate::domain::Object,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    write: bool,
+) -> Result<bool, String> {
+    match db.active_object_policy(&object.namespace, &object.kind) {
+        Err(error) if error.starts_with("object_security_denied") => Ok(false),
+        Err(error) => Err(error),
+        Ok(None) => Ok(true),
+        Ok(Some(policy)) => {
+            let mut context = policy_context.clone();
+            if context.subjects.is_empty() {
+                context.subjects = principals.to_vec();
+            }
+            let context = context.normalized();
+            let operation = if write {
+                crate::sekai::object_security::ObjectSecurityOperation::Update
+            } else {
+                crate::sekai::object_security::ObjectSecurityOperation::Read
+            };
+            Ok(policy.allows(&context, object, operation))
+        }
     }
 }
 

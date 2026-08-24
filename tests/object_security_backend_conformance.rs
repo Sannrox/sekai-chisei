@@ -231,6 +231,70 @@ fn exercise(db: RuntimeDb, namespace: &str) {
             .unwrap()
             .is_none()
     );
+
+    let write = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "document".into(),
+        rules: vec![
+            ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Read,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            },
+            ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Update,
+                predicates: vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+                    property: "owner".into(),
+                }],
+            },
+            ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Delete,
+                predicates: vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+                    property: "owner".into(),
+                }],
+            },
+            ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Create,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            },
+            ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Sync,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            },
+        ],
+    };
+    let write_revision = db
+        .put_object_security_policy(&write, "root", "put-write", 11)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), write_revision.revision_digest.clone())]),
+        "root",
+        "activate-write",
+        12,
+    )
+    .unwrap();
+    let loaded = db
+        .active_object_policy(namespace, "document")
+        .unwrap()
+        .unwrap();
+    let alice = PrincipalPolicyContext {
+        subjects: vec!["alice".into()],
+        scopes: Vec::new(),
+    };
+    let bob = PrincipalPolicyContext {
+        subjects: vec!["bob".into()],
+        scopes: Vec::new(),
+    };
+    let alice_object = object(namespace, "a", "alpha", "alice", "open");
+    assert!(loaded.allows(&alice, &alice_object, ObjectSecurityOperation::Read));
+    assert!(loaded.allows(&alice, &alice_object, ObjectSecurityOperation::Update));
+    assert!(!loaded.allows(&bob, &alice_object, ObjectSecurityOperation::Update));
+    assert_eq!(db.object_query_cursor_key().unwrap().len(), 32);
+    assert_eq!(
+        db.object_query_cursor_key().unwrap(),
+        db.object_query_cursor_key().unwrap()
+    );
 }
 
 #[test]

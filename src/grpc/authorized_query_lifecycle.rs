@@ -100,7 +100,9 @@ impl SekaiServiceImpl {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        let inner = req.into_inner();
+        let page_token = inner.page_token;
+        let mut filter = parse_list_filter(inner.filter.unwrap_or_default())?;
         if tenant_context.is_some() {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
@@ -154,6 +156,7 @@ impl SekaiServiceImpl {
             return Ok(Response::new(ListObjectsResponse {
                 objects: Vec::new(),
                 total: 0,
+                next_page_token: String::new(),
             }));
         }
         {
@@ -176,6 +179,52 @@ impl SekaiServiceImpl {
                 queried_properties,
             )?;
         }
+        // Token binds principal policy context, activation, and query. ACL,
+        // team, and marking changes are re-applied when the page is served.
+        let principal_context_digest = policy_context
+            .digest()
+            .map_err(|_| Status::permission_denied("access denied"))?;
+        let query_digest = crate::sekai::object_security::object_query_digest(&filter)
+            .map_err(Status::invalid_argument)?;
+        let cursor_namespace = filter.namespace.clone().unwrap_or_default();
+        let policy_activation_digest = if cursor_namespace.is_empty() {
+            "legacy".into()
+        } else {
+            match self
+                .db
+                .get_object_security_activation(&cursor_namespace)
+                .map_err(Status::internal)?
+            {
+                Some(activation) => {
+                    crate::sekai::object_security::object_security_activation_digest(&activation)
+                        .map_err(Status::internal)?
+                }
+                None => "legacy".into(),
+            }
+        };
+        if !page_token.is_empty() {
+            if cursor_namespace.is_empty() || filter.offset != 0 {
+                return Err(Status::invalid_argument(
+                    "page_token requires a namespace filter and zero offset",
+                ));
+            }
+            let cursor = crate::sekai::object_security::ObjectQueryCursor::decode(
+                &page_token,
+                &self.object_query_cursor_key,
+                now_millis(),
+            )
+            .map_err(Status::failed_precondition)?;
+            if cursor.principal_context_digest != principal_context_digest
+                || cursor.namespace != cursor_namespace
+                || cursor.policy_activation_digest != policy_activation_digest
+                || cursor.query_digest != query_digest
+            {
+                return Err(Status::failed_precondition(
+                    "object query cursor authority or query has changed",
+                ));
+            }
+            filter.offset = cursor.offset;
+        }
         // The API now defaults paging at 100 rows when no limit is provided;
         // DB callers using list_objects(&filter) remain unchanged.
         let (objects, total) = list_objects_with_marking(
@@ -193,9 +242,27 @@ impl SekaiServiceImpl {
                 )
             },
         )?;
+        let returned = objects.len() as i32;
+        let next_offset = filter.offset.saturating_add(returned);
+        let next_page_token = if !cursor_namespace.is_empty() && next_offset < total && returned > 0
+        {
+            crate::sekai::object_security::ObjectQueryCursor::issue(
+                next_offset,
+                principal_context_digest,
+                cursor_namespace,
+                policy_activation_digest,
+                query_digest,
+                now_millis(),
+            )
+            .and_then(|cursor| cursor.encode(&self.object_query_cursor_key))
+            .map_err(Status::internal)?
+        } else {
+            String::new()
+        };
         let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
+            next_page_token,
         });
         if let (Some(_), Some(operation_id)) =
             (invoked_capability.as_deref(), operation_id.as_deref())
@@ -317,6 +384,7 @@ impl SekaiServiceImpl {
             return Ok(Response::new(ListObjectsResponse {
                 objects: Vec::new(),
                 total: 0,
+                next_page_token: String::new(),
             }));
         }
         {
@@ -352,6 +420,7 @@ impl SekaiServiceImpl {
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(to_proto_obj).collect(),
             total: filtered.len() as i32,
+            next_page_token: String::new(),
         }))
     }
     pub(super) async fn get_visible_links(

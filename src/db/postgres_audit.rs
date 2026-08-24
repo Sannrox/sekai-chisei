@@ -1,11 +1,22 @@
 use crate::db::postgres::PostgresDb;
 use crate::domain::Object;
-use crate::sekai::audit::{ObjectChange, object_diff_changes};
+use crate::sekai::audit::{ObjectChange, object_diff_changes, object_diff_changes_with_snapshot};
+use crate::sekai::object_security::ObjectSecurityPolicy;
+use std::collections::BTreeSet;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
 
 impl PostgresDb {
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_authorized_policy(object, actor, None)
+    }
+
+    pub fn create_object_with_authorized_policy(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
         let mut connection = self.connection()?;
@@ -13,6 +24,11 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_object_lifecycle(&mut transaction, &object.id)?;
+        require_postgres_policy_generation(
+            &mut transaction,
+            &object.namespace,
+            expected_policy_generation,
+        )?;
         let historical: i64 = transaction
             .query_one(
                 "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = $1",
@@ -57,6 +73,8 @@ impl PostgresDb {
         object: &Object,
         actor: &str,
         expected_updated: i64,
+        expected_policy_generation: Option<&str>,
+        expected: Option<&Object>,
     ) -> Result<Option<Object>, String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -77,6 +95,16 @@ impl PostgresDb {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
+        require_postgres_policy_generation(
+            &mut transaction,
+            &before.namespace,
+            expected_policy_generation,
+        )?;
+        if let Some(expected) = expected
+            && !before.persisted_state_matches(expected)
+        {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
         if before.namespace != object.namespace {
             return Err("object namespace is immutable".into());
         }
@@ -150,6 +178,25 @@ impl PostgresDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_authorized_snapshot(id, None, actor, None)
+    }
+
+    pub fn delete_object_with_authorized_snapshot(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
+        let snapshot_keys = expected
+            .map(|object| postgres_security_snapshot_property_keys(self, object))
+            .or_else(|| {
+                self.get_object(id)
+                    .ok()
+                    .flatten()
+                    .map(|object| postgres_security_snapshot_property_keys(self, &object))
+            })
+            .unwrap_or_default();
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -163,6 +210,28 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?
             .map(row_to_object)
             .transpose()?;
+        let namespace = expected
+            .map(|object| object.namespace.as_str())
+            .or_else(|| before.as_ref().map(|object| object.namespace.as_str()));
+        if let Some(namespace) = namespace {
+            require_postgres_policy_generation(
+                &mut transaction,
+                namespace,
+                expected_policy_generation,
+            )?;
+        }
+        if let Some(expected) = expected {
+            match &before {
+                Some(before) if before.persisted_state_matches(expected) => {}
+                Some(_) => {
+                    return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+                }
+                None => {
+                    transaction.commit().map_err(|error| error.to_string())?;
+                    return Ok(None);
+                }
+            }
+        }
         transaction
             .execute(
                 "DELETE FROM sekai_links WHERE from_id = $1 OR to_id = $1",
@@ -175,11 +244,12 @@ impl PostgresDb {
         if let Some(before) = &before {
             insert_changes(
                 &mut transaction,
-                &object_diff_changes(
+                &object_diff_changes_with_snapshot(
                     actor,
                     Some(before),
                     None,
                     chrono::Utc::now().timestamp_millis(),
+                    &snapshot_keys,
                 ),
             )?;
         }
@@ -204,6 +274,51 @@ impl PostgresDb {
             .map(|rows| rows.into_iter().map(row_to_change).collect())
             .map_err(|error| error.to_string())
     }
+}
+
+pub(crate) fn postgres_security_snapshot_property_keys(
+    db: &PostgresDb,
+    object: &Object,
+) -> BTreeSet<String> {
+    db.get_object_security_activation(&object.namespace)
+        .ok()
+        .flatten()
+        .and_then(|activation| activation.policies.get(&object.kind).cloned())
+        .and_then(|digest| {
+            db.get_object_security_policy(&object.namespace, &digest)
+                .ok()
+                .flatten()
+        })
+        .and_then(|revision| {
+            ObjectSecurityPolicy::from_canonical_input(&revision.canonical_policy_json).ok()
+        })
+        .map(|policy| policy.policy_driving_properties().into_iter().collect())
+        .unwrap_or_default()
+}
+
+pub(crate) fn require_postgres_policy_generation(
+    transaction: &mut postgres::Transaction<'_>,
+    namespace: &str,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    transaction
+        .query_one("SELECT pg_advisory_xact_lock(hashtext($1))", &[&namespace])
+        .map_err(|error| error.to_string())?;
+    let actual = transaction
+        .query_opt(
+            "SELECT activation_id FROM sekai_object_security_activations WHERE namespace = $1",
+            &[&namespace],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get::<_, String>(0))
+        .unwrap_or_else(|| "legacy".into());
+    if actual != expected {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    Ok(())
 }
 
 pub(crate) fn lock_object_lifecycle(

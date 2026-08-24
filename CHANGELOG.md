@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Apply activated `sekai.object-security-policy/v1` rules to writes, traversal,
+  linked-object reads, lineage, synchronization, object-bound leases, and
+  authority-bound `ListObjects` cursors. Read rules do not grant mutation;
+  updates compare the authorized snapshot inside the persist transaction.
 - Merge of a governed definition proposal requires the expected published
   digest, compare-and-swaps that pointer, and returns a durable `receipt_id`
   stored on the merged proposal. Exact replay returns the same receipt without
@@ -18,8 +22,7 @@
 - Add immutable `sekai.object-security-policy/v1` revisions, atomic namespace
   activation, administrative gRPC inspection/mutation, and SQLite/PostgreSQL
   storage-predicate enforcement for direct object reads and `ListObjects`.
-  Existing inactive namespaces keep prior ACL and marking semantics; writes,
-  remaining object consumers, and authority-bound cursors remain unsupported.
+  Existing inactive namespaces keep prior ACL and marking semantics.
 - Add a separate bounded native content contract for ordered text, image,
   audio, and document descriptors. Content plans preserve the existing text
   RPCs, authorize disclosure through Chisei policy, verify transient payload

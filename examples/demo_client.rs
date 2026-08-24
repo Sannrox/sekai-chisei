@@ -252,6 +252,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
                 kind: "service".to_string(),
                 ..Default::default()
             }),
+            ..Default::default()
         })
         .await
     {
