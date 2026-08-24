@@ -49,6 +49,18 @@ pub trait ObjectSyncBackend: Send + Sync {
         now_ms: i64,
     ) -> Result<SourceBatchResult, String>;
 
+    /// Internal backend-neutral inspection of the lineage owned by one
+    /// persisted source identity. This is not an authorization or RPC surface.
+    #[doc(hidden)]
+    fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<ObjectLineage>, String> {
+        let _ = (namespace, source_id);
+        Err("source identity lineage is unavailable".into())
+    }
+
     fn get_source_sync_state(
         &self,
         namespace: &str,
@@ -65,6 +77,14 @@ impl ObjectSyncBackend for SekaiDb {
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
         SekaiDb::apply_source_batch(self, batch, authenticated_producer, now_ms)
+    }
+
+    fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<ObjectLineage>, String> {
+        SekaiDb::get_source_identity_lineage(self, namespace, source_id)
     }
 
     fn get_source_sync_state(
@@ -85,6 +105,14 @@ impl ObjectSyncBackend for PostgresDb {
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
         PostgresDb::apply_source_batch(self, batch, authenticated_producer, now_ms)
+    }
+
+    fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<ObjectLineage>, String> {
+        PostgresDb::get_source_identity_lineage(self, namespace, source_id)
     }
 
     fn get_source_sync_state(
@@ -965,6 +993,29 @@ impl SekaiDb {
         )?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    pub(crate) fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<ObjectLineage>, String> {
+        let conn = self.conn();
+        let lineage_json = conn
+            .query_row(
+                "SELECT lineage_json FROM sekai_source_identities
+                 WHERE namespace=?1 AND source_id=?2",
+                params![namespace, source_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| "source identity lineage is unavailable".to_string())?;
+        lineage_json
+            .map(|lineage_json| {
+                serde_json::from_str(&lineage_json)
+                    .map_err(|_| "stored source identity lineage is invalid".to_string())
+            })
+            .transpose()
     }
 
     pub fn get_source_sync_state(

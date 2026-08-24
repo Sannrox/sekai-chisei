@@ -244,9 +244,32 @@ outbox contents.
 
 SQLite and reusable PostgreSQL implement the same binding, replay, generation,
 contiguous-range, recovery, identity, tombstone, and checkpoint contract.
-Normal CI runs SQLite conformance. PostgreSQL conformance and concurrency tests
-require an isolated TLS database through `SEKAI_TEST_POSTGRES_URL` and are
-ignored otherwise:
+Normal CI remains offline and runs both the advertised-adapter lifecycle suite
+and SQLite backend conformance:
+
+```sh
+cargo test --test object_sync_adapters
+cargo test --test object_sync_backend_conformance
+```
+
+The versioned lifecycle fixture covers initial projection, refresh, explicit
+tombstone, reversal/reactivation, immutable-revision conflict detection, stable
+source/object/type identity, canonical normalized payload digests, snapshot
+source-sequence absence, and source → dataset → object lineage. The conflict
+reuses the current reversal revision with divergent content so stateful backends
+must fail closed against their latest source version. The fixture runs against
+the one catalog-advertised GitHub Issue/PullRequest normalizer and an independent
+test-only canary implementation of the same fixed profile. The canary is not
+catalog-advertised and does not add a source, profile, connector, or adapter
+family. Catalog coverage must exactly match the advertised profile set, and
+deliberately divergent fixtures must be rejected.
+
+The shared backend exercise verifies reactivation after tombstone with the same
+object id, stable projected identity and persisted lineage binding, fail-closed
+current-revision and type conflicts, and unchanged checkpoints after denial.
+SQLite and the ignored PostgreSQL test invoke that same exercise. PostgreSQL
+conformance and concurrency tests require an isolated TLS database through
+`SEKAI_TEST_POSTGRES_URL` and are ignored otherwise:
 
 ```sh
 SEKAI_TEST_POSTGRES_URL=... \

@@ -27,7 +27,8 @@ use sekai_chisei::sekai::object_sync::{
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow,
     SourceRecord,
 };
-use std::collections::{HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 
@@ -386,6 +387,147 @@ fn sequenced_record(external_id: &str, sequence: u64) -> SourceRecord {
     record.display_name = format!("Object {external_id}");
     record.source_sequence = Some(sequence);
     record
+}
+
+#[test]
+fn lifecycle_conformance_covers_every_advertised_profile_and_an_independent_canary() {
+    let github = object_sync_conformance::run_lifecycle_fixture(
+        "adapter.github.object_sync",
+        github_lifecycle_record,
+    )
+    .unwrap();
+    object_sync_conformance::assert_lifecycle_report(&github).unwrap();
+
+    let canary = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        canary_lifecycle_record,
+    )
+    .unwrap();
+    object_sync_conformance::assert_lifecycle_report(&canary).unwrap();
+
+    let advertised = sekai_chisei::source_adapter_catalog::built_in_source_adapters()
+        .into_iter()
+        .map(|profile| profile.adapter_id)
+        .collect::<BTreeSet<_>>();
+    let covered = BTreeSet::from([github.adapter_id]);
+    assert_eq!(covered, advertised);
+    assert!(!advertised.contains(&canary.adapter_id));
+}
+
+#[test]
+fn lifecycle_checker_rejects_tombstone_decision_drift() {
+    let mut report = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        canary_lifecycle_record,
+    )
+    .unwrap();
+    let tombstone = report
+        .projections
+        .iter_mut()
+        .find(|projection| projection.stage == object_sync_conformance::LifecycleStage::Tombstone)
+        .unwrap();
+    let mut object = match &tombstone.decision {
+        sekai_chisei::sekai::object_sync::SyncDecision::Tombstone(object) => object.clone(),
+        other => panic!("expected tombstone, got {other:?}"),
+    };
+    object.tombstoned = false;
+    tombstone.decision = sekai_chisei::sekai::object_sync::SyncDecision::Upsert(object);
+
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&report)
+            .unwrap_err()
+            .contains("decision diverged")
+    );
+}
+
+#[test]
+fn lifecycle_checker_rejects_constant_and_omitted_field_payload_digests() {
+    let constant_digest = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        |observation| {
+            let mut record = canary_lifecycle_record(observation)?;
+            record.payload_digest = format!("sha256:{}", "0".repeat(64));
+            Ok(record)
+        },
+    )
+    .unwrap();
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&constant_digest)
+            .unwrap_err()
+            .contains("payload digest diverged")
+    );
+
+    let omitted_field_digest = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        |observation| {
+            let mut record = canary_lifecycle_record(observation)?;
+            record.payload_digest = omitted_revision_payload_digest(observation)?;
+            Ok(record)
+        },
+    )
+    .unwrap();
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&omitted_field_digest)
+            .unwrap_err()
+            .contains("payload digest diverged")
+    );
+}
+
+#[test]
+fn lifecycle_checker_rejects_snapshot_source_sequence() {
+    let sequenced = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        |observation| {
+            let mut record = canary_lifecycle_record(observation)?;
+            record.source_sequence = Some(1);
+            Ok(record)
+        },
+    )
+    .unwrap();
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&sequenced)
+            .unwrap_err()
+            .contains("source sequence")
+    );
+}
+
+#[test]
+fn lifecycle_checker_rejects_lineage_and_immutable_revision_drift() {
+    let mut lineage_drift = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        canary_lifecycle_record,
+    )
+    .unwrap();
+    let reversal = lineage_drift
+        .projections
+        .iter_mut()
+        .find(|projection| projection.stage == object_sync_conformance::LifecycleStage::Reversal)
+        .unwrap();
+    reversal.lineage.dataset_id.push_str(":divergent");
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&lineage_drift)
+            .unwrap_err()
+            .contains("lineage binding diverged")
+    );
+
+    let revision_drift = object_sync_conformance::run_lifecycle_fixture(
+        "test.canary.github.object_sync",
+        |observation| {
+            let mut record = canary_lifecycle_record(observation)?;
+            if observation.stage
+                == object_sync_conformance::LifecycleStage::ImmutableRevisionConflict
+            {
+                record.source_version = "issue-674-divergent-revision".into();
+            }
+            Ok(record)
+        },
+    )
+    .unwrap();
+    assert!(
+        object_sync_conformance::assert_lifecycle_report(&revision_drift)
+            .unwrap_err()
+            .contains("normalized lifecycle observation diverged")
+    );
 }
 
 #[test]
@@ -1710,4 +1852,108 @@ fn object_sync_is_absent_from_evidence_discovery() {
     assert_eq!(source.len(), 1);
     assert_eq!(source[0].adapter_id, "adapter.github.object_sync");
     assert_eq!(source[0].type_digest, GITHUB_OBJECT_SYNC_TYPE_DIGEST);
+}
+
+fn github_lifecycle_record(
+    observation: &object_sync_conformance::LifecycleObservation,
+) -> Result<SourceRecord, String> {
+    github_object_sync::translate(
+        github_object_sync::GitHubObjectFixture {
+            repository: observation.source_instance.clone(),
+            kind: observation.type_name.clone(),
+            number: observation
+                .external_id
+                .parse()
+                .map_err(|_| "test lifecycle external id is invalid".to_string())?,
+            revision: observation.source_version.clone(),
+            title: observation.display_name.clone(),
+            state: observation.state.clone(),
+            deleted: observation.deleted,
+            observed_at_ms: observation.observed_at_ms,
+            properties: observation.properties.clone(),
+        },
+        &observation.source_instance,
+    )
+}
+
+#[derive(serde::Serialize)]
+struct CanaryNormalizedPayload<'a> {
+    repository: &'a str,
+    kind: &'a str,
+    number: u64,
+    revision: &'a str,
+    title: &'a str,
+    state: &'a str,
+    deleted: bool,
+    properties: &'a std::collections::BTreeMap<String, String>,
+}
+
+// Independent, test-only canary for the same fixed GitHub Issue/PullRequest
+// profile. It is deliberately absent from built_in_source_adapters().
+fn canary_lifecycle_record(
+    observation: &object_sync_conformance::LifecycleObservation,
+) -> Result<SourceRecord, String> {
+    let mut properties = observation.properties.clone();
+    properties.insert("state".into(), observation.state.clone());
+    let number = observation
+        .external_id
+        .parse::<u64>()
+        .map_err(|_| "test lifecycle external id is invalid".to_string())?;
+    let payload = serde_json::to_vec(&CanaryNormalizedPayload {
+        repository: &observation.source_instance,
+        kind: &observation.type_name,
+        number,
+        revision: &observation.source_version,
+        title: &observation.display_name,
+        state: &observation.state,
+        deleted: observation.deleted,
+        properties: &properties,
+    })
+    .map_err(|_| "test canary payload cannot be canonicalized".to_string())?;
+    Ok(SourceRecord {
+        source: "github".into(),
+        source_instance: observation.source_instance.clone(),
+        external_id: observation.external_id.clone(),
+        source_version: observation.source_version.clone(),
+        type_name: observation.type_name.clone(),
+        display_name: observation.display_name.clone(),
+        payload_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+        properties,
+        deleted: observation.deleted,
+        observed_at_ms: observation.observed_at_ms,
+        source_sequence: None,
+    })
+}
+
+#[derive(serde::Serialize)]
+struct OmittedRevisionPayload<'a> {
+    repository: &'a str,
+    kind: &'a str,
+    number: u64,
+    title: &'a str,
+    state: &'a str,
+    deleted: bool,
+    properties: &'a std::collections::BTreeMap<String, String>,
+}
+
+fn omitted_revision_payload_digest(
+    observation: &object_sync_conformance::LifecycleObservation,
+) -> Result<String, String> {
+    let number = observation
+        .external_id
+        .parse::<u64>()
+        .map_err(|_| "test lifecycle external id is invalid".to_string())?;
+    let mut properties = observation.properties.clone();
+    properties.insert("state".into(), observation.state.clone());
+    let payload = serde_json::to_vec(&OmittedRevisionPayload {
+        repository: &observation.source_instance,
+        kind: &observation.type_name,
+        number,
+        title: &observation.display_name,
+        state: &observation.state,
+        deleted: observation.deleted,
+        properties: &properties,
+    })
+    .map_err(|_| "omitted-field payload cannot be canonicalized".to_string())?;
+    Ok(format!("sha256:{:x}", Sha256::digest(payload)))
 }
