@@ -16732,7 +16732,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(requests.lock().unwrap().is_empty());
     }
 
