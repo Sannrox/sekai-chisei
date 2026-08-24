@@ -7,6 +7,7 @@ use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
 use crate::domain::Object;
 use crate::sekai::audit::object_diff_changes;
+use crate::sekai::object_lineage::ObjectLineage;
 use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_GITHUB, SourceBatch, SourceBatchResult,
     SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
@@ -577,6 +578,30 @@ impl PostgresDb {
         )?;
         transaction.commit()?;
         Ok(result)
+    }
+
+    pub(crate) fn get_source_identity_lineage(
+        &self,
+        namespace: &str,
+        source_id: &str,
+    ) -> Result<Option<ObjectLineage>, String> {
+        let mut connection = self
+            .connection()
+            .map_err(|_| "source identity lineage is unavailable".to_string())?;
+        let lineage_json = connection
+            .query_opt(
+                "SELECT lineage_json FROM sekai_source_identities
+                 WHERE namespace=$1 AND source_id=$2",
+                &[&namespace, &source_id],
+            )
+            .map_err(|_| "source identity lineage is unavailable".to_string())?
+            .map(|row| row.get::<_, String>(0));
+        lineage_json
+            .map(|lineage_json| {
+                serde_json::from_str(&lineage_json)
+                    .map_err(|_| "stored source identity lineage is invalid".to_string())
+            })
+            .transpose()
     }
 
     pub fn get_source_sync_state(

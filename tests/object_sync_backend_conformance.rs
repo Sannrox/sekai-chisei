@@ -4,6 +4,11 @@ use std::sync::{Arc, Barrier};
 use rusqlite::params;
 use sekai_chisei::db::object_sync::ObjectSyncBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::domain::Object;
+use sekai_chisei::sekai::object_lineage::{
+    LINEAGE_KIND_DATASET, LINEAGE_KIND_OBJECT, LINEAGE_KIND_SOURCE, ObjectLineage,
+    bind_sync_lineage, dataset_id_for,
+};
 use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_V2_VERSION,
@@ -15,10 +20,27 @@ use tempfile::TempDir;
 
 const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
 const SOURCE_INSTANCE: &str = "sekai-project/sekai-chisei";
+const SOURCE_ID: &str = "github:sekai-project/sekai-chisei#12";
 const PAYLOAD_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const REFRESHED_PAYLOAD_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+trait ObjectSyncConformanceBackend: ObjectSyncBackend {
+    fn projected_object(&self, object_id: &str) -> Result<Option<Object>, String>;
+}
+
+impl ObjectSyncConformanceBackend for SekaiDb {
+    fn projected_object(&self, object_id: &str) -> Result<Option<Object>, String> {
+        self.get_object(object_id)
+    }
+}
+
+impl ObjectSyncConformanceBackend for PostgresDb {
+    fn projected_object(&self, object_id: &str) -> Result<Option<Object>, String> {
+        self.get_object(object_id)
+    }
+}
 
 fn batch(prefix: &str, current_cursor: &str, next_cursor: &str, key: &str) -> SourceBatch {
     let source_instance = SOURCE_INSTANCE.to_string();
@@ -82,8 +104,90 @@ fn source_sync_state(db: &dyn ObjectSyncBackend, prefix: &str) -> Option<SourceS
         .unwrap()
 }
 
-fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
+fn decision_object(decision: &SyncDecision) -> &sekai_chisei::sekai::object_sync::SyncedObject {
+    match decision {
+        SyncDecision::Upsert(object) | SyncDecision::Tombstone(object) => object,
+        other => panic!("expected projected object, got {other:?}"),
+    }
+}
+
+fn assert_projected_identity_and_lineage(
+    db: &dyn ObjectSyncConformanceBackend,
+    decision: &SyncDecision,
+    expected_object_id: &str,
+    expected_source_version: &str,
+    expected_tombstoned: bool,
+) -> ObjectLineage {
+    let synced = decision_object(decision);
+    assert_eq!(synced.object_id, expected_object_id);
+    assert_eq!(synced.source_id, SOURCE_ID);
+    assert_eq!(synced.type_name, "Issue");
+    assert_eq!(synced.type_digest, TYPE_DIGEST);
+    assert_eq!(synced.source_version, expected_source_version);
+    assert_eq!(synced.tombstoned, expected_tombstoned);
+
+    let object = db.projected_object(expected_object_id).unwrap().unwrap();
+    assert_eq!(object.id, expected_object_id);
+    assert_eq!(object.external_id, synced.source_id);
+    assert_eq!(object.kind, synced.type_name);
+    assert_eq!(object.properties["sync_source"], "github");
+    assert_eq!(object.properties["sync_source_instance"], SOURCE_INSTANCE);
+    assert_eq!(object.properties["sync_source_id"], synced.source_id);
+    assert_eq!(
+        object.properties["sync_source_version"],
+        expected_source_version
+    );
+    assert_eq!(object.properties["sync_type_digest"], TYPE_DIGEST);
+    assert_eq!(
+        object.properties["sync_tombstoned"],
+        expected_tombstoned.to_string()
+    );
+
+    let expected_lineage = bind_sync_lineage(
+        &synced.type_digest,
+        &synced.source_id,
+        &synced.type_name,
+        &synced.object_id,
+    )
+    .unwrap();
+    let stored_lineage = db
+        .get_source_identity_lineage(&object.namespace, &synced.source_id)
+        .unwrap()
+        .expect("committed source identity must retain lineage");
+    assert_eq!(stored_lineage, expected_lineage);
+    assert_eq!(
+        stored_lineage.dataset_id,
+        dataset_id_for(TYPE_DIGEST, "Issue")
+    );
+    assert_eq!(stored_lineage.nodes.len(), 3);
+    assert_eq!(stored_lineage.nodes[0].kind, LINEAGE_KIND_SOURCE);
+    assert_eq!(stored_lineage.nodes[0].id, synced.source_id);
+    assert_eq!(stored_lineage.nodes[1].kind, LINEAGE_KIND_DATASET);
+    assert_eq!(stored_lineage.nodes[1].id, stored_lineage.dataset_id);
+    assert_eq!(stored_lineage.nodes[2].kind, LINEAGE_KIND_OBJECT);
+    assert_eq!(stored_lineage.nodes[2].id, synced.object_id);
+    stored_lineage
+}
+
+fn assert_object_unchanged(actual: &Object, expected: &Object) {
+    assert_eq!(actual.id, expected.id);
+    assert_eq!(actual.kind, expected.kind);
+    assert_eq!(actual.name, expected.name);
+    assert_eq!(actual.namespace, expected.namespace);
+    assert_eq!(actual.external_id, expected.external_id);
+    assert_eq!(actual.properties, expected.properties);
+    assert_eq!(actual.created, expected.created);
+    assert_eq!(actual.updated, expected.updated);
+}
+
+fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     let producer = format!("connector/{prefix}");
+    let namespace = format!("{prefix}-namespace");
+    assert!(
+        db.get_source_identity_lineage(&namespace, SOURCE_ID)
+            .unwrap()
+            .is_none()
+    );
     let page_one_batch = batch(prefix, "", "cursor:1", "snapshot-page-1");
     let page_one = db
         .apply_source_batch(&page_one_batch, &producer, 100)
@@ -96,6 +200,15 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
         SyncDecision::Upsert(object) => object.object_id.clone(),
         other => panic!("expected upsert, got {other:?}"),
     };
+    let stable_lineage = assert_projected_identity_and_lineage(
+        db,
+        &page_one.records[0].decision,
+        &object_id,
+        "node-v1",
+        false,
+    );
+    let page_one_state = source_sync_state(db, prefix).unwrap();
+    let page_one_object = db.projected_object(&object_id).unwrap().unwrap();
 
     let mut revision_conflict = batch(
         prefix,
@@ -111,6 +224,11 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
             .starts_with("source_revision_conflict:")
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
+    // Legacy v1 identity preflight runs before either backend inserts an OPEN
+    // transaction, so these denials must preserve the complete sync state.
+    assert_eq!(source_sync_state(db, prefix).unwrap(), page_one_state);
+    let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
+    assert_object_unchanged(&after_conflict, &page_one_object);
 
     let mut page_two_batch = batch(prefix, "cursor:1", "cursor:2", "snapshot-page-2");
     page_two_batch.records[0].source_version = "node-v2".into();
@@ -135,11 +253,21 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
         other => panic!("expected refreshed upsert, got {other:?}"),
     };
     assert_eq!(refreshed.object_id, object_id);
-    assert_eq!(refreshed.source_id, "github:sekai-project/sekai-chisei#12");
+    assert_eq!(refreshed.source_id, SOURCE_ID);
     assert_eq!(refreshed.source_version, "node-v2");
     assert_eq!(refreshed.payload_digest, REFRESHED_PAYLOAD_DIGEST);
     assert_eq!(refreshed.properties["state"], "closed");
     assert_eq!(refreshed.properties["title"], "Bounded sync refreshed");
+    assert_eq!(
+        assert_projected_identity_and_lineage(
+            db,
+            &page_two.records[0].decision,
+            &object_id,
+            "node-v2",
+            false,
+        ),
+        stable_lineage
+    );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:2"));
     let page_two_state = source_sync_state(db, prefix).unwrap();
     assert_eq!(
@@ -190,23 +318,108 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     tombstone.records[0].source_version = "node-v3".into();
     redigest(&mut tombstone);
     let tombstone_result = db.apply_source_batch(&tombstone, &producer, 800).unwrap();
-    let tombstoned = match &tombstone_result.records[0].decision {
-        SyncDecision::Tombstone(object) => object,
-        other => panic!("expected tombstone, got {other:?}"),
-    };
-    assert_eq!(tombstoned.object_id, object_id);
+    assert_eq!(
+        assert_projected_identity_and_lineage(
+            db,
+            &tombstone_result.records[0].decision,
+            &object_id,
+            "node-v3",
+            true,
+        ),
+        stable_lineage
+    );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:3"));
+    let tombstone_state = source_sync_state(db, prefix).unwrap();
+    let tombstone_object = db.projected_object(&object_id).unwrap().unwrap();
 
-    let mut conflict = batch(prefix, "cursor:3", "cursor:4", "batch-type-conflict");
-    conflict.records[0].type_name = "PullRequest".into();
-    conflict.records[0].source_version = "node-v4".into();
-    redigest(&mut conflict);
+    let mut tombstone_type_conflict = batch(
+        prefix,
+        "cursor:3",
+        "cursor:blocked-type",
+        "batch-type-conflict",
+    );
+    tombstone_type_conflict.records[0].type_name = "PullRequest".into();
+    tombstone_type_conflict.records[0].source_version = "node-v4".into();
+    redigest(&mut tombstone_type_conflict);
     assert!(
-        db.apply_source_batch(&conflict, &producer, 900)
+        db.apply_source_batch(&tombstone_type_conflict, &producer, 900)
             .unwrap_err()
             .starts_with("type_identity_conflict:")
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:3"));
+    assert_eq!(source_sync_state(db, prefix).unwrap(), tombstone_state);
+    let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
+    assert_object_unchanged(&after_conflict, &tombstone_object);
+
+    let mut reversal = batch(prefix, "cursor:3", "cursor:4", "batch-reversal");
+    reversal.records[0].source_version = "node-v4".into();
+    reversal.records[0].display_name = "Bounded sync reactivated".into();
+    reversal.records[0]
+        .properties
+        .insert("title".into(), "Bounded sync reactivated".into());
+    redigest(&mut reversal);
+    let reversal_result = db.apply_source_batch(&reversal, &producer, 1_000).unwrap();
+    assert!(matches!(
+        reversal_result.records[0].decision,
+        SyncDecision::Upsert(_)
+    ));
+    assert_eq!(
+        assert_projected_identity_and_lineage(
+            db,
+            &reversal_result.records[0].decision,
+            &object_id,
+            "node-v4",
+            false,
+        ),
+        stable_lineage
+    );
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:4"));
+    let reversal_state = source_sync_state(db, prefix).unwrap();
+    let reversal_object = db.projected_object(&object_id).unwrap().unwrap();
+
+    let mut reversal_revision_conflict = reversal.clone();
+    reversal_revision_conflict.idempotency_key = format!("{prefix}-reversal-revision-conflict");
+    reversal_revision_conflict.current_cursor = "cursor:4".into();
+    reversal_revision_conflict.proposed_next_cursor = "cursor:blocked-revision".into();
+    reversal_revision_conflict.records[0].payload_digest = REFRESHED_PAYLOAD_DIGEST.into();
+    reversal_revision_conflict.records[0].display_name = "Conflicting reactivation".into();
+    redigest(&mut reversal_revision_conflict);
+    assert!(
+        db.apply_source_batch(&reversal_revision_conflict, &producer, 1_100)
+            .unwrap_err()
+            .starts_with("source_revision_conflict:")
+    );
+    assert_eq!(source_sync_state(db, prefix).unwrap(), reversal_state);
+    let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
+    assert_object_unchanged(&after_conflict, &reversal_object);
+    assert_eq!(
+        db.get_source_identity_lineage(&namespace, SOURCE_ID)
+            .unwrap(),
+        Some(stable_lineage.clone())
+    );
+
+    let mut reversal_type_conflict = batch(
+        prefix,
+        "cursor:4",
+        "cursor:blocked-type-after-reversal",
+        "batch-type-conflict-after-reversal",
+    );
+    reversal_type_conflict.records[0].type_name = "PullRequest".into();
+    reversal_type_conflict.records[0].source_version = "node-v5".into();
+    redigest(&mut reversal_type_conflict);
+    assert!(
+        db.apply_source_batch(&reversal_type_conflict, &producer, 1_200)
+            .unwrap_err()
+            .starts_with("type_identity_conflict:")
+    );
+    assert_eq!(source_sync_state(db, prefix).unwrap(), reversal_state);
+    let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
+    assert_object_unchanged(&after_conflict, &reversal_object);
+    assert_eq!(
+        db.get_source_identity_lineage(&namespace, SOURCE_ID)
+            .unwrap(),
+        Some(stable_lineage.clone())
+    );
 
     let state = db
         .get_source_sync_state(&format!("{prefix}-namespace"), SOURCE_INSTANCE, TYPE_DIGEST)
@@ -215,10 +428,10 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     assert_eq!(state.binding.producer_identity, producer);
     assert_eq!(state.binding.type_digest, TYPE_DIGEST);
     assert!(state.open_transaction.is_none());
-    assert_eq!(state.checkpoint.unwrap().cursor, "cursor:3");
+    assert_eq!(state.checkpoint.unwrap().cursor, "cursor:4");
     assert_eq!(
         state.last_result.unwrap().transaction,
-        tombstone_result.transaction
+        reversal_result.transaction
     );
 }
 

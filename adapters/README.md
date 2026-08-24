@@ -217,11 +217,23 @@ outbox. Quarantine and transport diagnostics must remain bounded and value-free:
 do not echo credentials, source payloads, feed epochs, cursors, authorization
 metadata, remote response bodies, or outbox contents. Webhook and ordered-feed
 collection remain separate transports.
-Offline conformance runs through:
+Offline adapter and SQLite backend conformance run through:
 
 ```sh
 cargo test --test object_sync_adapters
+cargo test --test object_sync_backend_conformance
 ```
+
+The adapter suite applies the versioned refresh, tombstone, reversal,
+current immutable-revision conflict, and source → dataset → object lineage
+fixture to the catalog-advertised GitHub Issue/PullRequest normalizer and to an
+independent offline canary implementation of that same fixed profile. The
+canary is test-only and is deliberately not returned by
+`built_in_source_adapters`; the suite separately requires advertised
+conformance coverage to equal the catalog exactly. Deliberately divergent
+tombstone, lineage, payload-digest, source-sequence, and immutable-revision
+fixtures prove that the checker rejects lifecycle drift. Neither suite performs
+network access.
 
 Authorized consumers can inspect one admitted submission by ID through
 `GetEvidenceSubmission`. The response is bounded metadata and lifecycle
