@@ -72,8 +72,9 @@ exact compare-and-swap. Creation and edits recheck namespace and member
 authorization and commit revision, request, audit, and head state atomically.
 They do not mutate runtime facts or snapshot legacy schema and ontology rows.
 A proposal pins exact base and candidate digests; merge compare-and-swaps the
-namespace published head only when live grants, approvals, and member
-identity still match. See
+namespace published head against an expected digest, stores a receipt in the
+same transaction, and denies candidates that do not descend from the pinned
+base. Close records a canonical reason without moving the head. See
 [Governed definition branches](definition-branches.md) and
 [ADR 0024](decisions/0024-governed-definition-branches.md).
 

@@ -48,16 +48,23 @@ enter the published member map. Creating a proposal does not move the
 published head.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
-`MergeDefinitionProposal` rechecks that the published head still equals the
-pinned base, the branch head still equals the candidate, at least one
-approval exists, and named foreign digests are not members. It then
-compare-and-swaps the namespace published head and marks the candidate
-published in the same transaction. Interrupted merges leave the published
-head unchanged.
+`MergeDefinitionProposal` requires `expected_published_digest` and rechecks
+that the live published head equals both that digest and the pinned base, the
+branch head still equals the candidate, the candidate descends from the pinned
+base, at least one recorded approver still holds namespace write and
+changed-member admin, and named foreign digests are not members. It then
+compare-and-swaps the namespace published head, stores a durable `receipt_id`
+on the merged proposal, and writes the receipt, audit, and idempotency record
+in the same transaction. Exact replay of the same idempotency key returns that
+receipt without moving the published head again. A stale expected digest or a
+candidate that is not a descendant of the pinned base fails closed as not
+mergeable. Interrupted merges leave the published head unchanged and store no
+receipt.
 
-`CloseDefinitionProposal` rejects an open proposal without moving the
-published head. `GetPublishedDefinitionRevision` returns the current
-published pointer.
+`CloseDefinitionProposal` rejects an open proposal with a canonical
+`reason_code` (`operator_abort`, `superseded`, or `policy_denied`) without
+moving the published head. Merge of a closed proposal remains denied.
+`GetPublishedDefinitionRevision` returns the current published pointer.
 
 ## Content identity
 

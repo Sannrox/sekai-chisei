@@ -3222,6 +3222,7 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_proposal_missing_approval")
         || error.starts_with("definition_proposal_no_change")
         || error.starts_with("foreign_authority_is_not_a_grant")
+        || error.starts_with("incompatible_definition_proposal_candidate")
     {
         Status::failed_precondition("definition write is not current")
     } else if error.starts_with("definition_edit_no_change") {
@@ -3232,8 +3233,25 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("immutable_definition_")
     {
         Status::already_exists("definition write conflicts with durable state")
+    } else if error.starts_with("definition_proposal_invalid_close_reason") {
+        Status::invalid_argument("definition close reason is invalid")
     } else {
         Status::internal("definition write unavailable")
+    }
+}
+
+#[cfg(test)]
+mod definition_write_error_tests {
+    use super::*;
+
+    #[test]
+    fn not_descendant_candidate_is_failed_precondition_not_already_exists() {
+        let status = map_definition_write_error(
+            "incompatible_definition_proposal_candidate: candidate is not a descendant of the pinned base"
+                .into(),
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_ne!(status.code(), tonic::Code::AlreadyExists);
     }
 }
 
@@ -3262,6 +3280,8 @@ fn to_proto_definition_proposal(
         created_by: proposal.created_by.clone(),
         created_at_ms: proposal.created_at_ms,
         updated_at_ms: proposal.updated_at_ms,
+        receipt_id: proposal.receipt_id.clone(),
+        close_reason_code: proposal.close_reason_code.clone(),
     }
 }
 
@@ -4217,6 +4237,7 @@ impl SekaiService for SekaiServiceImpl {
         let request = definition_proposal_domain::MergeDefinitionProposal {
             namespace: input.namespace,
             proposal_id: input.proposal_id,
+            expected_published_digest: input.expected_published_digest,
             idempotency_key: input.idempotency_key,
         };
         request.request_digest().map_err(Status::invalid_argument)?;
@@ -4272,6 +4293,7 @@ impl SekaiService for SekaiServiceImpl {
             proposal: Some(to_proto_definition_proposal(&result.proposal)),
             previous_published_digest: result.previous_published_digest,
             published_revision: Some(to_proto_definition_revision(&result.published_revision)),
+            receipt_id: result.receipt_id,
         }))
     }
 
@@ -4293,6 +4315,7 @@ impl SekaiService for SekaiServiceImpl {
         let request = definition_proposal_domain::CloseDefinitionProposal {
             namespace: input.namespace,
             proposal_id: input.proposal_id,
+            reason_code: input.reason_code,
             idempotency_key: input.idempotency_key,
         };
         request.request_digest().map_err(Status::invalid_argument)?;
@@ -8253,6 +8276,7 @@ mod tests {
             .close_definition_proposal(with_principal(CloseDefinitionProposalRequest {
                 namespace: "proposal-close".into(),
                 proposal_id: "cs-1".into(),
+                reason_code: "operator_abort".into(),
                 idempotency_key: "close-1".into(),
             }))
             .await
@@ -8316,7 +8340,7 @@ mod tests {
                 namespace: "proposal-live".into(),
                 branch_id: "feature".into(),
                 proposal_id: "cs-1".into(),
-                base_digest: parent.revision_digest,
+                base_digest: parent.revision_digest.clone(),
                 candidate_digest: applied.revision.unwrap().revision_digest,
                 eval_plan_digests: Vec::new(),
                 named_foreign_digests: Vec::new(),
@@ -8350,6 +8374,7 @@ mod tests {
                 MergeDefinitionProposalRequest {
                     namespace: "proposal-live".into(),
                     proposal_id: "cs-1".into(),
+                    expected_published_digest: parent.revision_digest,
                     idempotency_key: "merge-1".into(),
                 },
                 "root",
@@ -8416,6 +8441,7 @@ mod tests {
                 MergeDefinitionProposalRequest {
                     namespace: "proposal-team".into(),
                     proposal_id: "cs-1".into(),
+                    expected_published_digest: parent.revision_digest.clone(),
                     idempotency_key: "merge-missing".into(),
                 },
                 "root",
@@ -8448,11 +8474,40 @@ mod tests {
         ))
         .await
         .unwrap();
+        let stale = svc
+            .merge_definition_proposal(with_named_principal(
+                MergeDefinitionProposalRequest {
+                    namespace: "proposal-team".into(),
+                    proposal_id: "cs-1".into(),
+                    expected_published_digest: candidate.clone(),
+                    idempotency_key: "merge-stale-head".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.get_published_definition_revision(with_named_principal(
+                GetPublishedDefinitionRevisionRequest {
+                    namespace: "proposal-team".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .revision
+            .unwrap()
+            .revision_digest,
+            parent.revision_digest
+        );
         let merged = svc
             .merge_definition_proposal(with_named_principal(
                 MergeDefinitionProposalRequest {
                     namespace: "proposal-team".into(),
                     proposal_id: "cs-1".into(),
+                    expected_published_digest: parent.revision_digest.clone(),
                     idempotency_key: "merge-1".into(),
                 },
                 "root",
@@ -8460,7 +8515,12 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(merged.proposal.unwrap().status, "merged");
+        assert_eq!(merged.proposal.as_ref().unwrap().status, "merged");
+        assert!(!merged.receipt_id.is_empty());
+        assert_eq!(
+            merged.proposal.as_ref().unwrap().receipt_id,
+            merged.receipt_id
+        );
         assert_eq!(merged.previous_published_digest, parent.revision_digest);
         assert_eq!(
             merged.published_revision.unwrap().revision_digest,

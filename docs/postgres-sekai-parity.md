@@ -22,7 +22,8 @@ cursors, and foreign binding isolation.
 
 The reusable `sekai.definition-branch` surface shares insert-only member and
 revision storage, proposal and published-head identity, expected-head
-advancement, idempotency, and audit semantics across SQLite and PostgreSQL.
+advancement, merge receipt compare-and-swap, close reasons, idempotency, and
+audit semantics across SQLite and PostgreSQL.
 PostgreSQL serializes branch, proposal, and idempotency identities before
 checking durable state, so concurrent writers cannot both advance one expected
 head or published pointer.

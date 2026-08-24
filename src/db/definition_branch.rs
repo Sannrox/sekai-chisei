@@ -12,7 +12,7 @@ use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
     MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    reject_foreign_member_grants,
+    merge_receipt_id, reject_foreign_member_grants, require_descendant_candidate,
 };
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
@@ -291,6 +291,8 @@ impl SekaiDb {
                     created_by TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
+                    receipt_id TEXT NOT NULL DEFAULT '',
+                    close_reason_code TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY(namespace, proposal_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_definition_proposal_branch
@@ -310,7 +312,19 @@ impl SekaiDb {
                     LIMIT 1
                   );",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        for statement in [
+            "ALTER TABLE sekai_definition_proposals ADD COLUMN receipt_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sekai_definition_proposals ADD COLUMN close_reason_code TEXT NOT NULL DEFAULT ''",
+        ] {
+            match self.conn().execute(statement, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
     }
 
     pub fn seed_published_definition_revision(
@@ -619,6 +633,8 @@ impl SekaiDb {
             created_by: actor.into(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            receipt_id: String::new(),
+            close_reason_code: String::new(),
         };
         insert_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -746,6 +762,12 @@ impl SekaiDb {
             load_published_head_sqlite(&transaction, &proposal.namespace)?.ok_or_else(|| {
                 "definition_revision_not_found: published head is unavailable".to_string()
             })?;
+        if published != request.expected_published_digest {
+            return Err(
+                "stale_published_definition_head: expected published digest does not match published head"
+                    .into(),
+            );
+        }
         if published != proposal.base_digest {
             return Err(
                 "stale_published_definition_head: published head does not match pinned base".into(),
@@ -760,6 +782,17 @@ impl SekaiDb {
             "definition_revision_not_found: candidate revision is unavailable".to_string()
         })?;
         reject_foreign_member_grants(&candidate, &proposal.named_foreign_digests)?;
+        require_descendant_candidate(&candidate, &proposal.base_digest, |digest| {
+            load_revision_sqlite(&transaction, &proposal.namespace, digest)
+        })?;
+        let receipt_id = merge_receipt_id(
+            &proposal.namespace,
+            &proposal.proposal_id,
+            &proposal.proposal_digest,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            &published,
+        )?;
         let published_revision = mark_revision_published_sqlite(&transaction, &candidate, now_ms)?;
         write_published_head_sqlite(
             &transaction,
@@ -770,12 +803,14 @@ impl SekaiDb {
         )?;
         proposal.status = STATUS_MERGED.into();
         proposal.updated_at_ms = now_ms;
+        proposal.receipt_id = receipt_id.clone();
         update_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::MergeProposal {
             result: Box::new(DefinitionProposalMergeResult {
                 proposal: proposal.clone(),
                 previous_published_digest: published,
                 published_revision: published_revision.clone(),
+                receipt_id,
             }),
         };
         persist_result_sqlite(
@@ -822,6 +857,7 @@ impl SekaiDb {
                 })?;
         proposal.require_open()?;
         proposal.status = STATUS_CLOSED.into();
+        proposal.close_reason_code = request.reason_code.clone();
         proposal.updated_at_ms = now_ms;
         update_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CloseProposal {
@@ -1091,8 +1127,8 @@ fn insert_proposal_sqlite(
         .execute(
             "INSERT INTO sekai_definition_proposals (
                 namespace, proposal_id, branch_id, proposal_digest, status, body_json,
-                created_by, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                created_by, created_at_ms, updated_at_ms, receipt_id, close_reason_code
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 proposal.namespace,
                 proposal.proposal_id,
@@ -1103,6 +1139,8 @@ fn insert_proposal_sqlite(
                 proposal.created_by,
                 proposal.created_at_ms,
                 proposal.updated_at_ms,
+                proposal.receipt_id,
+                proposal.close_reason_code,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1118,12 +1156,14 @@ fn update_proposal_sqlite(
     let updated = transaction
         .execute(
             "UPDATE sekai_definition_proposals
-             SET status=?1, body_json=?2, updated_at_ms=?3
-             WHERE namespace=?4 AND proposal_id=?5",
+             SET status=?1, body_json=?2, updated_at_ms=?3, receipt_id=?4, close_reason_code=?5
+             WHERE namespace=?6 AND proposal_id=?7",
             params![
                 proposal.status,
                 body_json,
                 proposal.updated_at_ms,
+                proposal.receipt_id,
+                proposal.close_reason_code,
                 proposal.namespace,
                 proposal.proposal_id,
             ],
@@ -1496,6 +1536,206 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sekai_definition_branch_audit
                  WHERE namespace='team-a' AND action='apply_edit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 0);
+    }
+
+    #[test]
+    fn merge_denies_a_candidate_that_does_not_descend_from_the_pinned_base() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (parent, _, create) = parent_fixture(&db);
+        db.create_definition_branch(&create, "author", 2).unwrap();
+        let disconnected_member = DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Incident".into(),
+            definition_json: r#"{"name":"Incident"}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare("team-a")
+        .unwrap();
+        let disconnected = prepare_revision(
+            "team-a",
+            "",
+            [DefinitionRevisionMember {
+                member_kind: disconnected_member.member_kind.clone(),
+                member_id: disconnected_member.member_id.clone(),
+                member_digest: disconnected_member.member_digest.clone(),
+            }],
+            false,
+            "author",
+            3,
+        )
+        .unwrap();
+        {
+            let mut connection = db.conn();
+            let transaction = connection.transaction().unwrap();
+            insert_members_sqlite(&transaction, &[disconnected_member]).unwrap();
+            insert_revision_sqlite(&transaction, &disconnected).unwrap();
+            transaction
+                .execute(
+                    "UPDATE sekai_definition_branches
+                     SET head_revision_digest=?1, updated_at_ms=3
+                     WHERE namespace='team-a' AND branch_id='feature'",
+                    params![disconnected.revision_digest],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        db.create_definition_proposal(
+            &CreateDefinitionProposal {
+                namespace: "team-a".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-foreign".into(),
+                base_digest: parent.revision_digest.clone(),
+                candidate_digest: disconnected.revision_digest.clone(),
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-foreign".into(),
+            },
+            "author",
+            4,
+        )
+        .unwrap();
+        db.approve_definition_proposal(
+            &ApproveDefinitionProposal {
+                namespace: "team-a".into(),
+                proposal_id: "cs-foreign".into(),
+                idempotency_key: "approve-foreign".into(),
+            },
+            "author",
+            5,
+        )
+        .unwrap();
+        let error = db
+            .merge_definition_proposal(
+                &MergeDefinitionProposal {
+                    namespace: "team-a".into(),
+                    proposal_id: "cs-foreign".into(),
+                    expected_published_digest: parent.revision_digest.clone(),
+                    idempotency_key: "merge-foreign".into(),
+                },
+                "author",
+                6,
+            )
+            .unwrap_err();
+        assert!(error.contains("incompatible_definition_proposal_candidate"));
+        assert!(!error.contains("AlreadyExists"));
+        assert_eq!(
+            db.get_published_definition_revision("team-a")
+                .unwrap()
+                .unwrap()
+                .revision_digest,
+            parent.revision_digest
+        );
+    }
+
+    #[test]
+    fn interrupted_merge_leaves_published_head_without_a_receipt() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (parent, _, create) = parent_fixture(&db);
+        db.create_definition_branch(&create, "author", 2).unwrap();
+        let edit = ApplyDefinitionBranchEdit {
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            expected_head_digest: parent.revision_digest.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                member_digest: String::new(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: "edit-1".into(),
+        };
+        let DefinitionWriteResult::ApplyEdit { result } =
+            db.apply_definition_branch_edit(&edit, "author", 3).unwrap()
+        else {
+            panic!("expected edit");
+        };
+        db.create_definition_proposal(
+            &CreateDefinitionProposal {
+                namespace: "team-a".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-1".into(),
+                base_digest: parent.revision_digest.clone(),
+                candidate_digest: result.revision.revision_digest.clone(),
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-1".into(),
+            },
+            "author",
+            4,
+        )
+        .unwrap();
+        db.approve_definition_proposal(
+            &ApproveDefinitionProposal {
+                namespace: "team-a".into(),
+                proposal_id: "cs-1".into(),
+                idempotency_key: "approve-1".into(),
+            },
+            "author",
+            5,
+        )
+        .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_definition_merge_receipt
+                 BEFORE INSERT ON sekai_definition_requests
+                 WHEN NEW.idempotency_key = 'merge-interrupted'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected merge receipt failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(
+            db.merge_definition_proposal(
+                &MergeDefinitionProposal {
+                    namespace: "team-a".into(),
+                    proposal_id: "cs-1".into(),
+                    expected_published_digest: parent.revision_digest.clone(),
+                    idempotency_key: "merge-interrupted".into(),
+                },
+                "author",
+                6,
+            )
+            .unwrap_err()
+            .contains("injected merge receipt failure")
+        );
+        let connection = db.conn();
+        let published: String = connection
+            .query_row(
+                "SELECT revision_digest FROM sekai_definition_published_heads
+                 WHERE namespace='team-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(published, parent.revision_digest);
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM sekai_definition_proposals
+                 WHERE namespace='team-a' AND proposal_id='cs-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, STATUS_OPEN);
+        let request_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_definition_requests
+                 WHERE namespace='team-a' AND idempotency_key='merge-interrupted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_count, 0);
+        let audit_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_definition_branch_audit
+                 WHERE namespace='team-a' AND action='merge_proposal'",
                 [],
                 |row| row.get(0),
             )

@@ -12,7 +12,7 @@ use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
     DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
     MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
-    reject_foreign_member_grants,
+    merge_receipt_id, reject_foreign_member_grants, require_descendant_candidate,
 };
 
 impl PostgresDb {
@@ -347,6 +347,8 @@ impl PostgresDb {
             created_by: actor.into(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            receipt_id: String::new(),
+            close_reason_code: String::new(),
         };
         insert_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
@@ -482,6 +484,12 @@ impl PostgresDb {
             .ok_or_else(|| {
                 "definition_revision_not_found: published head is unavailable".to_string()
             })?;
+        if published != request.expected_published_digest {
+            return Err(
+                "stale_published_definition_head: expected published digest does not match published head"
+                    .into(),
+            );
+        }
         if published != proposal.base_digest {
             return Err(
                 "stale_published_definition_head: published head does not match pinned base".into(),
@@ -496,6 +504,17 @@ impl PostgresDb {
             "definition_revision_not_found: candidate revision is unavailable".to_string()
         })?;
         reject_foreign_member_grants(&candidate, &proposal.named_foreign_digests)?;
+        require_descendant_candidate(&candidate, &proposal.base_digest, |digest| {
+            load_revision_postgres(&mut transaction, &proposal.namespace, digest)
+        })?;
+        let receipt_id = merge_receipt_id(
+            &proposal.namespace,
+            &proposal.proposal_id,
+            &proposal.proposal_digest,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            &published,
+        )?;
         let published_revision = mark_revision_published_postgres(&mut transaction, &candidate)?;
         write_published_head_postgres(
             &mut transaction,
@@ -506,12 +525,14 @@ impl PostgresDb {
         )?;
         proposal.status = STATUS_MERGED.into();
         proposal.updated_at_ms = now_ms;
+        proposal.receipt_id = receipt_id.clone();
         update_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::MergeProposal {
             result: Box::new(DefinitionProposalMergeResult {
                 proposal: proposal.clone(),
                 previous_published_digest: published,
                 published_revision: published_revision.clone(),
+                receipt_id,
             }),
         };
         persist_result_postgres(
@@ -559,6 +580,7 @@ impl PostgresDb {
                 })?;
         proposal.require_open()?;
         proposal.status = STATUS_CLOSED.into();
+        proposal.close_reason_code = request.reason_code.clone();
         proposal.updated_at_ms = now_ms;
         update_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::CloseProposal {
@@ -811,8 +833,8 @@ fn insert_proposal_postgres(
         .execute(
             "INSERT INTO sekai_definition_proposals (
                 namespace, proposal_id, branch_id, proposal_digest, status, body_json,
-                created_by, created_at_ms, updated_at_ms
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                created_by, created_at_ms, updated_at_ms, receipt_id, close_reason_code
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &proposal.namespace,
                 &proposal.proposal_id,
@@ -823,6 +845,8 @@ fn insert_proposal_postgres(
                 &proposal.created_by,
                 &proposal.created_at_ms,
                 &proposal.updated_at_ms,
+                &proposal.receipt_id,
+                &proposal.close_reason_code,
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -838,12 +862,14 @@ fn update_proposal_postgres(
     let updated = transaction
         .execute(
             "UPDATE sekai_definition_proposals
-             SET status=$1, body_json=$2, updated_at_ms=$3
-             WHERE namespace=$4 AND proposal_id=$5",
+             SET status=$1, body_json=$2, updated_at_ms=$3, receipt_id=$4, close_reason_code=$5
+             WHERE namespace=$6 AND proposal_id=$7",
             &[
                 &proposal.status,
                 &body_json,
                 &proposal.updated_at_ms,
+                &proposal.receipt_id,
+                &proposal.close_reason_code,
                 &proposal.namespace,
                 &proposal.proposal_id,
             ],

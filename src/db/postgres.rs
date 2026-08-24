@@ -51,6 +51,8 @@ const SOURCE_CHANGE_FEED_SCHEMA: &str = include_str!("postgres/0030_source_chang
 const DEFINITION_BRANCHES_SCHEMA: &str = include_str!("postgres/0031_definition_branches.sql");
 const OBJECT_SECURITY_SCHEMA: &str = include_str!("postgres/0032_object_security.sql");
 const DEFINITION_PROPOSALS_SCHEMA: &str = include_str!("postgres/0033_definition_proposals.sql");
+const DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA: &str =
+    include_str!("postgres/0034_definition_proposal_merge_evidence.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -219,6 +221,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 32,
         name: "definition_proposals",
         sql: DEFINITION_PROPOSALS_SCHEMA,
+    },
+    Migration {
+        version: 33,
+        name: "definition_proposal_merge_evidence",
+        sql: DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA,
     },
 ];
 
@@ -697,6 +704,18 @@ mod tests {
         assert!(OBJECT_SYNC_SCHEMA.contains("status IN ('OPEN', 'COMMITTED', 'ABORTED')"));
         assert!(OBJECT_SYNC_SCHEMA.contains("outcome IN ('success', 'denial', 'unavailable')"));
         assert!(!OBJECT_SYNC_SCHEMA.contains("unknown"));
+        assert!(
+            DEFINITION_PROPOSALS_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS sekai_definition_proposals")
+        );
+        assert!(
+            DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA
+                .contains("ADD COLUMN IF NOT EXISTS receipt_id")
+        );
+        assert!(
+            DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA
+                .contains("ADD COLUMN IF NOT EXISTS close_reason_code")
+        );
         assert!(!OBJECT_SYNC_SCHEMA.contains("partial"));
         assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("CREATE TABLE sekai_source_sync_generations"));
         assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("ADD COLUMN sync_generation BIGINT"));

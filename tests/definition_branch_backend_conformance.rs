@@ -7,8 +7,8 @@ use sekai_chisei::sekai::definition_branch::{
     DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
 };
 use sekai_chisei::sekai::definition_proposal::{
-    ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    MergeDefinitionProposal, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
+    ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
+    CreateDefinitionProposal, MergeDefinitionProposal, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -237,6 +237,7 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
     let merge = MergeDefinitionProposal {
         namespace: namespace.into(),
         proposal_id: "cs-1".into(),
+        expected_published_digest: parent_digest.clone(),
         idempotency_key: "merge-missing".into(),
     };
     assert!(
@@ -277,6 +278,7 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
     let stale_merge = MergeDefinitionProposal {
         namespace: namespace.into(),
         proposal_id: "cs-1".into(),
+        expected_published_digest: parent_digest.clone(),
         idempotency_key: "merge-stale".into(),
     };
     assert!(
@@ -354,36 +356,70 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         14,
     )
     .unwrap();
-    let merged = db
+    let stale_expected = db
         .merge_definition_proposal(
             &MergeDefinitionProposal {
                 namespace: namespace.into(),
                 proposal_id: "cs-2".into(),
-                idempotency_key: "merge-2".into(),
+                expected_published_digest: second.revision.revision_digest.clone(),
+                idempotency_key: "merge-stale-head".into(),
             },
             "author",
             15,
         )
+        .unwrap_err();
+    assert!(stale_expected.contains("stale_published_definition_head"));
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent_digest
+    );
+
+    let merge_request = MergeDefinitionProposal {
+        namespace: namespace.into(),
+        proposal_id: "cs-2".into(),
+        expected_published_digest: parent_digest.clone(),
+        idempotency_key: "merge-2".into(),
+    };
+    let merged = db
+        .merge_definition_proposal(&merge_request, "author", 16)
         .unwrap();
     assert_eq!(
         merged,
-        db.merge_definition_proposal(
-            &MergeDefinitionProposal {
-                namespace: namespace.into(),
-                proposal_id: "cs-2".into(),
-                idempotency_key: "merge-2".into(),
-            },
-            "author",
-            16,
-        )
-        .unwrap()
+        db.merge_definition_proposal(&merge_request, "author", 17)
+            .unwrap()
     );
     let DefinitionWriteResult::MergeProposal { result } = merged else {
         panic!("expected merge");
     };
     assert_eq!(result.proposal.status, STATUS_MERGED);
+    assert!(!result.receipt_id.is_empty());
+    assert_eq!(result.proposal.receipt_id, result.receipt_id);
     assert_eq!(result.previous_published_digest, parent_digest);
     assert!(result.published_revision.published);
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        second.revision.revision_digest
+    );
+    let replayed_head = db
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap()
+        .revision_digest;
+    db.merge_definition_proposal(&merge_request, "author", 18)
+        .unwrap();
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        replayed_head
+    );
     assert_eq!(
         db.get_published_definition_revision(namespace)
             .unwrap()
@@ -418,16 +454,39 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
             &CloseDefinitionProposal {
                 namespace: namespace.into(),
                 proposal_id: "cs-1".into(),
+                reason_code: CLOSE_REASON_SUPERSEDED.into(),
                 idempotency_key: "close-1".into(),
             },
             "author",
-            17,
+            19,
         )
         .unwrap();
     let DefinitionWriteResult::CloseProposal { proposal } = closed else {
         panic!("expected close");
     };
     assert_eq!(proposal.status, STATUS_CLOSED);
+    assert_eq!(proposal.close_reason_code, CLOSE_REASON_SUPERSEDED);
+    assert!(
+        db.merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "cs-1".into(),
+                expected_published_digest: parent_digest.clone(),
+                idempotency_key: "merge-closed".into(),
+            },
+            "author",
+            20,
+        )
+        .unwrap_err()
+        .contains("definition_proposal_not_open")
+    );
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        second.revision.revision_digest
+    );
 }
 
 fn exercise_concurrent_stale_head(db: Arc<dyn DefinitionBranchBackend>, namespace: &str) {
