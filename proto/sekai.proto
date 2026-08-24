@@ -1422,6 +1422,86 @@ message GetSourceSyncStateResponse {
   SourceSyncState state = 2;
 }
 
+// One canonical definition document changed on a governed branch. The server
+// recomputes member_digest from the namespace, identity, and canonical JSON.
+message DefinitionMemberInput {
+  string member_kind = 1;
+  string member_id = 2;
+  string definition_json = 3;
+  string member_digest = 4;
+}
+
+message DefinitionMemberRef {
+  string member_kind = 1;
+  string member_id = 2;
+}
+
+message DefinitionRevisionMember {
+  string member_kind = 1;
+  string member_id = 2;
+  string member_digest = 3;
+}
+
+message DefinitionRevision {
+  string contract_version = 1;
+  string namespace = 2;
+  string revision_digest = 3;
+  string parent_revision_digest = 4;
+  repeated DefinitionRevisionMember members = 5;
+  bool published = 6;
+  string created_by = 7;
+  int64 created_at_ms = 8;
+}
+
+// A stable authoring identity. The head advances only through an exact
+// expected-head compare-and-swap; its revisions remain immutable.
+message DefinitionBranch {
+  string contract_version = 1;
+  string namespace = 2;
+  string branch_id = 3;
+  string base_revision_digest = 4;
+  string head_revision_digest = 5;
+  string created_by = 6;
+  int64 created_at_ms = 7;
+  int64 updated_at_ms = 8;
+}
+
+message CreateDefinitionBranchRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string parent_revision_digest = 3;
+  string idempotency_key = 4;
+}
+
+message CreateDefinitionBranchResponse {
+  DefinitionBranch branch = 1;
+}
+
+message GetDefinitionBranchRequest {
+  string namespace = 1;
+  string branch_id = 2;
+}
+
+message GetDefinitionBranchResponse {
+  DefinitionBranch branch = 1;
+}
+
+message ApplyDefinitionBranchEditRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string expected_head_digest = 3;
+  repeated DefinitionMemberInput upserts = 4;
+  repeated DefinitionMemberRef removals = 5;
+  string idempotency_key = 6;
+}
+
+message ApplyDefinitionBranchEditResponse {
+  DefinitionBranch branch = 1;
+  string previous_head_digest = 2;
+  DefinitionRevision revision = 3;
+  repeated string changed_member_digests = 4;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1498,6 +1578,9 @@ service SekaiService {
   rpc TakeoverExpiredLease(TakeoverExpiredLeaseRequest) returns (TakeoverExpiredLeaseResponse);
   rpc ApplySourceBatch(ApplySourceBatchRequest) returns (ApplySourceBatchResponse);
   rpc GetSourceSyncState(GetSourceSyncStateRequest) returns (GetSourceSyncStateResponse);
+  rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
+  rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
+  rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);

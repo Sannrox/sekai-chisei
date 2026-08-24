@@ -64,6 +64,8 @@ lives in the separate [research index](research/README.md).
 
 - [Ontology definitions](ontology.md) — classes, relations, schemas,
   provenance, and validation boundaries.
+- [Governed definition branches](definition-branches.md) — namespace-scoped,
+  content-addressed definition revisions and compare-and-swap branch edits.
 - [Standalone ontology crate](../crates/sekai-ontology/README.md) — embedded
   library and local `sekai` CLI.
 - [Capability catalogs](capability-catalog.md) — native discovery and the HTTP

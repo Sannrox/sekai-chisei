@@ -1,5 +1,6 @@
 //! Capability metadata for PostgreSQL reusable Sekai foundations.
 
+use crate::db::definition_branch::POSTGRES_DEFINITION_BRANCH_SURFACE;
 use crate::db::graph::POSTGRES_GRAPH_SURFACES;
 use crate::db::object_sync::POSTGRES_OBJECT_SYNC_SURFACE;
 use crate::runtime_backend::{
@@ -12,6 +13,7 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.credentials",
     "sekai.coordination",
     "sekai.datasets",
+    POSTGRES_DEFINITION_BRANCH_SURFACE,
     "sekai.evidence",
     "sekai.function-definitions",
     "sekai.guarded-mutations",

@@ -9,6 +9,7 @@
     "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",
+    "sekai.definition-branch",
     "sekai.evidence",
     "sekai.function-definitions",
     "sekai.graph",

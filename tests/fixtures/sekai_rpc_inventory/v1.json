@@ -90,6 +90,45 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "CreateDefinitionBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetDefinitionBranch",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ApplyDefinitionBranchEdit",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_branch_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CreateObject",
       "kind": "persistent",
       "surfaces": [
@@ -1242,6 +1281,7 @@
     "sekai.coordination",
     "sekai.credentials",
     "sekai.datasets",
+    "sekai.definition-branch",
     "sekai.evidence",
     "sekai.function-definitions",
     "sekai.graph",
@@ -1265,12 +1305,14 @@
     262,
     263,
     264,
-    265
+    265,
+    666
   ],
   "evidence_harnesses": [
     "tests/action_governance_backend_conformance.rs",
     "tests/coordination_backend_conformance.rs",
     "tests/decision_backend_conformance.rs",
+    "tests/definition_branch_backend_conformance.rs",
     "tests/definition_lifecycle_backend_conformance.rs",
     "tests/evidence_backend_conformance.rs",
     "tests/graph_backend_conformance.rs",

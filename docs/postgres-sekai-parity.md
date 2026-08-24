@@ -20,6 +20,12 @@ lineage, results, and the checkpoint. The same backend harness covers two-page
 snapshot resume, cross-page stable object identity, old-page replay, stale
 cursors, and foreign binding isolation.
 
+The reusable `sekai.definition-branch` surface shares insert-only member and
+revision storage, expected-head advancement, idempotency, and audit semantics
+across SQLite and PostgreSQL. PostgreSQL serializes branch and idempotency
+identities before checking durable state, so concurrent writers cannot both
+advance one expected head.
+
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
 
@@ -53,6 +59,7 @@ Evidence is checked in as:
 | #261–#265 | Guarded mutations, definition lifecycle, decisions, team namespaces |
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
+| #666 | Governed definition branch and immutable revision foundation |
 
 ## Still outside this parent
 
@@ -76,6 +83,9 @@ database:
 ```sh
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test --test object_sync_backend_conformance -- --ignored
+
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test --test definition_branch_backend_conformance -- --ignored
 ```
 
 The ordered-feed migration is additive and one-way on both backends. Version 1

@@ -14,6 +14,7 @@ pub mod coordination;
 pub mod credentials;
 pub mod dataset;
 pub mod deduplication;
+pub mod definition_branch;
 pub mod escalation;
 pub mod evidence;
 pub(crate) mod evidence_admission_lifecycle;

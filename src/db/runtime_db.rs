@@ -21,6 +21,7 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
+use crate::db::definition_branch::DefinitionBranchBackend;
 use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::action_policy::ActionPolicy;
@@ -29,6 +30,7 @@ use crate::sekai::audit::{Decision, DecisionFilter, ObjectChange};
 use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
 use crate::sekai::deduplication::*;
+use crate::sekai::definition_branch::*;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceEnvelope, EvidenceLifecycleState};
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::{
@@ -84,6 +86,103 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    pub fn get_definition_revision(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<DefinitionRevision>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_revision(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::get_definition_revision(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+            ),
+        }
+    }
+
+    pub fn get_definition_members(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Vec<DefinitionMember>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_members(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::get_definition_members(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+            ),
+        }
+    }
+
+    pub fn get_definition_branch(
+        &self,
+        namespace: &str,
+        branch_id: &str,
+    ) -> Result<Option<DefinitionBranch>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                DefinitionBranchBackend::get_definition_branch(db.as_ref(), namespace, branch_id)
+            }
+            Self::Postgres(db) => {
+                DefinitionBranchBackend::get_definition_branch(db.as_ref(), namespace, branch_id)
+            }
+        }
+    }
+
+    pub fn create_definition_branch(
+        &self,
+        request: &CreateDefinitionBranch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::create_definition_branch(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::create_definition_branch(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn apply_definition_branch_edit(
+        &self,
+        request: &ApplyDefinitionBranchEdit,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::apply_definition_branch_edit(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::apply_definition_branch_edit(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
     pub fn put_governed_subject_provenance_export(
         &self,
         actor: &str,

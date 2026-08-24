@@ -53,6 +53,7 @@ use crate::sekai::action_work_lifecycle::{
 };
 use crate::sekai::attestation;
 use crate::sekai::capability;
+use crate::sekai::definition_branch as definition_branch_domain;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_admission_lifecycle::{
     EvidenceAdmissionLifecycle, EvidenceAdmissionLifecycleError, EvidenceAdmissionOutcome,
@@ -3048,6 +3049,174 @@ fn authorize_source_sync_namespace(
     }
 }
 
+fn definition_schema_member_name(member_kind: &str, member_id: &str) -> String {
+    match member_kind {
+        "object_type" => member_id.into(),
+        "interface_type" => format!("interface:{member_id}"),
+        "link_type" => format!("link:{member_id}"),
+        "control" => format!("control:{member_id}"),
+        _ => format!("{member_kind}:{member_id}"),
+    }
+}
+
+fn definition_member_object_id(member_kind: &str, member_id: &str) -> String {
+    match member_kind {
+        "action_type" => action_object_id(member_id),
+        "ontology_class" => ontology_class_object_id(member_id),
+        "ontology_relation" => ontology_relation_object_id(member_id),
+        _ => schema_object_id(&definition_schema_member_name(member_kind, member_id)),
+    }
+}
+
+fn authorize_definition_member_read(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    member_kind: &str,
+    member_id: &str,
+) -> Result<(), Status> {
+    check_read(
+        &service.security,
+        &definition_member_object_id(member_kind, member_id),
+        principals,
+    )
+    .map_err(|_| Status::not_found("definition revision unavailable"))
+}
+
+fn authorize_definition_member_write(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    member_kind: &str,
+    member_id: &str,
+) -> Result<(), Status> {
+    match member_kind {
+        "action_type" => check_action_admin(&service.security, member_id, principals),
+        "ontology_class" => check_ontology_admin(
+            &service.security,
+            &ontology_class_object_id(member_id),
+            principals,
+        ),
+        "ontology_relation" => check_ontology_admin(
+            &service.security,
+            &ontology_relation_object_id(member_id),
+            principals,
+        ),
+        _ => check_schema_admin(
+            &service.security,
+            &definition_schema_member_name(member_kind, member_id),
+            principals,
+        ),
+    }
+}
+
+fn authorize_definition_revision(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    revision_digest: &str,
+    require_published: bool,
+) -> Result<(), Status> {
+    let revision = service
+        .db
+        .get_definition_revision(namespace, revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .filter(|revision| !require_published || revision.published)
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let members = service
+        .db
+        .get_definition_members(namespace, &revision.revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    if members.len() != revision.members.len() {
+        return Err(Status::internal("definition revision unavailable"));
+    }
+    for member in members {
+        authorize_definition_member_read(
+            service,
+            principals,
+            &member.member_kind,
+            &member.member_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn from_proto_definition_member_input(
+    member: &DefinitionMemberInput,
+) -> definition_branch_domain::DefinitionMemberInput {
+    definition_branch_domain::DefinitionMemberInput {
+        member_kind: member.member_kind.clone(),
+        member_id: member.member_id.clone(),
+        definition_json: member.definition_json.clone(),
+        member_digest: member.member_digest.clone(),
+    }
+}
+
+fn from_proto_definition_member_ref(
+    member: &DefinitionMemberRef,
+) -> definition_branch_domain::DefinitionMemberRef {
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: member.member_kind.clone(),
+        member_id: member.member_id.clone(),
+    }
+}
+
+fn to_proto_definition_branch(
+    branch: &definition_branch_domain::DefinitionBranch,
+) -> DefinitionBranch {
+    DefinitionBranch {
+        contract_version: branch.contract_version.clone(),
+        namespace: branch.namespace.clone(),
+        branch_id: branch.branch_id.clone(),
+        base_revision_digest: branch.base_revision_digest.clone(),
+        head_revision_digest: branch.head_revision_digest.clone(),
+        created_by: branch.created_by.clone(),
+        created_at_ms: branch.created_at_ms,
+        updated_at_ms: branch.updated_at_ms,
+    }
+}
+
+fn to_proto_definition_revision(
+    revision: &definition_branch_domain::DefinitionRevision,
+) -> DefinitionRevision {
+    DefinitionRevision {
+        contract_version: revision.contract_version.clone(),
+        namespace: revision.namespace.clone(),
+        revision_digest: revision.revision_digest.clone(),
+        parent_revision_digest: revision.parent_revision_digest.clone(),
+        members: revision
+            .members
+            .iter()
+            .map(|member| DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            })
+            .collect(),
+        published: revision.published,
+        created_by: revision.created_by.clone(),
+        created_at_ms: revision.created_at_ms,
+    }
+}
+
+fn map_definition_write_error(error: String) -> Status {
+    if error.starts_with("definition_revision_not_found")
+        || error.starts_with("definition_branch_not_found")
+        || error.starts_with("definition_member_not_found")
+    {
+        Status::not_found("definition resource unavailable")
+    } else if error.starts_with("stale_definition_branch_head") {
+        Status::failed_precondition("definition branch head is stale")
+    } else if error.starts_with("definition_edit_no_change") {
+        Status::failed_precondition("definition edit has no effect")
+    } else if error.starts_with("definition_idempotency_conflict")
+        || error.starts_with("definition_branch_conflict")
+        || error.starts_with("immutable_definition_")
+    {
+        Status::already_exists("definition write conflicts with durable state")
+    } else {
+        Status::internal("definition write unavailable")
+    }
+}
+
 fn from_proto_source_batch(batch: SourceBatch) -> Result<source_sync_domain::SourceBatch, Status> {
     let delivery = batch
         .delivery
@@ -3646,6 +3815,163 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(GetSourceSyncStateResponse {
             found: state.is_some(),
             state: state.as_ref().map(to_proto_source_sync_state),
+        }))
+    }
+
+    async fn create_definition_branch(
+        &self,
+        req: Request<CreateDefinitionBranchRequest>,
+    ) -> Result<Response<CreateDefinitionBranchResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_branch_domain::CreateDefinitionBranch {
+            namespace: input.namespace,
+            branch_id: input.branch_id,
+            parent_revision_digest: input.parent_revision_digest,
+            idempotency_key: input.idempotency_key,
+        };
+        request.validate().map_err(Status::invalid_argument)?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &request.namespace,
+            &request.parent_revision_digest,
+            true,
+        )?;
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .create_definition_branch(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::CreateBranch { branch } = result
+        else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(CreateDefinitionBranchResponse {
+            branch: Some(to_proto_definition_branch(&branch)),
+        }))
+    }
+
+    async fn get_definition_branch(
+        &self,
+        req: Request<GetDefinitionBranchRequest>,
+    ) -> Result<Response<GetDefinitionBranchResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        if input.branch_id.is_empty()
+            || input.branch_id.len() > definition_branch_domain::MAX_DEFINITION_ID_BYTES
+            || input.branch_id.trim() != input.branch_id
+            || input.branch_id.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument("canonical branch_id required"));
+        }
+        let branch = self
+            .db
+            .get_definition_branch(&input.namespace, &input.branch_id)
+            .map_err(|_| Status::internal("definition branch unavailable"))?
+            .ok_or_else(|| Status::not_found("definition branch unavailable"))?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &branch.namespace,
+            &branch.head_revision_digest,
+            false,
+        )?;
+        Ok(Response::new(GetDefinitionBranchResponse {
+            branch: Some(to_proto_definition_branch(&branch)),
+        }))
+    }
+
+    async fn apply_definition_branch_edit(
+        &self,
+        req: Request<ApplyDefinitionBranchEditRequest>,
+    ) -> Result<Response<ApplyDefinitionBranchEditResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_branch_domain::ApplyDefinitionBranchEdit {
+            namespace: input.namespace,
+            branch_id: input.branch_id,
+            expected_head_digest: input.expected_head_digest,
+            upserts: input
+                .upserts
+                .iter()
+                .map(from_proto_definition_member_input)
+                .collect(),
+            removals: input
+                .removals
+                .iter()
+                .map(from_proto_definition_member_ref)
+                .collect(),
+            idempotency_key: input.idempotency_key,
+        };
+        let (upserts, removals, _) = request.prepare().map_err(Status::invalid_argument)?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &request.namespace,
+            &request.expected_head_digest,
+            false,
+        )?;
+        for member in &upserts {
+            authorize_definition_member_write(
+                self,
+                &principals,
+                &member.member_kind,
+                &member.member_id,
+            )?;
+        }
+        for member in &removals {
+            authorize_definition_member_write(
+                self,
+                &principals,
+                &member.member_kind,
+                &member.member_id,
+            )?;
+        }
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .apply_definition_branch_edit(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::ApplyEdit { result } = result else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(ApplyDefinitionBranchEditResponse {
+            branch: Some(to_proto_definition_branch(&result.branch)),
+            previous_head_digest: result.previous_head_digest,
+            revision: Some(to_proto_definition_revision(&result.revision)),
+            changed_member_digests: result.changed_member_digests,
         }))
     }
 
@@ -7117,6 +7443,185 @@ mod tests {
         for grant in grants {
             svc.security.add_grant(&grant);
         }
+    }
+
+    fn seed_definition_parent(
+        svc: &SekaiServiceImpl,
+        namespace: &str,
+    ) -> definition_branch_domain::DefinitionRevision {
+        let member = definition_branch_domain::DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket"}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare(namespace)
+        .unwrap();
+        let revision = definition_branch_domain::prepare_revision(
+            namespace,
+            "",
+            [definition_branch_domain::DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            }],
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        let RuntimeDb::Sqlite(db) = svc.db.as_ref() else {
+            panic!("test service must use SQLite");
+        };
+        db.seed_published_definition_revision(&revision, &[member])
+            .unwrap();
+        revision
+    }
+
+    #[tokio::test]
+    async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "definition-team");
+        let created = svc
+            .create_definition_branch(with_named_principal(
+                CreateDefinitionBranchRequest {
+                    namespace: "definition-team".into(),
+                    branch_id: "feature".into(),
+                    parent_revision_digest: parent.revision_digest.clone(),
+                    idempotency_key: "create-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap();
+        assert_eq!(created.head_revision_digest, parent.revision_digest);
+
+        let edit = ApplyDefinitionBranchEditRequest {
+            namespace: "definition-team".into(),
+            branch_id: "feature".into(),
+            expected_head_digest: parent.revision_digest.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                member_digest: String::new(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: "edit-1".into(),
+        };
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(edit.clone(), "root"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(applied.previous_head_digest, parent.revision_digest);
+        assert!(!applied.revision.unwrap().published);
+        assert_eq!(applied.changed_member_digests.len(), 1);
+        let current = svc
+            .get_definition_branch(with_named_principal(
+                GetDefinitionBranchRequest {
+                    namespace: "definition-team".into(),
+                    branch_id: "feature".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .branch
+            .unwrap();
+        assert_eq!(
+            current.head_revision_digest,
+            applied.branch.unwrap().head_revision_digest
+        );
+
+        let mut stale = edit;
+        stale.idempotency_key = "edit-2".into();
+        let error = svc
+            .apply_definition_branch_edit(with_named_principal(stale, "root"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.db
+                .get_definition_revision("definition-team", &parent.revision_digest)
+                .unwrap()
+                .unwrap(),
+            parent
+        );
+    }
+
+    #[tokio::test]
+    async fn definition_branch_edit_rechecks_member_admin() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "definition-denial");
+        let read_grant = security::Grant {
+            id: "definition-ticket-reader".into(),
+            object_id: schema_object_id("Ticket"),
+            principal: "tester".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        svc.db.create_grant(&read_grant).unwrap();
+        svc.security.add_grant(&read_grant);
+        svc.create_definition_branch(with_principal(CreateDefinitionBranchRequest {
+            namespace: "definition-denial".into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: parent.revision_digest.clone(),
+            idempotency_key: "create-1".into(),
+        }))
+        .await
+        .unwrap();
+
+        let error = svc
+            .apply_definition_branch_edit(with_principal(ApplyDefinitionBranchEditRequest {
+                namespace: "definition-denial".into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "schema admin required");
+
+        let object_admin_grant = security::Grant {
+            id: "definition-ticket-admin".into(),
+            object_id: schema_object_id("Ticket"),
+            principal: "tester".into(),
+            role: security::Role::Admin,
+            created: 2,
+        };
+        svc.db.create_grant(&object_admin_grant).unwrap();
+        svc.security.add_grant(&object_admin_grant);
+        let error = svc
+            .apply_definition_branch_edit(with_principal(ApplyDefinitionBranchEditRequest {
+                namespace: "definition-denial".into(),
+                branch_id: "feature".into(),
+                expected_head_digest: parent.revision_digest,
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "interface_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket"}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "edit-interface".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "schema admin required");
     }
 
     fn source_batch(
