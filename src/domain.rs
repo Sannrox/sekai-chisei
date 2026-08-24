@@ -85,6 +85,19 @@ pub struct Object {
     pub updated: i64,
 }
 
+impl Object {
+    pub(crate) fn persisted_state_matches(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.kind == other.kind
+            && self.name == other.name
+            && self.namespace == other.namespace
+            && self.external_id == other.external_id
+            && self.properties == other.properties
+            && self.created == other.created
+            && self.updated == other.updated
+    }
+}
+
 // --- Link ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

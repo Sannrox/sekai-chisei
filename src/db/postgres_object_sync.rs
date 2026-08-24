@@ -2,9 +2,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use postgres::{GenericClient, IsolationLevel, Row};
 
-use crate::db::object_sync::{ApplyError, PreparedBatch, PreparedRecord, validate_binding};
+use crate::db::object_sync::{
+    ApplyError, PreparedBatch, PreparedRecord, SourceSyncAuthorization,
+    authorize_source_sync_transition, validate_binding,
+};
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
+use crate::db::postgres_object_security::{load_policy_postgres, load_profile_postgres};
 use crate::domain::Object;
 use crate::sekai::audit::object_diff_changes;
 use crate::sekai::object_lineage::ObjectLineage;
@@ -53,6 +57,31 @@ impl PostgresDb {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_authorized(batch, authenticated_producer, now_ms, None)
+    }
+
+    pub fn apply_source_batch_with_object_security(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        authorization: &SourceSyncAuthorization,
+    ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_authorized(
+            batch,
+            authenticated_producer,
+            now_ms,
+            Some(authorization),
+        )
+    }
+
+    fn apply_source_batch_authorized(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        authorization: Option<&SourceSyncAuthorization>,
+    ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
             .map_err(|error| error.to_string())?;
@@ -66,7 +95,13 @@ impl PostgresDb {
         {
             OpenDisposition::Committed(result) => Ok(*result),
             OpenDisposition::Open => self
-                .commit_source_batch(batch, &prepared, authenticated_producer, now_ms)
+                .commit_source_batch(
+                    batch,
+                    &prepared,
+                    authenticated_producer,
+                    now_ms,
+                    authorization,
+                )
                 .map_err(|error| error.to_string()),
         }
     }
@@ -261,6 +296,7 @@ impl PostgresDb {
         prepared: &PreparedBatch,
         authenticated_producer: &str,
         now_ms: i64,
+        authorization: Option<&SourceSyncAuthorization>,
     ) -> Result<SourceBatchResult, ApplyError> {
         let mut connection = self.connection().map_err(ApplyError::storage)?;
         let mut transaction = connection.transaction()?;
@@ -321,20 +357,40 @@ impl PostgresDb {
                     now_ms,
                 )?;
             }
-            transaction.execute(
-                "UPDATE sekai_source_batch_transactions
-                 SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
-                 WHERE transaction_id = $3 AND status = 'OPEN'",
-                &[&now_ms, &error.to_string(), &prepared.transaction_id],
-            )?;
-            transaction.execute(
-                "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
-                &[&now_ms, &prepared.binding_id],
-            )?;
-            transaction.commit()?;
-            return Err(error);
+            return abort_open_source_batch_postgres(transaction, prepared, now_ms, error);
         }
 
+        let policy_state = authorization
+            .map(|_| {
+                let profile = load_profile_postgres(&mut transaction, &batch.namespace)
+                    .map_err(ApplyError::storage)?;
+                let records = profile
+                    .as_ref()
+                    .map(|profile| {
+                        profile
+                            .bindings
+                            .iter()
+                            .map(|binding| {
+                                load_policy_postgres(
+                                    &mut transaction,
+                                    &batch.namespace,
+                                    &binding.policy_digest,
+                                )
+                                .map_err(ApplyError::storage)?
+                                .ok_or_else(|| {
+                                    ApplyError::denied(
+                                        "object_security_denied",
+                                        "active source object policy is unavailable",
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, ApplyError>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok::<_, ApplyError>((profile, records))
+            })
+            .transpose()?;
         let mut record_results = Vec::with_capacity(prepared.records.len());
         for prepared_record in &prepared.records {
             let before = load_object(&mut transaction, &prepared_record.object.object_id, true)?;
@@ -363,6 +419,22 @@ impl PostgresDb {
                     .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
                 updated: now_ms,
             };
+            if let (Some(authorization), Some((profile, records))) =
+                (authorization, policy_state.as_ref())
+            {
+                let object_admin =
+                    source_sync_object_admin_postgres(&mut transaction, &object, authorization)?;
+                if let Err(error) = authorize_source_sync_transition(
+                    profile.as_ref(),
+                    records,
+                    authorization,
+                    before.as_ref(),
+                    &object,
+                    object_admin,
+                ) {
+                    return abort_open_source_batch_postgres(transaction, prepared, now_ms, error);
+                }
+            }
             transaction.execute(
                 "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)
@@ -1026,6 +1098,64 @@ fn commit_generation_state(
         }
     }
     Ok(())
+}
+
+fn abort_open_source_batch_postgres(
+    mut transaction: postgres::Transaction<'_>,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+    error: ApplyError,
+) -> Result<SourceBatchResult, ApplyError> {
+    transaction.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
+         WHERE transaction_id = $3 AND status = 'OPEN'",
+        &[&now_ms, &error.to_string(), &prepared.transaction_id],
+    )?;
+    transaction.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
+        &[&now_ms, &prepared.binding_id],
+    )?;
+    transaction.commit()?;
+    Err(error)
+}
+
+fn source_sync_object_admin_postgres(
+    transaction: &mut postgres::Transaction<'_>,
+    object: &Object,
+    authorization: &SourceSyncAuthorization,
+) -> Result<bool, ApplyError> {
+    if authorization
+        .principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(true);
+    }
+    let namespace_external_id = format!("namespace:{}", object.namespace);
+    let allowed = transaction.query_one(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM sekai_grants grant_row
+            WHERE grant_row.principal = ANY($1)
+              AND grant_row.role = 'admin'
+              AND (
+                grant_row.object_id = $2
+                OR EXISTS (
+                    SELECT 1 FROM sekai_objects namespace_object
+                    WHERE namespace_object.id = grant_row.object_id
+                      AND namespace_object.kind = 'namespace'
+                      AND namespace_object.external_id = $3
+                )
+              )
+         )",
+        &[
+            &authorization.principals,
+            &object.id,
+            &namespace_external_id,
+        ],
+    )?;
+    Ok(allowed.get(0))
 }
 
 fn load_object(

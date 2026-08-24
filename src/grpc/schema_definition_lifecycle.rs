@@ -98,6 +98,53 @@ impl SchemaDefinitionLifecycle {
         )
         .map_err(SchemaDefinitionLifecycleError::InvalidDefinition)?;
         self.validate_computed_properties(&definition)?;
+        if let Some(existing) = registry.get(&definition.kind) {
+            for record in self
+                .db
+                .active_object_security_policies_for_kind(&definition.kind)
+                .map_err(SchemaDefinitionLifecycleError::Persistence)?
+            {
+                for property_name in record
+                    .policy
+                    .rules
+                    .iter()
+                    .flat_map(|rule| &rule.conditions)
+                    .flat_map(|condition| [&condition.left, &condition.right])
+                    .filter(|operand| {
+                        operand.source == object_security_domain::OperandSource::ObjectProperty
+                    })
+                    .map(|operand| operand.name.as_str())
+                {
+                    let existing_property = existing
+                        .properties
+                        .iter()
+                        .find(|property| property.name == property_name)
+                        .ok_or_else(|| {
+                            SchemaDefinitionLifecycleError::InvalidDefinition(
+                                "active object policy references unavailable schema state".into(),
+                            )
+                        })?;
+                    let proposed_property = definition
+                        .properties
+                        .iter()
+                        .find(|property| property.name == property_name)
+                        .ok_or_else(|| {
+                            SchemaDefinitionLifecycleError::InvalidDefinition(
+                                "active object policy property cannot be removed".into(),
+                            )
+                        })?;
+                    if serde_json::to_value(existing_property).map_err(|error| {
+                        SchemaDefinitionLifecycleError::InvalidDefinition(error.to_string())
+                    })? != serde_json::to_value(proposed_property).map_err(|error| {
+                        SchemaDefinitionLifecycleError::InvalidDefinition(error.to_string())
+                    })? {
+                        return Err(SchemaDefinitionLifecycleError::InvalidDefinition(
+                            "active object policy property cannot change".into(),
+                        ));
+                    }
+                }
+            }
+        }
         self.db
             .upsert_object_type(&definition)
             .map_err(SchemaDefinitionLifecycleError::Persistence)?;
@@ -258,6 +305,83 @@ mod tests {
         assert!(reader.snapshot().unwrap().get("shared").is_none());
 
         assert!(reader.refresh_snapshot().unwrap().get("shared").is_some());
+    }
+
+    #[test]
+    fn active_object_policy_freezes_only_referenced_schema_properties() {
+        let db = runtime_db();
+        let lifecycle = SchemaDefinitionLifecycle::load(db.clone());
+        let mut original = definition("secured");
+        original.properties.push(schema::PropertyDef {
+            name: "owner".into(),
+            prop_type: schema::PropertyType::String,
+            required: false,
+            description: "Security owner".into(),
+            enum_values: Vec::new(),
+            link_kind: String::new(),
+            compute_expr: String::new(),
+            classification: "public".into(),
+            struct_fields: Vec::new(),
+        });
+        lifecycle.put_definition(original.clone()).unwrap();
+        let created = db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: "default".into(),
+                    object_kind: "secured".into(),
+                    revision: "1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "owner".into(),
+                        conditions: vec![object_security_domain::PolicyCondition {
+                            left: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::ObjectProperty,
+                                name: "owner".into(),
+                                value: String::new(),
+                            },
+                            operator: object_security_domain::ConditionOperator::Equals,
+                            right: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::PrincipalAttribute,
+                                name: "subject".into(),
+                                value: String::new(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "create-secured".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        db.activate_object_security_profile(
+            &object_security_domain::ActivateObjectSecurityProfile {
+                namespace: "default".into(),
+                expected_profile_digest: String::new(),
+                bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                    object_kind: "secured".into(),
+                    policy_digest: record.policy.policy_digest,
+                }],
+                idempotency_key: "activate-secured".into(),
+            },
+            &["secured".into()],
+            "root",
+            2,
+        )
+        .unwrap();
+
+        let mut description_changed = original;
+        description_changed.description = "Changed schema description".into();
+        lifecycle.put_definition(description_changed).unwrap();
+        let removed_security_property = definition("secured");
+        assert!(matches!(
+            lifecycle.put_definition(removed_security_property),
+            Err(SchemaDefinitionLifecycleError::InvalidDefinition(error))
+                if error.contains("cannot be removed")
+        ));
     }
 
     #[test]

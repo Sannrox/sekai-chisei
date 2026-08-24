@@ -80,6 +80,7 @@ use crate::sekai::markings;
 use crate::sekai::object_mutation::{
     LeasePrecondition as MutationLeasePrecondition, MutationPersistenceError, ObjectMutation,
 };
+use crate::sekai::object_security as object_security_domain;
 use crate::sekai::object_sync as source_sync_domain;
 use crate::sekai::schema::{self, SchemaRegistry};
 use crate::sekai::security::SecurityChecker;
@@ -122,6 +123,7 @@ pub struct SekaiServiceImpl {
     gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
     site_id: String,
+    object_query_cursor_key: [u8; 32],
 }
 
 impl SekaiServiceImpl {
@@ -137,6 +139,9 @@ impl SekaiServiceImpl {
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
         let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
+        let object_query_cursor_key = db
+            .object_query_cursor_key()
+            .expect("initialize durable object query cursor key");
         Self {
             db,
             security,
@@ -144,6 +149,7 @@ impl SekaiServiceImpl {
             budget: None,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            object_query_cursor_key,
         }
     }
 
@@ -601,6 +607,87 @@ fn object_passes_marking(
     Ok(result.decision != markings::MarkingDecision::Deny)
 }
 
+#[derive(Debug)]
+enum ObjectAccessEvidence {
+    LegacyMarking(markings::MarkingCheckResult),
+    Policy(object_security_domain::ObjectAuthorizationDecision),
+}
+
+fn principal_security_context(
+    db: &RuntimeDb,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<object_security_domain::PrincipalSecurityContext, Status> {
+    if let (Some(extension), Some(context)) = (db.enterprise_extension(), tenant_context) {
+        return extension
+            .object_security_context(context)
+            .map_err(extension_status);
+    }
+    let subject = principals
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "anonymous".into());
+    let mut principals = principals.to_vec();
+    principals.sort();
+    principals.dedup();
+    Ok(object_security_domain::PrincipalSecurityContext {
+        attributes: std::collections::BTreeMap::from([
+            ("credential_kind".into(), "machine".into()),
+            ("issuer".into(), "sekai:community".into()),
+            ("subject".into(), subject),
+            ("tenant_id".into(), String::new()),
+            ("x_acl_principals".into(), principals.join(",")),
+        ]),
+        entitlements: std::collections::BTreeSet::new(),
+    })
+}
+
+fn evaluate_active_object_policy(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: &str,
+) -> Result<Option<object_security_domain::ObjectAuthorizationDecision>, Status> {
+    if db
+        .get_object_security_profile(&object.namespace)
+        .map_err(|_| Status::unavailable("object security profile unavailable"))?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let record = db
+        .get_active_object_security_policy(&object.namespace, &object.kind)
+        .map_err(|_| Status::unavailable("object security policy unavailable"))?
+        .ok_or_else(|| Status::permission_denied("access denied"))?;
+    if record.revocation.is_some() {
+        return Err(Status::permission_denied("access denied"));
+    }
+    let context = object_security_domain::ObjectAuthorizationContext {
+        principal: principal_security_context(db, principals, tenant_context)?,
+        operation: operation.into(),
+    };
+    object_security_domain::evaluate_object_policy(&record.policy, &context, object)
+        .map(Some)
+        .map_err(|_| Status::permission_denied("access denied"))
+}
+
+fn object_passes_security_policy(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: &str,
+) -> Result<bool, Status> {
+    if is_reserved_governance_kind(&object.kind) {
+        return object_passes_marking(db, object, principals);
+    }
+    match evaluate_active_object_policy(db, object, principals, tenant_context, operation)? {
+        Some(decision) => Ok(decision.allowed),
+        None => object_passes_marking(db, object, principals),
+    }
+}
+
 fn object_is_visible(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -608,11 +695,23 @@ fn object_is_visible(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
 ) -> bool {
+    object_is_visible_for(db, security, object, principals, tenant_context, "read")
+}
+
+fn object_is_visible_for(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: &str,
+) -> bool {
     !is_reserved_governance_kind(&object.kind)
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
-        && object_passes_marking(db, object, principals).unwrap_or(false)
+        && object_passes_security_policy(db, object, principals, tenant_context, operation)
+            .unwrap_or(false)
 }
 
 /// Single-object read root: reserved kinds are observationally missing, tenant
@@ -623,8 +722,9 @@ fn require_visible_read_root(
     object: domain::Object,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
+    operation: &str,
     operation_id: &str,
-) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
+) -> Result<(domain::Object, ObjectAccessEvidence), Status> {
     if is_reserved_governance_kind(&object.kind) {
         return Err(Status::not_found("not found"));
     }
@@ -632,8 +732,18 @@ fn require_visible_read_root(
         .map_err(|_| Status::not_found("not found"))?;
     check_team_namespace(db, principals, &object.namespace, false)?;
     check_read(security, &object.id, principals)?;
-    let marking = enforce_object_marking_access(db, &object, principals, operation_id)?;
-    Ok((object, marking))
+    if let Some(decision) =
+        evaluate_active_object_policy(db, &object, principals, tenant_context, operation)
+            .map_err(|_| Status::not_found("not found"))?
+    {
+        if !decision.allowed {
+            return Err(Status::not_found("not found"));
+        }
+        return Ok((object, ObjectAccessEvidence::Policy(decision)));
+    }
+    let marking = enforce_object_marking_access(db, &object, principals, operation_id)
+        .map_err(|_| Status::not_found("not found"))?;
+    Ok((object, ObjectAccessEvidence::LegacyMarking(marking)))
 }
 
 fn retain_reachable_visible_objects(
@@ -725,8 +835,56 @@ fn retain_reachable_visible_lineage(
     edges.retain(|edge| reachable.contains(&edge.from) && reachable.contains(&edge.to));
 }
 
-/// ACL-visible list with marking filter, exact marking-visible totals, and
-/// offset/limit applied over the filtered set.
+fn storage_object_security_context(
+    db: &RuntimeDb,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<
+    (
+        object_security_domain::PrincipalSecurityContext,
+        Vec<&'static str>,
+        bool,
+    ),
+    Status,
+> {
+    let principal = principal_security_context(db, principals, tenant_context)?;
+    let legacy_authority = resolve_principal_authority(db, principals)?;
+    let trusted_legacy = markings::is_trusted_service_principal(&legacy_authority.principal);
+    let allowed_legacy_markings = match legacy_authority.classification_ceiling {
+        Some(evidence_domain::EvidenceClassification::Restricted) => {
+            vec!["public", "internal", "confidential", "restricted"]
+        }
+        Some(evidence_domain::EvidenceClassification::Confidential) => {
+            vec!["public", "internal", "confidential"]
+        }
+        Some(evidence_domain::EvidenceClassification::Internal) => vec!["public", "internal"],
+        Some(evidence_domain::EvidenceClassification::Public) => vec!["public"],
+        None => Vec::new(),
+    };
+    Ok((principal, allowed_legacy_markings, trusted_legacy))
+}
+
+fn object_security_profile_state_digest(db: &RuntimeDb, namespace: &str) -> Result<String, Status> {
+    let Some(profile) = db
+        .get_object_security_profile(namespace)
+        .map_err(|_| Status::unavailable("object security profile unavailable"))?
+    else {
+        return Ok("legacy".into());
+    };
+    let mut records = Vec::with_capacity(profile.bindings.len());
+    for binding in &profile.bindings {
+        records.push(
+            db.get_object_security_policy(namespace, &binding.policy_digest)
+                .map_err(|_| Status::unavailable("object security policy unavailable"))?
+                .ok_or_else(|| Status::unavailable("object security policy unavailable"))?,
+        );
+    }
+    object_security_domain::object_security_profile_state_digest(&profile, &records)
+        .map_err(|_| Status::unavailable("object security profile state is invalid"))
+}
+
+/// Storage-authorized list with exact visible totals and offset/limit applied
+/// only after ACL, namespace, active object policy, and legacy marking filters.
 fn list_objects_with_marking<F>(
     db: &RuntimeDb,
     filter: &domain::ListFilter,
@@ -742,47 +900,31 @@ where
     ) -> Result<Vec<domain::Object>, Status>,
 {
     let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-    let requested_limit = if filter.limit <= 0 {
-        domain::DEFAULT_LIST_LIMIT as usize
+    let (principal, allowed_legacy_markings, trusted_legacy) =
+        storage_object_security_context(db, principals, tenant_context)?;
+    let (objects, visible_total) = db
+        .list_objects_with_object_security(
+            filter,
+            &principal_refs,
+            RESERVED_GOVERNANCE_KINDS,
+            &principal,
+            "query",
+            &allowed_legacy_markings,
+            trusted_legacy,
+        )
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+    let objects = objects
+        .into_iter()
+        .filter(|object| {
+            enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
+        })
+        .collect::<Vec<_>>();
+    let visible_total = if tenant_context.is_some() && filter.namespace.is_none() {
+        objects.len() as i32
     } else {
-        (filter.limit as usize).min(domain::MAX_LIST_LIMIT as usize)
+        visible_total
     };
-    let requested_offset = filter.offset.max(0) as usize;
-    let mut scan_offset = 0i32;
-    let mut visible_index = 0usize;
-    let mut collected = Vec::new();
-    let mut visible_total = 0i32;
-    loop {
-        let mut scan_filter = filter.clone();
-        scan_filter.offset = scan_offset;
-        scan_filter.limit = domain::MAX_LIST_LIMIT;
-        let (page, principal_total) = db
-            .list_objects_with_total_for_principals(
-                &scan_filter,
-                &principal_refs,
-                RESERVED_GOVERNANCE_KINDS,
-            )
-            .map_err(Status::internal)?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len() as i32;
-        for object in page {
-            if !object_passes_marking(db, &object, principals).unwrap_or(false) {
-                continue;
-            }
-            if visible_index >= requested_offset && collected.len() < requested_limit {
-                collected.push(object);
-            }
-            visible_index = visible_index.saturating_add(1);
-            visible_total = visible_total.saturating_add(1);
-        }
-        scan_offset = scan_offset.saturating_add(page_len);
-        if scan_offset >= principal_total {
-            break;
-        }
-    }
-    let objects = resolve(collected, principals, tenant_context)?;
+    let objects = resolve(objects, principals, tenant_context)?;
     Ok((objects, visible_total))
 }
 
@@ -828,6 +970,92 @@ fn enforce_object_marking_access(
         return Err(Status::permission_denied("access denied"));
     }
     Ok(result)
+}
+
+fn enforce_object_operation_access(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: &str,
+    operation_id: &str,
+) -> Result<ObjectAccessEvidence, Status> {
+    if let Some(decision) =
+        evaluate_active_object_policy(db, object, principals, tenant_context, operation)?
+    {
+        if !decision.allowed {
+            return Err(Status::permission_denied("access denied"));
+        }
+        return Ok(ObjectAccessEvidence::Policy(decision));
+    }
+    enforce_object_marking_access(db, object, principals, operation_id)
+        .map(ObjectAccessEvidence::LegacyMarking)
+}
+
+fn ensure_policy_driving_update_allowed(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    before: &domain::Object,
+    after: &domain::Object,
+    principals: &[String],
+) -> Result<(), Status> {
+    let scope_changed = before.kind != after.kind || before.namespace != after.namespace;
+    if scope_changed {
+        let before_profile = db
+            .get_object_security_profile(&before.namespace)
+            .map_err(|_| Status::unavailable("object security profile unavailable"))?;
+        let after_profile = if after.namespace == before.namespace {
+            before_profile.is_some()
+        } else {
+            db.get_object_security_profile(&after.namespace)
+                .map_err(|_| Status::unavailable("object security profile unavailable"))?
+                .is_some()
+        };
+        if before_profile.is_some() || after_profile {
+            check_object_admin(db, security, before, principals)?;
+        }
+    }
+    let mut policy_properties = std::collections::BTreeSet::<String>::new();
+    let mut saw_active_policy = false;
+    for (namespace, kind) in [
+        (before.namespace.as_str(), before.kind.as_str()),
+        (after.namespace.as_str(), after.kind.as_str()),
+    ] {
+        match db
+            .get_active_object_security_policy(namespace, kind)
+            .map_err(|_| Status::unavailable("object security policy unavailable"))?
+        {
+            Some(record) if record.revocation.is_some() => {
+                return Err(Status::permission_denied("access denied"));
+            }
+            Some(record) => {
+                saw_active_policy = true;
+                policy_properties.extend(
+                    record
+                        .policy
+                        .rules
+                        .iter()
+                        .flat_map(|rule| &rule.conditions)
+                        .flat_map(|condition| [&condition.left, &condition.right])
+                        .filter(|operand| {
+                            operand.source == object_security_domain::OperandSource::ObjectProperty
+                        })
+                        .map(|operand| operand.name.clone()),
+                );
+            }
+            None => {}
+        }
+    }
+    if !saw_active_policy {
+        return Ok(());
+    }
+    let changes_policy_input = policy_properties
+        .iter()
+        .any(|property| before.properties.get(property) != after.properties.get(property));
+    if !changes_policy_input {
+        return Ok(());
+    }
+    check_object_admin(db, security, before, principals)
 }
 
 fn record_marking_or_purpose_decision(
@@ -1154,10 +1382,23 @@ fn check_work_unit_read(
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
 ) -> Result<(), Status> {
     if !work_unit.target_object_id.is_empty() {
         check_object_namespace_access(db, principals, &work_unit.target_object_id, false)?;
-        check_read(security, &work_unit.target_object_id, principals)
+        check_read(security, &work_unit.target_object_id, principals)?;
+        let object = db
+            .get_object(&work_unit.target_object_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("work unit unavailable"))?;
+        enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false)?;
+        if object_passes_security_policy(db, &object, principals, tenant_context, "action")
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(Status::not_found("work unit unavailable"))
+        }
     } else if principal_matches(&work_unit.owner_principal, principals) {
         Ok(())
     } else {
@@ -1170,10 +1411,23 @@ fn check_work_unit_write(
     security: &SecurityChecker,
     work_unit: &coordination::WorkUnit,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
 ) -> Result<(), Status> {
     if !work_unit.target_object_id.is_empty() {
         check_object_namespace_access(db, principals, &work_unit.target_object_id, true)?;
-        check_write(security, &work_unit.target_object_id, principals)
+        check_write(security, &work_unit.target_object_id, principals)?;
+        let object = db
+            .get_object(&work_unit.target_object_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("work unit unavailable"))?;
+        enforce_namespace_tenant_context(db, tenant_context, &object.namespace, true)?;
+        if object_passes_security_policy(db, &object, principals, tenant_context, "action")
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(Status::not_found("work unit unavailable"))
+        }
     } else if principal_matches(&work_unit.owner_principal, principals) {
         Ok(())
     } else {
@@ -2302,6 +2556,7 @@ fn handoff_reference_available(
     reference: &handoff_domain::HandoffReference,
     namespace: &str,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
     now_ms: i64,
 ) -> Result<bool, Status> {
     let available = match reference.kind.as_str() {
@@ -2336,8 +2591,14 @@ fn handoff_reference_available(
                         .is_ok_and(|object| {
                             object.is_some_and(|object| object.namespace == namespace)
                         })
-                    && check_work_unit_read(&service.db, &service.security, &work_unit, principals)
-                        .is_ok()
+                    && check_work_unit_read(
+                        &service.db,
+                        &service.security,
+                        &work_unit,
+                        principals,
+                        tenant_context,
+                    )
+                    .is_ok()
             }),
         "object" => service
             .db
@@ -2347,8 +2608,23 @@ fn handoff_reference_available(
                 object.namespace == namespace
                     && reference_content_digest(&object)
                         .is_ok_and(|digest| digest == reference.version)
+                    && enforce_namespace_tenant_context(
+                        &service.db,
+                        tenant_context,
+                        namespace,
+                        false,
+                    )
+                    .is_ok()
                     && check_team_namespace(&service.db, principals, namespace, false).is_ok()
                     && check_read(&service.security, &object.id, principals).is_ok()
+                    && object_passes_security_policy(
+                        &service.db,
+                        &object,
+                        principals,
+                        tenant_context,
+                        "read",
+                    )
+                    .unwrap_or(false)
             }),
         "evidence_submission" => {
             if let Some(submission) = service
@@ -2512,6 +2788,9 @@ fn map_mutation_persistence_error(error: MutationPersistenceError) -> Status {
         MutationPersistenceError::Graph(error) => map_graph_mutation_error(error),
         MutationPersistenceError::Lease(error) => map_lease_error(error),
         MutationPersistenceError::NotFound => Status::not_found("not found"),
+        MutationPersistenceError::ChangedSinceAuthorization => {
+            Status::failed_precondition(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION)
+        }
     }
 }
 
@@ -2643,6 +2922,7 @@ const MAX_GOVERNED_VISIBILITY_WORK: usize = 8_192;
 fn governed_reference_tree_visible(
     service: &SekaiServiceImpl,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
     namespace: &str,
     object_id: &str,
     visibility_cache: &mut HashMap<String, bool>,
@@ -2679,9 +2959,23 @@ fn governed_reference_tree_visible(
             let object = service.db.get_object(&id).map_err(Status::internal)?;
             let visible = object.as_ref().is_some_and(|object| {
                 object.namespace == namespace
+                    && enforce_namespace_tenant_context(
+                        &service.db,
+                        tenant_context,
+                        namespace,
+                        false,
+                    )
+                    .is_ok()
                     && check_team_namespace(&service.db, principals, namespace, false).is_ok()
                     && check_read(&service.security, &id, principals).is_ok()
-                    && object_passes_marking(&service.db, object, principals).unwrap_or(false)
+                    && object_passes_security_policy(
+                        &service.db,
+                        object,
+                        principals,
+                        tenant_context,
+                        "read",
+                    )
+                    .unwrap_or(false)
             });
             if !visible {
                 active.remove(&id);
@@ -2769,7 +3063,8 @@ fn governed_object_for_read(
             .is_err()
         || check_team_namespace(&service.db, principals, &object.namespace, false).is_err()
         || check_read(&service.security, object_id, principals).is_err()
-        || !object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+        || !object_passes_security_policy(&service.db, &object, principals, tenant_context, "read")
+            .unwrap_or(false)
     {
         return Err(Status::not_found("governed fact not found"));
     }
@@ -2782,6 +3077,7 @@ fn governed_object_for_read(
         if !governed_reference_tree_visible(
             service,
             principals,
+            tenant_context,
             &object.namespace,
             object_id,
             &mut visibility_cache,
@@ -2796,6 +3092,7 @@ fn governed_object_for_read(
 fn list_visible_governed_objects(
     service: &SekaiServiceImpl,
     principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
     namespace: &str,
     kind: &str,
     visibility_cache: &mut HashMap<String, bool>,
@@ -2821,10 +3118,18 @@ fn list_visible_governed_objects(
         }
         offset = offset.saturating_add(page.len() as i32);
         for object in page {
-            if object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+            if object_passes_security_policy(
+                &service.db,
+                &object,
+                principals,
+                tenant_context,
+                "read",
+            )
+            .unwrap_or(false)
                 && governed_reference_tree_visible(
                     service,
                     principals,
+                    tenant_context,
                     namespace,
                     &object.id,
                     visibility_cache,
@@ -3217,6 +3522,218 @@ fn map_definition_write_error(error: String) -> Status {
     }
 }
 
+fn parse_object_security_operand(
+    operand: Option<ObjectSecurityPolicyOperand>,
+) -> Result<object_security_domain::PolicyOperand, Status> {
+    let operand = operand.ok_or_else(|| Status::invalid_argument("policy operand required"))?;
+    let source = match operand.source.as_str() {
+        "fixed" => object_security_domain::OperandSource::Fixed,
+        "object_property" => object_security_domain::OperandSource::ObjectProperty,
+        "operation_context" => object_security_domain::OperandSource::OperationContext,
+        "principal_attribute" => object_security_domain::OperandSource::PrincipalAttribute,
+        "principal_entitlement" => object_security_domain::OperandSource::PrincipalEntitlement,
+        _ => return Err(Status::invalid_argument("unknown policy operand source")),
+    };
+    Ok(object_security_domain::PolicyOperand {
+        source,
+        name: operand.name,
+        value: operand.value,
+    })
+}
+
+fn parse_object_security_rule(
+    rule: ObjectSecurityRule,
+) -> Result<object_security_domain::ObjectSecurityRule, Status> {
+    let conditions = rule
+        .conditions
+        .into_iter()
+        .map(|condition| {
+            let operator = match condition.operator.as_str() {
+                "equals" => object_security_domain::ConditionOperator::Equals,
+                "not_equals" => object_security_domain::ConditionOperator::NotEquals,
+                "contains" => object_security_domain::ConditionOperator::Contains,
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "unknown policy condition operator",
+                    ));
+                }
+            };
+            Ok(object_security_domain::PolicyCondition {
+                left: parse_object_security_operand(condition.left)?,
+                operator,
+                right: parse_object_security_operand(condition.right)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(object_security_domain::ObjectSecurityRule {
+        rule_id: rule.rule_id,
+        conditions,
+    })
+}
+
+fn to_proto_object_security_operand(
+    operand: &object_security_domain::PolicyOperand,
+) -> ObjectSecurityPolicyOperand {
+    let source = match operand.source {
+        object_security_domain::OperandSource::Fixed => "fixed",
+        object_security_domain::OperandSource::ObjectProperty => "object_property",
+        object_security_domain::OperandSource::OperationContext => "operation_context",
+        object_security_domain::OperandSource::PrincipalAttribute => "principal_attribute",
+        object_security_domain::OperandSource::PrincipalEntitlement => "principal_entitlement",
+    };
+    ObjectSecurityPolicyOperand {
+        source: source.into(),
+        name: operand.name.clone(),
+        value: operand.value.clone(),
+    }
+}
+
+fn to_proto_object_security_rule(
+    rule: &object_security_domain::ObjectSecurityRule,
+) -> ObjectSecurityRule {
+    ObjectSecurityRule {
+        rule_id: rule.rule_id.clone(),
+        conditions: rule
+            .conditions
+            .iter()
+            .map(|condition| ObjectSecurityPolicyCondition {
+                left: Some(to_proto_object_security_operand(&condition.left)),
+                operator: match condition.operator {
+                    object_security_domain::ConditionOperator::Contains => "contains",
+                    object_security_domain::ConditionOperator::Equals => "equals",
+                    object_security_domain::ConditionOperator::NotEquals => "not_equals",
+                }
+                .into(),
+                right: Some(to_proto_object_security_operand(&condition.right)),
+            })
+            .collect(),
+    }
+}
+
+fn to_proto_object_security_record(
+    record: &object_security_domain::ObjectSecurityPolicyRecord,
+) -> ObjectSecurityPolicyRecord {
+    ObjectSecurityPolicyRecord {
+        policy: Some(ObjectSecurityPolicyRevision {
+            contract_version: record.policy.contract_version.clone(),
+            namespace: record.policy.namespace.clone(),
+            object_kind: record.policy.object_kind.clone(),
+            revision: record.policy.revision.clone(),
+            rules: record
+                .policy
+                .rules
+                .iter()
+                .map(to_proto_object_security_rule)
+                .collect(),
+            policy_digest: record.policy.policy_digest.clone(),
+            created_by: record.policy.created_by.clone(),
+            created_at_ms: record.policy.created_at_ms,
+        }),
+        revocation: record
+            .revocation
+            .as_ref()
+            .map(|revocation| ObjectSecurityPolicyRevocation {
+                namespace: revocation.namespace.clone(),
+                policy_digest: revocation.policy_digest.clone(),
+                reason: revocation.reason.clone(),
+                revoked_by: revocation.revoked_by.clone(),
+                revoked_at_ms: revocation.revoked_at_ms,
+            }),
+    }
+}
+
+fn to_proto_object_security_profile(
+    profile: &object_security_domain::ObjectSecurityProfile,
+) -> ObjectSecurityProfile {
+    ObjectSecurityProfile {
+        contract_version: profile.contract_version.clone(),
+        namespace: profile.namespace.clone(),
+        profile_digest: profile.profile_digest.clone(),
+        bindings: profile
+            .bindings
+            .iter()
+            .map(|binding| ObjectSecurityPolicyBinding {
+                object_kind: binding.object_kind.clone(),
+                policy_digest: binding.policy_digest.clone(),
+            })
+            .collect(),
+        activated_by: profile.activated_by.clone(),
+        activated_at_ms: profile.activated_at_ms,
+    }
+}
+
+fn validate_object_security_policy_schema(
+    service: &SekaiServiceImpl,
+    policy: &object_security_domain::ObjectSecurityPolicyRevision,
+) -> Result<(), Status> {
+    service.require_schema_kind_loaded(&policy.object_kind)?;
+    let schema = service
+        .schema_definitions
+        .refresh_snapshot()
+        .map_err(map_schema_definition_lifecycle_error)?;
+    validate_object_security_policy_against_schema(policy, &schema)
+}
+
+fn validate_object_security_policy_against_schema(
+    policy: &object_security_domain::ObjectSecurityPolicyRevision,
+    schema: &SchemaRegistry,
+) -> Result<(), Status> {
+    let object_type = schema
+        .get(&policy.object_kind)
+        .ok_or_else(|| Status::failed_precondition("object type is not advertised"))?;
+    for operand in policy
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.conditions)
+        .flat_map(|condition| [&condition.left, &condition.right])
+        .filter(|operand| operand.source == object_security_domain::OperandSource::ObjectProperty)
+    {
+        let property = object_type
+            .properties
+            .iter()
+            .find(|property| property.name == operand.name)
+            .ok_or_else(|| {
+                Status::failed_precondition("policy references an unknown object property")
+            })?;
+        if matches!(
+            property.prop_type,
+            schema::PropertyType::Computed
+                | schema::PropertyType::Link
+                | schema::PropertyType::Struct
+        ) {
+            return Err(Status::failed_precondition(
+                "policy references an unsupported property kind",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn map_object_security_error(error: String) -> Status {
+    if error.starts_with("object_security_policy_unavailable") {
+        Status::not_found("object security policy unavailable")
+    } else if error.starts_with("stale_object_security_profile")
+        || error.starts_with("object_security_profile_invalid")
+        || error.starts_with("object_security_policy_revoked")
+    {
+        Status::failed_precondition("object security state changed or is invalid")
+    } else if error.starts_with("object_security_idempotency_conflict")
+        || error.starts_with("object_security_policy_conflict")
+    {
+        Status::already_exists("object security write conflicts with durable state")
+    } else if error.contains("required")
+        || error.contains("supported")
+        || error.contains("unknown")
+        || error.contains("invalid")
+        || error.contains("digest")
+        || error.contains("advertised object type")
+    {
+        Status::invalid_argument("invalid object security policy request")
+    } else {
+        Status::internal("object security state unavailable")
+    }
+}
+
 fn from_proto_source_batch(batch: SourceBatch) -> Result<source_sync_domain::SourceBatch, Status> {
     let delivery = batch
         .delivery
@@ -3456,6 +3973,49 @@ fn to_proto_source_batch_result(
     }
 }
 
+fn redact_source_sync_state(
+    db: &RuntimeDb,
+    mut state: source_sync_domain::SourceSyncState,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<source_sync_domain::SourceSyncState, Status> {
+    let Some(last_result) = state.last_result.as_mut() else {
+        return Ok(state);
+    };
+    let mut records = Vec::with_capacity(last_result.records.len());
+    for record in last_result.records.drain(..) {
+        let object = match &record.decision {
+            source_sync_domain::SyncDecision::Upsert(object)
+            | source_sync_domain::SyncDecision::Tombstone(object) => object,
+            source_sync_domain::SyncDecision::Conflict { .. }
+            | source_sync_domain::SyncDecision::Reject { .. } => {
+                records.push(record);
+                continue;
+            }
+        };
+        let live = db
+            .get_object(&object.object_id)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        let candidate = live.unwrap_or_else(|| domain::Object {
+            id: object.object_id.clone(),
+            kind: object.type_name.clone(),
+            name: object.source_id.clone(),
+            namespace: state.binding.namespace.clone(),
+            external_id: object.source_id.clone(),
+            properties: object.properties.clone().into_iter().collect(),
+            created: 0,
+            updated: 0,
+        });
+        if object_passes_security_policy(db, &candidate, principals, tenant_context, "read")
+            .unwrap_or(false)
+        {
+            records.push(record);
+        }
+    }
+    last_result.records = records;
+    Ok(state)
+}
+
 fn to_proto_source_sync_state(state: &source_sync_domain::SourceSyncState) -> SourceSyncState {
     SourceSyncState {
         binding: Some(to_proto_source_binding(&state.binding)),
@@ -3506,6 +4066,9 @@ fn map_source_sync_apply_error(error: String) -> Status {
     match code {
         "producer_identity_mismatch" | "binding_producer_conflict" => {
             Status::permission_denied("source producer identity denied")
+        }
+        "object_security_denied" | "object_security_admin_required" => {
+            Status::permission_denied("access denied")
         }
         "unsupported_version" | "unsupported_adapter" => {
             Status::failed_precondition("source sync contract version is unsupported")
@@ -3782,9 +4345,18 @@ impl SekaiService for SekaiServiceImpl {
         }
         let mut batch = from_proto_source_batch(proto)?;
         batch.producer_identity = principal.clone();
+        let authorization = crate::db::object_sync::SourceSyncAuthorization {
+            principal: principal_security_context(&self.db, &principals, tenant_context.as_ref())?,
+            principals: principals.clone(),
+        };
         let result = self
             .db
-            .apply_source_batch(&batch, &principal, now_millis())
+            .apply_source_batch_with_object_security(
+                &batch,
+                &principal,
+                now_millis(),
+                &authorization,
+            )
             .map_err(map_source_sync_apply_error)?;
         ensure_authoritative_source_result(&result)?;
         Ok(Response::new(ApplySourceBatchResponse {
@@ -3812,6 +4384,11 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_source_sync_state(&input.namespace, &input.source_instance, &input.type_digest)
             .map_err(|_| Status::internal("source sync state unavailable"))?;
+        let state = state
+            .map(|state| {
+                redact_source_sync_state(&self.db, state, &principals, tenant_context.as_ref())
+            })
+            .transpose()?;
         Ok(Response::new(GetSourceSyncStateResponse {
             found: state.is_some(),
             state: state.as_ref().map(to_proto_source_sync_state),
@@ -3975,12 +4552,272 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    async fn create_object_security_policy(
+        &self,
+        req: Request<CreateObjectSecurityPolicyRequest>,
+    ) -> Result<Response<CreateObjectSecurityPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = object_security_domain::ObjectSecurityPolicyInput {
+            namespace: input.namespace,
+            object_kind: input.object_kind,
+            revision: input.revision,
+            rules: input
+                .rules
+                .into_iter()
+                .map(parse_object_security_rule)
+                .collect::<Result<Vec<_>, Status>>()?,
+            policy_digest: input.policy_digest,
+            idempotency_key: input.idempotency_key,
+        };
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let now = now_millis();
+        let request_digest = request
+            .request_digest(actor, now)
+            .map_err(Status::invalid_argument)?;
+        if let Some(result) = self
+            .db
+            .replay_object_security_write(
+                &request.namespace,
+                actor,
+                &request.idempotency_key,
+                "create_policy",
+                &request_digest,
+            )
+            .map_err(map_object_security_error)?
+        {
+            let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = result
+            else {
+                return Err(Status::internal("object security replay result is invalid"));
+            };
+            return Ok(Response::new(CreateObjectSecurityPolicyResponse {
+                record: Some(to_proto_object_security_record(&record)),
+            }));
+        }
+        let policy = request
+            .prepare(actor, now)
+            .map_err(Status::invalid_argument)?;
+        validate_object_security_policy_schema(self, &policy)?;
+        let result = self
+            .db
+            .create_object_security_policy(&request, actor, now)
+            .map_err(map_object_security_error)?;
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = result
+        else {
+            return Err(Status::internal("object security replay result is invalid"));
+        };
+        Ok(Response::new(CreateObjectSecurityPolicyResponse {
+            record: Some(to_proto_object_security_record(&record)),
+        }))
+    }
+
+    async fn get_object_security_policy(
+        &self,
+        req: Request<GetObjectSecurityPolicyRequest>,
+    ) -> Result<Response<GetObjectSecurityPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let record = self
+            .db
+            .get_object_security_policy(&input.namespace, &input.policy_digest)
+            .map_err(|_| Status::internal("object security policy unavailable"))?
+            .ok_or_else(|| Status::not_found("object security policy unavailable"))?;
+        Ok(Response::new(GetObjectSecurityPolicyResponse {
+            record: Some(to_proto_object_security_record(&record)),
+        }))
+    }
+
+    async fn activate_object_security_profile(
+        &self,
+        req: Request<ActivateObjectSecurityProfileRequest>,
+    ) -> Result<Response<ActivateObjectSecurityProfileResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = object_security_domain::ActivateObjectSecurityProfile {
+            namespace: input.namespace,
+            expected_profile_digest: input.expected_profile_digest,
+            bindings: input
+                .bindings
+                .into_iter()
+                .map(
+                    |binding| object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: binding.object_kind,
+                        policy_digest: binding.policy_digest,
+                    },
+                )
+                .collect(),
+            idempotency_key: input.idempotency_key,
+        };
+        let schema = self
+            .schema_definitions
+            .refresh_snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        let mut advertised_object_kinds = schema
+            .object_types()
+            .map(|object_type| object_type.kind.clone())
+            .filter(|kind| !is_reserved_governance_kind(kind))
+            .collect::<Vec<_>>();
+        advertised_object_kinds.sort();
+        advertised_object_kinds.dedup();
+        if advertised_object_kinds.is_empty() {
+            return Err(Status::failed_precondition(
+                "no advertised object types are available for activation",
+            ));
+        }
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let now = now_millis();
+        let request_digest = request
+            .request_digest(actor)
+            .map_err(Status::invalid_argument)?;
+        if let Some(result) = self
+            .db
+            .replay_object_security_write(
+                &request.namespace,
+                actor,
+                &request.idempotency_key,
+                "activate_profile",
+                &request_digest,
+            )
+            .map_err(map_object_security_error)?
+        {
+            let object_security_domain::ObjectSecurityWriteResult::ActivateProfile { profile } =
+                result
+            else {
+                return Err(Status::internal("object security replay result is invalid"));
+            };
+            return Ok(Response::new(ActivateObjectSecurityProfileResponse {
+                profile: Some(to_proto_object_security_profile(&profile)),
+            }));
+        }
+        let (prepared_profile, _) = request
+            .prepare(advertised_object_kinds.iter().cloned(), actor, now)
+            .map_err(Status::invalid_argument)?;
+        for binding in &prepared_profile.bindings {
+            let record = self
+                .db
+                .get_object_security_policy(&prepared_profile.namespace, &binding.policy_digest)
+                .map_err(|_| Status::unavailable("object security policy unavailable"))?
+                .ok_or_else(|| Status::failed_precondition("bound policy is unavailable"))?;
+            if record.revocation.is_some() || record.policy.object_kind != binding.object_kind {
+                return Err(Status::failed_precondition(
+                    "bound policy is revoked or targets another object type",
+                ));
+            }
+            validate_object_security_policy_against_schema(&record.policy, &schema)?;
+        }
+        let result = self
+            .db
+            .activate_object_security_profile(&request, &advertised_object_kinds, actor, now)
+            .map_err(map_object_security_error)?;
+        let object_security_domain::ObjectSecurityWriteResult::ActivateProfile { profile } = result
+        else {
+            return Err(Status::internal("object security replay result is invalid"));
+        };
+        Ok(Response::new(ActivateObjectSecurityProfileResponse {
+            profile: Some(to_proto_object_security_profile(&profile)),
+        }))
+    }
+
+    async fn get_object_security_profile(
+        &self,
+        req: Request<GetObjectSecurityProfileRequest>,
+    ) -> Result<Response<GetObjectSecurityProfileResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let profile = self
+            .db
+            .get_object_security_profile(&input.namespace)
+            .map_err(|_| Status::internal("object security profile unavailable"))?
+            .ok_or_else(|| Status::not_found("object security profile unavailable"))?;
+        Ok(Response::new(GetObjectSecurityProfileResponse {
+            profile: Some(to_proto_object_security_profile(&profile)),
+        }))
+    }
+
+    async fn revoke_object_security_policy(
+        &self,
+        req: Request<RevokeObjectSecurityPolicyRequest>,
+    ) -> Result<Response<RevokeObjectSecurityPolicyResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = object_security_domain::RevokeObjectSecurityPolicy {
+            namespace: input.namespace,
+            policy_digest: input.policy_digest,
+            reason: input.reason,
+            idempotency_key: input.idempotency_key,
+        };
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .revoke_object_security_policy(&request, actor, now_millis())
+            .map_err(map_object_security_error)?;
+        let object_security_domain::ObjectSecurityWriteResult::RevokePolicy { record } = result
+        else {
+            return Err(Status::internal("object security replay result is invalid"));
+        };
+        Ok(Response::new(RevokeObjectSecurityPolicyResponse {
+            record: Some(to_proto_object_security_record(&record)),
+        }))
+    }
+
     async fn create_handoff(
         &self,
         req: Request<CreateHandoffRequest>,
     ) -> Result<Response<CreateHandoffResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let proto = inner
             .manifest
@@ -4028,6 +4865,7 @@ impl SekaiService for SekaiServiceImpl {
                         reference,
                         &namespace,
                         &principals,
+                        tenant_context.as_ref(),
                         current_time,
                     )
                     .map_err(|status| HandoffLifecycleError::Storage(status.to_string()))
@@ -4187,6 +5025,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<RetrieveContextResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let namespace = Self::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default();
         let mut receipt_guard = self.begin_semantic_catalog_invocation(
             &req,
@@ -4197,7 +5036,8 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
-        let result = self.execute_retrieve_context(&principals, req.into_inner());
+        let result =
+            self.execute_retrieve_context(&principals, tenant_context.as_ref(), req.into_inner());
         match result {
             Ok(response) => {
                 if let Some((_, guard)) = receipt_guard.as_mut() {
@@ -4223,6 +5063,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ExpandRelationsResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let namespace = req.get_ref().namespace.trim().to_string();
         if namespace.is_empty() || namespace != req.get_ref().namespace {
             return Err(Status::invalid_argument("canonical namespace required"));
@@ -4245,6 +5086,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            tenant_context.as_ref(),
             RetrieveContextRequest {
                 roots: vec![root],
                 relations: inner.relations,
@@ -4318,6 +5160,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ExplainDerivationResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let namespace = req.get_ref().namespace.trim().to_string();
         if namespace.is_empty() || namespace != req.get_ref().namespace {
             return Err(Status::invalid_argument("canonical namespace required"));
@@ -4344,6 +5187,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            tenant_context.as_ref(),
             RetrieveContextRequest {
                 roots: vec![from],
                 relations: inner.relations,
@@ -4553,6 +5397,7 @@ impl SekaiService for SekaiServiceImpl {
         let facts = list_visible_governed_objects(
             self,
             &principals,
+            tenant_context.as_ref(),
             &inner.namespace,
             governed_fact_domain::FACT_KIND,
             &mut visibility_cache,
@@ -4565,6 +5410,7 @@ impl SekaiService for SekaiServiceImpl {
         let waivers = list_visible_governed_objects(
             self,
             &principals,
+            tenant_context.as_ref(),
             &inner.namespace,
             governed_fact_domain::WAIVER_KIND,
             &mut visibility_cache,
@@ -5469,6 +6315,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CreateWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let work_unit = inner
             .work_unit
@@ -5487,9 +6334,13 @@ impl SekaiService for SekaiServiceImpl {
                     now_ms: chrono::Utc::now().timestamp_millis(),
                 },
                 |target| match target {
-                    CreateAuthorizationTarget::IdempotencyReplay(existing) => {
-                        check_work_unit_read(&self.db, &self.security, existing, &principals)
-                    }
+                    CreateAuthorizationTarget::IdempotencyReplay(existing) => check_work_unit_read(
+                        &self.db,
+                        &self.security,
+                        existing,
+                        &principals,
+                        tenant_context.as_ref(),
+                    ),
                     CreateAuthorizationTarget::New(candidate) => {
                         if !candidate.target_object_id.is_empty() {
                             check_object_namespace_access(
@@ -5499,6 +6350,13 @@ impl SekaiService for SekaiServiceImpl {
                                 true,
                             )?;
                             check_write(&self.security, &candidate.target_object_id, &principals)?;
+                            check_work_unit_write(
+                                &self.db,
+                                &self.security,
+                                candidate,
+                                &principals,
+                                tenant_context.as_ref(),
+                            )?;
                         } else if is_managed_team_principal(&self.db, &principals)? {
                             return Err(Status::permission_denied(
                                 "team work units require a namespace-bound target object",
@@ -5527,12 +6385,19 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let work_unit = self
             .db
             .get_work_unit(&req.into_inner().id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
+        check_work_unit_read(
+            &self.db,
+            &self.security,
+            &work_unit,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(GetWorkUnitResponse {
             work_unit: Some(to_proto_work_unit(&work_unit)),
         }))
@@ -5543,6 +6408,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListWorkUnitsResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let filter = req.into_inner().filter.unwrap_or_default();
         let limit = filter.limit;
         let mut work_units = if limit > 0 {
@@ -5583,8 +6449,14 @@ impl SekaiService for SekaiServiceImpl {
                     page_token = coordination::make_page_token(last.created_at, &last.id);
                 }
                 for work_unit in rows {
-                    if check_work_unit_read(&self.db, &self.security, work_unit, &principals)
-                        .is_ok()
+                    if check_work_unit_read(
+                        &self.db,
+                        &self.security,
+                        work_unit,
+                        &principals,
+                        tenant_context.as_ref(),
+                    )
+                    .is_ok()
                     {
                         visible.push(work_unit.clone());
                         if visible.len() > visible_limit {
@@ -5608,7 +6480,14 @@ impl SekaiService for SekaiServiceImpl {
                 .map_err(Status::internal)?
                 .into_iter()
                 .filter(|work_unit| {
-                    check_work_unit_read(&self.db, &self.security, work_unit, &principals).is_ok()
+                    check_work_unit_read(
+                        &self.db,
+                        &self.security,
+                        work_unit,
+                        &principals,
+                        tenant_context.as_ref(),
+                    )
+                    .is_ok()
                 })
                 .collect::<Vec<_>>()
         };
@@ -5633,6 +6512,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<TryAdmitWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let work_unit_id = inner.work_unit_id;
         let work_unit = self
@@ -5640,7 +6520,13 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.db, &self.security, &work_unit, &principals)?;
+        check_work_unit_write(
+            &self.db,
+            &self.security,
+            &work_unit,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let owner = principals
             .first()
             .cloned()
@@ -5674,6 +6560,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<HeartbeatWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let work_unit_id = inner.work_unit_id;
         let existing = self
@@ -5681,7 +6568,13 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
+        check_work_unit_write(
+            &self.db,
+            &self.security,
+            &existing,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let work_unit = transition_work_unit(
             &self.db,
             &principals,
@@ -5699,6 +6592,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CompleteWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let work_unit_id = inner.work_unit_id;
         let existing = self
@@ -5706,7 +6600,13 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
+        check_work_unit_write(
+            &self.db,
+            &self.security,
+            &existing,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let work_unit = transition_work_unit(
             &self.db,
             &principals,
@@ -5724,13 +6624,20 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<FailWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let existing = self
             .db
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
+        check_work_unit_write(
+            &self.db,
+            &self.security,
+            &existing,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let work_unit = transition_work_unit(
             &self.db,
             &principals,
@@ -5748,13 +6655,20 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CancelWorkUnitResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let existing = self
             .db
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_write(&self.db, &self.security, &existing, &principals)?;
+        check_work_unit_write(
+            &self.db,
+            &self.security,
+            &existing,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let work_unit = transition_work_unit(
             &self.db,
             &principals,
@@ -5772,6 +6686,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListReservationsResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let reservations = self
             .db
@@ -5800,7 +6715,15 @@ impl SekaiService for SekaiServiceImpl {
                 .get_work_unit(&reservation.work_unit_id)
                 .map_err(Status::internal)?
             {
-                if check_work_unit_read(&self.db, &self.security, &work_unit, &principals).is_ok() {
+                if check_work_unit_read(
+                    &self.db,
+                    &self.security,
+                    &work_unit,
+                    &principals,
+                    tenant_context.as_ref(),
+                )
+                .is_ok()
+                {
                     visible.push(to_proto_reservation(&reservation));
                 }
             }
@@ -5815,13 +6738,20 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListRunEventsResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let inner = req.into_inner();
         let work_unit = self
             .db
             .get_work_unit(&inner.work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
+        check_work_unit_read(
+            &self.db,
+            &self.security,
+            &work_unit,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let limit = inner.limit;
         let mut events = self
             .db
@@ -6428,37 +7358,44 @@ impl SekaiService for SekaiServiceImpl {
             .db
             .get_object(&inner.object_id)
             .map_err(Status::internal)?;
-        match object.as_ref() {
-            Some(object) => {
-                enforce_namespace_tenant_context(
-                    &self.db,
-                    tenant_context.as_ref(),
-                    &object.namespace,
-                    false,
-                )
-                .map_err(|_| Status::not_found("not found"))?;
-                enforce_object_marking_access(
-                    &self.db,
-                    object,
-                    &principals,
-                    &format!("list_object_changes:{}", object.id),
-                )?;
-            }
-            None if tenant_context.is_some() => {
-                return Err(Status::not_found("not found"));
-            }
-            // Without a live object we cannot reconstruct access_marking.
-            // Residual: ACL-only for orphan history until tombstones retain
-            // access_marking (documented residual risk).
-            None => {}
-        }
-        let object_kind = match object.as_ref() {
-            Some(object) => Some(object.kind.clone()),
-            None => self
+        let authorization_object = match object {
+            Some(object) => object,
+            None => match self
                 .db
-                .object_change_kind(&inner.object_id)
-                .map_err(Status::internal)?,
+                .object_change_security_snapshot(&inner.object_id)
+                .map_err(Status::internal)?
+            {
+                Some(snapshot) => snapshot,
+                None if self
+                    .db
+                    .object_change_kind(&inner.object_id)
+                    .map_err(Status::internal)?
+                    .is_none() =>
+                {
+                    return Ok(Response::new(ListObjectChangesResponse {
+                        changes: Vec::new(),
+                    }));
+                }
+                None => return Err(Status::not_found("not found")),
+            },
         };
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &authorization_object.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
+        enforce_object_operation_access(
+            &self.db,
+            &authorization_object,
+            &principals,
+            tenant_context.as_ref(),
+            "read",
+            &format!("list_object_changes:{}", authorization_object.id),
+        )
+        .map_err(|_| Status::not_found("not found"))?;
+        let object_kind = authorization_object.kind;
         let schema = self
             .schema_definitions
             .snapshot()
@@ -6469,26 +7406,14 @@ impl SekaiService for SekaiServiceImpl {
             .map_err(Status::internal)?
             .into_iter()
             .map(|change| {
-                if let Some(kind) = object_kind.as_deref() {
-                    redact_object_change_values(
-                        change,
-                        &inner.object_id,
-                        kind,
-                        &schema,
-                        &self.security,
-                        &principals,
-                    )
-                } else {
-                    ObjectChange {
-                        id: change.id,
-                        object_id: change.object_id,
-                        field: change.field,
-                        old_value: change.old_value,
-                        new_value: change.new_value,
-                        changed_by: change.changed_by,
-                        timestamp: change.timestamp,
-                    }
-                }
+                redact_object_change_values(
+                    change,
+                    &inner.object_id,
+                    &object_kind,
+                    &schema,
+                    &self.security,
+                    &principals,
+                )
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
@@ -6898,6 +7823,7 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetProvenanceReportResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
         let work_unit_id = req.into_inner().work_unit_id.trim().to_string();
         if work_unit_id.is_empty() {
             return Err(Status::invalid_argument("work_unit_id required"));
@@ -6907,7 +7833,13 @@ impl SekaiService for SekaiServiceImpl {
             .get_work_unit(&work_unit_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("work unit not found"))?;
-        check_work_unit_read(&self.db, &self.security, &work_unit, &principals)?;
+        check_work_unit_read(
+            &self.db,
+            &self.security,
+            &work_unit,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
         let report = crate::provenance::assemble_report(&self.db, &work_unit_id)
             .map_err(Status::internal)?;
         Ok(Response::new(GetProvenanceReportResponse {
@@ -7215,6 +8147,56 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+
+        db.create_object_with_audit(
+            &domain::Object {
+                id: "tenant-allowed".into(),
+                kind: "component".into(),
+                name: "allowed".into(),
+                namespace: "allowed".into(),
+                external_id: "tenant-allowed".into(),
+                properties: HashMap::from([("color".into(), "red".into())]),
+                created: 1,
+                updated: 1,
+            },
+            "root",
+        )
+        .unwrap();
+        db.create_object_with_audit(
+            &domain::Object {
+                id: "tenant-denied".into(),
+                kind: "component".into(),
+                name: "denied".into(),
+                namespace: "denied".into(),
+                external_id: "tenant-denied".into(),
+                properties: HashMap::from([("color".into(), "red".into())]),
+                created: 1,
+                updated: 1,
+            },
+            "root",
+        )
+        .unwrap();
+        let filter = domain::ListFilter {
+            kind: Some("component".into()),
+            property_filters: vec![domain::PropertyFilter {
+                key: "color".into(),
+                op: "eq".into(),
+                value: "red".into(),
+            }],
+            limit: i32::MAX,
+            ..Default::default()
+        };
+        let (objects, total) = list_objects_with_marking(
+            &db,
+            &filter,
+            &["root".into()],
+            Some(&tenant),
+            |objects, _, _| Ok(objects),
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].namespace, "allowed");
     }
 
     #[test]
@@ -8009,6 +8991,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_sync_enforces_active_object_policies() {
+        let svc = service();
+        let namespace = "sync-object-policy";
+        let producer = "connector/github-primary";
+        grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+        let created = svc
+            .db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: namespace.into(),
+                    object_kind: "Issue".into(),
+                    revision: "sync-1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "closed-only".into(),
+                        conditions: vec![object_security_domain::PolicyCondition {
+                            left: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::ObjectProperty,
+                                name: "state".into(),
+                                value: String::new(),
+                            },
+                            operator: object_security_domain::ConditionOperator::Equals,
+                            right: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::Fixed,
+                                name: String::new(),
+                                value: "closed".into(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "sync-object-policy".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        svc.db
+            .activate_object_security_profile(
+                &object_security_domain::ActivateObjectSecurityProfile {
+                    namespace: namespace.into(),
+                    expected_profile_digest: String::new(),
+                    bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: "Issue".into(),
+                        policy_digest: record.policy.policy_digest,
+                    }],
+                    idempotency_key: "sync-object-profile".into(),
+                },
+                &["Issue".into()],
+                "root",
+                2,
+            )
+            .unwrap();
+        let denied = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(source_batch(
+                        namespace,
+                        producer,
+                        "",
+                        "cursor:denied",
+                        "batch-policy-denied",
+                    )),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "access denied");
+        let objects = svc
+            .db
+            .list_all_objects(&domain::ListFilter {
+                namespace: Some(namespace.into()),
+                kind: Some("Issue".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(objects.is_empty());
+    }
+
+    #[tokio::test]
     async fn source_sync_maps_version_cursor_and_secret_failures() {
         let svc = service();
         let namespace = "sync-failures";
@@ -8480,7 +9546,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -8572,7 +9638,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -8707,6 +9773,7 @@ mod tests {
                     limit: 10,
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -9157,6 +10224,7 @@ mod tests {
                     kind: "cluster".into(),
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -9490,6 +10558,349 @@ mod tests {
         assert_eq!(changes[1].new_value, "done");
         assert_eq!(changes[2].old_value, "api");
         assert_eq!(changes[2].new_value, "worker");
+    }
+
+    #[tokio::test]
+    async fn deleted_object_history_rechecks_the_tombstoned_policy_state() {
+        let svc = service();
+        svc.create_object(with_named_principal(
+            CreateObjectRequest {
+                object: Some(Object {
+                    id: "policy-history".into(),
+                    kind: "component".into(),
+                    name: "private".into(),
+                    namespace: "default".into(),
+                    external_id: "component:policy-history".into(),
+                    properties: HashMap::from([("owner".into(), "alice".into())]),
+                    created: 1,
+                    updated: 1,
+                }),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        let bob_grant = security::Grant {
+            id: "policy-history-bob".into(),
+            object_id: "policy-history".into(),
+            principal: "bob".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        svc.db.create_grant(&bob_grant).unwrap();
+        svc.security.add_grant(&bob_grant);
+        let created = svc
+            .db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: "default".into(),
+                    object_kind: "component".into(),
+                    revision: "history-1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "owner".into(),
+                        conditions: vec![object_security_domain::PolicyCondition {
+                            left: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::ObjectProperty,
+                                name: "owner".into(),
+                                value: String::new(),
+                            },
+                            operator: object_security_domain::ConditionOperator::Equals,
+                            right: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::PrincipalAttribute,
+                                name: "subject".into(),
+                                value: String::new(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "history-policy".into(),
+                },
+                "root",
+                2,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        svc.db
+            .activate_object_security_profile(
+                &object_security_domain::ActivateObjectSecurityProfile {
+                    namespace: "default".into(),
+                    expected_profile_digest: String::new(),
+                    bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: "component".into(),
+                        policy_digest: record.policy.policy_digest,
+                    }],
+                    idempotency_key: "history-profile".into(),
+                },
+                &["component".into()],
+                "root",
+                3,
+            )
+            .unwrap();
+        svc.delete_object(with_named_principal(
+            DeleteObjectRequest {
+                id: "policy-history".into(),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        for (id, principal) in [
+            ("policy-history-alice-after-delete", "alice"),
+            ("policy-history-bob-after-delete", "bob"),
+        ] {
+            let grant = security::Grant {
+                id: id.into(),
+                object_id: "policy-history".into(),
+                principal: principal.into(),
+                role: security::Role::Viewer,
+                created: 4,
+            };
+            svc.db.create_grant(&grant).unwrap();
+            svc.security.add_grant(&grant);
+        }
+
+        svc.list_object_changes(with_named_principal(
+            ListObjectChangesRequest {
+                object_id: "policy-history".into(),
+                limit: 10,
+                offset: 0,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        let denied = svc
+            .list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: "policy-history".into(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::NotFound);
+    }
+
+    #[test]
+    fn active_profiles_do_not_apply_to_reserved_governance_kinds() {
+        let svc = service();
+        let created = svc
+            .db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: "default".into(),
+                    object_kind: "component".into(),
+                    revision: "governance-exclusion-1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "allow".into(),
+                        conditions: Vec::new(),
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "governance-exclusion-policy".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        svc.db
+            .activate_object_security_profile(
+                &object_security_domain::ActivateObjectSecurityProfile {
+                    namespace: "default".into(),
+                    expected_profile_digest: String::new(),
+                    bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: "component".into(),
+                        policy_digest: record.policy.policy_digest,
+                    }],
+                    idempotency_key: "governance-exclusion-profile".into(),
+                },
+                &["component".into()],
+                "root",
+                2,
+            )
+            .unwrap();
+        let governed = domain::Object {
+            id: "governed".into(),
+            kind: governed_fact_domain::FACT_KIND.into(),
+            name: "governed".into(),
+            namespace: "default".into(),
+            external_id: "governed".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        assert!(
+            object_passes_security_policy(&svc.db, &governed, &["alice".into()], None, "read",)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn active_profile_kind_transition_requires_object_admin() {
+        let svc = service();
+        let created = svc
+            .db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: "default".into(),
+                    object_kind: "component".into(),
+                    revision: "kind-transition-1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "allow".into(),
+                        conditions: Vec::new(),
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "kind-transition-policy".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        svc.db
+            .activate_object_security_profile(
+                &object_security_domain::ActivateObjectSecurityProfile {
+                    namespace: "default".into(),
+                    expected_profile_digest: String::new(),
+                    bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: "component".into(),
+                        policy_digest: record.policy.policy_digest,
+                    }],
+                    idempotency_key: "kind-transition-profile".into(),
+                },
+                &["component".into()],
+                "root",
+                2,
+            )
+            .unwrap();
+        let before = domain::Object {
+            id: "kind-transition".into(),
+            kind: "component".into(),
+            name: "before".into(),
+            namespace: "default".into(),
+            external_id: "kind-transition".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        let mut after = before.clone();
+        after.kind = "artifact".into();
+        let grant = security::Grant {
+            id: "kind-transition-editor".into(),
+            object_id: before.id.clone(),
+            principal: "alice".into(),
+            role: security::Role::Editor,
+            created: 1,
+        };
+        svc.security.add_grant(&grant);
+        let error = ensure_policy_driving_update_allowed(
+            &svc.db,
+            &svc.security,
+            &before,
+            &after,
+            &["alice".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn destination_policy_inputs_require_object_admin() {
+        let svc = service();
+        let created = svc
+            .db
+            .create_object_security_policy(
+                &object_security_domain::ObjectSecurityPolicyInput {
+                    namespace: "secure".into(),
+                    object_kind: "artifact".into(),
+                    revision: "dest-1".into(),
+                    rules: vec![object_security_domain::ObjectSecurityRule {
+                        rule_id: "owner".into(),
+                        conditions: vec![object_security_domain::PolicyCondition {
+                            left: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::ObjectProperty,
+                                name: "owner".into(),
+                                value: String::new(),
+                            },
+                            operator: object_security_domain::ConditionOperator::Equals,
+                            right: object_security_domain::PolicyOperand {
+                                source: object_security_domain::OperandSource::PrincipalAttribute,
+                                name: "subject".into(),
+                                value: String::new(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "dest-policy".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let object_security_domain::ObjectSecurityWriteResult::CreatePolicy { record } = created
+        else {
+            panic!("expected created policy");
+        };
+        svc.db
+            .activate_object_security_profile(
+                &object_security_domain::ActivateObjectSecurityProfile {
+                    namespace: "secure".into(),
+                    expected_profile_digest: String::new(),
+                    bindings: vec![object_security_domain::ObjectSecurityPolicyBinding {
+                        object_kind: "artifact".into(),
+                        policy_digest: record.policy.policy_digest,
+                    }],
+                    idempotency_key: "dest-profile".into(),
+                },
+                &["artifact".into()],
+                "root",
+                2,
+            )
+            .unwrap();
+        let before = domain::Object {
+            id: "scope-transition".into(),
+            kind: "component".into(),
+            name: "before".into(),
+            namespace: "default".into(),
+            external_id: "scope-transition".into(),
+            properties: HashMap::from([("owner".into(), "bob".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let mut after = before.clone();
+        after.kind = "artifact".into();
+        after.namespace = "secure".into();
+        after.properties.insert("owner".into(), "alice".into());
+        let grant = security::Grant {
+            id: "scope-transition-editor".into(),
+            object_id: before.id.clone(),
+            principal: "alice".into(),
+            role: security::Role::Editor,
+            created: 1,
+        };
+        svc.security.add_grant(&grant);
+        let error = ensure_policy_driving_update_allowed(
+            &svc.db,
+            &svc.security,
+            &before,
+            &after,
+            &["alice".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -11490,6 +12901,7 @@ mod tests {
                     interface_filter: vec!["Trackable".into()],
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -12866,6 +14278,7 @@ mod tests {
                         offset: 0,
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -12895,7 +14308,10 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest { filter: None },
+                ListObjectsRequest {
+                    filter: None,
+                    page_token: String::new(),
+                },
                 "alice",
             ))
             .await
@@ -12922,6 +14338,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -12945,6 +14362,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -13105,7 +14523,7 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.code(), tonic::Code::NotFound);
 
         // The same namespace/request pair produces the same id and the action's exact-retry path
         // does not duplicate the object, link, or grant.
@@ -13371,6 +14789,7 @@ mod tests {
                     kind: "action_policy".into(),
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()

@@ -122,6 +122,14 @@ impl SekaiServiceImpl {
             .replay("create", &domain_object)
             .map_err(map_mutation_persistence_error)?
         {
+            enforce_object_operation_access(
+                &self.db,
+                &created,
+                &principals,
+                tenant_context.as_ref(),
+                "create",
+                &format!("guarded_create_object_replay:{}", created.id),
+            )?;
             let created =
                 self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
             return Ok(Response::new(GuardedCreateObjectResponse {
@@ -158,6 +166,14 @@ impl SekaiServiceImpl {
             )?;
             drop(schema);
         }
+        enforce_object_operation_access(
+            &self.db,
+            &domain_object,
+            &principals,
+            tenant_context.as_ref(),
+            "create",
+            &format!("guarded_create_object:{}", domain_object.id),
+        )?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let created = mutation
             .create(&domain_object, actor, now_millis())
@@ -209,7 +225,20 @@ impl SekaiServiceImpl {
                 "namespace:* external IDs are reserved for namespace boundaries",
             ));
         }
-        let existing = self.db.get_object(&object.id).map_err(Status::internal)?;
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let (principal, allowed_legacy_markings, trusted_legacy_markings) =
+            storage_object_security_context(&self.db, &principals, tenant_context.as_ref())?;
+        let existing = self
+            .db
+            .get_object_with_object_security(
+                &object.id,
+                &principal_refs,
+                &principal,
+                "update",
+                &allowed_legacy_markings,
+                trusted_legacy_markings,
+            )
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
         if precondition.is_none() && existing.is_none() {
             return Err(Status::not_found("not found"));
         }
@@ -246,10 +275,12 @@ impl SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
         if let Some(existing) = &existing {
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 existing,
                 &principals,
+                tenant_context.as_ref(),
+                "update",
                 &format!("guarded_update_object:{}", existing.id),
             )?;
         }
@@ -298,10 +329,12 @@ impl SekaiServiceImpl {
             .replay("update", &request_object)
             .map_err(map_mutation_persistence_error)?
         {
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &updated,
                 &principals,
+                tenant_context.as_ref(),
+                "update",
                 &format!("guarded_update_object_replay:{}", updated.id),
             )?;
             let updated =
@@ -352,7 +385,22 @@ impl SekaiServiceImpl {
                 existing,
                 &domain_object,
             )?;
+            ensure_policy_driving_update_allowed(
+                &self.db,
+                &self.security,
+                existing,
+                &domain_object,
+                &principals,
+            )?;
         }
+        enforce_object_operation_access(
+            &self.db,
+            &domain_object,
+            &principals,
+            tenant_context.as_ref(),
+            "update",
+            &format!("guarded_update_object_proposed:{}", domain_object.id),
+        )?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let updated = mutation
             .update(
@@ -381,11 +429,26 @@ impl SekaiServiceImpl {
         if precondition.is_some() {
             require_authenticated(&principals)?;
         }
-        let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
-        if precondition.is_none() && expected.is_none() {
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let (principal, allowed_legacy_markings, trusted_legacy_markings) =
+            storage_object_security_context(&self.db, &principals, tenant_context.as_ref())?;
+        let expected = self
+            .db
+            .get_object_with_object_security(
+                &input.id,
+                &principal_refs,
+                &principal,
+                "delete",
+                &allowed_legacy_markings,
+                trusted_legacy_markings,
+            )
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        if expected.is_none() && precondition.is_none() {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
         }
-        check_write(&self.security, &input.id, &principals)?;
+        if expected.is_some() {
+            check_write(&self.security, &input.id, &principals)?;
+        }
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
                 &self.db,
@@ -413,10 +476,12 @@ impl SekaiServiceImpl {
                 true,
             )?;
             check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 existing,
                 &principals,
+                tenant_context.as_ref(),
+                "delete",
                 &format!("guarded_delete_object:{}", existing.id),
             )?;
             if existing.kind == markings::PRINCIPAL_PROFILE_KIND {

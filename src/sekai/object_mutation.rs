@@ -20,6 +20,7 @@ pub(crate) enum MutationPersistenceError {
     Graph(String),
     Lease(LeaseError),
     NotFound,
+    ChangedSinceAuthorization,
 }
 
 pub(crate) struct ObjectMutation<'a> {
@@ -109,11 +110,14 @@ impl<'a> ObjectMutation<'a> {
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            self.db
-                .update_object_with_audit(object, actor)
-                .map_err(MutationPersistenceError::Graph)?
-                .ok_or(MutationPersistenceError::NotFound)?;
-            Ok(object.clone())
+            match self.db.update_object_with_audit(object, expected, actor) {
+                Ok(Some(_)) => Ok(object.clone()),
+                Ok(None) => Err(MutationPersistenceError::NotFound),
+                Err(error) if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION => {
+                    Err(MutationPersistenceError::ChangedSinceAuthorization)
+                }
+                Err(error) => Err(MutationPersistenceError::Graph(error)),
+            }
         }
     }
 
@@ -138,10 +142,14 @@ impl<'a> ObjectMutation<'a> {
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            self.db
-                .delete_object_with_audit(id, actor)
-                .map_err(MutationPersistenceError::Graph)?;
-            Ok(())
+            match self.db.delete_object_with_audit(id, expected, actor) {
+                Ok(None) if expected.is_some() => Err(MutationPersistenceError::NotFound),
+                Ok(_) => Ok(()),
+                Err(error) if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION => {
+                    Err(MutationPersistenceError::ChangedSinceAuthorization)
+                }
+                Err(error) => Err(MutationPersistenceError::Graph(error)),
+            }
         }
     }
 }
@@ -199,5 +207,46 @@ mod tests {
             ObjectMutation::direct(&db).update(&value, &value, None, "actor", 1),
             Err(MutationPersistenceError::NotFound)
         ));
+    }
+
+    #[test]
+    fn direct_update_rejects_stale_authorized_snapshot() {
+        let db = RuntimeDb::memory();
+        let mutation = ObjectMutation::direct(&db);
+        let original = object("one");
+        mutation.create(&original, "actor", 1).unwrap();
+        let mut intervening = original.clone();
+        intervening.name = "intervening".into();
+        intervening.updated = 2;
+        mutation
+            .update(&intervening, &intervening, Some(&original), "actor", 2)
+            .unwrap();
+        let mut stale = original.clone();
+        stale.name = "stale".into();
+        stale.updated = 3;
+        assert!(matches!(
+            mutation.update(&stale, &stale, Some(&original), "actor", 3),
+            Err(MutationPersistenceError::ChangedSinceAuthorization)
+        ));
+        assert_eq!(db.get_object("one").unwrap().unwrap().name, "intervening");
+    }
+
+    #[test]
+    fn direct_delete_rejects_stale_authorized_snapshot() {
+        let db = RuntimeDb::memory();
+        let mutation = ObjectMutation::direct(&db);
+        let original = object("one");
+        mutation.create(&original, "actor", 1).unwrap();
+        let mut intervening = original.clone();
+        intervening.name = "intervening".into();
+        intervening.updated = 2;
+        mutation
+            .update(&intervening, &intervening, Some(&original), "actor", 2)
+            .unwrap();
+        assert!(matches!(
+            mutation.delete("one", Some(&original), "actor", 3),
+            Err(MutationPersistenceError::ChangedSinceAuthorization)
+        ));
+        assert_eq!(db.get_object("one").unwrap().unwrap().name, "intervening");
     }
 }

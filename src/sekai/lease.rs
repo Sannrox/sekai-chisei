@@ -432,11 +432,7 @@ impl SekaiDb {
                     "SELECT id,kind,name,namespace,external_id,properties,created,updated FROM sekai_objects WHERE id=?1",
                     params![object.id], crate::db::sekai::row_to_object,
                 ).optional().map_err(storage)?.ok_or_else(|| LeaseError::Mutation("not found".into()))?;
-                if !expected.is_some_and(|expected| object_state_matches(expected, &before)) {
-                    return Err(LeaseError::Mutation(
-                        "object changed since authorization".into(),
-                    ));
-                }
+                require_authorized_snapshot(expected, &before)?;
                 if before.namespace != object.namespace { return Err(LeaseError::Mutation("object namespace is immutable".into())); }
                 if before.kind != object.kind {
                     crate::sekai::ontology::validate_object_kind_change(tx, &object.id, &object.kind).map_err(LeaseError::Mutation)?;
@@ -465,6 +461,9 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
+        let snapshot_keys = expected
+            .map(|object| crate::sekai::audit::sqlite_security_snapshot_property_keys(self, object))
+            .unwrap_or_default();
         self.guarded_object_mutation(
             namespace, key, token, request_id, "delete", object_id, &input_json, actor, now_ms,
             |tx, transaction_now_ms| {
@@ -472,14 +471,19 @@ impl SekaiDb {
                     "SELECT id,kind,name,namespace,external_id,properties,created,updated FROM sekai_objects WHERE id=?1",
                     params![object_id], crate::db::sekai::row_to_object,
                 ).optional().map_err(storage)?.ok_or_else(|| LeaseError::Mutation("not found".into()))?;
-                if !expected.is_some_and(|expected| object_state_matches(expected, &before)) {
-                    return Err(LeaseError::Mutation(
-                        "object changed since authorization".into(),
-                    ));
-                }
+                require_authorized_snapshot(expected, &before)?;
                 tx.execute("DELETE FROM sekai_objects WHERE id=?1", params![object_id]).map_err(storage)?;
                 tx.execute("DELETE FROM sekai_links WHERE from_id=?1 OR to_id=?1", params![object_id]).map_err(storage)?;
-                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::object_diff_changes(actor, Some(&before), None, transaction_now_ms)).map_err(LeaseError::Mutation)?;
+                crate::sekai::audit::insert_object_changes(
+                    tx,
+                    &crate::sekai::audit::object_diff_changes_with_snapshot(
+                        actor,
+                        Some(&before),
+                        None,
+                        transaction_now_ms,
+                        &snapshot_keys,
+                    ),
+                ).map_err(LeaseError::Mutation)?;
                 Ok(Object {
                     id: before.id,
                     kind: String::new(),
@@ -569,15 +573,23 @@ fn validate(
     Ok(())
 }
 
+pub(crate) const OBJECT_CHANGED_SINCE_AUTHORIZATION: &str = "object changed since authorization";
+
 pub(crate) fn object_state_matches(left: &Object, right: &Object) -> bool {
-    left.id == right.id
-        && left.kind == right.kind
-        && left.name == right.name
-        && left.namespace == right.namespace
-        && left.external_id == right.external_id
-        && left.properties == right.properties
-        && left.created == right.created
-        && left.updated == right.updated
+    left.persisted_state_matches(right)
+}
+
+pub(crate) fn require_authorized_snapshot(
+    expected: Option<&Object>,
+    before: &Object,
+) -> Result<(), LeaseError> {
+    match expected {
+        Some(expected) if object_state_matches(expected, before) => Ok(()),
+        Some(_) => Err(LeaseError::Mutation(
+            OBJECT_CHANGED_SINCE_AUTHORIZATION.into(),
+        )),
+        None => Err(LeaseError::Mutation("not found".into())),
+    }
 }
 
 pub(crate) fn guarded_mutation_digest(
@@ -1168,7 +1180,8 @@ mod tests {
         let original = object("o", "before");
         db.create_object_with_audit(&original, "a").unwrap();
         let intervening = object("o", "intervening");
-        db.update_object_with_audit(&intervening, "other").unwrap();
+        db.update_object_with_audit(&intervening, None, "other")
+            .unwrap();
         let intended = object("o", "intended");
         assert!(matches!(
             db.guarded_update_object(
@@ -1197,7 +1210,7 @@ mod tests {
                 12,
             )
             .unwrap();
-        db.delete_object_with_audit("o", "other").unwrap();
+        db.delete_object_with_audit("o", None, "other").unwrap();
         let replay = db
             .guarded_update_object(
                 &intended,
@@ -1213,6 +1226,129 @@ mod tests {
             .unwrap();
         assert_eq!(replay.name, committed.name);
         assert!(db.get_object("o").unwrap().is_none());
+    }
+
+    #[test]
+    fn guarded_mutation_without_authorized_snapshot_does_not_reveal_a_live_row() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let lease = db
+            .acquire_lease("n", "k", "a", 100, "lease", "a", DEFAULT_SITE_ID, 10)
+            .unwrap();
+        let original = object("o", "before");
+        db.create_object_with_audit(&original, "a").unwrap();
+        assert!(matches!(
+            db.guarded_update_object(
+                &original,
+                &original,
+                None,
+                "n",
+                "k",
+                &lease.fencing_token,
+                "probe-update",
+                "a",
+                11,
+            ),
+            Err(LeaseError::Mutation(message)) if message == "not found"
+        ));
+        assert!(matches!(
+            db.guarded_delete_object(
+                "o",
+                None,
+                "n",
+                "k",
+                &lease.fencing_token,
+                "probe-delete",
+                "a",
+                12,
+            ),
+            Err(LeaseError::Mutation(message)) if message == "not found"
+        ));
+        assert_eq!(db.get_object("o").unwrap().unwrap().name, "before");
+    }
+
+    #[test]
+    fn guarded_delete_records_policy_driving_snapshot_properties() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let mut original = object("o", "before");
+        original.properties.insert("owner".into(), "alice".into());
+        original
+            .properties
+            .insert("secret".into(), "sk-not-captured".into());
+        db.create_object_with_audit(&original, "a").unwrap();
+        let created = db
+            .create_object_security_policy(
+                &crate::sekai::object_security::ObjectSecurityPolicyInput {
+                    namespace: "n".into(),
+                    object_kind: "component".into(),
+                    revision: "lease-delete-1".into(),
+                    rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                        rule_id: "owner".into(),
+                        conditions: vec![crate::sekai::object_security::PolicyCondition {
+                            left: crate::sekai::object_security::PolicyOperand {
+                                source: crate::sekai::object_security::OperandSource::ObjectProperty,
+                                name: "owner".into(),
+                                value: String::new(),
+                            },
+                            operator: crate::sekai::object_security::ConditionOperator::Equals,
+                            right: crate::sekai::object_security::PolicyOperand {
+                                source: crate::sekai::object_security::OperandSource::PrincipalAttribute,
+                                name: "subject".into(),
+                                value: String::new(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "lease-delete-policy".into(),
+                },
+                "root",
+                2,
+            )
+            .unwrap();
+        let crate::sekai::object_security::ObjectSecurityWriteResult::CreatePolicy { record } =
+            created
+        else {
+            panic!("expected created policy");
+        };
+        db.activate_object_security_profile(
+            &crate::sekai::object_security::ActivateObjectSecurityProfile {
+                namespace: "n".into(),
+                expected_profile_digest: String::new(),
+                bindings: vec![crate::sekai::object_security::ObjectSecurityPolicyBinding {
+                    object_kind: "component".into(),
+                    policy_digest: record.policy.policy_digest,
+                }],
+                idempotency_key: "lease-delete-profile".into(),
+            },
+            &["component".into()],
+            "root",
+            3,
+        )
+        .unwrap();
+        let lease = db
+            .acquire_lease("n", "k", "a", 100, "lease", "a", DEFAULT_SITE_ID, 10)
+            .unwrap();
+        db.guarded_delete_object(
+            "o",
+            Some(&original),
+            "n",
+            "k",
+            &lease.fencing_token,
+            "delete",
+            "a",
+            11,
+        )
+        .unwrap();
+        let snapshot = db
+            .object_change_security_snapshot("o")
+            .unwrap()
+            .expect("delete should retain a security snapshot");
+        assert_eq!(snapshot.kind, "component");
+        assert_eq!(snapshot.namespace, "n");
+        assert_eq!(
+            snapshot.properties,
+            HashMap::from([("owner".into(), "alice".into())])
+        );
+        assert!(!snapshot.properties.contains_key("secret"));
     }
 
     #[test]

@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use crate::db::postgres::PostgresDb;
 use crate::domain::{
-    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
+    DEFAULT_LIST_LIMIT, Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter,
+    is_valid_property_key,
 };
 use crate::sekai::lineage::{LineageEdge, LineageNode, LineageResult};
+use crate::sekai::object_security::PrincipalSecurityContext;
 use postgres::IsolationLevel;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
@@ -43,6 +45,160 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?
             .map(row_to_object)
             .transpose()
+    }
+
+    pub fn get_object_with_object_security(
+        &self,
+        id: &str,
+        principals: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Option<Object>, String> {
+        let privileged = principals
+            .iter()
+            .any(|principal| matches!(*principal, "root" | "local"));
+        let effective = principals
+            .iter()
+            .filter(|principal| !principal.is_empty() && **principal != "anonymous")
+            .map(|principal| (*principal).to_string())
+            .collect::<Vec<_>>();
+        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> =
+            vec![Box::new(id.to_string()), Box::new(effective)];
+        let (object_security, mut object_security_params) =
+            crate::db::object_security::postgres_object_security_filter(
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+                params.len(),
+            )?;
+        params.append(&mut object_security_params);
+        let namespace_filter = if privileged {
+            String::new()
+        } else {
+            " AND (
+                NOT EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    JOIN sekai_grants namespace_grant
+                      ON namespace_grant.object_id = boundary.id
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                      AND namespace_grant.principal = ANY($2)
+                )
+            )"
+            .to_string()
+        };
+        let refs = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        self.connection()?
+            .query_opt(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o
+                     WHERE o.id = $1
+                       AND (
+                         NOT EXISTS (SELECT 1 FROM sekai_grants grant_row WHERE grant_row.object_id = o.id)
+                         OR EXISTS (
+                           SELECT 1 FROM sekai_grants grant_row
+                           WHERE grant_row.object_id = o.id AND grant_row.principal = ANY($2)
+                         )
+                       )
+                       {namespace_filter}
+                       AND {object_security}"
+                ),
+                &refs,
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()
+    }
+
+    pub fn find_objects_by_external_id_with_object_security(
+        &self,
+        external_id: &str,
+        principals: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Vec<Object>, String> {
+        let privileged = principals
+            .iter()
+            .any(|principal| matches!(*principal, "root" | "local"));
+        let effective = principals
+            .iter()
+            .filter(|principal| !principal.is_empty() && **principal != "anonymous")
+            .map(|principal| (*principal).to_string())
+            .collect::<Vec<_>>();
+        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> =
+            vec![Box::new(external_id.to_string()), Box::new(effective)];
+        let (object_security, mut object_security_params) =
+            crate::db::object_security::postgres_object_security_filter(
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+                params.len(),
+            )?;
+        params.append(&mut object_security_params);
+        let namespace_filter = if privileged {
+            String::new()
+        } else {
+            " AND (
+                NOT EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                )
+                OR EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    JOIN sekai_grants namespace_grant
+                      ON namespace_grant.object_id = boundary.id
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                      AND namespace_grant.principal = ANY($2)
+                )
+            )"
+            .to_string()
+        };
+        let refs = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o
+                     WHERE o.external_id = $1
+                       AND (
+                         NOT EXISTS (SELECT 1 FROM sekai_grants grant_row WHERE grant_row.object_id = o.id)
+                         OR EXISTS (
+                           SELECT 1 FROM sekai_grants grant_row
+                           WHERE grant_row.object_id = o.id AND grant_row.principal = ANY($2)
+                         )
+                       )
+                       {namespace_filter}
+                       AND {object_security}
+                     ORDER BY o.id"
+                ),
+                &refs,
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
     }
 
     pub fn update_object(&self, object: &Object) -> Result<(), String> {
@@ -146,7 +302,8 @@ impl PostgresDb {
     }
 
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
-        self.list_objects_query(filter, None).map(|result| result.0)
+        self.list_objects_query(filter, None, None, &[])
+            .map(|result| result.0)
     }
 
     pub fn list_objects_with_total_for_principals(
@@ -154,13 +311,43 @@ impl PostgresDb {
         filter: &ListFilter,
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
-        self.list_objects_query(filter, Some(principals))
+        self.list_objects_query(filter, Some(principals), None, &[])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_objects_with_object_security(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut filter = filter.clone();
+        if filter.limit <= 0 {
+            filter.limit = DEFAULT_LIST_LIMIT;
+        }
+        self.list_objects_query(
+            &filter,
+            Some(principals),
+            Some((
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            )),
+            excluded_kinds,
+        )
     }
 
     fn list_objects_query(
         &self,
         filter: &ListFilter,
         principals: Option<&[&str]>,
+        object_security: Option<(&PrincipalSecurityContext, &str, &[&str], bool)>,
+        excluded_kinds: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
         let mut where_parts = Vec::new();
         let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
@@ -188,6 +375,23 @@ impl PostgresDb {
                       AND t.implements_json::jsonb ? {parameter}
                 )"
             ));
+        }
+        if !excluded_kinds.is_empty() {
+            if excluded_kinds.iter().any(|kind| {
+                kind.is_empty()
+                    || !kind
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            }) {
+                return Err("unsafe excluded object kind".into());
+            }
+            params.push(Box::new(
+                excluded_kinds
+                    .iter()
+                    .map(|kind| (*kind).to_string())
+                    .collect::<Vec<_>>(),
+            ));
+            where_parts.push(format!("NOT (o.kind = ANY(${}))", params.len()));
         }
         if let Some(principals) = principals {
             let privileged = principals
@@ -226,6 +430,18 @@ impl PostgresDb {
                     ))"
                 ));
             }
+        }
+        if let Some((principal, operation, allowed_markings, trusted)) = object_security {
+            let (predicate, mut predicate_params) =
+                crate::db::object_security::postgres_object_security_filter(
+                    principal,
+                    operation,
+                    allowed_markings,
+                    trusted,
+                    params.len(),
+                )?;
+            params.append(&mut predicate_params);
+            where_parts.push(predicate);
         }
         let where_sql = if where_parts.is_empty() {
             String::new()

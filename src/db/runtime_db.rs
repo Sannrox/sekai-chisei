@@ -22,6 +22,7 @@ use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEve
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
 use crate::db::definition_branch::DefinitionBranchBackend;
+use crate::db::object_security::ObjectSecurityBackend;
 use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::action_policy::ActionPolicy;
@@ -42,6 +43,10 @@ use crate::sekai::function::Function;
 use crate::sekai::handoff::*;
 use crate::sekai::lease::{Lease, LeaseError};
 use crate::sekai::ledger::*;
+use crate::sekai::object_security::{
+    ActivateObjectSecurityProfile, ObjectSecurityPolicyInput, ObjectSecurityPolicyRecord,
+    ObjectSecurityProfile, ObjectSecurityWriteResult, RevokeObjectSecurityPolicy,
+};
 use crate::sekai::object_sync::{SourceBatch, SourceBatchResult, SourceSyncState};
 use crate::sekai::observation::{TaskObservation, TaskObservationBaseline, *};
 use crate::sekai::ontology::*;
@@ -86,6 +91,187 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    pub fn create_object_security_policy(
+        &self,
+        input: &ObjectSecurityPolicyInput,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<ObjectSecurityWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::create_object_security_policy(
+                db.as_ref(),
+                input,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::create_object_security_policy(
+                db.as_ref(),
+                input,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn replay_object_security_write(
+        &self,
+        namespace: &str,
+        actor: &str,
+        idempotency_key: &str,
+        operation: &str,
+        request_digest: &str,
+    ) -> Result<Option<ObjectSecurityWriteResult>, String> {
+        match self {
+            Self::Sqlite(db) => db.replay_object_security_write(
+                namespace,
+                actor,
+                idempotency_key,
+                operation,
+                request_digest,
+            ),
+            Self::Postgres(db) => db.replay_object_security_write(
+                namespace,
+                actor,
+                idempotency_key,
+                operation,
+                request_digest,
+            ),
+        }
+    }
+
+    pub fn get_object_security_policy(
+        &self,
+        namespace: &str,
+        policy_digest: &str,
+    ) -> Result<Option<ObjectSecurityPolicyRecord>, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::get_object_security_policy(
+                db.as_ref(),
+                namespace,
+                policy_digest,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::get_object_security_policy(
+                db.as_ref(),
+                namespace,
+                policy_digest,
+            ),
+        }
+    }
+
+    pub fn activate_object_security_profile(
+        &self,
+        request: &ActivateObjectSecurityProfile,
+        advertised_object_kinds: &[String],
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<ObjectSecurityWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::activate_object_security_profile(
+                db.as_ref(),
+                request,
+                advertised_object_kinds,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::activate_object_security_profile(
+                db.as_ref(),
+                request,
+                advertised_object_kinds,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn get_object_security_profile(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<ObjectSecurityProfile>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                ObjectSecurityBackend::get_object_security_profile(db.as_ref(), namespace)
+            }
+            Self::Postgres(db) => {
+                ObjectSecurityBackend::get_object_security_profile(db.as_ref(), namespace)
+            }
+        }
+    }
+
+    pub fn object_security_kind_is_active(&self, object_kind: &str) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                ObjectSecurityBackend::object_security_kind_is_active(db.as_ref(), object_kind)
+            }
+            Self::Postgres(db) => {
+                ObjectSecurityBackend::object_security_kind_is_active(db.as_ref(), object_kind)
+            }
+        }
+    }
+
+    pub fn active_object_security_policies_for_kind(
+        &self,
+        object_kind: &str,
+    ) -> Result<Vec<ObjectSecurityPolicyRecord>, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::active_object_security_policies_for_kind(
+                db.as_ref(),
+                object_kind,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::active_object_security_policies_for_kind(
+                db.as_ref(),
+                object_kind,
+            ),
+        }
+    }
+
+    pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::object_query_cursor_key(db.as_ref()),
+            Self::Postgres(db) => ObjectSecurityBackend::object_query_cursor_key(db.as_ref()),
+        }
+    }
+
+    pub fn revoke_object_security_policy(
+        &self,
+        request: &RevokeObjectSecurityPolicy,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<ObjectSecurityWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::revoke_object_security_policy(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::revoke_object_security_policy(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn get_active_object_security_policy(
+        &self,
+        namespace: &str,
+        object_kind: &str,
+    ) -> Result<Option<ObjectSecurityPolicyRecord>, String> {
+        match self {
+            Self::Sqlite(db) => ObjectSecurityBackend::get_active_object_security_policy(
+                db.as_ref(),
+                namespace,
+                object_kind,
+            ),
+            Self::Postgres(db) => ObjectSecurityBackend::get_active_object_security_policy(
+                db.as_ref(),
+                namespace,
+                object_kind,
+            ),
+        }
+    }
+
     pub fn get_definition_revision(
         &self,
         namespace: &str,
@@ -394,6 +580,29 @@ impl RuntimeDb {
         }
     }
 
+    pub fn apply_source_batch_with_object_security(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        authorization: &crate::db::object_sync::SourceSyncAuthorization,
+    ) -> Result<SourceBatchResult, String> {
+        match self {
+            Self::Sqlite(db) => db.apply_source_batch_with_object_security(
+                batch,
+                authenticated_producer,
+                now_ms,
+                authorization,
+            ),
+            Self::Postgres(db) => db.apply_source_batch_with_object_security(
+                batch,
+                authenticated_producer,
+                now_ms,
+                authorization,
+            ),
+        }
+    }
+
     pub fn get_source_sync_state(
         &self,
         namespace: &str,
@@ -451,6 +660,64 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_object(id),
             Self::Postgres(db) => db.get_object(id),
+        }
+    }
+
+    pub fn get_object_with_object_security(
+        &self,
+        id: &str,
+        principals: &[&str],
+        principal: &crate::sekai::object_security::PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Option<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_with_object_security(
+                id,
+                principals,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
+            Self::Postgres(db) => db.get_object_with_object_security(
+                id,
+                principals,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
+        }
+    }
+
+    pub fn find_objects_by_external_id_with_object_security(
+        &self,
+        external_id: &str,
+        principals: &[&str],
+        principal: &crate::sekai::object_security::PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_objects_by_external_id_with_object_security(
+                external_id,
+                principals,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
+            Self::Postgres(db) => db.find_objects_by_external_id_with_object_security(
+                external_id,
+                principals,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
         }
     }
 
@@ -1323,11 +1590,12 @@ impl RuntimeDb {
     pub fn delete_object_with_audit(
         &self,
         id: &str,
+        expected: Option<&Object>,
         actor: &str,
     ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.delete_object_with_audit(id, actor),
-            Self::Postgres(db) => db.delete_object_with_audit(id, actor),
+            Self::Sqlite(db) => db.delete_object_with_audit(id, expected, actor),
+            Self::Postgres(db) => db.delete_object_with_audit(id, expected, actor),
         }
     }
 
@@ -2784,6 +3052,39 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_objects_with_object_security(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        principal: &crate::sekai::object_security::PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        match self {
+            Self::Sqlite(db) => db.list_objects_with_object_security(
+                filter,
+                principals,
+                excluded_kinds,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
+            Self::Postgres(db) => db.list_objects_with_object_security(
+                filter,
+                principals,
+                excluded_kinds,
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            ),
+        }
+    }
+
     pub fn list_objects_with_text_visibility(
         &self,
         filter: &ListFilter,
@@ -2936,10 +3237,7 @@ impl RuntimeDb {
     ) -> Result<Vec<ObjectChange>, String> {
         match self {
             Self::Sqlite(db) => db.list_visible_object_changes(object_id, limit, offset),
-            Self::Postgres(_) => Err(
-                "list_visible_object_changes is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Postgres(db) => db.list_visible_object_changes(object_id, limit, offset),
         }
     }
 
@@ -2962,18 +3260,24 @@ impl RuntimeDb {
     pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.object_change_kind(object_id),
-            Self::Postgres(_) => {
-                Err("object_change_kind is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => db.object_change_kind(object_id),
         }
     }
 
     pub fn object_change_namespace(&self, object_id: &str) -> Result<Option<String>, String> {
         match self {
             Self::Sqlite(db) => db.object_change_namespace(object_id),
-            Self::Postgres(_) => Err(
-                "object_change_namespace is unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => db.object_change_namespace(object_id),
+        }
+    }
+
+    pub fn object_change_security_snapshot(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_change_security_snapshot(object_id),
+            Self::Postgres(db) => db.object_change_security_snapshot(object_id),
         }
     }
 
@@ -3606,15 +3910,22 @@ impl RuntimeDb {
     pub fn update_object_with_audit(
         &self,
         object: &Object,
+        expected: Option<&Object>,
         actor: &str,
     ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.update_object_with_audit(object, actor),
+            Self::Sqlite(db) => db.update_object_with_audit(object, expected, actor),
             Self::Postgres(db) => {
-                let Some(existing) = db.get_object(&object.id)? else {
-                    return Ok(None);
+                let (expected_updated, expected) = match expected {
+                    Some(expected) => (expected.updated, Some(expected)),
+                    None => {
+                        let Some(existing) = db.get_object(&object.id)? else {
+                            return Ok(None);
+                        };
+                        (existing.updated, None)
+                    }
                 };
-                db.update_object_with_audit_if_revision(object, actor, existing.updated)
+                db.update_object_with_audit_if_revision(object, actor, expected_updated, expected)
             }
         }
     }

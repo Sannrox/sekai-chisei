@@ -7,7 +7,9 @@ design discussion if residency/federation needs a richer lattice.
 
 The `ActionTypeDef.required_purpose` portion was retired when the pre-1.0 graph
 Action DSL was removed. Object markings and authoritative principal profiles
-remain accepted.
+remain accepted only as compatibility behavior for namespaces without an
+active object security profile. ADR 0025 supersedes the fail-open rule after
+profile activation.
 
 ## Context
 

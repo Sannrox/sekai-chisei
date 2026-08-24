@@ -40,6 +40,8 @@ If you want to deploy or operate the control plane:
 
 - [Architecture](architecture.md) — ownership, trust boundaries, data model,
   and governed entry paths.
+- [Object security policies](object-security-policies.md) — versioned
+  namespace object-type grants compiled into storage predicates.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
   provenance, and validation.
 - [Governed definition branches](definition-branches.md) — immutable member and

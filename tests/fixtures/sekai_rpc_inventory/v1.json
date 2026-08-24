@@ -1271,6 +1271,66 @@
       ],
       "durable_dependencies": [],
       "product_tier": "advanced"
+    },
+    {
+      "rpc": "CreateObjectSecurityPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetObjectSecurityPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ActivateObjectSecurityProfile",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetObjectSecurityProfile",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RevokeObjectSecurityPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
     }
   ],
   "complete_sekai_surfaces": [
@@ -1288,6 +1348,7 @@
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
+    "sekai.object-security",
     "sekai.object-sync",
     "sekai.ontology-definitions",
     "sekai.reconciliation",
@@ -1317,6 +1378,7 @@
     "tests/evidence_backend_conformance.rs",
     "tests/graph_backend_conformance.rs",
     "tests/guarded_mutation_backend_conformance.rs",
+    "tests/object_security_backend_conformance.rs",
     "tests/object_sync_backend_conformance.rs",
     "tests/retention_dedup_backend_conformance.rs",
     "tests/reusable_sekai_backend_conformance.rs",

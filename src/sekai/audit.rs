@@ -55,6 +55,18 @@ fn validate_decision(decision: &Decision) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn sqlite_security_snapshot_property_keys(
+    db: &SekaiDb,
+    object: &Object,
+) -> BTreeSet<String> {
+    use crate::db::object_security::ObjectSecurityBackend;
+    db.get_active_object_security_policy(&object.namespace, &object.kind)
+        .ok()
+        .flatten()
+        .map(|record| record.snapshot_property_keys())
+        .unwrap_or_default()
+}
+
 fn looks_like_secret(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     [
@@ -80,10 +92,25 @@ pub fn record_object_diff(
     after: Option<&Object>,
 ) -> Result<u32, String> {
     let timestamp = chrono::Utc::now().timestamp_millis();
-    let changes = object_diff_changes(actor, before, after, timestamp);
+    let snapshot_keys = before
+        .map(|object| security_snapshot_property_keys(db, object))
+        .transpose()?
+        .unwrap_or_default();
+    let changes =
+        object_diff_changes_with_snapshot(actor, before, after, timestamp, &snapshot_keys);
     let count = changes.len() as u32;
     db.record_object_changes(&changes)?;
     Ok(count)
+}
+
+fn security_snapshot_property_keys(
+    db: &RuntimeDb,
+    object: &Object,
+) -> Result<BTreeSet<String>, String> {
+    Ok(db
+        .get_active_object_security_policy(&object.namespace, &object.kind)?
+        .map(|record| record.snapshot_property_keys())
+        .unwrap_or_default())
 }
 
 pub(crate) fn object_diff_changes(
@@ -91,6 +118,16 @@ pub(crate) fn object_diff_changes(
     before: Option<&Object>,
     after: Option<&Object>,
     timestamp: i64,
+) -> Vec<ObjectChange> {
+    object_diff_changes_with_snapshot(actor, before, after, timestamp, &BTreeSet::new())
+}
+
+pub(crate) fn object_diff_changes_with_snapshot(
+    actor: &str,
+    before: Option<&Object>,
+    after: Option<&Object>,
+    timestamp: i64,
+    snapshot_property_keys: &BTreeSet<String>,
 ) -> Vec<ObjectChange> {
     let mut changes = Vec::new();
 
@@ -114,6 +151,42 @@ pub(crate) fn object_diff_changes(
                 changed_by: actor.into(),
                 timestamp,
             });
+            changes.push(ObjectChange {
+                id: uuid::Uuid::new_v4().to_string(),
+                object_id: before.id.clone(),
+                field: "_security_snapshot".into(),
+                old_value: "v1".into(),
+                new_value: String::new(),
+                changed_by: actor.into(),
+                timestamp,
+            });
+            changes.push(ObjectChange {
+                id: uuid::Uuid::new_v4().to_string(),
+                object_id: before.id.clone(),
+                field: "_security_kind".into(),
+                old_value: before.kind.clone(),
+                new_value: String::new(),
+                changed_by: actor.into(),
+                timestamp,
+            });
+            for key in snapshot_property_keys {
+                if !before.properties.contains_key(key) {
+                    continue;
+                }
+                let value = before.properties.get(key).cloned().unwrap_or_default();
+                if looks_like_secret(&value) {
+                    continue;
+                }
+                changes.push(ObjectChange {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    object_id: before.id.clone(),
+                    field: format!("_security_property.{key}"),
+                    old_value: value,
+                    new_value: String::new(),
+                    changed_by: actor.into(),
+                    timestamp,
+                });
+            }
             changes.push(ObjectChange {
                 id: uuid::Uuid::new_v4().to_string(),
                 object_id: before.id.clone(),
@@ -867,6 +940,7 @@ impl SekaiDb {
     pub fn update_object_with_audit(
         &self,
         object: &Object,
+        expected: Option<&Object>,
         actor: &str,
     ) -> Result<Option<Object>, String> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
@@ -886,6 +960,11 @@ impl SekaiDb {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(None);
         };
+        if let Some(expected) = expected
+            && !before_object.persisted_state_matches(expected)
+        {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
         if before_object.namespace != object.namespace {
             return Err("object namespace is immutable".into());
         }
@@ -916,8 +995,18 @@ impl SekaiDb {
     pub fn delete_object_with_audit(
         &self,
         id: &str,
+        expected: Option<&Object>,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        let snapshot_keys = expected
+            .map(|object| sqlite_security_snapshot_property_keys(self, object))
+            .or_else(|| {
+                self.get_object(id)
+                    .ok()
+                    .flatten()
+                    .map(|object| sqlite_security_snapshot_property_keys(self, &object))
+            })
+            .unwrap_or_default();
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
@@ -928,6 +1017,18 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        if let Some(expected) = expected {
+            match &before {
+                Some(before) if before.persisted_state_matches(expected) => {}
+                Some(_) => {
+                    return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+                }
+                None => {
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Ok(None);
+                }
+            }
+        }
         tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         tx.execute(
@@ -937,7 +1038,10 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?;
         if let Some(before) = &before {
             let now = chrono::Utc::now().timestamp_millis();
-            insert_object_changes(&tx, &object_diff_changes(actor, Some(before), None, now))?;
+            insert_object_changes(
+                &tx,
+                &object_diff_changes_with_snapshot(actor, Some(before), None, now, &snapshot_keys),
+            )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(before)
@@ -979,7 +1083,7 @@ impl SekaiDb {
     ) -> Result<Vec<ObjectChange>, String> {
         let conn = self.conn();
         let effective_limit = if limit > 0 { limit } else { 100 };
-        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 AND field NOT IN ('_namespace', '_security_snapshot', '_security_kind') AND field NOT LIKE '_security_property.%' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![object_id, effective_limit, offset], |row| {
@@ -1038,6 +1142,82 @@ impl SekaiDb {
         .optional()
         .map(|value| value.filter(|namespace| !namespace.is_empty()))
         .map_err(|e| e.to_string())
+    }
+
+    fn object_change_security_kind(&self, object_id: &str) -> Result<Option<String>, String> {
+        self.conn()
+            .query_row(
+                "SELECT old_value FROM sekai_object_changes
+                 WHERE object_id = ?1 AND field = '_security_kind'
+                 ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+                params![object_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(|kind| kind.filter(|value| !value.is_empty()))
+    }
+
+    pub fn object_change_security_snapshot(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<Object>, String> {
+        let marker = self
+            .conn()
+            .query_row(
+                "SELECT old_value FROM sekai_object_changes
+                 WHERE object_id = ?1 AND field = '_security_snapshot'
+                 ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+                params![object_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        if marker != "v1" {
+            return Err("object change security snapshot version is unsupported".into());
+        }
+        let kind = self
+            .object_change_security_kind(object_id)?
+            .or(self.object_change_kind(object_id)?)
+            .ok_or_else(|| "object change security snapshot kind is unavailable".to_string())?;
+        let namespace = self.object_change_namespace(object_id)?.ok_or_else(|| {
+            "object change security snapshot namespace is unavailable".to_string()
+        })?;
+        let connection = self.conn();
+        let mut statement = connection
+            .prepare(
+                "SELECT field, old_value FROM sekai_object_changes
+                 WHERE object_id = ?1 AND field LIKE '_security_property.%'
+                 ORDER BY rowid",
+            )
+            .map_err(|error| error.to_string())?;
+        let properties = statement
+            .query_map(params![object_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let (field, value) = row.map_err(|error| error.to_string())?;
+                let key = field
+                    .strip_prefix("_security_property.")
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(|| "invalid object security property snapshot".to_string())?;
+                Ok((key.to_string(), value))
+            })
+            .collect::<Result<HashMap<_, _>, String>>()?;
+        Ok(Some(Object {
+            id: object_id.into(),
+            kind,
+            name: String::new(),
+            namespace,
+            external_id: String::new(),
+            properties,
+            created: 0,
+            updated: 0,
+        }))
     }
 
     pub fn purge_old_records(&self, before: i64) -> Result<i32, String> {
@@ -1371,16 +1551,24 @@ mod tests {
         );
         assert_eq!(
             record_object_diff(&db, "tester", Some(&obj), None).unwrap(),
-            2
+            4
         );
 
         let changes = db.list_object_changes("o1", 10, 0).unwrap();
         assert_eq!(changes[0].field, "_namespace");
         assert_eq!(changes[0].old_value, "default");
-        assert_eq!(changes[1].field, "_deleted");
-        assert_eq!(changes[1].old_value, "component/api");
-        assert_eq!(changes[2].field, "_created");
-        assert_eq!(changes[2].new_value, "component/api");
+        assert_eq!(changes[1].field, "_security_kind");
+        assert_eq!(changes[1].old_value, "component");
+        assert_eq!(changes[2].field, "_security_snapshot");
+        assert_eq!(changes[3].field, "_deleted");
+        assert_eq!(changes[3].old_value, "component/api");
+        assert_eq!(changes[4].field, "_created");
+        assert_eq!(changes[4].new_value, "component/api");
+        let snapshot = db.object_change_security_snapshot("o1").unwrap().unwrap();
+        assert_eq!(snapshot.id, obj.id);
+        assert_eq!(snapshot.namespace, obj.namespace);
+        assert_eq!(snapshot.kind, obj.kind);
+        assert_eq!(snapshot.properties, obj.properties);
         let visible = db.list_visible_object_changes("o1", 1, 0).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].field, "_deleted");
@@ -1403,16 +1591,47 @@ mod tests {
         let mut moved = original.clone();
         moved.namespace = "beta".into();
         assert_eq!(
-            db.update_object_with_audit(&moved, "tester").unwrap_err(),
+            db.update_object_with_audit(&moved, None, "tester")
+                .unwrap_err(),
             "object namespace is immutable"
         );
 
-        db.delete_object_with_audit(&original.id, "tester").unwrap();
+        db.delete_object_with_audit(&original.id, None, "tester")
+            .unwrap();
         assert_eq!(
             db.create_object_with_audit(&original, "tester")
                 .unwrap_err(),
             "object IDs with audit history cannot be reused"
         );
+    }
+
+    #[test]
+    fn audited_update_and_delete_bind_the_authorized_snapshot() {
+        let db = setup();
+        let original = object("stable-id", "api", "alpha", "api:stable", HashMap::new());
+        db.create_object_with_audit(&original, "tester").unwrap();
+        let mut intervening = original.clone();
+        intervening.name = "intervening".into();
+        intervening.updated = 2;
+        db.update_object_with_audit(&intervening, Some(&original), "tester")
+            .unwrap();
+        assert_eq!(
+            db.update_object_with_audit(&original, Some(&original), "tester")
+                .unwrap_err(),
+            crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION
+        );
+        assert_eq!(
+            db.delete_object_with_audit(&original.id, Some(&original), "tester")
+                .unwrap_err(),
+            crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION
+        );
+        assert_eq!(
+            db.get_object(&original.id).unwrap().unwrap().name,
+            "intervening"
+        );
+        db.delete_object_with_audit(&original.id, Some(&intervening), "tester")
+            .unwrap();
+        assert!(db.get_object(&original.id).unwrap().is_none());
     }
 
     #[test]

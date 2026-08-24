@@ -97,7 +97,7 @@ impl GraphBackend for SekaiDb {
         sqlite_update_object(self, object, actor, expected_updated)
     }
     fn delete_object(&self, id: &str, actor: &str) -> Result<Option<Object>, String> {
-        self.delete_object_with_audit(id, actor)
+        self.delete_object_with_audit(id, None, actor)
     }
     fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         self.list_objects(filter)
@@ -307,10 +307,10 @@ impl GraphBackend for PostgresDb {
         actor: &str,
         expected_updated: i64,
     ) -> Result<Option<Object>, String> {
-        self.update_object_with_audit_if_revision(object, actor, expected_updated)
+        self.update_object_with_audit_if_revision(object, actor, expected_updated, None)
     }
     fn delete_object(&self, id: &str, actor: &str) -> Result<Option<Object>, String> {
-        self.delete_object_with_audit(id, actor)
+        self.delete_object_with_audit(id, None, actor)
     }
     fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         self.list_objects(filter)

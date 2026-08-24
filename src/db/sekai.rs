@@ -11,8 +11,10 @@ use crate::obs::labels::{Outcome, Subsystem, WaitKind};
 use crate::obs::signals;
 
 use crate::domain::{
-    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
+    DEFAULT_LIST_LIMIT, Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter,
+    is_valid_property_key,
 };
+use crate::sekai::object_security::PrincipalSecurityContext;
 
 pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
@@ -188,6 +190,7 @@ impl SekaiDb {
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
         self.migrate_object_sync()?;
+        self.migrate_object_security()?;
         self.migrate_definition_branches()?;
         self.migrate_ledger()?;
         self.migrate_retention()?;
@@ -668,6 +671,90 @@ impl SekaiDb {
         ).optional().map_err(|e| e.to_string())
     }
 
+    pub fn get_object_with_object_security(
+        &self,
+        id: &str,
+        principals: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Option<Object>, String> {
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(id.to_string())];
+        let (visibility, mut visibility_params) = build_visibility_filter(principals, params.len());
+        params.append(&mut visibility_params);
+        let (object_security, mut object_security_params) =
+            crate::db::object_security::sqlite_object_security_filter(
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+                params.len(),
+            )?;
+        params.append(&mut object_security_params);
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects
+                     WHERE id = ?1{visibility}{object_security}"
+                ),
+                params
+                    .iter()
+                    .map(|value| value.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn find_objects_by_external_id_with_object_security(
+        &self,
+        external_id: &str,
+        principals: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<Vec<Object>, String> {
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(external_id.to_string())];
+        let (visibility, mut visibility_params) = build_visibility_filter(principals, params.len());
+        params.append(&mut visibility_params);
+        let (object_security, mut object_security_params) =
+            crate::db::object_security::sqlite_object_security_filter(
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+                params.len(),
+            )?;
+        params.append(&mut object_security_params);
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE external_id = ?1{visibility}{object_security}
+                 ORDER BY id"
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(
+                params
+                    .iter()
+                    .map(|value| value.as_ref())
+                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                    .as_slice(),
+                row_to_object,
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn update_object(&self, o: &Object) -> Result<(), String> {
         if self.update_object_with_existing(o)?.is_none() {
             return Err("not found".into());
@@ -861,6 +948,7 @@ impl SekaiDb {
             None,
             false,
             true,
+            None,
         )
     }
 
@@ -883,6 +971,7 @@ impl SekaiDb {
             Some(allowed_markings),
             trusted,
             true,
+            None,
         )
     }
 
@@ -904,10 +993,43 @@ impl SekaiDb {
             Some(allowed_markings),
             trusted,
             false,
+            None,
         )
         .map(|(objects, _)| objects)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_objects_with_object_security(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        principal: &PrincipalSecurityContext,
+        operation: &str,
+        allowed_legacy_markings: &[&str],
+        trusted_legacy_markings: bool,
+    ) -> Result<(Vec<Object>, i32), String> {
+        let mut filter = filter.clone();
+        if filter.limit <= 0 {
+            filter.limit = DEFAULT_LIST_LIMIT;
+        }
+        self.list_objects_with_total_for_principals_and_markings(
+            &filter,
+            principals,
+            excluded_kinds,
+            None,
+            false,
+            true,
+            Some((
+                principal,
+                operation,
+                allowed_legacy_markings,
+                trusted_legacy_markings,
+            )),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn list_objects_with_total_for_principals_and_markings(
         &self,
         filter: &ListFilter,
@@ -916,6 +1038,7 @@ impl SekaiDb {
         allowed_markings: Option<&[&str]>,
         trusted: bool,
         include_total: bool,
+        object_security: Option<(&PrincipalSecurityContext, &str, &[&str], bool)>,
     ) -> Result<(Vec<Object>, i32), String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         // Static (no-bind) exclusion of internal governance kinds so pagination
@@ -947,6 +1070,19 @@ impl SekaiDb {
         let (marking_filter, mut marking_params) =
             build_marking_visibility_filter(allowed_markings, trusted, query.params.len());
         query.params.append(&mut marking_params);
+        let (object_security_filter, mut object_security_params) =
+            if let Some((principal, operation, allowed_markings, trusted)) = object_security {
+                crate::db::object_security::sqlite_object_security_filter(
+                    principal,
+                    operation,
+                    allowed_markings,
+                    trusted,
+                    query.params.len(),
+                )?
+            } else {
+                (String::new(), Vec::new())
+            };
+        query.params.append(&mut object_security_params);
         let order_sql = build_order_by_sql(
             filter.order_by.as_str(),
             filter.descending,
@@ -960,8 +1096,12 @@ impl SekaiDb {
             filter.limit.min(MAX_LIST_LIMIT)
         };
         let mut list_sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}",
-            query.where_sql, visibility_filter, marking_filter, kind_exclusion
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}{}",
+            query.where_sql,
+            visibility_filter,
+            marking_filter,
+            object_security_filter,
+            kind_exclusion
         );
         if let Some(order_sql) = order_sql.as_deref() {
             list_sql.push_str(order_sql);
@@ -999,6 +1139,20 @@ impl SekaiDb {
             trusted,
             query.where_param_count + count_visibility_params.len(),
         );
+        let (count_object_security_filter, count_object_security_params) =
+            if let Some((principal, operation, allowed_markings, trusted)) = object_security {
+                crate::db::object_security::sqlite_object_security_filter(
+                    principal,
+                    operation,
+                    allowed_markings,
+                    trusted,
+                    query.where_param_count
+                        + count_visibility_params.len()
+                        + count_marking_params.len(),
+                )?
+            } else {
+                (String::new(), Vec::new())
+            };
         let mut count_params: Vec<&dyn rusqlite::types::ToSql> = query
             .params
             .iter()
@@ -1013,12 +1167,21 @@ impl SekaiDb {
         let total = conn
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}",
-                    query.where_sql, count_visibility_filter, count_marking_filter, kind_exclusion
+                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}{}",
+                    query.where_sql,
+                    count_visibility_filter,
+                    count_marking_filter,
+                    count_object_security_filter,
+                    kind_exclusion
                 ),
                 {
                     count_params.extend(
                         count_marking_params
+                            .iter()
+                            .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+                    );
+                    count_params.extend(
+                        count_object_security_params
                             .iter()
                             .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
                     );

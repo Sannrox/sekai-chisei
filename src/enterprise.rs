@@ -332,6 +332,36 @@ pub trait EnterpriseExtension: Send + Sync {
         action: NamespaceAction,
     ) -> Result<(), ExtensionError>;
 
+    /// Derive allowlisted object-policy inputs from the already validated
+    /// credential context. Implementations may add only `x_`-prefixed
+    /// attributes and bounded mandatory-control entitlements; request metadata
+    /// is never an input to this method.
+    fn object_security_context(
+        &self,
+        context: &AuthenticatedContext,
+    ) -> Result<crate::sekai::object_security::PrincipalSecurityContext, ExtensionError> {
+        let credential_kind = match context.credential_kind {
+            CredentialKind::HumanSession => "human_session",
+            CredentialKind::Machine => "machine",
+        };
+        Ok(crate::sekai::object_security::PrincipalSecurityContext {
+            attributes: std::collections::BTreeMap::from([
+                ("credential_kind".into(), credential_kind.into()),
+                ("issuer".into(), context.issuer.clone()),
+                ("subject".into(), context.principal.subject.clone()),
+                (
+                    "tenant_id".into(),
+                    context
+                        .tenant
+                        .as_ref()
+                        .map(|tenant| tenant.tenant_id.clone())
+                        .unwrap_or_default(),
+                ),
+            ]),
+            entitlements: context.scopes.iter().cloned().collect(),
+        })
+    }
+
     /// Resolve a tenant-scoped model-provider credential (#118).
     ///
     /// Default: unavailable. Enterprise distributions must implement this so

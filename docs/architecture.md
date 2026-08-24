@@ -240,12 +240,13 @@ those contracts into this authoritative process. Concrete tenant persistence,
 OIDC/OAuth behavior, and enterprise composition are not part of the community
 runtime.
 
-The current injection seam admits enterprise credentials only to the
-namespace-aware object, link, lease, traversal, and object-change RPCs that
-invoke the authorization hook. Other Sekai and all Chisei RPCs fail closed for
-enterprise-scoped credentials. Action execution and approval resumption also
-remain unavailable until an enterprise composition can persist and re-derive
-the authenticated approval identity.
+The current injection seam admits enterprise credentials only to
+namespace-aware object, link, lease, traversal, semantic retrieval,
+object-change, governed-fact, handoff, and coordination paths that preserve the
+authenticated context through policy evaluation. Other Sekai and all Chisei
+RPCs fail closed for enterprise-scoped credentials. Action execution and
+approval resumption also remain unavailable until an enterprise composition can
+persist and re-derive the authenticated approval identity.
 
 SQLite startup detects populated legacy tenant tables or tenant-bound
 credentials before normal migrations. It fails without changing them and
@@ -325,6 +326,23 @@ silence as success. Shomei may embed the signed permit and admitted host report,
 while receipts keep host self-report, independent effect verification, and
 downstream outcome separate.
 
+### Object authorization
+
+Credential scope and namespace access are narrowed by an explicitly activated,
+versioned object-type policy. Policies compare trusted principal context and
+mandatory entitlements with canonical object state and operation context.
+SQLite and PostgreSQL compile the supported vocabulary into the object query so
+filters, ordering, totals, and pagination operate on the authorized relation.
+Missing, revoked, invalid, stale, or unsupported active policy state denies.
+
+Activation atomically binds every advertised non-governance object type in a
+namespace. An empty rule is the explicit broad compatibility grant; there is no
+implicit grant after activation. Query cursors bind principal context,
+namespace, profile revision, query digest, and expiry. This layer does not
+replace narrower property/value, mutation, action, approval, or effect
+controls. See [Object security policies](object-security-policies.md) and
+[ADR 0025](decisions/0025-versioned-object-security-policies.md).
+
 ## Persistence
 
 SQLite is the server's default storage backend and runs in WAL mode for file
@@ -334,7 +352,8 @@ conformance for dual-backend inventory paths: core graph and authorization,
 object-change and decision audit, datasets and virtual tables, action
 definitions, function definitions, generation-fenced leases and guarded object
 mutations, team-namespace bootstrap, principal credentials, coordination and
-work admission, external evidence admission and
+work admission, versioned object security policies and query predicates,
+external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Known community Postgres fail-closed exceptions include public
 audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,

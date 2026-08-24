@@ -136,6 +136,10 @@ impl SchemaRegistry {
         self.types.get(kind)
     }
 
+    pub fn object_types(&self) -> impl Iterator<Item = &ObjectType> {
+        self.types.values()
+    }
+
     pub fn get_interface(&self, name: &str) -> Option<&InterfaceDef> {
         self.interfaces.get(name)
     }
@@ -938,8 +942,11 @@ impl SekaiDb {
             serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
         let implements_json =
             serde_json::to_string(&object_type.implements).map_err(|error| error.to_string())?;
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction.execute(
             "INSERT INTO sekai_object_types (kind, description, properties_json, implements_json, created, updated)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(kind) DO UPDATE SET
@@ -956,6 +963,7 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 

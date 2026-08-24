@@ -9,6 +9,10 @@ use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 use crate::domain::Object;
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 use crate::sekai::object_lineage::{ObjectLineage, bind_sync_lineage};
+use crate::sekai::object_security::{
+    ObjectAuthorizationContext, ObjectSecurityPolicyRecord, ObjectSecurityProfile,
+    PrincipalSecurityContext, evaluate_object_policy,
+};
 use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
     SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
@@ -40,6 +44,12 @@ const RESERVED_SYNC_PROPERTIES: &[&str] = &[
     "sync_type_digest",
     "sync_tombstoned",
 ];
+
+#[derive(Debug, Clone)]
+pub struct SourceSyncAuthorization {
+    pub principal: PrincipalSecurityContext,
+    pub principals: Vec<String>,
+}
 
 pub trait ObjectSyncBackend: Send + Sync {
     fn apply_source_batch(
@@ -176,6 +186,86 @@ impl From<postgres::Error> for ApplyError {
     fn from(error: postgres::Error) -> Self {
         Self::Storage(error.to_string())
     }
+}
+
+pub(crate) fn authorize_source_sync_transition(
+    profile: Option<&ObjectSecurityProfile>,
+    records: &[ObjectSecurityPolicyRecord],
+    authorization: &SourceSyncAuthorization,
+    before: Option<&Object>,
+    after: &Object,
+    object_admin: bool,
+) -> Result<(), ApplyError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let context = ObjectAuthorizationContext {
+        principal: authorization.principal.clone(),
+        operation: "sync".into(),
+    };
+    let policy_for = |kind: &str| -> Result<&ObjectSecurityPolicyRecord, ApplyError> {
+        let digest = profile.policy_digest_for(kind).ok_or_else(|| {
+            ApplyError::denied(
+                "object_security_denied",
+                "active object security profile has no policy for source object type",
+            )
+        })?;
+        records
+            .iter()
+            .find(|record| record.policy.policy_digest == digest)
+            .filter(|record| record.revocation.is_none())
+            .ok_or_else(|| {
+                ApplyError::denied(
+                    "object_security_denied",
+                    "active source object policy is unavailable or revoked",
+                )
+            })
+    };
+    let authorize = |object: &Object| -> Result<&ObjectSecurityPolicyRecord, ApplyError> {
+        let record = policy_for(&object.kind)?;
+        let decision = evaluate_object_policy(&record.policy, &context, object).map_err(|_| {
+            ApplyError::denied(
+                "object_security_denied",
+                "source object policy evaluation failed",
+            )
+        })?;
+        if !decision.allowed {
+            return Err(ApplyError::denied(
+                "object_security_denied",
+                "source object policy denied the mutation",
+            ));
+        }
+        Ok(record)
+    };
+    let before_policy = before.map(authorize).transpose()?;
+    let after_policy = authorize(after)?;
+    if let Some(before) = before {
+        if before.kind != after.kind && !object_admin {
+            return Err(ApplyError::denied(
+                "object_security_admin_required",
+                "source object kind changes require object admin",
+            ));
+        }
+        let changes_policy_input = before_policy
+            .into_iter()
+            .chain(std::iter::once(after_policy))
+            .flat_map(|record| &record.policy.rules)
+            .flat_map(|rule| &rule.conditions)
+            .flat_map(|condition| [&condition.left, &condition.right])
+            .filter(|operand| {
+                operand.source == crate::sekai::object_security::OperandSource::ObjectProperty
+            })
+            .any(|operand| {
+                before.properties.get(&operand.name) != after.properties.get(&operand.name)
+            });
+        if changes_policy_input && !object_admin {
+            return Err(ApplyError::denied(
+                "object_security_admin_required",
+                "source security-relevant property changes require object admin",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -489,6 +579,31 @@ impl SekaiDb {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_authorized(batch, authenticated_producer, now_ms, None)
+    }
+
+    pub fn apply_source_batch_with_object_security(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        authorization: &SourceSyncAuthorization,
+    ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_authorized(
+            batch,
+            authenticated_producer,
+            now_ms,
+            Some(authorization),
+        )
+    }
+
+    fn apply_source_batch_authorized(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        authorization: Option<&SourceSyncAuthorization>,
+    ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
             .map_err(|error| error.to_string())?;
@@ -502,7 +617,13 @@ impl SekaiDb {
         {
             OpenDisposition::Committed(result) => Ok(*result),
             OpenDisposition::Open => self
-                .commit_source_batch(batch, &prepared, authenticated_producer, now_ms)
+                .commit_source_batch(
+                    batch,
+                    &prepared,
+                    authenticated_producer,
+                    now_ms,
+                    authorization,
+                )
                 .map_err(|error| error.to_string()),
         }
     }
@@ -690,6 +811,7 @@ impl SekaiDb {
         prepared: &PreparedBatch,
         authenticated_producer: &str,
         now_ms: i64,
+        authorization: Option<&SourceSyncAuthorization>,
     ) -> Result<SourceBatchResult, ApplyError> {
         let mut conn = self.conn();
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -743,20 +865,41 @@ impl SekaiDb {
                     now_ms,
                 )?;
             }
-            transaction.execute(
-                "UPDATE sekai_source_batch_transactions
-                 SET status='ABORTED', outcome='denial', closed_at_ms=?1, reason=?2
-                 WHERE transaction_id=?3 AND status='OPEN'",
-                params![now_ms, error.to_string(), prepared.transaction_id],
-            )?;
-            transaction.execute(
-                "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
-                params![now_ms, prepared.binding_id],
-            )?;
-            transaction.commit()?;
-            return Err(error);
+            return abort_open_source_batch_sqlite(transaction, prepared, now_ms, error);
         }
 
+        let policy_state = authorization
+            .map(|_| {
+                let profile =
+                    crate::db::object_security::load_profile_sqlite(&transaction, &batch.namespace)
+                        .map_err(ApplyError::Storage)?;
+                let records = profile
+                    .as_ref()
+                    .map(|profile| {
+                        profile
+                            .bindings
+                            .iter()
+                            .map(|binding| {
+                                crate::db::object_security::load_policy_sqlite(
+                                    &transaction,
+                                    &batch.namespace,
+                                    &binding.policy_digest,
+                                )
+                                .map_err(ApplyError::Storage)?
+                                .ok_or_else(|| {
+                                    ApplyError::denied(
+                                        "object_security_denied",
+                                        "active source object policy is unavailable",
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, ApplyError>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                Ok::<_, ApplyError>((profile, records))
+            })
+            .transpose()?;
         let mut record_results = Vec::with_capacity(prepared.records.len());
         for prepared_record in &prepared.records {
             let before = load_object(&transaction, &prepared_record.object.object_id)?;
@@ -783,6 +926,22 @@ impl SekaiDb {
                     .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
                 updated: now_ms,
             };
+            if let (Some(authorization), Some((profile, records))) =
+                (authorization, policy_state.as_ref())
+            {
+                let object_admin =
+                    source_sync_object_admin_sqlite(&transaction, &object, authorization)?;
+                if let Err(error) = authorize_source_sync_transition(
+                    profile.as_ref(),
+                    records,
+                    authorization,
+                    before.as_ref(),
+                    &object,
+                    object_admin,
+                ) {
+                    return abort_open_source_batch_sqlite(transaction, prepared, now_ms, error);
+                }
+            }
             transaction.execute(
                 "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)
@@ -1499,6 +1658,66 @@ fn commit_generation_state(
     Ok(())
 }
 
+fn abort_open_source_batch_sqlite(
+    transaction: rusqlite::Transaction<'_>,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+    error: ApplyError,
+) -> Result<SourceBatchResult, ApplyError> {
+    transaction.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status='ABORTED', outcome='denial', closed_at_ms=?1, reason=?2
+         WHERE transaction_id=?3 AND status='OPEN'",
+        params![now_ms, error.to_string(), prepared.transaction_id],
+    )?;
+    transaction.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
+        params![now_ms, prepared.binding_id],
+    )?;
+    transaction.commit()?;
+    Err(error)
+}
+
+fn source_sync_object_admin_sqlite(
+    connection: &Connection,
+    object: &Object,
+    authorization: &SourceSyncAuthorization,
+) -> Result<bool, ApplyError> {
+    if authorization
+        .principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(true);
+    }
+    let namespace_external_id = format!("namespace:{}", object.namespace);
+    for principal in &authorization.principals {
+        let allowed = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM sekai_grants grant_row
+                WHERE grant_row.principal = ?1
+                  AND grant_row.role = 'admin'
+                  AND (
+                    grant_row.object_id = ?2
+                    OR EXISTS (
+                        SELECT 1 FROM sekai_objects namespace_object
+                        WHERE namespace_object.id = grant_row.object_id
+                          AND namespace_object.kind = 'namespace'
+                          AND namespace_object.external_id = ?3
+                    )
+                  )
+             )",
+            params![principal, object.id, namespace_external_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if allowed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn load_object(conn: &Connection, object_id: &str) -> Result<Option<Object>, ApplyError> {
     conn.query_row(
         "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -1859,6 +2078,11 @@ mod tests {
 
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
+    use crate::sekai::object_security::{
+        ActivateObjectSecurityProfile, ConditionOperator, ObjectSecurityPolicyBinding,
+        ObjectSecurityPolicyInput, ObjectSecurityRule, ObjectSecurityWriteResult, OperandSource,
+        PolicyCondition, PolicyOperand, PrincipalSecurityContext,
+    };
     use crate::sekai::object_sync::{
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
         GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
@@ -2016,6 +2240,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!((identity_count, result_count), (1, 1));
+    }
+
+    #[test]
+    fn apply_source_batch_enforces_active_object_policy() {
+        let db = db();
+        let created = db
+            .create_object_security_policy(
+                &ObjectSecurityPolicyInput {
+                    namespace: "acme".into(),
+                    object_kind: "Issue".into(),
+                    revision: "sync-1".into(),
+                    rules: vec![ObjectSecurityRule {
+                        rule_id: "closed-only".into(),
+                        conditions: vec![PolicyCondition {
+                            left: PolicyOperand {
+                                source: OperandSource::ObjectProperty,
+                                name: "state".into(),
+                                value: String::new(),
+                            },
+                            operator: ConditionOperator::Equals,
+                            right: PolicyOperand {
+                                source: OperandSource::Fixed,
+                                name: String::new(),
+                                value: "closed".into(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "sync-policy".into(),
+                },
+                "root",
+                1,
+            )
+            .unwrap();
+        let ObjectSecurityWriteResult::CreatePolicy { record } = created else {
+            panic!("expected created policy");
+        };
+        db.activate_object_security_profile(
+            &ActivateObjectSecurityProfile {
+                namespace: "acme".into(),
+                expected_profile_digest: String::new(),
+                bindings: vec![ObjectSecurityPolicyBinding {
+                    object_kind: "Issue".into(),
+                    policy_digest: record.policy.policy_digest,
+                }],
+                idempotency_key: "sync-profile".into(),
+            },
+            &["Issue".into()],
+            "root",
+            2,
+        )
+        .unwrap();
+        let authorization = SourceSyncAuthorization {
+            principal: PrincipalSecurityContext {
+                attributes: BTreeMap::from([("subject".into(), PRODUCER.into())]),
+                entitlements: Default::default(),
+            },
+            principals: vec![PRODUCER.into()],
+        };
+        let error = db
+            .apply_source_batch_with_object_security(
+                &batch("", "cursor:denied", "batch-denied"),
+                PRODUCER,
+                100,
+                &authorization,
+            )
+            .unwrap_err();
+        assert!(
+            error.starts_with("object_security_denied:"),
+            "unexpected error {error}"
+        );
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.latest_transaction.unwrap().status,
+            SourceBatchStatus::Aborted
+        );
+        assert!(db.list_all_objects(&Default::default()).unwrap().is_empty());
     }
 
     #[test]

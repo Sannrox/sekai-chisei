@@ -11,6 +11,7 @@ impl SekaiServiceImpl {
     pub(super) fn execute_retrieve_context(
         &self,
         principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
         inner: RetrieveContextRequest,
     ) -> Result<RetrieveContextResponse, Status> {
         let reasoning_started = std::time::Instant::now();
@@ -173,7 +174,21 @@ impl SekaiServiceImpl {
             |object| {
                 self.security.can_access(&object.id, &principal_refs)
                     && check_team_namespace(&self.db, principals, &object.namespace, false).is_ok()
-                    && object_passes_marking(&self.db, object, principals).unwrap_or(false)
+                    && enforce_namespace_tenant_context(
+                        &self.db,
+                        tenant_context,
+                        &object.namespace,
+                        false,
+                    )
+                    .is_ok()
+                    && object_passes_security_policy(
+                        &self.db,
+                        object,
+                        principals,
+                        tenant_context,
+                        "traverse",
+                    )
+                    .unwrap_or(false)
             },
             |object| is_reserved_governance_kind(&object.kind),
         )
@@ -195,8 +210,11 @@ impl SekaiServiceImpl {
             result.truncated = true;
         }
         for candidate in &mut result.candidates {
-            candidate.object =
-                self.resolve_computed_for_response(candidate.object.clone(), principals, None)?;
+            candidate.object = self.resolve_computed_for_response(
+                candidate.object.clone(),
+                principals,
+                tenant_context,
+            )?;
         }
 
         Ok(RetrieveContextResponse {

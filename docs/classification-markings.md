@@ -72,12 +72,18 @@ leaking classification details in the RPC error.
 
 ## Migration
 
-1. Existing unmarked data continues to work without principal profiles.
-2. Operators mark sensitive objects with `access_marking`.
-3. Create `principal:<actor>` profiles with ceilings and purpose allow-lists
-   before marking objects or purpose-gating actions that those principals use.
-4. Purpose-gated action types only block callers once `required_purpose` is set
-   on the action type definition.
+This mechanism remains available only while a namespace has no active object
+security profile. For new deployments, or when migrating an existing
+namespace, follow [Object security policies](object-security-policies.md):
+
+1. create one reviewed policy per advertised object type;
+2. use an explicit broad compatibility rule where temporary prior access is
+   required;
+3. activate the complete namespace profile atomically; and
+4. replace compatibility rules with narrowing policy revisions.
+
+After activation, the versioned object policy supersedes `access_marking` for
+object visibility. No activation path treats a missing policy as a grant.
 
 ## Residual risks (v1)
 

@@ -212,7 +212,7 @@ pub(crate) fn apply(
         None
     } else {
         Some(
-            db.update_object_with_audit(&object, actor)
+            db.update_object_with_audit(&object, None, actor)
                 .map_err(ActionObjectMutationError::Internal)?
                 .ok_or_else(|| {
                     ActionObjectMutationError::FailedPrecondition(format!(
@@ -250,7 +250,7 @@ pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor:
         && current.updated == applied.applied_updated
     {
         previous.updated = current.updated.saturating_add(1);
-        let _ = db.update_object_with_audit(&previous, actor);
+        let _ = db.update_object_with_audit(&previous, None, actor);
     }
 }
 

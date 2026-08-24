@@ -378,7 +378,7 @@ fn resolve_context_objects(req: &PipelineRequest, db: &RuntimeDb) -> Vec<crate::
         }
         let obj = db.find_by_external_id(&external_id).ok().flatten();
         if let Some(obj) = obj
-            && context_object_authorized(req, db, &obj)
+            && context_object_authorized(req, db, &obj, "read")
         {
             objects.push(obj);
         }
@@ -386,7 +386,42 @@ fn resolve_context_objects(req: &PipelineRequest, db: &RuntimeDb) -> Vec<crate::
     objects
 }
 
-fn context_object_authorized(req: &PipelineRequest, db: &RuntimeDb, object: &Object) -> bool {
+fn context_object_authorized(
+    req: &PipelineRequest,
+    db: &RuntimeDb,
+    object: &Object,
+    operation: &str,
+) -> bool {
+    let profile_active = match db.get_object_security_profile(&object.namespace) {
+        Ok(profile) => profile.is_some(),
+        Err(_) => return false,
+    };
+    if profile_active {
+        if req.memory_actor.is_empty() || object.namespace != req.namespace.trim() {
+            return false;
+        }
+        let record = match db.get_active_object_security_policy(&object.namespace, &object.kind) {
+            Ok(Some(record)) if record.revocation.is_none() => record,
+            _ => return false,
+        };
+        let context = crate::sekai::object_security::ObjectAuthorizationContext {
+            principal: crate::sekai::object_security::PrincipalSecurityContext {
+                attributes: std::collections::BTreeMap::from([
+                    ("credential_kind".into(), "machine".into()),
+                    ("issuer".into(), "sekai:community".into()),
+                    ("subject".into(), req.memory_actor.clone()),
+                    ("tenant_id".into(), String::new()),
+                ]),
+                entitlements: std::collections::BTreeSet::new(),
+            },
+            operation: operation.into(),
+        };
+        if !crate::sekai::object_security::evaluate_object_policy(&record.policy, &context, object)
+            .is_ok_and(|decision| decision.allowed)
+        {
+            return false;
+        }
+    }
     // Direct in-process pipeline users are trusted and historically omit an
     // actor. Network entry points always populate this from authenticated metadata.
     if req.memory_actor.is_empty() || matches!(req.memory_actor.as_str(), "root" | "local") {
@@ -627,7 +662,7 @@ fn collect_related_verdict_context(
     );
 
     for candidate in candidates {
-        if !context_object_authorized(req, db, &candidate) {
+        if !context_object_authorized(req, db, &candidate, "traverse") {
             continue;
         }
         if candidate.kind == KIND_LEARNING {
@@ -855,7 +890,7 @@ fn run_object_context_enrich(
                 .unwrap_or_default();
             let mut pitfalls = Vec::new();
             for candidate in learnings {
-                if !context_object_authorized(req, db, &candidate) {
+                if !context_object_authorized(req, db, &candidate, "traverse") {
                     continue;
                 }
                 if candidate.kind == KIND_LEARNING {
@@ -1474,7 +1509,7 @@ fn run_learnings_enrich(
             .find_by_external_id(&format!("namespace:{}", context.kind))
             .ok()
             .flatten()
-            .filter(|object| context_object_authorized(req, db, object))
+            .filter(|object| context_object_authorized(req, db, object, "read"))
         {
             sources.push(ns_obj.id);
         }
@@ -1483,7 +1518,7 @@ fn run_learnings_enrich(
                 .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             for obj in learnings {
-                if !context_object_authorized(req, db, &obj) {
+                if !context_object_authorized(req, db, &obj, "traverse") {
                     continue;
                 }
                 if obj.kind != KIND_LEARNING {
@@ -1590,7 +1625,7 @@ impl Step for SpecEnrichStep {
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default();
             for comp in components {
-                if !context_object_authorized(req, db, &comp) {
+                if !context_object_authorized(req, db, &comp, "traverse") {
                     continue;
                 }
                 if !is_evaluable_context(db, &comp) {
@@ -1748,7 +1783,7 @@ impl Step for RiskStep {
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|object| context_object_authorized(req, db, object))
+                .filter(|object| context_object_authorized(req, db, object, "traverse"))
                 .collect::<Vec<_>>();
             let components = authorized_components
                 .into_iter()
@@ -1837,7 +1872,7 @@ fn raw_risk_score(req: &PipelineRequest, db: &RuntimeDb) -> f64 {
             .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
             .unwrap_or_default()
             .into_iter()
-            .filter(|object| context_object_authorized(req, db, object))
+            .filter(|object| context_object_authorized(req, db, object, "traverse"))
             .collect::<Vec<_>>();
         if components
             .iter()

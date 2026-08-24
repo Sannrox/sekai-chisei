@@ -361,12 +361,14 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 103);
+        assert_eq!(inventory.entries.len(), 108);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
         assert!(inventory.entry("ApplySourceBatch").is_some());
         assert!(inventory.entry("GetSourceSyncState").is_some());
+        assert!(inventory.entry("CreateObjectSecurityPolicy").is_some());
+        assert!(inventory.entry("ActivateObjectSecurityProfile").is_some());
         assert!(inventory.entry("CreateDefinitionBranch").is_some());
         assert!(inventory.entry("GetDefinitionBranch").is_some());
         assert!(inventory.entry("ApplyDefinitionBranchEdit").is_some());

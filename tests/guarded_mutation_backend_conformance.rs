@@ -149,6 +149,21 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
         ),
         Err(LeaseError::Mutation(message)) if message == "object changed since authorization"
     ));
+    assert!(matches!(
+        db.guarded_update_object(
+            &updated,
+            &updated,
+            None,
+            &namespace,
+            &key,
+            &lease.fencing_token,
+            "missing-snapshot",
+            "actor-a",
+            17,
+        ),
+        Err(LeaseError::Mutation(message)) if message == "not found"
+    ));
+    assert_eq!(db.get_object(&object_id).unwrap().unwrap().name, "updated");
 
     db.guarded_delete_object(
         &object_id,

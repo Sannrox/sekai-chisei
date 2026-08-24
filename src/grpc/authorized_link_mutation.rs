@@ -35,10 +35,12 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &object,
                 &principals,
+                tenant_context.as_ref(),
+                "update",
                 &format!("create_link:{object_id}"),
             )?;
             endpoints.push(object);
@@ -98,10 +100,12 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &object,
                 &principals,
+                tenant_context.as_ref(),
+                "update",
                 &format!("delete_link:{object_id}"),
             )?;
         }

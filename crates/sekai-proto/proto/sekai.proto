@@ -190,6 +190,64 @@ message Grant {
   int64 created = 5;
 }
 
+// Immutable, namespace-scoped object authorization policy. A policy is an OR
+// of rules and each rule is an AND of conditions. An empty policy denies all;
+// an empty rule is an explicit broad compatibility grant.
+message ObjectSecurityPolicyOperand {
+  string source = 1; // fixed | object_property | operation_context | principal_attribute | principal_entitlement
+  string name = 2;
+  string value = 3;
+}
+
+message ObjectSecurityPolicyCondition {
+  ObjectSecurityPolicyOperand left = 1;
+  string operator = 2; // equals | not_equals | contains
+  ObjectSecurityPolicyOperand right = 3;
+}
+
+message ObjectSecurityRule {
+  string rule_id = 1;
+  repeated ObjectSecurityPolicyCondition conditions = 2;
+}
+
+message ObjectSecurityPolicyRevision {
+  string contract_version = 1;
+  string namespace = 2;
+  string object_kind = 3;
+  string revision = 4;
+  repeated ObjectSecurityRule rules = 5;
+  string policy_digest = 6;
+  string created_by = 7;
+  int64 created_at_ms = 8;
+}
+
+message ObjectSecurityPolicyRevocation {
+  string namespace = 1;
+  string policy_digest = 2;
+  string reason = 3;
+  string revoked_by = 4;
+  int64 revoked_at_ms = 5;
+}
+
+message ObjectSecurityPolicyRecord {
+  ObjectSecurityPolicyRevision policy = 1;
+  ObjectSecurityPolicyRevocation revocation = 2;
+}
+
+message ObjectSecurityPolicyBinding {
+  string object_kind = 1;
+  string policy_digest = 2;
+}
+
+message ObjectSecurityProfile {
+  string contract_version = 1;
+  string namespace = 2;
+  string profile_digest = 3;
+  repeated ObjectSecurityPolicyBinding bindings = 4;
+  string activated_by = 5;
+  int64 activated_at_ms = 6;
+}
+
 message Decision {
   string id = 1;
   int64 timestamp = 2;
@@ -389,10 +447,58 @@ message DeleteObjectRequest {
   LeasePrecondition lease_precondition = 2;
 }
 message DeleteObjectResponse {}
-message ListObjectsRequest { ListFilter filter = 1; }
-message ListObjectsResponse { repeated Object objects = 1; int32 total = 2; }
+message ListObjectsRequest {
+  ListFilter filter = 1;
+  string page_token = 2;
+}
+message ListObjectsResponse {
+  repeated Object objects = 1;
+  int32 total = 2;
+  string next_page_token = 3;
+}
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
+
+message CreateObjectSecurityPolicyRequest {
+  string namespace = 1;
+  string object_kind = 2;
+  string revision = 3;
+  repeated ObjectSecurityRule rules = 4;
+  string policy_digest = 5;
+  string idempotency_key = 6;
+}
+message CreateObjectSecurityPolicyResponse {
+  ObjectSecurityPolicyRecord record = 1;
+}
+message GetObjectSecurityPolicyRequest {
+  string namespace = 1;
+  string policy_digest = 2;
+}
+message GetObjectSecurityPolicyResponse {
+  ObjectSecurityPolicyRecord record = 1;
+}
+message ActivateObjectSecurityProfileRequest {
+  string namespace = 1;
+  string expected_profile_digest = 2;
+  repeated ObjectSecurityPolicyBinding bindings = 3;
+  string idempotency_key = 4;
+}
+message ActivateObjectSecurityProfileResponse {
+  ObjectSecurityProfile profile = 1;
+}
+message GetObjectSecurityProfileRequest { string namespace = 1; }
+message GetObjectSecurityProfileResponse {
+  ObjectSecurityProfile profile = 1;
+}
+message RevokeObjectSecurityPolicyRequest {
+  string namespace = 1;
+  string policy_digest = 2;
+  string reason = 3;
+  string idempotency_key = 4;
+}
+message RevokeObjectSecurityPolicyResponse {
+  ObjectSecurityPolicyRecord record = 1;
+}
 
 message CreateLinkRequest { Link link = 1; bool fail_if_exists = 2; }
 message CreateLinkResponse { Link link = 1; }
@@ -1581,6 +1687,11 @@ service SekaiService {
   rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
   rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
   rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);
+  rpc CreateObjectSecurityPolicy(CreateObjectSecurityPolicyRequest) returns (CreateObjectSecurityPolicyResponse);
+  rpc GetObjectSecurityPolicy(GetObjectSecurityPolicyRequest) returns (GetObjectSecurityPolicyResponse);
+  rpc ActivateObjectSecurityProfile(ActivateObjectSecurityProfileRequest) returns (ActivateObjectSecurityProfileResponse);
+  rpc GetObjectSecurityProfile(GetObjectSecurityProfileRequest) returns (GetObjectSecurityProfileResponse);
+  rpc RevokeObjectSecurityPolicy(RevokeObjectSecurityPolicyRequest) returns (RevokeObjectSecurityPolicyResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);

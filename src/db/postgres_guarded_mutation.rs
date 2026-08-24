@@ -1,9 +1,10 @@
 use crate::db::postgres::PostgresDb;
+use crate::db::postgres_audit::postgres_security_snapshot_property_keys;
 use crate::domain::Object;
-use crate::sekai::audit::{ObjectChange, object_diff_changes};
+use crate::sekai::audit::{ObjectChange, object_diff_changes, object_diff_changes_with_snapshot};
 use crate::sekai::lease::{
-    Lease, LeaseError, canonical_object_input, guarded_mutation_digest, object_state_matches,
-    validate_text,
+    Lease, LeaseError, canonical_object_input, guarded_mutation_digest,
+    require_authorized_snapshot, validate_text,
 };
 use std::time::Instant;
 
@@ -166,11 +167,7 @@ impl PostgresDb {
                     .map(row_to_object)
                     .transpose()?
                     .ok_or_else(|| LeaseError::Mutation("not found".into()))?;
-                if !expected.is_some_and(|expected| object_state_matches(expected, &before)) {
-                    return Err(LeaseError::Mutation(
-                        "object changed since authorization".into(),
-                    ));
-                }
+                require_authorized_snapshot(expected, &before)?;
                 if before.namespace != object.namespace {
                     return Err(LeaseError::Mutation("object namespace is immutable".into()));
                 }
@@ -218,6 +215,9 @@ impl PostgresDb {
         now_ms: i64,
     ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
+        let snapshot_keys = expected
+            .map(|object| postgres_security_snapshot_property_keys(self, object))
+            .unwrap_or_default();
         self.guarded_object_mutation(
             namespace,
             key,
@@ -241,11 +241,7 @@ impl PostgresDb {
                     .map(row_to_object)
                     .transpose()?
                     .ok_or_else(|| LeaseError::Mutation("not found".into()))?;
-                if !expected.is_some_and(|expected| object_state_matches(expected, &before)) {
-                    return Err(LeaseError::Mutation(
-                        "object changed since authorization".into(),
-                    ));
-                }
+                require_authorized_snapshot(expected, &before)?;
                 tx.execute(
                     "DELETE FROM sekai_links WHERE from_id=$1 OR to_id=$1",
                     &[&object_id],
@@ -255,7 +251,13 @@ impl PostgresDb {
                     .map_err(storage)?;
                 insert_changes(
                     tx,
-                    &object_diff_changes(actor, Some(&before), None, transaction_now_ms),
+                    &object_diff_changes_with_snapshot(
+                        actor,
+                        Some(&before),
+                        None,
+                        transaction_now_ms,
+                        &snapshot_keys,
+                    ),
                 )?;
                 Ok(Object {
                     id: before.id,

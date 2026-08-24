@@ -6,8 +6,13 @@
 //! context, and team-namespace admission before invoking this interface.
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::domain::Object;
 use crate::sekai::lease::{Lease, LeaseError};
+use crate::sekai::object_security::{
+    ObjectAuthorizationContext, PrincipalSecurityContext, evaluate_object_policy,
+};
 use crate::sekai::security::SecurityChecker;
+use std::collections::{BTreeMap, BTreeSet};
 
 const OBJECT_BOUND_LEASE_KEY_PREFIX: &str = "object:";
 
@@ -311,8 +316,72 @@ impl<'a> LeaseLifecycle<'a> {
                 "object-bound lease namespace must match the target object namespace".into(),
             ));
         }
+        if !object_security_allows(self.db, &object, principals, write)? {
+            return if allow_missing_target {
+                Ok(())
+            } else {
+                Err(LeaseLifecycleError::NotFound(format!(
+                    "object-bound lease target {object_id} not found"
+                )))
+            };
+        }
         Ok(())
     }
+}
+
+fn community_principal(principals: &[String]) -> PrincipalSecurityContext {
+    let subject = principals
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "anonymous".into());
+    let mut ordered = principals.to_vec();
+    ordered.sort();
+    ordered.dedup();
+    PrincipalSecurityContext {
+        attributes: BTreeMap::from([
+            ("credential_kind".into(), "machine".into()),
+            ("issuer".into(), "sekai:community".into()),
+            ("subject".into(), subject),
+            ("tenant_id".into(), String::new()),
+            ("x_acl_principals".into(), ordered.join(",")),
+        ]),
+        entitlements: BTreeSet::new(),
+    }
+}
+
+fn object_security_allows(
+    db: &RuntimeDb,
+    object: &Object,
+    principals: &[String],
+    write: bool,
+) -> Result<bool, LeaseLifecycleError> {
+    if db
+        .get_object_security_profile(&object.namespace)
+        .map_err(LeaseLifecycleError::Storage)?
+        .is_none()
+    {
+        return Ok(true);
+    }
+    let Some(record) = db
+        .get_active_object_security_policy(&object.namespace, &object.kind)
+        .map_err(LeaseLifecycleError::Storage)?
+    else {
+        return Ok(false);
+    };
+    if record.revocation.is_some() {
+        return Ok(false);
+    }
+    let context = ObjectAuthorizationContext {
+        principal: community_principal(principals),
+        operation: if write {
+            "update".into()
+        } else {
+            "read".into()
+        },
+    };
+    evaluate_object_policy(&record.policy, &context, object)
+        .map(|decision| decision.allowed)
+        .map_err(LeaseLifecycleError::Storage)
 }
 
 fn object_bound_target(key: &str) -> Result<Option<&str>, LeaseLifecycleError> {
@@ -394,6 +463,102 @@ mod tests {
             db.get_lease("default", "object:target").unwrap(),
             Some(lease)
         );
+    }
+
+    #[test]
+    fn object_bound_lease_treats_policy_hidden_targets_as_missing() {
+        let db = RuntimeDb::memory();
+        let mut target = object("target", "default");
+        target.properties.insert("owner".into(), "alice".into());
+        db.create_object_with_audit(&target, "alice").unwrap();
+        let created = db
+            .create_object_security_policy(
+                &crate::sekai::object_security::ObjectSecurityPolicyInput {
+                    namespace: "default".into(),
+                    object_kind: "component".into(),
+                    revision: "lease-hidden-1".into(),
+                    rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                        rule_id: "owner".into(),
+                        conditions: vec![crate::sekai::object_security::PolicyCondition {
+                            left: crate::sekai::object_security::PolicyOperand {
+                                source: crate::sekai::object_security::OperandSource::ObjectProperty,
+                                name: "owner".into(),
+                                value: String::new(),
+                            },
+                            operator: crate::sekai::object_security::ConditionOperator::Equals,
+                            right: crate::sekai::object_security::PolicyOperand {
+                                source: crate::sekai::object_security::OperandSource::PrincipalAttribute,
+                                name: "subject".into(),
+                                value: String::new(),
+                            },
+                        }],
+                    }],
+                    policy_digest: String::new(),
+                    idempotency_key: "lease-hidden-policy".into(),
+                },
+                "root",
+                2,
+            )
+            .unwrap();
+        let crate::sekai::object_security::ObjectSecurityWriteResult::CreatePolicy { record } =
+            created
+        else {
+            panic!("expected created policy");
+        };
+        db.activate_object_security_profile(
+            &crate::sekai::object_security::ActivateObjectSecurityProfile {
+                namespace: "default".into(),
+                expected_profile_digest: String::new(),
+                bindings: vec![crate::sekai::object_security::ObjectSecurityPolicyBinding {
+                    object_kind: "component".into(),
+                    policy_digest: record.policy.policy_digest,
+                }],
+                idempotency_key: "lease-hidden-profile".into(),
+            },
+            &["component".into()],
+            "root",
+            3,
+        )
+        .unwrap();
+        let security = SecurityChecker::new();
+        for principal in ["alice", "bob"] {
+            security.add_grant(&Grant {
+                id: format!("grant-{principal}"),
+                object_id: "target".into(),
+                principal: principal.into(),
+                role: Role::Editor,
+                created: 1,
+            });
+        }
+        let lifecycle = LeaseLifecycle::new(&db, &security, "local");
+        let hidden = lifecycle.acquire(AcquireLease {
+            namespace: "default",
+            key: "object:target",
+            owner: "bob",
+            ttl_ms: 1_000,
+            request_id: "bob-acquire",
+            actor: "bob",
+            principals: &["bob".into()],
+            now_ms: 10,
+        });
+        assert_eq!(
+            hidden,
+            Err(LeaseLifecycleError::NotFound(
+                "object-bound lease target target not found".into()
+            ))
+        );
+        lifecycle
+            .acquire(AcquireLease {
+                namespace: "default",
+                key: "object:target",
+                owner: "alice",
+                ttl_ms: 1_000,
+                request_id: "alice-acquire",
+                actor: "alice",
+                principals: &["alice".into()],
+                now_ms: 11,
+            })
+            .unwrap();
     }
 
     #[test]
