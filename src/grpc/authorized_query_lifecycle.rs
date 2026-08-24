@@ -100,7 +100,29 @@ impl SekaiServiceImpl {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let filter = parse_list_filter(req.into_inner().filter.unwrap_or_default())?;
+        let input = req.into_inner();
+        let mut filter = parse_list_filter(input.filter.unwrap_or_default())?;
+        let policy_revision = self
+            .db
+            .policy_cursor_binding(filter.namespace.as_deref())
+            .map_err(Status::internal)?;
+        let query_digest = crate::sekai::object_security::list_query_digest(&filter);
+        let now_ms = now_millis();
+        if !input.page_token.trim().is_empty() {
+            let token =
+                crate::sekai::object_security::ObjectListPageToken::decode(&input.page_token)
+                    .map_err(Status::failed_precondition)?;
+            token
+                .validate(
+                    &policy_context,
+                    filter.namespace.as_deref().unwrap_or_default(),
+                    &policy_revision,
+                    &query_digest,
+                    now_ms,
+                )
+                .map_err(Status::failed_precondition)?;
+            filter.offset = token.offset;
+        }
         if tenant_context.is_some() {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
@@ -154,6 +176,7 @@ impl SekaiServiceImpl {
             return Ok(Response::new(ListObjectsResponse {
                 objects: Vec::new(),
                 total: 0,
+                next_page_token: String::new(),
             }));
         }
         {
@@ -193,9 +216,30 @@ impl SekaiServiceImpl {
                 )
             },
         )?;
+        let next_page_token = if !objects.is_empty() {
+            let consumed = filter.offset.saturating_add(objects.len() as i32);
+            if consumed < total {
+                crate::sekai::object_security::ObjectListPageToken {
+                    principal_digest: policy_context.digest(),
+                    namespace: filter.namespace.clone().unwrap_or_default(),
+                    policy_revision,
+                    query_digest,
+                    offset: consumed,
+                    expiry_ms: now_ms
+                        + crate::sekai::object_security::OBJECT_LIST_PAGE_TOKEN_TTL_MS,
+                }
+                .encode()
+                .unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         let mut response = Response::new(ListObjectsResponse {
             objects: objects.iter().map(to_proto_obj).collect(),
             total,
+            next_page_token,
         });
         if let (Some(_), Some(operation_id)) =
             (invoked_capability.as_deref(), operation_id.as_deref())
@@ -311,12 +355,14 @@ impl SekaiServiceImpl {
         req: Request<FindByPropertyRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
             return Ok(Response::new(ListObjectsResponse {
                 objects: Vec::new(),
                 total: 0,
+                next_page_token: String::new(),
             }));
         }
         {
@@ -328,7 +374,7 @@ impl SekaiServiceImpl {
         }
         let objs = self
             .db
-            .find_by_property(&r.kind, &r.key, &r.value)
+            .find_by_property_with_policy_context(&r.kind, &r.key, &r.value, Some(&policy_context))
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
         let filtered = self.security.filter_objects(&objs, &refs);
@@ -344,14 +390,16 @@ impl SekaiServiceImpl {
                 )
             })
             .collect::<Vec<_>>();
-        let filtered = self.resolve_computed_for_responses(
+        let filtered = self.resolve_computed_for_responses_with_policy(
             filtered.into_iter().cloned().collect(),
             &principals,
+            Some(&policy_context),
             tenant_context.as_ref(),
         )?;
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(to_proto_obj).collect(),
             total: filtered.len() as i32,
+            next_page_token: String::new(),
         }))
     }
     pub(super) async fn get_visible_links(
@@ -359,12 +407,13 @@ impl SekaiServiceImpl {
         req: Request<GetLinksRequest>,
     ) -> Result<Response<GetLinksResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -389,7 +438,7 @@ impl SekaiServiceImpl {
             .filter(|link| {
                 [&link.from_id, &link.to_id].into_iter().all(|object_id| {
                     self.db
-                        .get_object(object_id)
+                        .get_object_with_policy_context(object_id, &policy_context)
                         .ok()
                         .flatten()
                         .is_some_and(|object| {
@@ -413,11 +462,12 @@ impl SekaiServiceImpl {
         req: Request<GetLinkedObjectsRequest>,
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -435,7 +485,12 @@ impl SekaiServiceImpl {
         };
         let objs = self
             .db
-            .get_linked_objects(&root.id, &r.relation, &dir)
+            .get_linked_objects_with_policy_context(
+                &root.id,
+                &r.relation,
+                &dir,
+                Some(&policy_context),
+            )
             .map_err(Status::internal)?;
         let objs = objs
             .into_iter()
@@ -449,8 +504,12 @@ impl SekaiServiceImpl {
                 )
             })
             .collect();
-        let objs =
-            self.resolve_computed_for_responses(objs, &principals, tenant_context.as_ref())?;
+        let objs = self.resolve_computed_for_responses_with_policy(
+            objs,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
         }))
@@ -460,6 +519,7 @@ impl SekaiServiceImpl {
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let q = req
             .into_inner()
@@ -478,34 +538,37 @@ impl SekaiServiceImpl {
             kind_filter: q.kind_filter,
             interface_filter: q.interface_filter,
             property_filter: q.property_filter,
+            policy_context: Some(policy_context.clone()),
         };
         let start = if !gq.start_id.is_empty() {
             self.db
-                .get_object(&gq.start_id)
+                .get_object_with_policy_context(&gq.start_id, &policy_context)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("not found"))?
         } else if !gq.start_external_id.is_empty() {
             let external_id = gq.start_external_id.clone();
-            if tenant_context.is_some() {
-                self.db
-                    .find_all_by_external_id(&external_id)
-                    .map_err(Status::internal)?
-                    .into_iter()
-                    .find(|candidate| {
-                        object_is_visible(
+            self.db
+                .find_all_by_external_id(&external_id)
+                .map_err(Status::internal)?
+                .into_iter()
+                .find_map(|candidate| {
+                    if tenant_context.is_some()
+                        && !object_is_visible(
                             &self.db,
                             &self.security,
-                            candidate,
+                            &candidate,
                             &principals,
                             tenant_context.as_ref(),
                         )
-                    })
-            } else {
-                self.db
-                    .find_by_external_id(&external_id)
-                    .map_err(Status::internal)?
-            }
-            .ok_or(Status::not_found("not found"))?
+                    {
+                        return None;
+                    }
+                    self.db
+                        .get_object_with_policy_context(&candidate.id, &policy_context)
+                        .ok()
+                        .flatten()
+                })
+                .ok_or(Status::not_found("not found"))?
         } else {
             return Err(Status::invalid_argument(
                 "start_id or start_external_id required",
@@ -552,8 +615,12 @@ impl SekaiServiceImpl {
             )
         });
         retain_reachable_visible_objects(&start.id, gq.direction, &mut res.objects, &mut res.links);
-        res.objects =
-            self.resolve_computed_for_responses(res.objects, &principals, tenant_context.as_ref())?;
+        res.objects = self.resolve_computed_for_responses_with_policy(
+            res.objects,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -566,11 +633,12 @@ impl SekaiServiceImpl {
         req: Request<GetLineageRequest>,
     ) -> Result<Response<GetLineageResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -586,18 +654,24 @@ impl SekaiServiceImpl {
             .get_lineage(&root.id, r.max_nodes as usize)
             .map_err(Status::internal)?;
         res.nodes.retain(|node| {
-            object_is_visible(
-                &self.db,
-                &self.security,
-                &node.object,
-                &principals,
-                tenant_context.as_ref(),
-            )
+            self.db
+                .get_object_with_policy_context(&node.object.id, &policy_context)
+                .ok()
+                .flatten()
+                .is_some()
+                && object_is_visible(
+                    &self.db,
+                    &self.security,
+                    &node.object,
+                    &principals,
+                    tenant_context.as_ref(),
+                )
         });
         retain_reachable_visible_lineage(&root.id, &mut res.nodes, &mut res.edges);
-        let objects = self.resolve_computed_for_responses(
+        let objects = self.resolve_computed_for_responses_with_policy(
             res.nodes.iter().map(|node| node.object.clone()).collect(),
             &principals,
+            Some(&policy_context),
             tenant_context.as_ref(),
         )?;
         let nodes = res

@@ -389,8 +389,15 @@ message DeleteObjectRequest {
   LeasePrecondition lease_precondition = 2;
 }
 message DeleteObjectResponse {}
-message ListObjectsRequest { ListFilter filter = 1; }
-message ListObjectsResponse { repeated Object objects = 1; int32 total = 2; }
+message ListObjectsRequest {
+  ListFilter filter = 1;
+  string page_token = 2;
+}
+message ListObjectsResponse {
+  repeated Object objects = 1;
+  int32 total = 2;
+  string next_page_token = 3;
+}
 message ObjectSecurityPolicyRevision {
   string namespace = 1;
   string kind = 2;

@@ -3,10 +3,17 @@ use std::collections::BTreeMap;
 use postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
-use crate::db::object_security::{mapping_digest, predicate_columns};
+use sha2::{Digest, Sha256};
+
+use crate::db::object_security::{
+    ObjectPolicyWriteDecision, mapping_digest, postgres_object_security_predicate,
+    predicate_columns,
+};
 use crate::db::postgres::PostgresDb;
+use crate::domain::Object;
 use crate::sekai::object_security::{
     ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
+    PrincipalPolicyContext,
 };
 
 impl PostgresDb {
@@ -431,4 +438,219 @@ fn validate_write(actor: &str, key: &str, now_ms: i64) -> Result<(), String> {
         return Err("invalid object-security write context".into());
     }
     Ok(())
+}
+
+pub(crate) fn postgres_snapshot_authorized(
+    client: &mut impl GenericClient,
+    object: &Object,
+    context: &PrincipalPolicyContext,
+) -> Result<bool, String> {
+    let context = context.clone().normalized();
+    let properties = crate::domain::storage_properties_json(&object.properties)?;
+    let predicate = postgres_object_security_predicate("snapshot", "$4", "$5");
+    let authorized: bool = client
+        .query_one(
+            &format!(
+                "SELECT EXISTS (
+                    SELECT 1 FROM (
+                        SELECT $1::text AS namespace, $2::text AS kind, $3::text AS properties
+                    ) snapshot
+                    WHERE {predicate}
+                )"
+            ),
+            &[
+                &object.namespace,
+                &object.kind,
+                &properties,
+                &context.subjects,
+                &context.scopes,
+            ],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    Ok(authorized)
+}
+
+fn postgres_active_revision(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    kind: &str,
+) -> Result<Option<String>, String> {
+    client
+        .query_opt(
+            "SELECT revision_digest FROM sekai_object_security_active_policies
+             WHERE namespace=$1 AND kind=$2",
+            &[&namespace, &kind],
+        )
+        .map_err(|error| error.to_string())
+        .map(|row| row.map(|row| row.get(0)))
+}
+
+fn postgres_namespace_activated(
+    client: &mut impl GenericClient,
+    namespace: &str,
+) -> Result<bool, String> {
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM sekai_object_security_activations WHERE namespace=$1
+             )",
+            &[&namespace],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    Ok(exists)
+}
+
+fn postgres_insert_write_audit(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    actor: &str,
+    action: &str,
+    revision_digest: &str,
+    reason_code: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    client
+        .execute(
+            "INSERT INTO sekai_object_security_audit
+             (event_id, namespace, actor, action, revision_digest, policy_count, reason_code, created_at_ms)
+             VALUES ($1, $2, $3, $4, $5, 1, $6, $7)",
+            &[
+                &Uuid::new_v4().to_string(),
+                &namespace,
+                &actor,
+                &action,
+                &revision_digest,
+                &reason_code,
+                &now_ms,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn postgres_authorize_object_write(
+    client: &mut impl GenericClient,
+    current: Option<&Object>,
+    proposed: Option<&Object>,
+    context: &PrincipalPolicyContext,
+    actor: &str,
+    action: &str,
+    now_ms: i64,
+) -> Result<ObjectPolicyWriteDecision, String> {
+    let namespace = current
+        .or(proposed)
+        .map(|object| object.namespace.as_str())
+        .unwrap_or_default();
+    if namespace.is_empty() || !postgres_namespace_activated(client, namespace)? {
+        return Ok(ObjectPolicyWriteDecision::Inactive);
+    }
+    if let Some(current) = current {
+        let revision =
+            postgres_active_revision(client, namespace, &current.kind)?.unwrap_or_default();
+        if !postgres_snapshot_authorized(client, current, context)? {
+            postgres_insert_write_audit(
+                client,
+                namespace,
+                actor,
+                action,
+                &revision,
+                "deny_current",
+                now_ms,
+            )?;
+            return Ok(ObjectPolicyWriteDecision::DenyCurrent {
+                revision_digest: revision,
+            });
+        }
+    }
+    if let Some(proposed) = proposed {
+        let revision =
+            postgres_active_revision(client, namespace, &proposed.kind)?.unwrap_or_default();
+        if !postgres_snapshot_authorized(client, proposed, context)? {
+            postgres_insert_write_audit(
+                client,
+                namespace,
+                actor,
+                action,
+                &revision,
+                "deny_proposed",
+                now_ms,
+            )?;
+            return Ok(ObjectPolicyWriteDecision::DenyProposed {
+                revision_digest: revision,
+            });
+        }
+        postgres_insert_write_audit(client, namespace, actor, action, &revision, "allow", now_ms)?;
+        return Ok(ObjectPolicyWriteDecision::Allow {
+            revision_digest: revision,
+        });
+    }
+    let kind = current
+        .map(|object| object.kind.as_str())
+        .unwrap_or_default();
+    let revision = postgres_active_revision(client, namespace, kind)?.unwrap_or_default();
+    postgres_insert_write_audit(client, namespace, actor, action, &revision, "allow", now_ms)?;
+    Ok(ObjectPolicyWriteDecision::Allow {
+        revision_digest: revision,
+    })
+}
+
+impl PostgresDb {
+    pub fn policy_cursor_binding(&self, namespace: Option<&str>) -> Result<String, String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let digest = postgres_policy_cursor_binding(&mut transaction, namespace)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(digest)
+    }
+}
+
+pub(crate) fn postgres_policy_cursor_binding(
+    client: &mut impl GenericClient,
+    namespace: Option<&str>,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sekai.object-security-cursor-binding/v1\0");
+    if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
+        hasher.update(namespace.as_bytes());
+        let rows = client
+            .query(
+                "SELECT kind, revision_digest FROM sekai_object_security_active_policies
+                 WHERE namespace=$1 ORDER BY kind",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let kind: String = row.get(0);
+            let digest: String = row.get(1);
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(digest.as_bytes());
+        }
+    } else {
+        hasher.update(b"*");
+        let rows = client
+            .query(
+                "SELECT namespace, kind, revision_digest FROM sekai_object_security_active_policies
+                 ORDER BY namespace, kind",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let namespace: String = row.get(0);
+            let kind: String = row.get(1);
+            let digest: String = row.get(2);
+            hasher.update([0]);
+            hasher.update(namespace.as_bytes());
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(digest.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }

@@ -373,6 +373,7 @@ impl SekaiDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
@@ -394,6 +395,21 @@ impl SekaiDb {
                 ).map_err(storage)?;
                 if historical_changes > 0 {
                     return Err(LeaseError::Mutation("object IDs with audit history cannot be reused".into()));
+                }
+                if let Some(policy) = policy {
+                    let decision = crate::db::object_security::sqlite_authorize_object_write(
+                        tx,
+                        None,
+                        Some(object),
+                        policy,
+                        actor,
+                        "object_create",
+                        transaction_now_ms,
+                    )
+                    .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
                 }
                 let props = crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
@@ -418,6 +434,7 @@ impl SekaiDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
@@ -441,6 +458,21 @@ impl SekaiDb {
                 if before.kind != object.kind {
                     crate::sekai::ontology::validate_object_kind_change(tx, &object.id, &object.kind).map_err(LeaseError::Mutation)?;
                 }
+                if let Some(policy) = policy {
+                    let decision = crate::db::object_security::sqlite_authorize_object_write(
+                        tx,
+                        Some(&before),
+                        Some(object),
+                        policy,
+                        actor,
+                        "object_update",
+                        transaction_now_ms,
+                    )
+                    .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
+                }
                 let props = crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
                     "UPDATE sekai_objects SET kind=?2,name=?3,namespace=?4,external_id=?5,properties=?6,updated=?7 WHERE id=?1",
@@ -463,6 +495,7 @@ impl SekaiDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
         self.guarded_object_mutation(
@@ -476,6 +509,21 @@ impl SekaiDb {
                     return Err(LeaseError::Mutation(
                         "object changed since authorization".into(),
                     ));
+                }
+                if let Some(policy) = policy {
+                    let decision = crate::db::object_security::sqlite_authorize_object_write(
+                        tx,
+                        Some(&before),
+                        None,
+                        policy,
+                        actor,
+                        "object_delete",
+                        transaction_now_ms,
+                    )
+                    .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
                 }
                 tx.execute("DELETE FROM sekai_objects WHERE id=?1", params![object_id]).map_err(storage)?;
                 tx.execute("DELETE FROM sekai_links WHERE from_id=?1 OR to_id=?1", params![object_id]).map_err(storage)?;
@@ -952,8 +1000,17 @@ mod tests {
             .acquire_lease("n", "k", "a", 10, "lease-1", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let original = object("o", "original");
-        db.guarded_create_object(&original, "n", "k", &first.fencing_token, "create", "a", 11)
-            .unwrap();
+        db.guarded_create_object(
+            &original,
+            "n",
+            "k",
+            &first.fencing_token,
+            "create",
+            "a",
+            11,
+            None,
+        )
+        .unwrap();
 
         let mut expired_update = original.clone();
         expired_update.name = "expired".into();
@@ -967,7 +1024,8 @@ mod tests {
                 &first.fencing_token,
                 "expired-update",
                 "a",
-                20
+                20,
+                None
             ),
             Err(LeaseError::Stale(_))
         ));
@@ -994,7 +1052,8 @@ mod tests {
                 &first.fencing_token,
                 "stale-delete",
                 "a",
-                21
+                21,
+                None
             ),
             Err(LeaseError::Stale(_))
         ));
@@ -1018,7 +1077,8 @@ mod tests {
                 &second.fencing_token,
                 "released-update",
                 "b",
-                23
+                23,
+                None
             ),
             Err(LeaseError::Stale(_))
         ));
@@ -1032,8 +1092,17 @@ mod tests {
             .acquire_lease("n", "k", "a", 100, "lease", "a", DEFAULT_SITE_ID, 10)
             .unwrap();
         let value = object("o", "value");
-        db.guarded_create_object(&value, "n", "k", &lease.fencing_token, "create", "a", 11)
-            .unwrap();
+        db.guarded_create_object(
+            &value,
+            "n",
+            "k",
+            &lease.fencing_token,
+            "create",
+            "a",
+            11,
+            None,
+        )
+        .unwrap();
         let mut stale_authorization = value.clone();
         stale_authorization.name = "different".into();
         assert!(matches!(
@@ -1045,8 +1114,7 @@ mod tests {
                 &lease.fencing_token,
                 "stale-authorization",
                 "a",
-                12,
-            ),
+                12, None),
             Err(LeaseError::Mutation(message)) if message == "object changed since authorization"
         ));
         db.guarded_delete_object(
@@ -1058,6 +1126,7 @@ mod tests {
             "delete",
             "a",
             12,
+            None,
         )
         .unwrap();
         db.guarded_delete_object(
@@ -1069,6 +1138,7 @@ mod tests {
             "delete",
             "a",
             999,
+            None,
         )
         .unwrap();
         let changes = db.list_object_changes("o", 100, 0).unwrap();
@@ -1124,6 +1194,7 @@ mod tests {
                     "update",
                     "a",
                     19,
+                    None,
                 )
             })
         };
@@ -1180,8 +1251,7 @@ mod tests {
                 &lease.fencing_token,
                 "stale-snapshot",
                 "a",
-                11,
-            ),
+                11, None),
             Err(LeaseError::Mutation(message)) if message == "object changed since authorization"
         ));
         let committed = db
@@ -1195,6 +1265,7 @@ mod tests {
                 "update",
                 "a",
                 12,
+                None,
             )
             .unwrap();
         db.delete_object_with_audit("o", "other").unwrap();
@@ -1209,6 +1280,7 @@ mod tests {
                 "update",
                 "a",
                 999,
+                None,
             )
             .unwrap();
         assert_eq!(replay.name, committed.name);

@@ -1,11 +1,22 @@
 use crate::db::postgres::PostgresDb;
+use crate::db::postgres_object_security::postgres_authorize_object_write;
 use crate::domain::Object;
 use crate::sekai::audit::{ObjectChange, object_diff_changes};
+use crate::sekai::object_security::PrincipalPolicyContext;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
 
 impl PostgresDb {
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_policy_audit(object, actor, None)
+    }
+
+    pub fn create_object_with_policy_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        policy: Option<&PrincipalPolicyContext>,
+    ) -> Result<(), String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
         let mut connection = self.connection()?;
@@ -22,6 +33,23 @@ impl PostgresDb {
             .get(0);
         if historical > 0 {
             return Err("object IDs with audit history cannot be reused".into());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(policy) = policy {
+            let decision = postgres_authorize_object_write(
+                &mut transaction,
+                None,
+                Some(object),
+                policy,
+                actor,
+                "object_create",
+                now,
+            )?;
+            if let Some(error) = decision.deny_error() {
+                // Commit the value-free deny audit; do not persist the object write.
+                transaction.commit().map_err(|error| error.to_string())?;
+                return Err(error.into());
+            }
         }
         transaction
             .execute(
@@ -42,12 +70,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         insert_changes(
             &mut transaction,
-            &object_diff_changes(
-                actor,
-                None,
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
-            ),
+            &object_diff_changes(actor, None, Some(object), now),
         )?;
         transaction.commit().map_err(|error| error.to_string())
     }
@@ -57,6 +80,16 @@ impl PostgresDb {
         object: &Object,
         actor: &str,
         expected_updated: i64,
+    ) -> Result<Option<Object>, String> {
+        self.update_object_with_policy_audit_if_revision(object, actor, expected_updated, None)
+    }
+
+    pub fn update_object_with_policy_audit_if_revision(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_updated: i64,
+        policy: Option<&PrincipalPolicyContext>,
     ) -> Result<Option<Object>, String> {
         validate_namespace_identity(object)?;
         let properties = crate::domain::storage_properties_json(&object.properties)?;
@@ -91,6 +124,26 @@ impl PostgresDb {
         if before.updated != expected_updated || object.updated <= expected_updated {
             return Err("object revision conflict".into());
         }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(policy) = policy {
+            let decision = postgres_authorize_object_write(
+                &mut transaction,
+                Some(&before),
+                Some(object),
+                policy,
+                actor,
+                "object_update",
+                now,
+            )?;
+            if let Some(error) = decision.deny_error() {
+                transaction.commit().map_err(|error| error.to_string())?;
+                return if error == crate::db::object_security::OBJECT_SECURITY_NOT_FOUND {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                };
+            }
+        }
         // The updated timestamp is the optimistic revision token shared by the
         // current public Object contract. A stale writer cannot overwrite a
         // newer committed revision.
@@ -117,12 +170,7 @@ impl PostgresDb {
         }
         insert_changes(
             &mut transaction,
-            &object_diff_changes(
-                actor,
-                Some(&before),
-                Some(object),
-                chrono::Utc::now().timestamp_millis(),
-            ),
+            &object_diff_changes(actor, Some(&before), Some(object), now),
         )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(Some(before))
@@ -150,6 +198,15 @@ impl PostgresDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_policy_audit(id, actor, None)
+    }
+
+    pub fn delete_object_with_policy_audit(
+        &self,
+        id: &str,
+        actor: &str,
+        policy: Option<&PrincipalPolicyContext>,
+    ) -> Result<Option<Object>, String> {
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -163,6 +220,22 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?
             .map(row_to_object)
             .transpose()?;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let (Some(policy), Some(before_object)) = (policy, before.as_ref()) {
+            let decision = postgres_authorize_object_write(
+                &mut transaction,
+                Some(before_object),
+                None,
+                policy,
+                actor,
+                "object_delete",
+                now,
+            )?;
+            if decision.deny_error().is_some() {
+                transaction.commit().map_err(|error| error.to_string())?;
+                return Ok(None);
+            }
+        }
         transaction
             .execute(
                 "DELETE FROM sekai_links WHERE from_id = $1 OR to_id = $1",

@@ -231,6 +231,105 @@ fn exercise(db: RuntimeDb, namespace: &str) {
             .unwrap()
             .is_none()
     );
+
+    let owner = policy(
+        namespace,
+        "document",
+        vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+            property: "owner".into(),
+        }],
+    );
+    let owner_revision = db
+        .put_object_security_policy(&owner, "root", "put-owner-writes", 11)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), owner_revision.revision_digest.clone())]),
+        "root",
+        "activate-owner-writes",
+        12,
+    )
+    .unwrap();
+    let alice = PrincipalPolicyContext {
+        subjects: vec!["alice".into()],
+        scopes: vec![],
+    };
+    let bob = PrincipalPolicyContext {
+        subjects: vec!["bob".into()],
+        scopes: vec![],
+    };
+
+    let mut proposed = object(namespace, "a", "alpha", "alice", "open");
+    proposed.name = "alpha-renamed".into();
+    proposed.updated = 2;
+    assert!(
+        db.update_object_with_policy_audit(&proposed, "alice", Some(&alice))
+            .unwrap()
+            .is_some()
+    );
+    proposed.properties.insert("owner".into(), "bob".into());
+    proposed.updated = 3;
+    assert_eq!(
+        db.update_object_with_policy_audit(&proposed, "alice", Some(&alice))
+            .unwrap_err(),
+        "object_security_denied"
+    );
+    assert!(
+        db.update_object_with_policy_audit(&proposed, "alice", Some(&bob))
+            .unwrap()
+            .is_none()
+    );
+    let mut created = object(namespace, "new", "november", "bob", "open");
+    created.updated = 4;
+    created.created = 4;
+    assert_eq!(
+        db.create_object_with_policy_audit(&created, "alice", Some(&alice))
+            .unwrap_err(),
+        "object_security_denied"
+    );
+    db.create_object_with_policy_audit(&created, "bob", Some(&bob))
+        .unwrap();
+    assert!(
+        db.delete_object_with_policy_audit(&object_id(namespace, "b"), "alice", Some(&alice))
+            .unwrap()
+            .is_none()
+    );
+    assert!(db.get_object(&object_id(namespace, "b")).unwrap().is_some());
+    assert!(
+        db.delete_object_with_policy_audit(&object_id(namespace, "c"), "alice", Some(&alice))
+            .unwrap()
+            .is_some()
+    );
+
+    let found = db
+        .find_by_property_with_policy_context("document", "state", "open", Some(&alice))
+        .unwrap();
+    assert!(
+        found
+            .iter()
+            .all(|row| row.properties.get("owner") == Some(&"alice".to_string()))
+    );
+    assert!(found.iter().all(|row| row.id != object_id(namespace, "b")));
+
+    if matches!(&db, RuntimeDb::Sqlite(_)) {
+        let audit_reasons: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT reason_code FROM sekai_object_security_audit
+                 WHERE namespace=?1 AND action LIKE 'object_%' ORDER BY created_at_ms, event_id",
+            )
+            .unwrap()
+            .query_map([namespace], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(audit_reasons.contains(&"allow".to_string()));
+        assert!(audit_reasons.contains(&"deny_current".to_string()));
+        assert!(audit_reasons.contains(&"deny_proposed".to_string()));
+        assert!(audit_reasons.iter().all(|reason| {
+            matches!(reason.as_str(), "allow" | "deny_current" | "deny_proposed")
+        }));
+    }
 }
 
 #[test]

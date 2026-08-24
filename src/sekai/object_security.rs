@@ -89,6 +89,101 @@ impl PrincipalPolicyContext {
         self.scopes.dedup();
         self
     }
+
+    pub fn digest(&self) -> String {
+        let context = self.clone().normalized();
+        let mut hasher = Sha256::new();
+        hasher.update(b"sekai.object-security-principal/v1\0");
+        hasher.update(serde_json::to_vec(&context.subjects).unwrap_or_default());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(&context.scopes).unwrap_or_default());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+pub const OBJECT_LIST_PAGE_TOKEN_TTL_MS: i64 = 15 * 60 * 1000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectListPageToken {
+    pub principal_digest: String,
+    pub namespace: String,
+    pub policy_revision: String,
+    pub query_digest: String,
+    pub offset: i32,
+    pub expiry_ms: i64,
+}
+
+impl ObjectListPageToken {
+    pub fn encode(&self) -> Result<String, String> {
+        let json = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        Ok(base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            json,
+        ))
+    }
+
+    pub fn decode(token: &str) -> Result<Self, String> {
+        let json = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            token.trim(),
+        )
+        .map_err(|_| "object_security_cursor_invalid: malformed page token".to_string())?;
+        serde_json::from_slice(&json)
+            .map_err(|_| "object_security_cursor_invalid: malformed page token".into())
+    }
+
+    pub fn validate(
+        &self,
+        context: &PrincipalPolicyContext,
+        namespace: &str,
+        policy_revision: &str,
+        query_digest: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if self.expiry_ms <= now_ms {
+            return Err("object_security_cursor_expired: page token expired".into());
+        }
+        if self.principal_digest != context.digest()
+            || self.namespace != namespace
+            || self.policy_revision != policy_revision
+            || self.query_digest != query_digest
+            || self.offset < 0
+        {
+            return Err(
+                "object_security_cursor_mismatch: page token is bound to a different authority or query"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn list_query_digest(filter: &crate::domain::ListFilter) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sekai.object-security-list-query/v1\0");
+    hasher.update(filter.kind.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(filter.name.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(filter.namespace.as_deref().unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(filter.order_by.as_bytes());
+    hasher.update([0]);
+    hasher.update([u8::from(filter.descending)]);
+    hasher.update(filter.limit.to_le_bytes());
+    for property in &filter.property_filters {
+        hasher.update([0]);
+        hasher.update(property.key.as_bytes());
+        hasher.update([0]);
+        hasher.update(property.op.as_bytes());
+        hasher.update([0]);
+        hasher.update(property.value.as_bytes());
+    }
+    for interface in &filter.interface_filter {
+        hasher.update([0]);
+        hasher.update(interface.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 impl ObjectSecurityPolicy {
@@ -356,5 +451,40 @@ mod tests {
         .normalized();
         assert_eq!(context.subjects, ["alice"]);
         assert_eq!(context.scopes, ["documents:read"]);
+    }
+
+    #[test]
+    fn page_token_rejects_changed_authority_or_expiry() {
+        let context = PrincipalPolicyContext {
+            subjects: vec!["alice".into()],
+            scopes: vec!["documents:read".into()],
+        }
+        .normalized();
+        let token = ObjectListPageToken {
+            principal_digest: context.digest(),
+            namespace: "acme".into(),
+            policy_revision: "rev".into(),
+            query_digest: "query".into(),
+            offset: 2,
+            expiry_ms: 100,
+        };
+        assert!(token.validate(&context, "acme", "rev", "query", 99).is_ok());
+        assert!(
+            token
+                .validate(&context, "acme", "rev", "query", 100)
+                .unwrap_err()
+                .contains("expired")
+        );
+        let other = PrincipalPolicyContext {
+            subjects: vec!["bob".into()],
+            scopes: vec!["documents:read".into()],
+        }
+        .normalized();
+        assert!(
+            token
+                .validate(&other, "acme", "rev", "query", 99)
+                .unwrap_err()
+                .contains("mismatch")
+        );
     }
 }

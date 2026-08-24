@@ -7,6 +7,7 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
 use crate::sekai::lease::LeaseError;
+use crate::sekai::object_security::PrincipalPolicyContext;
 
 pub(crate) struct LeasePrecondition<'a> {
     pub namespace: &'a str,
@@ -25,18 +26,29 @@ pub(crate) enum MutationPersistenceError {
 pub(crate) struct ObjectMutation<'a> {
     db: &'a RuntimeDb,
     lease: Option<LeasePrecondition<'a>>,
+    policy: Option<&'a PrincipalPolicyContext>,
 }
 
 impl<'a> ObjectMutation<'a> {
     pub(crate) fn direct(db: &'a RuntimeDb) -> Self {
-        Self { db, lease: None }
+        Self {
+            db,
+            lease: None,
+            policy: None,
+        }
     }
 
     pub(crate) fn guarded(db: &'a RuntimeDb, lease: LeasePrecondition<'a>) -> Self {
         Self {
             db,
             lease: Some(lease),
+            policy: None,
         }
+    }
+
+    pub(crate) fn with_policy(mut self, policy: &'a PrincipalPolicyContext) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     pub(crate) fn replay(
@@ -76,11 +88,12 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.policy,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
             self.db
-                .create_object_with_audit(object, actor)
+                .create_object_with_policy_audit(object, actor, self.policy)
                 .map_err(MutationPersistenceError::Graph)?;
             Ok(object.clone())
         }
@@ -106,11 +119,12 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.policy,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
             self.db
-                .update_object_with_audit(object, actor)
+                .update_object_with_policy_audit(object, actor, self.policy)
                 .map_err(MutationPersistenceError::Graph)?
                 .ok_or(MutationPersistenceError::NotFound)?;
             Ok(object.clone())
@@ -135,11 +149,12 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.policy,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
             self.db
-                .delete_object_with_audit(id, actor)
+                .delete_object_with_policy_audit(id, actor, self.policy)
                 .map_err(MutationPersistenceError::Graph)?;
             Ok(())
         }

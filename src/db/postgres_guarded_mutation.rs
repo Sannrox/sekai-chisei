@@ -62,6 +62,7 @@ impl PostgresDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
@@ -97,6 +98,22 @@ impl PostgresDb {
                     return Err(LeaseError::Mutation(
                         "object IDs with audit history cannot be reused".into(),
                     ));
+                }
+                if let Some(policy) = policy {
+                    let decision =
+                        crate::db::postgres_object_security::postgres_authorize_object_write(
+                            tx,
+                            None,
+                            Some(object),
+                            policy,
+                            actor,
+                            "object_create",
+                            transaction_now_ms,
+                        )
+                        .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
                 }
                 let props =
                     crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
@@ -137,6 +154,7 @@ impl PostgresDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
@@ -181,6 +199,22 @@ impl PostgresDb {
                             .into(),
                     ));
                 }
+                if let Some(policy) = policy {
+                    let decision =
+                        crate::db::postgres_object_security::postgres_authorize_object_write(
+                            tx,
+                            Some(&before),
+                            Some(object),
+                            policy,
+                            actor,
+                            "object_update",
+                            transaction_now_ms,
+                        )
+                        .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
+                }
                 let props =
                     crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
@@ -218,6 +252,7 @@ impl PostgresDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
         self.guarded_object_mutation(
@@ -247,6 +282,22 @@ impl PostgresDb {
                     return Err(LeaseError::Mutation(
                         "object changed since authorization".into(),
                     ));
+                }
+                if let Some(policy) = policy {
+                    let decision =
+                        crate::db::postgres_object_security::postgres_authorize_object_write(
+                            tx,
+                            Some(&before),
+                            None,
+                            policy,
+                            actor,
+                            "object_delete",
+                            transaction_now_ms,
+                        )
+                        .map_err(LeaseError::Mutation)?;
+                    if let Some(error) = decision.deny_error() {
+                        return Err(LeaseError::Mutation(error.into()));
+                    }
                 }
                 tx.execute(
                     "DELETE FROM sekai_links WHERE from_id=$1 OR to_id=$1",

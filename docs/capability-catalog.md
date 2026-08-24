@@ -63,10 +63,12 @@ namespace membership, object ACLs, policy, budgets, object state, and current
 schema.
 
 Object-query discovery does not expose or cache object-security policy
-authority. After explicit namespace activation, direct reads and
-`ListObjects` recheck the active revision per row in storage. Mixed-namespace
-lists retain legacy behavior for unactivated rows. Raw backing datasets retain
-their independent authorization boundary.
+authority. After explicit namespace activation, direct reads, remaining object
+consumers, writes, and `ListObjects` recheck the active revision per row or
+snapshot in storage. Mixed-namespace lists retain legacy behavior for
+unactivated rows. Page tokens are bound to the caller and current policy
+revisions. Raw backing datasets retain their independent authorization
+boundary.
 
 ## Governed invocation binding
 

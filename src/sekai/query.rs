@@ -2,6 +2,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -17,6 +18,7 @@ pub struct GraphQuery {
     pub kind_filter: Vec<String>,
     pub interface_filter: Vec<String>,
     pub property_filter: HashMap<String, String>,
+    pub policy_context: Option<PrincipalPolicyContext>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -73,7 +75,12 @@ pub fn traverse(
                     }
                     visited.insert(target.clone());
 
-                    if let Some(obj) = db.get_object(target)? {
+                    let obj = if let Some(context) = &q.policy_context {
+                        db.get_object_with_policy_context(target, context)?
+                    } else {
+                        db.get_object(target)?
+                    };
+                    if let Some(obj) = obj {
                         next.push_back(target.clone());
                         if matches_filters(
                             &obj,

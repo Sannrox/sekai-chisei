@@ -13,6 +13,7 @@ impl SekaiServiceImpl {
         req: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
@@ -24,7 +25,7 @@ impl SekaiServiceImpl {
         for object_id in [&l.from_id, &l.to_id] {
             let object = self
                 .db
-                .get_object(object_id)
+                .get_object_with_policy_context(object_id, &policy_context)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
             enforce_namespace_tenant_context(
@@ -78,6 +79,7 @@ impl SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let id = req.into_inner().id;
@@ -87,7 +89,7 @@ impl SekaiServiceImpl {
         for object_id in [&link.from_id, &link.to_id] {
             let object = self
                 .db
-                .get_object(object_id)
+                .get_object_with_policy_context(object_id, &policy_context)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
             enforce_namespace_tenant_context(

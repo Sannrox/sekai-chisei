@@ -667,6 +667,7 @@ fn build_retrieval_query(
         max_explanation_bytes: input.max_explanation_bytes,
         initial_source_rows: 0,
         source_rows_truncated: false,
+        policy_context: None,
     })
 }
 
@@ -840,6 +841,13 @@ fn run_lookup_retrieval(
     mut query: RetrievalQuery,
 ) -> Result<retrieval::RetrievalResult, RetrievalLookupError> {
     let started = Instant::now();
+    query.policy_context = Some(
+        crate::sekai::object_security::PrincipalPolicyContext {
+            subjects: vec![actor.to_string()],
+            scopes: Vec::new(),
+        }
+        .normalized(),
+    );
     let principals = effective_lookup_principals(actor);
     let roots = query.roots.clone();
     if let Some(reason) = preflight_root_access(&roots, namespace, &principals, db)

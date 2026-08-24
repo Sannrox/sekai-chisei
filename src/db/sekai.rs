@@ -675,22 +675,23 @@ impl SekaiDb {
         id: &str,
         context: &PrincipalPolicyContext,
     ) -> Result<Option<Object>, String> {
-        let context = context.clone().normalized();
-        let subjects =
-            serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
-        let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+        let (subjects, scopes) = crate::db::object_security::bind_sqlite_policy_context(context)?;
         self.conn()
             .query_row(
                 &format!(
                     "SELECT id, kind, name, namespace, external_id, properties, created, updated
                      FROM sekai_objects WHERE id=?1{}",
-                    sqlite_object_security_filter(1)
+                    crate::db::object_security::sqlite_object_security_filter(1)
                 ),
                 params![id, subjects, scopes],
                 row_to_object,
             )
             .optional()
             .map_err(|error| error.to_string())
+    }
+
+    pub fn policy_cursor_binding(&self, namespace: Option<&str>) -> Result<String, String> {
+        crate::db::object_security::sqlite_policy_cursor_binding(&self.conn(), namespace)
     }
 
     pub fn update_object(&self, o: &Object) -> Result<(), String> {
@@ -1112,16 +1113,35 @@ impl SekaiDb {
         key: &str,
         value: &str,
     ) -> Result<Vec<Object>, String> {
+        self.find_by_property_with_policy_context(kind, key, value, None)
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
             return Err("invalid property key".into());
         }
         let conn = self.conn();
         let json_path = format!("$.{}", key);
-        let mut stmt = conn.prepare(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE kind = ?1 AND json_extract(properties, ?2) = ?3"
-        ).map_err(|e| e.to_string())?;
+        let (policy_filter, policy_params) = build_sqlite_object_security_filter(context, 3)?;
+        let sql = format!(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated
+             FROM sekai_objects WHERE kind = ?1 AND json_extract(properties, ?2) = ?3{policy_filter}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&kind, &json_path, &value];
+        params.extend(
+            policy_params
+                .iter()
+                .map(|value| value.as_ref() as &dyn rusqlite::types::ToSql),
+        );
         let rows = stmt
-            .query_map(params![kind, json_path, value], row_to_object)
+            .query_map(params.as_slice(), row_to_object)
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -1310,6 +1330,16 @@ impl SekaiDb {
         relation: &str,
         dir: &Direction,
     ) -> Result<Vec<Object>, String> {
+        self.get_linked_objects_with_policy_context(object_id, relation, dir, None)
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         let links = self.get_links(object_id, relation, dir)?;
         let mut objects = Vec::new();
         for link in &links {
@@ -1317,7 +1347,12 @@ impl SekaiDb {
                 Direction::Outgoing => &link.to_id,
                 Direction::Incoming => &link.from_id,
             };
-            if let Ok(Some(obj)) = self.get_object(target_id) {
+            let object = if let Some(context) = context {
+                self.get_object_with_policy_context(target_id, context)?
+            } else {
+                self.get_object(target_id)?
+            };
+            if let Some(obj) = object {
                 objects.push(obj);
             }
         }
@@ -1550,60 +1585,11 @@ fn build_sqlite_object_security_filter(
     let Some(context) = context else {
         return Ok((String::new(), Vec::new()));
     };
-    let context = context.clone().normalized();
-    let subjects = serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
-    let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+    let (subjects, scopes) = crate::db::object_security::bind_sqlite_policy_context(context)?;
     Ok((
-        sqlite_object_security_filter(start_param),
+        crate::db::object_security::sqlite_object_security_filter(start_param),
         vec![Box::new(subjects), Box::new(scopes)],
     ))
-}
-
-fn sqlite_object_security_filter(start_param: usize) -> String {
-    let subjects = start_param + 1;
-    let scopes = start_param + 2;
-    format!(
-        " AND (
-            NOT EXISTS (
-                SELECT 1 FROM sekai_object_security_activations activation
-                WHERE activation.namespace = sekai_objects.namespace
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM sekai_object_security_active_policies active
-                JOIN sekai_object_security_rules rule
-                  ON rule.namespace=active.namespace
-                 AND rule.revision_digest=active.revision_digest
-                WHERE active.namespace=sekai_objects.namespace
-                  AND active.kind=sekai_objects.kind
-                  AND rule.operation='read'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM sekai_object_security_predicates predicate
-                    WHERE predicate.namespace=rule.namespace
-                      AND predicate.revision_digest=rule.revision_digest
-                      AND predicate.rule_index=rule.rule_index
-                      AND CASE predicate.predicate_kind
-                        WHEN 'allow_all' THEN 0
-                        WHEN 'subject_equals_property' THEN NOT EXISTS (
-                            SELECT 1 FROM json_each(?{subjects}) subject
-                            WHERE subject.value=json_extract(
-                                sekai_objects.properties, '$.' || predicate.property_key
-                            )
-                        )
-                        WHEN 'required_scope_equals' THEN NOT EXISTS (
-                            SELECT 1 FROM json_each(?{scopes}) scope
-                            WHERE scope.value=predicate.fixed_value
-                        )
-                        WHEN 'property_equals' THEN
-                            COALESCE(json_extract(
-                                sekai_objects.properties, '$.' || predicate.property_key
-                            ), '') <> predicate.fixed_value
-                        ELSE 1
-                      END
-                  )
-            )
-        )"
-    )
 }
 
 fn build_property_filter_condition(

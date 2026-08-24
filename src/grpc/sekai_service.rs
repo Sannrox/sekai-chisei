@@ -1709,6 +1709,10 @@ fn check_ontology_relation_read(
 fn map_graph_mutation_error(error: String) -> Status {
     if error == "link endpoints violate ontology constraint" {
         Status::failed_precondition(error)
+    } else if error == crate::db::object_security::OBJECT_SECURITY_NOT_FOUND {
+        Status::not_found("not found")
+    } else if error == crate::db::object_security::OBJECT_SECURITY_DENIED {
+        Status::failed_precondition("object mutation denied")
     } else {
         Status::internal(error)
     }
@@ -2473,6 +2477,16 @@ fn map_lease_error(error: crate::sekai::lease::LeaseError) -> Status {
         LeaseError::NotExpired => Status::failed_precondition("lease has not expired"),
         LeaseError::Storage(message) => Status::internal(message),
         LeaseError::Mutation(message) if message == "not found" => Status::not_found(message),
+        LeaseError::Mutation(message)
+            if message == crate::db::object_security::OBJECT_SECURITY_NOT_FOUND =>
+        {
+            Status::not_found("not found")
+        }
+        LeaseError::Mutation(message)
+            if message == crate::db::object_security::OBJECT_SECURITY_DENIED =>
+        {
+            Status::failed_precondition("object mutation denied")
+        }
         LeaseError::Mutation(message) => Status::failed_precondition(message),
     }
 }
@@ -4704,7 +4718,8 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
-        let result = self.execute_retrieve_context(&principals, req.into_inner());
+        let policy_context = principal_policy_context(&req);
+        let result = self.execute_retrieve_context(&principals, &policy_context, req.into_inner());
         match result {
             Ok(response) => {
                 if let Some((_, guard)) = receipt_guard.as_mut() {
@@ -4744,6 +4759,7 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
+        let policy_context = principal_policy_context(&req);
         let inner = req.into_inner();
         let root = inner
             .root
@@ -4752,6 +4768,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            &policy_context,
             RetrieveContextRequest {
                 roots: vec![root],
                 relations: inner.relations,
@@ -4839,6 +4856,7 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
+        let policy_context = principal_policy_context(&req);
         let inner = req.into_inner();
         let from = inner
             .from
@@ -4851,6 +4869,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            &policy_context,
             RetrieveContextRequest {
                 roots: vec![from],
                 relations: inner.relations,
@@ -9707,6 +9726,7 @@ mod tests {
                     limit: 10,
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -10157,6 +10177,7 @@ mod tests {
                     kind: "cluster".into(),
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -10311,6 +10332,7 @@ mod tests {
                         kind: "policy-cluster".into(),
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -12643,6 +12665,7 @@ mod tests {
                     interface_filter: vec!["Trackable".into()],
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()
@@ -14037,7 +14060,10 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest { filter: None },
+                ListObjectsRequest {
+                    filter: None,
+                    page_token: String::new(),
+                },
                 "alice",
             ))
             .await
@@ -14079,6 +14105,7 @@ mod tests {
                         offset: 0,
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -14108,7 +14135,10 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest { filter: None },
+                ListObjectsRequest {
+                    filter: None,
+                    page_token: String::new(),
+                },
                 "alice",
             ))
             .await
@@ -14135,6 +14165,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -14158,6 +14189,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    page_token: String::new(),
                 },
                 "alice",
             ))
@@ -14584,6 +14616,7 @@ mod tests {
                     kind: "action_policy".into(),
                     ..Default::default()
                 }),
+                page_token: String::new(),
             }))
             .await
             .unwrap()

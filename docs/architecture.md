@@ -78,11 +78,12 @@ identity still match. See
 [ADR 0024](decisions/0024-governed-definition-branches.md).
 
 Explicit namespace activation can add immutable object-security policy
-revisions to direct object read and `ListObjects`. SQLite and PostgreSQL compile
-the bounded v1 vocabulary into storage predicates before rows, totals,
-ordering, filtering, limits, or offsets are materialized. Inactive namespaces
-retain existing behavior; activated namespaces deny missing or unsupported
-policy while ACLs, team boundaries, and markings remain narrowing layers. See
+revisions to object reads, remaining object consumers, and writes. SQLite and
+PostgreSQL compile the bounded v1 vocabulary into storage predicates before
+rows, totals, ordering, filtering, limits, offsets, traversal hops, or mutation
+snapshots are materialized. Inactive namespaces retain existing behavior;
+activated namespaces deny missing or unsupported policy while ACLs, team
+boundaries, and markings remain narrowing layers. See
 [Object security policy](object-security.md) and
 [ADR 0025](decisions/0025-storage-enforced-object-security.md).
 

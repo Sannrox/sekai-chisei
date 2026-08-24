@@ -28,9 +28,10 @@ checking durable state, so concurrent writers cannot both advance one expected
 head or published pointer.
 
 The reusable `sekai.object-security` surface shares immutable policy
-revisions, exact replay, complete atomic activation, and SQL-enforced direct
-read/list predicates across SQLite and PostgreSQL. Normal CI runs SQLite;
-PostgreSQL conformance remains an ignored isolated-database test.
+revisions, exact replay, complete atomic activation, SQL-enforced object
+predicates, transactional write reauthorization, remaining object consumers,
+and authority-bound list cursors across SQLite and PostgreSQL. Normal CI runs
+SQLite; PostgreSQL conformance remains an ignored isolated-database test.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
@@ -67,6 +68,7 @@ Evidence is checked in as:
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 | #666 | Governed definition branch and immutable revision foundation |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
+| #729 | Write reauthorization, remaining object consumers, and bound list cursors |
 
 ## Still outside this parent
 

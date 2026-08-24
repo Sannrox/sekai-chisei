@@ -8,11 +8,17 @@
   head only with a live approval and matching member identity. Stale
   candidates, missing approvals, and foreign digests fail before the head
   moves; exact replay and closed proposals preserve history.
+- Apply activated object-security policy to writes and remaining object
+  consumers. Creates authorize proposed state, deletes authorize current
+  state, and updates reauthorize both snapshots inside the mutation
+  transaction. Traversal, linked reads, property search, retrieval, export,
+  synchronization, and action object resolution use the same storage
+  predicates. `ListObjects` page tokens bind principal, namespace, policy
+  revision, query, and expiry so mixed-authority pagination fails closed.
 - Add immutable `sekai.object-security-policy/v1` revisions, atomic namespace
   activation, administrative gRPC inspection/mutation, and SQLite/PostgreSQL
   storage-predicate enforcement for direct object reads and `ListObjects`.
-  Existing inactive namespaces keep prior ACL and marking semantics; writes,
-  remaining object consumers, and authority-bound cursors remain unsupported.
+  Existing inactive namespaces keep prior ACL and marking semantics.
 - Add a separate bounded native content contract for ordered text, image,
   audio, and document descriptors. Content plans preserve the existing text
   RPCs, authorize disclosure through Chisei policy, verify transient payload

@@ -6,6 +6,7 @@
 use super::*;
 
 impl SekaiServiceImpl {
+    #[allow(dead_code)]
     pub(super) fn resolve_computed_for_response(
         &self,
         object: domain::Object,
@@ -60,6 +61,7 @@ impl SekaiServiceImpl {
         ))
     }
 
+    #[allow(dead_code)]
     pub(super) fn resolve_computed_for_responses(
         &self,
         objects: Vec<domain::Object>,

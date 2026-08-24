@@ -103,6 +103,7 @@ pub struct RetrievalQuery {
     pub max_explanation_bytes: u64,
     pub initial_source_rows: u32,
     pub source_rows_truncated: bool,
+    pub policy_context: Option<crate::sekai::object_security::PrincipalPolicyContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,7 +388,7 @@ where
     for root in &query.roots {
         match root {
             RetrievalRoot::Object(id) => {
-                let Some(object) = load_object(db, id, &mut object_cache)? else {
+                let Some(object) = load_object(db, query, id, &mut object_cache)? else {
                     result.unresolved_roots = result.unresolved_roots.saturating_add(1);
                     continue;
                 };
@@ -405,14 +406,24 @@ where
                 seeds.insert((object.id, origin));
             }
             RetrievalRoot::External(external_id) => {
-                let Some(object) = db
-                    .find_by_external_id(external_id)
-                    .map_err(RetrievalError::Storage)?
-                else {
+                let candidates = db
+                    .find_all_by_external_id(external_id)
+                    .map_err(RetrievalError::Storage)?;
+                if candidates.is_empty() {
+                    result.unresolved_roots = result.unresolved_roots.saturating_add(1);
+                    continue;
+                }
+                let mut object = None;
+                for found in candidates {
+                    if let Some(loaded) = load_object(db, query, &found.id, &mut object_cache)? {
+                        object = Some(loaded);
+                        break;
+                    }
+                }
+                let Some(object) = object else {
                     result.unresolved_roots = result.unresolved_roots.saturating_add(1);
                     continue;
                 };
-                object_cache.insert(object.id.clone(), Some(object.clone()));
                 if is_forbidden(&object) {
                     result.denied_roots = result.denied_roots.saturating_add(1);
                     continue;
@@ -431,8 +442,8 @@ where
                     result.unresolved_roots = result.unresolved_roots.saturating_add(1);
                     continue;
                 };
-                let from = load_object(db, &link.from_id, &mut object_cache)?;
-                let to = load_object(db, &link.to_id, &mut object_cache)?;
+                let from = load_object(db, query, &link.from_id, &mut object_cache)?;
+                let to = load_object(db, query, &link.to_id, &mut object_cache)?;
                 let (Some(from), Some(to)) = (from, to) else {
                     result.unresolved_roots = result.unresolved_roots.saturating_add(1);
                     continue;
@@ -492,7 +503,7 @@ where
         .map(|(id, origin)| (id, origin, Vec::<Link>::new()))
         .collect::<Vec<_>>();
     for (id, origin, _) in &frontier {
-        let object = load_object(db, id, &mut object_cache)?.ok_or_else(|| {
+        let object = load_object(db, query, id, &mut object_cache)?.ok_or_else(|| {
             RetrievalError::Storage(format!("resolved context root disappeared: {id}"))
         })?;
         candidates
@@ -538,7 +549,7 @@ where
             let adjacent = &adjacency_cache[&current_id];
 
             for (link, target_id) in adjacent {
-                let Some(target) = load_object(db, target_id, &mut object_cache)? else {
+                let Some(target) = load_object(db, query, target_id, &mut object_cache)? else {
                     continue;
                 };
                 if is_forbidden(&target) || !can_read(&target) {
@@ -1011,13 +1022,19 @@ fn to_u32(value: usize) -> u32 {
 
 fn load_object(
     db: &RuntimeDb,
+    query: &RetrievalQuery,
     id: &str,
     cache: &mut HashMap<String, Option<Object>>,
 ) -> Result<Option<Object>, RetrievalError> {
     if let Some(object) = cache.get(id) {
         return Ok(object.clone());
     }
-    let object = db.get_object(id).map_err(RetrievalError::Storage)?;
+    let object = if let Some(context) = &query.policy_context {
+        db.get_object_with_policy_context(id, context)
+            .map_err(RetrievalError::Storage)?
+    } else {
+        db.get_object(id).map_err(RetrievalError::Storage)?
+    };
     cache.insert(id.to_string(), object.clone());
     Ok(object)
 }

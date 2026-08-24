@@ -783,6 +783,23 @@ impl SekaiDb {
                     .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
                 updated: now_ms,
             };
+            let policy = crate::sekai::object_security::PrincipalPolicyContext {
+                subjects: vec![authenticated_producer.to_string()],
+                scopes: Vec::new(),
+            };
+            let decision = crate::db::object_security::sqlite_authorize_object_write(
+                &transaction,
+                before.as_ref(),
+                Some(&object),
+                &policy,
+                authenticated_producer,
+                "object_sync",
+                now_ms,
+            )
+            .map_err(ApplyError::Storage)?;
+            if let Some(error) = decision.deny_error() {
+                return Err(ApplyError::denied("object_security_denied", error));
+            }
             transaction.execute(
                 "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)

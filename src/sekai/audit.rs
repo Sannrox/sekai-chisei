@@ -824,6 +824,15 @@ impl SekaiDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_policy_audit(object, actor, None)
+    }
+
+    pub fn create_object_with_policy_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
+    ) -> Result<(), String> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* object IDs are reserved for namespace boundaries".into());
         }
@@ -842,6 +851,23 @@ impl SekaiDb {
         if historical_changes > 0 {
             return Err("object IDs with audit history cannot be reused".into());
         }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(policy) = policy {
+            let decision = crate::db::object_security::sqlite_authorize_object_write(
+                &tx,
+                None,
+                Some(object),
+                policy,
+                actor,
+                "object_create",
+                now,
+            )?;
+            if let Some(error) = decision.deny_error() {
+                // Commit the value-free deny audit; do not persist the object write.
+                tx.commit().map_err(|e| e.to_string())?;
+                return Err(error.into());
+            }
+        }
         let props = crate::domain::storage_properties_json(&object.properties)?;
         tx.execute(
             "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -857,7 +883,6 @@ impl SekaiDb {
             ],
         )
         .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp_millis();
         let changes = object_diff_changes(actor, None, Some(object), now);
         insert_object_changes(&tx, &changes)?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -868,6 +893,15 @@ impl SekaiDb {
         &self,
         object: &Object,
         actor: &str,
+    ) -> Result<Option<Object>, String> {
+        self.update_object_with_policy_audit(object, actor, None)
+    }
+
+    pub fn update_object_with_policy_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Option<Object>, String> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
@@ -892,6 +926,26 @@ impl SekaiDb {
         if before_object.kind != object.kind {
             crate::sekai::ontology::validate_object_kind_change(&tx, &object.id, &object.kind)?;
         }
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(policy) = policy {
+            let decision = crate::db::object_security::sqlite_authorize_object_write(
+                &tx,
+                Some(&before_object),
+                Some(object),
+                policy,
+                actor,
+                "object_update",
+                now,
+            )?;
+            if let Some(error) = decision.deny_error() {
+                tx.commit().map_err(|e| e.to_string())?;
+                return if error == crate::db::object_security::OBJECT_SECURITY_NOT_FOUND {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                };
+            }
+        }
         let props = crate::domain::storage_properties_json(&object.properties)?;
         tx.execute(
             "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
@@ -906,7 +960,6 @@ impl SekaiDb {
             ],
         )
         .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp_millis();
         let changes = object_diff_changes(actor, Some(&before_object), Some(object), now);
         insert_object_changes(&tx, &changes)?;
         tx.commit().map_err(|e| e.to_string())?;
@@ -918,6 +971,15 @@ impl SekaiDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_policy_audit(id, actor, None)
+    }
+
+    pub fn delete_object_with_policy_audit(
+        &self,
+        id: &str,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
+    ) -> Result<Option<Object>, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
@@ -928,6 +990,22 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().timestamp_millis();
+        if let (Some(policy), Some(before_object)) = (policy, before.as_ref()) {
+            let decision = crate::db::object_security::sqlite_authorize_object_write(
+                &tx,
+                Some(before_object),
+                None,
+                policy,
+                actor,
+                "object_delete",
+                now,
+            )?;
+            if decision.deny_error().is_some() {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(None);
+            }
+        }
         tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         tx.execute(
@@ -936,7 +1014,6 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         if let Some(before) = &before {
-            let now = chrono::Utc::now().timestamp_millis();
             insert_object_changes(&tx, &object_diff_changes(actor, Some(before), None, now))?;
         }
         tx.commit().map_err(|e| e.to_string())?;

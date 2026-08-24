@@ -266,6 +266,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
+                actor,
             ) {
                 Ok(None) => None,
                 Ok(Some(planned)) => {

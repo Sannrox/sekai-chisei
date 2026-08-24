@@ -23,26 +23,35 @@ rule are ANDed:
 
 Only the trusted authenticated context supplies subjects and scopes. Request
 metadata is not authority. SQLite and PostgreSQL apply policy in SQL before a
-direct row, `FindByExternalId`, or `ListObjects` total, ordering, filter,
-limit, and offset is materialized. PostgreSQL parses property documents through `sekai_jsonb_object`, so
+direct row, `FindByExternalId`, `ListObjects`, property search, linked-object
+read, traversal hop, retrieval load, or mutation snapshot is materialized.
+PostgreSQL parses property documents through `sekai_jsonb_object`, so
 malformed or jsonb-rejected values are indeterminate and denied instead of
-aborting the query. Unauthorized direct reads are returned as absent. Markings
-and existing ACLs remain narrowing layers. Generic object writes reject NUL
-property keys and values so new rows cannot poison PostgreSQL policy casts.
+aborting the query. Unauthorized direct reads and hidden current objects are
+returned as absent. Markings and existing ACLs remain narrowing layers. Generic
+object writes reject NUL property keys and values so new rows cannot poison
+PostgreSQL policy casts.
 
 `ListObjects` may span activated and unactivated namespaces. Its storage
 predicate applies each activated namespace's kind policy per row while
 preserving legacy behavior for unactivated rows; no global activation state
-changes an unactivated namespace's request shape.
+changes an unactivated namespace's request shape. Page tokens bind principal
+context, namespace, active policy revisions, query digest, and expiry. A
+changed authority or policy rejects the token instead of continuing under mixed
+authority. Offset remains accepted; a presented token overrides offset.
+
+Activated writes reauthorize inside the mutation transaction. Creates authorize
+the proposed object. Deletes authorize the current object. Updates require
+authority over both current and proposed snapshots. Unauthorized proposed state
+fails closed without disclosing protected values. Successful and denied writes
+record a value-free audit row with the exact policy revision and a bounded
+reason (`allow`, `deny_current`, or `deny_proposed`).
 
 ## Unsupported follow-ups
 
-This slice does not authorize writes. Creates, updates, and deletes require
-transactional current/proposed-state reauthorization in a later slice.
 Policy namespace and kind identities stay ASCII tokens (`[A-Za-z0-9_.:/-]`).
 Open-taxonomy kinds with spaces or other characters cannot be activated until
-a later identity migration. Traversal, linked-object reads, property search,
-retrieval, export, synchronization, and action object resolution also require
-migration to the same storage-authorized relation. Pagination remains
-offset-based; cursors bound to principal context, namespace, policy revision,
-query digest, and expiry are not yet implemented.
+a later identity migration. The v1 rule language is unchanged: writes reuse the
+landed read relation rather than adding operation-specific operators. Property
+and property-value visibility, row-query extensions, purpose-bound access, and
+hierarchical classifications remain later stages.

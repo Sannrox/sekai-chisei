@@ -11,6 +11,7 @@ impl SekaiServiceImpl {
     pub(super) fn execute_retrieve_context(
         &self,
         principals: &[String],
+        policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
         inner: RetrieveContextRequest,
     ) -> Result<RetrieveContextResponse, Status> {
         let reasoning_started = std::time::Instant::now();
@@ -39,6 +40,7 @@ impl SekaiServiceImpl {
             max_explanation_bytes: inner.max_explanation_bytes,
             initial_source_rows: 0,
             source_rows_truncated: false,
+            policy_context: Some(policy_context.clone()),
         };
         let reasoning_timeout =
             std::time::Duration::from_millis(u64::from(if query.max_time_ms == 0 {
@@ -195,8 +197,12 @@ impl SekaiServiceImpl {
             result.truncated = true;
         }
         for candidate in &mut result.candidates {
-            candidate.object =
-                self.resolve_computed_for_response(candidate.object.clone(), principals, None)?;
+            candidate.object = self.resolve_computed_for_response_with_policy(
+                candidate.object.clone(),
+                principals,
+                Some(policy_context),
+                None,
+            )?;
         }
 
         Ok(RetrieveContextResponse {

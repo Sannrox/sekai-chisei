@@ -44,6 +44,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             "create-1",
             "actor-a",
             11,
+            None,
         )
         .unwrap();
     assert_eq!(created.name, "original");
@@ -57,6 +58,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             "create-1",
             "actor-a",
             12,
+            None
         )
         .unwrap()
         .name,
@@ -74,6 +76,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             "create-1",
             "actor-a",
             13,
+            None
         ),
         Err(LeaseError::Conflict(_))
     ));
@@ -92,6 +95,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             "update-1",
             "actor-a",
             14,
+            None,
         )
         .unwrap();
     assert_eq!(committed.name, "updated");
@@ -106,6 +110,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             "update-1",
             "actor-a",
             15,
+            None
         )
         .unwrap()
         .name,
@@ -124,8 +129,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             &lease.fencing_token,
             "namespace-mismatch",
             "actor-a",
-            16,
-        ),
+            16, None),
         Err(LeaseError::Mutation(message)) if message == "object namespace is immutable"
     ));
     assert_eq!(
@@ -145,8 +149,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
             &lease.fencing_token,
             "stale-auth",
             "actor-a",
-            17,
-        ),
+            17, None),
         Err(LeaseError::Mutation(message)) if message == "object changed since authorization"
     ));
 
@@ -159,6 +162,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
         "delete-1",
         "actor-a",
         18,
+        None,
     )
     .unwrap();
     db.guarded_delete_object(
@@ -170,6 +174,7 @@ fn exercise(db: &dyn GuardedHarness, prefix: &str) {
         "delete-1",
         "actor-a",
         19,
+        None,
     )
     .unwrap();
     assert!(db.get_object(&object_id).unwrap().is_none());
@@ -210,6 +215,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
         "create",
         "actor-a",
         11,
+        None,
     )
     .unwrap();
 
@@ -226,6 +232,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
             "expired-update",
             "actor-a",
             20,
+            None
         ),
         Err(LeaseError::Stale(_))
     ));
@@ -254,6 +261,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
             "stale-delete",
             "actor-a",
             21,
+            None
         ),
         Err(LeaseError::Stale(_))
     ));
@@ -279,6 +287,7 @@ fn exercise_fencing(db: &dyn GuardedHarness, prefix: &str) {
             "released-update",
             "actor-b",
             23,
+            None
         ),
         Err(LeaseError::Stale(_))
     ));
@@ -356,6 +365,7 @@ fn postgres_guarded_update_and_takeover_have_one_serializable_order() {
                 "update",
                 "actor-a",
                 19,
+                None,
             )
         })
     };

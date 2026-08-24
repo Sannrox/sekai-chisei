@@ -3,6 +3,7 @@
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 use crate::domain::Object;
 use crate::sekai::lease::LeaseError;
+use crate::sekai::object_security::PrincipalPolicyContext;
 
 pub const POSTGRES_GUARDED_MUTATION_SURFACE: &str = "sekai.guarded-mutations";
 
@@ -29,6 +30,7 @@ pub trait GuardedMutationBackend: Send + Sync {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -43,6 +45,7 @@ pub trait GuardedMutationBackend: Send + Sync {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -56,6 +59,7 @@ pub trait GuardedMutationBackend: Send + Sync {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&PrincipalPolicyContext>,
     ) -> Result<(), LeaseError>;
 }
 
@@ -91,9 +95,10 @@ macro_rules! forward {
             request_id: &str,
             actor: &str,
             now_ms: i64,
+            policy: Option<&PrincipalPolicyContext>,
         ) -> Result<Object, LeaseError> {
             <$target>::guarded_create_object(
-                self, object, namespace, key, token, request_id, actor, now_ms,
+                self, object, namespace, key, token, request_id, actor, now_ms, policy,
             )
         }
         fn guarded_update_object(
@@ -107,6 +112,7 @@ macro_rules! forward {
             request_id: &str,
             actor: &str,
             now_ms: i64,
+            policy: Option<&PrincipalPolicyContext>,
         ) -> Result<Object, LeaseError> {
             <$target>::guarded_update_object(
                 self,
@@ -119,6 +125,7 @@ macro_rules! forward {
                 request_id,
                 actor,
                 now_ms,
+                policy,
             )
         }
         fn guarded_delete_object(
@@ -131,9 +138,10 @@ macro_rules! forward {
             request_id: &str,
             actor: &str,
             now_ms: i64,
+            policy: Option<&PrincipalPolicyContext>,
         ) -> Result<(), LeaseError> {
             <$target>::guarded_delete_object(
-                self, object_id, expected, namespace, key, token, request_id, actor, now_ms,
+                self, object_id, expected, namespace, key, token, request_id, actor, now_ms, policy,
             )
         }
     };

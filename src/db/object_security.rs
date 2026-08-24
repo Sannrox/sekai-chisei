@@ -7,9 +7,34 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
+use crate::domain::Object;
 use crate::sekai::object_security::{
     ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
+    PrincipalPolicyContext,
 };
+
+pub const OBJECT_SECURITY_NOT_FOUND: &str = "object_security_not_found";
+pub const OBJECT_SECURITY_DENIED: &str = "object_security_denied";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectPolicyWriteDecision {
+    Inactive,
+    Allow { revision_digest: String },
+    DenyCurrent { revision_digest: String },
+    DenyProposed { revision_digest: String },
+}
+
+impl ObjectPolicyWriteDecision {
+    pub fn deny_error(&self) -> Option<&'static str> {
+        match self {
+            // Hidden current state is observationally absent. Proposed-state
+            // denial is returned only after the current object was authorized.
+            Self::DenyCurrent { .. } => Some(OBJECT_SECURITY_NOT_FOUND),
+            Self::DenyProposed { .. } => Some(OBJECT_SECURITY_DENIED),
+            Self::Inactive | Self::Allow { .. } => None,
+        }
+    }
+}
 
 pub const POSTGRES_OBJECT_SECURITY_SURFACE: &str = "sekai.object-security";
 
@@ -602,4 +627,327 @@ fn validate_write(actor: &str, key: &str, now_ms: i64) -> Result<(), String> {
         return Err("invalid object-security write context".into());
     }
     Ok(())
+}
+
+pub(crate) fn sqlite_object_security_predicate(
+    table: &str,
+    subjects: usize,
+    scopes: usize,
+) -> String {
+    format!(
+        "(
+            NOT EXISTS (
+                SELECT 1 FROM sekai_object_security_activations activation
+                WHERE activation.namespace = {table}.namespace
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM sekai_object_security_active_policies active
+                JOIN sekai_object_security_rules rule
+                  ON rule.namespace=active.namespace
+                 AND rule.revision_digest=active.revision_digest
+                WHERE active.namespace={table}.namespace
+                  AND active.kind={table}.kind
+                  AND rule.operation='read'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sekai_object_security_predicates predicate
+                    WHERE predicate.namespace=rule.namespace
+                      AND predicate.revision_digest=rule.revision_digest
+                      AND predicate.rule_index=rule.rule_index
+                      AND CASE predicate.predicate_kind
+                        WHEN 'allow_all' THEN 0
+                        WHEN 'subject_equals_property' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(?{subjects}) subject
+                            WHERE subject.value=json_extract(
+                                {table}.properties, '$.' || predicate.property_key
+                            )
+                        )
+                        WHEN 'required_scope_equals' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(?{scopes}) scope
+                            WHERE scope.value=predicate.fixed_value
+                        )
+                        WHEN 'property_equals' THEN
+                            COALESCE(json_extract(
+                                {table}.properties, '$.' || predicate.property_key
+                            ), '') <> predicate.fixed_value
+                        ELSE 1
+                      END
+                  )
+            )
+        )"
+    )
+}
+
+pub(crate) fn sqlite_object_security_filter(start_param: usize) -> String {
+    format!(
+        " AND {}",
+        sqlite_object_security_predicate("sekai_objects", start_param + 1, start_param + 2)
+    )
+}
+
+pub(crate) fn postgres_object_security_predicate(
+    table: &str,
+    subjects: &str,
+    scopes: &str,
+) -> String {
+    format!(
+        "(
+            NOT EXISTS (
+                SELECT 1 FROM sekai_object_security_activations activation
+                WHERE activation.namespace={table}.namespace
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM sekai_object_security_active_policies active
+                JOIN sekai_object_security_rules rule
+                  ON rule.namespace=active.namespace
+                 AND rule.revision_digest=active.revision_digest
+                WHERE active.namespace={table}.namespace
+                  AND active.kind={table}.kind
+                  AND rule.operation='read'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sekai_object_security_predicates predicate
+                    WHERE predicate.namespace=rule.namespace
+                      AND predicate.revision_digest=rule.revision_digest
+                      AND predicate.rule_index=rule.rule_index
+                      AND CASE
+                        WHEN sekai_jsonb_object({table}.properties) IS NULL THEN TRUE
+                        WHEN predicate.predicate_kind = 'allow_all' THEN FALSE
+                        WHEN predicate.predicate_kind = 'subject_equals_property' THEN NOT (
+                            COALESCE(
+                                sekai_jsonb_object({table}.properties) ->> predicate.property_key, ''
+                            ) = ANY({subjects})
+                        )
+                        WHEN predicate.predicate_kind = 'required_scope_equals' THEN NOT (
+                            predicate.fixed_value = ANY({scopes})
+                        )
+                        WHEN predicate.predicate_kind = 'property_equals' THEN
+                            COALESCE(
+                                sekai_jsonb_object({table}.properties) ->> predicate.property_key, ''
+                            ) <> predicate.fixed_value
+                        ELSE TRUE
+                      END
+                  )
+            )
+        )"
+    )
+}
+
+pub(crate) fn postgres_object_security_filter(subjects: &str, scopes: &str) -> String {
+    format!(
+        " AND {}",
+        postgres_object_security_predicate("o", subjects, scopes)
+    )
+}
+
+pub(crate) fn bind_sqlite_policy_context(
+    context: &PrincipalPolicyContext,
+) -> Result<(String, String), String> {
+    let context = context.clone().normalized();
+    Ok((
+        serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?,
+        serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?,
+    ))
+}
+
+pub(crate) fn sqlite_snapshot_authorized(
+    tx: &Transaction<'_>,
+    object: &Object,
+    context: &PrincipalPolicyContext,
+) -> Result<bool, String> {
+    let (subjects, scopes) = bind_sqlite_policy_context(context)?;
+    let properties = crate::domain::storage_properties_json(&object.properties)?;
+    let predicate = sqlite_object_security_predicate("snapshot", 4, 5);
+    let authorized: i64 = tx
+        .query_row(
+            &format!(
+                "SELECT EXISTS (
+                    SELECT 1 FROM (
+                        SELECT ?1 AS namespace, ?2 AS kind, ?3 AS properties
+                    ) AS snapshot
+                    WHERE {predicate}
+                )"
+            ),
+            params![object.namespace, object.kind, properties, subjects, scopes],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(authorized != 0)
+}
+
+fn sqlite_active_revision(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    kind: &str,
+) -> Result<Option<String>, String> {
+    tx.query_row(
+        "SELECT revision_digest FROM sekai_object_security_active_policies
+         WHERE namespace=?1 AND kind=?2",
+        params![namespace, kind],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn sqlite_namespace_activated(tx: &Transaction<'_>, namespace: &str) -> Result<bool, String> {
+    let exists: i64 = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sekai_object_security_activations WHERE namespace=?1
+             )",
+            params![namespace],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(exists != 0)
+}
+
+fn sqlite_insert_write_audit(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    actor: &str,
+    action: &str,
+    revision_digest: &str,
+    reason_code: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO sekai_object_security_audit
+         (event_id, namespace, actor, action, revision_digest, policy_count, reason_code, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            namespace,
+            actor,
+            action,
+            revision_digest,
+            reason_code,
+            now_ms
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Authorize a mutation snapshot and persist a value-free audit row.
+/// Callers commit that row even when the object write is skipped.
+pub(crate) fn sqlite_authorize_object_write(
+    tx: &Transaction<'_>,
+    current: Option<&Object>,
+    proposed: Option<&Object>,
+    context: &PrincipalPolicyContext,
+    actor: &str,
+    action: &str,
+    now_ms: i64,
+) -> Result<ObjectPolicyWriteDecision, String> {
+    let namespace = current
+        .or(proposed)
+        .map(|object| object.namespace.as_str())
+        .unwrap_or_default();
+    if namespace.is_empty() || !sqlite_namespace_activated(tx, namespace)? {
+        return Ok(ObjectPolicyWriteDecision::Inactive);
+    }
+    if let Some(current) = current {
+        let revision = sqlite_active_revision(tx, namespace, &current.kind)?.unwrap_or_default();
+        if !sqlite_snapshot_authorized(tx, current, context)? {
+            sqlite_insert_write_audit(
+                tx,
+                namespace,
+                actor,
+                action,
+                &revision,
+                "deny_current",
+                now_ms,
+            )?;
+            return Ok(ObjectPolicyWriteDecision::DenyCurrent {
+                revision_digest: revision,
+            });
+        }
+    }
+    if let Some(proposed) = proposed {
+        let revision = sqlite_active_revision(tx, namespace, &proposed.kind)?.unwrap_or_default();
+        if !sqlite_snapshot_authorized(tx, proposed, context)? {
+            sqlite_insert_write_audit(
+                tx,
+                namespace,
+                actor,
+                action,
+                &revision,
+                "deny_proposed",
+                now_ms,
+            )?;
+            return Ok(ObjectPolicyWriteDecision::DenyProposed {
+                revision_digest: revision,
+            });
+        }
+        sqlite_insert_write_audit(tx, namespace, actor, action, &revision, "allow", now_ms)?;
+        return Ok(ObjectPolicyWriteDecision::Allow {
+            revision_digest: revision,
+        });
+    }
+    let kind = current
+        .map(|object| object.kind.as_str())
+        .unwrap_or_default();
+    let revision = sqlite_active_revision(tx, namespace, kind)?.unwrap_or_default();
+    sqlite_insert_write_audit(tx, namespace, actor, action, &revision, "allow", now_ms)?;
+    Ok(ObjectPolicyWriteDecision::Allow {
+        revision_digest: revision,
+    })
+}
+
+pub(crate) fn sqlite_policy_cursor_binding(
+    connection: &rusqlite::Connection,
+    namespace: Option<&str>,
+) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sekai.object-security-cursor-binding/v1\0");
+    if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
+        hasher.update(namespace.as_bytes());
+        let mut statement = connection
+            .prepare(
+                "SELECT kind, revision_digest FROM sekai_object_security_active_policies
+                 WHERE namespace=?1 ORDER BY kind",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![namespace], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (kind, digest) = row.map_err(|error| error.to_string())?;
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(digest.as_bytes());
+        }
+    } else {
+        hasher.update(b"*");
+        let mut statement = connection
+            .prepare(
+                "SELECT namespace, kind, revision_digest FROM sekai_object_security_active_policies
+                 ORDER BY namespace, kind",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (namespace, kind, digest) = row.map_err(|error| error.to_string())?;
+            hasher.update([0]);
+            hasher.update(namespace.as_bytes());
+            hasher.update([0]);
+            hasher.update(kind.as_bytes());
+            hasher.update([0]);
+            hasher.update(digest.as_bytes());
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }

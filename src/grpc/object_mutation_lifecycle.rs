@@ -41,6 +41,7 @@ impl SekaiServiceImpl {
         req: Request<GuardedCreateObjectRequest>,
     ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -104,26 +105,33 @@ impl SekaiServiceImpl {
         {
             markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
         }
-        let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
-            |precondition| {
-                ObjectMutation::guarded(
-                    &self.db,
-                    MutationLeasePrecondition {
-                        namespace: &precondition.namespace,
-                        key: &precondition.key,
-                        fencing_token: &precondition.fencing_token,
-                        request_id: &precondition.request_id,
-                    },
-                )
-            },
-        );
+        let mutation = precondition
+            .as_ref()
+            .map_or_else(
+                || ObjectMutation::direct(&self.db),
+                |precondition| {
+                    ObjectMutation::guarded(
+                        &self.db,
+                        MutationLeasePrecondition {
+                            namespace: &precondition.namespace,
+                            key: &precondition.key,
+                            fencing_token: &precondition.fencing_token,
+                            request_id: &precondition.request_id,
+                        },
+                    )
+                },
+            )
+            .with_policy(&policy_context);
         if let Some(created) = mutation
             .replay("create", &domain_object)
             .map_err(map_mutation_persistence_error)?
         {
-            let created =
-                self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
+            let created = self.resolve_computed_for_response_with_policy(
+                created,
+                &principals,
+                Some(&policy_context),
+                tenant_context.as_ref(),
+            )?;
             return Ok(Response::new(GuardedCreateObjectResponse {
                 object: Some(to_proto_obj(&created)),
             }));
@@ -180,8 +188,12 @@ impl SekaiServiceImpl {
             }
             self.security.add_grant(&grant);
         }
-        let created =
-            self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
+        let created = self.resolve_computed_for_response_with_policy(
+            created,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(GuardedCreateObjectResponse {
             object: Some(to_proto_obj(&created)),
         }))
@@ -192,6 +204,7 @@ impl SekaiServiceImpl {
         req: Request<GuardedUpdateObjectRequest>,
     ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -209,7 +222,10 @@ impl SekaiServiceImpl {
                 "namespace:* external IDs are reserved for namespace boundaries",
             ));
         }
-        let existing = self.db.get_object(&object.id).map_err(Status::internal)?;
+        let existing = self
+            .db
+            .get_object_with_policy_context(&object.id, &policy_context)
+            .map_err(Status::internal)?;
         if precondition.is_none() && existing.is_none() {
             return Err(Status::not_found("not found"));
         }
@@ -280,20 +296,23 @@ impl SekaiServiceImpl {
             markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
         }
         let request_object = domain_object.clone();
-        let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
-            |precondition| {
-                ObjectMutation::guarded(
-                    &self.db,
-                    MutationLeasePrecondition {
-                        namespace: &precondition.namespace,
-                        key: &precondition.key,
-                        fencing_token: &precondition.fencing_token,
-                        request_id: &precondition.request_id,
-                    },
-                )
-            },
-        );
+        let mutation = precondition
+            .as_ref()
+            .map_or_else(
+                || ObjectMutation::direct(&self.db),
+                |precondition| {
+                    ObjectMutation::guarded(
+                        &self.db,
+                        MutationLeasePrecondition {
+                            namespace: &precondition.namespace,
+                            key: &precondition.key,
+                            fencing_token: &precondition.fencing_token,
+                            request_id: &precondition.request_id,
+                        },
+                    )
+                },
+            )
+            .with_policy(&policy_context);
         if let Some(updated) = mutation
             .replay("update", &request_object)
             .map_err(map_mutation_persistence_error)?
@@ -304,11 +323,18 @@ impl SekaiServiceImpl {
                 &principals,
                 &format!("guarded_update_object_replay:{}", updated.id),
             )?;
-            let updated =
-                self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
+            let updated = self.resolve_computed_for_response_with_policy(
+                updated,
+                &principals,
+                Some(&policy_context),
+                tenant_context.as_ref(),
+            )?;
             return Ok(Response::new(GuardedUpdateObjectResponse {
                 object: Some(to_proto_obj(&updated)),
             }));
+        }
+        if existing.is_none() {
+            return Err(Status::not_found("not found"));
         }
         if is_reserved_governance_kind(&domain_object.kind)
             || existing
@@ -363,8 +389,12 @@ impl SekaiServiceImpl {
                 now_millis(),
             )
             .map_err(map_mutation_persistence_error)?;
-        let updated =
-            self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
+        let updated = self.resolve_computed_for_response_with_policy(
+            updated,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(GuardedUpdateObjectResponse {
             object: Some(to_proto_obj(&updated)),
         }))
@@ -375,14 +405,18 @@ impl SekaiServiceImpl {
         req: Request<GuardedDeleteObjectRequest>,
     ) -> Result<Response<GuardedDeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
             require_authenticated(&principals)?;
         }
-        let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
-        if precondition.is_none() && expected.is_none() {
+        let expected = self
+            .db
+            .get_object_with_policy_context(&input.id, &policy_context)
+            .map_err(Status::internal)?;
+        if expected.is_none() {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
         }
         check_write(&self.security, &input.id, &principals)?;
@@ -441,20 +475,23 @@ impl SekaiServiceImpl {
             }
         }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
-        let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
-            |precondition| {
-                ObjectMutation::guarded(
-                    &self.db,
-                    MutationLeasePrecondition {
-                        namespace: &precondition.namespace,
-                        key: &precondition.key,
-                        fencing_token: &precondition.fencing_token,
-                        request_id: &precondition.request_id,
-                    },
-                )
-            },
-        );
+        let mutation = precondition
+            .as_ref()
+            .map_or_else(
+                || ObjectMutation::direct(&self.db),
+                |precondition| {
+                    ObjectMutation::guarded(
+                        &self.db,
+                        MutationLeasePrecondition {
+                            namespace: &precondition.namespace,
+                            key: &precondition.key,
+                            fencing_token: &precondition.fencing_token,
+                            request_id: &precondition.request_id,
+                        },
+                    )
+                },
+            )
+            .with_policy(&policy_context);
         mutation
             .delete(&input.id, expected.as_ref(), actor, now_millis())
             .map_err(map_mutation_persistence_error)?;

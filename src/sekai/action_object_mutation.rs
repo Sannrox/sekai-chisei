@@ -69,6 +69,7 @@ pub(crate) fn plan(
     type_def: &GovernedActionType,
     namespace: &str,
     parameters_json: &str,
+    actor: &str,
 ) -> Result<Option<PlannedObjectMutation>, ActionObjectMutationError> {
     let object_kind = type_def.object_kind.trim();
     let mutation = type_def.object_mutation.trim();
@@ -122,8 +123,12 @@ pub(crate) fn plan(
         .unwrap_or(object_id)
         .to_string();
     let properties = object_properties(&parameters)?;
+    let policy = crate::sekai::object_security::PrincipalPolicyContext {
+        subjects: vec![actor.to_string()],
+        scopes: Vec::new(),
+    };
     let existing = db
-        .get_object(object_id)
+        .get_object_with_policy_context(object_id, &policy)
         .map_err(ActionObjectMutationError::Internal)?;
 
     match mutation {
@@ -206,14 +211,18 @@ pub(crate) fn apply(
     object.updated = now_ms;
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
+    let policy = crate::sekai::object_security::PrincipalPolicyContext {
+        subjects: vec![actor.to_string()],
+        scopes: Vec::new(),
+    };
     let previous = if created {
-        db.create_object_with_audit(&object, actor)
-            .map_err(ActionObjectMutationError::Internal)?;
+        db.create_object_with_policy_audit(&object, actor, Some(&policy))
+            .map_err(map_policy_mutation_error)?;
         None
     } else {
         Some(
-            db.update_object_with_audit(&object, actor)
-                .map_err(ActionObjectMutationError::Internal)?
+            db.update_object_with_policy_audit(&object, actor, Some(&policy))
+                .map_err(map_policy_mutation_error)?
                 .ok_or_else(|| {
                     ActionObjectMutationError::FailedPrecondition(format!(
                         "object {object_id} not found"
@@ -251,6 +260,16 @@ pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor:
     {
         previous.updated = current.updated.saturating_add(1);
         let _ = db.update_object_with_audit(&previous, actor);
+    }
+}
+
+fn map_policy_mutation_error(error: String) -> ActionObjectMutationError {
+    if error == crate::db::object_security::OBJECT_SECURITY_NOT_FOUND {
+        ActionObjectMutationError::FailedPrecondition("object not found".into())
+    } else if error == crate::db::object_security::OBJECT_SECURITY_DENIED {
+        ActionObjectMutationError::FailedPrecondition("object mutation denied".into())
+    } else {
+        ActionObjectMutationError::Internal(error)
     }
 }
 
@@ -349,7 +368,14 @@ mod tests {
             updated_at_ms: 0,
             disabled_at_ms: 0,
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":" rec-1 "}"#).unwrap_err();
+        let error = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":" rec-1 "}"#,
+            "alice",
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::InvalidArgument(_)
@@ -395,7 +421,14 @@ mod tests {
             updated_at_ms: 0,
             disabled_at_ms: 0,
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":"rec-schema"}"#).unwrap_err();
+        let error = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-schema"}"#,
+            "alice",
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::FailedPrecondition(_)
@@ -431,14 +464,26 @@ mod tests {
             updated_at_ms: 0,
             disabled_at_ms: 0,
         };
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#)
-            .unwrap()
-            .expect("planned");
+        let planned = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-abort"}"#,
+            "alice",
+        )
+        .unwrap()
+        .expect("planned");
         let applied = apply(&db, planned, "alice", 10).unwrap();
         compensate(&db, &applied, "alice");
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#)
-            .unwrap()
-            .expect("planned after abort");
+        let planned = plan(
+            &db,
+            &type_def,
+            "acme",
+            r#"{"object_id":"rec-abort"}"#,
+            "alice",
+        )
+        .unwrap()
+        .expect("planned after abort");
         apply(&db, planned, "alice", 20).unwrap();
         assert_eq!(
             db.get_object("rec-abort").unwrap().unwrap().kind,
@@ -479,6 +524,7 @@ mod tests {
             &create,
             "acme",
             r#"{"object_id":"rec-restore","city":"oslo"}"#,
+            "alice",
         )
         .unwrap()
         .expect("planned");
@@ -493,6 +539,7 @@ mod tests {
             &update,
             "acme",
             r#"{"object_id":"rec-restore","city":"bergen"}"#,
+            "alice",
         )
         .unwrap()
         .expect("planned");

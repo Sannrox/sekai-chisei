@@ -1,10 +1,11 @@
 # ADR 0025: Enforce activated object security in storage queries
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-08-24
 - Owners: @Sannrox
 - Discussion: https://github.com/Sannrox/sekai-chisei/discussions/724
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/667
+- Follow-up: https://github.com/Sannrox/sekai-chisei/issues/729
 - Supersedes: ADR 0007 fail-open behavior, only after explicit namespace activation
 - Superseded by: none
 
@@ -28,9 +29,11 @@ policy denies.
 The v1 read vocabulary is an OR of rules whose predicates are ANDed. It permits
 only explicit `allow_all`, trusted subject equal to an object property, a
 required principal scope equal to a fixed value, and an object property equal
-to a fixed value. SQLite and PostgreSQL compile these predicates into the
-object read/list SQL before rows, totals, ordering, filters, limits, or offsets
-are materialized. Existing layers continue to narrow the result.
+to a fixed value. SQLite and PostgreSQL compile these predicates into object
+SQL before rows, totals, ordering, filters, limits, offsets, remaining object
+consumers, or mutation snapshots are materialized. Existing layers continue to
+narrow the result. Writes reuse that same read relation: create authorizes
+proposed state, delete authorizes current state, and update authorizes both.
 
 ## Alternatives considered
 
@@ -44,15 +47,17 @@ Policy administration is separate from generic object mutation and produces
 bounded, value-free audit rows. Rollback activates a prior valid revision; it
 does not restore implicit grants.
 
-This first slice supports direct object read and `ListObjects`. Transactional
-write reauthorization, traversal and other object consumers, export/sync/action
-resolution, and authority-bound cursors remain unsupported follow-up
-obligations. Markings remain an additional narrowing layer.
+Direct reads, `ListObjects`, remaining object consumers, transactional write
+reauthorization, and authority-bound list cursors now use the same storage
+relation. Markings remain an additional narrowing layer. The v1 vocabulary is
+unchanged; property-level, row, purpose, and classification policies remain
+later stages.
 
 ## Validation
 
-Pure domain tests cover canonicalization, stable digests, and deny-unknown
-parsing. Shared backend conformance covers immutable replay, activation
-completeness, supported predicates, non-disclosing direct denial, list
-operators, and immediate policy replacement. SQLite runs in normal CI;
+Pure domain tests cover canonicalization, stable digests, deny-unknown
+parsing, and page-token binding. Shared backend conformance covers immutable
+replay, activation completeness, supported predicates, non-disclosing direct
+denial, list operators, write reauthorization, remaining consumers, bounded
+audit reasons, and immediate policy replacement. SQLite runs in normal CI;
 PostgreSQL follows the ignored isolated-database convention.

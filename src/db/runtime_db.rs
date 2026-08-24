@@ -662,6 +662,13 @@ impl RuntimeDb {
         }
     }
 
+    pub fn policy_cursor_binding(&self, namespace: Option<&str>) -> Result<String, String> {
+        match self {
+            Self::Sqlite(db) => db.policy_cursor_binding(namespace),
+            Self::Postgres(db) => db.policy_cursor_binding(namespace),
+        }
+    }
+
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_operation_receipt(receipt),
@@ -1448,9 +1455,18 @@ impl RuntimeDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_policy_audit(object, actor, None)
+    }
+
+    pub fn create_object_with_policy_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
+    ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.create_object_with_audit(object, actor),
-            Self::Postgres(db) => db.create_object_with_audit(object, actor),
+            Self::Sqlite(db) => db.create_object_with_policy_audit(object, actor, policy),
+            Self::Postgres(db) => db.create_object_with_policy_audit(object, actor, policy),
         }
     }
 
@@ -1533,9 +1549,18 @@ impl RuntimeDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_policy_audit(id, actor, None)
+    }
+
+    pub fn delete_object_with_policy_audit(
+        &self,
+        id: &str,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
+    ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.delete_object_with_audit(id, actor),
-            Self::Postgres(db) => db.delete_object_with_audit(id, actor),
+            Self::Sqlite(db) => db.delete_object_with_policy_audit(id, actor, policy),
+            Self::Postgres(db) => db.delete_object_with_policy_audit(id, actor, policy),
         }
     }
 
@@ -1668,9 +1693,21 @@ impl RuntimeDb {
         key: &str,
         value: &str,
     ) -> Result<Vec<Object>, String> {
+        self.find_by_property_with_policy_context(kind, key, value, None)
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.find_by_property(kind, key, value),
-            Self::Postgres(db) => db.find_by_property(kind, key, value),
+            Self::Sqlite(db) => db.find_by_property_with_policy_context(kind, key, value, context),
+            Self::Postgres(db) => {
+                db.find_by_property_with_policy_context(kind, key, value, context)
+            }
         }
     }
 
@@ -1868,9 +1905,23 @@ impl RuntimeDb {
         relation: &str,
         dir: &Direction,
     ) -> Result<Vec<Object>, String> {
+        self.get_linked_objects_with_policy_context(object_id, relation, dir, None)
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.get_linked_objects(object_id, relation, dir),
-            Self::Postgres(db) => db.get_linked_objects(object_id, relation, dir),
+            Self::Sqlite(db) => {
+                db.get_linked_objects_with_policy_context(object_id, relation, dir, context)
+            }
+            Self::Postgres(db) => {
+                db.get_linked_objects_with_policy_context(object_id, relation, dir, context)
+            }
         }
     }
 
@@ -1926,14 +1977,15 @@ impl RuntimeDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         match self {
-            Self::Sqlite(db) => {
-                db.guarded_create_object(object, namespace, key, token, request_id, actor, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.guarded_create_object(object, namespace, key, token, request_id, actor, now_ms)
-            }
+            Self::Sqlite(db) => db.guarded_create_object(
+                object, namespace, key, token, request_id, actor, now_ms, policy,
+            ),
+            Self::Postgres(db) => db.guarded_create_object(
+                object, namespace, key, token, request_id, actor, now_ms, policy,
+            ),
         }
     }
 
@@ -1947,13 +1999,14 @@ impl RuntimeDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<(), LeaseError> {
         match self {
             Self::Sqlite(db) => db.guarded_delete_object(
-                object_id, expected, namespace, key, token, request_id, actor, now_ms,
+                object_id, expected, namespace, key, token, request_id, actor, now_ms, policy,
             ),
             Self::Postgres(db) => db.guarded_delete_object(
-                object_id, expected, namespace, key, token, request_id, actor, now_ms,
+                object_id, expected, namespace, key, token, request_id, actor, now_ms, policy,
             ),
         }
     }
@@ -2001,6 +2054,7 @@ impl RuntimeDb {
         request_id: &str,
         actor: &str,
         now_ms: i64,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
     ) -> Result<Object, LeaseError> {
         match self {
             Self::Sqlite(db) => db.guarded_update_object(
@@ -2013,6 +2067,7 @@ impl RuntimeDb {
                 request_id,
                 actor,
                 now_ms,
+                policy,
             ),
             Self::Postgres(db) => db.guarded_update_object(
                 object,
@@ -2024,6 +2079,7 @@ impl RuntimeDb {
                 request_id,
                 actor,
                 now_ms,
+                policy,
             ),
         }
     }
@@ -3839,13 +3895,27 @@ impl RuntimeDb {
         object: &Object,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.update_object_with_policy_audit(object, actor, None)
+    }
+
+    pub fn update_object_with_policy_audit(
+        &self,
+        object: &Object,
+        actor: &str,
+        policy: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
+    ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.update_object_with_audit(object, actor),
+            Self::Sqlite(db) => db.update_object_with_policy_audit(object, actor, policy),
             Self::Postgres(db) => {
                 let Some(existing) = db.get_object(&object.id)? else {
                     return Ok(None);
                 };
-                db.update_object_with_audit_if_revision(object, actor, existing.updated)
+                db.update_object_with_policy_audit_if_revision(
+                    object,
+                    actor,
+                    existing.updated,
+                    policy,
+                )
             }
         }
     }

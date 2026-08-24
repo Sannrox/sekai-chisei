@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::db::object_security::postgres_object_security_filter;
 use crate::db::postgres::PostgresDb;
 use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, excluded_kinds_sql,
@@ -11,54 +12,9 @@ use postgres::IsolationLevel;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
 const LINK_COLUMNS: &str = "id, from_id, to_id, relation, created";
-const POSTGRES_PROPERTIES_UNUSABLE: &str = "sekai_jsonb_object(o.properties) IS NULL";
 
 fn postgres_stored_property_text(key_sql: &str) -> String {
     format!("(sekai_jsonb_object(o.properties) ->> {key_sql})")
-}
-
-fn postgres_object_security_filter(subjects: &str, scopes: &str) -> String {
-    format!(
-        " AND (
-            NOT EXISTS (
-                SELECT 1 FROM sekai_object_security_activations activation
-                WHERE activation.namespace=o.namespace
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM sekai_object_security_active_policies active
-                JOIN sekai_object_security_rules rule
-                  ON rule.namespace=active.namespace
-                 AND rule.revision_digest=active.revision_digest
-                WHERE active.namespace=o.namespace
-                  AND active.kind=o.kind
-                  AND rule.operation='read'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM sekai_object_security_predicates predicate
-                    WHERE predicate.namespace=rule.namespace
-                      AND predicate.revision_digest=rule.revision_digest
-                      AND predicate.rule_index=rule.rule_index
-                      AND CASE
-                        WHEN {POSTGRES_PROPERTIES_UNUSABLE} THEN TRUE
-                        WHEN predicate.predicate_kind = 'allow_all' THEN FALSE
-                        WHEN predicate.predicate_kind = 'subject_equals_property' THEN NOT (
-                            COALESCE(
-                                sekai_jsonb_object(o.properties) ->> predicate.property_key, ''
-                            ) = ANY({subjects})
-                        )
-                        WHEN predicate.predicate_kind = 'required_scope_equals' THEN NOT (
-                            predicate.fixed_value = ANY({scopes})
-                        )
-                        WHEN predicate.predicate_kind = 'property_equals' THEN
-                            COALESCE(
-                                sekai_jsonb_object(o.properties) ->> predicate.property_key, ''
-                            ) <> predicate.fixed_value
-                        ELSE TRUE
-                      END
-                  )
-            )
-        )"
-    )
 }
 
 impl PostgresDb {
@@ -413,16 +369,39 @@ impl PostgresDb {
         key: &str,
         value: &str,
     ) -> Result<Vec<Object>, String> {
+        self.find_by_property_with_policy_context(kind, key, value, None)
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         if !is_valid_property_key(key) {
             return Err("invalid property key".into());
         }
-        self.query_objects(
-            &format!(
+        let context = context.map(|context| context.clone().normalized());
+        let sql = if context.is_some() {
+            format!(
+                "SELECT {OBJECT_COLUMNS} FROM sekai_objects o
+                 WHERE o.kind = $1 AND (sekai_jsonb_object(o.properties) ->> $2) = $3{}",
+                postgres_object_security_filter("$4", "$5")
+            )
+        } else {
+            format!(
                 "SELECT {OBJECT_COLUMNS} FROM sekai_objects
-                 WHERE kind = $1 AND (properties::jsonb ->> $2) = $3"
+                 WHERE kind = $1 AND (sekai_jsonb_object(properties) ->> $2) = $3"
+            )
+        };
+        match context {
+            Some(context) => self.query_objects(
+                &sql,
+                &[&kind, &key, &value, &context.subjects, &context.scopes],
             ),
-            &[&kind, &key, &value],
-        )
+            None => self.query_objects(&sql, &[&kind, &key, &value]),
+        }
     }
 
     pub fn create_link(&self, link: &Link) -> Result<(), String> {
@@ -509,6 +488,16 @@ impl PostgresDb {
         relation: &str,
         direction: &Direction,
     ) -> Result<Vec<Object>, String> {
+        self.get_linked_objects_with_policy_context(object_id, relation, direction, None)
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &Direction,
+        context: Option<&PrincipalPolicyContext>,
+    ) -> Result<Vec<Object>, String> {
         let links = self.get_links(object_id, relation, direction)?;
         let mut objects = Vec::with_capacity(links.len());
         for link in links {
@@ -516,7 +505,12 @@ impl PostgresDb {
                 Direction::Outgoing => link.to_id,
                 Direction::Incoming => link.from_id,
             };
-            if let Some(object) = self.get_object(&target_id)? {
+            let object = if let Some(context) = context {
+                self.get_object_with_policy_context(&target_id, context)?
+            } else {
+                self.get_object(&target_id)?
+            };
+            if let Some(object) = object {
                 objects.push(object);
             }
         }
