@@ -48,6 +48,7 @@ const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
 const REMOVE_LEGACY_ACTIONS_SCHEMA: &str = include_str!("postgres/0028_remove_legacy_actions.sql");
 const OBJECT_SYNC_SCHEMA: &str = include_str!("postgres/0029_object_sync.sql");
 const SOURCE_CHANGE_FEED_SCHEMA: &str = include_str!("postgres/0030_source_change_feed.sql");
+const DEFINITION_BRANCHES_SCHEMA: &str = include_str!("postgres/0031_definition_branches.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -201,6 +202,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 29,
         name: "source_change_feed",
         sql: SOURCE_CHANGE_FEED_SCHEMA,
+    },
+    Migration {
+        version: 30,
+        name: "definition_branches",
+        sql: DEFINITION_BRANCHES_SCHEMA,
     },
 ];
 

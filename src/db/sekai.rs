@@ -188,6 +188,7 @@ impl SekaiDb {
         self.migrate_principal_credentials()?;
         self.migrate_audit()?;
         self.migrate_object_sync()?;
+        self.migrate_definition_branches()?;
         self.migrate_ledger()?;
         self.migrate_retention()?;
         self.migrate_attestations()?;

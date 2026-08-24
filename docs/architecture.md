@@ -65,6 +65,16 @@ cross-table contract; partial storage interfaces that cannot provide it fail
 closed. See [Generation-fenced leases](leases.md) for the client and
 downstream-executor contract.
 
+Governed definition branches provide an additive authoring foundation above
+immutable namespace-scoped definition revisions. Canonical member documents
+and revisions are insert-only; only a stable branch head advances through an
+exact compare-and-swap. Creation and edits recheck namespace and member
+authorization and commit revision, request, audit, and head state atomically.
+They do not publish definitions, mutate runtime facts, or snapshot legacy
+schema and ontology rows. See
+[Governed definition branches](definition-branches.md) and
+[ADR 0024](decisions/0024-governed-definition-branches.md).
+
 ### Chisei: governed decisions
 
 Chisei resolves how an operation may proceed. It owns policy, context

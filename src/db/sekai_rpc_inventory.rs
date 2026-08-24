@@ -1,4 +1,5 @@
-//! Checked-in inventory of reusable `SekaiService` RPCs for PostgreSQL parity.
+//! Checked-in inventory of reusable `SekaiService` RPCs, including governed
+//! definition branches, for PostgreSQL parity.
 //!
 //! The inventory is the fail-closed bridge between `proto/sekai.proto` and the
 //! shared SQLite/PostgreSQL evidence harnesses. PostgreSQL may advertise the
@@ -360,12 +361,15 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 100);
+        assert_eq!(inventory.entries.len(), 103);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
         assert!(inventory.entry("ApplySourceBatch").is_some());
         assert!(inventory.entry("GetSourceSyncState").is_some());
+        assert!(inventory.entry("CreateDefinitionBranch").is_some());
+        assert!(inventory.entry("GetDefinitionBranch").is_some());
+        assert!(inventory.entry("ApplyDefinitionBranchEdit").is_some());
         assert!(inventory.entry("ListEvidenceAdapters").is_some());
         assert!(inventory.entry("PutGovernedActionType").is_some());
         assert!(inventory.entry("SubmitActionInstance").is_some());

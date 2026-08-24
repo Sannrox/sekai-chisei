@@ -413,7 +413,12 @@ mod tests {
                 .iter()
                 .all(|surface| !surface.to_ascii_lowercase().contains("tenant"))
         );
-        for surface in ["chisei.execution", "sekai.graph", "gateway.governance"] {
+        for surface in [
+            "chisei.execution",
+            "sekai.definition-branch",
+            "sekai.graph",
+            "gateway.governance",
+        ] {
             assert!(
                 capabilities
                     .reusable_surfaces

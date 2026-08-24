@@ -71,6 +71,9 @@ SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
   cargo test --locked --test reusable_sekai_backend_conformance -- --ignored --nocapture
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
+  cargo test --locked --test definition_branch_backend_conformance -- --ignored --nocapture
+SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
+SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
   cargo test --locked --test retention_dedup_backend_conformance -- --ignored --nocapture
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
