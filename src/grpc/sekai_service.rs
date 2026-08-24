@@ -3048,8 +3048,32 @@ fn authorize_source_sync_namespace(
     }
 }
 
-fn from_proto_source_batch(batch: SourceBatch) -> source_sync_domain::SourceBatch {
-    source_sync_domain::SourceBatch {
+fn from_proto_source_batch(batch: SourceBatch) -> Result<source_sync_domain::SourceBatch, Status> {
+    let delivery = batch
+        .delivery
+        .map(|delivery| {
+            let mode = match SourceDeliveryMode::try_from(delivery.mode) {
+                Ok(SourceDeliveryMode::Snapshot) => {
+                    source_sync_domain::SourceDeliveryMode::Snapshot
+                }
+                Ok(SourceDeliveryMode::ChangeFeed) => {
+                    source_sync_domain::SourceDeliveryMode::ChangeFeed
+                }
+                Ok(SourceDeliveryMode::Unspecified) | Err(_) => {
+                    return Err(Status::invalid_argument("source delivery mode is invalid"));
+                }
+            };
+            Ok(source_sync_domain::SourceDeliveryWindow {
+                mode,
+                sync_generation: delivery.sync_generation,
+                source_feed_epoch: delivery.source_feed_epoch,
+                offset_start: delivery.offset_start,
+                offset_end: delivery.offset_end,
+                snapshot_complete: delivery.snapshot_complete,
+            })
+        })
+        .transpose()?;
+    Ok(source_sync_domain::SourceBatch {
         contract_version: batch.contract_version,
         namespace: batch.namespace,
         producer_identity: batch.producer_identity,
@@ -3078,9 +3102,11 @@ fn from_proto_source_batch(batch: SourceBatch) -> source_sync_domain::SourceBatc
                 properties: record.properties.into_iter().collect(),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
+                source_sequence: record.source_sequence,
             })
             .collect(),
-    }
+        delivery,
+    })
 }
 
 fn source_batch_status(status: source_sync_domain::SourceBatchStatus) -> &'static str {
@@ -3098,6 +3124,18 @@ fn source_operation_outcome(outcome: source_sync_domain::OperationOutcome) -> &'
         source_sync_domain::OperationOutcome::Unavailable => "unavailable",
         source_sync_domain::OperationOutcome::Partial => "partial",
         source_sync_domain::OperationOutcome::Unknown => "unknown",
+    }
+}
+
+fn proto_source_delivery_mode(mode: Option<source_sync_domain::SourceDeliveryMode>) -> i32 {
+    match mode {
+        None => SourceDeliveryMode::Unspecified as i32,
+        Some(source_sync_domain::SourceDeliveryMode::Snapshot) => {
+            SourceDeliveryMode::Snapshot as i32
+        }
+        Some(source_sync_domain::SourceDeliveryMode::ChangeFeed) => {
+            SourceDeliveryMode::ChangeFeed as i32
+        }
     }
 }
 
@@ -3134,6 +3172,13 @@ fn to_proto_source_transaction(
         opened_at_ms: transaction.opened_at_ms,
         closed_at_ms: transaction.closed_at_ms,
         reason: transaction.reason.clone(),
+        contract_version: transaction.contract_version.clone(),
+        delivery_mode: proto_source_delivery_mode(transaction.delivery_mode),
+        sync_generation: transaction.sync_generation,
+        source_feed_epoch: transaction.source_feed_epoch.clone(),
+        offset_start: transaction.offset_start,
+        offset_end: transaction.offset_end,
+        snapshot_complete: transaction.snapshot_complete,
     }
 }
 
@@ -3146,6 +3191,11 @@ fn to_proto_source_checkpoint(
         cursor: checkpoint.cursor.clone(),
         committed_batch_digest: checkpoint.committed_batch_digest.clone(),
         advanced_at_ms: checkpoint.advanced_at_ms,
+        contract_version: checkpoint.contract_version.clone(),
+        delivery_mode: proto_source_delivery_mode(checkpoint.delivery_mode),
+        sync_generation: checkpoint.sync_generation,
+        source_feed_epoch: checkpoint.source_feed_epoch.clone(),
+        committed_offset: checkpoint.committed_offset,
     }
 }
 
@@ -3189,6 +3239,37 @@ fn to_proto_source_record_result(
         reason: result.reason.clone(),
         object: object.map(to_proto_synced_object),
         lineage,
+        source_sequence: result.source_sequence,
+    }
+}
+
+fn to_proto_source_generation(
+    generation: &source_sync_domain::SourceSyncGeneration,
+) -> SourceSyncGeneration {
+    let status = match generation.status {
+        source_sync_domain::SourceSyncGenerationStatus::Snapshotting => {
+            SourceSyncGenerationStatus::Snapshotting
+        }
+        source_sync_domain::SourceSyncGenerationStatus::Active => {
+            SourceSyncGenerationStatus::Active
+        }
+        source_sync_domain::SourceSyncGenerationStatus::RecoveryRequired => {
+            SourceSyncGenerationStatus::RecoveryRequired
+        }
+        source_sync_domain::SourceSyncGenerationStatus::Superseded => {
+            SourceSyncGenerationStatus::Superseded
+        }
+    };
+    SourceSyncGeneration {
+        binding_id: generation.binding_id.clone(),
+        sync_generation: generation.sync_generation,
+        status: status as i32,
+        delivery_mode: proto_source_delivery_mode(Some(generation.delivery_mode)),
+        source_feed_epoch: generation.source_feed_epoch.clone(),
+        committed_offset: generation.committed_offset,
+        reason: generation.reason.clone(),
+        created_at_ms: generation.created_at_ms,
+        updated_at_ms: generation.updated_at_ms,
     }
 }
 
@@ -3216,6 +3297,14 @@ fn to_proto_source_sync_state(state: &source_sync_domain::SourceSyncState) -> So
             .map(to_proto_source_transaction),
         last_result: state.last_result.as_ref().map(to_proto_source_batch_result),
         updated_at_ms: state.updated_at_ms,
+        current_generation: state
+            .current_generation
+            .as_ref()
+            .map(to_proto_source_generation),
+        latest_transaction: state
+            .latest_transaction
+            .as_ref()
+            .map(to_proto_source_transaction),
     }
 }
 
@@ -3256,9 +3345,11 @@ fn map_source_sync_apply_error(error: String) -> Status {
         "idempotency_conflict" | "replay_identity_conflict" | "source_identity_conflict" => {
             Status::already_exists("source sync identity conflict")
         }
-        "stale_cursor" | "foreign_cursor" | "open_transaction_conflict" => {
-            Status::aborted("source checkpoint conflict")
-        }
+        "stale_cursor"
+        | "foreign_cursor"
+        | "open_transaction_conflict"
+        | "overlapping_range"
+        | "missing_range" => Status::aborted("source checkpoint conflict"),
         "batch_aborted"
         | "inactive_binding"
         | "binding_source_conflict"
@@ -3268,7 +3359,12 @@ fn map_source_sync_apply_error(error: String) -> Status {
         | "source_revision_conflict"
         | "ambiguous_identity_state"
         | "orphaned_open_transaction"
-        | "missing_open_transaction" => Status::failed_precondition("source sync state conflict"),
+        | "missing_open_transaction"
+        | "legacy_batch_after_v2"
+        | "generation_conflict"
+        | "feed_epoch_conflict"
+        | "phase_conflict"
+        | "recovery_required" => Status::failed_precondition("source sync state conflict"),
         "canonicalization_failed"
         | "foreign_source"
         | "foreign_family"
@@ -3288,6 +3384,21 @@ fn map_source_sync_apply_error(error: String) -> Status {
         | "text_bounds"
         | "invalid_digest"
         | "reserved_property"
+        | "missing_delivery_metadata"
+        | "unexpected_delivery_metadata"
+        | "invalid_sync_generation"
+        | "invalid_snapshot_metadata"
+        | "missing_feed_epoch"
+        | "invalid_change_feed_metadata"
+        | "missing_delivery_range"
+        | "invalid_delivery_range"
+        | "unexpected_source_sequence"
+        | "missing_source_sequence"
+        | "duplicate_source_sequence"
+        | "reordered_source_sequence"
+        | "noncontiguous_source_sequence"
+        | "invalid_feed_epoch"
+        | "delivery_position_out_of_range"
         | "invalid_record" => Status::invalid_argument("invalid source batch"),
         "storage_error" => Status::internal("source sync storage failure"),
         _ => Status::internal("source sync unavailable"),
@@ -3500,7 +3611,7 @@ impl SekaiService for SekaiServiceImpl {
         if proto.producer_identity != principal {
             return Err(Status::permission_denied("source producer identity denied"));
         }
-        let mut batch = from_proto_source_batch(proto);
+        let mut batch = from_proto_source_batch(proto)?;
         batch.producer_identity = principal.clone();
         let result = self
             .db
@@ -7045,7 +7156,9 @@ mod tests {
                 ]),
                 deleted: false,
                 observed_at_ms: 10,
+                source_sequence: None,
             }],
+            delivery: None,
         };
         domain.batch_digest = domain.canonical_digest().unwrap();
         SourceBatch {
@@ -7077,13 +7190,15 @@ mod tests {
                     properties: record.properties.into_iter().collect(),
                     deleted: record.deleted,
                     observed_at_ms: record.observed_at_ms,
+                    source_sequence: record.source_sequence,
                 })
                 .collect(),
+            delivery: None,
         }
     }
 
     fn redigest_source_batch(batch: &mut SourceBatch) {
-        let mut domain = from_proto_source_batch(batch.clone());
+        let mut domain = from_proto_source_batch(batch.clone()).unwrap();
         domain.batch_digest.clear();
         batch.batch_digest = domain.canonical_digest().unwrap();
     }
@@ -7397,8 +7512,7 @@ mod tests {
 
         let mut unknown_version =
             source_batch(namespace, producer, "", "cursor:ignored", "batch-version");
-        unknown_version.contract_version = "sekai.source-batch/v2".into();
-        redigest_source_batch(&mut unknown_version);
+        unknown_version.contract_version = "sekai.source-batch/v3".into();
         let version_error = svc
             .apply_source_batch(with_named_principal(
                 ApplySourceBatchRequest {
@@ -7551,6 +7665,133 @@ mod tests {
             state_after_failures.last_result.as_ref(),
             Some(&first_result)
         );
+    }
+
+    #[tokio::test]
+    async fn source_sync_v2_state_and_bounded_errors_are_exposed() {
+        let svc = service();
+        let namespace = "sync-v2-state";
+        let producer = "connector/github-primary";
+        grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+
+        let mut snapshot = source_batch(namespace, producer, "", "cursor:snapshot", "snapshot-1");
+        snapshot.contract_version = source_sync_domain::SOURCE_BATCH_V2_VERSION.into();
+        snapshot.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Snapshot as i32,
+            sync_generation: 1,
+            source_feed_epoch: Some("epoch-1".into()),
+            offset_start: None,
+            offset_end: Some(40),
+            snapshot_complete: true,
+        });
+        redigest_source_batch(&mut snapshot);
+        svc.apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest {
+                batch: Some(snapshot),
+            },
+            producer,
+        ))
+        .await
+        .unwrap();
+
+        let active = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .state
+            .unwrap();
+        let generation = active.current_generation.unwrap();
+        assert_eq!(generation.status, SourceSyncGenerationStatus::Active as i32);
+        assert_eq!(generation.committed_offset, Some(40));
+        let checkpoint = active.checkpoint.unwrap();
+        assert_eq!(checkpoint.sync_generation, Some(1));
+        assert_eq!(checkpoint.committed_offset, Some(40));
+
+        let mut missing = source_batch(
+            namespace,
+            producer,
+            "cursor:snapshot",
+            "cursor:missing",
+            "feed-missing",
+        );
+        missing.contract_version = source_sync_domain::SOURCE_BATCH_V2_VERSION.into();
+        missing.records[0].source_sequence = Some(51);
+        missing.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed as i32,
+            sync_generation: 1,
+            source_feed_epoch: Some("epoch-1".into()),
+            offset_start: Some(50),
+            offset_end: Some(51),
+            snapshot_complete: false,
+        });
+        redigest_source_batch(&mut missing);
+        let missing_error = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(missing),
+                },
+                producer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing_error.code(), tonic::Code::Aborted);
+        assert!(!missing_error.message().contains("50"));
+
+        let recovery = svc
+            .get_source_sync_state(with_named_principal(
+                GetSourceSyncStateRequest {
+                    namespace: namespace.into(),
+                    source_instance: "acme/ops".into(),
+                    type_digest: SOURCE_TYPE_DIGEST.into(),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .state
+            .unwrap();
+        assert_eq!(
+            recovery.current_generation.unwrap().status,
+            SourceSyncGenerationStatus::RecoveryRequired as i32
+        );
+        assert_eq!(recovery.latest_transaction.unwrap().status, "ABORTED");
+
+        for error in [
+            "generation_conflict: 999",
+            "feed_epoch_conflict: private-epoch",
+            "phase_conflict: internal-phase",
+        ] {
+            let status = map_source_sync_apply_error(error.into());
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(!status.message().contains("999"));
+            assert!(!status.message().contains("private-epoch"));
+            assert!(!status.message().contains("internal-phase"));
+        }
+    }
+
+    #[test]
+    fn source_sync_proto_rejects_unspecified_delivery_mode() {
+        let mut proto = source_batch("sync-v2-conversion", "connector/test", "", "next", "key");
+        proto.contract_version = source_sync_domain::SOURCE_BATCH_V2_VERSION.into();
+        proto.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Unspecified as i32,
+            sync_generation: 1,
+            source_feed_epoch: None,
+            offset_start: None,
+            offset_end: None,
+            snapshot_complete: false,
+        });
+        let error = from_proto_source_batch(proto).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     fn widget_schema_type() -> ObjectType {

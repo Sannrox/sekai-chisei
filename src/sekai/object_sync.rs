@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 
 pub const SOURCE_BATCH_VERSION: &str = "sekai.source-batch/v1";
+pub const SOURCE_BATCH_V2_VERSION: &str = "sekai.source-batch/v2";
 pub const SOURCE_TYPE_REVISION_VERSION: &str = "sekai.source-type-revision/v1";
 pub const SOURCE_GITHUB: &str = "github";
 pub const FAMILY_OBJECT_SYNC: &str = "source_control.object_sync";
@@ -47,6 +48,58 @@ pub const MAX_SOURCE_IDENTIFIER_BYTES: usize = 512;
 pub const MAX_SOURCE_DISPLAY_NAME_BYTES: usize = 1024;
 pub const MAX_SOURCE_PROPERTY_KEY_BYTES: usize = 128;
 pub const MAX_SOURCE_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_SOURCE_FEED_EPOCH_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceDeliveryMode {
+    Snapshot,
+    ChangeFeed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceSyncGenerationStatus {
+    Snapshotting,
+    Active,
+    RecoveryRequired,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceSyncGeneration {
+    pub binding_id: String,
+    pub sync_generation: u64,
+    pub status: SourceSyncGenerationStatus,
+    pub delivery_mode: SourceDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_feed_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_offset: Option<u64>,
+    pub reason: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Replay-relevant delivery metadata for the v2 source-batch contract.
+///
+/// Change-feed offsets describe the half-open-to-closed range
+/// `(offset_start, offset_end]`. A completed snapshot uses only `offset_end`
+/// for its source-provided change-feed handoff barrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDeliveryWindow {
+    pub mode: SourceDeliveryMode,
+    pub sync_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_feed_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_end: Option<u64>,
+    pub snapshot_complete: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +118,8 @@ pub struct SourceRecord {
     pub properties: BTreeMap<String, String>,
     pub deleted: bool,
     pub observed_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u64>,
 }
 
 impl SourceRecord {
@@ -94,6 +149,8 @@ pub struct SourceBatch {
     pub batch_digest: String,
     pub collected_at_ms: i64,
     pub records: Vec<SourceRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SourceDeliveryWindow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -110,6 +167,24 @@ struct CanonicalSourceBatch<'a> {
     current_cursor: &'a str,
     proposed_next_cursor: &'a str,
     idempotency_key: &'a str,
+    records: &'a [SourceRecord],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CanonicalSourceBatchV2<'a> {
+    contract_version: &'a str,
+    namespace: &'a str,
+    producer_identity: &'a str,
+    source: &'a str,
+    source_instance: &'a str,
+    family: &'a str,
+    adapter_id: &'a str,
+    adapter_version: &'a str,
+    type_digest: &'a str,
+    current_cursor: &'a str,
+    proposed_next_cursor: &'a str,
+    idempotency_key: &'a str,
+    delivery: &'a SourceDeliveryWindow,
     records: &'a [SourceRecord],
 }
 
@@ -156,22 +231,67 @@ impl SourceBatch {
     /// Digest of all replay-relevant input. Collection time and the digest
     /// field itself are deliberately excluded.
     pub fn canonical_digest(&self) -> Result<String, SourceBatchValidationError> {
-        let canonical = CanonicalSourceBatch {
-            contract_version: &self.contract_version,
-            namespace: &self.namespace,
-            producer_identity: &self.producer_identity,
-            source: &self.source,
-            source_instance: &self.source_instance,
-            family: &self.family,
-            adapter_id: &self.adapter_id,
-            adapter_version: &self.adapter_version,
-            type_digest: &self.type_digest,
-            current_cursor: &self.current_cursor,
-            proposed_next_cursor: &self.proposed_next_cursor,
-            idempotency_key: &self.idempotency_key,
-            records: &self.records,
-        };
-        let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        let bytes = match self.contract_version.as_str() {
+            SOURCE_BATCH_VERSION => {
+                if self.delivery.is_some()
+                    || self
+                        .records
+                        .iter()
+                        .any(|record| record.source_sequence.is_some())
+                {
+                    return Err(SourceBatchValidationError::new(
+                        "unexpected_delivery_metadata",
+                        "v1 source batches cannot contain delivery metadata or source sequences",
+                    ));
+                }
+                serde_json::to_vec(&CanonicalSourceBatch {
+                    contract_version: &self.contract_version,
+                    namespace: &self.namespace,
+                    producer_identity: &self.producer_identity,
+                    source: &self.source,
+                    source_instance: &self.source_instance,
+                    family: &self.family,
+                    adapter_id: &self.adapter_id,
+                    adapter_version: &self.adapter_version,
+                    type_digest: &self.type_digest,
+                    current_cursor: &self.current_cursor,
+                    proposed_next_cursor: &self.proposed_next_cursor,
+                    idempotency_key: &self.idempotency_key,
+                    records: &self.records,
+                })
+            }
+            SOURCE_BATCH_V2_VERSION => {
+                let delivery = self.delivery.as_ref().ok_or_else(|| {
+                    SourceBatchValidationError::new(
+                        "missing_delivery_metadata",
+                        "v2 source batches require a delivery envelope",
+                    )
+                })?;
+                serde_json::to_vec(&CanonicalSourceBatchV2 {
+                    contract_version: &self.contract_version,
+                    namespace: &self.namespace,
+                    producer_identity: &self.producer_identity,
+                    source: &self.source,
+                    source_instance: &self.source_instance,
+                    family: &self.family,
+                    adapter_id: &self.adapter_id,
+                    adapter_version: &self.adapter_version,
+                    type_digest: &self.type_digest,
+                    current_cursor: &self.current_cursor,
+                    proposed_next_cursor: &self.proposed_next_cursor,
+                    idempotency_key: &self.idempotency_key,
+                    delivery,
+                    records: &self.records,
+                })
+            }
+            _ => {
+                return Err(SourceBatchValidationError::new(
+                    "unsupported_version",
+                    "source batch contract version is not supported",
+                ));
+            }
+        }
+        .map_err(|error| {
             SourceBatchValidationError::new(
                 "canonicalization_failed",
                 format!("source batch cannot be canonicalized: {error}"),
@@ -211,12 +331,7 @@ impl SourceBatch {
     }
 
     pub fn validate(&self) -> Result<(), SourceBatchValidationError> {
-        if self.contract_version != SOURCE_BATCH_VERSION {
-            return Err(SourceBatchValidationError::new(
-                "unsupported_version",
-                "source batch contract version is not supported",
-            ));
-        }
+        validate_delivery_envelope(self)?;
         require_bounded_identifier("namespace", &self.namespace)?;
         require_bounded_identifier("producer_identity", &self.producer_identity)?;
         require_bounded_identifier("source_instance", &self.source_instance)?;
@@ -275,6 +390,7 @@ impl SourceBatch {
                 ));
             }
         }
+        validate_ordered_delivery(self)?;
 
         require_digest("batch_digest", &self.batch_digest)?;
         if self.batch_digest != self.canonical_digest()? {
@@ -361,6 +477,20 @@ pub struct SourceBatchTransaction {
     pub opened_at_ms: i64,
     pub closed_at_ms: Option<i64>,
     pub reason: String,
+    #[serde(default = "default_source_batch_version")]
+    pub contract_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<SourceDeliveryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_feed_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -371,6 +501,16 @@ pub struct SourceCheckpoint {
     pub cursor: String,
     pub committed_batch_digest: String,
     pub advanced_at_ms: i64,
+    #[serde(default = "default_source_batch_version")]
+    pub contract_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<SourceDeliveryMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_feed_epoch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +522,8 @@ pub struct SourceRecordResult {
     pub decision: SyncDecision,
     pub outcome: OperationOutcome,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,7 +542,15 @@ pub struct SourceSyncState {
     pub checkpoint: Option<SourceCheckpoint>,
     pub open_transaction: Option<SourceBatchTransaction>,
     pub last_result: Option<SourceBatchResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<SourceSyncGeneration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_transaction: Option<SourceBatchTransaction>,
     pub updated_at_ms: i64,
+}
+
+fn default_source_batch_version() -> String {
+    SOURCE_BATCH_VERSION.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,11 +654,224 @@ pub fn detect_identity_conflict(
     None
 }
 
+fn validate_delivery_envelope(batch: &SourceBatch) -> Result<(), SourceBatchValidationError> {
+    match batch.contract_version.as_str() {
+        SOURCE_BATCH_VERSION => {
+            if batch.delivery.is_some()
+                || batch
+                    .records
+                    .iter()
+                    .any(|record| record.source_sequence.is_some())
+            {
+                return Err(SourceBatchValidationError::new(
+                    "unexpected_delivery_metadata",
+                    "v1 source batches cannot contain delivery metadata or source sequences",
+                ));
+            }
+            Ok(())
+        }
+        SOURCE_BATCH_V2_VERSION => {
+            let delivery = batch.delivery.as_ref().ok_or_else(|| {
+                SourceBatchValidationError::new(
+                    "missing_delivery_metadata",
+                    "v2 source batches require a delivery envelope",
+                )
+            })?;
+            if delivery.sync_generation == 0 {
+                return Err(SourceBatchValidationError::new(
+                    "invalid_sync_generation",
+                    "delivery sync_generation must be positive",
+                ));
+            }
+            require_db_u64("delivery.sync_generation", delivery.sync_generation)?;
+            if let Some(epoch) = &delivery.source_feed_epoch {
+                validate_source_feed_epoch(epoch)?;
+            }
+            for (label, value) in [
+                ("delivery.offset_start", delivery.offset_start),
+                ("delivery.offset_end", delivery.offset_end),
+            ] {
+                if let Some(value) = value {
+                    require_db_u64(label, value)?;
+                }
+            }
+            match delivery.mode {
+                SourceDeliveryMode::Snapshot => {
+                    if delivery.offset_start.is_some()
+                        || (delivery.snapshot_complete && delivery.offset_end.is_none())
+                        || (!delivery.snapshot_complete && delivery.offset_end.is_some())
+                    {
+                        return Err(SourceBatchValidationError::new(
+                            "invalid_snapshot_metadata",
+                            "snapshot delivery offsets do not match completion state",
+                        ));
+                    }
+                    if delivery.snapshot_complete && delivery.source_feed_epoch.is_none() {
+                        return Err(SourceBatchValidationError::new(
+                            "missing_feed_epoch",
+                            "completed snapshot delivery requires a source feed epoch",
+                        ));
+                    }
+                }
+                SourceDeliveryMode::ChangeFeed => {
+                    if delivery.source_feed_epoch.is_none() {
+                        return Err(SourceBatchValidationError::new(
+                            "missing_feed_epoch",
+                            "change-feed delivery requires a source feed epoch",
+                        ));
+                    }
+                    if delivery.snapshot_complete {
+                        return Err(SourceBatchValidationError::new(
+                            "invalid_change_feed_metadata",
+                            "change-feed delivery cannot complete a snapshot",
+                        ));
+                    }
+                    let (Some(offset_start), Some(offset_end)) =
+                        (delivery.offset_start, delivery.offset_end)
+                    else {
+                        return Err(SourceBatchValidationError::new(
+                            "missing_delivery_range",
+                            "change-feed delivery requires both range offsets",
+                        ));
+                    };
+                    if offset_end <= offset_start {
+                        return Err(SourceBatchValidationError::new(
+                            "invalid_delivery_range",
+                            "change-feed offset_end must be greater than offset_start",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(SourceBatchValidationError::new(
+            "unsupported_version",
+            "source batch contract version is not supported",
+        )),
+    }
+}
+
+fn validate_ordered_delivery(batch: &SourceBatch) -> Result<(), SourceBatchValidationError> {
+    if batch.contract_version == SOURCE_BATCH_VERSION {
+        return Ok(());
+    }
+    let delivery = batch.delivery.as_ref().ok_or_else(|| {
+        SourceBatchValidationError::new(
+            "missing_delivery_metadata",
+            "v2 source batches require a delivery envelope",
+        )
+    })?;
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot => {
+            if batch
+                .records
+                .iter()
+                .any(|record| record.source_sequence.is_some())
+            {
+                return Err(SourceBatchValidationError::new(
+                    "unexpected_source_sequence",
+                    "snapshot records cannot contain source_sequence",
+                ));
+            }
+        }
+        SourceDeliveryMode::ChangeFeed => {
+            let (Some(offset_start), Some(offset_end)) =
+                (delivery.offset_start, delivery.offset_end)
+            else {
+                return Err(SourceBatchValidationError::new(
+                    "missing_delivery_range",
+                    "change-feed delivery requires both range offsets",
+                ));
+            };
+            let sequences = batch
+                .records
+                .iter()
+                .map(|record| {
+                    record.source_sequence.ok_or_else(|| {
+                        SourceBatchValidationError::new(
+                            "missing_source_sequence",
+                            "every change-feed record requires source_sequence",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut seen = HashSet::with_capacity(sequences.len());
+            for sequence in &sequences {
+                if !seen.insert(*sequence) {
+                    return Err(SourceBatchValidationError::new(
+                        "duplicate_source_sequence",
+                        "change-feed source_sequence values must be unique",
+                    ));
+                }
+            }
+            if sequences.windows(2).any(|pair| pair[0] > pair[1]) {
+                return Err(SourceBatchValidationError::new(
+                    "reordered_source_sequence",
+                    "change-feed source_sequence values must be strictly increasing",
+                ));
+            }
+
+            // This is contract-shape validation, not a stateful gap signal.
+            // Stateful gaps are batches whose offset_start is ahead of the
+            // plane-owned committed offset; persistence durably aborts those
+            // after OPEN and marks the generation RECOVERY_REQUIRED.
+            let expected_len = offset_end.checked_sub(offset_start).ok_or_else(|| {
+                SourceBatchValidationError::new(
+                    "invalid_delivery_range",
+                    "change-feed delivery range is invalid",
+                )
+            })?;
+            if expected_len != sequences.len() as u64
+                || sequences.iter().enumerate().any(|(index, sequence)| {
+                    offset_start
+                        .checked_add(index as u64 + 1)
+                        .is_none_or(|expected| expected != *sequence)
+                })
+            {
+                return Err(SourceBatchValidationError::new(
+                    "noncontiguous_source_sequence",
+                    "change-feed source_sequence values must exactly cover the delivery range",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_feed_epoch(value: &str) -> Result<(), SourceBatchValidationError> {
+    if value.is_empty()
+        || value.len() > MAX_SOURCE_FEED_EPOCH_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(SourceBatchValidationError::new(
+            "invalid_feed_epoch",
+            format!(
+                "source feed epoch must be canonical and at most {MAX_SOURCE_FEED_EPOCH_BYTES} bytes"
+            ),
+        ));
+    }
+    if contains_secret_like_text(value) {
+        return Err(SourceBatchValidationError::new(
+            "secret_like_text",
+            "source feed epoch contains credential-like text",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_record(
     record: &SourceRecord,
     index: usize,
     batch: &SourceBatch,
 ) -> Result<(), SourceBatchValidationError> {
+    if let Some(source_sequence) = record.source_sequence {
+        require_db_u64(
+            &format!("records[{index}].source_sequence"),
+            source_sequence,
+        )?;
+    }
     if record.source != batch.source || record.source_instance != batch.source_instance {
         return Err(SourceBatchValidationError::new(
             "mixed_source_identity",
@@ -579,6 +942,16 @@ fn validate_record(
             MAX_SOURCE_PROPERTY_VALUE_BYTES,
             true,
         )?;
+    }
+    Ok(())
+}
+
+fn require_db_u64(label: &str, value: u64) -> Result<(), SourceBatchValidationError> {
+    if value > i64::MAX as u64 {
+        return Err(SourceBatchValidationError::new(
+            "delivery_position_out_of_range",
+            format!("{label} exceeds the supported delivery position range"),
+        ));
     }
     Ok(())
 }
@@ -770,6 +1143,7 @@ mod tests {
             ]),
             deleted: false,
             observed_at_ms: 10,
+            source_sequence: None,
         }
     }
 
@@ -790,7 +1164,45 @@ mod tests {
             batch_digest: String::new(),
             collected_at_ms: 20,
             records: vec![issue()],
+            delivery: None,
         };
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    fn valid_v2_snapshot() -> SourceBatch {
+        let mut batch = valid_batch();
+        batch.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        batch.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Snapshot,
+            sync_generation: 1,
+            source_feed_epoch: Some("github-events-2026-08".into()),
+            offset_start: None,
+            offset_end: Some(40),
+            snapshot_complete: true,
+        });
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    fn valid_v2_change_feed() -> SourceBatch {
+        let mut batch = valid_batch();
+        batch.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        batch.current_cursor = "cursor:40".into();
+        batch.proposed_next_cursor = "cursor:42".into();
+        batch.records[0].source_sequence = Some(41);
+        let mut second = issue();
+        second.external_id = "13".into();
+        second.source_sequence = Some(42);
+        batch.records.push(second);
+        batch.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some("github-events-2026-08".into()),
+            offset_start: Some(40),
+            offset_end: Some(42),
+            snapshot_complete: false,
+        });
         batch.batch_digest = batch.canonical_digest().unwrap();
         batch
     }
@@ -859,12 +1271,239 @@ mod tests {
     }
 
     #[test]
-    fn unknown_contract_version_fails_closed() {
-        let mut batch = valid_batch();
-        batch.contract_version = "sekai.source-batch/v2".into();
+    fn v1_canonical_digest_matches_pre_v2_golden() {
+        assert_eq!(
+            valid_batch().canonical_digest().unwrap(),
+            "sha256:ce53c092fa3bbff8d70fb0f07ea4140977fe38f6832eaba0f4a9eae29f33d6fa"
+        );
+    }
+
+    #[test]
+    fn valid_v2_snapshot_and_change_feed_are_admitted() {
+        valid_v2_snapshot().validate().unwrap();
+        valid_v2_change_feed().validate().unwrap();
+    }
+
+    #[test]
+    fn persisted_v1_result_json_deserializes_with_additive_state_defaults() {
+        let json = serde_json::json!({
+            "transaction": {
+                "transaction_id": "tx-1",
+                "binding_id": "binding-1",
+                "namespace": "acme",
+                "producer_identity": "connector/github-primary",
+                "idempotency_key": "batch-1",
+                "batch_digest": format!("sha256:{}", "a".repeat(64)),
+                "current_cursor": "",
+                "proposed_next_cursor": "cursor:1",
+                "status": "COMMITTED",
+                "outcome": "success",
+                "opened_at_ms": 10,
+                "closed_at_ms": 11,
+                "reason": "committed"
+            },
+            "records": [{
+                "transaction_id": "tx-1",
+                "source_id": "github:acme/ops#12",
+                "source_version": "node-v1",
+                "decision": {
+                    "upsert": {
+                        "object_id": "object-1",
+                        "type_name": "Issue",
+                        "source_id": "github:acme/ops#12",
+                        "source_version": "node-v1",
+                        "payload_digest": PAYLOAD_DIGEST,
+                        "properties": {},
+                        "tombstoned": false,
+                        "type_digest": TYPE_DIGEST
+                    }
+                },
+                "outcome": "success",
+                "reason": "upserted"
+            }],
+            "checkpoint_advanced": true
+        });
+        let result: SourceBatchResult = serde_json::from_value(json).unwrap();
+        assert_eq!(result.transaction.contract_version, SOURCE_BATCH_VERSION);
+        assert!(result.transaction.delivery_mode.is_none());
+        assert!(result.transaction.sync_generation.is_none());
+        assert!(result.records[0].source_sequence.is_none());
+    }
+
+    #[test]
+    fn generation_state_serde_uses_stable_status_vocabulary() {
+        let generation = SourceSyncGeneration {
+            binding_id: "binding-1".into(),
+            sync_generation: 2,
+            status: SourceSyncGenerationStatus::RecoveryRequired,
+            delivery_mode: SourceDeliveryMode::ChangeFeed,
+            source_feed_epoch: Some("epoch-1".into()),
+            committed_offset: Some(42),
+            reason: "missing_range".into(),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        };
+        let json = serde_json::to_value(&generation).unwrap();
+        assert_eq!(json["status"], "RECOVERY_REQUIRED");
+        assert_eq!(
+            serde_json::from_value::<SourceSyncGeneration>(json).unwrap(),
+            generation
+        );
+    }
+
+    #[test]
+    fn delivery_positions_above_signed_storage_range_fail_stably() {
+        let mut batch = valid_v2_change_feed();
+        batch.delivery.as_mut().unwrap().offset_end = Some(i64::MAX as u64 + 1);
+        batch.records[1].source_sequence = Some(i64::MAX as u64 + 1);
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        assert_eq!(
+            batch.validate().unwrap_err().code,
+            "delivery_position_out_of_range"
+        );
+    }
+
+    #[test]
+    fn v1_delivery_metadata_fails_closed() {
+        let mut delivery = valid_batch();
+        delivery.delivery = valid_v2_snapshot().delivery;
+        assert_eq!(
+            delivery.validate().unwrap_err().code,
+            "unexpected_delivery_metadata"
+        );
+        assert_eq!(
+            delivery.canonical_digest().unwrap_err().code,
+            "unexpected_delivery_metadata"
+        );
+
+        let mut sequence = valid_batch();
+        sequence.records[0].source_sequence = Some(1);
+        assert_eq!(
+            sequence.validate().unwrap_err().code,
+            "unexpected_delivery_metadata"
+        );
+        assert_eq!(
+            sequence.canonical_digest().unwrap_err().code,
+            "unexpected_delivery_metadata"
+        );
+    }
+
+    #[test]
+    fn v2_reordered_duplicate_and_noncontiguous_sequences_fail_closed() {
+        let mut reordered = valid_v2_change_feed();
+        reordered.records[0].source_sequence = Some(42);
+        reordered.records[1].source_sequence = Some(41);
+        reordered.batch_digest = reordered.canonical_digest().unwrap();
+        assert_eq!(
+            reordered.validate().unwrap_err().code,
+            "reordered_source_sequence"
+        );
+
+        let mut duplicate = valid_v2_change_feed();
+        duplicate.records[1].source_sequence = Some(41);
+        duplicate.batch_digest = duplicate.canonical_digest().unwrap();
+        assert_eq!(
+            duplicate.validate().unwrap_err().code,
+            "duplicate_source_sequence"
+        );
+
+        let mut gap = valid_v2_change_feed();
+        gap.records[1].source_sequence = Some(43);
+        gap.delivery.as_mut().unwrap().offset_end = Some(43);
+        gap.batch_digest = gap.canonical_digest().unwrap();
+        assert_eq!(
+            gap.validate().unwrap_err().code,
+            "noncontiguous_source_sequence"
+        );
+    }
+
+    #[test]
+    fn v2_missing_range_and_bad_snapshot_metadata_fail_closed() {
+        let mut missing_range = valid_v2_change_feed();
+        missing_range.delivery.as_mut().unwrap().offset_end = None;
+        missing_range.batch_digest = missing_range.canonical_digest().unwrap();
+        assert_eq!(
+            missing_range.validate().unwrap_err().code,
+            "missing_delivery_range"
+        );
+
+        let mut snapshot = valid_v2_snapshot();
+        snapshot.delivery.as_mut().unwrap().offset_start = Some(0);
+        snapshot.batch_digest = snapshot.canonical_digest().unwrap();
+        assert_eq!(
+            snapshot.validate().unwrap_err().code,
+            "invalid_snapshot_metadata"
+        );
+
+        let mut missing_handoff = valid_v2_snapshot();
+        missing_handoff.delivery.as_mut().unwrap().offset_end = None;
+        missing_handoff.batch_digest = missing_handoff.canonical_digest().unwrap();
+        assert_eq!(
+            missing_handoff.validate().unwrap_err().code,
+            "invalid_snapshot_metadata"
+        );
+    }
+
+    #[test]
+    fn v2_missing_and_mixed_record_metadata_fail_closed() {
+        let mut missing_delivery = valid_batch();
+        missing_delivery.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        assert_eq!(
+            missing_delivery.validate().unwrap_err().code,
+            "missing_delivery_metadata"
+        );
+
+        let mut missing_sequence = valid_v2_change_feed();
+        missing_sequence.records[0].source_sequence = None;
+        missing_sequence.batch_digest = missing_sequence.canonical_digest().unwrap();
+        assert_eq!(
+            missing_sequence.validate().unwrap_err().code,
+            "missing_source_sequence"
+        );
+
+        let mut snapshot_sequence = valid_v2_snapshot();
+        snapshot_sequence.records[0].source_sequence = Some(1);
+        snapshot_sequence.batch_digest = snapshot_sequence.canonical_digest().unwrap();
+        assert_eq!(
+            snapshot_sequence.validate().unwrap_err().code,
+            "unexpected_source_sequence"
+        );
+
+        let mut incomplete_snapshot_metadata = valid_v2_snapshot();
+        incomplete_snapshot_metadata
+            .delivery
+            .as_mut()
+            .unwrap()
+            .source_feed_epoch = None;
+        incomplete_snapshot_metadata.batch_digest =
+            incomplete_snapshot_metadata.canonical_digest().unwrap();
+        assert_eq!(
+            incomplete_snapshot_metadata.validate().unwrap_err().code,
+            "missing_feed_epoch"
+        );
+    }
+
+    #[test]
+    fn source_feed_epoch_validation_does_not_echo_secret_like_content() {
+        let secret = "ghp_sensitive-feed-epoch";
+        let mut batch = valid_v2_change_feed();
+        batch.delivery.as_mut().unwrap().source_feed_epoch = Some(secret.into());
         batch.batch_digest = batch.canonical_digest().unwrap();
         let error = batch.validate().unwrap_err();
+        assert_eq!(error.code, "secret_like_text");
+        assert!(!error.message.contains(secret));
+    }
+
+    #[test]
+    fn unknown_contract_version_fails_closed() {
+        let mut batch = valid_batch();
+        batch.contract_version = "sekai.source-batch/v3".into();
+        let error = batch.validate().unwrap_err();
         assert_eq!(error.code, "unsupported_version");
+        assert_eq!(
+            batch.canonical_digest().unwrap_err().code,
+            "unsupported_version"
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
     include_str!("postgres/0027_governed_subject_provenance.sql");
 const REMOVE_LEGACY_ACTIONS_SCHEMA: &str = include_str!("postgres/0028_remove_legacy_actions.sql");
 const OBJECT_SYNC_SCHEMA: &str = include_str!("postgres/0029_object_sync.sql");
+const SOURCE_CHANGE_FEED_SCHEMA: &str = include_str!("postgres/0030_source_change_feed.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -195,6 +196,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 28,
         name: "object_sync",
         sql: OBJECT_SYNC_SCHEMA,
+    },
+    Migration {
+        version: 29,
+        name: "source_change_feed",
+        sql: SOURCE_CHANGE_FEED_SCHEMA,
     },
 ];
 
@@ -674,6 +680,9 @@ mod tests {
         assert!(OBJECT_SYNC_SCHEMA.contains("outcome IN ('success', 'denial', 'unavailable')"));
         assert!(!OBJECT_SYNC_SCHEMA.contains("unknown"));
         assert!(!OBJECT_SYNC_SCHEMA.contains("partial"));
+        assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("CREATE TABLE sekai_source_sync_generations"));
+        assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("ADD COLUMN sync_generation BIGINT"));
+        assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("ADD COLUMN source_sequence BIGINT"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
         assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
         assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));

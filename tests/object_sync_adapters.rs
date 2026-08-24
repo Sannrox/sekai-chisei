@@ -2,21 +2,31 @@
 mod github_object_sync;
 #[path = "../adapters/object_sync_conformance.rs"]
 mod object_sync_conformance;
+#[path = "../adapters/object_sync_feed.rs"]
+mod object_sync_feed;
 #[path = "../adapters/object_sync_sdk.rs"]
 mod object_sync_sdk;
 #[path = "../adapters/object_sync_snapshot.rs"]
 mod object_sync_snapshot;
 
+use object_sync_feed::{
+    ChangeFeedPage, ChangeFeedSource, ChangeFeedSourceFailure, run_change_feed,
+};
 use object_sync_sdk::{
     ApplySourceBatchReply, GetSourceSyncStateInput, OutboxLimits, SourceAdapterConfig,
-    SourceOutbox, SourceSyncStateView, SourceSyncTransport, TransportFailure, build_source_batch,
+    SourceGenerationStatus, SourceOutbox, SourceRunDisposition, SourceSyncStateView,
+    SourceSyncTransport, TransportFailure, build_source_batch, build_source_batch_v2,
     serialize_source_batch,
 };
 use object_sync_snapshot::{
-    SnapshotPage, SnapshotPageSource, SnapshotRead, SnapshotRunError, SnapshotRunLimits,
-    SnapshotRunOutcome, SnapshotSourceFailure, run_snapshot,
+    GenerationSnapshotPage, GenerationSnapshotRead, GenerationSnapshotSource, SnapshotPage,
+    SnapshotPageSource, SnapshotRead, SnapshotRunError, SnapshotRunLimits, SnapshotRunOutcome,
+    SnapshotSourceFailure, run_generation_snapshot_v2, run_snapshot,
 };
-use sekai_chisei::sekai::object_sync::{GITHUB_OBJECT_SYNC_TYPE_DIGEST, SourceBatch, SourceRecord};
+use sekai_chisei::sekai::object_sync::{
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow,
+    SourceRecord,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
@@ -179,6 +189,7 @@ impl Default for CheckpointTransport {
                 current_cursor: None,
                 open_transaction: false,
                 last_committed_batch_digest: None,
+                ..Default::default()
             },
             failures: VecDeque::new(),
             applied: Vec::new(),
@@ -223,6 +234,7 @@ impl SourceSyncTransport for CheckpointTransport {
             current_cursor: Some(batch.proposed_next_cursor.clone()),
             open_transaction: false,
             last_committed_batch_digest: Some(batch.batch_digest.clone()),
+            ..Default::default()
         };
         let reply = ApplySourceBatchReply::Committed {
             idempotency_key: batch.idempotency_key.clone(),
@@ -243,6 +255,137 @@ impl SourceSyncTransport for CheckpointTransport {
         self.state_reads += 1;
         Ok(self.state.clone())
     }
+}
+
+struct ScriptedGenerationSnapshot {
+    pages: VecDeque<GenerationSnapshotPage>,
+    observed: Vec<Option<String>>,
+}
+
+impl GenerationSnapshotSource for ScriptedGenerationSnapshot {
+    fn read_generation_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        _max_records: usize,
+    ) -> Result<GenerationSnapshotRead, SnapshotSourceFailure> {
+        self.observed.push(committed_cursor.map(ToOwned::to_owned));
+        self.pages
+            .pop_front()
+            .map(GenerationSnapshotRead::Page)
+            .ok_or(SnapshotSourceFailure::Invalid)
+    }
+}
+
+struct ScriptedFeed {
+    pages: VecDeque<Result<ChangeFeedPage, ChangeFeedSourceFailure>>,
+    reads: Vec<(String, u64)>,
+}
+
+impl ChangeFeedSource for ScriptedFeed {
+    fn read_change_feed(
+        &mut self,
+        source_feed_epoch: &str,
+        committed_offset: u64,
+        _max_records: usize,
+    ) -> Result<ChangeFeedPage, ChangeFeedSourceFailure> {
+        self.reads
+            .push((source_feed_epoch.to_owned(), committed_offset));
+        self.pages
+            .pop_front()
+            .unwrap_or(Err(ChangeFeedSourceFailure::Invalid))
+    }
+}
+
+#[derive(Default)]
+struct GenerationTransport {
+    state: SourceSyncStateView,
+    applied: Vec<SourceBatch>,
+    failures: VecDeque<TransportFailure>,
+}
+
+impl SourceSyncTransport for GenerationTransport {
+    fn apply_source_batch(
+        &mut self,
+        batch: &SourceBatch,
+    ) -> Result<ApplySourceBatchReply, TransportFailure> {
+        self.applied.push(batch.clone());
+        if let Some(failure) = self.failures.pop_front() {
+            return Err(failure);
+        }
+        let Some(delivery) = batch.delivery.as_ref() else {
+            return Ok(ApplySourceBatchReply::Rejected {
+                reason_code: "v2_required".into(),
+            });
+        };
+        if self.state.current_cursor.as_deref().unwrap_or_default() != batch.current_cursor {
+            return Ok(ApplySourceBatchReply::Rejected {
+                reason_code: "stale_cursor".into(),
+            });
+        }
+        if delivery.mode == SourceDeliveryMode::ChangeFeed
+            && delivery
+                .offset_start
+                .zip(self.state.committed_offset)
+                .is_some_and(|(start, committed)| start > committed)
+        {
+            self.state.generation_status = Some(SourceGenerationStatus::RecoveryRequired);
+            self.state.latest_transaction_reason = Some("missing_source_range".into());
+            return Ok(ApplySourceBatchReply::Rejected {
+                reason_code: "missing_source_range".into(),
+            });
+        }
+        self.state.found = true;
+        self.state.current_cursor = Some(batch.proposed_next_cursor.clone());
+        self.state.open_transaction = false;
+        self.state.last_committed_batch_digest = Some(batch.batch_digest.clone());
+        self.state.latest_transaction_idempotency_key = Some(batch.idempotency_key.clone());
+        self.state.sync_generation = Some(delivery.sync_generation);
+        match delivery.mode {
+            SourceDeliveryMode::Snapshot if delivery.snapshot_complete => {
+                self.state.generation_status = Some(SourceGenerationStatus::Active);
+                self.state.delivery_mode = Some(SourceDeliveryMode::ChangeFeed);
+                self.state.source_feed_epoch = delivery.source_feed_epoch.clone();
+                self.state.committed_offset = delivery.offset_end;
+            }
+            SourceDeliveryMode::Snapshot => {
+                self.state.generation_status = Some(SourceGenerationStatus::Snapshotting);
+                self.state.delivery_mode = Some(SourceDeliveryMode::Snapshot);
+                self.state.source_feed_epoch = None;
+                self.state.committed_offset = None;
+            }
+            SourceDeliveryMode::ChangeFeed => {
+                if self.state.source_feed_epoch != delivery.source_feed_epoch {
+                    return Ok(ApplySourceBatchReply::Rejected {
+                        reason_code: "feed_epoch_mismatch".into(),
+                    });
+                }
+                self.state.generation_status = Some(SourceGenerationStatus::Active);
+                self.state.delivery_mode = Some(SourceDeliveryMode::ChangeFeed);
+                self.state.committed_offset = delivery.offset_end;
+            }
+        }
+        Ok(ApplySourceBatchReply::Committed {
+            idempotency_key: batch.idempotency_key.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            committed_cursor: batch.proposed_next_cursor.clone(),
+        })
+    }
+
+    fn get_source_sync_state(
+        &mut self,
+        _input: &GetSourceSyncStateInput,
+    ) -> Result<SourceSyncStateView, TransportFailure> {
+        Ok(self.state.clone())
+    }
+}
+
+fn sequenced_record(external_id: &str, sequence: u64) -> SourceRecord {
+    let mut record = issue();
+    record.external_id = external_id.into();
+    record.source_version = format!("revision-{external_id}-{sequence}");
+    record.display_name = format!("Object {external_id}");
+    record.source_sequence = Some(sequence);
+    record
 }
 
 #[test]
@@ -296,6 +439,539 @@ fn batch_and_serialization_are_deterministic_and_match_contract() {
     assert_eq!(value["records"][0]["external_id"], "665");
     assert!(first.idempotency_key.starts_with("sync-"));
     assert!(first.batch_digest.starts_with("sha256:"));
+}
+
+#[test]
+fn v2_builder_preserves_order_and_binds_delivery_identity() {
+    let delivery = SourceDeliveryWindow {
+        mode: SourceDeliveryMode::ChangeFeed,
+        sync_generation: 3,
+        source_feed_epoch: Some("feed-epoch-a".into()),
+        offset_start: Some(40),
+        offset_end: Some(42),
+        snapshot_complete: false,
+    };
+    let first = build_source_batch_v2(
+        &config(),
+        "cursor:40",
+        "cursor:42",
+        1_787_510_500_000,
+        vec![sequenced_record("671", 41), sequenced_record("672", 42)],
+        delivery.clone(),
+    )
+    .unwrap();
+    let later_collection = build_source_batch_v2(
+        &config(),
+        "cursor:40",
+        "cursor:42",
+        1_787_510_900_000,
+        vec![sequenced_record("671", 41), sequenced_record("672", 42)],
+        delivery.clone(),
+    )
+    .unwrap();
+    assert_eq!(first.idempotency_key, later_collection.idempotency_key);
+    assert_eq!(first.batch_digest, later_collection.batch_digest);
+    assert_eq!(
+        first
+            .records
+            .iter()
+            .map(|record| record.source_sequence)
+            .collect::<Vec<_>>(),
+        [Some(41), Some(42)]
+    );
+
+    let mut next_generation = delivery;
+    next_generation.sync_generation = 4;
+    let changed = build_source_batch_v2(
+        &config(),
+        "cursor:40",
+        "cursor:42",
+        1_787_510_500_000,
+        vec![sequenced_record("671", 41), sequenced_record("672", 42)],
+        next_generation,
+    )
+    .unwrap();
+    assert_ne!(first.idempotency_key, changed.idempotency_key);
+    assert_ne!(first.batch_digest, changed.batch_digest);
+}
+
+#[test]
+fn v2_builder_rejects_reordered_duplicate_and_missing_internal_sequences() {
+    for (records, expected) in [
+        (
+            vec![sequenced_record("671", 42), sequenced_record("672", 41)],
+            "reordered_source_sequence",
+        ),
+        (
+            vec![sequenced_record("671", 41), sequenced_record("672", 41)],
+            "duplicate_source_sequence",
+        ),
+        (
+            vec![sequenced_record("671", 41), sequenced_record("672", 43)],
+            "noncontiguous_source_sequence",
+        ),
+    ] {
+        let error = build_source_batch_v2(
+            &config(),
+            "cursor:40",
+            "cursor:42",
+            1_787_510_500_000,
+            records,
+            SourceDeliveryWindow {
+                mode: SourceDeliveryMode::ChangeFeed,
+                sync_generation: 1,
+                source_feed_epoch: Some("feed-epoch-a".into()),
+                offset_start: Some(40),
+                offset_end: Some(42),
+                snapshot_complete: false,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn terminal_snapshot_handoff_then_two_feed_batches_are_contiguous() {
+    let root = temporary_root("v2-handoff");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut transport = GenerationTransport::default();
+    let mut snapshot = ScriptedGenerationSnapshot {
+        pages: VecDeque::from([GenerationSnapshotPage {
+            records: snapshot_page_one(),
+            proposed_next_cursor: "snapshot:complete".into(),
+            collected_at_ms: 1_787_511_100_000,
+            complete: true,
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            handoff_offset: Some(40),
+        }]),
+        observed: Vec::new(),
+    };
+    let snapshot_outcome = run_generation_snapshot_v2(
+        &config(),
+        &outbox,
+        &mut transport,
+        &mut snapshot,
+        SnapshotRunLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(snapshot_outcome.disposition, SourceRunDisposition::CaughtUp);
+    assert_eq!(snapshot_outcome.sync_generation, Some(1));
+    assert_eq!(snapshot_outcome.committed_offset, Some(40));
+
+    let mut feed = ScriptedFeed {
+        pages: VecDeque::from([
+            Ok(ChangeFeedPage {
+                offset_start: 40,
+                records: vec![sequenced_record("674", 41)],
+                proposed_next_cursor: "feed:41".into(),
+                collected_at_ms: 1_787_511_160_000,
+                caught_up: false,
+            }),
+            Ok(ChangeFeedPage {
+                offset_start: 41,
+                records: vec![sequenced_record("675", 42)],
+                proposed_next_cursor: "feed:42".into(),
+                collected_at_ms: 1_787_511_220_000,
+                caught_up: true,
+            }),
+        ]),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut feed, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::InProgress
+    );
+    let caught_up = run_change_feed(&config(), &outbox, &mut transport, &mut feed, 10).unwrap();
+    assert_eq!(caught_up.disposition, SourceRunDisposition::CaughtUp);
+    assert_eq!(caught_up.committed_offset, Some(42));
+    assert_eq!(
+        feed.reads,
+        [("feed-epoch-a".into(), 40), ("feed-epoch-a".into(), 41)]
+    );
+    assert_eq!(transport.applied.len(), 3);
+    assert_eq!(transport.applied[0].current_cursor, "");
+    assert_eq!(transport.applied[1].current_cursor, "snapshot:complete");
+    assert_eq!(transport.applied[2].current_cursor, "feed:41");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_starts_only_the_next_snapshot_generation_from_plane_cursor() {
+    let root = temporary_root("snapshot-next-generation");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut transport = GenerationTransport {
+        state: SourceSyncStateView {
+            found: true,
+            current_cursor: Some("plane:recovery-cursor".into()),
+            generation_status: Some(SourceGenerationStatus::RecoveryRequired),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(2),
+            source_feed_epoch: Some("old-epoch".into()),
+            committed_offset: Some(91),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut snapshot = ScriptedGenerationSnapshot {
+        pages: VecDeque::from([GenerationSnapshotPage {
+            records: snapshot_page_one(),
+            proposed_next_cursor: "snapshot:generation-3".into(),
+            collected_at_ms: 1_787_511_300_000,
+            complete: true,
+            source_feed_epoch: Some("feed-epoch-b".into()),
+            handoff_offset: Some(100),
+        }]),
+        observed: Vec::new(),
+    };
+    let outcome = run_generation_snapshot_v2(
+        &config(),
+        &outbox,
+        &mut transport,
+        &mut snapshot,
+        SnapshotRunLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(outcome.disposition, SourceRunDisposition::CaughtUp);
+    assert_eq!(outcome.sync_generation, Some(3));
+    assert_eq!(
+        snapshot.observed,
+        [Some("plane:recovery-cursor".to_string())]
+    );
+    assert_eq!(transport.applied[0].current_cursor, "plane:recovery-cursor");
+    assert_eq!(
+        transport.applied[0]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .sync_generation,
+        3
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn feed_requires_snapshot_and_reports_unsupported_ordering() {
+    let root = temporary_root("feed-gates");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut transport = GenerationTransport::default();
+    let mut unread = ScriptedFeed {
+        pages: VecDeque::new(),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut unread, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::SnapshotRequired
+    );
+    assert!(unread.reads.is_empty());
+
+    transport.state = SourceSyncStateView {
+        found: true,
+        current_cursor: Some("snapshot:complete".into()),
+        generation_status: Some(SourceGenerationStatus::Active),
+        delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+        sync_generation: Some(1),
+        source_feed_epoch: Some("feed-epoch-a".into()),
+        committed_offset: Some(40),
+        ..Default::default()
+    };
+    let mut unsupported = ScriptedFeed {
+        pages: VecDeque::from([Err(ChangeFeedSourceFailure::UnsupportedOrdering)]),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut unsupported, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::UnsupportedOrdering
+    );
+    assert_eq!(
+        github_object_sync::direct_feed_capability(),
+        github_object_sync::DirectFeedCapability::UnsupportedOrdering
+    );
+    assert!(transport.applied.is_empty());
+
+    let mut unavailable = ScriptedFeed {
+        pages: VecDeque::from([Err(ChangeFeedSourceFailure::Unavailable)]),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut unavailable, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::Pending
+    );
+    assert!(transport.applied.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn feed_fails_closed_for_open_foreign_and_mismatched_state() {
+    for state in [
+        SourceSyncStateView {
+            found: true,
+            current_cursor: Some("feed:40".into()),
+            open_transaction: true,
+            generation_status: Some(SourceGenerationStatus::Active),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(1),
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            committed_offset: Some(40),
+            ..Default::default()
+        },
+        SourceSyncStateView {
+            found: false,
+            current_cursor: Some("copied:cursor".into()),
+            ..Default::default()
+        },
+        SourceSyncStateView {
+            found: true,
+            current_cursor: Some("feed:40".into()),
+            generation_status: Some(SourceGenerationStatus::Active),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(1),
+            committed_offset: Some(40),
+            ..Default::default()
+        },
+    ] {
+        let root = temporary_root("feed-state");
+        let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+        let mut transport = GenerationTransport {
+            state,
+            ..Default::default()
+        };
+        let mut unread = ScriptedFeed {
+            pages: VecDeque::new(),
+            reads: Vec::new(),
+        };
+        assert_eq!(
+            run_change_feed(&config(), &outbox, &mut transport, &mut unread, 10)
+                .unwrap()
+                .disposition,
+            SourceRunDisposition::RecoveryRequired
+        );
+        assert!(unread.reads.is_empty());
+        assert!(transport.applied.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn feed_runner_keeps_shared_outbox_bindings_isolated() {
+    let root = temporary_root("feed-shared-outbox");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut other_config = config();
+    other_config.source_instance = "sannrox/other-repository".into();
+    let mut other_record = issue();
+    other_record.source_instance = other_config.source_instance.clone();
+    let other = build_source_batch(
+        &other_config,
+        "",
+        "other:snapshot",
+        1_787_511_100_000,
+        vec![other_record],
+    )
+    .unwrap();
+    outbox.enqueue(&other).unwrap();
+
+    let mut transport = GenerationTransport {
+        state: SourceSyncStateView {
+            found: true,
+            current_cursor: Some("feed:40".into()),
+            generation_status: Some(SourceGenerationStatus::Active),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(1),
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            committed_offset: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut feed = ScriptedFeed {
+        pages: VecDeque::from([Ok(ChangeFeedPage {
+            offset_start: 40,
+            records: vec![sequenced_record("674", 41)],
+            proposed_next_cursor: "feed:41".into(),
+            collected_at_ms: 1_787_511_160_000,
+            caught_up: true,
+        })]),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut feed, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::CaughtUp
+    );
+    assert_eq!(transport.applied.len(), 1);
+    assert_eq!(outbox.pending().unwrap(), [other]);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn plane_missing_range_requires_recovery_without_running_snapshot() {
+    let root = temporary_root("feed-plane-gap");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let mut transport = GenerationTransport {
+        state: SourceSyncStateView {
+            found: true,
+            current_cursor: Some("feed:40".into()),
+            generation_status: Some(SourceGenerationStatus::Active),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(1),
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            committed_offset: Some(40),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut feed = ScriptedFeed {
+        pages: VecDeque::from([Ok(ChangeFeedPage {
+            offset_start: 50,
+            records: vec![sequenced_record("674", 51)],
+            proposed_next_cursor: "feed:51".into(),
+            collected_at_ms: 1_787_511_160_000,
+            caught_up: false,
+        })]),
+        reads: Vec::new(),
+    };
+    assert_eq!(
+        run_change_feed(&config(), &outbox, &mut transport, &mut feed, 10)
+            .unwrap()
+            .disposition,
+        SourceRunDisposition::RecoveryRequired
+    );
+    assert_eq!(transport.applied.len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn feed_runner_never_counts_historical_replay_as_current_progress() {
+    let root = temporary_root("feed-historical-replay");
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let historical = build_source_batch_v2(
+        &config(),
+        "feed:40",
+        "feed:41",
+        1_787_511_160_000,
+        vec![sequenced_record("674", 41)],
+        SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            offset_start: Some(40),
+            offset_end: Some(41),
+            snapshot_complete: false,
+        },
+    )
+    .unwrap();
+    outbox.enqueue(&historical).unwrap();
+    let mut transport = ScriptedTransport {
+        replies: VecDeque::from([Ok(ApplySourceBatchReply::Committed {
+            idempotency_key: historical.idempotency_key.clone(),
+            batch_digest: historical.batch_digest.clone(),
+            committed_cursor: historical.proposed_next_cursor.clone(),
+        })]),
+        state: Some(SourceSyncStateView {
+            found: true,
+            current_cursor: Some("feed:42".into()),
+            last_committed_batch_digest: Some(format!("sha256:{}", "e".repeat(64))),
+            generation_status: Some(SourceGenerationStatus::Active),
+            delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+            sync_generation: Some(1),
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            committed_offset: Some(42),
+            latest_transaction_idempotency_key: Some("sync-historical-successor".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut unread = ScriptedFeed {
+        pages: VecDeque::new(),
+        reads: Vec::new(),
+    };
+    let outcome = run_change_feed(&config(), &outbox, &mut transport, &mut unread, 10).unwrap();
+    assert_eq!(outcome.disposition, SourceRunDisposition::RecoveryRequired);
+    assert_eq!(outcome.batches_committed, 0);
+    assert!(unread.reads.is_empty());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn v2_outbox_restart_replays_exact_batch_and_invalid_values_stay_secret_safe() {
+    let root = temporary_root("v2-restart");
+    let batch = build_source_batch_v2(
+        &config(),
+        "feed:40",
+        "feed:41",
+        1_787_511_160_000,
+        vec![sequenced_record("674", 41)],
+        SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            offset_start: Some(40),
+            offset_end: Some(41),
+            snapshot_complete: false,
+        },
+    )
+    .unwrap();
+    let mut ambiguous = ScriptedTransport {
+        replies: VecDeque::from([Err(TransportFailure::Ambiguous)]),
+        ..Default::default()
+    };
+    let mut committed = ScriptedTransport {
+        replies: VecDeque::from([Ok(ApplySourceBatchReply::Committed {
+            idempotency_key: batch.idempotency_key.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            committed_cursor: batch.proposed_next_cursor.clone(),
+        })]),
+        ..Default::default()
+    };
+    object_sync_conformance::run_restart_and_commit(&root, &batch, &mut ambiguous, &mut committed)
+        .unwrap();
+
+    let cursor_secret = "ghp_sensitive-cursor";
+    let cursor_error = build_source_batch_v2(
+        &config(),
+        cursor_secret,
+        "feed:41",
+        1_787_511_160_000,
+        vec![sequenced_record("674", 41)],
+        SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some("feed-epoch-a".into()),
+            offset_start: Some(40),
+            offset_end: Some(41),
+            snapshot_complete: false,
+        },
+    )
+    .unwrap_err();
+    assert!(!cursor_error.contains(cursor_secret));
+    let epoch_secret = "ghp_sensitive-epoch";
+    let epoch_error = build_source_batch_v2(
+        &config(),
+        "feed:40",
+        "feed:41",
+        1_787_511_160_000,
+        vec![sequenced_record("674", 41)],
+        SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some(epoch_secret.into()),
+            offset_start: Some(40),
+            offset_end: Some(41),
+            snapshot_complete: false,
+        },
+    )
+    .unwrap_err();
+    assert!(!epoch_error.contains(epoch_secret));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -840,6 +1516,7 @@ fn snapshot_runner_fails_closed_for_open_foreign_and_invalid_progress() {
             current_cursor: Some("opaque:snapshot-d:page-1".into()),
             open_transaction: true,
             last_committed_batch_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -869,6 +1546,7 @@ fn snapshot_runner_fails_closed_for_open_foreign_and_invalid_progress() {
             current_cursor: Some("opaque:copied-from-another-binding".into()),
             open_transaction: false,
             last_committed_batch_digest: None,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -997,6 +1675,7 @@ fn state_transport_seam_reads_without_credentials() {
         current_cursor: Some("cursor:665".into()),
         open_transaction: false,
         last_committed_batch_digest: Some(format!("sha256:{}", "a".repeat(64))),
+        ..Default::default()
     };
     let mut transport = ScriptedTransport {
         state: Some(expected.clone()),

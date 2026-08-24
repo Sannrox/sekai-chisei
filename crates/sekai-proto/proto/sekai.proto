@@ -1252,6 +1252,26 @@ message SourceRecord {
   map<string, string> properties = 8;
   bool deleted = 9;
   int64 observed_at_ms = 10;
+  optional uint64 source_sequence = 11;
+}
+
+enum SourceDeliveryMode {
+  SOURCE_DELIVERY_MODE_UNSPECIFIED = 0;
+  SOURCE_DELIVERY_MODE_SNAPSHOT = 1;
+  SOURCE_DELIVERY_MODE_CHANGE_FEED = 2;
+}
+
+// Replay-relevant ordered-delivery metadata for sekai.source-batch/v2.
+message SourceDeliveryWindow {
+  SourceDeliveryMode mode = 1;
+  uint64 sync_generation = 2;
+  optional string source_feed_epoch = 3;
+  // Exclusive lower bound for change-feed delivery.
+  optional uint64 offset_start = 4;
+  // Inclusive upper bound for change-feed delivery, or the handoff barrier
+  // when snapshot_complete is true.
+  optional uint64 offset_end = 5;
+  bool snapshot_complete = 6;
 }
 
 message SourceBatch {
@@ -1271,6 +1291,7 @@ message SourceBatch {
   string batch_digest = 13;
   int64 collected_at_ms = 14;
   repeated SourceRecord records = 15;
+  SourceDeliveryWindow delivery = 16;
 }
 
 message SourceBinding {
@@ -1301,6 +1322,13 @@ message SourceBatchTransaction {
   int64 opened_at_ms = 11;
   optional int64 closed_at_ms = 12;
   string reason = 13;
+  string contract_version = 14;
+  SourceDeliveryMode delivery_mode = 15;
+  optional uint64 sync_generation = 16;
+  optional string source_feed_epoch = 17;
+  optional uint64 offset_start = 18;
+  optional uint64 offset_end = 19;
+  optional bool snapshot_complete = 20;
 }
 
 message SourceCheckpoint {
@@ -1309,6 +1337,11 @@ message SourceCheckpoint {
   string cursor = 3;
   string committed_batch_digest = 4;
   int64 advanced_at_ms = 5;
+  string contract_version = 6;
+  SourceDeliveryMode delivery_mode = 7;
+  optional uint64 sync_generation = 8;
+  optional string source_feed_epoch = 9;
+  optional uint64 committed_offset = 10;
 }
 
 message SyncedObject {
@@ -1338,6 +1371,7 @@ message SourceRecordResult {
   string reason = 6;
   SyncedObject object = 7;
   SourceRecordLineage lineage = 8;
+  optional uint64 source_sequence = 9;
 }
 
 message SourceBatchResult {
@@ -1346,12 +1380,34 @@ message SourceBatchResult {
   bool checkpoint_advanced = 3;
 }
 
+enum SourceSyncGenerationStatus {
+  SOURCE_SYNC_GENERATION_STATUS_UNSPECIFIED = 0;
+  SOURCE_SYNC_GENERATION_STATUS_SNAPSHOTTING = 1;
+  SOURCE_SYNC_GENERATION_STATUS_ACTIVE = 2;
+  SOURCE_SYNC_GENERATION_STATUS_RECOVERY_REQUIRED = 3;
+  SOURCE_SYNC_GENERATION_STATUS_SUPERSEDED = 4;
+}
+
+message SourceSyncGeneration {
+  string binding_id = 1;
+  uint64 sync_generation = 2;
+  SourceSyncGenerationStatus status = 3;
+  SourceDeliveryMode delivery_mode = 4;
+  optional string source_feed_epoch = 5;
+  optional uint64 committed_offset = 6;
+  string reason = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+}
+
 message SourceSyncState {
   SourceBinding binding = 1;
   SourceCheckpoint checkpoint = 2;
   SourceBatchTransaction open_transaction = 3;
   SourceBatchResult last_result = 4;
   int64 updated_at_ms = 5;
+  SourceSyncGeneration current_generation = 6;
+  SourceBatchTransaction latest_transaction = 7;
 }
 
 message ApplySourceBatchRequest { SourceBatch batch = 1; }

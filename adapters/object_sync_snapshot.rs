@@ -6,10 +6,13 @@
 //! opaque cursor.
 
 use crate::object_sync_sdk::{
-    FlushDisposition, GetSourceSyncStateInput, SourceAdapterConfig, SourceOutbox,
-    SourceSyncTransport, TransportFailure, build_source_batch,
+    FlushDisposition, GetSourceSyncStateInput, SourceAdapterConfig, SourceGenerationStatus,
+    SourceOutbox, SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
+    TransportFailure, build_source_batch, build_source_batch_v2,
 };
-use sekai_chisei::sekai::object_sync::{MAX_SOURCE_BATCH_RECORDS, SourceRecord};
+use sekai_chisei::sekai::object_sync::{
+    MAX_SOURCE_BATCH_RECORDS, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+};
 
 pub const DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN: usize = 32;
 
@@ -58,6 +61,31 @@ pub trait SnapshotPageSource {
         committed_cursor: Option<&str>,
         max_records: usize,
     ) -> Result<SnapshotRead, SnapshotSourceFailure>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationSnapshotPage {
+    pub records: Vec<SourceRecord>,
+    pub proposed_next_cursor: String,
+    pub collected_at_ms: i64,
+    pub complete: bool,
+    /// Required only for the terminal page.
+    pub source_feed_epoch: Option<String>,
+    /// Required only for the terminal page.
+    pub handoff_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationSnapshotRead {
+    Page(GenerationSnapshotPage),
+}
+
+pub trait GenerationSnapshotSource {
+    fn read_generation_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<GenerationSnapshotRead, SnapshotSourceFailure>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +255,188 @@ pub fn run_snapshot<T: SourceSyncTransport, S: SnapshotPageSource>(
     }
 }
 
+/// Process generation-fenced v2 snapshot pages.
+///
+/// A new generation is admitted only for a new/legacy binding or after the
+/// plane reports the prior generation as recovery-required.
+pub fn run_generation_snapshot_v2<T: SourceSyncTransport, S: GenerationSnapshotSource>(
+    config: &SourceAdapterConfig,
+    outbox: &SourceOutbox,
+    transport: &mut T,
+    source: &mut S,
+    limits: SnapshotRunLimits,
+) -> Result<SourceRunReport, SnapshotRunError> {
+    if validate_limits(limits).is_err() {
+        return Ok(SourceRunReport {
+            disposition: SourceRunDisposition::InvalidInput,
+            batches_committed: 0,
+            committed_cursor: None,
+            sync_generation: None,
+            committed_offset: None,
+        });
+    }
+    let mut batches_committed = 0;
+
+    if let Some(pending) = pending_binding_batch(config, outbox)? {
+        let entry = outbox
+            .flush_idempotency_key(&pending.idempotency_key, transport, true)
+            .map_err(|_| SnapshotRunError::Outbox)?;
+        match entry.disposition {
+            FlushDisposition::Pending => {
+                let state = read_state(config, transport)?;
+                return Ok(SourceRunReport::from_state(
+                    SourceRunDisposition::Pending,
+                    batches_committed,
+                    &state,
+                ));
+            }
+            FlushDisposition::Quarantined => {
+                let state = read_state(config, transport)?;
+                return Ok(SourceRunReport::from_state(
+                    rejected_disposition(&state),
+                    batches_committed,
+                    &state,
+                ));
+            }
+            FlushDisposition::Committed => {
+                let state = read_state(config, transport)?;
+                if !state_matches_v2_batch(&state, &pending) {
+                    return Ok(SourceRunReport::from_state(
+                        SourceRunDisposition::RecoveryRequired,
+                        batches_committed,
+                        &state,
+                    ));
+                }
+                batches_committed += 1;
+            }
+        }
+    }
+
+    loop {
+        let state = read_state(config, transport)?;
+        if state.open_transaction || (!state.found && state.current_cursor.is_some()) {
+            return Ok(SourceRunReport::from_state(
+                SourceRunDisposition::RecoveryRequired,
+                batches_committed,
+                &state,
+            ));
+        }
+        let Some(sync_generation) = snapshot_generation(&state) else {
+            let disposition = if state.generation_status == Some(SourceGenerationStatus::Active) {
+                SourceRunDisposition::CaughtUp
+            } else {
+                SourceRunDisposition::RecoveryRequired
+            };
+            return Ok(SourceRunReport::from_state(
+                disposition,
+                batches_committed,
+                &state,
+            ));
+        };
+
+        let page = match source
+            .read_generation_page(state.current_cursor.as_deref(), limits.max_records_per_page)
+        {
+            Ok(GenerationSnapshotRead::Page(page)) => page,
+            Err(SnapshotSourceFailure::Unavailable) => {
+                return Ok(SourceRunReport::from_state(
+                    SourceRunDisposition::Pending,
+                    batches_committed,
+                    &state,
+                ));
+            }
+            Err(SnapshotSourceFailure::Invalid) => {
+                return Ok(SourceRunReport::from_state(
+                    SourceRunDisposition::InvalidInput,
+                    batches_committed,
+                    &state,
+                ));
+            }
+        };
+        if !valid_generation_page(&page, state.current_cursor.as_deref(), limits) {
+            return Ok(SourceRunReport::from_state(
+                SourceRunDisposition::InvalidInput,
+                batches_committed,
+                &state,
+            ));
+        }
+
+        let delivery = SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Snapshot,
+            sync_generation,
+            source_feed_epoch: page.source_feed_epoch.clone(),
+            offset_start: None,
+            offset_end: page.handoff_offset,
+            snapshot_complete: page.complete,
+        };
+        let batch = match build_source_batch_v2(
+            config,
+            state.current_cursor.as_deref().unwrap_or_default(),
+            &page.proposed_next_cursor,
+            page.collected_at_ms,
+            page.records,
+            delivery,
+        ) {
+            Ok(batch) => batch,
+            Err(_) => {
+                return Ok(SourceRunReport::from_state(
+                    SourceRunDisposition::InvalidInput,
+                    batches_committed,
+                    &state,
+                ));
+            }
+        };
+        outbox
+            .enqueue(&batch)
+            .map_err(|_| SnapshotRunError::Outbox)?;
+        let entry = outbox
+            .flush_idempotency_key(&batch.idempotency_key, transport, true)
+            .map_err(|_| SnapshotRunError::Outbox)?;
+        match entry.disposition {
+            FlushDisposition::Pending => {
+                return Ok(SourceRunReport::from_state(
+                    SourceRunDisposition::Pending,
+                    batches_committed,
+                    &state,
+                ));
+            }
+            FlushDisposition::Quarantined => {
+                let rejected_state = read_state(config, transport)?;
+                return Ok(SourceRunReport::from_state(
+                    rejected_disposition(&rejected_state),
+                    batches_committed,
+                    &rejected_state,
+                ));
+            }
+            FlushDisposition::Committed => {
+                let verified = read_state(config, transport)?;
+                if !state_matches_v2_batch(&verified, &batch) {
+                    return Ok(SourceRunReport::from_state(
+                        SourceRunDisposition::RecoveryRequired,
+                        batches_committed,
+                        &verified,
+                    ));
+                }
+                batches_committed += 1;
+                if page.complete {
+                    return Ok(SourceRunReport::from_state(
+                        SourceRunDisposition::CaughtUp,
+                        batches_committed,
+                        &verified,
+                    ));
+                }
+                if batches_committed == limits.max_pages_per_run {
+                    return Ok(SourceRunReport::from_state(
+                        SourceRunDisposition::InProgress,
+                        batches_committed,
+                        &verified,
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn read_state<T: SourceSyncTransport>(
     config: &SourceAdapterConfig,
     transport: &mut T,
@@ -251,6 +461,65 @@ fn state_matches_batch(
         && !state.open_transaction
         && state.current_cursor.as_deref() == Some(batch.proposed_next_cursor.as_str())
         && state.last_committed_batch_digest.as_deref() == Some(batch.batch_digest.as_str())
+}
+
+fn snapshot_generation(state: &SourceSyncStateView) -> Option<u64> {
+    match state.generation_status {
+        None if state.sync_generation.is_none() => Some(1),
+        Some(SourceGenerationStatus::Snapshotting)
+            if state.delivery_mode == Some(SourceDeliveryMode::Snapshot) =>
+        {
+            state.sync_generation
+        }
+        Some(SourceGenerationStatus::RecoveryRequired) => state
+            .sync_generation
+            .and_then(|generation| generation.checked_add(1)),
+        _ => None,
+    }
+}
+
+fn state_matches_v2_batch(state: &SourceSyncStateView, batch: &SourceBatch) -> bool {
+    let Some(delivery) = batch.delivery.as_ref() else {
+        return false;
+    };
+    let common = state.found
+        && !state.open_transaction
+        && state.current_cursor.as_deref() == Some(batch.proposed_next_cursor.as_str())
+        && state.last_committed_batch_digest.as_deref() == Some(batch.batch_digest.as_str())
+        && state.latest_transaction_idempotency_key.as_deref()
+            == Some(batch.idempotency_key.as_str())
+        && state.sync_generation == Some(delivery.sync_generation);
+    if !common {
+        return false;
+    }
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot if delivery.snapshot_complete => {
+            state.generation_status == Some(SourceGenerationStatus::Active)
+                && state.delivery_mode == Some(SourceDeliveryMode::ChangeFeed)
+                && state.source_feed_epoch == delivery.source_feed_epoch
+                && state.committed_offset == delivery.offset_end
+        }
+        SourceDeliveryMode::Snapshot => {
+            state.generation_status == Some(SourceGenerationStatus::Snapshotting)
+                && state.delivery_mode == Some(SourceDeliveryMode::Snapshot)
+                && state.source_feed_epoch.is_none()
+                && state.committed_offset.is_none()
+        }
+        SourceDeliveryMode::ChangeFeed => false,
+    }
+}
+
+fn rejected_disposition(state: &SourceSyncStateView) -> SourceRunDisposition {
+    if state.generation_status == Some(SourceGenerationStatus::RecoveryRequired)
+        || state
+            .latest_transaction_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("missing") && reason.contains("range"))
+    {
+        SourceRunDisposition::RecoveryRequired
+    } else {
+        SourceRunDisposition::Rejected
+    }
 }
 
 fn validate_limits(limits: SnapshotRunLimits) -> Result<(), SnapshotRunError> {
@@ -278,6 +547,26 @@ fn validate_page(
     } else {
         Ok(())
     }
+}
+
+fn valid_generation_page(
+    page: &GenerationSnapshotPage,
+    committed_cursor: Option<&str>,
+    limits: SnapshotRunLimits,
+) -> bool {
+    let terminal_metadata_valid = if page.complete {
+        page.source_feed_epoch
+            .as_deref()
+            .is_some_and(|epoch| !epoch.is_empty())
+            && page.handoff_offset.is_some()
+    } else {
+        page.source_feed_epoch.is_none() && page.handoff_offset.is_none()
+    };
+    !page.records.is_empty()
+        && page.records.len() <= limits.max_records_per_page
+        && !page.proposed_next_cursor.is_empty()
+        && committed_cursor != Some(page.proposed_next_cursor.as_str())
+        && terminal_metadata_valid
 }
 
 fn pending_binding_batch(

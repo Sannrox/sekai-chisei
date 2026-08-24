@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 
+use rusqlite::params;
 use sekai_chisei::db::object_sync::ObjectSyncBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_VERSION, SOURCE_GITHUB,
-    SourceBatch, SourceBatchStatus, SourceRecord, SourceSyncState, SyncDecision,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_V2_VERSION,
+    SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatch, SourceBatchStatus, SourceDeliveryMode,
+    SourceDeliveryWindow, SourceRecord, SourceSyncGenerationStatus, SourceSyncState, SyncDecision,
 };
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 
 const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
 const SOURCE_INSTANCE: &str = "sekai-project/sekai-chisei";
@@ -47,7 +51,9 @@ fn batch(prefix: &str, current_cursor: &str, next_cursor: &str, key: &str) -> So
             ]),
             deleted: false,
             observed_at_ms: 10,
+            source_sequence: None,
         }],
+        delivery: None,
     };
     redigest(&mut batch);
     batch
@@ -55,6 +61,15 @@ fn batch(prefix: &str, current_cursor: &str, next_cursor: &str, key: &str) -> So
 
 fn redigest(batch: &mut SourceBatch) {
     batch.batch_digest = batch.canonical_digest().unwrap();
+}
+
+fn stable_id(prefix: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{prefix}-{:x}", digest.finalize())
 }
 
 fn checkpoint(db: &dyn ObjectSyncBackend, prefix: &str) -> Option<String> {
@@ -207,9 +222,225 @@ fn exercise_object_sync(db: &dyn ObjectSyncBackend, prefix: &str) {
     );
 }
 
+fn exercise_ordered_feed(db: &dyn ObjectSyncBackend, prefix: &str) {
+    let producer = format!("connector/{prefix}");
+    let mut snapshot = batch(prefix, "", "cursor:snapshot", "snapshot-1");
+    snapshot.contract_version = SOURCE_BATCH_V2_VERSION.into();
+    snapshot.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::Snapshot,
+        sync_generation: 1,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: None,
+        offset_end: Some(40),
+        snapshot_complete: true,
+    });
+    redigest(&mut snapshot);
+    let snapshot_result = db.apply_source_batch(&snapshot, &producer, 1_000).unwrap();
+    let handoff = source_sync_state(db, prefix).unwrap();
+    assert_eq!(
+        handoff.current_generation.as_ref().unwrap().status,
+        SourceSyncGenerationStatus::Active
+    );
+    assert_eq!(
+        handoff.current_generation.as_ref().unwrap().delivery_mode,
+        SourceDeliveryMode::ChangeFeed
+    );
+    assert_eq!(
+        handoff
+            .current_generation
+            .as_ref()
+            .unwrap()
+            .committed_offset,
+        Some(40)
+    );
+
+    let mut feed = batch(prefix, "cursor:snapshot", "cursor:41", "feed-41");
+    feed.contract_version = SOURCE_BATCH_V2_VERSION.into();
+    feed.records[0].source_sequence = Some(41);
+    feed.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::ChangeFeed,
+        sync_generation: 1,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: Some(40),
+        offset_end: Some(41),
+        snapshot_complete: false,
+    });
+    redigest(&mut feed);
+    db.apply_source_batch(&feed, &producer, 1_100).unwrap();
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:41"));
+
+    assert_eq!(
+        db.apply_source_batch(&snapshot, &producer, 1_200).unwrap(),
+        snapshot_result
+    );
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:41"));
+
+    let mut overlap = feed.clone();
+    overlap.idempotency_key = format!("{prefix}-overlap");
+    overlap.current_cursor = "cursor:41".into();
+    overlap.proposed_next_cursor = "cursor:overlap".into();
+    redigest(&mut overlap);
+    assert!(
+        db.apply_source_batch(&overlap, &producer, 1_300)
+            .unwrap_err()
+            .starts_with("overlapping_range:")
+    );
+
+    let mut missing = feed.clone();
+    missing.idempotency_key = format!("{prefix}-missing");
+    missing.current_cursor = "cursor:41".into();
+    missing.proposed_next_cursor = "cursor:missing".into();
+    missing.records[0].source_sequence = Some(51);
+    missing.delivery.as_mut().unwrap().offset_start = Some(50);
+    missing.delivery.as_mut().unwrap().offset_end = Some(51);
+    redigest(&mut missing);
+    assert!(
+        db.apply_source_batch(&missing, &producer, 1_400)
+            .unwrap_err()
+            .starts_with("missing_range:")
+    );
+    let recovery_state = source_sync_state(db, prefix).unwrap();
+    assert_eq!(
+        recovery_state.current_generation.as_ref().unwrap().status,
+        SourceSyncGenerationStatus::RecoveryRequired
+    );
+    assert_eq!(
+        recovery_state.latest_transaction.as_ref().unwrap().status,
+        SourceBatchStatus::Aborted
+    );
+
+    let mut recovery = batch(prefix, "cursor:41", "cursor:recovered", "snapshot-2");
+    recovery.contract_version = SOURCE_BATCH_V2_VERSION.into();
+    recovery.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::Snapshot,
+        sync_generation: 2,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: None,
+        offset_end: Some(80),
+        snapshot_complete: true,
+    });
+    redigest(&mut recovery);
+    db.apply_source_batch(&recovery, &producer, 1_500).unwrap();
+    let recovered = source_sync_state(db, prefix).unwrap();
+    assert_eq!(
+        recovered.current_generation.as_ref().unwrap().status,
+        SourceSyncGenerationStatus::Active
+    );
+    assert_eq!(
+        recovered
+            .current_generation
+            .as_ref()
+            .unwrap()
+            .sync_generation,
+        2
+    );
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:recovered"));
+}
+
 #[test]
 fn sqlite_object_sync_backend_conformance() {
     exercise_object_sync(&SekaiDb::new(":memory:").unwrap(), "sqlite");
+    exercise_ordered_feed(&SekaiDb::new(":memory:").unwrap(), "sqlite-ordered");
+}
+
+#[test]
+fn sqlite_ordered_open_resumes_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("ordered-open.sqlite");
+    let prefix = "sqlite-open-restart";
+    let producer = format!("connector/{prefix}");
+    let mut snapshot = batch(prefix, "", "cursor:snapshot", "snapshot-1");
+    snapshot.contract_version = SOURCE_BATCH_V2_VERSION.into();
+    snapshot.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::Snapshot,
+        sync_generation: 1,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: None,
+        offset_end: Some(40),
+        snapshot_complete: true,
+    });
+    redigest(&mut snapshot);
+    SekaiDb::new(path.to_str().unwrap()).unwrap();
+
+    let binding_id = stable_id(
+        "source-binding",
+        &[
+            &snapshot.namespace,
+            &snapshot.source,
+            &snapshot.source_instance,
+        ],
+    );
+    let transaction_id = stable_id(
+        "source-batch",
+        &[
+            &snapshot.namespace,
+            &snapshot.producer_identity,
+            &snapshot.idempotency_key,
+        ],
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO sekai_source_bindings (
+                binding_id, namespace, producer_identity, source, source_instance,
+                family, adapter_id, adapter_version, type_digest, created_at_ms,
+                active, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 100, 1, 100)",
+            params![
+                binding_id,
+                snapshot.namespace,
+                snapshot.producer_identity,
+                snapshot.source,
+                snapshot.source_instance,
+                snapshot.family,
+                snapshot.adapter_id,
+                snapshot.adapter_version,
+                snapshot.type_digest,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sekai_source_batch_transactions (
+                transaction_id, binding_id, namespace, producer_identity, idempotency_key,
+                batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
+                outcome, opened_at_ms, reason, contract_version, delivery_mode,
+                sync_generation, feed_epoch, offset_end, snapshot_complete
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'OPEN',
+                'unavailable', 100, 'awaiting atomic commit', ?10, 'snapshot',
+                1, 'epoch-1', 40, 1
+             )",
+            params![
+                transaction_id,
+                binding_id,
+                snapshot.namespace,
+                snapshot.producer_identity,
+                snapshot.idempotency_key,
+                snapshot.batch_digest,
+                serde_json::to_string(&snapshot).unwrap(),
+                snapshot.current_cursor,
+                snapshot.proposed_next_cursor,
+                snapshot.contract_version,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SekaiDb::new(path.to_str().unwrap()).unwrap();
+    let result = reopened
+        .apply_source_batch(&snapshot, &producer, 200)
+        .unwrap();
+    assert_eq!(result.transaction.opened_at_ms, 100);
+    assert_eq!(result.transaction.status, SourceBatchStatus::Committed);
+    assert_eq!(
+        source_sync_state(&reopened, prefix)
+            .unwrap()
+            .current_generation
+            .unwrap()
+            .status,
+        SourceSyncGenerationStatus::Active
+    );
 }
 
 fn postgres() -> PostgresDb {
@@ -226,7 +457,9 @@ fn postgres() -> PostgresDb {
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_object_sync_backend_conformance() {
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
-    exercise_object_sync(&postgres(), &prefix);
+    let db = postgres();
+    exercise_object_sync(&db, &prefix);
+    exercise_ordered_feed(&db, &format!("{prefix}-ordered"));
 }
 
 #[test]

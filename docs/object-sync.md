@@ -1,11 +1,14 @@
 # Inbound object sync
 
-Inbound object sync admits bounded source batches and advances a plane-owned
-checkpoint only when every object, audit, lineage, result, and checkpoint write
-commits. The first and only source profile is GitHub Issue/PullRequest under
+Inbound object sync admits bounded source batches and advances
+control-plane-owned generation, offset, and cursor state only when every
+object, audit, lineage, result, and checkpoint write commits. The first and
+only source profile is GitHub Issue/PullRequest under
 `source_control.object_sync`. See
 [ADR 0022](decisions/0022-source-batch-transactions.md) and
-[ADR 0021](decisions/0021-defer-second-object-sync-source.md).
+[ADR 0021](decisions/0021-defer-second-object-sync-source.md). The ordered-feed
+design rationale is in
+[ADR 0023](decisions/0023-generation-fenced-source-change-feeds.md).
 
 ## Adapter workflow
 
@@ -25,7 +28,7 @@ The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
 perform no GitHub network requests.
 
-## Checkpointed snapshots
+## Version 1 checkpointed snapshots
 
 The reference snapshot runner pages a bounded source snapshot through the same
 batch contract. It does not add a snapshot RPC or persistence schema, and the
@@ -62,6 +65,69 @@ tombstone-by-absence: deletions must remain explicit `deleted: true` records.
 Across pages, a later revision of the same source identity refreshes the same
 derived object id.
 
+## Version 2 ordered synchronization
+
+`sekai.source-batch/v2` adds a replay-relevant `delivery` window and an optional
+`source_sequence` on each record. It retains the v1 source binding, identity,
+cursor, authorization, outbox, and atomic-commit rules.
+
+A v2 adapter must use one of two delivery modes:
+
+- `snapshot` establishes a control-plane-owned `sync_generation`. Snapshot
+  records have no `source_sequence`. The terminal page sets
+  `snapshot_complete`, supplies the stable `source_feed_epoch`, and carries the
+  source's consistency-barrier offset. The cursor on that terminal page is
+  committed with the barrier; adapter-local page state is not handoff
+  authority.
+- `change_feed` remains in the same generation and epoch. Its range is
+  `(offset_start, offset_end]`: `offset_start` must equal the last committed
+  offset, `offset_end` is inclusive, and every record has a strictly increasing
+  `source_sequence` that covers every offset in the range exactly once.
+
+Read `GetSourceSyncState` before collection and after every exact commit. Build
+the next batch only from the returned cursor, generation, epoch, and committed
+offset. Persist the complete normalized batch, including delivery metadata and
+source sequences, before calling `ApplySourceBatch`. Do not derive progress from
+timestamps, pagination positions, process-local counters, or the order in which
+records happened to arrive.
+
+The control plane owns generation transitions. Generation 1 begins with a
+snapshot. After the generation enters `RECOVERY_REQUIRED`, only a snapshot for
+exactly the next generation may reset ordered progress, and its
+`current_cursor` must reference
+the last committed cursor. The reset preserves the existing source binding,
+type revision, object identity, and lineage. Batches from an older generation
+cannot advance the replacement generation.
+
+### Ordered-feed failure and recovery
+
+- Exact replay of a committed batch returns the stored result without another
+  mutation or checkpoint advance.
+- A duplicate, reordered, or noncontiguous sequence inside a declared batch is
+  contract-invalid and is rejected before enqueue or durable transaction
+  creation. It cannot mutate generation state.
+- An overlapping non-replay range durably aborts without changing graph state,
+  generation progress, or the checkpoint.
+- A stateful missing range, where `offset_start` is ahead of the plane-owned
+  committed offset, durably aborts and marks the current generation
+  `RECOVERY_REQUIRED`. Do not skip the range or synthesize a replacement
+  offset.
+- Ambiguous transport progress stays in the outbox. Replay the exact persisted
+  batch before collecting another range.
+- Once a generation is `RECOVERY_REQUIRED`, only the next-generation snapshot
+  flow above can resume collection. Database repair must use authoritative
+  evidence and a complete consistent backup.
+
+A source is eligible for `change_feed` only when it provides a stable feed
+epoch, a contiguous monotonic sequence, and an authoritative snapshot/feed
+handoff offset. If any guarantee is absent, report the source capability as
+unsupported. GitHub's public Events API is not a supported gapless feed and
+must not be mapped to v2 offsets. A deployment-specific source transport may
+use v2 only when it independently provides all three guarantees.
+
+Snapshot completion still does not imply tombstone-by-absence. Every deletion
+must arrive as an explicit `deleted: true` source record.
+
 ## Batch contract
 
 A batch binds one namespace, authenticated producer, source instance, adapter
@@ -69,7 +135,7 @@ version, and type revision. `current_cursor` must be empty for the first batch
 and must exactly equal the last committed cursor thereafter. The adapter may
 propose `proposed_next_cursor`; only the control plane persists it.
 
-Version 1 admits exactly one code-owned type revision:
+The current object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;
 - family: `source_control.object_sync`;
@@ -86,8 +152,12 @@ decision and authoritative registration lifecycle; v1 does not infer a
 revision from caller input.
 
 The canonical batch digest includes all replay-relevant input, including the
-idempotency key and both cursors. It excludes `collected_at_ms`, so an exact
-retry after restart remains the same batch. The server rejects:
+idempotency key and both cursors. For v2 it also includes the complete delivery
+window and every source sequence. It excludes `collected_at_ms`, so an exact
+retry after restart remains the same batch. The v1 canonical form is unchanged,
+so previously committed v1 batches remain exactly replayable. Once a binding
+has started v2 ordered synchronization, a new v1 batch cannot advance it. The
+server rejects:
 
 - unknown contract or adapter versions;
 - mixed sources, repositories, or unsupported record kinds;
@@ -113,15 +183,18 @@ backend transaction and closes the batch as `COMMITTED` or `ABORTED`.
 - A storage failure may leave matching durable `OPEN` evidence. Retrying the
   exact batch resumes it; a different batch cannot overtake it.
 - Exact committed replay returns the stored result and does not mutate again.
+- For v2, generation state and the committed offset advance in this same
+  transaction; no audit row is treated as a substitute for offset continuity.
 - Ambiguous transport progress stays pending in the adapter outbox. Neither the
   adapter nor server manufactures `success`, `partial`, or `unknown`.
 - The outbox permits only one unresolved batch for a
   namespace/source-instance/type-revision binding. Exact re-enqueue is
   idempotent; a distinct later batch waits until the prior batch resolves.
 
-There is no operator endpoint that force-commits, edits, or discards an open
-transaction. Recovery is exact replay or database repair from authoritative
-evidence.
+There is no operator endpoint that force-commits, edits, discards, or skips an
+open transaction or ordered range. Recovery is exact replay, an authorized
+next-generation snapshot after `recovery_required`, or database repair from
+authoritative evidence.
 
 ## Identity and deletion
 
@@ -157,40 +230,60 @@ authority. Enterprise tenant context, when present, must agree with the
 namespace.
 
 Adapters retain source credentials and transport behavior outside the control
-plane. Evidence admission cannot mutate an object-sync identity. Outbound
-source mutation remains a governed Action with a permit-backed
+plane. Delivery metadata is progress evidence, not authority; every state read,
+batch apply, and recovery snapshot rechecks the authenticated principal and
+namespace access. Evidence admission cannot mutate an object-sync identity.
+Outbound source mutation remains a governed Action with a permit-backed
 `external_mutate` effect.
+
+Diagnostics use bounded reason codes and do not echo source payloads, feed
+epochs, cursors, credentials, authorization metadata, database details, or
+outbox contents.
 
 ## Persistence, retention, and rollback
 
-SQLite and reusable PostgreSQL implement the same binding, replay, lifecycle,
-identity, tombstone, and checkpoint contract. Normal CI runs SQLite
-conformance. PostgreSQL conformance and concurrency tests require an isolated
-TLS database through `SEKAI_TEST_POSTGRES_URL` and are ignored otherwise.
+SQLite and reusable PostgreSQL implement the same binding, replay, generation,
+contiguous-range, recovery, identity, tombstone, and checkpoint contract.
+Normal CI runs SQLite conformance. PostgreSQL conformance and concurrency tests
+require an isolated TLS database through `SEKAI_TEST_POSTGRES_URL` and are
+ignored otherwise:
+
+```sh
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test --test object_sync_backend_conformance -- --ignored
+```
+
 A partial unique graph index on `(namespace, external_id)` for `github:*`
 identities prevents concurrent ordinary object writes from colliding with sync
 projections. Existing duplicate GitHub identities must be repaired before the
 object-sync migration can apply.
 
-Object-sync migrations are additive and have no automatic down migration.
+Object-sync migrations are additive and one-way. Existing v1 transactions and
+checkpoints remain readable, but a binary that cannot read v2 generation state
+cannot safely continue an upgraded binding. There is no automatic down
+migration.
 Backups must include graph, audit, source binding, transaction, identity,
-result, and checkpoint tables from one database snapshot. Rolling back the
-binary does not roll back a committed checkpoint. Restore the complete atomic
-backup instead of deleting or editing individual sync rows.
+result, generation, and checkpoint tables from one database snapshot. Rolling
+back the binary does not roll back a committed generation, offset, or
+checkpoint. Restore the complete atomic backup from before the v2 transition
+instead of deleting or editing individual sync rows.
 
-Retain committed batch/result and identity/lineage evidence while the projected
-object or downstream decisions remain retained. The current retention runner
-does not independently purge object-sync tables.
+Retain committed batch/result, generation/offset, and identity/lineage evidence
+while the projected object or downstream decisions remain retained. Batch and
+record-result history is the ordered-feed continuity evidence; object-change
+audit may have a different retention window and is not a replacement for it.
+The current retention runner does not independently purge object-sync tables.
 Snapshot pages have no separate retention or rollback unit. Restore the graph,
-source-sync tables, and final checkpoint from the same database snapshot, then
-let the adapter resume from that restored plane-owned cursor.
+source-sync tables, generation state, and final checkpoint from the same
+database snapshot, then let the adapter resume from that restored
+control-plane-owned cursor and offset.
 
 ## Non-goals
 
-Webhook and change-feed collection remain separate transports into this
-contract. Checkpointed snapshots add no pipeline, transform language, plugin
-runtime, connector marketplace, credential store, tombstone-by-absence,
-unrestricted write-back, or second source.
+Webhooks, snapshots, and ordered feeds remain separate collection transports
+into this contract. Ordered synchronization adds no pipeline, transform
+language, plugin runtime, connector marketplace, credential store,
+tombstone-by-absence, unrestricted write-back, or second source.
 
 Governed functions and computed properties do not write derived objects onto a
 type revision and must not invent a sync source id. See
