@@ -21,10 +21,11 @@ snapshot resume, cross-page stable object identity, old-page replay, stale
 cursors, and foreign binding isolation.
 
 The reusable `sekai.definition-branch` surface shares insert-only member and
-revision storage, expected-head advancement, idempotency, and audit semantics
-across SQLite and PostgreSQL. PostgreSQL serializes branch and idempotency
+revision storage, expected-head advancement, digest-bound proposals, published
+head compare-and-swap, idempotency, and audit semantics across SQLite and
+PostgreSQL. PostgreSQL serializes branch, published-head, and idempotency
 identities before checking durable state, so concurrent writers cannot both
-advance one expected head.
+advance one expected head or publish two change sets onto the same base.
 
 The reusable `sekai.object-security` surface shares immutable policy
 revisions, exact replay, complete atomic activation, and SQL-enforced direct
@@ -65,6 +66,7 @@ Evidence is checked in as:
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 | #666 | Governed definition branch and immutable revision foundation |
+| #683 | Digest-bound proposal, live approval, and atomic published-head merge |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
 
 ## Still outside this parent

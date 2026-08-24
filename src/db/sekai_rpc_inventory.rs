@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 107);
+        assert_eq!(inventory.entries.len(), 113);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
@@ -378,6 +378,12 @@ mod tests {
         assert!(inventory.entry("CreateDefinitionBranch").is_some());
         assert!(inventory.entry("GetDefinitionBranch").is_some());
         assert!(inventory.entry("ApplyDefinitionBranchEdit").is_some());
+        assert!(inventory.entry("CreateDefinitionProposal").is_some());
+        assert!(inventory.entry("GetDefinitionProposal").is_some());
+        assert!(inventory.entry("ApproveDefinitionProposal").is_some());
+        assert!(inventory.entry("RejectDefinitionProposal").is_some());
+        assert!(inventory.entry("MergeDefinitionProposal").is_some());
+        assert!(inventory.entry("GetPublishedDefinitionHead").is_some());
         assert!(inventory.entry("ListEvidenceAdapters").is_some());
         assert!(inventory.entry("PutGovernedActionType").is_some());
         assert!(inventory.entry("SubmitActionInstance").is_some());

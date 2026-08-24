@@ -258,6 +258,127 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_published_definition_head(&self, namespace: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                DefinitionBranchBackend::get_published_definition_head(db.as_ref(), namespace)
+            }
+            Self::Postgres(db) => {
+                DefinitionBranchBackend::get_published_definition_head(db.as_ref(), namespace)
+            }
+        }
+    }
+
+    pub fn get_definition_proposal(
+        &self,
+        namespace: &str,
+        branch_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<crate::sekai::definition_proposal::DefinitionProposal>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_proposal(
+                db.as_ref(),
+                namespace,
+                branch_id,
+                proposal_id,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::get_definition_proposal(
+                db.as_ref(),
+                namespace,
+                branch_id,
+                proposal_id,
+            ),
+        }
+    }
+
+    pub fn create_definition_proposal(
+        &self,
+        request: &crate::sekai::definition_proposal::CreateDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::create_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::create_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn approve_definition_proposal(
+        &self,
+        request: &crate::sekai::definition_proposal::ApproveDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::approve_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::approve_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn reject_definition_proposal(
+        &self,
+        request: &crate::sekai::definition_proposal::RejectDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::reject_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::reject_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn merge_definition_proposal(
+        &self,
+        request: &crate::sekai::definition_proposal::MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::merge_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::merge_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
     pub fn put_governed_subject_provenance_export(
         &self,
         actor: &str,

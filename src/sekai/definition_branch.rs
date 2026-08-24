@@ -121,6 +121,18 @@ pub enum DefinitionWriteResult {
     ApplyEdit {
         result: Box<DefinitionBranchEditResult>,
     },
+    CreateProposal {
+        proposal: crate::sekai::definition_proposal::DefinitionProposal,
+    },
+    ApproveProposal {
+        proposal: crate::sekai::definition_proposal::DefinitionProposal,
+    },
+    RejectProposal {
+        proposal: crate::sekai::definition_proposal::DefinitionProposal,
+    },
+    MergeProposal {
+        result: Box<crate::sekai::definition_proposal::DefinitionMergeResult>,
+    },
 }
 
 impl DefinitionMemberRef {
@@ -454,7 +466,7 @@ pub fn validate_digest(field: &str, digest: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_namespace(namespace: &str) -> Result<(), String> {
+pub(crate) fn validate_namespace(namespace: &str) -> Result<(), String> {
     validate_identifier("namespace", namespace, MAX_DEFINITION_ID_BYTES)
 }
 
@@ -466,7 +478,11 @@ fn validate_member_identity(member_kind: &str, member_id: &str) -> Result<(), St
     validate_identifier("member_id", member_id, MAX_DEFINITION_ID_BYTES)
 }
 
-fn validate_identifier(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+pub(crate) fn validate_identifier(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
     if value.is_empty()
         || value.len() > max_bytes
         || value.trim() != value
@@ -508,7 +524,7 @@ fn member_digest(namespace: &str, member_kind: &str, member_id: &str, body: &[u8
     format!("sha256:{:x}", hasher.finalize())
 }
 
-fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
+pub(crate) fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
     let canonical = crate::shomei::canonical_json_with_finite_numbers(value)?;
     let mut hasher = Sha256::new();
     hasher.update(BRANCH_CONTRACT_VERSION.as_bytes());

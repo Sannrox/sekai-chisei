@@ -8,6 +8,12 @@ use crate::sekai::definition_branch::{
     DefinitionBranchEditResult, DefinitionMember, DefinitionRevision, DefinitionWriteResult,
     apply_member_changes, changed_member_digests, validate_revision_members,
 };
+use crate::sekai::definition_proposal::{
+    ApproveDefinitionProposal, CreateDefinitionProposal, DefinitionProposal,
+    MergeDefinitionProposal, RejectDefinitionProposal, apply_proposal_approval,
+    apply_proposal_rejection, candidate_descends_from_base, mark_proposal_merged,
+    named_foreign_digests_confer_no_grant, prepare_proposal, require_mergeable_proposal,
+};
 
 impl PostgresDb {
     pub fn seed_published_definition_revision(
@@ -25,6 +31,12 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         insert_members_postgres(&mut transaction, members)?;
         insert_revision_postgres(&mut transaction, revision)?;
+        upsert_published_head_postgres(
+            &mut transaction,
+            &revision.namespace,
+            &revision.revision_digest,
+            revision.created_at_ms,
+        )?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -232,6 +244,513 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+
+    pub fn get_published_definition_head(&self, namespace: &str) -> Result<Option<String>, String> {
+        load_published_head_postgres(&mut *self.connection()?, namespace, false)
+    }
+
+    pub fn get_definition_proposal(
+        &self,
+        namespace: &str,
+        branch_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<DefinitionProposal>, String> {
+        load_proposal_postgres(
+            &mut *self.connection()?,
+            namespace,
+            branch_id,
+            proposal_id,
+            false,
+        )
+    }
+
+    pub fn create_definition_proposal(
+        &self,
+        request: &CreateDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let proposal = validate_new_proposal_postgres(&mut transaction, request, actor, now_ms)?;
+        insert_proposal_postgres(&mut transaction, &proposal)?;
+        let result = DefinitionWriteResult::CreateProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "create_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn approve_definition_proposal(
+        &self,
+        request: &ApproveDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+            true,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        let proposal =
+            apply_proposal_approval(&current, actor, &request.expected_proposal_digest, now_ms)?;
+        update_proposal_postgres(&mut transaction, &proposal)?;
+        let result = DefinitionWriteResult::ApproveProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "approve_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn reject_definition_proposal(
+        &self,
+        request: &RejectDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+            true,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        let proposal = apply_proposal_rejection(
+            &current,
+            actor,
+            &request.expected_proposal_digest,
+            &request.reason_code,
+            now_ms,
+        )?;
+        update_proposal_postgres(&mut transaction, &proposal)?;
+        let result = DefinitionWriteResult::RejectProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "reject_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn merge_definition_proposal(
+        &self,
+        request: &MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+            true,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        require_mergeable_proposal(&current, &request.expected_proposal_digest)?;
+        if current.base_digest != request.expected_published_digest {
+            return Err(
+                "definition_proposal_stale_base: expected published head does not match proposal"
+                    .into(),
+            );
+        }
+        let published = load_published_head_postgres(&mut transaction, &request.namespace, true)?
+            .ok_or_else(|| {
+            "definition_proposal_stale_base: published head is unavailable".to_string()
+        })?;
+        if published != current.base_digest {
+            return Err(
+                "definition_proposal_stale_base: published head moved after the proposal was pinned"
+                    .into(),
+            );
+        }
+        let branch = load_branch_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            true,
+        )?
+        .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        if branch.head_revision_digest != current.candidate_digest {
+            return Err(
+                "definition_proposal_changed_digest: branch head moved after the proposal was pinned"
+                    .into(),
+            );
+        }
+        let candidate = load_revision_postgres(
+            &mut transaction,
+            &request.namespace,
+            &current.candidate_digest,
+        )?
+        .ok_or_else(|| {
+            "definition_revision_not_found: candidate revision is unavailable".to_string()
+        })?;
+        let members = load_members_postgres(&mut transaction, &candidate)?;
+        validate_revision_members(&candidate, &members)?;
+        named_foreign_digests_confer_no_grant(&current, &candidate)?;
+        candidate_descends_from_base(&candidate, &current.base_digest, |parent_digest| {
+            load_revision_postgres(&mut transaction, &request.namespace, parent_digest)
+        })?;
+        let receipt_id = format!("definition-audit:{request_digest}");
+        let proposal = mark_proposal_merged(&current, &receipt_id, now_ms)?;
+        let published_revision = mark_revision_published_postgres(&mut transaction, &candidate)?;
+        cas_published_head_postgres(
+            &mut transaction,
+            &request.namespace,
+            &current.base_digest,
+            &current.candidate_digest,
+            now_ms,
+        )?;
+        update_proposal_postgres(&mut transaction, &proposal)?;
+        let result = DefinitionWriteResult::MergeProposal {
+            result: Box::new(crate::sekai::definition_proposal::DefinitionMergeResult {
+                proposal: proposal.clone(),
+                previous_published_digest: current.base_digest.clone(),
+                published_digest: published_revision.revision_digest.clone(),
+                revision: published_revision,
+                receipt_id,
+            }),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "merge_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+fn validate_new_proposal_postgres(
+    transaction: &mut Transaction<'_>,
+    request: &CreateDefinitionProposal,
+    actor: &str,
+    now_ms: i64,
+) -> Result<DefinitionProposal, String> {
+    let proposal = prepare_proposal(request, actor, now_ms)?;
+    if load_proposal_postgres(
+        transaction,
+        &request.namespace,
+        &request.branch_id,
+        &request.proposal_id,
+        true,
+    )?
+    .is_some()
+    {
+        return Err("definition_proposal_conflict: proposal identity is already in use".into());
+    }
+    let branch = load_branch_postgres(transaction, &request.namespace, &request.branch_id, true)?
+        .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+    if branch.head_revision_digest != request.candidate_digest {
+        return Err(
+            "definition_proposal_changed_digest: candidate is not the current branch head".into(),
+        );
+    }
+    let published = load_published_head_postgres(transaction, &request.namespace, true)?
+        .ok_or_else(|| {
+            "definition_proposal_stale_base: published head is unavailable".to_string()
+        })?;
+    if published != request.base_digest {
+        return Err(
+            "definition_proposal_stale_base: base is not the current published head".into(),
+        );
+    }
+    let candidate =
+        load_revision_postgres(transaction, &request.namespace, &request.candidate_digest)?
+            .ok_or_else(|| {
+                "definition_revision_not_found: candidate revision is unavailable".to_string()
+            })?;
+    let members = load_members_postgres(transaction, &candidate)?;
+    validate_revision_members(&candidate, &members)?;
+    named_foreign_digests_confer_no_grant(&proposal, &candidate)?;
+    candidate_descends_from_base(&candidate, &request.base_digest, |parent_digest| {
+        load_revision_postgres(transaction, &request.namespace, parent_digest)
+    })?;
+    Ok(proposal)
+}
+
+fn load_published_head_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    for_update: bool,
+) -> Result<Option<String>, String> {
+    let suffix = if for_update { " FOR UPDATE" } else { "" };
+    let statement = format!(
+        "SELECT revision_digest FROM sekai_definition_published_heads WHERE namespace=$1{suffix}"
+    );
+    client
+        .query_opt(&statement, &[&namespace])
+        .map_err(|error| error.to_string())?
+        .map(|row| Ok(row.get(0)))
+        .transpose()
+}
+
+fn upsert_published_head_postgres(
+    transaction: &mut Transaction<'_>,
+    namespace: &str,
+    revision_digest: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    match load_published_head_postgres(transaction, namespace, true)? {
+        Some(existing) if existing == revision_digest => Ok(()),
+        Some(_) => Err(
+            "definition_proposal_stale_base: published head is already bound to another revision"
+                .into(),
+        ),
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO sekai_definition_published_heads (
+                        namespace, revision_digest, updated_at_ms
+                     ) VALUES ($1, $2, $3)",
+                    &[&namespace, &revision_digest, &now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+fn cas_published_head_postgres(
+    transaction: &mut Transaction<'_>,
+    namespace: &str,
+    expected: &str,
+    next: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_published_heads
+             SET revision_digest=$1, updated_at_ms=$2
+             WHERE namespace=$3 AND revision_digest=$4",
+            &[&next, &now_ms, &namespace, &expected],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err(
+            "definition_proposal_stale_base: published head moved after the proposal was pinned"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn mark_revision_published_postgres(
+    transaction: &mut Transaction<'_>,
+    revision: &DefinitionRevision,
+) -> Result<DefinitionRevision, String> {
+    let mut published = revision.clone();
+    published.published = true;
+    published.verify()?;
+    let body_json = serde_json::to_string(&published).map_err(|error| error.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_revisions
+             SET published=TRUE, body_json=$1
+             WHERE namespace=$2 AND revision_digest=$3 AND published=FALSE",
+            &[&body_json, &published.namespace, &published.revision_digest],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("immutable_definition_revision_conflict: digest is already bound".into());
+    }
+    Ok(published)
+}
+
+fn load_proposal_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    for_update: bool,
+) -> Result<Option<DefinitionProposal>, String> {
+    let suffix = if for_update { " FOR UPDATE" } else { "" };
+    let statement = format!(
+        "SELECT body_json FROM sekai_definition_proposals
+         WHERE namespace=$1 AND branch_id=$2 AND proposal_id=$3{suffix}"
+    );
+    client
+        .query_opt(&statement, &[&namespace, &branch_id, &proposal_id])
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            let body: String = row.get(0);
+            let proposal: DefinitionProposal = serde_json::from_str(&body)
+                .map_err(|error| format!("corrupt definition proposal: {error}"))?;
+            proposal.verify()?;
+            Ok(proposal)
+        })
+        .transpose()
+}
+
+fn insert_proposal_postgres(
+    transaction: &mut Transaction<'_>,
+    proposal: &DefinitionProposal,
+) -> Result<(), String> {
+    proposal.verify()?;
+    let body_json = serde_json::to_string(proposal).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO sekai_definition_proposals (
+                namespace, branch_id, proposal_id, proposal_digest, base_digest,
+                candidate_digest, status, body_json, created_by, created_at_ms, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &proposal.namespace,
+                &proposal.branch_id,
+                &proposal.proposal_id,
+                &proposal.proposal_digest,
+                &proposal.base_digest,
+                &proposal.candidate_digest,
+                &proposal.status,
+                &body_json,
+                &proposal.created_by,
+                &proposal.created_at_ms,
+                &proposal.updated_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_proposal_postgres(
+    transaction: &mut Transaction<'_>,
+    proposal: &DefinitionProposal,
+) -> Result<(), String> {
+    proposal.verify()?;
+    let body_json = serde_json::to_string(proposal).map_err(|error| error.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_proposals
+             SET proposal_digest=$1, base_digest=$2, candidate_digest=$3, status=$4,
+                 body_json=$5, updated_at_ms=$6
+             WHERE namespace=$7 AND branch_id=$8 AND proposal_id=$9",
+            &[
+                &proposal.proposal_digest,
+                &proposal.base_digest,
+                &proposal.candidate_digest,
+                &proposal.status,
+                &body_json,
+                &proposal.updated_at_ms,
+                &proposal.namespace,
+                &proposal.branch_id,
+                &proposal.proposal_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("definition_proposal_not_found: proposal is unavailable".into());
+    }
+    Ok(())
 }
 
 fn validate_write_context(actor: &str, now_ms: i64) -> Result<(), String> {
@@ -256,6 +775,7 @@ fn lock_write<T: serde::Serialize>(
     for key in [
         format!("{namespace}\0{actor}\0{idempotency_key}"),
         format!("{namespace}\0{branch_id}"),
+        format!("{namespace}\0published_head"),
     ] {
         transaction
             .query_one(

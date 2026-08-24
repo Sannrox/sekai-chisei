@@ -42,8 +42,9 @@ If you want to deploy or operate the control plane:
   and governed entry paths.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
   provenance, and validation.
-- [Governed definition branches](definition-branches.md) — immutable member and
-  revision identity with compare-and-swap authoring heads.
+- [Governed definition branches](definition-branches.md) — immutable member
+  and revision identity, compare-and-swap authoring heads, and digest-bound
+  proposal merge onto the published head.
 - [Capability catalogs](capability-catalog.md) — native governed-surface
   discovery (`DiscoverCapabilities` `1.0`) and the HTTP provider-profile
   matrix (`chisei.provider-capabilities/v1`).

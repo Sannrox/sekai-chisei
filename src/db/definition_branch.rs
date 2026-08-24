@@ -8,6 +8,12 @@ use crate::sekai::definition_branch::{
     DefinitionBranchEditResult, DefinitionMember, DefinitionRevision, DefinitionWriteResult,
     apply_member_changes, changed_member_digests, validate_revision_members,
 };
+use crate::sekai::definition_proposal::{
+    ApproveDefinitionProposal, CreateDefinitionProposal, DefinitionProposal,
+    MergeDefinitionProposal, RejectDefinitionProposal, apply_proposal_approval,
+    apply_proposal_rejection, candidate_descends_from_base, mark_proposal_merged,
+    named_foreign_digests_confer_no_grant, prepare_proposal, require_mergeable_proposal,
+};
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
 
@@ -46,6 +52,43 @@ pub trait DefinitionBranchBackend: Send + Sync {
     fn apply_definition_branch_edit(
         &self,
         request: &ApplyDefinitionBranchEdit,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn get_published_definition_head(&self, namespace: &str) -> Result<Option<String>, String>;
+
+    fn get_definition_proposal(
+        &self,
+        namespace: &str,
+        branch_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<DefinitionProposal>, String>;
+
+    fn create_definition_proposal(
+        &self,
+        request: &CreateDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn approve_definition_proposal(
+        &self,
+        request: &ApproveDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn reject_definition_proposal(
+        &self,
+        request: &RejectDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn merge_definition_proposal(
+        &self,
+        request: &MergeDefinitionProposal,
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String>;
@@ -101,6 +144,55 @@ macro_rules! forward {
             now_ms: i64,
         ) -> Result<DefinitionWriteResult, String> {
             <$target>::apply_definition_branch_edit(self, request, actor, now_ms)
+        }
+
+        fn get_published_definition_head(&self, namespace: &str) -> Result<Option<String>, String> {
+            <$target>::get_published_definition_head(self, namespace)
+        }
+
+        fn get_definition_proposal(
+            &self,
+            namespace: &str,
+            branch_id: &str,
+            proposal_id: &str,
+        ) -> Result<Option<DefinitionProposal>, String> {
+            <$target>::get_definition_proposal(self, namespace, branch_id, proposal_id)
+        }
+
+        fn create_definition_proposal(
+            &self,
+            request: &CreateDefinitionProposal,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::create_definition_proposal(self, request, actor, now_ms)
+        }
+
+        fn approve_definition_proposal(
+            &self,
+            request: &ApproveDefinitionProposal,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::approve_definition_proposal(self, request, actor, now_ms)
+        }
+
+        fn reject_definition_proposal(
+            &self,
+            request: &RejectDefinitionProposal,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::reject_definition_proposal(self, request, actor, now_ms)
+        }
+
+        fn merge_definition_proposal(
+            &self,
+            request: &MergeDefinitionProposal,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::merge_definition_proposal(self, request, actor, now_ms)
         }
     };
 }
@@ -177,7 +269,48 @@ impl SekaiDb {
                     created_at_ms INTEGER NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_definition_branch_audit_history
-                    ON sekai_definition_branch_audit(namespace, branch_id, created_at_ms, event_id);",
+                    ON sekai_definition_branch_audit(namespace, branch_id, created_at_ms, event_id);
+
+                CREATE TABLE IF NOT EXISTS sekai_definition_published_heads (
+                    namespace TEXT PRIMARY KEY,
+                    revision_digest TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sekai_definition_proposals (
+                    namespace TEXT NOT NULL,
+                    branch_id TEXT NOT NULL,
+                    proposal_id TEXT NOT NULL,
+                    proposal_digest TEXT NOT NULL,
+                    base_digest TEXT NOT NULL,
+                    candidate_digest TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY(namespace, branch_id, proposal_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_definition_proposal_digest
+                    ON sekai_definition_proposals(namespace, proposal_digest);
+                CREATE INDEX IF NOT EXISTS idx_definition_proposal_branch
+                    ON sekai_definition_proposals(namespace, branch_id, updated_at_ms, proposal_id);
+
+                INSERT OR IGNORE INTO sekai_definition_published_heads (
+                    namespace, revision_digest, updated_at_ms
+                )
+                SELECT namespace, revision_digest, created_at_ms
+                FROM sekai_definition_revisions
+                WHERE published = 1
+                  AND namespace NOT IN (
+                      SELECT namespace FROM sekai_definition_published_heads
+                  )
+                  AND created_at_ms = (
+                      SELECT MAX(created_at_ms)
+                      FROM sekai_definition_revisions AS newer
+                      WHERE newer.namespace = sekai_definition_revisions.namespace
+                        AND newer.published = 1
+                  );",
             )
             .map_err(|error| error.to_string())
     }
@@ -197,6 +330,12 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         insert_members_sqlite(&transaction, members)?;
         insert_revision_sqlite(&transaction, revision)?;
+        upsert_published_head_sqlite(
+            &transaction,
+            &revision.namespace,
+            &revision.revision_digest,
+            revision.created_at_ms,
+        )?;
         transaction.commit().map_err(|error| error.to_string())
     }
 
@@ -391,6 +530,488 @@ impl SekaiDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+
+    pub fn get_published_definition_head(&self, namespace: &str) -> Result<Option<String>, String> {
+        load_published_head_sqlite(&self.conn(), namespace)
+    }
+
+    pub fn get_definition_proposal(
+        &self,
+        namespace: &str,
+        branch_id: &str,
+        proposal_id: &str,
+    ) -> Result<Option<DefinitionProposal>, String> {
+        load_proposal_sqlite(&self.conn(), namespace, branch_id, proposal_id)
+    }
+
+    pub fn create_definition_proposal(
+        &self,
+        request: &CreateDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(replayed) = replay_sqlite(
+            &transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let proposal = validate_new_proposal_sqlite(&transaction, request, actor, now_ms)?;
+        insert_proposal_sqlite(&transaction, &proposal)?;
+        let result = DefinitionWriteResult::CreateProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "create_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn approve_definition_proposal(
+        &self,
+        request: &ApproveDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(replayed) = replay_sqlite(
+            &transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_sqlite(
+            &transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        let proposal =
+            apply_proposal_approval(&current, actor, &request.expected_proposal_digest, now_ms)?;
+        update_proposal_sqlite(&transaction, &proposal)?;
+        let result = DefinitionWriteResult::ApproveProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "approve_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn reject_definition_proposal(
+        &self,
+        request: &RejectDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(replayed) = replay_sqlite(
+            &transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_sqlite(
+            &transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        let proposal = apply_proposal_rejection(
+            &current,
+            actor,
+            &request.expected_proposal_digest,
+            &request.reason_code,
+            now_ms,
+        )?;
+        update_proposal_sqlite(&transaction, &proposal)?;
+        let result = DefinitionWriteResult::RejectProposal {
+            proposal: proposal.clone(),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "reject_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    pub fn merge_definition_proposal(
+        &self,
+        request: &MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        request.validate()?;
+        validate_write_context(actor, now_ms)?;
+        let request_digest = request.request_digest()?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(replayed) = replay_sqlite(
+            &transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let current = load_proposal_sqlite(
+            &transaction,
+            &request.namespace,
+            &request.branch_id,
+            &request.proposal_id,
+        )?
+        .ok_or_else(|| "definition_proposal_not_found: proposal is unavailable".to_string())?;
+        require_mergeable_proposal(&current, &request.expected_proposal_digest)?;
+        if current.base_digest != request.expected_published_digest {
+            return Err(
+                "definition_proposal_stale_base: expected published head does not match proposal"
+                    .into(),
+            );
+        }
+        let published =
+            load_published_head_sqlite(&transaction, &request.namespace)?.ok_or_else(|| {
+                "definition_proposal_stale_base: published head is unavailable".to_string()
+            })?;
+        if published != current.base_digest {
+            return Err(
+                "definition_proposal_stale_base: published head moved after the proposal was pinned"
+                    .into(),
+            );
+        }
+        let branch = load_branch_sqlite(&transaction, &request.namespace, &request.branch_id)?
+            .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        if branch.head_revision_digest != current.candidate_digest {
+            return Err(
+                "definition_proposal_changed_digest: branch head moved after the proposal was pinned"
+                    .into(),
+            );
+        }
+        let candidate =
+            load_revision_sqlite(&transaction, &request.namespace, &current.candidate_digest)?
+                .ok_or_else(|| {
+                    "definition_revision_not_found: candidate revision is unavailable".to_string()
+                })?;
+        let members = load_members_sqlite(&transaction, &candidate)?;
+        validate_revision_members(&candidate, &members)?;
+        named_foreign_digests_confer_no_grant(&current, &candidate)?;
+        candidate_descends_from_base(&candidate, &current.base_digest, |parent_digest| {
+            load_revision_sqlite(&transaction, &request.namespace, parent_digest)
+        })?;
+        let receipt_id = format!("definition-audit:{request_digest}");
+        let proposal = mark_proposal_merged(&current, &receipt_id, now_ms)?;
+        let published_revision = mark_revision_published_sqlite(&transaction, &candidate)?;
+        cas_published_head_sqlite(
+            &transaction,
+            &request.namespace,
+            &current.base_digest,
+            &current.candidate_digest,
+            now_ms,
+        )?;
+        update_proposal_sqlite(&transaction, &proposal)?;
+        let result = DefinitionWriteResult::MergeProposal {
+            result: Box::new(crate::sekai::definition_proposal::DefinitionMergeResult {
+                proposal: proposal.clone(),
+                previous_published_digest: current.base_digest.clone(),
+                published_digest: published_revision.revision_digest.clone(),
+                revision: published_revision,
+                receipt_id,
+            }),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            "merge_proposal",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+fn validate_new_proposal_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &CreateDefinitionProposal,
+    actor: &str,
+    now_ms: i64,
+) -> Result<DefinitionProposal, String> {
+    let proposal = prepare_proposal(request, actor, now_ms)?;
+    if load_proposal_sqlite(
+        transaction,
+        &request.namespace,
+        &request.branch_id,
+        &request.proposal_id,
+    )?
+    .is_some()
+    {
+        return Err("definition_proposal_conflict: proposal identity is already in use".into());
+    }
+    let branch = load_branch_sqlite(transaction, &request.namespace, &request.branch_id)?
+        .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+    if branch.head_revision_digest != request.candidate_digest {
+        return Err(
+            "definition_proposal_changed_digest: candidate is not the current branch head".into(),
+        );
+    }
+    let published =
+        load_published_head_sqlite(transaction, &request.namespace)?.ok_or_else(|| {
+            "definition_proposal_stale_base: published head is unavailable".to_string()
+        })?;
+    if published != request.base_digest {
+        return Err(
+            "definition_proposal_stale_base: base is not the current published head".into(),
+        );
+    }
+    let candidate =
+        load_revision_sqlite(transaction, &request.namespace, &request.candidate_digest)?
+            .ok_or_else(|| {
+                "definition_revision_not_found: candidate revision is unavailable".to_string()
+            })?;
+    let members = load_members_sqlite(transaction, &candidate)?;
+    validate_revision_members(&candidate, &members)?;
+    named_foreign_digests_confer_no_grant(&proposal, &candidate)?;
+    candidate_descends_from_base(&candidate, &request.base_digest, |parent_digest| {
+        load_revision_sqlite(transaction, &request.namespace, parent_digest)
+    })?;
+    Ok(proposal)
+}
+
+fn load_published_head_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+) -> Result<Option<String>, String> {
+    connection
+        .query_row(
+            "SELECT revision_digest FROM sekai_definition_published_heads WHERE namespace=?1",
+            params![namespace],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+fn upsert_published_head_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    revision_digest: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    match load_published_head_sqlite(transaction, namespace)? {
+        Some(existing) if existing == revision_digest => Ok(()),
+        Some(_) => Err(
+            "definition_proposal_stale_base: published head is already bound to another revision"
+                .into(),
+        ),
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO sekai_definition_published_heads (
+                        namespace, revision_digest, updated_at_ms
+                     ) VALUES (?1, ?2, ?3)",
+                    params![namespace, revision_digest, now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+fn cas_published_head_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    namespace: &str,
+    expected: &str,
+    next: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_published_heads
+             SET revision_digest=?1, updated_at_ms=?2
+             WHERE namespace=?3 AND revision_digest=?4",
+            params![next, now_ms, namespace, expected],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err(
+            "definition_proposal_stale_base: published head moved after the proposal was pinned"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn mark_revision_published_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    revision: &DefinitionRevision,
+) -> Result<DefinitionRevision, String> {
+    let mut published = revision.clone();
+    published.published = true;
+    published.verify()?;
+    let body_json = serde_json::to_string(&published).map_err(|error| error.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_revisions
+             SET published=1, body_json=?1
+             WHERE namespace=?2 AND revision_digest=?3 AND published=0",
+            params![body_json, published.namespace, published.revision_digest],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("immutable_definition_revision_conflict: digest is already bound".into());
+    }
+    Ok(published)
+}
+
+fn load_proposal_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    branch_id: &str,
+    proposal_id: &str,
+) -> Result<Option<DefinitionProposal>, String> {
+    connection
+        .query_row(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE namespace=?1 AND branch_id=?2 AND proposal_id=?3",
+            params![namespace, branch_id, proposal_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .map(|body| {
+            let proposal: DefinitionProposal = serde_json::from_str(&body)
+                .map_err(|error| format!("corrupt definition proposal: {error}"))?;
+            proposal.verify()?;
+            Ok(proposal)
+        })
+        .transpose()
+}
+
+fn insert_proposal_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    proposal: &DefinitionProposal,
+) -> Result<(), String> {
+    proposal.verify()?;
+    let body_json = serde_json::to_string(proposal).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO sekai_definition_proposals (
+                namespace, branch_id, proposal_id, proposal_digest, base_digest,
+                candidate_digest, status, body_json, created_by, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                proposal.namespace,
+                proposal.branch_id,
+                proposal.proposal_id,
+                proposal.proposal_digest,
+                proposal.base_digest,
+                proposal.candidate_digest,
+                proposal.status,
+                body_json,
+                proposal.created_by,
+                proposal.created_at_ms,
+                proposal.updated_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_proposal_sqlite(
+    transaction: &rusqlite::Transaction<'_>,
+    proposal: &DefinitionProposal,
+) -> Result<(), String> {
+    proposal.verify()?;
+    let body_json = serde_json::to_string(proposal).map_err(|error| error.to_string())?;
+    let updated = transaction
+        .execute(
+            "UPDATE sekai_definition_proposals
+             SET proposal_digest=?1, base_digest=?2, candidate_digest=?3, status=?4,
+                 body_json=?5, updated_at_ms=?6
+             WHERE namespace=?7 AND branch_id=?8 AND proposal_id=?9",
+            params![
+                proposal.proposal_digest,
+                proposal.base_digest,
+                proposal.candidate_digest,
+                proposal.status,
+                body_json,
+                proposal.updated_at_ms,
+                proposal.namespace,
+                proposal.branch_id,
+                proposal.proposal_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated != 1 {
+        return Err("definition_proposal_not_found: proposal is unavailable".into());
+    }
+    Ok(())
 }
 
 fn validate_write_context(actor: &str, now_ms: i64) -> Result<(), String> {
@@ -859,5 +1480,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 0);
+    }
+
+    #[test]
+    fn failed_published_head_advance_does_not_merge() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (parent, member, create) = parent_fixture(&db);
+        db.create_definition_branch(&create, "author", 2).unwrap();
+        let edit = ApplyDefinitionBranchEdit {
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            expected_head_digest: parent.revision_digest.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "control".into(),
+                member_id: "retention".into(),
+                definition_json: r#"{"mode":"strict"}"#.into(),
+                member_digest: String::new(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: "edit-merge".into(),
+        };
+        let DefinitionWriteResult::ApplyEdit { result } =
+            db.apply_definition_branch_edit(&edit, "author", 3).unwrap()
+        else {
+            panic!("expected edit");
+        };
+        let create_proposal = crate::sekai::definition_proposal::CreateDefinitionProposal {
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-1".into(),
+            base_digest: parent.revision_digest.clone(),
+            candidate_digest: result.revision.revision_digest.clone(),
+            frozen_eval_plans: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "propose-1".into(),
+        };
+        let DefinitionWriteResult::CreateProposal { proposal } = db
+            .create_definition_proposal(&create_proposal, "author", 4)
+            .unwrap()
+        else {
+            panic!("expected proposal");
+        };
+        db.approve_definition_proposal(
+            &crate::sekai::definition_proposal::ApproveDefinitionProposal {
+                namespace: "team-a".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-1".into(),
+                expected_proposal_digest: proposal.proposal_digest.clone(),
+                idempotency_key: "approve-1".into(),
+            },
+            "reviewer",
+            5,
+        )
+        .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_published_head_advance
+                 BEFORE UPDATE ON sekai_definition_published_heads
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected published-head failure');
+                 END;",
+            )
+            .unwrap();
+        let error = db
+            .merge_definition_proposal(
+                &crate::sekai::definition_proposal::MergeDefinitionProposal {
+                    namespace: "team-a".into(),
+                    branch_id: "feature".into(),
+                    proposal_id: "cs-1".into(),
+                    expected_proposal_digest: proposal.proposal_digest,
+                    expected_published_digest: parent.revision_digest.clone(),
+                    idempotency_key: "merge-interrupted".into(),
+                },
+                "author",
+                6,
+            )
+            .unwrap_err();
+        assert!(error.contains("injected published-head failure"));
+        assert_eq!(
+            db.get_published_definition_head("team-a").unwrap().unwrap(),
+            parent.revision_digest
+        );
+        assert_eq!(
+            db.get_definition_proposal("team-a", "feature", "cs-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+        assert!(
+            !db.get_definition_revision("team-a", &result.revision.revision_digest)
+                .unwrap()
+                .unwrap()
+                .published
+        );
+        let request_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_definition_requests
+                 WHERE namespace='team-a' AND idempotency_key='merge-interrupted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_count, 0);
+        let _ = member;
     }
 }

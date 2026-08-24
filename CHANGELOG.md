@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Publish or reject one governed definition change set as a digest-bound
+  branch proposal. Merge compare-and-swaps the namespace published head only
+  after live set-level approval and member publish-grant recheck; stale bases,
+  changed candidates, missing approval, and rejection fail closed. Frozen
+  evaluation-plan references and named foreign digests confer no grant.
 - Add immutable `sekai.object-security-policy/v1` revisions, atomic namespace
   activation, administrative gRPC inspection/mutation, and SQLite/PostgreSQL
   storage-predicate enforcement for direct object reads and `ListObjects`.

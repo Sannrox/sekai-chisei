@@ -1539,6 +1539,123 @@ message ApplyDefinitionBranchEditResponse {
   repeated string changed_member_digests = 4;
 }
 
+// Frozen evaluation-plan identity named by a change set. It is a dependency
+// digest, not a second merge protocol and not a runtime grant.
+message FrozenEvalPlanRef {
+  string plan_id = 1;
+  string plan_digest = 2;
+}
+
+message DefinitionProposalApproval {
+  string approved_by = 1;
+  int64 approved_at_ms = 2;
+  string proposal_digest = 3;
+}
+
+message DefinitionProposalRejection {
+  string rejected_by = 1;
+  int64 rejected_at_ms = 2;
+  string proposal_digest = 3;
+  string reason_code = 4;
+}
+
+// A change set is a proposal on a governed branch. Identity is the pinned
+// (namespace, branch_id, proposal_id, base_digest, candidate_digest) tuple.
+message DefinitionProposal {
+  string contract_version = 1;
+  string namespace = 2;
+  string branch_id = 3;
+  string proposal_id = 4;
+  string base_digest = 5;
+  string candidate_digest = 6;
+  string proposal_digest = 7;
+  repeated FrozenEvalPlanRef frozen_eval_plans = 8;
+  repeated string named_foreign_digests = 9;
+  string status = 10;
+  string created_by = 11;
+  int64 created_at_ms = 12;
+  int64 updated_at_ms = 13;
+  DefinitionProposalApproval approval = 14;
+  DefinitionProposalRejection rejection = 15;
+  string merge_receipt_id = 16;
+}
+
+message CreateDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string base_digest = 4;
+  string candidate_digest = 5;
+  repeated FrozenEvalPlanRef frozen_eval_plans = 6;
+  repeated string named_foreign_digests = 7;
+  string idempotency_key = 8;
+}
+
+message CreateDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message GetDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+}
+
+message GetDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message ApproveDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string expected_proposal_digest = 4;
+  string idempotency_key = 5;
+}
+
+message ApproveDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message RejectDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string expected_proposal_digest = 4;
+  string reason_code = 5;
+  string idempotency_key = 6;
+}
+
+message RejectDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message MergeDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string expected_proposal_digest = 4;
+  string expected_published_digest = 5;
+  string idempotency_key = 6;
+}
+
+message MergeDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+  string previous_published_digest = 2;
+  string published_digest = 3;
+  DefinitionRevision revision = 4;
+  string receipt_id = 5;
+}
+
+message GetPublishedDefinitionHeadRequest {
+  string namespace = 1;
+}
+
+message GetPublishedDefinitionHeadResponse {
+  string namespace = 1;
+  string revision_digest = 2;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1618,6 +1735,12 @@ service SekaiService {
   rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
   rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
   rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);
+  rpc CreateDefinitionProposal(CreateDefinitionProposalRequest) returns (CreateDefinitionProposalResponse);
+  rpc GetDefinitionProposal(GetDefinitionProposalRequest) returns (GetDefinitionProposalResponse);
+  rpc ApproveDefinitionProposal(ApproveDefinitionProposalRequest) returns (ApproveDefinitionProposalResponse);
+  rpc RejectDefinitionProposal(RejectDefinitionProposalRequest) returns (RejectDefinitionProposalResponse);
+  rpc MergeDefinitionProposal(MergeDefinitionProposalRequest) returns (MergeDefinitionProposalResponse);
+  rpc GetPublishedDefinitionHead(GetPublishedDefinitionHeadRequest) returns (GetPublishedDefinitionHeadResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);
