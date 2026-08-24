@@ -306,7 +306,7 @@ impl GraphBackend for PostgresDb {
         actor: &str,
         expected_updated: i64,
     ) -> Result<Option<Object>, String> {
-        self.update_object_with_audit_if_revision(object, actor, expected_updated)
+        self.update_object_with_audit_if_revision(object, actor, expected_updated, None, None)
     }
     fn delete_object(&self, id: &str, actor: &str) -> Result<Option<Object>, String> {
         self.delete_object_with_audit(id, actor)

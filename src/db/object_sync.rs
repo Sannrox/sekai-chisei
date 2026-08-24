@@ -489,6 +489,23 @@ impl SekaiDb {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_policy_generation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_source_batch_with_policy_generation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+    ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
             .map_err(|error| error.to_string())?;
@@ -502,7 +519,14 @@ impl SekaiDb {
         {
             OpenDisposition::Committed(result) => Ok(*result),
             OpenDisposition::Open => self
-                .commit_source_batch(batch, &prepared, authenticated_producer, now_ms)
+                .commit_source_batch(
+                    batch,
+                    &prepared,
+                    authenticated_producer,
+                    now_ms,
+                    expected_policy_generation,
+                    authorized_objects,
+                )
                 .map_err(|error| error.to_string()),
         }
     }
@@ -690,9 +714,17 @@ impl SekaiDb {
         prepared: &PreparedBatch,
         authenticated_producer: &str,
         now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
     ) -> Result<SourceBatchResult, ApplyError> {
         let mut conn = self.conn();
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::sekai::audit::require_sqlite_policy_generation(
+            &transaction,
+            &batch.namespace,
+            expected_policy_generation,
+        )
+        .map_err(ApplyError::Storage)?;
         let stored = load_batch_by_key(
             &transaction,
             &batch.namespace,
@@ -757,9 +789,24 @@ impl SekaiDb {
             return Err(error);
         }
 
+        if let Some(authorized) = authorized_objects {
+            for expected in authorized {
+                let current = load_object(&transaction, &expected.id)?;
+                require_authorized_object_snapshot(
+                    current.as_ref(),
+                    Some(std::slice::from_ref(expected)),
+                    &expected.id,
+                )?;
+            }
+        }
         let mut record_results = Vec::with_capacity(prepared.records.len());
         for prepared_record in &prepared.records {
             let before = load_object(&transaction, &prepared_record.object.object_id)?;
+            require_authorized_object_snapshot(
+                before.as_ref(),
+                authorized_objects,
+                &prepared_record.object.object_id,
+            )?;
             transaction.execute(
                 "DELETE FROM sekai_source_identities
                  WHERE namespace=?1 AND source_id=?2",
@@ -1499,6 +1546,25 @@ fn commit_generation_state(
     Ok(())
 }
 
+pub(crate) fn require_authorized_object_snapshot(
+    before: Option<&Object>,
+    authorized: Option<&[Object]>,
+    object_id: &str,
+) -> Result<(), ApplyError> {
+    let Some(authorized) = authorized else {
+        return Ok(());
+    };
+    let expected = authorized.iter().find(|object| object.id == object_id);
+    match (before, expected) {
+        (Some(current), Some(expected)) if current.persisted_state_matches(expected) => Ok(()),
+        (None, None) => Ok(()),
+        _ => Err(ApplyError::denied(
+            "object_changed_since_authorization",
+            crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION,
+        )),
+    }
+}
+
 fn load_object(conn: &Connection, object_id: &str) -> Result<Option<Object>, ApplyError> {
     conn.query_row(
         "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -1852,7 +1918,7 @@ fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyE
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -1872,6 +1938,50 @@ mod tests {
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const PAYLOAD_DIGEST: &str =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn sample_object(id: &str, name: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: "Issue".into(),
+            name: name.into(),
+            namespace: "ops".into(),
+            external_id: id.into(),
+            properties: HashMap::from([("state".into(), "open".into())]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    fn authorized_sync_snapshot_rejects_stale_or_missing_current_rows() {
+        let current = sample_object("issue-1", "Bounded sync");
+        require_authorized_object_snapshot(
+            Some(&current),
+            Some(std::slice::from_ref(&current)),
+            "issue-1",
+        )
+        .unwrap();
+        let mut stale = current.clone();
+        stale.name = "changed".into();
+        assert!(
+            require_authorized_object_snapshot(
+                Some(&stale),
+                Some(std::slice::from_ref(&current)),
+                "issue-1"
+            )
+            .unwrap_err()
+            .code()
+                == Some("object_changed_since_authorization")
+        );
+        assert!(
+            require_authorized_object_snapshot(Some(&current), Some(&[]), "issue-1")
+                .unwrap_err()
+                .code()
+                == Some("object_changed_since_authorization")
+        );
+        require_authorized_object_snapshot(None, Some(&[]), "issue-1").unwrap();
+        require_authorized_object_snapshot(Some(&current), None, "issue-1").unwrap();
+    }
 
     fn record() -> SourceRecord {
         SourceRecord {

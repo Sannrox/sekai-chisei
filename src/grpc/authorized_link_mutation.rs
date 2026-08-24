@@ -27,6 +27,16 @@ impl SekaiServiceImpl {
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
+            if evaluate_active_object_policy(
+                &self.db,
+                &object,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+            )? == Some(false)
+            {
+                return Err(Status::not_found("link endpoint not found"));
+            }
             enforce_namespace_tenant_context(
                 &self.db,
                 tenant_context.as_ref(),
@@ -35,10 +45,12 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &object,
                 &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("create_link:{object_id}"),
             )?;
             endpoints.push(object);
@@ -59,16 +71,21 @@ impl SekaiServiceImpl {
             relation: l.relation.clone(),
             created: l.created,
         };
-        if fail_if_exists {
-            if !self
-                .db
-                .create_link_once(&dl)
-                .map_err(map_graph_mutation_error)?
-            {
-                return Err(Status::already_exists("link already exists"));
-            }
-        } else {
-            self.db.create_link(&dl).map_err(map_graph_mutation_error)?;
+        let from_generation = object_security_generation(&self.db, &endpoints[0].namespace)?;
+        let to_generation = object_security_generation(&self.db, &endpoints[1].namespace)?;
+        let created = self
+            .db
+            .create_link_with_authorized_endpoints(
+                &dl,
+                &endpoints[0],
+                &endpoints[1],
+                Some(&from_generation),
+                Some(&to_generation),
+                fail_if_exists,
+            )
+            .map_err(map_graph_mutation_error)?;
+        if fail_if_exists && !created {
+            return Err(Status::already_exists("link already exists"));
         }
         Ok(Response::new(CreateLinkResponse { link: Some(l) }))
     }
@@ -84,12 +101,23 @@ impl SekaiServiceImpl {
         let Some(link) = self.db.get_link(&id).map_err(Status::internal)? else {
             return Ok(Response::new(DeleteLinkResponse {}));
         };
+        let mut endpoints = Vec::with_capacity(2);
         for object_id in [&link.from_id, &link.to_id] {
             let object = self
                 .db
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
+            if evaluate_active_object_policy(
+                &self.db,
+                &object,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+            )? == Some(false)
+            {
+                return Err(Status::not_found("link endpoint not found"));
+            }
             enforce_namespace_tenant_context(
                 &self.db,
                 tenant_context.as_ref(),
@@ -98,14 +126,27 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &object,
                 &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("delete_link:{object_id}"),
             )?;
+            endpoints.push(object);
         }
-        self.db.delete_link(&id).map_err(Status::internal)?;
+        let from_generation = object_security_generation(&self.db, &endpoints[0].namespace)?;
+        let to_generation = object_security_generation(&self.db, &endpoints[1].namespace)?;
+        self.db
+            .delete_link_with_authorized_endpoints(
+                &id,
+                &endpoints[0],
+                &endpoints[1],
+                Some(&from_generation),
+                Some(&to_generation),
+            )
+            .map_err(map_graph_mutation_error)?;
         Ok(Response::new(DeleteLinkResponse {}))
     }
 }

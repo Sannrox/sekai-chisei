@@ -53,6 +53,7 @@ const OBJECT_SECURITY_SCHEMA: &str = include_str!("postgres/0032_object_security
 const DEFINITION_PROPOSALS_SCHEMA: &str = include_str!("postgres/0033_definition_proposals.sql");
 const DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA: &str =
     include_str!("postgres/0034_definition_proposal_merge_evidence.sql");
+const OBJECT_QUERY_CURSOR_SCHEMA: &str = include_str!("postgres/0035_object_query_cursor.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -226,6 +227,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 33,
         name: "definition_proposal_merge_evidence",
         sql: DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA,
+    },
+    Migration {
+        version: 34,
+        name: "object_query_cursor",
+        sql: OBJECT_QUERY_CURSOR_SCHEMA,
     },
 ];
 

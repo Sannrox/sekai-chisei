@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::db::postgres::PostgresDb;
+use crate::db::postgres_audit::{lock_object_lifecycle, require_postgres_policy_generation};
 use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, excluded_kinds_sql,
     is_valid_property_key, storage_properties_json,
@@ -459,11 +460,80 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn create_link_with_authorized_endpoints(
+        &self,
+        link: &Link,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+        fail_if_exists: bool,
+    ) -> Result<bool, String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        require_postgres_authorized_link_endpoints(
+            &mut transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let inserted = transaction
+            .execute(
+                "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+                &[
+                    &link.id,
+                    &link.from_id,
+                    &link.to_id,
+                    &link.relation,
+                    &link.created,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(if fail_if_exists { inserted == 1 } else { true })
+    }
+
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
         self.connection()?
             .execute("DELETE FROM sekai_links WHERE id = $1", &[&id])
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn delete_link_with_authorized_endpoints(
+        &self,
+        id: &str,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        require_postgres_authorized_link_endpoints(
+            &mut transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM sekai_links WHERE id = $1 AND from_id = $2 AND to_id = $3",
+                &[&id, &expected_from.id, &expected_to.id],
+            )
+            .map_err(|error| error.to_string())?;
+        if deleted != 1 {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn get_link(&self, id: &str) -> Result<Option<Link>, String> {
@@ -746,6 +816,48 @@ fn is_lineage_relation(relation: &str) -> bool {
             | "evidence_for"
             | "derived_from"
     )
+}
+
+fn require_postgres_authorized_link_endpoints(
+    transaction: &mut postgres::Transaction<'_>,
+    expected_from: &Object,
+    expected_to: &Object,
+    from_generation: Option<&str>,
+    to_generation: Option<&str>,
+) -> Result<(), String> {
+    let (first, second) = if expected_from.id <= expected_to.id {
+        (expected_from, expected_to)
+    } else {
+        (expected_to, expected_from)
+    };
+    lock_object_lifecycle(transaction, &first.id)?;
+    if first.id != second.id {
+        lock_object_lifecycle(transaction, &second.id)?;
+    }
+    require_postgres_policy_generation(transaction, &expected_from.namespace, from_generation)?;
+    require_postgres_policy_generation(transaction, &expected_to.namespace, to_generation)?;
+    let from = transaction
+        .query_opt(
+            &format!("SELECT {OBJECT_COLUMNS} FROM sekai_objects WHERE id = $1 FOR UPDATE"),
+            &[&expected_from.id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(row_to_object)
+        .transpose()?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    let to = transaction
+        .query_opt(
+            &format!("SELECT {OBJECT_COLUMNS} FROM sekai_objects WHERE id = $1 FOR UPDATE"),
+            &[&expected_to.id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(row_to_object)
+        .transpose()?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    if !from.persisted_state_matches(expected_from) || !to.persisted_state_matches(expected_to) {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    Ok(())
 }
 
 fn row_to_object(row: postgres::Row) -> Result<Object, String> {

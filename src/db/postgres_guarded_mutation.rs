@@ -1,6 +1,6 @@
 use crate::db::postgres::PostgresDb;
 use crate::domain::Object;
-use crate::sekai::audit::{ObjectChange, object_diff_changes};
+use crate::sekai::audit::{ObjectChange, object_diff_changes, object_diff_changes_with_snapshot};
 use crate::sekai::lease::{
     Lease, LeaseError, canonical_object_input, guarded_mutation_digest, object_state_matches,
     validate_text,
@@ -63,6 +63,23 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_create_object_with_policy(
+            object, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_create_object_with_policy(
+        &self,
+        object: &Object,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
                 "namespace:* object IDs are reserved for namespace boundaries".into(),
@@ -86,6 +103,12 @@ impl PostgresDb {
             now_ms,
             |tx, transaction_now_ms| {
                 lock_object(tx, &object.id)?;
+                crate::db::postgres_audit::require_postgres_policy_generation(
+                    tx,
+                    &object.namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let historical_changes: i64 = tx
                     .query_one(
                         "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id=$1",
@@ -138,6 +161,34 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_update_object_with_policy(
+            object,
+            request_object,
+            expected,
+            namespace,
+            key,
+            token,
+            request_id,
+            actor,
+            now_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_update_object_with_policy(
+        &self,
+        object: &Object,
+        request_object: &Object,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
                 "namespace:* external IDs are reserved for namespace boundaries".into(),
@@ -156,6 +207,12 @@ impl PostgresDb {
             now_ms,
             |tx, transaction_now_ms| {
                 lock_object(tx, &object.id)?;
+                crate::db::postgres_audit::require_postgres_policy_generation(
+                    tx,
+                    &object.namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let before = tx
                     .query_opt(
                         &format!(
@@ -219,7 +276,37 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<(), LeaseError> {
+        self.guarded_delete_object_with_policy(
+            object_id, expected, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_delete_object_with_policy(
+        &self,
+        object_id: &str,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
+        let snapshot_keys = expected
+            .map(|object| {
+                crate::db::postgres_audit::postgres_security_snapshot_property_keys(self, object)
+            })
+            .or_else(|| {
+                self.get_object(object_id).ok().flatten().map(|object| {
+                    crate::db::postgres_audit::postgres_security_snapshot_property_keys(
+                        self, &object,
+                    )
+                })
+            })
+            .unwrap_or_default();
         self.guarded_object_mutation(
             namespace,
             key,
@@ -232,6 +319,15 @@ impl PostgresDb {
             now_ms,
             |tx, transaction_now_ms| {
                 lock_object(tx, object_id)?;
+                let policy_namespace = expected
+                    .map(|object| object.namespace.as_str())
+                    .unwrap_or(namespace);
+                crate::db::postgres_audit::require_postgres_policy_generation(
+                    tx,
+                    policy_namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let before = tx
                     .query_opt(
                         &format!(
@@ -257,7 +353,13 @@ impl PostgresDb {
                     .map_err(storage)?;
                 insert_changes(
                     tx,
-                    &object_diff_changes(actor, Some(&before), None, transaction_now_ms),
+                    &object_diff_changes_with_snapshot(
+                        actor,
+                        Some(&before),
+                        None,
+                        transaction_now_ms,
+                        &snapshot_keys,
+                    ),
                 )?;
                 Ok(Object {
                     id: before.id,

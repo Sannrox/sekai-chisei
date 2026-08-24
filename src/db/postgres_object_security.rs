@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
-use crate::db::object_security::{mapping_digest, predicate_columns};
+use crate::db::object_security::{cursor_key_from_secret, mapping_digest, predicate_columns};
 use crate::db::postgres::PostgresDb;
 use crate::sekai::object_security::{
     ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
@@ -257,6 +257,42 @@ impl PostgresDb {
             .map(|row| row.get(0))
             .map_err(|error| error.to_string())
     }
+
+    pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_opt(
+                "SELECT secret_value FROM sekai_object_security_runtime_secrets
+                 WHERE name = 'object_query_cursor_hmac'",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0));
+        let secret = existing
+            .unwrap_or_else(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+        transaction
+            .execute(
+                "INSERT INTO sekai_object_security_runtime_secrets
+                    (name, secret_value)
+                 VALUES ('object_query_cursor_hmac', $1)
+                 ON CONFLICT (name) DO NOTHING",
+                &[&secret],
+            )
+            .map_err(|error| error.to_string())?;
+        let secret = transaction
+            .query_one(
+                "SELECT secret_value FROM sekai_object_security_runtime_secrets
+                 WHERE name = 'object_query_cursor_hmac'",
+                &[],
+            )
+            .map(|row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(cursor_key_from_secret(&secret))
+    }
 }
 
 fn insert_revision(
@@ -281,11 +317,12 @@ fn insert_revision(
     for (rule_index, rule) in policy.rules.iter().enumerate() {
         tx.execute(
             "INSERT INTO sekai_object_security_rules
-             (namespace, revision_digest, rule_index, operation) VALUES ($1, $2, $3, 'read')",
+             (namespace, revision_digest, rule_index, operation) VALUES ($1, $2, $3, $4)",
             &[
                 &revision.namespace,
                 &revision.revision_digest,
                 &(rule_index as i32),
+                &rule.operation.as_str(),
             ],
         )
         .map_err(|error| error.to_string())?;

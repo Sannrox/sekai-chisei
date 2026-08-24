@@ -39,6 +39,7 @@ pub trait ObjectSecurityBackend: Send + Sync {
         namespace: &str,
     ) -> Result<Option<ObjectSecurityActivation>, String>;
     fn has_object_security_activations(&self) -> Result<bool, String>;
+    fn object_query_cursor_key(&self) -> Result<[u8; 32], String>;
 }
 
 impl ObjectSecurityBackend for SekaiDb {
@@ -77,6 +78,9 @@ impl ObjectSecurityBackend for SekaiDb {
     fn has_object_security_activations(&self) -> Result<bool, String> {
         self.has_object_security_activations()
     }
+    fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        self.object_query_cursor_key()
+    }
 }
 
 impl ObjectSecurityBackend for PostgresDb {
@@ -114,6 +118,9 @@ impl ObjectSecurityBackend for PostgresDb {
     }
     fn has_object_security_activations(&self) -> Result<bool, String> {
         self.has_object_security_activations()
+    }
+    fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        self.object_query_cursor_key()
     }
 }
 
@@ -178,6 +185,10 @@ impl SekaiDb {
                     policy_count INTEGER NOT NULL,
                     reason_code TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sekai_object_security_runtime_secrets (
+                    name TEXT PRIMARY KEY,
+                    secret_value TEXT NOT NULL
                 );",
             )
             .map_err(|error| error.to_string())
@@ -434,6 +445,42 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())
     }
+
+    pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing = transaction
+            .query_row(
+                "SELECT secret_value FROM sekai_object_security_runtime_secrets
+                 WHERE name = 'object_query_cursor_hmac'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let secret = existing
+            .unwrap_or_else(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_object_security_runtime_secrets
+                    (name, secret_value)
+                 VALUES ('object_query_cursor_hmac', ?1)",
+                params![secret],
+            )
+            .map_err(|error| error.to_string())?;
+        let secret = transaction
+            .query_row(
+                "SELECT secret_value FROM sekai_object_security_runtime_secrets
+                 WHERE name = 'object_query_cursor_hmac'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(cursor_key_from_secret(&secret))
+    }
 }
 
 fn insert_revision_sqlite(
@@ -458,11 +505,12 @@ fn insert_revision_sqlite(
     for (rule_index, rule) in policy.rules.iter().enumerate() {
         tx.execute(
             "INSERT INTO sekai_object_security_rules
-             (namespace, revision_digest, rule_index, operation) VALUES (?1, ?2, ?3, 'read')",
+             (namespace, revision_digest, rule_index, operation) VALUES (?1, ?2, ?3, ?4)",
             params![
                 revision.namespace,
                 revision.revision_digest,
-                rule_index as i64
+                rule_index as i64,
+                rule.operation.as_str()
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -589,6 +637,10 @@ pub(crate) fn mapping_digest(namespace: &str, policies: &BTreeMap<String, String
     hasher.update([0]);
     hasher.update(serde_json::to_vec(policies).unwrap_or_default());
     format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn cursor_key_from_secret(secret: &str) -> [u8; 32] {
+    Sha256::digest(secret.as_bytes()).into()
 }
 
 fn validate_write(actor: &str, key: &str, now_ms: i64) -> Result<(), String> {

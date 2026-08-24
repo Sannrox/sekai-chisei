@@ -44,10 +44,12 @@ Policy administration is separate from generic object mutation and produces
 bounded, value-free audit rows. Rollback activates a prior valid revision; it
 does not restore implicit grants.
 
-This first slice supports direct object read and `ListObjects`. Transactional
-write reauthorization, traversal and other object consumers, export/sync/action
-resolution, and authority-bound cursors remain unsupported follow-up
-obligations. Markings remain an additional narrowing layer.
+Activated namespaces apply the same compiled relation to remaining object
+consumers. Writes reauthorize current and proposed state against
+operation-specific rules inside the persist transaction. List pagination
+cursors bind principal context, namespace, activation digest, query digest,
+and expiry. Markings remain an additional narrowing layer. Property-level
+grants and richer rule vocabularies remain separate decisions.
 
 ## Validation
 
