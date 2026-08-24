@@ -31,6 +31,7 @@ use crate::sekai::coordination::*;
 use crate::sekai::dataset::{Dataset, DatasetRedaction, RowFilter, RowQuery, VirtualTable};
 use crate::sekai::deduplication::*;
 use crate::sekai::definition_branch::*;
+use crate::sekai::definition_proposal::*;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceEnvelope, EvidenceLifecycleState};
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::{
@@ -250,6 +251,127 @@ impl RuntimeDb {
                 now_ms,
             ),
             Self::Postgres(db) => DefinitionBranchBackend::apply_definition_branch_edit(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn get_published_definition_revision(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<DefinitionRevision>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                DefinitionBranchBackend::get_published_definition_revision(db.as_ref(), namespace)
+            }
+            Self::Postgres(db) => {
+                DefinitionBranchBackend::get_published_definition_revision(db.as_ref(), namespace)
+            }
+        }
+    }
+
+    pub fn get_definition_proposal(
+        &self,
+        namespace: &str,
+        proposal_id: &str,
+    ) -> Result<Option<DefinitionProposal>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_proposal(
+                db.as_ref(),
+                namespace,
+                proposal_id,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::get_definition_proposal(
+                db.as_ref(),
+                namespace,
+                proposal_id,
+            ),
+        }
+    }
+
+    pub fn create_definition_proposal(
+        &self,
+        request: &CreateDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::create_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::create_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn approve_definition_proposal(
+        &self,
+        request: &ApproveDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::approve_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::approve_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn merge_definition_proposal(
+        &self,
+        request: &MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::merge_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::merge_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn close_definition_proposal(
+        &self,
+        request: &CloseDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::close_definition_proposal(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::close_definition_proposal(
                 db.as_ref(),
                 request,
                 actor,

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Publish or reject one governed definition proposal. A proposal pins exact
+  published-base and branch-head digests, frozen evaluation-plan references,
+  and named foreign digests; merge compare-and-swaps the namespace published
+  head only with a live approval and matching member identity. Stale
+  candidates, missing approvals, and foreign digests fail before the head
+  moves; exact replay and closed proposals preserve history.
 - Add immutable `sekai.object-security-policy/v1` revisions, atomic namespace
   activation, administrative gRPC inspection/mutation, and SQLite/PostgreSQL
   storage-predicate enforcement for direct object reads and `ListObjects`.

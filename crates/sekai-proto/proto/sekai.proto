@@ -1539,6 +1539,95 @@ message ApplyDefinitionBranchEditResponse {
   repeated string changed_member_digests = 4;
 }
 
+// A reviewable pin of one published base revision and one branch-head
+// candidate. Approvals and status are lifecycle projections; identity is the
+// content digest of the pinned closure.
+message DefinitionProposalApproval {
+  string actor = 1;
+  int64 approved_at_ms = 2;
+}
+
+message DefinitionProposal {
+  string contract_version = 1;
+  string namespace = 2;
+  string branch_id = 3;
+  string proposal_id = 4;
+  string base_digest = 5;
+  string candidate_digest = 6;
+  string proposal_digest = 7;
+  repeated string eval_plan_digests = 8;
+  repeated string named_foreign_digests = 9;
+  repeated DefinitionProposalApproval approvals = 10;
+  string status = 11; // open | merged | closed
+  string created_by = 12;
+  int64 created_at_ms = 13;
+  int64 updated_at_ms = 14;
+}
+
+message CreateDefinitionProposalRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string proposal_id = 3;
+  string base_digest = 4;
+  string candidate_digest = 5;
+  repeated string eval_plan_digests = 6;
+  repeated string named_foreign_digests = 7;
+  string idempotency_key = 8;
+}
+
+message CreateDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message GetDefinitionProposalRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+}
+
+message GetDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message ApproveDefinitionProposalRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+  string idempotency_key = 3;
+}
+
+message ApproveDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message MergeDefinitionProposalRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+  string idempotency_key = 3;
+}
+
+message MergeDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+  string previous_published_digest = 2;
+  DefinitionRevision published_revision = 3;
+}
+
+message CloseDefinitionProposalRequest {
+  string namespace = 1;
+  string proposal_id = 2;
+  string idempotency_key = 3;
+}
+
+message CloseDefinitionProposalResponse {
+  DefinitionProposal proposal = 1;
+}
+
+message GetPublishedDefinitionRevisionRequest {
+  string namespace = 1;
+}
+
+message GetPublishedDefinitionRevisionResponse {
+  DefinitionRevision revision = 1;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1618,6 +1707,12 @@ service SekaiService {
   rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
   rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
   rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);
+  rpc CreateDefinitionProposal(CreateDefinitionProposalRequest) returns (CreateDefinitionProposalResponse);
+  rpc GetDefinitionProposal(GetDefinitionProposalRequest) returns (GetDefinitionProposalResponse);
+  rpc ApproveDefinitionProposal(ApproveDefinitionProposalRequest) returns (ApproveDefinitionProposalResponse);
+  rpc MergeDefinitionProposal(MergeDefinitionProposalRequest) returns (MergeDefinitionProposalResponse);
+  rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
+  rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);
