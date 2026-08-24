@@ -1,9 +1,10 @@
 //! Governed definition proposals that publish or reject one exact revision.
 //!
 //! A proposal pins a published base digest and a branch-head candidate. Merge
-//! compare-and-swaps the namespace published head in one transaction. Branch
-//! edits after the pin, missing approvals, and foreign digests never become a
-//! grant.
+//! compare-and-swaps the namespace published head against an expected digest
+//! and stores a receipt in the same transaction. Branch edits after the pin,
+//! missing approvals, non-descendant candidates, and foreign digests never
+//! become a grant. Close records a canonical reason without moving the head.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,11 @@ pub const MAX_PROPOSAL_DIGEST_REFS: usize = 32;
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_MERGED: &str = "merged";
 pub const STATUS_CLOSED: &str = "closed";
+
+pub const CLOSE_REASON_OPERATOR_ABORT: &str = "operator_abort";
+pub const CLOSE_REASON_SUPERSEDED: &str = "superseded";
+pub const CLOSE_REASON_POLICY_DENIED: &str = "policy_denied";
+const MAX_ANCESTRY_WALK: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DefinitionProposalApproval {
@@ -43,6 +49,10 @@ pub struct DefinitionProposal {
     pub created_by: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub receipt_id: String,
+    #[serde(default)]
+    pub close_reason_code: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +78,7 @@ pub struct ApproveDefinitionProposal {
 pub struct MergeDefinitionProposal {
     pub namespace: String,
     pub proposal_id: String,
+    pub expected_published_digest: String,
     pub idempotency_key: String,
 }
 
@@ -75,6 +86,7 @@ pub struct MergeDefinitionProposal {
 pub struct CloseDefinitionProposal {
     pub namespace: String,
     pub proposal_id: String,
+    pub reason_code: String,
     pub idempotency_key: String,
 }
 
@@ -83,6 +95,7 @@ pub struct DefinitionProposalMergeResult {
     pub proposal: DefinitionProposal,
     pub previous_published_digest: String,
     pub published_revision: DefinitionRevision,
+    pub receipt_id: String,
 }
 
 impl CreateDefinitionProposal {
@@ -158,6 +171,7 @@ impl MergeDefinitionProposal {
     pub fn request_digest(&self) -> Result<String, String> {
         validate_namespace(&self.namespace)?;
         validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_digest("expected_published_digest", &self.expected_published_digest)?;
         validate_identifier(
             "idempotency_key",
             &self.idempotency_key,
@@ -171,6 +185,7 @@ impl CloseDefinitionProposal {
     pub fn request_digest(&self) -> Result<String, String> {
         validate_namespace(&self.namespace)?;
         validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_close_reason_code(&self.reason_code)?;
         validate_identifier(
             "idempotency_key",
             &self.idempotency_key,
@@ -211,7 +226,30 @@ impl DefinitionProposal {
             return Err("definition proposal content binding is invalid".into());
         }
         match self.status.as_str() {
-            STATUS_OPEN | STATUS_MERGED | STATUS_CLOSED => {}
+            STATUS_OPEN => {
+                if !self.receipt_id.is_empty() || !self.close_reason_code.is_empty() {
+                    return Err(
+                        "definition proposal open state cannot carry a receipt or close reason"
+                            .into(),
+                    );
+                }
+            }
+            STATUS_MERGED => {
+                if !self.receipt_id.is_empty() {
+                    validate_digest("receipt_id", &self.receipt_id)?;
+                }
+                if !self.close_reason_code.is_empty() {
+                    return Err("merged definition proposal cannot carry a close reason".into());
+                }
+            }
+            STATUS_CLOSED => {
+                if !self.receipt_id.is_empty() {
+                    return Err("closed definition proposal cannot carry a merge receipt".into());
+                }
+                if !self.close_reason_code.is_empty() {
+                    validate_close_reason_code(&self.close_reason_code)?;
+                }
+            }
             _ => return Err("definition proposal status is unsupported".into()),
         }
         validate_identifier("created_by", &self.created_by, MAX_DEFINITION_ID_BYTES)?;
@@ -277,6 +315,76 @@ pub fn changed_member_refs(
     changed.into_iter().collect()
 }
 
+pub fn validate_close_reason_code(reason_code: &str) -> Result<(), String> {
+    match reason_code {
+        CLOSE_REASON_OPERATOR_ABORT | CLOSE_REASON_SUPERSEDED | CLOSE_REASON_POLICY_DENIED => {
+            Ok(())
+        }
+        _ => Err("definition_proposal_invalid_close_reason: reason_code is not canonical".into()),
+    }
+}
+
+pub fn merge_receipt_id(
+    namespace: &str,
+    proposal_id: &str,
+    proposal_digest: &str,
+    base_digest: &str,
+    candidate_digest: &str,
+    previous_published_digest: &str,
+) -> Result<String, String> {
+    canonical_digest(
+        "definition_proposal_merge_receipt",
+        &MergeReceiptDigestInput {
+            namespace,
+            proposal_id,
+            proposal_digest,
+            base_digest,
+            candidate_digest,
+            previous_published_digest,
+        },
+    )
+}
+
+pub fn require_descendant_candidate(
+    candidate: &DefinitionRevision,
+    base_digest: &str,
+    mut load_parent: impl FnMut(&str) -> Result<Option<DefinitionRevision>, String>,
+) -> Result<(), String> {
+    if candidate.revision_digest == base_digest {
+        return Err("definition_proposal_no_change: candidate must differ from base".into());
+    }
+    let mut current = candidate.parent_revision_digest.clone();
+    let mut seen = BTreeSet::from([candidate.revision_digest.clone()]);
+    for _ in 0..MAX_ANCESTRY_WALK {
+        if current.is_empty() {
+            return Err(
+                "incompatible_definition_proposal_candidate: candidate is not a descendant of the pinned base"
+                    .into(),
+            );
+        }
+        if current == base_digest {
+            return Ok(());
+        }
+        if !seen.insert(current.clone()) {
+            return Err(
+                "incompatible_definition_proposal_candidate: revision parent chain contains a cycle"
+                    .into(),
+            );
+        }
+        let Some(parent) = load_parent(&current)? else {
+            return Err(
+                "incompatible_definition_proposal_candidate: candidate is not a descendant of the pinned base"
+                    .into(),
+            );
+        };
+        current = parent.parent_revision_digest;
+    }
+    Err(
+        "incompatible_definition_proposal_candidate: revision parent chain exceeds the supported depth"
+            .into(),
+    )
+}
+
 pub fn reject_foreign_member_grants(
     revision: &DefinitionRevision,
     named_foreign_digests: &[String],
@@ -330,6 +438,16 @@ fn proposal_content_digest(
             named_foreign_digests,
         },
     )
+}
+
+#[derive(Serialize)]
+struct MergeReceiptDigestInput<'a> {
+    namespace: &'a str,
+    proposal_id: &'a str,
+    proposal_digest: &'a str,
+    base_digest: &'a str,
+    candidate_digest: &'a str,
+    previous_published_digest: &'a str,
 }
 
 #[derive(Serialize)]
@@ -430,5 +548,107 @@ mod tests {
                 .unwrap_err()
                 .contains("foreign_authority_is_not_a_grant")
         );
+    }
+
+    #[test]
+    fn historical_merged_and_closed_proposals_load_without_new_columns() {
+        let mut proposal = DefinitionProposal {
+            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-1".into(),
+            base_digest: digest('a'),
+            candidate_digest: digest('b'),
+            proposal_digest: String::new(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            approvals: Vec::new(),
+            status: STATUS_MERGED.into(),
+            created_by: "author".into(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            receipt_id: String::new(),
+            close_reason_code: String::new(),
+        };
+        proposal.proposal_digest = proposal_content_digest(
+            &proposal.namespace,
+            &proposal.branch_id,
+            &proposal.proposal_id,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+            &proposal.eval_plan_digests,
+            &proposal.named_foreign_digests,
+        )
+        .unwrap();
+        proposal.verify().unwrap();
+        proposal.status = STATUS_CLOSED.into();
+        proposal.verify().unwrap();
+    }
+
+    #[test]
+    fn merge_requires_expected_published_digest() {
+        let request = MergeDefinitionProposal {
+            namespace: "team-a".into(),
+            proposal_id: "cs-1".into(),
+            expected_published_digest: String::new(),
+            idempotency_key: "merge-1".into(),
+        };
+        assert!(
+            request
+                .request_digest()
+                .unwrap_err()
+                .contains("expected_published_digest")
+        );
+    }
+
+    #[test]
+    fn close_rejects_unknown_reason_codes() {
+        let request = CloseDefinitionProposal {
+            namespace: "team-a".into(),
+            proposal_id: "cs-1".into(),
+            reason_code: "retry_later".into(),
+            idempotency_key: "close-1".into(),
+        };
+        assert!(
+            request
+                .request_digest()
+                .unwrap_err()
+                .contains("definition_proposal_invalid_close_reason")
+        );
+    }
+
+    #[test]
+    fn descendant_candidate_is_accepted_and_sibling_is_denied() {
+        let base = digest('a');
+        let candidate = DefinitionRevision {
+            contract_version: crate::sekai::definition_branch::REVISION_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            revision_digest: digest('c'),
+            parent_revision_digest: digest('b'),
+            members: Vec::new(),
+            published: false,
+            created_by: "author".into(),
+            created_at_ms: 1,
+        };
+        let mid = DefinitionRevision {
+            parent_revision_digest: base.clone(),
+            revision_digest: digest('b'),
+            ..candidate.clone()
+        };
+        require_descendant_candidate(&candidate, &base, |digest| {
+            if digest == mid.revision_digest {
+                Ok(Some(mid.clone()))
+            } else {
+                Ok(None)
+            }
+        })
+        .unwrap();
+        let sibling = DefinitionRevision {
+            parent_revision_digest: digest('z'),
+            ..candidate
+        };
+        let error = require_descendant_candidate(&sibling, &base, |_| Ok(None)).unwrap_err();
+        assert!(error.contains("incompatible_definition_proposal_candidate"));
+        assert!(!error.contains("AlreadyExists"));
     }
 }

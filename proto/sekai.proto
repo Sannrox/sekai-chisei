@@ -1562,6 +1562,8 @@ message DefinitionProposal {
   string created_by = 12;
   int64 created_at_ms = 13;
   int64 updated_at_ms = 14;
+  string receipt_id = 15; // set only after merge
+  string close_reason_code = 16; // set only after close
 }
 
 message CreateDefinitionProposalRequest {
@@ -1602,18 +1604,21 @@ message MergeDefinitionProposalRequest {
   string namespace = 1;
   string proposal_id = 2;
   string idempotency_key = 3;
+  string expected_published_digest = 4;
 }
 
 message MergeDefinitionProposalResponse {
   DefinitionProposal proposal = 1;
   string previous_published_digest = 2;
   DefinitionRevision published_revision = 3;
+  string receipt_id = 4;
 }
 
 message CloseDefinitionProposalRequest {
   string namespace = 1;
   string proposal_id = 2;
   string idempotency_key = 3;
+  string reason_code = 4;
 }
 
 message CloseDefinitionProposalResponse {

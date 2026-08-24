@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Merge of a governed definition proposal requires the expected published
+  digest, compare-and-swaps that pointer, and returns a durable `receipt_id`
+  stored on the merged proposal. Exact replay returns the same receipt without
+  moving the head again. A candidate that does not descend from the pinned
+  base is denied as not mergeable. Close records a canonical reason
+  (`operator_abort`, `superseded`, or `policy_denied`) without moving the
+  published head.
 - Publish or reject one governed definition proposal. A proposal pins exact
   published-base and branch-head digests, frozen evaluation-plan references,
   and named foreign digests; merge compare-and-swaps the namespace published
