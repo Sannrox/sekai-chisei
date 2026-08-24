@@ -62,6 +62,12 @@ Visibility is descriptive, not an authorization grant. Invocation rechecks
 namespace membership, object ACLs, policy, budgets, object state, and current
 schema.
 
+Object-query discovery does not expose or cache object-security policy
+authority. After explicit namespace activation, direct reads and
+`ListObjects` recheck the active revision per row in storage. Mixed-namespace
+lists retain legacy behavior for unactivated rows. Raw backing datasets retain
+their independent authorization boundary.
+
 ## Governed invocation binding
 
 The v1 receipt-attributed binding covers typed object-query entries,

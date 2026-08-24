@@ -189,6 +189,38 @@
       "product_tier": "core"
     },
     {
+      "rpc": "PutObjectSecurityPolicyRevision",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "GetObjectSecurityPolicyRevision",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "ActivateObjectSecurityPolicies",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "GetObjectSecurityActivation",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "FindByExternalId",
       "kind": "persistent",
       "surfaces": [
@@ -1288,6 +1320,7 @@
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",
+    "sekai.object-security",
     "sekai.object-sync",
     "sekai.ontology-definitions",
     "sekai.reconciliation",

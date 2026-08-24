@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add immutable `sekai.object-security-policy/v1` revisions, atomic namespace
+  activation, administrative gRPC inspection/mutation, and SQLite/PostgreSQL
+  storage-predicate enforcement for direct object reads and `ListObjects`.
+  Existing inactive namespaces keep prior ACL and marking semantics; writes,
+  remaining object consumers, and authority-bound cursors remain unsupported.
 - Add a separate bounded native content contract for ordered text, image,
   audio, and document descriptors. Content plans preserve the existing text
   RPCs, authorize disclosure through Chisei policy, verify transient payload

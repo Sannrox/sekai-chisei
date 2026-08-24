@@ -26,6 +26,11 @@ across SQLite and PostgreSQL. PostgreSQL serializes branch and idempotency
 identities before checking durable state, so concurrent writers cannot both
 advance one expected head.
 
+The reusable `sekai.object-security` surface shares immutable policy
+revisions, exact replay, complete atomic activation, and SQL-enforced direct
+read/list predicates across SQLite and PostgreSQL. Normal CI runs SQLite;
+PostgreSQL conformance remains an ignored isolated-database test.
+
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
 
@@ -60,6 +65,7 @@ Evidence is checked in as:
 | #462 | Graph-backed governed requirement, invariant, waiver, and invariant-set facts |
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 | #666 | Governed definition branch and immutable revision foundation |
+| #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
 
 ## Still outside this parent
 
@@ -86,6 +92,9 @@ SEKAI_TEST_POSTGRES_URL=... \
 
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test --test definition_branch_backend_conformance -- --ignored
+
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test --test object_security_backend_conformance -- --ignored
 ```
 
 The ordered-feed migration is additive and one-way on both backends. Version 1

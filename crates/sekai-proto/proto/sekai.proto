@@ -391,6 +391,43 @@ message DeleteObjectRequest {
 message DeleteObjectResponse {}
 message ListObjectsRequest { ListFilter filter = 1; }
 message ListObjectsResponse { repeated Object objects = 1; int32 total = 2; }
+message ObjectSecurityPolicyRevision {
+  string namespace = 1;
+  string kind = 2;
+  string revision_digest = 3;
+  bytes canonical_policy_json = 4;
+  string created_by = 5;
+  int64 created_at_ms = 6;
+}
+message PutObjectSecurityPolicyRevisionRequest {
+  bytes canonical_policy_json = 1;
+  string idempotency_key = 2;
+}
+message PutObjectSecurityPolicyRevisionResponse { ObjectSecurityPolicyRevision revision = 1; }
+message GetObjectSecurityPolicyRevisionRequest {
+  string namespace = 1;
+  string revision_digest = 2;
+}
+message GetObjectSecurityPolicyRevisionResponse { ObjectSecurityPolicyRevision revision = 1; }
+message ObjectSecurityPolicyBinding {
+  string kind = 1;
+  string revision_digest = 2;
+}
+message ObjectSecurityActivation {
+  string namespace = 1;
+  string activation_id = 2;
+  repeated ObjectSecurityPolicyBinding policies = 3;
+  string activated_by = 4;
+  int64 activated_at_ms = 5;
+}
+message ActivateObjectSecurityPoliciesRequest {
+  string namespace = 1;
+  repeated ObjectSecurityPolicyBinding policies = 2;
+  string idempotency_key = 3;
+}
+message ActivateObjectSecurityPoliciesResponse { ObjectSecurityActivation activation = 1; }
+message GetObjectSecurityActivationRequest { string namespace = 1; }
+message GetObjectSecurityActivationResponse { ObjectSecurityActivation activation = 1; }
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -1586,6 +1623,10 @@ service SekaiService {
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc PutObjectSecurityPolicyRevision(PutObjectSecurityPolicyRevisionRequest) returns (PutObjectSecurityPolicyRevisionResponse);
+  rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);
+  rpc ActivateObjectSecurityPolicies(ActivateObjectSecurityPoliciesRequest) returns (ActivateObjectSecurityPoliciesResponse);
+  rpc GetObjectSecurityActivation(GetObjectSecurityActivationRequest) returns (GetObjectSecurityActivationResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

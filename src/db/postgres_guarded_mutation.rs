@@ -98,7 +98,8 @@ impl PostgresDb {
                         "object IDs with audit history cannot be reused".into(),
                     ));
                 }
-                let props = serde_json::to_string(&object.properties).map_err(storage)?;
+                let props =
+                    crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
                     "INSERT INTO sekai_objects
                         (id,kind,name,namespace,external_id,properties,created,updated)
@@ -180,7 +181,8 @@ impl PostgresDb {
                             .into(),
                     ));
                 }
-                let props = serde_json::to_string(&object.properties).map_err(storage)?;
+                let props =
+                    crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
                     "UPDATE sekai_objects SET
                         kind=$2,name=$3,namespace=$4,external_id=$5,properties=$6,updated=$7

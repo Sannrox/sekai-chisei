@@ -13,21 +13,35 @@ impl SekaiServiceImpl {
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let id = req.into_inner().id;
         let obj = self
             .db
-            .get_object(&id)
+            .get_object_with_policy_context(&id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
-        let (obj, marking) = require_visible_read_root(
+        let namespace = obj.namespace.clone();
+        let visibility = require_visible_read_root(
             &self.db,
             &self.security,
             obj,
             &principals,
             tenant_context.as_ref(),
             &format!("get_object:{id}"),
-        )?;
+        );
+        let (obj, marking) = match visibility {
+            Ok(visible) => visible,
+            Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                let activated = self
+                    .db
+                    .get_object_security_activation(&namespace)
+                    .map_err(Status::internal)?
+                    .is_some();
+                return Err(map_direct_read_visibility_error(activated, status));
+            }
+            Err(status) => return Err(status),
+        };
         if marking.decision != markings::MarkingDecision::NotApplicable {
             let actor = principals.first().cloned().unwrap_or_default();
             let mut evidence = HashMap::new();
@@ -48,7 +62,12 @@ impl SekaiServiceImpl {
                 evidence,
             )?;
         }
-        let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
+        let obj = self.resolve_computed_for_response_with_policy(
+            obj,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+        )?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
         }))
@@ -58,6 +77,7 @@ impl SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let invoked_capability = req
             .metadata()
@@ -162,9 +182,15 @@ impl SekaiServiceImpl {
             &self.db,
             &filter,
             &principals,
+            &policy_context,
             tenant_context.as_ref(),
             |objects, principals, tenant_context| {
-                self.resolve_computed_for_responses(objects, principals, tenant_context)
+                self.resolve_computed_for_responses_with_policy(
+                    objects,
+                    principals,
+                    Some(&policy_context),
+                    tenant_context,
+                )
             },
         )?;
         let mut response = Response::new(ListObjectsResponse {
@@ -192,41 +218,93 @@ impl SekaiServiceImpl {
         req: Request<FindByExternalIdRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let external_id = req.into_inner().external_id;
-        let obj = if tenant_context.is_some() {
-            self.db
-                .find_all_by_external_id(&external_id)
+        let candidates = self
+            .db
+            .find_all_by_external_id(&external_id)
+            .map_err(Status::internal)?;
+        let mut first_acl_denied = None;
+        for candidate in candidates {
+            if tenant_context.is_some()
+                && !object_is_visible(
+                    &self.db,
+                    &self.security,
+                    &candidate,
+                    &principals,
+                    tenant_context.as_ref(),
+                )
+            {
+                continue;
+            }
+            let Some(obj) = self
+                .db
+                .get_object_with_policy_context(&candidate.id, &policy_context)
                 .map_err(Status::internal)?
-                .into_iter()
-                .find(|candidate| {
-                    object_is_visible(
-                        &self.db,
-                        &self.security,
-                        candidate,
-                        &principals,
-                        tenant_context.as_ref(),
-                    )
-                })
-        } else {
-            self.db
-                .find_by_external_id(&external_id)
-                .map_err(Status::internal)?
+            else {
+                continue;
+            };
+            let namespace = obj.namespace.clone();
+            let visibility = require_visible_read_root(
+                &self.db,
+                &self.security,
+                obj,
+                &principals,
+                tenant_context.as_ref(),
+                &format!("find_by_external_id:{}", candidate.id),
+            );
+            let (obj, marking) = match visibility {
+                Ok(visible) => visible,
+                Err(status) if status.code() == tonic::Code::PermissionDenied => {
+                    let activated = self
+                        .db
+                        .get_object_security_activation(&namespace)
+                        .map_err(Status::internal)?
+                        .is_some();
+                    let mapped = map_direct_read_visibility_error(activated, status);
+                    if mapped.code() == tonic::Code::NotFound {
+                        continue;
+                    }
+                    first_acl_denied.get_or_insert(mapped);
+                    continue;
+                }
+                Err(status) => return Err(status),
+            };
+            if marking.decision != markings::MarkingDecision::NotApplicable {
+                let actor = principals.first().cloned().unwrap_or_default();
+                let mut evidence = HashMap::new();
+                if let Some(value) = &marking.object_classification {
+                    evidence.insert("object_classification".into(), value.clone());
+                }
+                if let Some(value) = &marking.principal_ceiling {
+                    evidence.insert("principal_ceiling".into(), value.clone());
+                }
+                evidence.insert("detail".into(), marking.detail.clone());
+                record_marking_or_purpose_decision(
+                    &self.db,
+                    &actor,
+                    "marking.read",
+                    &obj.id,
+                    &marking.decision_id,
+                    "allowed",
+                    evidence,
+                )?;
+            }
+            let obj = self.resolve_computed_for_response_with_policy(
+                obj,
+                &principals,
+                Some(&policy_context),
+                tenant_context.as_ref(),
+            )?;
+            return Ok(Response::new(GetObjectResponse {
+                object: Some(to_proto_obj(&obj)),
+            }));
         }
-        .ok_or(Status::not_found("not found"))?;
-        let find_operation = format!("find_by_external_id:{}", obj.id);
-        let (obj, _) = require_visible_read_root(
-            &self.db,
-            &self.security,
-            obj,
-            &principals,
-            tenant_context.as_ref(),
-            &find_operation,
-        )?;
-        let obj = self.resolve_computed_for_response(obj, &principals, tenant_context.as_ref())?;
-        Ok(Response::new(GetObjectResponse {
-            object: Some(to_proto_obj(&obj)),
-        }))
+        if let Some(status) = first_acl_denied {
+            return Err(status);
+        }
+        Err(Status::not_found("not found"))
     }
     pub(super) async fn find_visible_by_property(
         &self,

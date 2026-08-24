@@ -395,7 +395,7 @@ impl SekaiDb {
                 if historical_changes > 0 {
                     return Err(LeaseError::Mutation("object IDs with audit history cannot be reused".into()));
                 }
-                let props = serde_json::to_string(&object.properties).map_err(storage)?;
+                let props = crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
                     "INSERT INTO sekai_objects (id,kind,name,namespace,external_id,properties,created,updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![object.id,object.kind,object.name,object.namespace,object.external_id,props,object.created,object.updated],
@@ -441,7 +441,7 @@ impl SekaiDb {
                 if before.kind != object.kind {
                     crate::sekai::ontology::validate_object_kind_change(tx, &object.id, &object.kind).map_err(LeaseError::Mutation)?;
                 }
-                let props = serde_json::to_string(&object.properties).map_err(storage)?;
+                let props = crate::domain::storage_properties_json(&object.properties).map_err(storage)?;
                 tx.execute(
                     "UPDATE sekai_objects SET kind=?2,name=?3,namespace=?4,external_id=?5,properties=?6,updated=?7 WHERE id=?1",
                     params![object.id,object.kind,object.name,object.namespace,object.external_id,props,object.updated],

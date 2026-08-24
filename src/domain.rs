@@ -23,6 +23,39 @@ pub fn is_valid_property_key(key: &str) -> bool {
     !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Quote internal kind constants for a static SQL exclusion. Unknown characters
+/// fail closed so a malformed kind cannot reopen a reserved-kind read surface.
+pub fn excluded_kinds_sql(column: &str, excluded_kinds: &[&str]) -> Result<String, String> {
+    if excluded_kinds.is_empty() {
+        return Ok(String::new());
+    }
+    for kind in excluded_kinds {
+        if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!(
+                "unsafe excluded kind {kind:?}: only ASCII alphanumeric and '_' allowed"
+            ));
+        }
+    }
+    let quoted = excluded_kinds
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(" AND {column} NOT IN ({quoted})"))
+}
+
+pub fn storage_properties_json(properties: &HashMap<String, String>) -> Result<String, String> {
+    for (key, value) in properties {
+        if key.contains('\0') {
+            return Err("object property key must not contain NUL".into());
+        }
+        if value.contains('\0') {
+            return Err("object property value must not contain NUL".into());
+        }
+    }
+    serde_json::to_string(properties).map_err(|error| error.to_string())
+}
+
 // --- Relations ---
 
 pub type Relation = String;
@@ -140,6 +173,32 @@ mod tests {
         let parsed: Object = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "obj-1");
         assert_eq!(parsed.properties["language"], "rust");
+    }
+
+    #[test]
+    fn excluded_kinds_sql_quotes_safe_kinds_and_rejects_unsafe_ones() {
+        assert_eq!(excluded_kinds_sql("kind", &[]).unwrap(), "");
+        assert_eq!(
+            excluded_kinds_sql("o.kind", &["capability", "action_policy"]).unwrap(),
+            " AND o.kind NOT IN ('capability','action_policy')"
+        );
+        assert!(
+            excluded_kinds_sql("kind", &["bad-kind"])
+                .unwrap_err()
+                .contains("unsafe")
+        );
+    }
+
+    #[test]
+    fn storage_properties_json_rejects_nul() {
+        let valid = HashMap::from([("owner".into(), "alice".into())]);
+        assert!(storage_properties_json(&valid).unwrap().contains("alice"));
+        let poisoned = HashMap::from([("owner".into(), "alice\0".into())]);
+        assert!(
+            storage_properties_json(&poisoned)
+                .unwrap_err()
+                .contains("NUL")
+        );
     }
 
     #[test]

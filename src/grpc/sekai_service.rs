@@ -27,7 +27,7 @@ mod semantic_retrieval_lifecycle;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
@@ -615,6 +615,14 @@ fn object_is_visible(
         && object_passes_marking(db, object, principals).unwrap_or(false)
 }
 
+fn map_direct_read_visibility_error(activated: bool, status: Status) -> Status {
+    if activated && status.code() == tonic::Code::PermissionDenied {
+        Status::not_found("not found")
+    } else {
+        status
+    }
+}
+
 /// Single-object read root: reserved kinds are observationally missing, tenant
 /// mismatches are missing, and ACL/team/marking failures stay fail-closed.
 fn require_visible_read_root(
@@ -731,6 +739,7 @@ fn list_objects_with_marking<F>(
     db: &RuntimeDb,
     filter: &domain::ListFilter,
     principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
     tenant_context: Option<&RequestEnterpriseContext>,
     resolve: F,
 ) -> Result<(Vec<domain::Object>, i32), Status>
@@ -757,10 +766,11 @@ where
         scan_filter.offset = scan_offset;
         scan_filter.limit = domain::MAX_LIST_LIMIT;
         let (page, principal_total) = db
-            .list_objects_with_total_for_principals(
+            .list_objects_with_total_for_policy_context(
                 &scan_filter,
                 &principal_refs,
                 RESERVED_GOVERNANCE_KINDS,
+                policy_context,
             )
             .map_err(Status::internal)?;
         if page.is_empty() {
@@ -4139,6 +4149,132 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         self.list_visible_objects(req).await
     }
+    async fn put_object_security_policy_revision(
+        &self,
+        req: Request<PutObjectSecurityPolicyRevisionRequest>,
+    ) -> Result<Response<PutObjectSecurityPolicyRevisionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
+            &input.canonical_policy_json,
+        )
+        .map_err(Status::invalid_argument)?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &policy.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &policy.namespace, true)?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let revision = self
+            .db
+            .put_object_security_policy(&policy, &actor, &input.idempotency_key, now_millis())
+            .map_err(map_object_security_error)?;
+        Ok(Response::new(PutObjectSecurityPolicyRevisionResponse {
+            revision: Some(to_proto_object_security_revision(&revision)),
+        }))
+    }
+
+    async fn get_object_security_policy_revision(
+        &self,
+        req: Request<GetObjectSecurityPolicyRevisionRequest>,
+    ) -> Result<Response<GetObjectSecurityPolicyRevisionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, false)?;
+        let revision = self
+            .db
+            .get_object_security_policy(&input.namespace, &input.revision_digest)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("not found"))?;
+        Ok(Response::new(GetObjectSecurityPolicyRevisionResponse {
+            revision: Some(to_proto_object_security_revision(&revision)),
+        }))
+    }
+
+    async fn activate_object_security_policies(
+        &self,
+        req: Request<ActivateObjectSecurityPoliciesRequest>,
+    ) -> Result<Response<ActivateObjectSecurityPoliciesResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, true)?;
+        let mut policies = BTreeMap::new();
+        for binding in input.policies {
+            if binding.kind.trim().is_empty()
+                || binding.revision_digest.trim().is_empty()
+                || policies
+                    .insert(binding.kind, binding.revision_digest)
+                    .is_some()
+            {
+                return Err(Status::invalid_argument(
+                    "each policy kind must appear exactly once",
+                ));
+            }
+        }
+        let actor = principals.first().cloned().unwrap_or_default();
+        let activation = self
+            .db
+            .activate_object_security_policies(
+                &input.namespace,
+                &policies,
+                &actor,
+                &input.idempotency_key,
+                now_millis(),
+            )
+            .map_err(map_object_security_error)?;
+        Ok(Response::new(ActivateObjectSecurityPoliciesResponse {
+            activation: Some(to_proto_object_security_activation(&activation)),
+        }))
+    }
+
+    async fn get_object_security_activation(
+        &self,
+        req: Request<GetObjectSecurityActivationRequest>,
+    ) -> Result<Response<GetObjectSecurityActivationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        check_team_namespace(&self.db, &principals, &input.namespace, false)?;
+        let activation = self
+            .db
+            .get_object_security_activation(&input.namespace)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("not found"))?;
+        Ok(Response::new(GetObjectSecurityActivationResponse {
+            activation: Some(to_proto_object_security_activation(&activation)),
+        }))
+    }
     async fn find_by_external_id(
         &self,
         req: Request<FindByExternalIdRequest>,
@@ -6926,6 +7062,52 @@ fn require_credential_admin(principals: &[String]) -> Result<(), Status> {
     Err(Status::permission_denied("credential admin required"))
 }
 
+fn map_object_security_error(error: String) -> Status {
+    if error.starts_with("object_security_idempotency_conflict")
+        || error.starts_with("object_security_activation_incomplete")
+        || error.starts_with("object_security_policy_not_found")
+        || error.starts_with("object_security_policy_invalid")
+    {
+        Status::failed_precondition(error)
+    } else if error.starts_with("invalid ") {
+        Status::invalid_argument(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn to_proto_object_security_revision(
+    revision: &crate::sekai::object_security::ObjectSecurityPolicyRevision,
+) -> ObjectSecurityPolicyRevision {
+    ObjectSecurityPolicyRevision {
+        namespace: revision.namespace.clone(),
+        kind: revision.kind.clone(),
+        revision_digest: revision.revision_digest.clone(),
+        canonical_policy_json: revision.canonical_policy_json.clone(),
+        created_by: revision.created_by.clone(),
+        created_at_ms: revision.created_at_ms,
+    }
+}
+
+fn to_proto_object_security_activation(
+    activation: &crate::sekai::object_security::ObjectSecurityActivation,
+) -> ObjectSecurityActivation {
+    ObjectSecurityActivation {
+        namespace: activation.namespace.clone(),
+        activation_id: activation.activation_id.clone(),
+        policies: activation
+            .policies
+            .iter()
+            .map(|(kind, revision_digest)| ObjectSecurityPolicyBinding {
+                kind: kind.clone(),
+                revision_digest: revision_digest.clone(),
+            })
+            .collect(),
+        activated_by: activation.activated_by.clone(),
+        activated_at_ms: activation.activated_at_ms,
+    }
+}
+
 fn credential_admin_actor(
     db: &RuntimeDb,
     req: &Request<impl std::any::Any>,
@@ -6943,6 +7125,27 @@ fn credential_admin_actor(
 }
 
 type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
+
+fn principal_policy_context(
+    req: &Request<impl std::any::Any>,
+) -> crate::sekai::object_security::PrincipalPolicyContext {
+    if let Some(context) = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return crate::sekai::object_security::PrincipalPolicyContext {
+            subjects: vec![context.principal.subject.clone()],
+            scopes: context.scopes.clone(),
+        }
+        .normalized();
+    }
+    // The community/insecure fallback remains explicit and carries no scopes.
+    crate::sekai::object_security::PrincipalPolicyContext {
+        subjects: caller_principals(req),
+        scopes: Vec::new(),
+    }
+    .normalized()
+}
 
 fn request_tenant_context(
     db: &RuntimeDb,
@@ -8483,6 +8686,95 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
+    #[test]
+    fn activated_direct_read_error_hides_only_permission_denials() {
+        assert_eq!(
+            map_direct_read_visibility_error(
+                false,
+                Status::permission_denied("legacy access denied")
+            )
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+        let hidden =
+            map_direct_read_visibility_error(true, Status::permission_denied("access denied"));
+        assert_eq!(hidden.code(), tonic::Code::NotFound);
+        assert_eq!(hidden.message(), "not found");
+        assert_eq!(
+            map_direct_read_visibility_error(true, Status::unavailable("storage unavailable"))
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
+        for (id, namespace, properties, acl_denied) in [
+            (
+                "activated-marked",
+                "activated-marking-ns",
+                HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "confidential".into(),
+                )]),
+                false,
+            ),
+            ("activated-acl", "activated-acl-ns", HashMap::new(), true),
+        ] {
+            let svc = service();
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: "document".into(),
+                    name: id.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties,
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+            if acl_denied {
+                grant_object_role(&svc, id, "bob", security::Role::Viewer);
+            }
+            let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+                contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION
+                    .into(),
+                namespace: namespace.into(),
+                kind: "document".into(),
+                rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                    operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                    predicates: vec![
+                        crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
+                    ],
+                }],
+            };
+            let revision = svc
+                .db
+                .put_object_security_policy(&policy, "root", &format!("put-{id}"), 1)
+                .unwrap();
+            svc.db
+                .activate_object_security_policies(
+                    namespace,
+                    &BTreeMap::from([("document".into(), revision.revision_digest)]),
+                    "root",
+                    &format!("activate-{id}"),
+                    2,
+                )
+                .unwrap();
+
+            let error = svc
+                .get_object(with_named_principal(
+                    GetObjectRequest { id: id.into() },
+                    "alice",
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::NotFound);
+            assert_eq!(error.message(), "not found");
+        }
+    }
+
     #[tokio::test]
     async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
         let svc = service();
@@ -8573,6 +8865,58 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn find_by_external_id_hides_activated_marking_denial_as_missing() {
+        let svc = service();
+        svc.db
+            .create_object(&domain::Object {
+                id: "artifact-activated-hidden".into(),
+                kind: "artifact".into(),
+                name: "secret".into(),
+                namespace: "ns".into(),
+                external_id: "artifact:activated-hidden".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "restricted".into(),
+                )]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "ns".into(),
+            kind: "artifact".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+        };
+        let revision = svc
+            .db
+            .put_object_security_policy(&policy, "root", "put-find-activated", 1)
+            .unwrap();
+        svc.db
+            .activate_object_security_policies(
+                "ns",
+                &BTreeMap::from([("artifact".into(), revision.revision_digest)]),
+                "root",
+                "activate-find-activated",
+                2,
+            )
+            .unwrap();
+        let err = svc
+            .find_by_external_id(with_named_principal(
+                FindByExternalIdRequest {
+                    external_id: "artifact:activated-hidden".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -9165,6 +9509,159 @@ mod tests {
 
         let stored = svc.db.get_object("cluster-1").unwrap().unwrap();
         assert!(!stored.properties.contains_key("child_count"));
+    }
+
+    #[tokio::test]
+    async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
+        let svc = service();
+        grant_schema_admin(&svc);
+        svc.create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "count_policy_children".into(),
+                pipeline: vec![
+                    PipelineStep {
+                        op: "self".into(),
+                        ..Default::default()
+                    },
+                    PipelineStep {
+                        op: "traverse".into(),
+                        relation: "contains".into(),
+                        ..Default::default()
+                    },
+                    PipelineStep {
+                        op: "aggregate".into(),
+                        func: "count".into(),
+                        r#as: "child_count".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+        svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "policy-cluster".into(),
+                properties: vec![PropertyDef {
+                    name: "child_count".into(),
+                    r#type: "computed".into(),
+                    compute_expr: "count_policy_children".into(),
+                    classification: "public".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap();
+
+        let namespace = "computed-policy";
+        for (id, kind, owner) in [
+            ("policy-cluster", "policy-cluster", "alice"),
+            ("allowed-child", "policy-component", "alice"),
+            ("denied-child", "policy-component", "bob"),
+        ] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: kind.into(),
+                    name: id.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties: HashMap::from([("owner".into(), owner.into())]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        for child in ["allowed-child", "denied-child"] {
+            svc.db
+                .create_link(&domain::Link {
+                    id: format!("policy-cluster->{child}"),
+                    from_id: "policy-cluster".into(),
+                    to_id: child.into(),
+                    relation: "contains".into(),
+                    created: 1,
+                })
+                .unwrap();
+        }
+
+        let allow_cluster = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: namespace.into(),
+            kind: "policy-cluster".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+        };
+        let owned_component = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: namespace.into(),
+            kind: "policy-component".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![
+                    crate::sekai::object_security::ObjectSecurityPredicate::SubjectEqualsProperty {
+                        property: "owner".into(),
+                    },
+                ],
+            }],
+        };
+        let cluster_revision = svc
+            .db
+            .put_object_security_policy(&allow_cluster, "root", "put-computed-cluster", 1)
+            .unwrap();
+        let component_revision = svc
+            .db
+            .put_object_security_policy(&owned_component, "root", "put-computed-component", 2)
+            .unwrap();
+        svc.db
+            .activate_object_security_policies(
+                namespace,
+                &BTreeMap::from([
+                    ("policy-cluster".into(), cluster_revision.revision_digest),
+                    (
+                        "policy-component".into(),
+                        component_revision.revision_digest,
+                    ),
+                ]),
+                "root",
+                "activate-computed-policy",
+                3,
+            )
+            .unwrap();
+
+        let got = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "policy-cluster".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(got.properties["child_count"], "1");
+
+        let listed = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "policy-cluster".into(),
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.objects[0].properties["child_count"], "1");
     }
 
     #[tokio::test]
@@ -12837,6 +13334,66 @@ mod tests {
             .work_unit
             .unwrap();
         assert_eq!(still_running.status, coordination::WORK_UNIT_STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn list_objects_without_filters_keeps_unactivated_namespace_compatibility() {
+        let svc = service();
+        for (id, namespace) in [
+            ("activated-list-object", "activated-list"),
+            ("legacy-list-object", "legacy-list"),
+        ] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: "document".into(),
+                    name: id.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "activated-list".into(),
+            kind: "document".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+        };
+        let revision = svc
+            .db
+            .put_object_security_policy(&policy, "root", "put-list-compat", 1)
+            .unwrap();
+        svc.db
+            .activate_object_security_policies(
+                "activated-list",
+                &BTreeMap::from([("document".into(), revision.revision_digest)]),
+                "root",
+                "activate-list-compat",
+                2,
+            )
+            .unwrap();
+
+        let response = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest { filter: None },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.total, 2);
+        assert!(
+            response
+                .objects
+                .iter()
+                .any(|object| object.id == "legacy-list-object")
+        );
     }
 
     #[tokio::test]
