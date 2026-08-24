@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::sekai::definition_proposal::{DefinitionProposal, DefinitionProposalMergeResult};
 use crate::sekai::json::contains_duplicate_object_keys;
 
 pub const MEMBER_CONTRACT_VERSION: &str = "sekai.definition-member/v1";
@@ -120,6 +121,18 @@ pub enum DefinitionWriteResult {
     },
     ApplyEdit {
         result: Box<DefinitionBranchEditResult>,
+    },
+    CreateProposal {
+        proposal: DefinitionProposal,
+    },
+    ApproveProposal {
+        proposal: DefinitionProposal,
+    },
+    MergeProposal {
+        result: Box<DefinitionProposalMergeResult>,
+    },
+    CloseProposal {
+        proposal: DefinitionProposal,
     },
 }
 
@@ -440,7 +453,7 @@ pub fn validate_revision_members(
     Ok(())
 }
 
-pub fn validate_digest(field: &str, digest: &str) -> Result<(), String> {
+pub(crate) fn validate_digest(field: &str, digest: &str) -> Result<(), String> {
     let Some(hex) = digest.strip_prefix("sha256:") else {
         return Err(format!("{field} must use sha256:<64 lowercase hex>"));
     };
@@ -454,7 +467,7 @@ pub fn validate_digest(field: &str, digest: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_namespace(namespace: &str) -> Result<(), String> {
+pub(crate) fn validate_namespace(namespace: &str) -> Result<(), String> {
     validate_identifier("namespace", namespace, MAX_DEFINITION_ID_BYTES)
 }
 
@@ -466,7 +479,11 @@ fn validate_member_identity(member_kind: &str, member_id: &str) -> Result<(), St
     validate_identifier("member_id", member_id, MAX_DEFINITION_ID_BYTES)
 }
 
-fn validate_identifier(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+pub(crate) fn validate_identifier(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
     if value.is_empty()
         || value.len() > max_bytes
         || value.trim() != value

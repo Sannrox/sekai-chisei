@@ -2,9 +2,9 @@
 
 Governed definition branches let an authorized schema author evolve one exact
 namespace-scoped definition revision without changing published definitions or
-runtime facts. The current contract is a persistence and concurrency
-foundation advertised at the experimental product tier; it does not yet
-publish, preview, compare, rebase, review, merge, or migrate a branch.
+runtime facts. The experimental product-tier contract now also publishes or
+rejects one pinned candidate through a proposal. It does not yet preview,
+compare, rebase, or migrate facts.
 
 ## Contract
 
@@ -40,6 +40,24 @@ every removal, sorted and deduplicated as one changed-member set.
 
 A competing writer that already advanced the head makes the request stale.
 The server does not automatically merge it.
+
+`CreateDefinitionProposal` pins the current published head as `base_digest`
+and the branch head as `candidate_digest`. Optional `eval_plan_digests` are
+frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
+enter the published member map. Creating a proposal does not move the
+published head.
+
+`ApproveDefinitionProposal` records a live approval on an open proposal.
+`MergeDefinitionProposal` rechecks that the published head still equals the
+pinned base, the branch head still equals the candidate, at least one
+approval exists, and named foreign digests are not members. It then
+compare-and-swaps the namespace published head and marks the candidate
+published in the same transaction. Interrupted merges leave the published
+head unchanged.
+
+`CloseDefinitionProposal` rejects an open proposal without moving the
+published head. `GetPublishedDefinitionRevision` returns the current
+published pointer.
 
 ## Content identity
 
@@ -92,16 +110,16 @@ its immutable revision and audit evidence.
 
 ## Current limits
 
-- No public registration or publication operation is part of this foundation.
-  Branch creation requires an existing published parent registered by a later
-  governed adoption path.
-- A branch cannot yet be rebased, proposed, approved, previewed, merged, or
-  archived.
+- Branch creation still requires an existing published parent. Tests and
+  adoption paths seed that parent; there is no implicit snapshot of legacy
+  mutable schema or ontology rows.
+- A branch cannot yet be rebased, previewed, archived, or used to migrate
+  runtime facts.
 - Revision differences and compatibility classifications are not inferred.
 - Runtime facts and source bindings remain attached to their existing type
   identities.
-- Existing mutable schema and ontology APIs remain separate legacy authoring
-  surfaces; branch creation never snapshots them implicitly.
+- Package identity is not a runtime grant. Evaluation-plan digests on a
+  proposal are frozen references, not a second merge protocol.
 
 See [ADR 0024](decisions/0024-governed-definition-branches.md) for the durable
 design and [the native protocol](../proto/sekai.proto) for exact messages.

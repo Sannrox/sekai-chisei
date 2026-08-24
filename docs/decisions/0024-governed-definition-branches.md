@@ -41,8 +41,9 @@ independently verifiable candidate.
    facts, source bindings, object identities, or mutable legacy definition
    rows.
 7. Rebase, deterministic differences, compatibility classification, isolated
-   preview, proposals, approvals, merge, branch archival, and fact migration
-   extend this branch/revision foundation through separate public contracts.
+   preview, branch archival, and fact migration extend this branch/revision
+   foundation through separate public contracts. Proposal, approval, and
+   published-head merge are the #683 publication contract.
 8. SQLite and reusable PostgreSQL advertise a branch surface only when they
    pass shared transactional and concurrency conformance.
 
