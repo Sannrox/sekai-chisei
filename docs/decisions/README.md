@@ -45,3 +45,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0022: Admit inbound records as plane-committed source batches](0022-source-batch-transactions.md)
 - [ADR 0023: Fence ordered source change feeds by synchronization generation](0023-generation-fenced-source-change-feeds.md)
 - [ADR 0024: Evolve governed definitions through branches with immutable revision history](0024-governed-definition-branches.md)
+- [ADR 0025: Enforce activated object security in storage queries](0025-storage-enforced-object-security.md)

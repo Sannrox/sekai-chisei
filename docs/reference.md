@@ -115,6 +115,9 @@ lives in the separate [research index](research/README.md).
 
 ## Security, classification, and federation
 
+- [Object security policy](object-security.md) — immutable policy revisions,
+  atomic namespace activation, storage-enforced direct reads and object lists,
+  and explicit unsupported follow-ups.
 - [Classification markings](classification-markings.md) — provisional
   markings and purpose constraints.
 - [Compliance export](compliance-export.md) — governed audit and residency

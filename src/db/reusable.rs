@@ -2,6 +2,7 @@
 
 use crate::db::definition_branch::POSTGRES_DEFINITION_BRANCH_SURFACE;
 use crate::db::graph::POSTGRES_GRAPH_SURFACES;
+use crate::db::object_security::POSTGRES_OBJECT_SECURITY_SURFACE;
 use crate::db::object_sync::POSTGRES_OBJECT_SYNC_SURFACE;
 use crate::runtime_backend::{
     BackendCapabilities, BackendIdentity, RUNTIME_BACKEND_CONTRACT_VERSION,
@@ -20,6 +21,7 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     "sekai.handoffs",
     "sekai.leases",
     "sekai.ontology-definitions",
+    POSTGRES_OBJECT_SECURITY_SURFACE,
     POSTGRES_OBJECT_SYNC_SURFACE,
     "sekai.retention",
     "sekai.scoped-content",

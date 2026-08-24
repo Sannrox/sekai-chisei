@@ -13,6 +13,7 @@ use crate::obs::signals;
 use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
 };
+use crate::sekai::object_security::PrincipalPolicyContext;
 
 pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
@@ -189,6 +190,7 @@ impl SekaiDb {
         self.migrate_audit()?;
         self.migrate_object_sync()?;
         self.migrate_definition_branches()?;
+        self.migrate_object_security()?;
         self.migrate_ledger()?;
         self.migrate_retention()?;
         self.migrate_attestations()?;
@@ -651,7 +653,7 @@ impl SekaiDb {
         if historical_changes > 0 {
             return Err("object IDs with audit history cannot be reused".into());
         }
-        let props = serde_json::to_string(&o.properties).unwrap_or_default();
+        let props = crate::domain::storage_properties_json(&o.properties)?;
         conn.execute(
             "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.created, o.updated],
@@ -666,6 +668,29 @@ impl SekaiDb {
             params![id],
             row_to_object,
         ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn get_object_with_policy_context(
+        &self,
+        id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Option<Object>, String> {
+        let context = context.clone().normalized();
+        let subjects =
+            serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
+        let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id=?1{}",
+                    sqlite_object_security_filter(1)
+                ),
+                params![id, subjects, scopes],
+                row_to_object,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
 
     pub fn update_object(&self, o: &Object) -> Result<(), String> {
@@ -705,7 +730,7 @@ impl SekaiDb {
         {
             crate::sekai::ontology::validate_object_kind_change(&tx, &o.id, &o.kind)?;
         }
-        let props = serde_json::to_string(&o.properties).unwrap_or_default();
+        let props = crate::domain::storage_properties_json(&o.properties)?;
         tx.execute(
             "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
             params![o.id, o.kind, o.name, o.namespace, o.external_id, props, o.updated],
@@ -861,6 +886,25 @@ impl SekaiDb {
             None,
             false,
             true,
+            None,
+        )
+    }
+
+    pub fn list_objects_with_total_for_policy_context(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_with_total_for_principals_and_markings(
+            filter,
+            principals,
+            excluded_kinds,
+            None,
+            false,
+            true,
+            Some(context),
         )
     }
 
@@ -883,6 +927,7 @@ impl SekaiDb {
             Some(allowed_markings),
             trusted,
             true,
+            None,
         )
     }
 
@@ -904,10 +949,12 @@ impl SekaiDb {
             Some(allowed_markings),
             trusted,
             false,
+            None,
         )
         .map(|(objects, _)| objects)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn list_objects_with_total_for_principals_and_markings(
         &self,
         filter: &ListFilter,
@@ -916,29 +963,14 @@ impl SekaiDb {
         allowed_markings: Option<&[&str]>,
         trusted: bool,
         include_total: bool,
+        policy_context: Option<&PrincipalPolicyContext>,
     ) -> Result<(Vec<Object>, i32), String> {
         let mut query = build_list_query(filter).map_err(|e| e.to_string())?;
         // Static (no-bind) exclusion of internal governance kinds so pagination
         // and totals are computed over the visible set. Kinds are internal
         // constants; a non-conforming kind fails the query closed rather than
         // being silently dropped (which would re-open the read-surface leak).
-        let kind_exclusion = if excluded_kinds.is_empty() {
-            String::new()
-        } else {
-            for kind in excluded_kinds {
-                if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    return Err(format!(
-                        "unsafe excluded kind {kind:?}: only ASCII alphanumeric and '_' allowed"
-                    ));
-                }
-            }
-            let quoted = excluded_kinds
-                .iter()
-                .map(|kind| format!("'{kind}'"))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(" AND kind NOT IN ({quoted})")
-        };
+        let kind_exclusion = crate::domain::excluded_kinds_sql("kind", excluded_kinds)?;
         // Keep visibility, marking, and order-by params disjoint to avoid
         // placeholder collisions for both list and count queries.
         let (visibility_filter, mut visibility_params) =
@@ -947,6 +979,9 @@ impl SekaiDb {
         let (marking_filter, mut marking_params) =
             build_marking_visibility_filter(allowed_markings, trusted, query.params.len());
         query.params.append(&mut marking_params);
+        let (policy_filter, mut policy_params) =
+            build_sqlite_object_security_filter(policy_context, query.params.len())?;
+        query.params.append(&mut policy_params);
         let order_sql = build_order_by_sql(
             filter.order_by.as_str(),
             filter.descending,
@@ -960,8 +995,8 @@ impl SekaiDb {
             filter.limit.min(MAX_LIST_LIMIT)
         };
         let mut list_sql = format!(
-            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}",
-            query.where_sql, visibility_filter, marking_filter, kind_exclusion
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects{}{}{}{}{}",
+            query.where_sql, visibility_filter, marking_filter, policy_filter, kind_exclusion
         );
         if let Some(order_sql) = order_sql.as_deref() {
             list_sql.push_str(order_sql);
@@ -973,23 +1008,26 @@ impl SekaiDb {
         ));
         query.params.push(Box::new(effective_limit));
         query.params.push(Box::new(filter.offset.max(0)));
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&list_sql).map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(
-                query
-                    .params
-                    .iter()
-                    .map(|v| v.as_ref())
-                    .collect::<Vec<&dyn rusqlite::types::ToSql>>()
-                    .as_slice(),
-                row_to_object,
-            )
-            .map_err(|e| e.to_string())?;
-        let objects: Vec<Object> = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let objects: Vec<Object> = {
+            let mut stmt = tx.prepare(&list_sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    query
+                        .params
+                        .iter()
+                        .map(|v| v.as_ref())
+                        .collect::<Vec<&dyn rusqlite::types::ToSql>>()
+                        .as_slice(),
+                    row_to_object,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
         if !include_total {
+            tx.commit().map_err(|e| e.to_string())?;
             return Ok((objects, 0));
         }
         let (count_visibility_filter, count_visibility_params) =
@@ -999,6 +1037,10 @@ impl SekaiDb {
             trusted,
             query.where_param_count + count_visibility_params.len(),
         );
+        let (count_policy_filter, count_policy_params) = build_sqlite_object_security_filter(
+            policy_context,
+            query.where_param_count + count_visibility_params.len() + count_marking_params.len(),
+        )?;
         let mut count_params: Vec<&dyn rusqlite::types::ToSql> = query
             .params
             .iter()
@@ -1010,15 +1052,24 @@ impl SekaiDb {
                 .iter()
                 .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
         );
-        let total = conn
+        let total = tx
             .query_row(
                 &format!(
-                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}",
-                    query.where_sql, count_visibility_filter, count_marking_filter, kind_exclusion
+                    "SELECT COUNT(*) FROM sekai_objects{}{}{}{}{}",
+                    query.where_sql,
+                    count_visibility_filter,
+                    count_marking_filter,
+                    count_policy_filter,
+                    kind_exclusion
                 ),
                 {
                     count_params.extend(
                         count_marking_params
+                            .iter()
+                            .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
+                    );
+                    count_params.extend(
+                        count_policy_params
                             .iter()
                             .map(|v| v.as_ref() as &dyn rusqlite::types::ToSql),
                     );
@@ -1027,6 +1078,7 @@ impl SekaiDb {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok((objects, total.min(i32::MAX as i64) as i32))
     }
 
@@ -1489,6 +1541,69 @@ fn build_marking_visibility_filter(
     }
     sql.push(')');
     (sql, params)
+}
+
+fn build_sqlite_object_security_filter(
+    context: Option<&PrincipalPolicyContext>,
+    start_param: usize,
+) -> Result<(String, Vec<Box<dyn rusqlite::types::ToSql>>), String> {
+    let Some(context) = context else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let context = context.clone().normalized();
+    let subjects = serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
+    let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+    Ok((
+        sqlite_object_security_filter(start_param),
+        vec![Box::new(subjects), Box::new(scopes)],
+    ))
+}
+
+fn sqlite_object_security_filter(start_param: usize) -> String {
+    let subjects = start_param + 1;
+    let scopes = start_param + 2;
+    format!(
+        " AND (
+            NOT EXISTS (
+                SELECT 1 FROM sekai_object_security_activations activation
+                WHERE activation.namespace = sekai_objects.namespace
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM sekai_object_security_active_policies active
+                JOIN sekai_object_security_rules rule
+                  ON rule.namespace=active.namespace
+                 AND rule.revision_digest=active.revision_digest
+                WHERE active.namespace=sekai_objects.namespace
+                  AND active.kind=sekai_objects.kind
+                  AND rule.operation='read'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sekai_object_security_predicates predicate
+                    WHERE predicate.namespace=rule.namespace
+                      AND predicate.revision_digest=rule.revision_digest
+                      AND predicate.rule_index=rule.rule_index
+                      AND CASE predicate.predicate_kind
+                        WHEN 'allow_all' THEN 0
+                        WHEN 'subject_equals_property' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(?{subjects}) subject
+                            WHERE subject.value=json_extract(
+                                sekai_objects.properties, '$.' || predicate.property_key
+                            )
+                        )
+                        WHEN 'required_scope_equals' THEN NOT EXISTS (
+                            SELECT 1 FROM json_each(?{scopes}) scope
+                            WHERE scope.value=predicate.fixed_value
+                        )
+                        WHEN 'property_equals' THEN
+                            COALESCE(json_extract(
+                                sekai_objects.properties, '$.' || predicate.property_key
+                            ), '') <> predicate.fixed_value
+                        ELSE 1
+                      END
+                  )
+            )
+        )"
+    )
 }
 
 fn build_property_filter_condition(

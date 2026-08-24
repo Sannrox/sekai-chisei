@@ -106,7 +106,7 @@ pub fn execute_with_filter<F>(
 where
     F: Fn(&Object) -> bool,
 {
-    execute_with_source_and_filter(db, f, params, None, allow)
+    execute_with_result_filter(db, f, params, |object| Ok(allow(object)))
 }
 
 pub fn execute_for_object_with_filter<F>(
@@ -119,10 +119,35 @@ pub fn execute_for_object_with_filter<F>(
 where
     F: Fn(&Object) -> bool,
 {
-    execute_with_source_and_filter(db, f, params, Some(source), allow)
+    execute_for_object_with_result_filter(db, f, source, params, |object| Ok(allow(object)))
 }
 
-fn execute_with_source_and_filter<F>(
+pub fn execute_with_result_filter<F>(
+    db: &RuntimeDb,
+    f: &Function,
+    params: &HashMap<String, String>,
+    allow: F,
+) -> Result<FunctionResult, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    execute_with_source_and_result_filter(db, f, params, None, allow)
+}
+
+pub fn execute_for_object_with_result_filter<F>(
+    db: &RuntimeDb,
+    f: &Function,
+    source: &Object,
+    params: &HashMap<String, String>,
+    allow: F,
+) -> Result<FunctionResult, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    execute_with_source_and_result_filter(db, f, params, Some(source), allow)
+}
+
+fn execute_with_source_and_result_filter<F>(
     db: &RuntimeDb,
     f: &Function,
     params: &HashMap<String, String>,
@@ -130,7 +155,7 @@ fn execute_with_source_and_filter<F>(
     allow: F,
 ) -> Result<FunctionResult, String>
 where
-    F: Fn(&Object) -> bool,
+    F: Fn(&Object) -> Result<bool, String>,
 {
     let mut objects: Vec<Object> = Vec::new();
     let mut result = FunctionResult::default();
@@ -138,11 +163,10 @@ where
     for step in &f.pipeline {
         match step.op.as_str() {
             "self" => {
-                objects = source
-                    .filter(|object| allow(object))
-                    .cloned()
-                    .into_iter()
-                    .collect();
+                objects = match source {
+                    Some(object) if allow(object)? => vec![object.clone()],
+                    _ => Vec::new(),
+                };
             }
             "filter" => {
                 let filter = crate::domain::ListFilter {
@@ -159,7 +183,7 @@ where
                             .unwrap_or(false)
                     });
                 }
-                filtered.retain(&allow);
+                retain_allowed(&mut filtered, &allow)?;
                 objects = filtered;
             }
             "traverse" => {
@@ -173,7 +197,7 @@ where
                     let linked = db.get_linked_objects(&obj.id, &step.relation, &dir)?;
                     next.extend(linked);
                 }
-                next.retain(&allow);
+                retain_allowed(&mut next, &allow)?;
                 objects = next;
             }
             "aggregate" => {
@@ -227,6 +251,20 @@ where
     }
     result.objects = objects;
     Ok(result)
+}
+
+fn retain_allowed<F>(objects: &mut Vec<Object>, allow: &F) -> Result<(), String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    let mut allowed = Vec::with_capacity(objects.len());
+    for object in objects.drain(..) {
+        if allow(&object)? {
+            allowed.push(object);
+        }
+    }
+    *objects = allowed;
+    Ok(())
 }
 
 fn resolve_param(value: &str, params: &HashMap<String, String>) -> String {
@@ -516,6 +554,12 @@ mod tests {
         let res =
             execute_for_object_with_filter(&db, &f, &source, &HashMap::new(), |_| true).unwrap();
         assert_eq!(res.aggregates["component_count"], "2");
+        let error =
+            execute_for_object_with_result_filter(&db, &f, &source, &HashMap::new(), |_| {
+                Err("policy unavailable".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "policy unavailable");
     }
 
     #[test]

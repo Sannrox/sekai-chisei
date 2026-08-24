@@ -2,18 +2,68 @@ use std::collections::HashMap;
 
 use crate::db::postgres::PostgresDb;
 use crate::domain::{
-    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, is_valid_property_key,
+    Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, excluded_kinds_sql,
+    is_valid_property_key, storage_properties_json,
 };
 use crate::sekai::lineage::{LineageEdge, LineageNode, LineageResult};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use postgres::IsolationLevel;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
 const LINK_COLUMNS: &str = "id, from_id, to_id, relation, created";
+const POSTGRES_PROPERTIES_UNUSABLE: &str = "sekai_jsonb_object(o.properties) IS NULL";
+
+fn postgres_stored_property_text(key_sql: &str) -> String {
+    format!("(sekai_jsonb_object(o.properties) ->> {key_sql})")
+}
+
+fn postgres_object_security_filter(subjects: &str, scopes: &str) -> String {
+    format!(
+        " AND (
+            NOT EXISTS (
+                SELECT 1 FROM sekai_object_security_activations activation
+                WHERE activation.namespace=o.namespace
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM sekai_object_security_active_policies active
+                JOIN sekai_object_security_rules rule
+                  ON rule.namespace=active.namespace
+                 AND rule.revision_digest=active.revision_digest
+                WHERE active.namespace=o.namespace
+                  AND active.kind=o.kind
+                  AND rule.operation='read'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM sekai_object_security_predicates predicate
+                    WHERE predicate.namespace=rule.namespace
+                      AND predicate.revision_digest=rule.revision_digest
+                      AND predicate.rule_index=rule.rule_index
+                      AND CASE
+                        WHEN {POSTGRES_PROPERTIES_UNUSABLE} THEN TRUE
+                        WHEN predicate.predicate_kind = 'allow_all' THEN FALSE
+                        WHEN predicate.predicate_kind = 'subject_equals_property' THEN NOT (
+                            COALESCE(
+                                sekai_jsonb_object(o.properties) ->> predicate.property_key, ''
+                            ) = ANY({subjects})
+                        )
+                        WHEN predicate.predicate_kind = 'required_scope_equals' THEN NOT (
+                            predicate.fixed_value = ANY({scopes})
+                        )
+                        WHEN predicate.predicate_kind = 'property_equals' THEN
+                            COALESCE(
+                                sekai_jsonb_object(o.properties) ->> predicate.property_key, ''
+                            ) <> predicate.fixed_value
+                        ELSE TRUE
+                      END
+                  )
+            )
+        )"
+    )
+}
 
 impl PostgresDb {
     pub fn create_object(&self, object: &Object) -> Result<(), String> {
-        let properties =
-            serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+        let properties = storage_properties_json(&object.properties)?;
         self.connection()?
             .execute(
                 "INSERT INTO sekai_objects
@@ -45,6 +95,26 @@ impl PostgresDb {
             .transpose()
     }
 
+    pub fn get_object_with_policy_context(
+        &self,
+        id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Option<Object>, String> {
+        let context = context.clone().normalized();
+        self.connection()?
+            .query_opt(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o
+                     WHERE o.id=$1{}",
+                    postgres_object_security_filter("$2", "$3")
+                ),
+                &[&id, &context.subjects, &context.scopes],
+            )
+            .map_err(|error| error.to_string())?
+            .map(row_to_object)
+            .transpose()
+    }
+
     pub fn update_object(&self, object: &Object) -> Result<(), String> {
         if self.update_object_with_existing(object)?.is_none() {
             return Err("not found".into());
@@ -53,8 +123,7 @@ impl PostgresDb {
     }
 
     pub fn update_object_with_existing(&self, object: &Object) -> Result<Option<Object>, String> {
-        let properties =
-            serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+        let properties = storage_properties_json(&object.properties)?;
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -146,7 +215,8 @@ impl PostgresDb {
     }
 
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
-        self.list_objects_query(filter, None).map(|result| result.0)
+        self.list_objects_query(filter, None, None, &[])
+            .map(|result| result.0)
     }
 
     pub fn list_objects_with_total_for_principals(
@@ -154,19 +224,35 @@ impl PostgresDb {
         filter: &ListFilter,
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
-        self.list_objects_query(filter, Some(principals))
+        self.list_objects_query(filter, Some(principals), None, &[])
+    }
+
+    pub fn list_objects_with_total_for_policy_context(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<(Vec<Object>, i32), String> {
+        self.list_objects_query(filter, Some(principals), Some(context), excluded_kinds)
     }
 
     fn list_objects_query(
         &self,
         filter: &ListFilter,
         principals: Option<&[&str]>,
+        policy_context: Option<&PrincipalPolicyContext>,
+        excluded_kinds: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
         let mut where_parts = Vec::new();
         let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = Vec::new();
         if let Some(kind) = &filter.kind {
             let parameter = push_text_param(&mut params, kind.clone());
             where_parts.push(format!("o.kind = {parameter}"));
+        }
+        let kind_exclusion = excluded_kinds_sql("o.kind", excluded_kinds)?;
+        if !kind_exclusion.is_empty() {
+            where_parts.push(kind_exclusion.trim_start_matches(" AND ").to_string());
         }
         if let Some(name) = &filter.name {
             let parameter = push_text_param(&mut params, name.clone());
@@ -227,6 +313,18 @@ impl PostgresDb {
                 ));
             }
         }
+        if let Some(context) = policy_context {
+            let context = context.clone().normalized();
+            params.push(Box::new(context.subjects));
+            let subjects = format!("${}", params.len());
+            params.push(Box::new(context.scopes));
+            let scopes = format!("${}", params.len());
+            where_parts.push(
+                postgres_object_security_filter(&subjects, &scopes)
+                    .trim_start_matches(" AND ")
+                    .to_string(),
+            );
+        }
         let where_sql = if where_parts.is_empty() {
             String::new()
         } else {
@@ -263,7 +361,7 @@ impl PostgresDb {
                     return Err("invalid property order key".into());
                 }
                 params.push(Box::new(key.to_string()));
-                let value = format!("o.properties::jsonb ->> ${}", params.len());
+                let value = postgres_stored_property_text(&format!("${}", params.len()));
                 let numeric = postgres_numeric_predicate(&value);
                 format!(
                     "CASE WHEN {value} IS NULL THEN 1 ELSE 0 END,
@@ -553,7 +651,7 @@ fn postgres_property_filter(
         }
         "contains" | "prefix" => {
             params.push(Box::new(filter.key.clone()));
-            let property = format!("o.properties::jsonb ->> ${}", params.len());
+            let property = postgres_stored_property_text(&format!("${}", params.len()));
             let suffix = if filter.op.eq_ignore_ascii_case("contains") {
                 "%"
             } else {
@@ -578,7 +676,7 @@ fn postgres_property_filter(
                 return Ok("FALSE".into());
             }
             params.push(Box::new(filter.key.clone()));
-            let property = format!("o.properties::jsonb ->> ${}", params.len());
+            let property = postgres_stored_property_text(&format!("${}", params.len()));
             params.push(Box::new(values));
             Ok(format!("{property} = ANY(${})", params.len()))
         }
@@ -610,7 +708,7 @@ fn push_property_comparison(
     params: &mut Vec<Box<dyn postgres::types::ToSql + Sync>>,
 ) -> (String, String) {
     params.push(Box::new(filter.key.clone()));
-    let property = format!("o.properties::jsonb ->> ${}", params.len());
+    let property = postgres_stored_property_text(&format!("${}", params.len()));
     params.push(Box::new(filter.value.clone()));
     let value = format!("${}", params.len());
     (property, value)

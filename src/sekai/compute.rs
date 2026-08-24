@@ -97,6 +97,18 @@ pub fn resolve_schema_computed_with_filter<F>(
 where
     F: Fn(&Object) -> bool,
 {
+    resolve_schema_computed_with_result_filter(obj, db, schema, |object| Ok(allow(object)))
+}
+
+pub fn resolve_schema_computed_with_result_filter<F>(
+    obj: &mut Object,
+    db: &RuntimeDb,
+    schema: &SchemaRegistry,
+    allow: F,
+) -> Result<(), String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
     let Some(object_type) = schema.get(&obj.kind) else {
         return Ok(());
     };
@@ -129,7 +141,7 @@ fn function_computed_value<F>(
     allow: &F,
 ) -> Result<Option<String>, String>
 where
-    F: Fn(&Object) -> bool,
+    F: Fn(&Object) -> Result<bool, String>,
 {
     let function = db
         .get_function(function_name)?
@@ -141,7 +153,8 @@ where
         ("namespace".to_string(), obj.namespace.clone()),
         ("external_id".to_string(), obj.external_id.clone()),
     ]);
-    let result = function::execute_for_object_with_filter(db, &function, obj, &params, allow)?;
+    let result =
+        function::execute_for_object_with_result_filter(db, &function, obj, &params, allow)?;
     if let Some(value) = result.aggregates.get(property_name) {
         return Ok(Some(value.clone()));
     }
@@ -161,15 +174,17 @@ fn fallback_computed_value<F>(
     allow: &F,
 ) -> Result<Option<String>, String>
 where
-    F: Fn(&Object) -> bool,
+    F: Fn(&Object) -> Result<bool, String>,
 {
     match (obj.kind.as_str(), property_name) {
         ("namespace", "component_count") => {
             let linked = db.get_linked_objects(&obj.id, "contains", &Direction::Outgoing)?;
-            let count = linked
-                .iter()
-                .filter(|object| object.kind == KIND_COMPONENT && allow(object))
-                .count();
+            let mut count = 0;
+            for object in linked.iter().filter(|object| object.kind == KIND_COMPONENT) {
+                if allow(object)? {
+                    count += 1;
+                }
+            }
             if count == 0 {
                 Ok(None)
             } else {

@@ -262,8 +262,7 @@ fn sqlite_update_object(
             &object.kind,
         )?;
     }
-    let properties =
-        serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+    let properties = crate::domain::storage_properties_json(&object.properties)?;
     let changed = transaction
         .execute(
             "UPDATE sekai_objects SET

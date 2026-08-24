@@ -42,6 +42,10 @@ use crate::sekai::function::Function;
 use crate::sekai::handoff::*;
 use crate::sekai::lease::{Lease, LeaseError};
 use crate::sekai::ledger::*;
+use crate::sekai::object_security::{
+    ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
+    PrincipalPolicyContext,
+};
 use crate::sekai::object_sync::{SourceBatch, SourceBatchResult, SourceSyncState};
 use crate::sekai::observation::{TaskObservation, TaskObservationBaseline, *};
 use crate::sekai::ontology::*;
@@ -86,6 +90,77 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    pub fn put_object_security_policy(
+        &self,
+        policy: &ObjectSecurityPolicy,
+        actor: &str,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<ObjectSecurityPolicyRevision, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.put_object_security_policy(policy, actor, idempotency_key, now_ms)
+            }
+            Self::Postgres(db) => {
+                db.put_object_security_policy(policy, actor, idempotency_key, now_ms)
+            }
+        }
+    }
+
+    pub fn get_object_security_policy(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+    ) -> Result<Option<ObjectSecurityPolicyRevision>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_security_policy(namespace, revision_digest),
+            Self::Postgres(db) => db.get_object_security_policy(namespace, revision_digest),
+        }
+    }
+
+    pub fn activate_object_security_policies(
+        &self,
+        namespace: &str,
+        policies: &BTreeMap<String, String>,
+        actor: &str,
+        idempotency_key: &str,
+        now_ms: i64,
+    ) -> Result<ObjectSecurityActivation, String> {
+        match self {
+            Self::Sqlite(db) => db.activate_object_security_policies(
+                namespace,
+                policies,
+                actor,
+                idempotency_key,
+                now_ms,
+            ),
+            Self::Postgres(db) => db.activate_object_security_policies(
+                namespace,
+                policies,
+                actor,
+                idempotency_key,
+                now_ms,
+            ),
+        }
+    }
+
+    pub fn get_object_security_activation(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<ObjectSecurityActivation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_security_activation(namespace),
+            Self::Postgres(db) => db.get_object_security_activation(namespace),
+        }
+    }
+
+    pub fn has_object_security_activations(&self) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.has_object_security_activations(),
+            Self::Postgres(db) => db.has_object_security_activations(),
+        }
+    }
+
     pub fn get_definition_revision(
         &self,
         namespace: &str,
@@ -451,6 +526,17 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_object(id),
             Self::Postgres(db) => db.get_object(id),
+        }
+    }
+
+    pub fn get_object_with_policy_context(
+        &self,
+        id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Option<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_with_policy_context(id, context),
+            Self::Postgres(db) => db.get_object_with_policy_context(id, context),
         }
     }
 
@@ -2781,6 +2867,29 @@ impl RuntimeDb {
                 let _ = excluded_kinds;
                 db.list_objects_with_total_for_principals(filter, principals)
             }
+        }
+    }
+
+    pub fn list_objects_with_total_for_policy_context(
+        &self,
+        filter: &ListFilter,
+        principals: &[&str],
+        excluded_kinds: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<(Vec<Object>, i32), String> {
+        match self {
+            Self::Sqlite(db) => db.list_objects_with_total_for_policy_context(
+                filter,
+                principals,
+                excluded_kinds,
+                context,
+            ),
+            Self::Postgres(db) => db.list_objects_with_total_for_policy_context(
+                filter,
+                principals,
+                excluded_kinds,
+                context,
+            ),
         }
     }
 

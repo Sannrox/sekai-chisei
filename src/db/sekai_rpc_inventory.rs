@@ -361,8 +361,16 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 103);
+        assert_eq!(inventory.entries.len(), 107);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
+            assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
+        }
+        for rpc in [
+            "PutObjectSecurityPolicyRevision",
+            "GetObjectSecurityPolicyRevision",
+            "ActivateObjectSecurityPolicies",
+            "GetObjectSecurityActivation",
+        ] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
         assert!(inventory.entry("ApplySourceBatch").is_some());

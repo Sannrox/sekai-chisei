@@ -7,8 +7,7 @@ const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties
 impl PostgresDb {
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
         validate_namespace_identity(object)?;
-        let properties =
-            serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+        let properties = crate::domain::storage_properties_json(&object.properties)?;
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -60,8 +59,7 @@ impl PostgresDb {
         expected_updated: i64,
     ) -> Result<Option<Object>, String> {
         validate_namespace_identity(object)?;
-        let properties =
-            serde_json::to_string(&object.properties).map_err(|error| error.to_string())?;
+        let properties = crate::domain::storage_properties_json(&object.properties)?;
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
