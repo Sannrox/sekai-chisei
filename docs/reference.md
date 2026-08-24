@@ -12,6 +12,9 @@ lives in the separate [research index](research/README.md).
   contract `1.0` for agents and SDKs, and HTTP
   `chisei.provider-capabilities/v1` for the gateway provider-profile matrix.
 - [Native gRPC protocol](../proto/) — service and message definitions.
+- [Bounded content execution](content-execution.md) — separate native
+  text/image/audio/document descriptors, transient payload verification, and
+  provider capability behavior.
 - [Sample observation readback](sample-observation-readback.md) — authenticated,
   redacted telemetry admission projection.
 - [SDK facade](../sdk/README.md) — generated-client layering and capability

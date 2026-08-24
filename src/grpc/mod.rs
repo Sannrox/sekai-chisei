@@ -244,6 +244,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ResolveInvariantSet"
             | "PlanExecution"
             | "ExecutePlanStream"
+            | "PlanContentExecution"
+            | "ExecuteContentPlanStream"
     )
 }
 

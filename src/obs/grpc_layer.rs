@@ -272,6 +272,8 @@ fn known_rpc(service: &str, method: &str) -> bool {
                 | "SetNamespacePolicy"
                 | "PlanExecution"
                 | "ExecutePlanStream"
+                | "PlanContentExecution"
+                | "ExecuteContentPlanStream"
                 | "ReportOperationEvent"
                 | "GetOperationReceipt"
                 | "GetSampleObservation"

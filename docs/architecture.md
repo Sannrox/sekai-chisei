@@ -93,6 +93,17 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both entry paths
 share the same policy, data, and audit layers.
 
+Ordered text, image, audio, and document inputs use the parallel
+`PlanContentExecution` and `ExecuteContentPlanStream` contract. The ordinary
+`ChatMessage` and text RPCs remain unchanged so an older server returns
+`UNIMPLEMENTED` instead of silently dropping content. Content planning reuses
+the native namespace, policy, routing, budget, evaluation, residency, privacy,
+egress, and receipt boundaries, while a separate principal-bound cache prevents
+content and text plan confusion. Hosts retain payload custody; resolved bytes
+are bounded, digest-verified immediately before provider disclosure, redacted
+from debug output, and excluded from durable provider-neutral state. See
+[Bounded content execution](content-execution.md).
+
 For fleet-managed native work, Gunshi is the outer allocation stage before
 `PlanExecution`. The request binds an exact, durably issued allocation;
 planning rejects modified allocations, stale policy revisions, conflicting

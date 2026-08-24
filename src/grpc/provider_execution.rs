@@ -9,6 +9,7 @@ use tonic::Status;
 use super::pb::chisei::{ChatMessage, ToolCall as ChiseiToolCall, ToolDef};
 use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
+use crate::content;
 use crate::db::runtime_db::RuntimeDb;
 use crate::llm;
 use crate::obs::correlation::Stage;
@@ -22,6 +23,16 @@ pub(super) struct ProviderExecutionRequest {
     pub(super) model: String,
     pub(super) system: String,
     pub(super) messages: Vec<ChatMessage>,
+    pub(super) tools: Vec<ToolDef>,
+    pub(super) max_tokens: i32,
+    pub(super) user_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProviderContentExecutionRequest {
+    pub(super) model: String,
+    pub(super) system: String,
+    pub(super) messages: Vec<content::ContentMessage>,
     pub(super) tools: Vec<ToolDef>,
     pub(super) max_tokens: i32,
     pub(super) user_id: Option<String>,
@@ -72,6 +83,139 @@ pub async fn execute_native_chat_request_stream(
         }),
     )
     .await
+}
+
+pub async fn execute_native_content_request_stream(
+    config: &Config,
+    budget: Arc<BudgetTracker>,
+    db: &RuntimeDb,
+    authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
+    request: ProviderContentExecutionRequest,
+) -> Result<ProviderExecutionStream, Status> {
+    let registry = refresh_provider_registry(config).await?;
+    let provider_name = registry
+        .resolve_model(&request.model)
+        .map(|resolved| resolved.provider)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let registry_state_path =
+        crate::provider_profile::provider_registry_state_path(&config.db_path);
+    let user_id = request
+        .user_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let estimated = estimate_content_request(&request);
+    let provider_credential = execution_provider_credential(
+        Some(ExecutionAuthentication {
+            db,
+            context: authenticated_context,
+        }),
+        &registry,
+        &request.model,
+    )?;
+    budget
+        .check_and_reserve(&user_id, estimated)
+        .map_err(Status::resource_exhausted)?;
+    let provider = match llm::resolve_with_registry_and_provider_credential(
+        &request.model,
+        &registry,
+        Some(&registry_state_path),
+        config.anthropic_api_key.as_deref(),
+        config.openai_api_key.as_deref(),
+        &config.ollama_url,
+        config.native_llm_url.as_deref(),
+        provider_credential
+            .as_ref()
+            .map(|credential| credential.secret.expose()),
+    ) {
+        Ok(provider) => provider,
+        Err(error) => {
+            budget.adjust(&user_id, estimated, 0);
+            return Err(Status::failed_precondition(error));
+        }
+    };
+    let domain_request = content::ContentChatRequest {
+        model: request.model,
+        system: request.system,
+        messages: request.messages,
+        tools: request
+            .tools
+            .iter()
+            .map(|tool| llm::ToolDef {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                input_schema: serde_json::from_str(&tool.input_schema_json)
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect(),
+        max_tokens: request.max_tokens,
+    };
+    let provider_span = info_span!(
+        "stage",
+        stage = Stage::ProviderRequest.as_str(),
+        provider = %provider_name,
+        streaming = true,
+        content_contract = content::CONTENT_CONTRACT_VERSION,
+        otel.kind = "client",
+    );
+    let stream = match provider
+        .content_chat_stream(&domain_request)
+        .instrument(provider_span)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            budget.adjust(&user_id, estimated, 0);
+            return Err(provider_error_status(error));
+        }
+    };
+    let budget_for_stream = budget.clone();
+    let (tx, rx) = mpsc::channel::<Result<ProviderExecutionChunk, Status>>(16);
+    let stream_span = info_span!(
+        "stage",
+        stage = Stage::ProviderRequest.as_str(),
+        provider = %provider_name,
+        streaming = true,
+        stream_consume = true,
+        content_contract = content::CONTENT_CONTRACT_VERSION,
+        otel.kind = "client",
+    );
+    tokio::spawn(
+        async move {
+            let mut stream = stream;
+            let mut last_tokens = 0;
+            while let Some(next) = stream.next().await {
+                match next {
+                    Ok(chunk) => {
+                        let actual_tokens = chunk
+                            .input_tokens
+                            .saturating_add(chunk.output_tokens)
+                            .saturating_add(chunk.cache_read_input_tokens)
+                            .saturating_add(chunk.cache_creation_input_tokens);
+                        if actual_tokens > 0 {
+                            last_tokens = actual_tokens;
+                        }
+                        let done = chunk.done;
+                        if tx.send(Ok(domain_chunk_to_execution(chunk))).await.is_err() {
+                            budget_for_stream.adjust(&user_id, estimated, last_tokens);
+                            return;
+                        }
+                        if done {
+                            budget_for_stream.adjust(&user_id, estimated, last_tokens);
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        budget_for_stream.adjust(&user_id, estimated, 0);
+                        let _ = tx.send(Err(Status::internal(error))).await;
+                        return;
+                    }
+                }
+            }
+            budget_for_stream.adjust(&user_id, estimated, last_tokens);
+        }
+        .instrument(stream_span),
+    );
+    Ok(Box::pin(ReceiverStream::new(rx)))
 }
 
 async fn execute_chat_request_stream_with_cache(
@@ -163,7 +307,8 @@ async fn execute_chat_request_stream_with_cache(
                         let done = chunk.done;
                         let execution_chunk = domain_chunk_to_execution(chunk);
                         if tx.send(Ok(execution_chunk)).await.is_err() {
-                            continue;
+                            budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
+                            return;
                         }
                         if done {
                             budget_for_stream.adjust(&user_id_for_stream, estimated, last_tokens);
@@ -415,6 +560,31 @@ pub fn estimate_chat_request(r: &ProviderExecutionRequest) -> i32 {
         .map(|t| ((t.name.len() + t.description.len() + t.input_schema_json.len()) as i32) / 4)
         .sum::<i32>();
     system_tokens + message_tokens + tool_defs_tokens + r.max_tokens
+}
+
+fn estimate_content_request(request: &ProviderContentExecutionRequest) -> i32 {
+    let bytes = request.system.len()
+        + request
+            .messages
+            .iter()
+            .map(|message| {
+                message.role.len()
+                    + message.tool_call_id.len()
+                    + message
+                        .parts
+                        .iter()
+                        .map(|part| part.descriptor.byte_length as usize)
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+        + request
+            .tools
+            .iter()
+            .map(|tool| tool.name.len() + tool.description.len() + tool.input_schema_json.len())
+            .sum::<usize>();
+    i32::try_from(bytes.div_ceil(4))
+        .unwrap_or(i32::MAX)
+        .saturating_add(request.max_tokens.max(0))
 }
 
 async fn refresh_provider_registry(

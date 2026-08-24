@@ -101,6 +101,70 @@ message ChatMessage {
   repeated ToolCall tool_calls = 4;
 }
 
+enum ContentPartKindV1 {
+  CONTENT_PART_KIND_V1_UNSPECIFIED = 0;
+  CONTENT_PART_KIND_V1_TEXT = 1;
+  CONTENT_PART_KIND_V1_IMAGE = 2;
+  CONTENT_PART_KIND_V1_AUDIO = 3;
+  CONTENT_PART_KIND_V1_DOCUMENT = 4;
+}
+
+enum ContentDisclosureStateV1 {
+  CONTENT_DISCLOSURE_STATE_V1_UNSPECIFIED = 0;
+  CONTENT_DISCLOSURE_STATE_V1_ACCEPTED = 1;
+  CONTENT_DISCLOSURE_STATE_V1_REDACTED = 2;
+  CONTENT_DISCLOSURE_STATE_V1_OMITTED = 3;
+}
+
+message ContentProvenanceV1 {
+  string source = 1;
+  string source_id = 2;
+  string source_version = 3;
+  int64 observed_at_ms = 4;
+}
+
+// Durable, provider-neutral metadata. Payload bytes are never stored here.
+message ContentPartDescriptorV1 {
+  string part_id = 1;
+  ContentPartKindV1 kind = 2;
+  string media_type = 3;
+  uint64 byte_length = 4;
+  string sha256_digest = 5;
+  string reference = 6;
+  ContentProvenanceV1 provenance = 7;
+  ContentDisclosureStateV1 disclosure_state = 8;
+  string disclosure_reason = 9;
+}
+
+// One-call payload. Implementations must bound and digest-check this value and
+// must not include it in logs, debug output, receipts, or durable storage.
+message ResolvedContentPartV1 {
+  ContentPartDescriptorV1 descriptor = 1;
+  oneof payload {
+    string text = 2;
+    bytes bytes = 3;
+  }
+}
+
+message ContentCapabilitiesV1 {
+  string contract_version = 1;
+  repeated ContentPartKindV1 input_kinds = 2;
+  repeated ContentPartKindV1 output_kinds = 3;
+  repeated string media_types = 4;
+  repeated string reference_modes = 5;
+  uint32 max_parts = 6;
+  uint64 max_part_bytes = 7;
+  uint64 max_aggregate_bytes = 8;
+  bool streaming = 9;
+}
+
+message ContentMessageV1 {
+  string role = 1;
+  repeated ContentPartDescriptorV1 parts = 2;
+  string tool_call_id = 3;
+  repeated ToolCall tool_calls = 4;
+}
+
 message ToolCall {
   string id = 1;
   string name = 2;
@@ -874,6 +938,51 @@ message ExecutePlanStreamEvent {
   int64 executed_at = 4;
 }
 
+// Content planning reuses the governed execution metadata but requires
+// ExecutionInput.messages to be empty. Ordered content lives only in the
+// parallel content_messages field so old text servers cannot silently drop it.
+message ContentExecutionInputV1 {
+  ExecutionInput execution = 1;
+  repeated ContentMessageV1 content_messages = 2;
+  ContentCapabilitiesV1 requested_capabilities = 3;
+  // Requested authority contract. The caller does not grant disclosure;
+  // Chisei reauthorizes states and binds its decision into the plan.
+  string disclosure_authority = 4;
+}
+
+message ContentExecutionPlanV1 {
+  ExecutionPlan execution = 1;
+  repeated ContentMessageV1 content_messages = 2;
+  ContentCapabilitiesV1 resolved_capabilities = 3;
+  string descriptor_digest = 4;
+}
+
+message PlanContentExecutionRequest {
+  ContentExecutionInputV1 input = 1;
+  GunshiAllocationBinding gunshi_allocation = 2;
+}
+
+message PlanContentExecutionResponse {
+  ContentExecutionPlanV1 plan = 1;
+}
+
+message ExecuteContentPlanRequest {
+  ContentExecutionPlanV1 plan = 1;
+  repeated ResolvedContentPartV1 resolved_parts = 2;
+}
+
+message ContentExecutionResponseV1 {
+  PlannedChatResponse response = 1;
+  repeated ContentPartDescriptorV1 output_parts = 2;
+}
+
+message ExecuteContentPlanStreamEvent {
+  string text_delta = 1;
+  ContentExecutionResponseV1 response = 2;
+  bool done = 3;
+  int64 executed_at = 4;
+}
+
 message OperationEvidenceReference {
   string kind = 1;
   string reference = 2;
@@ -1315,6 +1424,9 @@ service ChiseiService {
   rpc PlanExecution(PlanExecutionRequest) returns (PlanExecutionResponse);
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
+  // Parallel fail-closed content path. Older servers return UNIMPLEMENTED.
+  rpc PlanContentExecution(PlanContentExecutionRequest) returns (PlanContentExecutionResponse);
+  rpc ExecuteContentPlanStream(ExecuteContentPlanRequest) returns (stream ExecuteContentPlanStreamEvent);
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);

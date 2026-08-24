@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add a separate bounded native content contract for ordered text, image,
+  audio, and document descriptors. Content plans preserve the existing text
+  RPCs, authorize disclosure through Chisei policy, verify transient payload
+  bounds and digests before provider contact, and fail unsupported modalities
+  without text coercion.
 - Governed Action types can bind one admitted object kind and apply one
   create or update on `SubmitActionInstance`, sharing the caller `request_id`
   and optional `ontology_digest` receipt spine. Domain kinds stay in schemas

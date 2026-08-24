@@ -81,6 +81,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExecuteContentPlanStream",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "src/grpc/chisei_service/content_execution.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "ExecuteEvaluationManifest",
       "kind": "persistent",
       "surfaces": [
@@ -233,6 +247,25 @@
       ],
       "durable_dependencies": [],
       "product_tier": "experimental"
+    },
+    {
+      "rpc": "PlanContentExecution",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/chisei_service/content_execution.rs",
+        "tests/chisei_budget_backend_conformance.rs",
+        "src/db/postgres_budget.rs",
+        "tests/chisei_execution_backend_conformance.rs",
+        "src/db/postgres_chisei_receipts.rs",
+        "tests/chisei_policy_backend_conformance.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy",
+        "chisei.budget",
+        "chisei.execution"
+      ],
+      "product_tier": "core"
     },
     {
       "rpc": "PlanExecution",

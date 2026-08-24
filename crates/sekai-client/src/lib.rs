@@ -22,10 +22,15 @@ use hyper_util::rt::TokioIo;
 use prost::Message;
 pub use sekai_proto as protocol;
 pub use sekai_proto::chisei::{
-    ExecutePlanRequest, ExecutePlanStreamEvent, ExecutionInput, ExecutionPlan,
-    GetOperationReceiptRequest, GetOperationReceiptResponse, PlanExecutionRequest,
+    ContentCapabilitiesV1, ContentExecutionInputV1, ContentExecutionPlanV1, ContentMessageV1,
+    ContentPartDescriptorV1, ContentProvenanceV1, ExecuteContentPlanRequest,
+    ExecuteContentPlanStreamEvent, ExecutePlanRequest, ExecutePlanStreamEvent, ExecutionInput,
+    ExecutionPlan, GetOperationReceiptRequest, GetOperationReceiptResponse,
+    PlanContentExecutionRequest, PlanContentExecutionResponse, PlanExecutionRequest,
     PlanExecutionResponse, ReportOperationEventRequest, ReportOperationEventResponse,
+    ResolvedContentPartV1, resolved_content_part_v1,
 };
+use sha2::{Digest, Sha256};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
@@ -36,6 +41,9 @@ use uuid::Uuid;
 
 /// Version of the typed client contract, independent of the wire protocol.
 pub const SDK_CONTRACT_VERSION: &str = "sekai.sdk-core-loop/v1";
+pub const CONTENT_SDK_CONTRACT_VERSION: &str = "sekai.sdk-content-execution/v1";
+pub const CONTENT_CONTRACT_VERSION: &str = "chisei.content-execution/v1";
+pub const CONTENT_DISCLOSURE_AUTHORITY: &str = "chisei.policy/v1";
 
 /// The protocol package consumed by this crate. The generated source lives in
 /// `sekai-proto`; this crate intentionally does not carry a second snapshot.
@@ -64,6 +72,7 @@ pub const RESERVED_METADATA_KEYS: &[&str] = &[
 ];
 
 const PLAN_CAPABILITY: &str = "chisei.plan.execute";
+const CONTENT_CAPABILITY: &str = "chisei.content.execute";
 const EVENT_CAPABILITY: &str = "chisei.operation.report";
 const RECEIPT_CAPABILITY: &str = "chisei.receipt.read";
 const MAX_METADATA_VALUE_LENGTH: usize = 4096;
@@ -72,6 +81,9 @@ const DEFAULT_MAX_STREAM_EVENTS: usize = 1024;
 const DEFAULT_MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_EVENTS: usize = 100_000;
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTENT_PARTS: usize = 32;
+const MAX_CONTENT_PART_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONTENT_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Service identity retained in typed errors without exposing wire details.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,6 +570,35 @@ pub trait CoreLoopTransport: Send + Sync + 'static {
         request: Request<ExecutePlanRequest>,
     ) -> Result<Response<Self::Stream>, Status>;
 
+    async fn plan_content_execution(
+        &self,
+        _request: Request<PlanContentExecutionRequest>,
+    ) -> Result<Response<PlanContentExecutionResponse>, Status> {
+        Err(Status::unimplemented(
+            "bounded content execution is not implemented by this transport",
+        ))
+    }
+
+    async fn execute_content_plan_stream(
+        &self,
+        _request: Request<ExecuteContentPlanRequest>,
+    ) -> Result<
+        Response<
+            Pin<
+                Box<
+                    dyn Stream<Item = Result<ExecuteContentPlanStreamEvent, Status>>
+                        + Send
+                        + 'static,
+                >,
+            >,
+        >,
+        Status,
+    > {
+        Err(Status::unimplemented(
+            "bounded content execution is not implemented by this transport",
+        ))
+    }
+
     async fn report_operation_event(
         &self,
         request: Request<ReportOperationEventRequest>,
@@ -735,6 +776,38 @@ impl CoreLoopTransport for GrpcTransport {
             self.channel.clone(),
         );
         let response = client.execute_plan_stream(request).await?;
+        Ok(Response::new(Box::pin(response.into_inner())))
+    }
+
+    async fn plan_content_execution(
+        &self,
+        request: Request<PlanContentExecutionRequest>,
+    ) -> Result<Response<PlanContentExecutionResponse>, Status> {
+        let mut client = sekai_proto::chisei::chisei_service_client::ChiseiServiceClient::new(
+            self.channel.clone(),
+        );
+        client.plan_content_execution(request).await
+    }
+
+    async fn execute_content_plan_stream(
+        &self,
+        request: Request<ExecuteContentPlanRequest>,
+    ) -> Result<
+        Response<
+            Pin<
+                Box<
+                    dyn Stream<Item = Result<ExecuteContentPlanStreamEvent, Status>>
+                        + Send
+                        + 'static,
+                >,
+            >,
+        >,
+        Status,
+    > {
+        let mut client = sekai_proto::chisei::chisei_service_client::ChiseiServiceClient::new(
+            self.channel.clone(),
+        );
+        let response = client.execute_content_plan_stream(request).await?;
         Ok(Response::new(Box::pin(response.into_inner())))
     }
 
@@ -927,6 +1000,160 @@ where
                 return Err(identity.error(SdkErrorCode::DeadlineExceeded));
             }
             response = self.transport.execute_plan_stream(request) => response
+                .map_err(|status| identity.status_error(status)),
+        }?;
+        Ok(map_cancellable_stream(
+            response.into_inner(),
+            cancellation,
+            identity,
+            deadline,
+        ))
+    }
+
+    pub async fn plan_content_execution(
+        &self,
+        mut input: ContentExecutionInputV1,
+        options: CallOptions,
+    ) -> Result<ContentExecutionPlanV1, SdkError> {
+        validate_content_execution_input(&input)?;
+        let execution = input
+            .execution
+            .as_mut()
+            .ok_or_else(SdkError::invalid_argument)?;
+        let namespace = required_text("input.execution.namespace", &execution.namespace, 200)?;
+        let operation_id = execution
+            .logical_operation_id
+            .trim()
+            .is_empty()
+            .then(|| options.context.operation_id.clone())
+            .flatten()
+            .or_else(|| {
+                (!execution.logical_operation_id.trim().is_empty())
+                    .then(|| execution.logical_operation_id.clone())
+            })
+            .unwrap_or_else(new_id);
+        let mut options = self.call_options(
+            options,
+            Some(&namespace),
+            Some(CONTENT_CAPABILITY),
+            Some(&operation_id),
+        )?;
+        let input_request_id =
+            (!execution.request_id.trim().is_empty()).then(|| execution.request_id.clone());
+        if let (Some(option_request_id), Some(input_request_id)) =
+            (options.request_id.as_deref(), input_request_id.as_deref())
+            && option_request_id != input_request_id
+        {
+            return Err(SdkError::invalid_argument());
+        }
+        let request_id = options
+            .request_id
+            .clone()
+            .or(input_request_id)
+            .unwrap_or_else(new_id);
+        options.request_id = Some(request_id.clone());
+        execution.request_id = request_id;
+        if execution.logical_operation_id.trim().is_empty() {
+            execution.logical_operation_id = operation_id;
+        }
+        let response = self
+            .unary_call(
+                ServiceName::Chisei,
+                "PlanContentExecution",
+                PlanContentExecutionRequest {
+                    input: Some(input),
+                    gunshi_allocation: None,
+                },
+                options,
+                |transport, request| Box::pin(transport.plan_content_execution(request)),
+            )
+            .await?;
+        response
+            .plan
+            .ok_or_else(|| SdkError::new(SdkErrorCode::Internal))
+    }
+
+    pub async fn execute_content_plan_stream(
+        &self,
+        plan: ContentExecutionPlanV1,
+        resolved_parts: Vec<ResolvedContentPartV1>,
+        options: CallOptions,
+    ) -> Result<CancellableStream<ExecuteContentPlanStreamEvent>, SdkError> {
+        validate_content_execution_plan(&plan)?;
+        validate_resolved_content(&plan, &resolved_parts)?;
+        let execution = plan
+            .execution
+            .as_ref()
+            .ok_or_else(SdkError::invalid_argument)?;
+        let namespace = execution
+            .input
+            .as_ref()
+            .map(|input| input.namespace.as_str())
+            .filter(|value| !value.trim().is_empty());
+        let plan_operation_id = execution.input.as_ref().and_then(|input| {
+            (!input.logical_operation_id.trim().is_empty())
+                .then(|| input.logical_operation_id.clone())
+        });
+        if let (Some(option_operation_id), Some(plan_operation_id)) = (
+            options.context.operation_id.as_deref(),
+            plan_operation_id.as_deref(),
+        ) && option_operation_id != plan_operation_id
+        {
+            return Err(SdkError::invalid_argument());
+        }
+        let operation_id = options
+            .context
+            .operation_id
+            .clone()
+            .or(plan_operation_id)
+            .or_else(|| (!execution.plan_id.trim().is_empty()).then(|| execution.plan_id.clone()));
+        let mut options = self.call_options(
+            options,
+            namespace,
+            Some(CONTENT_CAPABILITY),
+            operation_id.as_deref(),
+        )?;
+        let plan_request_id = execution.input.as_ref().and_then(|input| {
+            (!input.request_id.trim().is_empty()).then(|| input.request_id.clone())
+        });
+        if let (Some(option_request_id), Some(plan_request_id)) =
+            (options.request_id.as_deref(), plan_request_id.as_deref())
+            && option_request_id != plan_request_id
+        {
+            return Err(SdkError::invalid_argument());
+        }
+        let request_id = options
+            .request_id
+            .clone()
+            .or(plan_request_id)
+            .unwrap_or_else(new_id);
+        options.request_id = Some(request_id.clone());
+        let timeout = self.call_timeout(&options)?;
+        let deadline = Instant::now() + timeout;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let cancellation = options.cancellation.clone().unwrap_or_default();
+        let metadata = self.build_metadata(&options, &request_id)?;
+        let mut request = Request::new(ExecuteContentPlanRequest {
+            plan: Some(plan),
+            resolved_parts,
+        });
+        *request.metadata_mut() = metadata;
+        request.set_timeout(remaining);
+        let identity = CallIdentity::new(
+            ServiceName::Chisei,
+            "ExecuteContentPlanStream",
+            &options,
+            &request_id,
+        );
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(identity.error(SdkErrorCode::Cancelled));
+            }
+            _ = tokio::time::sleep(remaining) => {
+                return Err(identity.error(SdkErrorCode::DeadlineExceeded));
+            }
+            response = self.transport.execute_content_plan_stream(request) => response
                 .map_err(|status| identity.status_error(status)),
         }?;
         Ok(map_cancellable_stream(
@@ -1485,6 +1712,228 @@ fn insert_metadata(metadata: &mut MetadataMap, key: &str, value: &str) -> Result
     Ok(())
 }
 
+fn validate_content_execution_input(input: &ContentExecutionInputV1) -> Result<(), SdkError> {
+    let execution = input
+        .execution
+        .as_ref()
+        .ok_or_else(SdkError::invalid_argument)?;
+    if !execution.messages.is_empty()
+        || input.disclosure_authority != CONTENT_DISCLOSURE_AUTHORITY
+        || input.content_messages.is_empty()
+    {
+        return Err(SdkError::invalid_argument());
+    }
+    let capabilities = input
+        .requested_capabilities
+        .as_ref()
+        .ok_or_else(SdkError::invalid_argument)?;
+    if capabilities.contract_version != CONTENT_CONTRACT_VERSION
+        || !capabilities.streaming
+        || capabilities.max_parts == 0
+        || capabilities.max_parts as usize > MAX_CONTENT_PARTS
+        || capabilities.max_part_bytes == 0
+        || capabilities.max_part_bytes > MAX_CONTENT_PART_BYTES
+        || capabilities.max_aggregate_bytes < capabilities.max_part_bytes
+        || capabilities.max_aggregate_bytes > MAX_CONTENT_AGGREGATE_BYTES
+        || capabilities.output_kinds != [1]
+        || capabilities.reference_modes != ["opaque"]
+    {
+        return Err(SdkError::invalid_argument());
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut aggregate = 0_u64;
+    let mut accepted = 0_usize;
+    let mut part_count = 0_usize;
+    for message in &input.content_messages {
+        if !matches!(message.role.as_str(), "user" | "assistant" | "tool") {
+            return Err(SdkError::invalid_argument());
+        }
+        for descriptor in &message.parts {
+            validate_content_descriptor(descriptor)?;
+            part_count = part_count.saturating_add(1);
+            if part_count > capabilities.max_parts as usize || part_count > MAX_CONTENT_PARTS {
+                return Err(SdkError::invalid_argument());
+            }
+            if !ids.insert(descriptor.part_id.as_str())
+                || descriptor.byte_length > capabilities.max_part_bytes
+                || !capabilities.input_kinds.contains(&descriptor.kind)
+                || !capabilities.media_types.contains(&descriptor.media_type)
+            {
+                return Err(SdkError::invalid_argument());
+            }
+            aggregate = aggregate
+                .checked_add(descriptor.byte_length)
+                .ok_or_else(SdkError::invalid_argument)?;
+            if aggregate > capabilities.max_aggregate_bytes {
+                return Err(SdkError::invalid_argument());
+            }
+            if descriptor.disclosure_state == 1 {
+                accepted += 1;
+            }
+        }
+    }
+    if accepted == 0 {
+        return Err(SdkError::invalid_argument());
+    }
+    Ok(())
+}
+
+fn validate_content_execution_plan(plan: &ContentExecutionPlanV1) -> Result<(), SdkError> {
+    let execution = plan
+        .execution
+        .as_ref()
+        .ok_or_else(SdkError::invalid_argument)?;
+    required_text("content plan id", &execution.plan_id, 200)?;
+    if plan.descriptor_digest.len() != 71
+        || !valid_sha256_digest(&plan.descriptor_digest)
+        || plan.content_messages.is_empty()
+        || plan.resolved_capabilities.is_none()
+    {
+        return Err(SdkError::invalid_argument());
+    }
+    for descriptor in plan
+        .content_messages
+        .iter()
+        .flat_map(|message| &message.parts)
+    {
+        validate_content_descriptor(descriptor)?;
+    }
+    Ok(())
+}
+
+fn validate_resolved_content(
+    plan: &ContentExecutionPlanV1,
+    resolved_parts: &[ResolvedContentPartV1],
+) -> Result<(), SdkError> {
+    let accepted = plan
+        .content_messages
+        .iter()
+        .flat_map(|message| &message.parts)
+        .filter(|descriptor| descriptor.disclosure_state == 1)
+        .map(|descriptor| (descriptor.part_id.as_str(), descriptor))
+        .collect::<std::collections::HashMap<_, _>>();
+    if resolved_parts.len() != accepted.len() {
+        return Err(SdkError::invalid_argument());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut aggregate = 0_u64;
+    for part in resolved_parts {
+        let descriptor = part
+            .descriptor
+            .as_ref()
+            .ok_or_else(SdkError::invalid_argument)?;
+        if accepted.get(descriptor.part_id.as_str()).copied() != Some(descriptor)
+            || !seen.insert(descriptor.part_id.as_str())
+        {
+            return Err(SdkError::invalid_argument());
+        }
+        let bytes = match (&part.payload, descriptor.kind) {
+            (Some(resolved_content_part_v1::Payload::Text(value)), 1) => value.as_bytes(),
+            (Some(resolved_content_part_v1::Payload::Bytes(value)), 2..=4) => value.as_slice(),
+            _ => return Err(SdkError::invalid_argument()),
+        };
+        if bytes.len() as u64 != descriptor.byte_length
+            || format!("sha256:{:x}", Sha256::digest(bytes)) != descriptor.sha256_digest
+        {
+            return Err(SdkError::invalid_argument());
+        }
+        aggregate = aggregate
+            .checked_add(descriptor.byte_length)
+            .ok_or_else(SdkError::invalid_argument)?;
+        if aggregate > MAX_CONTENT_AGGREGATE_BYTES {
+            return Err(SdkError::invalid_argument());
+        }
+    }
+    Ok(())
+}
+
+fn validate_content_descriptor(descriptor: &ContentPartDescriptorV1) -> Result<(), SdkError> {
+    required_text("content part id", &descriptor.part_id, 128)?;
+    if !matches!(descriptor.kind, 1..=4)
+        || descriptor.byte_length == 0
+        || descriptor.byte_length > MAX_CONTENT_PART_BYTES
+        || !valid_sha256_digest(&descriptor.sha256_digest)
+        || descriptor.provenance.is_none()
+        || !valid_opaque_reference(&descriptor.reference)
+        || !valid_content_media_type(descriptor.kind, &descriptor.media_type)
+        || !matches!(descriptor.disclosure_state, 1..=3)
+        || (descriptor.disclosure_state == 1 && !descriptor.disclosure_reason.trim().is_empty())
+    {
+        return Err(SdkError::invalid_argument());
+    }
+    if matches!(descriptor.disclosure_state, 2 | 3) {
+        required_text(
+            "content disclosure reason",
+            &descriptor.disclosure_reason,
+            512,
+        )?;
+    }
+    let provenance = descriptor.provenance.as_ref().expect("checked above");
+    required_text("content provenance source", &provenance.source, 256)?;
+    required_text("content provenance source id", &provenance.source_id, 256)?;
+    required_text(
+        "content provenance source version",
+        &provenance.source_version,
+        256,
+    )?;
+    Ok(())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
+}
+
+fn valid_opaque_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 256
+        && value == value.trim()
+        && !value.contains(char::is_whitespace)
+        && !value.contains(char::is_control)
+        && !value.contains('\\')
+        && !value.contains('?')
+        && !value.contains('#')
+        && !value.contains('@')
+        && !value.starts_with('/')
+        && !value.contains("://")
+        && !lower.starts_with("data:")
+        && !lower.starts_with("file:")
+        && !lower.contains("bearer")
+        && !lower.contains("token=")
+        && !lower.contains("key=")
+        && !lower.contains("secret=")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+}
+
+fn valid_content_media_type(kind: i32, value: &str) -> bool {
+    if value != value.trim().to_ascii_lowercase()
+        || value.contains(';')
+        || value.contains(char::is_whitespace)
+    {
+        return false;
+    }
+    match kind {
+        1 => matches!(value, "text/plain" | "text/markdown" | "application/json"),
+        2 => matches!(
+            value,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ),
+        3 => matches!(
+            value,
+            "audio/wav" | "audio/mpeg" | "audio/mp4" | "audio/ogg"
+        ),
+        4 => matches!(value, "application/pdf" | "text/plain" | "text/markdown"),
+        _ => false,
+    }
+}
+
 fn validate_text(name: &str, value: &str, max_length: usize) -> Result<String, SdkError> {
     if value.trim().is_empty()
         || value != value.trim()
@@ -1646,6 +2095,51 @@ mod tests {
             Ok(Response::new(Box::pin(stream::iter(events))))
         }
 
+        async fn plan_content_execution(
+            &self,
+            request: Request<PlanContentExecutionRequest>,
+        ) -> Result<Response<PlanContentExecutionResponse>, Status> {
+            self.record("PlanContentExecution", request.metadata());
+            let input = request
+                .into_inner()
+                .input
+                .ok_or_else(|| Status::invalid_argument("input required"))?;
+            let execution = input.execution.clone().unwrap_or_default();
+            Ok(Response::new(PlanContentExecutionResponse {
+                plan: Some(ContentExecutionPlanV1 {
+                    execution: Some(self.plan(execution)),
+                    content_messages: input.content_messages,
+                    resolved_capabilities: input.requested_capabilities,
+                    descriptor_digest: format!("sha256:{}", "0".repeat(64)),
+                }),
+            }))
+        }
+
+        async fn execute_content_plan_stream(
+            &self,
+            request: Request<ExecuteContentPlanRequest>,
+        ) -> Result<
+            Response<
+                Pin<
+                    Box<
+                        dyn Stream<Item = Result<ExecuteContentPlanStreamEvent, Status>>
+                            + Send
+                            + 'static,
+                    >,
+                >,
+            >,
+            Status,
+        > {
+            self.record("ExecuteContentPlanStream", request.metadata());
+            Ok(Response::new(Box::pin(stream::iter(vec![Ok(
+                ExecuteContentPlanStreamEvent {
+                    text_delta: "content-result".into(),
+                    done: true,
+                    ..Default::default()
+                },
+            )]))))
+        }
+
         async fn report_operation_event(
             &self,
             request: Request<ReportOperationEventRequest>,
@@ -1683,6 +2177,42 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LegacyTransport(FixtureTransport);
+
+    #[async_trait]
+    impl CoreLoopTransport for LegacyTransport {
+        type Stream = <FixtureTransport as CoreLoopTransport>::Stream;
+
+        async fn plan_execution(
+            &self,
+            request: Request<PlanExecutionRequest>,
+        ) -> Result<Response<PlanExecutionResponse>, Status> {
+            self.0.plan_execution(request).await
+        }
+
+        async fn execute_plan_stream(
+            &self,
+            request: Request<ExecutePlanRequest>,
+        ) -> Result<Response<Self::Stream>, Status> {
+            self.0.execute_plan_stream(request).await
+        }
+
+        async fn report_operation_event(
+            &self,
+            request: Request<ReportOperationEventRequest>,
+        ) -> Result<Response<ReportOperationEventResponse>, Status> {
+            self.0.report_operation_event(request).await
+        }
+
+        async fn get_operation_receipt(
+            &self,
+            request: Request<GetOperationReceiptRequest>,
+        ) -> Result<Response<GetOperationReceiptResponse>, Status> {
+            self.0.get_operation_receipt(request).await
+        }
+    }
+
     fn make_client(transport: FixtureTransport) -> CoreLoopClient<FixtureTransport> {
         let config = ClientConfig::for_injected("shikigami")
             .with_token("secret-token")
@@ -1690,6 +2220,201 @@ mod tests {
             .with_namespace("tenant-a")
             .with_catalog_version("catalog-v1");
         CoreLoopClient::new(config, transport).unwrap()
+    }
+
+    fn content_descriptor(
+        part_id: &str,
+        kind: i32,
+        media_type: &str,
+        payload: &[u8],
+    ) -> ContentPartDescriptorV1 {
+        ContentPartDescriptorV1 {
+            part_id: part_id.into(),
+            kind,
+            media_type: media_type.into(),
+            byte_length: payload.len() as u64,
+            sha256_digest: format!("sha256:{:x}", Sha256::digest(payload)),
+            reference: format!("fixture:{part_id}"),
+            provenance: Some(ContentProvenanceV1 {
+                source: "fixture".into(),
+                source_id: "mixed-content".into(),
+                source_version: "v1".into(),
+                observed_at_ms: 1,
+            }),
+            disclosure_state: 1,
+            disclosure_reason: String::new(),
+        }
+    }
+
+    fn mixed_content_input() -> (ContentExecutionInputV1, Vec<ResolvedContentPartV1>) {
+        let fixtures: [(&str, i32, &str, &[u8]); 4] = [
+            ("text-1", 1, "text/plain", b"hello"),
+            ("image-1", 2, "image/png", b"\x89PNG"),
+            ("audio-1", 3, "audio/wav", b"RIFF"),
+            ("document-1", 4, "application/pdf", b"%PDF"),
+        ];
+        let mut descriptors = fixtures
+            .iter()
+            .map(|(id, kind, media, payload)| content_descriptor(id, *kind, media, payload))
+            .collect::<Vec<_>>();
+        descriptors[2].disclosure_state = 2;
+        descriptors[2].disclosure_reason = "provider capability unavailable".into();
+        descriptors[3].disclosure_state = 3;
+        descriptors[3].disclosure_reason = "disclosure authority omitted payload".into();
+        let resolved = descriptors
+            .iter()
+            .zip(fixtures)
+            .filter(|(descriptor, _)| descriptor.disclosure_state == 1)
+            .map(
+                |(descriptor, (_, kind, _, payload))| ResolvedContentPartV1 {
+                    descriptor: Some(descriptor.clone()),
+                    payload: Some(if kind == 1 {
+                        resolved_content_part_v1::Payload::Text(
+                            String::from_utf8(payload.to_vec()).unwrap(),
+                        )
+                    } else {
+                        resolved_content_part_v1::Payload::Bytes(payload.to_vec())
+                    }),
+                },
+            )
+            .collect();
+        (
+            ContentExecutionInputV1 {
+                execution: Some(ExecutionInput {
+                    namespace: "tenant-a".into(),
+                    spec: "inspect mixed content".into(),
+                    ..Default::default()
+                }),
+                content_messages: vec![ContentMessageV1 {
+                    role: "user".into(),
+                    parts: descriptors,
+                    ..Default::default()
+                }],
+                requested_capabilities: Some(ContentCapabilitiesV1 {
+                    contract_version: CONTENT_CONTRACT_VERSION.into(),
+                    input_kinds: vec![1, 2, 3, 4],
+                    output_kinds: vec![1],
+                    media_types: vec![
+                        "text/plain".into(),
+                        "image/png".into(),
+                        "audio/wav".into(),
+                        "application/pdf".into(),
+                    ],
+                    reference_modes: vec!["opaque".into()],
+                    max_parts: 4,
+                    max_part_bytes: 1024,
+                    max_aggregate_bytes: 4096,
+                    streaming: true,
+                }),
+                disclosure_authority: CONTENT_DISCLOSURE_AUTHORITY.into(),
+            },
+            resolved,
+        )
+    }
+
+    #[tokio::test]
+    async fn content_facade_preserves_order_and_uses_distinct_capability() {
+        let transport = FixtureTransport::new();
+        let client = make_client(transport.clone());
+        let (input, resolved) = mixed_content_input();
+        let plan = client
+            .plan_content_execution(input, CallOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.content_messages[0]
+                .parts
+                .iter()
+                .map(|part| part.part_id.as_str())
+                .collect::<Vec<_>>(),
+            ["text-1", "image-1", "audio-1", "document-1"]
+        );
+        let mut events = client
+            .execute_content_plan_stream(plan, resolved, CallOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            events.next().await.unwrap().unwrap().text_delta,
+            "content-result"
+        );
+        let calls = transport.calls();
+        assert_eq!(
+            calls.iter().map(|call| call.method).collect::<Vec<_>>(),
+            ["PlanContentExecution", "ExecuteContentPlanStream"]
+        );
+        for call in calls {
+            assert_eq!(
+                call.metadata.get(CAPABILITY_METADATA).unwrap(),
+                CONTENT_CAPABILITY
+            );
+        }
+    }
+
+    #[test]
+    fn content_protocol_fixture_round_trips_stable_metadata() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/content_execution/v1.json"
+        ))
+        .unwrap();
+        let (input, _) = mixed_content_input();
+        assert_eq!(
+            fixture["contract_version"],
+            input
+                .requested_capabilities
+                .as_ref()
+                .unwrap()
+                .contract_version
+        );
+        assert_eq!(fixture["disclosure_authority"], input.disclosure_authority);
+        for (fixture_part, protocol_part) in fixture["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(&input.content_messages[0].parts)
+        {
+            assert_eq!(fixture_part["part_id"], protocol_part.part_id);
+            assert_eq!(fixture_part["media_type"], protocol_part.media_type);
+            assert_eq!(fixture_part["byte_length"], protocol_part.byte_length);
+            assert_eq!(fixture_part["sha256_digest"], protocol_part.sha256_digest);
+            assert_eq!(fixture_part["reference"], protocol_part.reference);
+            assert_eq!(
+                fixture_part["disclosure_reason"],
+                protocol_part.disclosure_reason
+            );
+        }
+        let encoded = input.encode_to_vec();
+        let decoded = ContentExecutionInputV1::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[tokio::test]
+    async fn content_validation_rejects_credentials_before_transport() {
+        let transport = FixtureTransport::new();
+        let client = make_client(transport.clone());
+        let (mut input, _) = mixed_content_input();
+        input.content_messages[0].parts[0].reference =
+            "https://example.test/item?token=secret".into();
+        let error = client
+            .plan_content_execution(input, CallOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, SdkErrorCode::InvalidArgument);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_transport_fails_content_rpc_as_unimplemented() {
+        let config = ClientConfig::for_injected("shikigami")
+            .with_token("secret-token")
+            .unwrap()
+            .with_namespace("tenant-a");
+        let client = CoreLoopClient::new(config, LegacyTransport(FixtureTransport::new())).unwrap();
+        let (input, _) = mixed_content_input();
+        let error = client
+            .plan_content_execution(input, CallOptions::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, SdkErrorCode::Unimplemented);
     }
 
     #[tokio::test]

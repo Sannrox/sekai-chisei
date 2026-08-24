@@ -1,0 +1,70 @@
+{
+  "contract_version": "chisei.content-execution/v1",
+  "disclosure_authority": "chisei.policy/v1",
+  "parts": [
+    {
+      "part_id": "text-1",
+      "kind": "text",
+      "media_type": "text/plain",
+      "byte_length": 5,
+      "sha256_digest": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "reference": "fixture:text-1",
+      "provenance": {
+        "source": "fixture",
+        "source_id": "mixed-content",
+        "source_version": "v1",
+        "observed_at_ms": 1
+      },
+      "disclosure_state": "accepted",
+      "disclosure_reason": ""
+    },
+    {
+      "part_id": "image-1",
+      "kind": "image",
+      "media_type": "image/png",
+      "byte_length": 4,
+      "sha256_digest": "sha256:0f4636c78f65d3639ece5a064b5ae753e3408614a14fb18ab4d7540d2c248543",
+      "reference": "fixture:image-1",
+      "provenance": {
+        "source": "fixture",
+        "source_id": "mixed-content",
+        "source_version": "v1",
+        "observed_at_ms": 1
+      },
+      "disclosure_state": "accepted",
+      "disclosure_reason": ""
+    },
+    {
+      "part_id": "audio-1",
+      "kind": "audio",
+      "media_type": "audio/wav",
+      "byte_length": 4,
+      "sha256_digest": "sha256:a40ff3d5900fb7698b8c865041347cb49eccedc8f93945f89629ad104aaecce4",
+      "reference": "fixture:audio-1",
+      "provenance": {
+        "source": "fixture",
+        "source_id": "mixed-content",
+        "source_version": "v1",
+        "observed_at_ms": 1
+      },
+      "disclosure_state": "redacted",
+      "disclosure_reason": "provider capability unavailable"
+    },
+    {
+      "part_id": "document-1",
+      "kind": "document",
+      "media_type": "application/pdf",
+      "byte_length": 4,
+      "sha256_digest": "sha256:315d429b7714cedb6ad04ac31240145257692630457f3c88253c5beceac76027",
+      "reference": "fixture:document-1",
+      "provenance": {
+        "source": "fixture",
+        "source_id": "mixed-content",
+        "source_version": "v1",
+        "observed_at_ms": 1
+      },
+      "disclosure_state": "omitted",
+      "disclosure_reason": "disclosure authority omitted payload"
+    }
+  ]
+}

@@ -3,6 +3,8 @@ use super::{
     MAX_PROVIDER_RESPONSE_BYTES, Provider, SamplingOptions, ToolCall, classify_reqwest_error,
     ensure_declared_response_size, read_bounded_response,
 };
+use crate::content::{ContentChatRequest, ContentKind, ResolvedPayload};
+use base64::Engine as _;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -103,6 +105,32 @@ impl Provider for OpenAI {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
+    }
+
+    async fn content_chat(&self, req: &ContentChatRequest) -> Result<ChatResponse, String> {
+        let body = content_chat_completions_body(req)?;
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let mut rb = self
+            .client
+            .post(&url)
+            .header("content-type", "application/json");
+        if !self.api_key.is_empty() {
+            rb = rb.header("authorization", format!("Bearer {}", self.api_key));
+        }
+        let resp = rb
+            .timeout(self.timeouts.request_timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error("openai content request", err))?;
+        let status = resp.status();
+        ensure_declared_response_size(resp.content_length(), "openai content response")?;
+        let body = read_bounded_response(resp, "openai content response").await?;
+        let text = String::from_utf8_lossy(&body);
+        if !status.is_success() {
+            return Err(format!("openai {}: {}", status, text));
+        }
+        parse_openai_chat_response(&text)
     }
 
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
@@ -315,6 +343,134 @@ fn chat_completions_body_with_sampling(
     body
 }
 
+fn content_chat_completions_body(req: &ContentChatRequest) -> Result<Value, String> {
+    let mut messages = Vec::new();
+    if !req.system.is_empty() {
+        messages.push(json!({"role": "system", "content": req.system}));
+    }
+    for message in &req.messages {
+        let mut value = json!({"role": message.role});
+        if message.role == "tool" {
+            if message.parts.len() != 1 || message.parts[0].descriptor.kind != ContentKind::Text {
+                return Err("OpenAI tool results support exactly one text content part".into());
+            }
+            let ResolvedPayload::Text(text) = &message.parts[0].payload else {
+                return Err("OpenAI tool result text payload required".into());
+            };
+            value["content"] = json!(text);
+            value["tool_call_id"] = json!(message.tool_call_id);
+        } else {
+            if message.parts.is_empty() && message.tool_calls.is_empty() {
+                return Err("OpenAI content message cannot be empty".into());
+            }
+            if !message.parts.is_empty() {
+                value["content"] = Value::Array(
+                    message
+                        .parts
+                        .iter()
+                        .map(|part| match (&part.descriptor.kind, &part.payload) {
+                            (ContentKind::Text, ResolvedPayload::Text(text)) => {
+                                Ok(json!({"type": "text", "text": text}))
+                            }
+                            (ContentKind::Image, ResolvedPayload::Bytes(bytes)) => {
+                                let encoded =
+                                    base64::engine::general_purpose::STANDARD.encode(bytes);
+                                Ok(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!(
+                                            "data:{};base64,{encoded}",
+                                            part.descriptor.media_type
+                                        )
+                                    }
+                                }))
+                            }
+                            (ContentKind::Audio | ContentKind::Document, _) => Err(
+                                "OpenAI content adapter does not support audio or document input",
+                            ),
+                            _ => Err("resolved content payload does not match its declared kind"),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            if !message.tool_calls.is_empty() {
+                value["tool_calls"] = json!(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.args.to_string(),
+                            }
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        messages.push(value);
+    }
+    let mut body = json!({
+        "model": outbound_model_name(&req.model),
+        "messages": messages,
+    });
+    if req.max_tokens > 0 {
+        body["max_tokens"] = json!(req.max_tokens);
+    }
+    if !req.tools.is_empty() {
+        body["tools"] = json!(
+            req.tools
+                .iter()
+                .map(|tool| json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(body)
+}
+
+fn parse_openai_chat_response(text: &str) -> Result<ChatResponse, String> {
+    let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let message = &value["choices"][0]["message"];
+    let content = message["content"].as_str().unwrap_or("").to_string();
+    let tool_calls = message["tool_calls"]
+        .as_array()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|call| ToolCall {
+                    id: call["id"].as_str().unwrap_or("").into(),
+                    name: call["function"]["name"].as_str().unwrap_or("").into(),
+                    args: serde_json::from_str(
+                        call["function"]["arguments"].as_str().unwrap_or("{}"),
+                    )
+                    .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ChatResponse {
+        content,
+        tool_calls,
+        input_tokens: value["usage"]["prompt_tokens"].as_i64().unwrap_or(0) as i32,
+        output_tokens: value["usage"]["completion_tokens"].as_i64().unwrap_or(0) as i32,
+        stop_reason: value["choices"][0]["finish_reason"]
+            .as_str()
+            .unwrap_or("stop")
+            .to_string(),
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    })
+}
+
 #[derive(Debug, Default)]
 struct OpenAiToolCallAssembly {
     id: String,
@@ -461,7 +617,12 @@ fn outbound_model_name(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAI, chat_completions_body_with_sampling, outbound_model_name, parse_openai_sse_event,
+        OpenAI, chat_completions_body_with_sampling, content_chat_completions_body,
+        outbound_model_name, parse_openai_sse_event,
+    };
+    use crate::content::{
+        ContentChatRequest, ContentDescriptor, ContentKind, ContentMessage, ContentProvenance,
+        DisclosureState, ResolvedContentPart, ResolvedPayload,
     };
     use crate::llm::{ChatRequest, HttpTimeouts, Provider, SamplingOptions};
     use axum::Router;
@@ -488,6 +649,98 @@ mod tests {
             max_tokens: 16,
             prompt_cache: Default::default(),
         }
+    }
+
+    fn content_part(
+        kind: ContentKind,
+        media_type: &str,
+        payload: ResolvedPayload,
+    ) -> ResolvedContentPart {
+        ResolvedContentPart {
+            descriptor: ContentDescriptor {
+                part_id: format!("{}-1", kind.modality()),
+                kind,
+                media_type: media_type.into(),
+                byte_length: payload.as_bytes().len() as u64,
+                sha256_digest: format!("sha256:{}", "0".repeat(64)),
+                reference: format!("fixture:{}", kind.modality()),
+                provenance: ContentProvenance {
+                    source: "fixture".into(),
+                    source_id: "provider-map".into(),
+                    source_version: "v1".into(),
+                    observed_at_ms: 1,
+                },
+                disclosure_state: DisclosureState::Accepted,
+                disclosure_reason: String::new(),
+            },
+            payload,
+        }
+    }
+
+    fn content_request(parts: Vec<ResolvedContentPart>) -> ContentChatRequest {
+        ContentChatRequest {
+            model: "openai/gpt-fixture".into(),
+            system: String::new(),
+            messages: vec![ContentMessage {
+                role: "user".into(),
+                parts,
+                tool_call_id: String::new(),
+                tool_calls: Vec::new(),
+            }],
+            tools: Vec::new(),
+            max_tokens: 16,
+        }
+    }
+
+    #[test]
+    fn content_body_maps_text_and_image_without_text_coercion() {
+        let body = content_chat_completions_body(&content_request(vec![
+            content_part(
+                ContentKind::Text,
+                "text/plain",
+                ResolvedPayload::Text("describe".into()),
+            ),
+            content_part(
+                ContentKind::Image,
+                "image/png",
+                ResolvedPayload::Bytes(b"png".to_vec()),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+        assert!(
+            body["messages"][0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn content_body_denies_audio_instead_of_coercing_it() {
+        let error = content_chat_completions_body(&content_request(vec![content_part(
+            ContentKind::Audio,
+            "audio/wav",
+            ResolvedPayload::Bytes(b"wav".to_vec()),
+        )]))
+        .unwrap_err();
+        assert!(error.contains("does not support audio or document"));
+    }
+
+    #[test]
+    fn content_body_omits_empty_assistant_content_only_for_tool_calls() {
+        let mut request = content_request(Vec::new());
+        assert!(content_chat_completions_body(&request).is_err());
+        request.messages[0].role = "assistant".into();
+        request.messages[0].tool_calls = vec![crate::llm::ToolCall {
+            id: "call-1".into(),
+            name: "lookup".into(),
+            args: json!({}),
+        }];
+        let body = content_chat_completions_body(&request).unwrap();
+        assert!(body["messages"][0].get("content").is_none());
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call-1");
     }
 
     #[test]
