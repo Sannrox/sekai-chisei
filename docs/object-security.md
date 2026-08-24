@@ -21,6 +21,14 @@ rule are ANDed:
 - `required_scope_equals` with a fixed scope;
 - `property_equals` with a validated key and fixed value.
 
+Rules name an operation. Seeing an object (`read`) does not grant mutation.
+Writes use `create`, `update`, and `delete` rules and reauthorize the locked
+current row plus the proposed object before commit. Traversal, linked-object
+reads, lineage, property search, and list pagination consume the same read
+relation. Synchronization uses `sync` rules. A `page_token` binds principal
+context, namespace, activation digest, query digest, and expiry; changed
+authority or policy rejects the cursor.
+
 Only the trusted authenticated context supplies subjects and scopes. Request
 metadata is not authority. SQLite and PostgreSQL apply policy in SQL before a
 direct row, `FindByExternalId`, or `ListObjects` total, ordering, filter,
@@ -37,12 +45,8 @@ changes an unactivated namespace's request shape.
 
 ## Unsupported follow-ups
 
-This slice does not authorize writes. Creates, updates, and deletes require
-transactional current/proposed-state reauthorization in a later slice.
 Policy namespace and kind identities stay ASCII tokens (`[A-Za-z0-9_.:/-]`).
 Open-taxonomy kinds with spaces or other characters cannot be activated until
-a later identity migration. Traversal, linked-object reads, property search,
-retrieval, export, synchronization, and action object resolution also require
-migration to the same storage-authorized relation. Pagination remains
-offset-based; cursors bound to principal context, namespace, policy revision,
-query digest, and expiry are not yet implemented.
+a later identity migration. The v1 predicate vocabulary is unchanged; operation
+context, entitlements, and additional operators remain out of scope. Property
+and value-instance grants remain later issues.

@@ -1175,12 +1175,87 @@ impl SekaiDb {
         Ok(inserted)
     }
 
+    pub fn create_link_with_authorized_endpoints(
+        &self,
+        l: &Link,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+        fail_if_exists: bool,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        require_authorized_link_endpoints(
+            &transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = ?1)",
+                params![l.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(!fail_if_exists);
+        }
+        crate::sekai::ontology::validate_link_constraint(
+            &transaction,
+            &l.from_id,
+            &l.to_id,
+            &l.relation,
+        )?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sekai_links (id, from_id, to_id, relation, created) VALUES (?1,?2,?3,?4,?5)",
+                params![l.id, l.from_id, l.to_id, l.relation, l.created],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
         let mut conn = self.conn();
         let transaction = conn.transaction().map_err(|e| e.to_string())?;
         transaction
             .execute("DELETE FROM sekai_links WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_link_with_authorized_endpoints(
+        &self,
+        id: &str,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction().map_err(|e| e.to_string())?;
+        require_authorized_link_endpoints(
+            &transaction,
+            expected_from,
+            expected_to,
+            from_generation,
+            to_generation,
+        )?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM sekai_links WHERE id = ?1 AND from_id = ?2 AND to_id = ?3",
+                params![id, expected_from.id, expected_to.id],
+            )
+            .map_err(|e| e.to_string())?;
+        if deleted != 1 {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -1323,6 +1398,47 @@ impl SekaiDb {
         }
         Ok(objects)
     }
+}
+
+fn require_authorized_link_endpoints(
+    conn: &Connection,
+    expected_from: &Object,
+    expected_to: &Object,
+    from_generation: Option<&str>,
+    to_generation: Option<&str>,
+) -> Result<(), String> {
+    crate::sekai::audit::require_sqlite_policy_generation(
+        conn,
+        &expected_from.namespace,
+        from_generation,
+    )?;
+    crate::sekai::audit::require_sqlite_policy_generation(
+        conn,
+        &expected_to.namespace,
+        to_generation,
+    )?;
+    let from = conn
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![expected_from.id],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    let to = conn
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![expected_to.id],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.to_string())?;
+    if !from.persisted_state_matches(expected_from) || !to.persisted_state_matches(expected_to) {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    Ok(())
 }
 
 pub(crate) fn row_to_object(row: &rusqlite::Row) -> rusqlite::Result<Object> {
@@ -2387,6 +2503,70 @@ mod tests {
             .get_links("r1", "contains", &Direction::Outgoing)
             .unwrap();
         assert_eq!(links.len(), 0);
+    }
+
+    #[test]
+    fn authorized_link_create_rejects_stale_endpoint_snapshot() {
+        let db = test_db();
+        let from = make_obj("r1", "namespace", "my-namespace");
+        let to = make_obj("c1", "component", "comp");
+        db.create_object(&from).unwrap();
+        db.create_object(&to).unwrap();
+        let mut stale = from.clone();
+        stale.name = "other".into();
+        let err = db
+            .create_link_with_authorized_endpoints(
+                &Link {
+                    id: "l1".into(),
+                    from_id: from.id.clone(),
+                    to_id: to.id.clone(),
+                    relation: "contains".into(),
+                    created: 1000,
+                },
+                &stale,
+                &to,
+                None,
+                None,
+                false,
+            )
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
+        db.create_link_with_authorized_endpoints(
+            &Link {
+                id: "l1".into(),
+                from_id: from.id.clone(),
+                to_id: to.id.clone(),
+                relation: "contains".into(),
+                created: 1000,
+            },
+            &from,
+            &to,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let mut changed = to.clone();
+        changed.name = "renamed".into();
+        db.update_object(&changed).unwrap();
+        let err = db
+            .delete_link_with_authorized_endpoints("l1", &from, &to, None, None)
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
+        db.update_object(&to).unwrap();
+        db.delete_link("l1").unwrap();
+        db.create_link(&Link {
+            id: "l1".into(),
+            from_id: to.id.clone(),
+            to_id: from.id.clone(),
+            relation: "contains".into(),
+            created: 1001,
+        })
+        .unwrap();
+        let err = db
+            .delete_link_with_authorized_endpoints("l1", &from, &to, None, None)
+            .unwrap_err();
+        assert_eq!(err, crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION);
     }
 
     #[test]

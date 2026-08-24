@@ -256,7 +256,7 @@ fn postgres_conflicting_updates_do_not_lose_a_revision() {
         candidate.updated = 11;
         std::thread::spawn(move || {
             barrier.wait();
-            db.update_object_with_audit_if_revision(&candidate, name, 10)
+            db.update_object_with_audit_if_revision(&candidate, name, 10, None, None)
         })
     });
     barrier.wait();

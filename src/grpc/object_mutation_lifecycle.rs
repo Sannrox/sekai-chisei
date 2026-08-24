@@ -90,6 +90,10 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
             LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+                .with_policy_context(principal_policy_context_from(
+                    &principals,
+                    tenant_context.as_ref(),
+                ))
                 .validate_guarded_mutation(GuardedMutationPrecondition {
                     key: &precondition.key,
                     lease_namespace: &precondition.namespace,
@@ -122,6 +126,14 @@ impl SekaiServiceImpl {
             .replay("create", &domain_object)
             .map_err(map_mutation_persistence_error)?
         {
+            enforce_object_operation_access(
+                &self.db,
+                &created,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Create,
+                &format!("guarded_create_object_replay:{}", created.id),
+            )?;
             let created =
                 self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
             return Ok(Response::new(GuardedCreateObjectResponse {
@@ -158,8 +170,18 @@ impl SekaiServiceImpl {
             )?;
             drop(schema);
         }
+        enforce_object_operation_access(
+            &self.db,
+            &domain_object,
+            &principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Create,
+            &format!("guarded_create_object:{}", domain_object.id),
+        )?;
+        let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let created = mutation
+            .with_policy_generation(&policy_generation)
             .create(&domain_object, actor, now_millis())
             .map_err(map_mutation_persistence_error)?;
         if created.kind == markings::PRINCIPAL_PROFILE_KIND {
@@ -210,6 +232,17 @@ impl SekaiServiceImpl {
             ));
         }
         let existing = self.db.get_object(&object.id).map_err(Status::internal)?;
+        if let Some(current) = &existing
+            && evaluate_active_object_policy(
+                &self.db,
+                current,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
+            )? == Some(false)
+        {
+            return Err(Status::not_found("not found"));
+        }
         if precondition.is_none() && existing.is_none() {
             return Err(Status::not_found("not found"));
         }
@@ -246,10 +279,12 @@ impl SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
         if let Some(existing) = &existing {
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 existing,
                 &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object:{}", existing.id),
             )?;
         }
@@ -262,6 +297,10 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
             LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+                .with_policy_context(principal_policy_context_from(
+                    &principals,
+                    tenant_context.as_ref(),
+                ))
                 .validate_guarded_mutation(GuardedMutationPrecondition {
                     key: &precondition.key,
                     lease_namespace: &precondition.namespace,
@@ -298,10 +337,12 @@ impl SekaiServiceImpl {
             .replay("update", &request_object)
             .map_err(map_mutation_persistence_error)?
         {
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 &updated,
                 &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object_replay:{}", updated.id),
             )?;
             let updated =
@@ -352,9 +393,26 @@ impl SekaiServiceImpl {
                 existing,
                 &domain_object,
             )?;
+            ensure_policy_driving_update_allowed(
+                &self.db,
+                &self.security,
+                existing,
+                &domain_object,
+                &principals,
+            )?;
         }
+        enforce_object_operation_access(
+            &self.db,
+            &domain_object,
+            &principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Update,
+            &format!("guarded_update_object_proposed:{}", domain_object.id),
+        )?;
+        let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let updated = mutation
+            .with_policy_generation(&policy_generation)
             .update(
                 &domain_object,
                 &request_object,
@@ -382,6 +440,20 @@ impl SekaiServiceImpl {
             require_authenticated(&principals)?;
         }
         let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
+        if let Some(current) = &expected
+            && evaluate_active_object_policy(
+                &self.db,
+                current,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Delete,
+            )? == Some(false)
+        {
+            if precondition.is_none() {
+                return Ok(Response::new(GuardedDeleteObjectResponse {}));
+            }
+            return Err(Status::not_found("not found"));
+        }
         if precondition.is_none() && expected.is_none() {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
         }
@@ -395,6 +467,10 @@ impl SekaiServiceImpl {
             )?;
             check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
             LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+                .with_policy_context(principal_policy_context_from(
+                    &principals,
+                    tenant_context.as_ref(),
+                ))
                 .validate_guarded_mutation(GuardedMutationPrecondition {
                     key: &precondition.key,
                     lease_namespace: &precondition.namespace,
@@ -413,10 +489,12 @@ impl SekaiServiceImpl {
                 true,
             )?;
             check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
-            enforce_object_marking_access(
+            enforce_object_operation_access(
                 &self.db,
                 existing,
                 &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Delete,
                 &format!("guarded_delete_object:{}", existing.id),
             )?;
             if existing.kind == markings::PRINCIPAL_PROFILE_KIND {
@@ -441,6 +519,10 @@ impl SekaiServiceImpl {
             }
         }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let policy_generation = expected
+            .as_ref()
+            .map(|object| object_security_generation(&self.db, &object.namespace))
+            .transpose()?;
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(&self.db),
             |precondition| {
@@ -455,6 +537,10 @@ impl SekaiServiceImpl {
                 )
             },
         );
+        let mutation = match policy_generation.as_deref() {
+            Some(generation) => mutation.with_policy_generation(generation),
+            None => mutation,
+        };
         mutation
             .delete(&input.id, expected.as_ref(), actor, now_millis())
             .map_err(map_mutation_persistence_error)?;

@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use postgres::{GenericClient, IsolationLevel, Row};
 
-use crate::db::object_sync::{ApplyError, PreparedBatch, PreparedRecord, validate_binding};
+use crate::db::object_sync::{
+    ApplyError, PreparedBatch, PreparedRecord, require_authorized_object_snapshot, validate_binding,
+};
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
 use crate::domain::Object;
@@ -53,6 +55,23 @@ impl PostgresDb {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_policy_generation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_source_batch_with_policy_generation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+    ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
             .map_err(|error| error.to_string())?;
@@ -66,7 +85,14 @@ impl PostgresDb {
         {
             OpenDisposition::Committed(result) => Ok(*result),
             OpenDisposition::Open => self
-                .commit_source_batch(batch, &prepared, authenticated_producer, now_ms)
+                .commit_source_batch(
+                    batch,
+                    &prepared,
+                    authenticated_producer,
+                    now_ms,
+                    expected_policy_generation,
+                    authorized_objects,
+                )
                 .map_err(|error| error.to_string()),
         }
     }
@@ -261,10 +287,18 @@ impl PostgresDb {
         prepared: &PreparedBatch,
         authenticated_producer: &str,
         now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
     ) -> Result<SourceBatchResult, ApplyError> {
         let mut connection = self.connection().map_err(ApplyError::storage)?;
         let mut transaction = connection.transaction()?;
         lock_batch_identities(&mut transaction, batch)?;
+        crate::db::postgres_audit::require_postgres_policy_generation(
+            &mut transaction,
+            &batch.namespace,
+            expected_policy_generation,
+        )
+        .map_err(ApplyError::storage)?;
         let stored = load_batch_by_key(
             &mut transaction,
             &batch.namespace,
@@ -335,9 +369,24 @@ impl PostgresDb {
             return Err(error);
         }
 
+        if let Some(authorized) = authorized_objects {
+            for expected in authorized {
+                let current = load_object(&mut transaction, &expected.id, true)?;
+                require_authorized_object_snapshot(
+                    current.as_ref(),
+                    Some(std::slice::from_ref(expected)),
+                    &expected.id,
+                )?;
+            }
+        }
         let mut record_results = Vec::with_capacity(prepared.records.len());
         for prepared_record in &prepared.records {
             let before = load_object(&mut transaction, &prepared_record.object.object_id, true)?;
+            require_authorized_object_snapshot(
+                before.as_ref(),
+                authorized_objects,
+                &prepared_record.object.object_id,
+            )?;
             transaction
                 .execute(
                     "DELETE FROM sekai_source_identities

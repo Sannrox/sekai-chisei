@@ -123,6 +123,7 @@ pub struct SekaiServiceImpl {
     gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
     site_id: String,
+    object_query_cursor_key: [u8; 32],
 }
 
 impl SekaiServiceImpl {
@@ -138,6 +139,9 @@ impl SekaiServiceImpl {
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
         let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
+        let object_query_cursor_key = db
+            .object_query_cursor_key()
+            .expect("initialize durable object query cursor key");
         Self {
             db,
             security,
@@ -145,6 +149,7 @@ impl SekaiServiceImpl {
             budget: None,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            object_query_cursor_key,
         }
     }
 
@@ -609,11 +614,154 @@ fn object_is_visible(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
 ) -> bool {
+    object_is_visible_for(
+        db,
+        security,
+        object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+    )
+}
+
+fn object_is_visible_for(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> bool {
     !is_reserved_governance_kind(&object.kind)
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
-        && object_passes_marking(db, object, principals).unwrap_or(false)
+        && object_passes_security_policy(db, object, principals, tenant_context, operation)
+            .unwrap_or(false)
+}
+
+fn object_security_generation(db: &RuntimeDb, namespace: &str) -> Result<String, Status> {
+    Ok(db
+        .get_object_security_activation(namespace)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?
+        .map(|activation| activation.activation_id)
+        .unwrap_or_else(|| "legacy".into()))
+}
+
+fn evaluate_active_object_policy(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> Result<Option<bool>, Status> {
+    match db.active_object_policy(&object.namespace, &object.kind) {
+        Ok(None) => Ok(None),
+        Ok(Some(policy)) => {
+            let context = principal_policy_context_from(principals, tenant_context);
+            Ok(Some(policy.allows(&context, object, operation)))
+        }
+        Err(error) if error.starts_with("object_security_denied") => Ok(Some(false)),
+        Err(_) => Err(Status::unavailable("object authorization unavailable")),
+    }
+}
+
+fn object_passes_security_policy(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> Result<bool, Status> {
+    if is_reserved_governance_kind(&object.kind) {
+        return object_passes_marking(db, object, principals);
+    }
+    match evaluate_active_object_policy(db, object, principals, tenant_context, operation)? {
+        Some(false) => Ok(false),
+        Some(true) => object_passes_marking(db, object, principals),
+        None => object_passes_marking(db, object, principals),
+    }
+}
+
+fn enforce_object_operation_access(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    operation_id: &str,
+) -> Result<markings::MarkingCheckResult, Status> {
+    if let Some(allowed) =
+        evaluate_active_object_policy(db, object, principals, tenant_context, operation)?
+    {
+        if !allowed {
+            return Err(Status::permission_denied("access denied"));
+        }
+        return enforce_object_marking_access(db, object, principals, operation_id);
+    }
+    enforce_object_marking_access(db, object, principals, operation_id)
+}
+
+fn ensure_policy_driving_update_allowed(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    before: &domain::Object,
+    after: &domain::Object,
+    principals: &[String],
+) -> Result<(), Status> {
+    let mut properties = std::collections::BTreeSet::<String>::new();
+    let mut saw_active_policy = false;
+    for (namespace, kind) in [
+        (before.namespace.as_str(), before.kind.as_str()),
+        (after.namespace.as_str(), after.kind.as_str()),
+    ] {
+        if let Some(policy) = db
+            .active_object_policy(namespace, kind)
+            .map_err(|_| Status::unavailable("object security policy unavailable"))?
+        {
+            saw_active_policy = true;
+            properties.extend(policy.policy_driving_properties());
+        }
+    }
+    if !saw_active_policy {
+        return Ok(());
+    }
+    if before.kind != after.kind || before.namespace != after.namespace {
+        return check_object_admin(db, security, before, principals);
+    }
+    let changes_policy_input = properties
+        .iter()
+        .any(|property| before.properties.get(property) != after.properties.get(property));
+    if !changes_policy_input {
+        return Ok(());
+    }
+    check_object_admin(db, security, before, principals)
+}
+
+fn check_object_admin(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    object: &domain::Object,
+    principals: &[String],
+) -> Result<(), Status> {
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return Ok(());
+    }
+    let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    if security.can_admin(&object.id, &refs) {
+        return Ok(());
+    }
+    let memberships = team_namespace_memberships(db, principals)?;
+    if memberships
+        .iter()
+        .any(|(namespace, role)| namespace == &object.namespace && *role == security::Role::Admin)
+    {
+        return Ok(());
+    }
+    Err(Status::permission_denied("admin access denied"))
 }
 
 fn map_direct_read_visibility_error(activated: bool, status: Status) -> Status {
@@ -641,6 +789,19 @@ fn require_visible_read_root(
         .map_err(|_| Status::not_found("not found"))?;
     check_team_namespace(db, principals, &object.namespace, false)?;
     check_read(security, &object.id, principals)?;
+    if let Some(allowed) = evaluate_active_object_policy(
+        db,
+        &object,
+        principals,
+        tenant_context,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
+    )
+    .map_err(|_| Status::not_found("not found"))?
+    {
+        if !allowed {
+            return Err(Status::not_found("not found"));
+        }
+    }
     let marking = enforce_object_marking_access(db, &object, principals, operation_id)?;
     Ok((object, marking))
 }
@@ -930,32 +1091,6 @@ fn validate_object_kind_change_access(
         }
     }
     Ok(())
-}
-
-fn check_object_admin(
-    db: &RuntimeDb,
-    security: &SecurityChecker,
-    object: &domain::Object,
-    principals: &[String],
-) -> Result<(), Status> {
-    if principals
-        .iter()
-        .any(|principal| matches!(principal.as_str(), "root" | "local"))
-    {
-        return Ok(());
-    }
-    let refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
-    if security.can_admin(&object.id, &refs) {
-        return Ok(());
-    }
-    let memberships = team_namespace_memberships(db, principals)?;
-    if memberships
-        .iter()
-        .any(|(namespace, role)| namespace == &object.namespace && *role == security::Role::Admin)
-    {
-        return Ok(());
-    }
-    Err(Status::permission_denied("admin access denied"))
 }
 
 fn check_object_namespace_access(
@@ -1707,7 +1842,9 @@ fn check_ontology_relation_read(
 }
 
 fn map_graph_mutation_error(error: String) -> Status {
-    if error == "link endpoints violate ontology constraint" {
+    if error == "link endpoints violate ontology constraint"
+        || error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION
+    {
         Status::failed_precondition(error)
     } else {
         Status::internal(error)
@@ -2523,6 +2660,9 @@ fn map_mutation_persistence_error(error: MutationPersistenceError) -> Status {
         MutationPersistenceError::Graph(error) => map_graph_mutation_error(error),
         MutationPersistenceError::Lease(error) => map_lease_error(error),
         MutationPersistenceError::NotFound => Status::not_found("not found"),
+        MutationPersistenceError::ChangedSinceAuthorization => {
+            Status::failed_precondition(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION)
+        }
     }
 }
 
@@ -3571,6 +3711,86 @@ fn ensure_authoritative_source_result(
     Ok(())
 }
 
+fn authorize_source_batch_object_policy(
+    db: &RuntimeDb,
+    batch: &crate::sekai::object_sync::SourceBatch,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<Vec<domain::Object>, Status> {
+    let context = principal_policy_context_from(principals, tenant_context);
+    let mut authorized = Vec::new();
+    for record in &batch.records {
+        let source_id = record.source_id();
+        for existing in db
+            .find_all_by_external_id(&source_id)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?
+        {
+            if existing.namespace != batch.namespace {
+                continue;
+            }
+            match db.active_object_policy(&existing.namespace, &existing.kind) {
+                Ok(None) => {}
+                Ok(Some(policy)) => {
+                    if !policy.allows(
+                        &context,
+                        &existing,
+                        crate::sekai::object_security::ObjectSecurityOperation::Sync,
+                    ) {
+                        return Err(Status::permission_denied("access denied"));
+                    }
+                }
+                Err(error) if error.starts_with("object_security_denied") => {
+                    return Err(Status::permission_denied("access denied"));
+                }
+                Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+            }
+            authorized.push(existing);
+        }
+        let mut properties = record
+            .properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        properties.insert("sync_source".into(), record.source.clone());
+        properties.insert(
+            "sync_source_instance".into(),
+            record.source_instance.clone(),
+        );
+        properties.insert("sync_source_id".into(), source_id.clone());
+        properties.insert("sync_source_version".into(), record.source_version.clone());
+        properties.insert("sync_payload_digest".into(), record.payload_digest.clone());
+        properties.insert("sync_type_digest".into(), batch.type_digest.clone());
+        properties.insert("sync_tombstoned".into(), record.deleted.to_string());
+        let object = domain::Object {
+            id: source_id.clone(),
+            kind: record.type_name.clone(),
+            name: record.display_name.clone(),
+            namespace: batch.namespace.clone(),
+            external_id: source_id,
+            properties,
+            created: 1,
+            updated: 1,
+        };
+        match db.active_object_policy(&object.namespace, &object.kind) {
+            Ok(None) => {}
+            Ok(Some(policy)) => {
+                if !policy.allows(
+                    &context,
+                    &object,
+                    crate::sekai::object_security::ObjectSecurityOperation::Sync,
+                ) {
+                    return Err(Status::permission_denied("access denied"));
+                }
+            }
+            Err(error) if error.starts_with("object_security_denied") => {
+                return Err(Status::permission_denied("access denied"));
+            }
+            Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+        }
+    }
+    Ok(authorized)
+}
+
 fn map_source_sync_apply_error(error: String) -> Status {
     let code = error
         .split_once(':')
@@ -3592,6 +3812,9 @@ fn map_source_sync_apply_error(error: String) -> Status {
         | "open_transaction_conflict"
         | "overlapping_range"
         | "missing_range" => Status::aborted("source checkpoint conflict"),
+        "object_changed_since_authorization" => {
+            Status::failed_precondition(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION)
+        }
         "batch_aborted"
         | "inactive_binding"
         | "binding_source_conflict"
@@ -3689,6 +3912,10 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .with_policy_context(principal_policy_context_from(
+                &principals,
+                tenant_context.as_ref(),
+            ))
             .acquire(AcquireLeaseCommand {
                 namespace: &input.namespace,
                 key: &input.key,
@@ -3721,6 +3948,10 @@ impl SekaiService for SekaiServiceImpl {
         )?;
         check_team_namespace(&self.db, &principals, &input.namespace, false)?;
         let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .with_policy_context(principal_policy_context_from(
+                &principals,
+                tenant_context.as_ref(),
+            ))
             .get(GetLeaseCommand {
                 namespace: &input.namespace,
                 key: &input.key,
@@ -3749,6 +3980,10 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .with_policy_context(principal_policy_context_from(
+                &principals,
+                tenant_context.as_ref(),
+            ))
             .refresh(RefreshLeaseCommand {
                 namespace: &input.namespace,
                 key: &input.key,
@@ -3782,6 +4017,10 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .with_policy_context(principal_policy_context_from(
+                &principals,
+                tenant_context.as_ref(),
+            ))
             .release(ReleaseLeaseCommand {
                 namespace: &input.namespace,
                 key: &input.key,
@@ -3814,6 +4053,10 @@ impl SekaiService for SekaiServiceImpl {
         check_team_namespace(&self.db, &principals, &input.namespace, true)?;
         let actor = principals.first().cloned().unwrap_or_default();
         let lease = LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            .with_policy_context(principal_policy_context_from(
+                &principals,
+                tenant_context.as_ref(),
+            ))
             .takeover_expired(TakeoverExpiredLeaseCommand {
                 namespace: &input.namespace,
                 key: &input.key,
@@ -3855,9 +4098,22 @@ impl SekaiService for SekaiServiceImpl {
         }
         let mut batch = from_proto_source_batch(proto)?;
         batch.producer_identity = principal.clone();
+        let authorized_objects = authorize_source_batch_object_policy(
+            &self.db,
+            &batch,
+            &principals,
+            tenant_context.as_ref(),
+        )?;
+        let policy_generation = object_security_generation(&self.db, &batch.namespace)?;
         let result = self
             .db
-            .apply_source_batch(&batch, &principal, now_millis())
+            .apply_source_batch_with_policy_generation(
+                &batch,
+                &principal,
+                now_millis(),
+                Some(&policy_generation),
+                Some(&authorized_objects),
+            )
             .map_err(map_source_sync_apply_error)?;
         ensure_authoritative_source_result(&result)?;
         Ok(Response::new(ApplySourceBatchResponse {
@@ -6944,6 +7200,16 @@ impl SekaiService for SekaiServiceImpl {
                     false,
                 )
                 .map_err(|_| Status::not_found("not found"))?;
+                if evaluate_active_object_policy(
+                    &self.db,
+                    object,
+                    &principals,
+                    tenant_context.as_ref(),
+                    crate::sekai::object_security::ObjectSecurityOperation::Read,
+                )? == Some(false)
+                {
+                    return Err(Status::not_found("not found"));
+                }
                 enforce_object_marking_access(
                     &self.db,
                     object,
@@ -6954,10 +7220,26 @@ impl SekaiService for SekaiServiceImpl {
             None if tenant_context.is_some() => {
                 return Err(Status::not_found("not found"));
             }
-            // Without a live object we cannot reconstruct access_marking.
-            // Residual: ACL-only for orphan history until tombstones retain
-            // access_marking (documented residual risk).
-            None => {}
+            None => {
+                // Deleted rows cannot be re-evaluated against the live object.
+                // If the inferred namespace is activated, refuse rather than
+                // leak field history under ACL-only residual access.
+                let activated = match self.db.object_change_namespace(&inner.object_id) {
+                    Ok(Some(namespace)) => self
+                        .db
+                        .get_object_security_activation(&namespace)
+                        .map_err(|_| Status::unavailable("object authorization unavailable"))?
+                        .is_some(),
+                    Ok(None) => false,
+                    Err(_) => self
+                        .db
+                        .has_object_security_activations()
+                        .map_err(|_| Status::unavailable("object authorization unavailable"))?,
+                };
+                if activated {
+                    return Err(Status::not_found("not found"));
+                }
+            }
         }
         let object_kind = match object.as_ref() {
             Some(object) => Some(object.kind.clone()),
@@ -7497,6 +7779,24 @@ fn credential_admin_actor(
 
 type RequestEnterpriseContext = crate::enterprise::AuthenticatedContext;
 
+fn principal_policy_context_from(
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> crate::sekai::object_security::PrincipalPolicyContext {
+    if let Some(context) = tenant_context {
+        return crate::sekai::object_security::PrincipalPolicyContext {
+            subjects: vec![context.principal.subject.clone()],
+            scopes: context.scopes.clone(),
+        }
+        .normalized();
+    }
+    crate::sekai::object_security::PrincipalPolicyContext {
+        subjects: principals.to_vec(),
+        scopes: Vec::new(),
+    }
+    .normalized()
+}
+
 fn principal_policy_context(
     req: &Request<impl std::any::Any>,
 ) -> crate::sekai::object_security::PrincipalPolicyContext {
@@ -7504,18 +7804,10 @@ fn principal_policy_context(
         .extensions()
         .get::<crate::enterprise::AuthenticatedContext>()
     {
-        return crate::sekai::object_security::PrincipalPolicyContext {
-            subjects: vec![context.principal.subject.clone()],
-            scopes: context.scopes.clone(),
-        }
-        .normalized();
+        return principal_policy_context_from(&[], Some(context));
     }
     // The community/insecure fallback remains explicit and carries no scopes.
-    crate::sekai::object_security::PrincipalPolicyContext {
-        subjects: caller_principals(req),
-        scopes: Vec::new(),
-    }
-    .normalized()
+    principal_policy_context_from(&caller_principals(req), None)
 }
 
 fn request_tenant_context(
@@ -9707,6 +9999,7 @@ mod tests {
                     limit: 10,
                     ..Default::default()
                 }),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -10157,6 +10450,7 @@ mod tests {
                     kind: "cluster".into(),
                     ..Default::default()
                 }),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -10311,6 +10605,7 @@ mod tests {
                         kind: "policy-cluster".into(),
                         ..Default::default()
                     }),
+                    ..Default::default()
                 },
                 "alice",
             ))
@@ -12643,6 +12938,7 @@ mod tests {
                     interface_filter: vec!["Trackable".into()],
                     ..Default::default()
                 }),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -14037,7 +14333,10 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest { filter: None },
+                ListObjectsRequest {
+                    filter: None,
+                    ..Default::default()
+                },
                 "alice",
             ))
             .await
@@ -14079,6 +14378,7 @@ mod tests {
                         offset: 0,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 },
                 "alice",
             ))
@@ -14108,7 +14408,10 @@ mod tests {
 
         let response = svc
             .list_objects(with_named_principal(
-                ListObjectsRequest { filter: None },
+                ListObjectsRequest {
+                    filter: None,
+                    ..Default::default()
+                },
                 "alice",
             ))
             .await
@@ -14135,6 +14438,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    ..Default::default()
                 },
                 "alice",
             ))
@@ -14158,6 +14462,7 @@ mod tests {
                         }],
                         ..Default::default()
                     }),
+                    ..Default::default()
                 },
                 "alice",
             ))
@@ -14584,6 +14889,7 @@ mod tests {
                     kind: "action_policy".into(),
                     ..Default::default()
                 }),
+                ..Default::default()
             }))
             .await
             .unwrap()

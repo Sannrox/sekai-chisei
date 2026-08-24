@@ -80,10 +80,51 @@ pub fn record_object_diff(
     after: Option<&Object>,
 ) -> Result<u32, String> {
     let timestamp = chrono::Utc::now().timestamp_millis();
-    let changes = object_diff_changes(actor, before, after, timestamp);
+    let snapshot_keys = before
+        .map(|object| security_snapshot_property_keys(db, object))
+        .transpose()?
+        .unwrap_or_default();
+    let changes =
+        object_diff_changes_with_snapshot(actor, before, after, timestamp, &snapshot_keys);
     let count = changes.len() as u32;
     db.record_object_changes(&changes)?;
     Ok(count)
+}
+
+fn security_snapshot_property_keys(
+    db: &RuntimeDb,
+    object: &Object,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    Ok(db
+        .active_object_policy(&object.namespace, &object.kind)?
+        .map(|policy| policy.policy_driving_properties().into_iter().collect())
+        .unwrap_or_default())
+}
+
+pub(crate) fn sqlite_security_snapshot_property_keys(
+    db: &crate::db::sekai::SekaiDb,
+    object: &Object,
+) -> std::collections::BTreeSet<String> {
+    crate::db::object_security::ObjectSecurityBackend::get_object_security_activation(
+        db,
+        &object.namespace,
+    )
+    .ok()
+    .flatten()
+    .and_then(|activation| {
+        let digest = activation.policies.get(&object.kind)?.clone();
+        db.get_object_security_policy(&object.namespace, &digest)
+            .ok()
+            .flatten()
+    })
+    .and_then(|revision| {
+        crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
+            &revision.canonical_policy_json,
+        )
+        .ok()
+    })
+    .map(|policy| policy.policy_driving_properties().into_iter().collect())
+    .unwrap_or_default()
 }
 
 pub(crate) fn object_diff_changes(
@@ -91,6 +132,16 @@ pub(crate) fn object_diff_changes(
     before: Option<&Object>,
     after: Option<&Object>,
     timestamp: i64,
+) -> Vec<ObjectChange> {
+    object_diff_changes_with_snapshot(actor, before, after, timestamp, &Default::default())
+}
+
+pub(crate) fn object_diff_changes_with_snapshot(
+    actor: &str,
+    before: Option<&Object>,
+    after: Option<&Object>,
+    timestamp: i64,
+    snapshot_property_keys: &std::collections::BTreeSet<String>,
 ) -> Vec<ObjectChange> {
     let mut changes = Vec::new();
 
@@ -123,6 +174,19 @@ pub(crate) fn object_diff_changes(
                 changed_by: actor.into(),
                 timestamp,
             });
+            if !snapshot_property_keys.is_empty() {
+                // Marker only: do not copy policy-driving values into audit.
+                // Deleted history in activated namespaces fails closed.
+                changes.push(ObjectChange {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    object_id: before.id.clone(),
+                    field: "_security_snapshot".into(),
+                    old_value: "v1".into(),
+                    new_value: String::new(),
+                    changed_by: actor.into(),
+                    timestamp,
+                });
+            }
         }
         (Some(before), Some(after)) => {
             push_if_changed(
@@ -824,6 +888,15 @@ impl SekaiDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_authorized_policy(object, actor, None)
+    }
+
+    pub fn create_object_with_authorized_policy(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), String> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* object IDs are reserved for namespace boundaries".into());
         }
@@ -832,6 +905,7 @@ impl SekaiDb {
         }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        require_sqlite_policy_generation(&tx, &object.namespace, expected_policy_generation)?;
         let historical_changes: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
@@ -869,6 +943,16 @@ impl SekaiDb {
         object: &Object,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.update_object_with_authorized_snapshot(object, None, actor, None)
+    }
+
+    pub fn update_object_with_authorized_snapshot(
+        &self,
+        object: &Object,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
         }
@@ -886,6 +970,16 @@ impl SekaiDb {
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(None);
         };
+        require_sqlite_policy_generation(
+            &tx,
+            &before_object.namespace,
+            expected_policy_generation,
+        )?;
+        if let Some(expected) = expected
+            && !before_object.persisted_state_matches(expected)
+        {
+            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+        }
         if before_object.namespace != object.namespace {
             return Err("object namespace is immutable".into());
         }
@@ -918,6 +1012,25 @@ impl SekaiDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_authorized_snapshot(id, None, actor, None)
+    }
+
+    pub fn delete_object_with_authorized_snapshot(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
+        let snapshot_keys = expected
+            .map(|object| sqlite_security_snapshot_property_keys(self, object))
+            .or_else(|| {
+                self.get_object(id)
+                    .ok()
+                    .flatten()
+                    .map(|object| sqlite_security_snapshot_property_keys(self, &object))
+            })
+            .unwrap_or_default();
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let before = tx
@@ -928,6 +1041,24 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        let namespace = expected
+            .map(|object| object.namespace.as_str())
+            .or_else(|| before.as_ref().map(|object| object.namespace.as_str()));
+        if let Some(namespace) = namespace {
+            require_sqlite_policy_generation(&tx, namespace, expected_policy_generation)?;
+        }
+        if let Some(expected) = expected {
+            match &before {
+                Some(before) if before.persisted_state_matches(expected) => {}
+                Some(_) => {
+                    return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+                }
+                None => {
+                    tx.commit().map_err(|e| e.to_string())?;
+                    return Ok(None);
+                }
+            }
+        }
         tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         tx.execute(
@@ -937,7 +1068,10 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?;
         if let Some(before) = &before {
             let now = chrono::Utc::now().timestamp_millis();
-            insert_object_changes(&tx, &object_diff_changes(actor, Some(before), None, now))?;
+            insert_object_changes(
+                &tx,
+                &object_diff_changes_with_snapshot(actor, Some(before), None, now, &snapshot_keys),
+            )?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(before)
@@ -979,7 +1113,7 @@ impl SekaiDb {
     ) -> Result<Vec<ObjectChange>, String> {
         let conn = self.conn();
         let effective_limit = if limit > 0 { limit } else { 100 };
-        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
+        let sql = "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp FROM sekai_object_changes WHERE object_id=?1 AND field <> '_namespace' AND field NOT IN ('_security_snapshot', '_security_kind') AND field NOT LIKE '_security_property.%' ORDER BY timestamp DESC, rowid DESC LIMIT ?2 OFFSET ?3";
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![object_id, effective_limit, offset], |row| {
@@ -1063,6 +1197,29 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         Ok(n1 + (n2 + n3) as i32)
     }
+}
+
+pub(crate) fn require_sqlite_policy_generation(
+    conn: &Connection,
+    namespace: &str,
+    expected: Option<&str>,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = conn
+        .query_row(
+            "SELECT activation_id FROM sekai_object_security_activations WHERE namespace = ?1",
+            params![namespace],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| "legacy".into());
+    if actual != expected {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_object_changes(

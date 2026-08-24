@@ -1,22 +1,65 @@
-//! Bounded, versioned object-instance read authorization policy.
+//! Bounded, versioned object-instance authorization policy.
 
 use std::collections::BTreeMap;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain::is_valid_property_key;
+use crate::domain::{ListFilter, Object, is_valid_property_key};
 
 pub const OBJECT_SECURITY_POLICY_VERSION: &str = "sekai.object-security-policy/v1";
 pub const MAX_POLICY_BYTES: usize = 64 * 1024;
+pub const OBJECT_QUERY_CURSOR_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_RULES: usize = 64;
 const MAX_PREDICATES: usize = 16;
 const MAX_VALUE_BYTES: usize = 1024;
+const OBJECT_QUERY_CURSOR_VERSION: &str = "sekai.object-query-cursor/v1";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectSecurityOperation {
     Read,
+    Query,
+    Traverse,
+    Create,
+    Update,
+    Delete,
+    Action,
+    Export,
+    Sync,
+}
+
+impl ObjectSecurityOperation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Query => "query",
+            Self::Traverse => "traverse",
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Action => "action",
+            Self::Export => "export",
+            Self::Sync => "sync",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "read" => Ok(Self::Read),
+            "query" => Ok(Self::Query),
+            "traverse" => Ok(Self::Traverse),
+            "create" => Ok(Self::Create),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
+            "action" => Ok(Self::Action),
+            "export" => Ok(Self::Export),
+            "sync" => Ok(Self::Sync),
+            _ => Err("unsupported object-security operation".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +132,123 @@ impl PrincipalPolicyContext {
         self.scopes.dedup();
         self
     }
+
+    pub fn digest(&self) -> Result<String, String> {
+        let normalized = self.clone().normalized();
+        canonical_hex_digest(
+            "principal_policy_context",
+            &(normalized.subjects, normalized.scopes),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectQueryCursor {
+    pub contract_version: String,
+    pub offset: i32,
+    pub principal_context_digest: String,
+    pub namespace: String,
+    pub policy_activation_digest: String,
+    pub query_digest: String,
+    pub expires_at_ms: i64,
+}
+
+impl ObjectQueryCursor {
+    pub fn issue(
+        offset: i32,
+        principal_context_digest: String,
+        namespace: String,
+        policy_activation_digest: String,
+        query_digest: String,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        if offset < 0 || now_ms <= 0 {
+            return Err("object query cursor position or issuance time is invalid".into());
+        }
+        validate_hex_digest("principal_context_digest", &principal_context_digest)?;
+        validate_identity("namespace", &namespace)?;
+        validate_digest_or_legacy("policy_activation_digest", &policy_activation_digest)?;
+        validate_hex_digest("query_digest", &query_digest)?;
+        Ok(Self {
+            contract_version: OBJECT_QUERY_CURSOR_VERSION.into(),
+            offset,
+            principal_context_digest,
+            namespace,
+            policy_activation_digest,
+            query_digest,
+            expires_at_ms: now_ms.saturating_add(OBJECT_QUERY_CURSOR_TTL_MS),
+        })
+    }
+
+    pub fn encode(&self, signing_key: &[u8]) -> Result<String, String> {
+        self.validate(self.expires_at_ms.saturating_sub(1))?;
+        let payload = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
+            .map_err(|_| "invalid cursor signing key")?;
+        mac.update(&payload);
+        let signature = mac.finalize().into_bytes();
+        Ok(format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(signature)
+        ))
+    }
+
+    pub fn decode(token: &str, signing_key: &[u8], now_ms: i64) -> Result<Self, String> {
+        if token.len() > 8_192 {
+            return Err("object query cursor exceeds the supported size".into());
+        }
+        let (payload, signature) = token
+            .split_once('.')
+            .ok_or_else(|| "object query cursor is malformed".to_string())?;
+        let payload = URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| "object query cursor is malformed".to_string())?;
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| "object query cursor is malformed".to_string())?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(signing_key)
+            .map_err(|_| "invalid cursor signing key")?;
+        mac.update(&payload);
+        mac.verify_slice(&signature)
+            .map_err(|_| "object query cursor signature is invalid".to_string())?;
+        let cursor: Self =
+            serde_json::from_slice(&payload).map_err(|_| "object query cursor is malformed")?;
+        cursor.validate(now_ms)?;
+        Ok(cursor)
+    }
+
+    pub fn validate(&self, now_ms: i64) -> Result<(), String> {
+        if self.contract_version != OBJECT_QUERY_CURSOR_VERSION
+            || self.offset < 0
+            || self.expires_at_ms <= now_ms
+        {
+            return Err("object query cursor is stale or unsupported".into());
+        }
+        validate_hex_digest("principal_context_digest", &self.principal_context_digest)?;
+        validate_identity("namespace", &self.namespace)?;
+        validate_digest_or_legacy("policy_activation_digest", &self.policy_activation_digest)?;
+        validate_hex_digest("query_digest", &self.query_digest)
+    }
+}
+
+pub fn object_query_digest(filter: &ListFilter) -> Result<String, String> {
+    let mut bound = filter.clone();
+    bound.offset = 0;
+    canonical_hex_digest("object_query", &bound)
+}
+
+pub fn object_security_activation_digest(
+    activation: &ObjectSecurityActivation,
+) -> Result<String, String> {
+    canonical_hex_digest(
+        "object_security_activation",
+        &(
+            &activation.namespace,
+            &activation.activation_id,
+            &activation.policies,
+        ),
+    )
 }
 
 impl ObjectSecurityPolicy {
@@ -157,6 +317,44 @@ impl ObjectSecurityPolicy {
         hasher.update(self.canonical_bytes()?);
         Ok(format!("{:x}", hasher.finalize()))
     }
+
+    pub fn allows(
+        &self,
+        context: &PrincipalPolicyContext,
+        object: &Object,
+        operation: ObjectSecurityOperation,
+    ) -> bool {
+        if self.namespace != object.namespace || self.kind != object.kind {
+            return false;
+        }
+        let context = context.clone().normalized();
+        self.rules.iter().any(|rule| {
+            rule.operation == operation
+                && rule
+                    .predicates
+                    .iter()
+                    .all(|predicate| predicate.matches(&context, object))
+        })
+    }
+
+    pub fn policy_driving_properties(&self) -> Vec<String> {
+        let mut properties = self
+            .rules
+            .iter()
+            .flat_map(|rule| rule.predicates.iter())
+            .filter_map(|predicate| match predicate {
+                ObjectSecurityPredicate::SubjectEqualsProperty { property }
+                | ObjectSecurityPredicate::PropertyEquals { property, .. } => {
+                    Some(property.clone())
+                }
+                ObjectSecurityPredicate::AllowAll
+                | ObjectSecurityPredicate::RequiredScopeEquals { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        properties.sort();
+        properties.dedup();
+        properties
+    }
 }
 
 fn validate_json_shape(value: &serde_json::Value) -> Result<(), String> {
@@ -220,6 +418,23 @@ impl ObjectSecurityPredicate {
             }
         }
     }
+
+    fn matches(&self, context: &PrincipalPolicyContext, object: &Object) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::SubjectEqualsProperty { property } => object
+                .properties
+                .get(property)
+                .is_some_and(|value| context.subjects.iter().any(|subject| subject == value)),
+            Self::RequiredScopeEquals { value } => {
+                context.scopes.iter().any(|scope| scope == value)
+            }
+            Self::PropertyEquals { property, value } => object
+                .properties
+                .get(property)
+                .is_some_and(|found| found == value),
+        }
+    }
 }
 
 fn predicate_key(predicate: &ObjectSecurityPredicate) -> String {
@@ -257,6 +472,30 @@ fn validate_value(label: &str, value: &str) -> Result<(), String> {
         return Err(format!("{label} must not contain NUL"));
     }
     Ok(())
+}
+
+fn canonical_hex_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
+    let encoded = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_hex_digest(field: &str, value: &str) -> Result<(), String> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("{field} must be a 64-character hexadecimal digest"));
+    }
+    Ok(())
+}
+
+fn validate_digest_or_legacy(field: &str, value: &str) -> Result<(), String> {
+    if value == "legacy" {
+        Ok(())
+    } else {
+        validate_hex_digest(field, value)
+    }
 }
 
 #[cfg(test)]
@@ -356,5 +595,79 @@ mod tests {
         .normalized();
         assert_eq!(context.subjects, ["alice"]);
         assert_eq!(context.scopes, ["documents:read"]);
+    }
+
+    fn sample_object(owner: &str) -> Object {
+        Object {
+            id: "object-1".into(),
+            kind: "document".into(),
+            name: "doc".into(),
+            namespace: "acme".into(),
+            external_id: "document:1".into(),
+            properties: std::collections::HashMap::from([("owner".into(), owner.into())]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    fn read_rules_do_not_grant_writes() {
+        let policy = ObjectSecurityPolicy::from_canonical_input(&document(serde_json::json!([
+            {"operation":"read","predicates":[{"kind":"allow_all"}]}
+        ])))
+        .unwrap();
+        let context = PrincipalPolicyContext {
+            subjects: vec!["alice".into()],
+            scopes: Vec::new(),
+        };
+        let object = sample_object("alice");
+        assert!(policy.allows(&context, &object, ObjectSecurityOperation::Read));
+        assert!(!policy.allows(&context, &object, ObjectSecurityOperation::Update));
+        assert!(!policy.allows(&context, &object, ObjectSecurityOperation::Create));
+    }
+
+    #[test]
+    fn matching_update_rule_authorizes_current_and_proposed_state() {
+        let policy = ObjectSecurityPolicy::from_canonical_input(&document(serde_json::json!([
+            {"operation":"update","predicates":[{"kind":"subject_equals_property","property":"owner"}]}
+        ])))
+        .unwrap();
+        let alice = PrincipalPolicyContext {
+            subjects: vec!["alice".into()],
+            scopes: Vec::new(),
+        };
+        assert!(policy.allows(
+            &alice,
+            &sample_object("alice"),
+            ObjectSecurityOperation::Update
+        ));
+        assert!(!policy.allows(
+            &alice,
+            &sample_object("bob"),
+            ObjectSecurityOperation::Update
+        ));
+    }
+
+    #[test]
+    fn object_query_cursor_binds_context_policy_query_and_expiry() {
+        let key = [7u8; 32];
+        let cursor = ObjectQueryCursor::issue(
+            10,
+            "a".repeat(64),
+            "acme".into(),
+            "legacy".into(),
+            "b".repeat(64),
+            1_000,
+        )
+        .unwrap();
+        let token = cursor.encode(&key).unwrap();
+        assert_eq!(
+            ObjectQueryCursor::decode(&token, &key, 1_001).unwrap(),
+            cursor
+        );
+        assert!(ObjectQueryCursor::decode(&token, &[8u8; 32], 1_001).is_err());
+        assert!(
+            ObjectQueryCursor::decode(&token, &key, 1_000 + OBJECT_QUERY_CURSOR_TTL_MS).is_err()
+        );
     }
 }

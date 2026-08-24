@@ -20,23 +20,35 @@ pub(crate) enum MutationPersistenceError {
     Graph(String),
     Lease(LeaseError),
     NotFound,
+    ChangedSinceAuthorization,
 }
 
 pub(crate) struct ObjectMutation<'a> {
     db: &'a RuntimeDb,
     lease: Option<LeasePrecondition<'a>>,
+    expected_policy_generation: Option<&'a str>,
 }
 
 impl<'a> ObjectMutation<'a> {
     pub(crate) fn direct(db: &'a RuntimeDb) -> Self {
-        Self { db, lease: None }
+        Self {
+            db,
+            lease: None,
+            expected_policy_generation: None,
+        }
     }
 
     pub(crate) fn guarded(db: &'a RuntimeDb, lease: LeasePrecondition<'a>) -> Self {
         Self {
             db,
             lease: Some(lease),
+            expected_policy_generation: None,
         }
+    }
+
+    pub(crate) fn with_policy_generation(mut self, generation: &'a str) -> Self {
+        self.expected_policy_generation = Some(generation);
+        self
     }
 
     pub(crate) fn replay(
@@ -68,7 +80,7 @@ impl<'a> ObjectMutation<'a> {
     ) -> Result<Object, MutationPersistenceError> {
         if let Some(lease) = &self.lease {
             self.db
-                .guarded_create_object(
+                .guarded_create_object_with_policy(
                     object,
                     lease.namespace,
                     lease.key,
@@ -76,11 +88,16 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.expected_policy_generation,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
             self.db
-                .create_object_with_audit(object, actor)
+                .create_object_with_authorized_policy(
+                    object,
+                    actor,
+                    self.expected_policy_generation,
+                )
                 .map_err(MutationPersistenceError::Graph)?;
             Ok(object.clone())
         }
@@ -96,7 +113,7 @@ impl<'a> ObjectMutation<'a> {
     ) -> Result<Object, MutationPersistenceError> {
         if let Some(lease) = &self.lease {
             self.db
-                .guarded_update_object(
+                .guarded_update_object_with_policy(
                     object,
                     request,
                     expected,
@@ -106,14 +123,23 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.expected_policy_generation,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            self.db
-                .update_object_with_audit(object, actor)
-                .map_err(MutationPersistenceError::Graph)?
-                .ok_or(MutationPersistenceError::NotFound)?;
-            Ok(object.clone())
+            match self.db.update_object_with_authorized_snapshot(
+                object,
+                expected,
+                actor,
+                self.expected_policy_generation,
+            ) {
+                Ok(Some(_)) => Ok(object.clone()),
+                Ok(None) => Err(MutationPersistenceError::NotFound),
+                Err(error) if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION => {
+                    Err(MutationPersistenceError::ChangedSinceAuthorization)
+                }
+                Err(error) => Err(MutationPersistenceError::Graph(error)),
+            }
         }
     }
 
@@ -126,7 +152,7 @@ impl<'a> ObjectMutation<'a> {
     ) -> Result<(), MutationPersistenceError> {
         if let Some(lease) = &self.lease {
             self.db
-                .guarded_delete_object(
+                .guarded_delete_object_with_policy(
                     id,
                     expected,
                     lease.namespace,
@@ -135,13 +161,23 @@ impl<'a> ObjectMutation<'a> {
                     lease.request_id,
                     actor,
                     now_ms,
+                    self.expected_policy_generation,
                 )
                 .map_err(MutationPersistenceError::Lease)
         } else {
-            self.db
-                .delete_object_with_audit(id, actor)
-                .map_err(MutationPersistenceError::Graph)?;
-            Ok(())
+            match self.db.delete_object_with_authorized_snapshot(
+                id,
+                expected,
+                actor,
+                self.expected_policy_generation,
+            ) {
+                Ok(None) if expected.is_some() => Err(MutationPersistenceError::NotFound),
+                Ok(_) => Ok(()),
+                Err(error) if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION => {
+                    Err(MutationPersistenceError::ChangedSinceAuthorization)
+                }
+                Err(error) => Err(MutationPersistenceError::Graph(error)),
+            }
         }
     }
 }

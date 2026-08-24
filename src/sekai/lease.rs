@@ -12,6 +12,7 @@ const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Default single-region site pin (`SEKAI_SITE_ID` default).
 pub const DEFAULT_SITE_ID: &str = "local";
+pub(crate) const OBJECT_CHANGED_SINCE_AUTHORIZATION: &str = "object changed since authorization";
 
 fn default_site_id() -> String {
     DEFAULT_SITE_ID.into()
@@ -374,6 +375,23 @@ impl SekaiDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_create_object_with_policy(
+            object, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_create_object_with_policy(
+        &self,
+        object: &Object,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         if object.id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
                 "namespace:* object IDs are reserved for namespace boundaries".into(),
@@ -388,6 +406,12 @@ impl SekaiDb {
         self.guarded_object_mutation(
             namespace, key, token, request_id, "create", &object.id, &input_json, actor, now_ms,
             |tx, transaction_now_ms| {
+                crate::sekai::audit::require_sqlite_policy_generation(
+                    tx,
+                    &object.namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let historical_changes: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id=?1",
                     params![object.id], |row| row.get(0),
@@ -419,6 +443,34 @@ impl SekaiDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_update_object_with_policy(
+            object,
+            request_object,
+            expected,
+            namespace,
+            key,
+            token,
+            request_id,
+            actor,
+            now_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_update_object_with_policy(
+        &self,
+        object: &Object,
+        request_object: &Object,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err(LeaseError::Mutation(
                 "namespace:* external IDs are reserved for namespace boundaries".into(),
@@ -428,6 +480,12 @@ impl SekaiDb {
         self.guarded_object_mutation(
             namespace, key, token, request_id, "update", &object.id, &input_json, actor, now_ms,
             |tx, transaction_now_ms| {
+                crate::sekai::audit::require_sqlite_policy_generation(
+                    tx,
+                    &object.namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let before = tx.query_row(
                     "SELECT id,kind,name,namespace,external_id,properties,created,updated FROM sekai_objects WHERE id=?1",
                     params![object.id], crate::db::sekai::row_to_object,
@@ -464,10 +522,48 @@ impl SekaiDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<(), LeaseError> {
+        self.guarded_delete_object_with_policy(
+            object_id, expected, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_delete_object_with_policy(
+        &self,
+        object_id: &str,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), LeaseError> {
         let input_json = serde_json::to_string(object_id).map_err(storage)?;
+        // Resolve snapshot keys before taking the mutation connection. The
+        // in-memory SQLite pool is size 1, so a nested `conn()` inside the
+        // Immediate transaction deadlocks.
+        let snapshot_keys = expected
+            .map(|object| crate::sekai::audit::sqlite_security_snapshot_property_keys(self, object))
+            .or_else(|| {
+                self.get_object(object_id).ok().flatten().map(|object| {
+                    crate::sekai::audit::sqlite_security_snapshot_property_keys(self, &object)
+                })
+            })
+            .unwrap_or_default();
         self.guarded_object_mutation(
             namespace, key, token, request_id, "delete", object_id, &input_json, actor, now_ms,
             |tx, transaction_now_ms| {
+                let namespace = expected
+                    .map(|object| object.namespace.as_str())
+                    .unwrap_or(namespace);
+                crate::sekai::audit::require_sqlite_policy_generation(
+                    tx,
+                    namespace,
+                    expected_policy_generation,
+                )
+                .map_err(LeaseError::Mutation)?;
                 let before = tx.query_row(
                     "SELECT id,kind,name,namespace,external_id,properties,created,updated FROM sekai_objects WHERE id=?1",
                     params![object_id], crate::db::sekai::row_to_object,
@@ -479,7 +575,17 @@ impl SekaiDb {
                 }
                 tx.execute("DELETE FROM sekai_objects WHERE id=?1", params![object_id]).map_err(storage)?;
                 tx.execute("DELETE FROM sekai_links WHERE from_id=?1 OR to_id=?1", params![object_id]).map_err(storage)?;
-                crate::sekai::audit::insert_object_changes(tx, &crate::sekai::audit::object_diff_changes(actor, Some(&before), None, transaction_now_ms)).map_err(LeaseError::Mutation)?;
+                crate::sekai::audit::insert_object_changes(
+                    tx,
+                    &crate::sekai::audit::object_diff_changes_with_snapshot(
+                        actor,
+                        Some(&before),
+                        None,
+                        transaction_now_ms,
+                        &snapshot_keys,
+                    ),
+                )
+                .map_err(LeaseError::Mutation)?;
                 Ok(Object {
                     id: before.id,
                     kind: String::new(),

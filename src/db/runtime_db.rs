@@ -162,6 +162,34 @@ impl RuntimeDb {
         }
     }
 
+    pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
+        match self {
+            Self::Sqlite(db) => db.object_query_cursor_key(),
+            Self::Postgres(db) => db.object_query_cursor_key(),
+        }
+    }
+
+    pub fn active_object_policy(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Option<ObjectSecurityPolicy>, String> {
+        let Some(activation) = self.get_object_security_activation(namespace)? else {
+            return Ok(None);
+        };
+        let Some(digest) = activation.policies.get(kind) else {
+            return Err(
+                "object_security_denied: activated namespace has no policy for kind".into(),
+            );
+        };
+        let Some(revision) = self.get_object_security_policy(namespace, digest)? else {
+            return Err("object_security_denied: active policy revision unavailable".into());
+        };
+        ObjectSecurityPolicy::from_canonical_input(&revision.canonical_policy_json)
+            .map(Some)
+            .map_err(|_| "object_security_denied: active policy revision is invalid".into())
+    }
+
     pub fn get_definition_revision(
         &self,
         namespace: &str,
@@ -575,18 +603,37 @@ impl RuntimeDb {
         authenticated_producer: &str,
         now_ms: i64,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_policy_generation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_source_batch_with_policy_generation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+    ) -> Result<SourceBatchResult, String> {
         match self {
-            Self::Sqlite(db) => ObjectSyncBackend::apply_source_batch(
-                db.as_ref(),
+            Self::Sqlite(db) => db.apply_source_batch_with_policy_generation(
                 batch,
                 authenticated_producer,
                 now_ms,
+                expected_policy_generation,
+                authorized_objects,
             ),
-            Self::Postgres(db) => ObjectSyncBackend::apply_source_batch(
-                db.as_ref(),
+            Self::Postgres(db) => db.apply_source_batch_with_policy_generation(
                 batch,
                 authenticated_producer,
                 now_ms,
+                expected_policy_generation,
+                authorized_objects,
             ),
         }
     }
@@ -1425,6 +1472,36 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_link_with_authorized_endpoints(
+        &self,
+        l: &Link,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+        fail_if_exists: bool,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.create_link_with_authorized_endpoints(
+                l,
+                expected_from,
+                expected_to,
+                from_generation,
+                to_generation,
+                fail_if_exists,
+            ),
+            Self::Postgres(db) => db.create_link_with_authorized_endpoints(
+                l,
+                expected_from,
+                expected_to,
+                from_generation,
+                to_generation,
+                fail_if_exists,
+            ),
+        }
+    }
+
     pub fn create_managed_team_credential(
         &self,
         principal: &str,
@@ -1448,9 +1525,22 @@ impl RuntimeDb {
     }
 
     pub fn create_object_with_audit(&self, object: &Object, actor: &str) -> Result<(), String> {
+        self.create_object_with_authorized_policy(object, actor, None)
+    }
+
+    pub fn create_object_with_authorized_policy(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.create_object_with_audit(object, actor),
-            Self::Postgres(db) => db.create_object_with_audit(object, actor),
+            Self::Sqlite(db) => {
+                db.create_object_with_authorized_policy(object, actor, expected_policy_generation)
+            }
+            Self::Postgres(db) => {
+                db.create_object_with_authorized_policy(object, actor, expected_policy_generation)
+            }
         }
     }
 
@@ -1521,6 +1611,32 @@ impl RuntimeDb {
         }
     }
 
+    pub fn delete_link_with_authorized_endpoints(
+        &self,
+        id: &str,
+        expected_from: &Object,
+        expected_to: &Object,
+        from_generation: Option<&str>,
+        to_generation: Option<&str>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_link_with_authorized_endpoints(
+                id,
+                expected_from,
+                expected_to,
+                from_generation,
+                to_generation,
+            ),
+            Self::Postgres(db) => db.delete_link_with_authorized_endpoints(
+                id,
+                expected_from,
+                expected_to,
+                from_generation,
+                to_generation,
+            ),
+        }
+    }
+
     pub fn delete_object_type(&self, kind: &str) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.delete_object_type(kind),
@@ -1533,9 +1649,29 @@ impl RuntimeDb {
         id: &str,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.delete_object_with_authorized_snapshot(id, None, actor, None)
+    }
+
+    pub fn delete_object_with_authorized_snapshot(
+        &self,
+        id: &str,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.delete_object_with_audit(id, actor),
-            Self::Postgres(db) => db.delete_object_with_audit(id, actor),
+            Self::Sqlite(db) => db.delete_object_with_authorized_snapshot(
+                id,
+                expected,
+                actor,
+                expected_policy_generation,
+            ),
+            Self::Postgres(db) => db.delete_object_with_authorized_snapshot(
+                id,
+                expected,
+                actor,
+                expected_policy_generation,
+            ),
         }
     }
 
@@ -1927,13 +2063,44 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_create_object_with_policy(
+            object, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_create_object_with_policy(
+        &self,
+        object: &Object,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         match self {
-            Self::Sqlite(db) => {
-                db.guarded_create_object(object, namespace, key, token, request_id, actor, now_ms)
-            }
-            Self::Postgres(db) => {
-                db.guarded_create_object(object, namespace, key, token, request_id, actor, now_ms)
-            }
+            Self::Sqlite(db) => db.guarded_create_object_with_policy(
+                object,
+                namespace,
+                key,
+                token,
+                request_id,
+                actor,
+                now_ms,
+                expected_policy_generation,
+            ),
+            Self::Postgres(db) => db.guarded_create_object_with_policy(
+                object,
+                namespace,
+                key,
+                token,
+                request_id,
+                actor,
+                now_ms,
+                expected_policy_generation,
+            ),
         }
     }
 
@@ -1948,12 +2115,46 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<(), LeaseError> {
+        self.guarded_delete_object_with_policy(
+            object_id, expected, namespace, key, token, request_id, actor, now_ms, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_delete_object_with_policy(
+        &self,
+        object_id: &str,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<(), LeaseError> {
         match self {
-            Self::Sqlite(db) => db.guarded_delete_object(
-                object_id, expected, namespace, key, token, request_id, actor, now_ms,
+            Self::Sqlite(db) => db.guarded_delete_object_with_policy(
+                object_id,
+                expected,
+                namespace,
+                key,
+                token,
+                request_id,
+                actor,
+                now_ms,
+                expected_policy_generation,
             ),
-            Self::Postgres(db) => db.guarded_delete_object(
-                object_id, expected, namespace, key, token, request_id, actor, now_ms,
+            Self::Postgres(db) => db.guarded_delete_object_with_policy(
+                object_id,
+                expected,
+                namespace,
+                key,
+                token,
+                request_id,
+                actor,
+                now_ms,
+                expected_policy_generation,
             ),
         }
     }
@@ -2002,8 +2203,36 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<Object, LeaseError> {
+        self.guarded_update_object_with_policy(
+            object,
+            request_object,
+            expected,
+            namespace,
+            key,
+            token,
+            request_id,
+            actor,
+            now_ms,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn guarded_update_object_with_policy(
+        &self,
+        object: &Object,
+        request_object: &Object,
+        expected: Option<&Object>,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        request_id: &str,
+        actor: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Object, LeaseError> {
         match self {
-            Self::Sqlite(db) => db.guarded_update_object(
+            Self::Sqlite(db) => db.guarded_update_object_with_policy(
                 object,
                 request_object,
                 expected,
@@ -2013,8 +2242,9 @@ impl RuntimeDb {
                 request_id,
                 actor,
                 now_ms,
+                expected_policy_generation,
             ),
-            Self::Postgres(db) => db.guarded_update_object(
+            Self::Postgres(db) => db.guarded_update_object_with_policy(
                 object,
                 request_object,
                 expected,
@@ -2024,6 +2254,7 @@ impl RuntimeDb {
                 request_id,
                 actor,
                 now_ms,
+                expected_policy_generation,
             ),
         }
     }
@@ -3839,13 +4070,39 @@ impl RuntimeDb {
         object: &Object,
         actor: &str,
     ) -> Result<Option<Object>, String> {
+        self.update_object_with_authorized_snapshot(object, None, actor, None)
+    }
+
+    pub fn update_object_with_authorized_snapshot(
+        &self,
+        object: &Object,
+        expected: Option<&Object>,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+    ) -> Result<Option<Object>, String> {
         match self {
-            Self::Sqlite(db) => db.update_object_with_audit(object, actor),
+            Self::Sqlite(db) => db.update_object_with_authorized_snapshot(
+                object,
+                expected,
+                actor,
+                expected_policy_generation,
+            ),
             Self::Postgres(db) => {
                 let Some(existing) = db.get_object(&object.id)? else {
                     return Ok(None);
                 };
-                db.update_object_with_audit_if_revision(object, actor, existing.updated)
+                if let Some(expected) = expected
+                    && !existing.persisted_state_matches(expected)
+                {
+                    return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+                }
+                db.update_object_with_audit_if_revision(
+                    object,
+                    actor,
+                    existing.updated,
+                    expected_policy_generation,
+                    expected,
+                )
             }
         }
     }

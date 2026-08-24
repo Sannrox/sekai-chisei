@@ -51,6 +51,7 @@ const SOURCE_CHANGE_FEED_SCHEMA: &str = include_str!("postgres/0030_source_chang
 const DEFINITION_BRANCHES_SCHEMA: &str = include_str!("postgres/0031_definition_branches.sql");
 const OBJECT_SECURITY_SCHEMA: &str = include_str!("postgres/0032_object_security.sql");
 const DEFINITION_PROPOSALS_SCHEMA: &str = include_str!("postgres/0033_definition_proposals.sql");
+const OBJECT_QUERY_CURSOR_SCHEMA: &str = include_str!("postgres/0034_object_query_cursor.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -219,6 +220,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 32,
         name: "definition_proposals",
         sql: DEFINITION_PROPOSALS_SCHEMA,
+    },
+    Migration {
+        version: 33,
+        name: "object_query_cursor",
+        sql: OBJECT_QUERY_CURSOR_SCHEMA,
     },
 ];
 
