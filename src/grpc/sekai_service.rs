@@ -54,6 +54,7 @@ use crate::sekai::action_work_lifecycle::{
 use crate::sekai::attestation;
 use crate::sekai::capability;
 use crate::sekai::definition_branch as definition_branch_domain;
+use crate::sekai::definition_proposal as definition_proposal_domain;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_admission_lifecycle::{
     EvidenceAdmissionLifecycle, EvidenceAdmissionLifecycleError, EvidenceAdmissionOutcome,
@@ -3201,20 +3202,82 @@ fn map_definition_write_error(error: String) -> Status {
     if error.starts_with("definition_revision_not_found")
         || error.starts_with("definition_branch_not_found")
         || error.starts_with("definition_member_not_found")
+        || error.starts_with("definition_proposal_not_found")
     {
         Status::not_found("definition resource unavailable")
-    } else if error.starts_with("stale_definition_branch_head") {
-        Status::failed_precondition("definition branch head is stale")
+    } else if error.starts_with("stale_definition_branch_head")
+        || error.starts_with("stale_definition_proposal_candidate")
+        || error.starts_with("stale_published_definition_head")
+        || error.starts_with("definition_proposal_not_open")
+        || error.starts_with("definition_proposal_missing_approval")
+        || error.starts_with("definition_proposal_no_change")
+        || error.starts_with("foreign_authority_is_not_a_grant")
+    {
+        Status::failed_precondition("definition write is not current")
     } else if error.starts_with("definition_edit_no_change") {
         Status::failed_precondition("definition edit has no effect")
     } else if error.starts_with("definition_idempotency_conflict")
         || error.starts_with("definition_branch_conflict")
+        || error.starts_with("definition_proposal_conflict")
         || error.starts_with("immutable_definition_")
     {
         Status::already_exists("definition write conflicts with durable state")
     } else {
         Status::internal("definition write unavailable")
     }
+}
+
+fn to_proto_definition_proposal(
+    proposal: &definition_proposal_domain::DefinitionProposal,
+) -> DefinitionProposal {
+    DefinitionProposal {
+        contract_version: proposal.contract_version.clone(),
+        namespace: proposal.namespace.clone(),
+        branch_id: proposal.branch_id.clone(),
+        proposal_id: proposal.proposal_id.clone(),
+        base_digest: proposal.base_digest.clone(),
+        candidate_digest: proposal.candidate_digest.clone(),
+        proposal_digest: proposal.proposal_digest.clone(),
+        eval_plan_digests: proposal.eval_plan_digests.clone(),
+        named_foreign_digests: proposal.named_foreign_digests.clone(),
+        approvals: proposal
+            .approvals
+            .iter()
+            .map(|approval| DefinitionProposalApproval {
+                actor: approval.actor.clone(),
+                approved_at_ms: approval.approved_at_ms,
+            })
+            .collect(),
+        status: proposal.status.clone(),
+        created_by: proposal.created_by.clone(),
+        created_at_ms: proposal.created_at_ms,
+        updated_at_ms: proposal.updated_at_ms,
+    }
+}
+
+fn authorize_proposal_member_writes(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    base_digest: &str,
+    candidate_digest: &str,
+) -> Result<(), Status> {
+    let base = service
+        .db
+        .get_definition_revision(namespace, base_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let candidate = service
+        .db
+        .get_definition_revision(namespace, candidate_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    for (member_kind, member_id) in
+        definition_proposal_domain::changed_member_refs(&base, &candidate)
+    {
+        authorize_definition_member_write(service, principals, &member_kind, &member_id)?;
+    }
+    Ok(())
 }
 
 fn from_proto_source_batch(batch: SourceBatch) -> Result<source_sync_domain::SourceBatch, Status> {
@@ -3972,6 +4035,314 @@ impl SekaiService for SekaiServiceImpl {
             previous_head_digest: result.previous_head_digest,
             revision: Some(to_proto_definition_revision(&result.revision)),
             changed_member_digests: result.changed_member_digests,
+        }))
+    }
+
+    async fn create_definition_proposal(
+        &self,
+        req: Request<CreateDefinitionProposalRequest>,
+    ) -> Result<Response<CreateDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_proposal_domain::CreateDefinitionProposal {
+            namespace: input.namespace,
+            branch_id: input.branch_id,
+            proposal_id: input.proposal_id,
+            base_digest: input.base_digest,
+            candidate_digest: input.candidate_digest,
+            eval_plan_digests: input.eval_plan_digests,
+            named_foreign_digests: input.named_foreign_digests,
+            idempotency_key: input.idempotency_key,
+        };
+        request.prepare().map_err(Status::invalid_argument)?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &request.namespace,
+            &request.base_digest,
+            true,
+        )?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &request.namespace,
+            &request.candidate_digest,
+            false,
+        )?;
+        authorize_proposal_member_writes(
+            self,
+            &principals,
+            &request.namespace,
+            &request.base_digest,
+            &request.candidate_digest,
+        )?;
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .create_definition_proposal(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::CreateProposal { proposal } = result
+        else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(CreateDefinitionProposalResponse {
+            proposal: Some(to_proto_definition_proposal(&proposal)),
+        }))
+    }
+
+    async fn get_definition_proposal(
+        &self,
+        req: Request<GetDefinitionProposalRequest>,
+    ) -> Result<Response<GetDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        if input.proposal_id.is_empty()
+            || input.proposal_id.len() > definition_branch_domain::MAX_DEFINITION_ID_BYTES
+            || input.proposal_id.trim() != input.proposal_id
+            || input.proposal_id.chars().any(char::is_control)
+        {
+            return Err(Status::invalid_argument("canonical proposal_id required"));
+        }
+        let proposal = self
+            .db
+            .get_definition_proposal(&input.namespace, &input.proposal_id)
+            .map_err(|_| Status::internal("definition proposal unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &proposal.namespace,
+            &proposal.candidate_digest,
+            false,
+        )?;
+        Ok(Response::new(GetDefinitionProposalResponse {
+            proposal: Some(to_proto_definition_proposal(&proposal)),
+        }))
+    }
+
+    async fn approve_definition_proposal(
+        &self,
+        req: Request<ApproveDefinitionProposalRequest>,
+    ) -> Result<Response<ApproveDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_proposal_domain::ApproveDefinitionProposal {
+            namespace: input.namespace,
+            proposal_id: input.proposal_id,
+            idempotency_key: input.idempotency_key,
+        };
+        request.request_digest().map_err(Status::invalid_argument)?;
+        let proposal = self
+            .db
+            .get_definition_proposal(&request.namespace, &request.proposal_id)
+            .map_err(|_| Status::internal("definition proposal unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_proposal_member_writes(
+            self,
+            &principals,
+            &proposal.namespace,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+        )?;
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .approve_definition_proposal(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::ApproveProposal { proposal } = result
+        else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(ApproveDefinitionProposalResponse {
+            proposal: Some(to_proto_definition_proposal(&proposal)),
+        }))
+    }
+
+    async fn merge_definition_proposal(
+        &self,
+        req: Request<MergeDefinitionProposalRequest>,
+    ) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_proposal_domain::MergeDefinitionProposal {
+            namespace: input.namespace,
+            proposal_id: input.proposal_id,
+            idempotency_key: input.idempotency_key,
+        };
+        request.request_digest().map_err(Status::invalid_argument)?;
+        let proposal = self
+            .db
+            .get_definition_proposal(&request.namespace, &request.proposal_id)
+            .map_err(|_| Status::internal("definition proposal unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_proposal_member_writes(
+            self,
+            &principals,
+            &proposal.namespace,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+        )?;
+        let has_live_approval = proposal.approvals.iter().any(|approval| {
+            let principals = std::slice::from_ref(&approval.actor);
+            authorize_source_sync_namespace(
+                self,
+                principals,
+                tenant_context.as_ref(),
+                &proposal.namespace,
+                true,
+            )
+            .and_then(|_| {
+                authorize_proposal_member_writes(
+                    self,
+                    principals,
+                    &proposal.namespace,
+                    &proposal.base_digest,
+                    &proposal.candidate_digest,
+                )
+            })
+            .is_ok()
+        });
+        if !has_live_approval {
+            return Err(Status::failed_precondition(
+                "definition write is not current",
+            ));
+        }
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .merge_definition_proposal(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::MergeProposal { result } = result
+        else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(MergeDefinitionProposalResponse {
+            proposal: Some(to_proto_definition_proposal(&result.proposal)),
+            previous_published_digest: result.previous_published_digest,
+            published_revision: Some(to_proto_definition_revision(&result.published_revision)),
+        }))
+    }
+
+    async fn close_definition_proposal(
+        &self,
+        req: Request<CloseDefinitionProposalRequest>,
+    ) -> Result<Response<CloseDefinitionProposalResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let request = definition_proposal_domain::CloseDefinitionProposal {
+            namespace: input.namespace,
+            proposal_id: input.proposal_id,
+            idempotency_key: input.idempotency_key,
+        };
+        request.request_digest().map_err(Status::invalid_argument)?;
+        let proposal = self
+            .db
+            .get_definition_proposal(&request.namespace, &request.proposal_id)
+            .map_err(|_| Status::internal("definition proposal unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_proposal_member_writes(
+            self,
+            &principals,
+            &proposal.namespace,
+            &proposal.base_digest,
+            &proposal.candidate_digest,
+        )?;
+        let actor = principals
+            .first()
+            .ok_or_else(|| Status::unauthenticated("principal required"))?;
+        let result = self
+            .db
+            .close_definition_proposal(&request, actor, now_millis())
+            .map_err(map_definition_write_error)?;
+        let definition_branch_domain::DefinitionWriteResult::CloseProposal { proposal } = result
+        else {
+            return Err(Status::internal("definition replay result is invalid"));
+        };
+        Ok(Response::new(CloseDefinitionProposalResponse {
+            proposal: Some(to_proto_definition_proposal(&proposal)),
+        }))
+    }
+
+    async fn get_published_definition_revision(
+        &self,
+        req: Request<GetPublishedDefinitionRevisionRequest>,
+    ) -> Result<Response<GetPublishedDefinitionRevisionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let revision = self
+            .db
+            .get_published_definition_revision(&input.namespace)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &revision.namespace,
+            &revision.revision_digest,
+            true,
+        )?;
+        Ok(Response::new(GetPublishedDefinitionRevisionResponse {
+            revision: Some(to_proto_definition_revision(&revision)),
         }))
     }
 
@@ -7622,6 +7993,291 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
         assert_eq!(error.message(), "schema admin required");
+    }
+
+    #[tokio::test]
+    async fn definition_proposal_close_rechecks_member_admin() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "proposal-close");
+        grant_source_namespace(&svc, "proposal-close", "tester", security::Role::Editor);
+        svc.create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "proposal-close".into(),
+                branch_id: "feature".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "proposal-close".into(),
+                    branch_id: "feature".into(),
+                    expected_head_digest: parent.revision_digest.clone(),
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: "object_type".into(),
+                        member_id: "Ticket".into(),
+                        definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: "edit-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        svc.create_definition_proposal(with_named_principal(
+            CreateDefinitionProposalRequest {
+                namespace: "proposal-close".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-1".into(),
+                base_digest: parent.revision_digest,
+                candidate_digest: applied.revision.unwrap().revision_digest,
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let error = svc
+            .close_definition_proposal(with_principal(CloseDefinitionProposalRequest {
+                namespace: "proposal-close".into(),
+                proposal_id: "cs-1".into(),
+                idempotency_key: "close-1".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "schema admin required");
+    }
+
+    #[tokio::test]
+    async fn definition_proposal_merge_accepts_one_live_approval() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "proposal-live");
+        grant_source_namespace(&svc, "proposal-live", "tester", security::Role::Editor);
+        for (id, principal) in [
+            ("proposal-live-ticket-root", "root"),
+            ("proposal-live-ticket-tester", "tester"),
+        ] {
+            let grant = security::Grant {
+                id: id.into(),
+                object_id: schema_object_id("Ticket"),
+                principal: principal.into(),
+                role: security::Role::Admin,
+                created: 1,
+            };
+            svc.db.create_grant(&grant).unwrap();
+            svc.security.add_grant(&grant);
+        }
+        svc.create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "proposal-live".into(),
+                branch_id: "feature".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "proposal-live".into(),
+                    branch_id: "feature".into(),
+                    expected_head_digest: parent.revision_digest.clone(),
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: "object_type".into(),
+                        member_id: "Ticket".into(),
+                        definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: "edit-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        svc.create_definition_proposal(with_named_principal(
+            CreateDefinitionProposalRequest {
+                namespace: "proposal-live".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-1".into(),
+                base_digest: parent.revision_digest,
+                candidate_digest: applied.revision.unwrap().revision_digest,
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: "proposal-live".into(),
+                proposal_id: "cs-1".into(),
+                idempotency_key: "approve-root".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.approve_definition_proposal(with_principal(ApproveDefinitionProposalRequest {
+            namespace: "proposal-live".into(),
+            proposal_id: "cs-1".into(),
+            idempotency_key: "approve-tester".into(),
+        }))
+        .await
+        .unwrap();
+        svc.security
+            .remove_grant(&schema_object_id("Ticket"), "tester");
+        let merged = svc
+            .merge_definition_proposal(with_named_principal(
+                MergeDefinitionProposalRequest {
+                    namespace: "proposal-live".into(),
+                    proposal_id: "cs-1".into(),
+                    idempotency_key: "merge-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(merged.proposal.unwrap().status, "merged");
+    }
+
+    #[tokio::test]
+    async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "proposal-team");
+        svc.create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "proposal-team".into(),
+                branch_id: "feature".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "proposal-team".into(),
+                    branch_id: "feature".into(),
+                    expected_head_digest: parent.revision_digest.clone(),
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: "object_type".into(),
+                        member_id: "Ticket".into(),
+                        definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: "edit-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let candidate = applied.revision.unwrap().revision_digest;
+        svc.create_definition_proposal(with_named_principal(
+            CreateDefinitionProposalRequest {
+                namespace: "proposal-team".into(),
+                branch_id: "feature".into(),
+                proposal_id: "cs-1".into(),
+                base_digest: parent.revision_digest.clone(),
+                candidate_digest: candidate.clone(),
+                eval_plan_digests: vec![format!("sha256:{}", "e".repeat(64))],
+                named_foreign_digests: vec![format!("sha256:{}", "f".repeat(64))],
+                idempotency_key: "propose-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let missing = svc
+            .merge_definition_proposal(with_named_principal(
+                MergeDefinitionProposalRequest {
+                    namespace: "proposal-team".into(),
+                    proposal_id: "cs-1".into(),
+                    idempotency_key: "merge-missing".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.get_published_definition_revision(with_named_principal(
+                GetPublishedDefinitionRevisionRequest {
+                    namespace: "proposal-team".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .revision
+            .unwrap()
+            .revision_digest,
+            parent.revision_digest
+        );
+        svc.approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: "proposal-team".into(),
+                proposal_id: "cs-1".into(),
+                idempotency_key: "approve-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let merged = svc
+            .merge_definition_proposal(with_named_principal(
+                MergeDefinitionProposalRequest {
+                    namespace: "proposal-team".into(),
+                    proposal_id: "cs-1".into(),
+                    idempotency_key: "merge-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(merged.proposal.unwrap().status, "merged");
+        assert_eq!(merged.previous_published_digest, parent.revision_digest);
+        assert_eq!(
+            merged.published_revision.unwrap().revision_digest,
+            candidate
+        );
+        assert_eq!(
+            svc.get_published_definition_revision(with_named_principal(
+                GetPublishedDefinitionRevisionRequest {
+                    namespace: "proposal-team".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .revision
+            .unwrap()
+            .revision_digest,
+            candidate
+        );
     }
 
     fn source_batch(
