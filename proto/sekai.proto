@@ -1633,6 +1633,35 @@ message GetPublishedDefinitionRevisionResponse {
   DefinitionRevision revision = 1;
 }
 
+message DefinitionMemberChange {
+  string member_kind = 1;
+  string member_id = 2;
+  string from_member_digest = 3;
+  string to_member_digest = 4;
+  repeated string added_properties = 5;
+  repeated string removed_properties = 6;
+  repeated string changed_properties = 7;
+}
+
+message DefinitionRevisionDiff {
+  string from_revision_digest = 1;
+  string to_revision_digest = 2;
+  string diff_digest = 3;
+  repeated DefinitionMemberChange added = 4;
+  repeated DefinitionMemberChange removed = 5;
+  repeated DefinitionMemberChange changed = 6;
+}
+
+message CompareDefinitionRevisionsRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+}
+
+message CompareDefinitionRevisionsResponse {
+  DefinitionRevisionDiff diff = 1;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1718,6 +1747,7 @@ service SekaiService {
   rpc MergeDefinitionProposal(MergeDefinitionProposalRequest) returns (MergeDefinitionProposalResponse);
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
+  rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);

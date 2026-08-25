@@ -6,6 +6,7 @@ use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput,
     DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
 };
+use sekai_chisei::sekai::definition_diff::compare_definition_revisions;
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
     CreateDefinitionProposal, MergeDefinitionProposal, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
@@ -531,10 +532,74 @@ fn exercise_concurrent_stale_head(db: Arc<dyn DefinitionBranchBackend>, namespac
     );
 }
 
+fn exercise_revision_diff(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent_digest, create) = seed(db, namespace);
+    db.create_definition_branch(&create, "author", 2).unwrap();
+    let edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: parent_digest.clone(),
+        upserts: vec![
+            member(
+                namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title","body"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "action_type",
+                "AssignTicket",
+                r#"{"name":"AssignTicket"}"#,
+            ),
+            typed_member(namespace, "control", "retention", r#"{"mode":"strict"}"#),
+        ],
+        removals: Vec::new(),
+        idempotency_key: "edit-diff".into(),
+    };
+    let DefinitionWriteResult::ApplyEdit { result } =
+        db.apply_definition_branch_edit(&edit, "author", 3).unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    let from = db
+        .get_definition_revision(namespace, &parent_digest)
+        .unwrap()
+        .unwrap();
+    let to = db
+        .get_definition_revision(namespace, &result.revision.revision_digest)
+        .unwrap()
+        .unwrap();
+    let from_members = db
+        .get_definition_members(namespace, &from.revision_digest)
+        .unwrap();
+    let to_members = db
+        .get_definition_members(namespace, &to.revision_digest)
+        .unwrap();
+    let diff = compare_definition_revisions(&from, &from_members, &to, &to_members).unwrap();
+    assert_eq!(
+        diff.added
+            .iter()
+            .map(|change| change.member_id.as_str())
+            .collect::<Vec<_>>(),
+        ["AssignTicket", "retention"]
+    );
+    assert!(diff.removed.is_empty());
+    assert_eq!(diff.changed.len(), 1);
+    assert_eq!(diff.changed[0].member_id, "Ticket");
+    assert_eq!(diff.changed[0].added_properties, ["body", "title"]);
+    let replay = compare_definition_revisions(&from, &from_members, &to, &to_members).unwrap();
+    assert_eq!(diff, replay);
+    let missing = db
+        .get_definition_revision(namespace, &format!("sha256:{}", "a".repeat(64)))
+        .unwrap();
+    assert!(missing.is_none());
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
     exercise_backend(&SekaiDb::new(":memory:").unwrap(), "sqlite-definition");
     exercise_proposal_publish(&SekaiDb::new(":memory:").unwrap(), "sqlite-proposal");
+    exercise_revision_diff(&SekaiDb::new(":memory:").unwrap(), "sqlite-diff");
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -558,5 +623,6 @@ fn postgres_definition_branch_backend_conformance() {
     let db = Arc::new(postgres());
     exercise_backend(db.as_ref(), &prefix);
     exercise_proposal_publish(db.as_ref(), &format!("{prefix}-proposal"));
+    exercise_revision_diff(db.as_ref(), &format!("{prefix}-diff"));
     exercise_concurrent_stale_head(db, &format!("{prefix}-concurrent"));
 }
