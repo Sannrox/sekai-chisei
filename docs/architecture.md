@@ -75,8 +75,9 @@ A proposal pins exact base and candidate digests; merge compare-and-swaps the
 namespace published head against an expected digest, stores a receipt in the
 same transaction, and denies candidates that do not descend from the pinned
 base. Close records a canonical reason without moving the head. See
-[Governed definition branches](definition-branches.md) and
-[ADR 0024](decisions/0024-governed-definition-branches.md).
+[Governed definition branches](definition-branches.md),
+[ADR 0024](decisions/0024-governed-definition-branches.md), and
+[ADR 0026](decisions/0026-governed-branch-proposals.md).
 
 Explicit namespace activation can add immutable object-security policy
 revisions to direct object read, `ListObjects`, remaining object consumers, and
