@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compare two authorized definition revisions and report deterministic added,
+  removed, and changed types, properties, links, actions, and controls without
+  returning definition bodies. Unknown constructs and unauthorized revisions
+  fail closed. Compatibility classification and fact migration remain separate.
 - Record governed branch proposals as ADR 0026: a change set is a digest-bound
   proposal that compare-and-swaps one namespace published head. Live approval
   is rechecked at merge; signatures, discovery, and package identity are not

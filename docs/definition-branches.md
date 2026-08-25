@@ -4,7 +4,7 @@ Governed definition branches let an authorized schema author evolve one exact
 namespace-scoped definition revision without changing published definitions or
 runtime facts. The experimental product-tier contract now also publishes or
 rejects one pinned candidate through a proposal. It does not yet preview,
-compare, rebase, or migrate facts.
+rebase, or migrate facts.
 
 ## Contract
 
@@ -66,6 +66,13 @@ receipt.
 moving the published head. Merge of a closed proposal remains denied.
 `GetPublishedDefinitionRevision` returns the current published pointer.
 
+`CompareDefinitionRevisions` takes two revision digests in one namespace. It
+reauthorizes every member on both revisions, then reports added, removed, and
+changed members in kind-then-id order. Changed object-type properties are
+named without returning definition JSON. Unknown property constructs fail
+closed. Unauthorized or missing revisions are unavailable and do not
+distinguish hidden from absent members.
+
 ## Content identity
 
 Member contract `sekai.definition-member/v1` supports these domain-neutral
@@ -122,7 +129,10 @@ its immutable revision and audit evidence.
   mutable schema or ontology rows.
 - A branch cannot yet be rebased, previewed, archived, or used to migrate
   runtime facts.
-- Revision differences and compatibility classifications are not inferred.
+- `CompareDefinitionRevisions` reports deterministic added, removed, and
+  changed members and property keys between two authorized revisions without
+  returning definition bodies. Compatibility classification and fact migration
+  remain separate contracts.
 - Runtime facts and source bindings remain attached to their existing type
   identities.
 - Package identity is not a runtime grant. Evaluation-plan digests on a

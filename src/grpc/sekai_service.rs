@@ -54,6 +54,7 @@ use crate::sekai::action_work_lifecycle::{
 use crate::sekai::attestation;
 use crate::sekai::capability;
 use crate::sekai::definition_branch as definition_branch_domain;
+use crate::sekai::definition_diff as definition_diff_domain;
 use crate::sekai::definition_proposal as definition_proposal_domain;
 use crate::sekai::evidence as evidence_domain;
 use crate::sekai::evidence_admission_lifecycle::{
@@ -3325,6 +3326,45 @@ fn to_proto_definition_branch(
     }
 }
 
+fn to_proto_definition_revision_diff(
+    diff: &definition_diff_domain::DefinitionRevisionDiff,
+) -> DefinitionRevisionDiff {
+    DefinitionRevisionDiff {
+        from_revision_digest: diff.from_revision_digest.clone(),
+        to_revision_digest: diff.to_revision_digest.clone(),
+        diff_digest: diff.diff_digest.clone(),
+        added: diff
+            .added
+            .iter()
+            .map(to_proto_definition_member_change)
+            .collect(),
+        removed: diff
+            .removed
+            .iter()
+            .map(to_proto_definition_member_change)
+            .collect(),
+        changed: diff
+            .changed
+            .iter()
+            .map(to_proto_definition_member_change)
+            .collect(),
+    }
+}
+
+fn to_proto_definition_member_change(
+    change: &definition_diff_domain::DefinitionMemberChange,
+) -> DefinitionMemberChange {
+    DefinitionMemberChange {
+        member_kind: change.member_kind.clone(),
+        member_id: change.member_id.clone(),
+        from_member_digest: change.from_member_digest.clone(),
+        to_member_digest: change.to_member_digest.clone(),
+        added_properties: change.added_properties.clone(),
+        removed_properties: change.removed_properties.clone(),
+        changed_properties: change.changed_properties.clone(),
+    }
+}
+
 fn to_proto_definition_revision(
     revision: &definition_branch_domain::DefinitionRevision,
 ) -> DefinitionRevision {
@@ -3363,8 +3403,11 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_proposal_no_change")
         || error.starts_with("foreign_authority_is_not_a_grant")
         || error.starts_with("incompatible_definition_proposal_candidate")
+        || error.starts_with("definition_revision_conflict")
     {
         Status::failed_precondition("definition write is not current")
+    } else if error.starts_with("unknown_definition_construct") {
+        Status::failed_precondition("definition compare encountered an unknown construct")
     } else if error.starts_with("definition_edit_no_change") {
         Status::failed_precondition("definition edit has no effect")
     } else if error.starts_with("definition_idempotency_conflict")
@@ -4632,6 +4675,72 @@ impl SekaiService for SekaiServiceImpl {
         )?;
         Ok(Response::new(GetPublishedDefinitionRevisionResponse {
             revision: Some(to_proto_definition_revision(&revision)),
+        }))
+    }
+
+    async fn compare_definition_revisions(
+        &self,
+        req: Request<CompareDefinitionRevisionsRequest>,
+    ) -> Result<Response<CompareDefinitionRevisionsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        definition_branch_domain::validate_digest(
+            "from_revision_digest",
+            &input.from_revision_digest,
+        )
+        .map_err(Status::invalid_argument)?;
+        definition_branch_domain::validate_digest("to_revision_digest", &input.to_revision_digest)
+            .map_err(Status::invalid_argument)?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &input.namespace,
+            &input.from_revision_digest,
+            false,
+        )?;
+        authorize_definition_revision(
+            self,
+            &principals,
+            &input.namespace,
+            &input.to_revision_digest,
+            false,
+        )?;
+        let from = self
+            .db
+            .get_definition_revision(&input.namespace, &input.from_revision_digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+        let to = self
+            .db
+            .get_definition_revision(&input.namespace, &input.to_revision_digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+        let from_members = self
+            .db
+            .get_definition_members(&input.namespace, &from.revision_digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))?;
+        let to_members = self
+            .db
+            .get_definition_members(&input.namespace, &to.revision_digest)
+            .map_err(|_| Status::internal("definition revision unavailable"))?;
+        let diff = definition_diff_domain::compare_definition_revisions(
+            &from,
+            &from_members,
+            &to,
+            &to_members,
+        )
+        .map_err(map_definition_write_error)?;
+        Ok(Response::new(CompareDefinitionRevisionsResponse {
+            diff: Some(to_proto_definition_revision_diff(&diff)),
         }))
     }
 
@@ -8511,6 +8620,79 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
         assert_eq!(error.message(), "schema admin required");
+    }
+
+    #[tokio::test]
+    async fn compare_definition_revisions_hides_unauthorized_members() {
+        let svc = service();
+        let parent = seed_definition_parent(&svc, "definition-diff");
+        grant_source_namespace(&svc, "definition-diff", "tester", security::Role::Editor);
+        svc.create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: "definition-diff".into(),
+                branch_id: "feature".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: "definition-diff".into(),
+                    branch_id: "feature".into(),
+                    expected_head_digest: parent.revision_digest.clone(),
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: "object_type".into(),
+                        member_id: "Ticket".into(),
+                        definition_json: r#"{"name":"Ticket","properties":["title","body"]}"#
+                            .into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: "edit-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let denied = svc
+            .compare_definition_revisions(with_named_principal(
+                CompareDefinitionRevisionsRequest {
+                    namespace: "definition-diff".into(),
+                    from_revision_digest: parent.revision_digest.clone(),
+                    to_revision_digest: applied.revision.as_ref().unwrap().revision_digest.clone(),
+                },
+                "nobody",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            denied.code() == tonic::Code::PermissionDenied
+                || denied.code() == tonic::Code::NotFound,
+            "{}",
+            denied.code()
+        );
+        let compared = svc
+            .compare_definition_revisions(with_named_principal(
+                CompareDefinitionRevisionsRequest {
+                    namespace: "definition-diff".into(),
+                    from_revision_digest: parent.revision_digest,
+                    to_revision_digest: applied.revision.unwrap().revision_digest,
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let diff = compared.diff.unwrap();
+        assert_eq!(diff.changed[0].member_id, "Ticket");
+        assert_eq!(diff.changed[0].added_properties, ["body", "title"]);
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
     }
 
     #[tokio::test]
