@@ -3291,6 +3291,48 @@ fn authorize_definition_revision(
     Ok(())
 }
 
+fn load_authorized_definition_revisions(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+    from_revision_digest: &str,
+    to_revision_digest: &str,
+) -> Result<
+    (
+        definition_branch_domain::DefinitionRevision,
+        Vec<definition_branch_domain::DefinitionMember>,
+        definition_branch_domain::DefinitionRevision,
+        Vec<definition_branch_domain::DefinitionMember>,
+    ),
+    Status,
+> {
+    definition_branch_domain::validate_digest("from_revision_digest", from_revision_digest)
+        .map_err(Status::invalid_argument)?;
+    definition_branch_domain::validate_digest("to_revision_digest", to_revision_digest)
+        .map_err(Status::invalid_argument)?;
+    authorize_definition_revision(service, principals, namespace, from_revision_digest, false)?;
+    authorize_definition_revision(service, principals, namespace, to_revision_digest, false)?;
+    let from = service
+        .db
+        .get_definition_revision(namespace, from_revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let to = service
+        .db
+        .get_definition_revision(namespace, to_revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?
+        .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
+    let from_members = service
+        .db
+        .get_definition_members(namespace, &from.revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    let to_members = service
+        .db
+        .get_definition_members(namespace, &to.revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    Ok((from, from_members, to, to_members))
+}
+
 fn from_proto_definition_member_input(
     member: &DefinitionMemberInput,
 ) -> definition_branch_domain::DefinitionMemberInput {
@@ -3362,6 +3404,35 @@ fn to_proto_definition_member_change(
         added_properties: change.added_properties.clone(),
         removed_properties: change.removed_properties.clone(),
         changed_properties: change.changed_properties.clone(),
+    }
+}
+
+fn to_proto_definition_revision_compatibility(
+    report: &definition_diff_domain::DefinitionRevisionCompatibility,
+) -> DefinitionRevisionCompatibility {
+    DefinitionRevisionCompatibility {
+        from_revision_digest: report.from_revision_digest.clone(),
+        to_revision_digest: report.to_revision_digest.clone(),
+        compatibility_digest: report.compatibility_digest.clone(),
+        class: report.class.clone(),
+        reasons: report
+            .reasons
+            .iter()
+            .map(to_proto_definition_compatibility_reason)
+            .collect(),
+        diff: Some(to_proto_definition_revision_diff(&report.diff)),
+    }
+}
+
+fn to_proto_definition_compatibility_reason(
+    reason: &definition_diff_domain::DefinitionCompatibilityReason,
+) -> DefinitionCompatibilityReason {
+    DefinitionCompatibilityReason {
+        class: reason.class.clone(),
+        member_kind: reason.member_kind.clone(),
+        member_id: reason.member_id.clone(),
+        code: reason.code.clone(),
+        property: reason.property.clone(),
     }
 }
 
@@ -4693,45 +4764,13 @@ impl SekaiService for SekaiServiceImpl {
             &input.namespace,
             false,
         )?;
-        definition_branch_domain::validate_digest(
-            "from_revision_digest",
-            &input.from_revision_digest,
-        )
-        .map_err(Status::invalid_argument)?;
-        definition_branch_domain::validate_digest("to_revision_digest", &input.to_revision_digest)
-            .map_err(Status::invalid_argument)?;
-        authorize_definition_revision(
+        let (from, from_members, to, to_members) = load_authorized_definition_revisions(
             self,
             &principals,
             &input.namespace,
             &input.from_revision_digest,
-            false,
-        )?;
-        authorize_definition_revision(
-            self,
-            &principals,
-            &input.namespace,
             &input.to_revision_digest,
-            false,
         )?;
-        let from = self
-            .db
-            .get_definition_revision(&input.namespace, &input.from_revision_digest)
-            .map_err(|_| Status::internal("definition revision unavailable"))?
-            .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
-        let to = self
-            .db
-            .get_definition_revision(&input.namespace, &input.to_revision_digest)
-            .map_err(|_| Status::internal("definition revision unavailable"))?
-            .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
-        let from_members = self
-            .db
-            .get_definition_members(&input.namespace, &from.revision_digest)
-            .map_err(|_| Status::internal("definition revision unavailable"))?;
-        let to_members = self
-            .db
-            .get_definition_members(&input.namespace, &to.revision_digest)
-            .map_err(|_| Status::internal("definition revision unavailable"))?;
         let diff = definition_diff_domain::compare_definition_revisions(
             &from,
             &from_members,
@@ -4742,6 +4781,42 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(CompareDefinitionRevisionsResponse {
             diff: Some(to_proto_definition_revision_diff(&diff)),
         }))
+    }
+
+    async fn classify_definition_revision_compatibility(
+        &self,
+        req: Request<ClassifyDefinitionRevisionCompatibilityRequest>,
+    ) -> Result<Response<ClassifyDefinitionRevisionCompatibilityResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let (from, from_members, to, to_members) = load_authorized_definition_revisions(
+            self,
+            &principals,
+            &input.namespace,
+            &input.from_revision_digest,
+            &input.to_revision_digest,
+        )?;
+        let compatibility = definition_diff_domain::classify_definition_revision_compatibility(
+            &from,
+            &from_members,
+            &to,
+            &to_members,
+        )
+        .map_err(map_definition_write_error)?;
+        Ok(Response::new(
+            ClassifyDefinitionRevisionCompatibilityResponse {
+                compatibility: Some(to_proto_definition_revision_compatibility(&compatibility)),
+            },
+        ))
     }
 
     async fn create_handoff(
@@ -8680,8 +8755,8 @@ mod tests {
             .compare_definition_revisions(with_named_principal(
                 CompareDefinitionRevisionsRequest {
                     namespace: "definition-diff".into(),
-                    from_revision_digest: parent.revision_digest,
-                    to_revision_digest: applied.revision.unwrap().revision_digest,
+                    from_revision_digest: parent.revision_digest.clone(),
+                    to_revision_digest: applied.revision.as_ref().unwrap().revision_digest.clone(),
                 },
                 "root",
             ))
@@ -8693,6 +8768,41 @@ mod tests {
         assert_eq!(diff.changed[0].added_properties, ["body", "title"]);
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
+        let classified = svc
+            .classify_definition_revision_compatibility(with_named_principal(
+                ClassifyDefinitionRevisionCompatibilityRequest {
+                    namespace: "definition-diff".into(),
+                    from_revision_digest: parent.revision_digest.clone(),
+                    to_revision_digest: applied.revision.as_ref().unwrap().revision_digest.clone(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let compatibility = classified.compatibility.unwrap();
+        assert_eq!(compatibility.class, "compatible");
+        assert_eq!(compatibility.reasons[0].code, "added_optional_property");
+        assert_eq!(compatibility.reasons[0].property, "body");
+        let denied_classify = svc
+            .classify_definition_revision_compatibility(with_named_principal(
+                ClassifyDefinitionRevisionCompatibilityRequest {
+                    namespace: "definition-diff".into(),
+                    from_revision_digest: parent.revision_digest,
+                    to_revision_digest: applied.revision.unwrap().revision_digest,
+                },
+                "nobody",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            denied_classify.code() == tonic::Code::PermissionDenied
+                || denied_classify.code() == tonic::Code::NotFound,
+            "{}",
+            denied_classify.code()
+        );
+        assert!(!denied_classify.message().contains("Ticket"));
+        assert!(!denied_classify.message().contains("body"));
     }
 
     #[tokio::test]
