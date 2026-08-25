@@ -128,5 +128,7 @@ its immutable revision and audit evidence.
 - Package identity is not a runtime grant. Evaluation-plan digests on a
   proposal are frozen references, not a second merge protocol.
 
-See [ADR 0024](decisions/0024-governed-definition-branches.md) for the durable
-design and [the native protocol](../proto/sekai.proto) for exact messages.
+See [ADR 0024](decisions/0024-governed-definition-branches.md) for the
+branch/revision foundation, [ADR 0026](decisions/0026-governed-branch-proposals.md)
+for publication as a digest-bound proposal, and
+[the native protocol](../proto/sekai.proto) for exact messages.

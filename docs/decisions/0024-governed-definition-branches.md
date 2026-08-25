@@ -6,7 +6,7 @@
 - Discussion: https://github.com/Sannrox/sekai-chisei/discussions/722
 - Supersedes: none
 - Superseded by: none
-- Related: ADR 0020, Issue #666
+- Related: ADR 0020, ADR 0026, Issue #666
 
 ## Context
 

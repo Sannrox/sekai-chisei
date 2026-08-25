@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Record governed branch proposals as ADR 0026: a change set is a digest-bound
+  proposal that compare-and-swaps one namespace published head. Live approval
+  is rechecked at merge; signatures, discovery, and package identity are not
+  grants. ADR 0024 remains the branch/revision foundation.
 - Apply activated `sekai.object-security-policy/v1` rules to writes, traversal,
   linked-object reads, lineage, synchronization, object-bound leases, and
   authority-bound `ListObjects` cursors. Read rules do not grant mutation;
