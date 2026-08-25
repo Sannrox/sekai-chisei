@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+- Classify two authorized definition revisions as compatible, conditional,
+  breaking, or unknown with bounded member and property reasons. Added optional
+  types and properties are compatible; new actions, controls, and marking
+  changes are conditional; removed members or properties and newly required
+  properties are breaking. Unknown constructs and unauthorized revisions fail
+  closed. Fact migration remains a separate contract.
 - Compare two authorized definition revisions and report deterministic added,
   removed, and changed types, properties, links, actions, and controls without
   returning definition bodies. Unknown constructs and unauthorized revisions
-  fail closed. Compatibility classification and fact migration remain separate.
+  fail closed.
 - Record governed branch proposals as ADR 0026: a change set is a digest-bound
   proposal that compare-and-swaps one namespace published head. Live approval
   is rechecked at merge; signatures, discovery, and package identity are not

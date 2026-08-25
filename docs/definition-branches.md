@@ -3,8 +3,8 @@
 Governed definition branches let an authorized schema author evolve one exact
 namespace-scoped definition revision without changing published definitions or
 runtime facts. The experimental product-tier contract now also publishes or
-rejects one pinned candidate through a proposal. It does not yet preview,
-rebase, or migrate facts.
+rejects one pinned candidate through a proposal, compares two revisions, and
+classifies compatibility. It does not yet preview, rebase, or migrate facts.
 
 ## Contract
 
@@ -73,6 +73,32 @@ named without returning definition JSON. Unknown property constructs fail
 closed. Unauthorized or missing revisions are unavailable and do not
 distinguish hidden from absent members.
 
+`ClassifyDefinitionRevisionCompatibility` reuses that authorized comparison
+and assigns a worst-wins class of `compatible`, `conditional`, `breaking`, or
+`unknown`, with content-bound reasons that name member identities, property
+keys, and reason codes. Reason volume inherits the revision member and
+definition-byte ceilings. It does not return definition bodies, mutate a
+published parent, or execute a fact migration.
+
+Classification vocabulary:
+
+- `compatible`: additive optional properties and new `object_type`,
+  `interface_type`, `ontology_class`, `ontology_relation`, or `link_type`
+  members. Removing a required constraint without removing the property is
+  compatible.
+- `conditional`: new `action_type` or `control` members, `access_marking`
+  changes, and known field changes such as `name` or `mode`. These require
+  live authorization or review before effect; they are not silent success.
+- `breaking`: removed members, removed properties, and newly required
+  properties. Breaking changes need an approved migration path before facts
+  can follow the candidate.
+- `unknown`: a well-formed change the classifier does not map, such as an
+  unrecognized field. Unknown is never treated as compatible.
+
+Malformed `properties`, `required`, or `access_marking` constructs fail closed
+instead of producing a class. The compatibility digest binds both revision
+digests, the class, the ordered reasons, and the compare digest.
+
 ## Content identity
 
 Member contract `sekai.definition-member/v1` supports these domain-neutral
@@ -131,8 +157,10 @@ its immutable revision and audit evidence.
   runtime facts.
 - `CompareDefinitionRevisions` reports deterministic added, removed, and
   changed members and property keys between two authorized revisions without
-  returning definition bodies. Compatibility classification and fact migration
-  remain separate contracts.
+  returning definition bodies.
+- `ClassifyDefinitionRevisionCompatibility` classifies that same authorized
+  pair as compatible, conditional, breaking, or unknown. Fact migration remains
+  a separate contract.
 - Runtime facts and source bindings remain attached to their existing type
   identities.
 - Package identity is not a runtime grant. Evaluation-plan digests on a

@@ -3,10 +3,12 @@ use std::sync::{Arc, Barrier};
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::definition_branch::{
-    ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput,
+    ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
     DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
 };
-use sekai_chisei::sekai::definition_diff::compare_definition_revisions;
+use sekai_chisei::sekai::definition_diff::{
+    classify_definition_revision_compatibility, compare_definition_revisions,
+};
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
     CreateDefinitionProposal, MergeDefinitionProposal, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
@@ -595,11 +597,138 @@ fn exercise_revision_diff(db: &dyn DefinitionBranchBackend, namespace: &str) {
     assert!(missing.is_none());
 }
 
+fn exercise_revision_compatibility(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent_digest, create) = seed(db, namespace);
+    db.create_definition_branch(&create, "author", 2).unwrap();
+    let compatible_edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: parent_digest.clone(),
+        upserts: vec![
+            member(
+                namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "link_type",
+                "AssignedTo",
+                r#"{"name":"AssignedTo"}"#,
+            ),
+        ],
+        removals: Vec::new(),
+        idempotency_key: "edit-compatible".into(),
+    };
+    let DefinitionWriteResult::ApplyEdit { result: compatible } = db
+        .apply_definition_branch_edit(&compatible_edit, "author", 3)
+        .unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    let from = db
+        .get_definition_revision(namespace, &parent_digest)
+        .unwrap()
+        .unwrap();
+    let compatible_to = db
+        .get_definition_revision(namespace, &compatible.revision.revision_digest)
+        .unwrap()
+        .unwrap();
+    let from_members = db
+        .get_definition_members(namespace, &from.revision_digest)
+        .unwrap();
+    let compatible_members = db
+        .get_definition_members(namespace, &compatible_to.revision_digest)
+        .unwrap();
+    let compatible_report = classify_definition_revision_compatibility(
+        &from,
+        &from_members,
+        &compatible_to,
+        &compatible_members,
+    )
+    .unwrap();
+    assert_eq!(compatible_report.class, "compatible");
+    let replay = classify_definition_revision_compatibility(
+        &from,
+        &from_members,
+        &compatible_to,
+        &compatible_members,
+    )
+    .unwrap();
+    assert_eq!(compatible_report, replay);
+
+    let mixed_edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: compatible.revision.revision_digest.clone(),
+        upserts: vec![
+            member(
+                namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title"],"required":["title"],"access_marking":"restricted"}"#,
+            ),
+            typed_member(namespace, "action_type", "Assign", r#"{"name":"Assign"}"#),
+            typed_member(namespace, "control", "retention", r#"{"mode":"strict"}"#),
+        ],
+        removals: vec![DefinitionMemberRef {
+            member_kind: "link_type".into(),
+            member_id: "AssignedTo".into(),
+        }],
+        idempotency_key: "edit-breaking".into(),
+    };
+    let DefinitionWriteResult::ApplyEdit { result: mixed } = db
+        .apply_definition_branch_edit(&mixed_edit, "author", 4)
+        .unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    let mixed_to = db
+        .get_definition_revision(namespace, &mixed.revision.revision_digest)
+        .unwrap()
+        .unwrap();
+    let mixed_members = db
+        .get_definition_members(namespace, &mixed_to.revision_digest)
+        .unwrap();
+    let mixed_report = classify_definition_revision_compatibility(
+        &compatible_to,
+        &compatible_members,
+        &mixed_to,
+        &mixed_members,
+    )
+    .unwrap();
+    assert_eq!(mixed_report.class, "breaking");
+    assert!(
+        mixed_report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "added_required_property")
+    );
+    assert!(
+        mixed_report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "removed_member" && reason.member_id == "AssignedTo")
+    );
+    assert!(
+        mixed_report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "added_action_type")
+    );
+    assert!(
+        mixed_report
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "changed_marking")
+    );
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
     exercise_backend(&SekaiDb::new(":memory:").unwrap(), "sqlite-definition");
     exercise_proposal_publish(&SekaiDb::new(":memory:").unwrap(), "sqlite-proposal");
     exercise_revision_diff(&SekaiDb::new(":memory:").unwrap(), "sqlite-diff");
+    exercise_revision_compatibility(&SekaiDb::new(":memory:").unwrap(), "sqlite-compat");
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -624,5 +753,6 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_backend(db.as_ref(), &prefix);
     exercise_proposal_publish(db.as_ref(), &format!("{prefix}-proposal"));
     exercise_revision_diff(db.as_ref(), &format!("{prefix}-diff"));
+    exercise_revision_compatibility(db.as_ref(), &format!("{prefix}-compat"));
     exercise_concurrent_stale_head(db, &format!("{prefix}-concurrent"));
 }
