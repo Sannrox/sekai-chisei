@@ -178,8 +178,13 @@ backend transaction and closes the batch as `COMMITTED` or `ABORTED`.
 - `COMMITTED` means all graph objects, object-change audit rows, source
   identities, lineage projections, per-record results, and the checkpoint
   committed together.
-- `ABORTED` means a post-open conflict was proven. No object or checkpoint
-  mutation from that batch committed.
+- `ABORTED` means a post-open ordered-feed conflict was proven. No object or
+  checkpoint mutation from that batch committed. Exact replay of an abort
+  cannot become success.
+- `QUARANTINED` means the batch was schema-incompatible with the admitted
+  type identity or immutable source revision. Record results, reason codes,
+  and the denial outcome are stored. No object or checkpoint mutation from
+  that batch committed. Exact replay returns the stored quarantine.
 - A storage failure may leave matching durable `OPEN` evidence. Retrying the
   exact batch resumes it; a different batch cannot overtake it.
 - Exact committed replay returns the stored result and does not mutate again.
@@ -207,10 +212,13 @@ authoritative evidence.
 - A later observation may refresh properties and source version but cannot
   change type kind, type revision, source binding, or object id.
 - Reusing the same immutable source version with a different payload digest,
-  display name, or projected properties fails as `source_revision_conflict`;
-  the object and checkpoint remain unchanged. The same version and projected
-  content may be retried or refreshed, while a different source version may
-  advance normally.
+  display name, or projected properties, or changing the bound type identity,
+  is quarantined as a retained denial. The object and checkpoint remain
+  unchanged. Exact replay of that batch returns the stored quarantine result
+  and cannot become success. Additive optional properties on a new source
+  version still commit. Malformed reserved properties and invalid checkpoints
+  fail closed before mutation. The same version and projected content may be
+  retried; a different source version may advance normally.
 - Generic object update and delete paths reject source-owned projections.
   Refresh and tombstone changes must arrive through `ApplySourceBatch`.
 - Delete observations tombstone the same object; they do not mint a new id.

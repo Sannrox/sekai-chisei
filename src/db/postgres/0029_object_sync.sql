@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sekai_source_batch_transactions (
     batch_json TEXT NOT NULL,
     current_cursor TEXT NOT NULL,
     proposed_next_cursor TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED')),
+    status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED', 'QUARANTINED')),
     outcome TEXT NOT NULL CHECK(outcome IN ('success', 'denial', 'unavailable')),
     opened_at_ms BIGINT NOT NULL,
     closed_at_ms BIGINT,

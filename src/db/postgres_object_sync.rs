@@ -14,7 +14,7 @@ use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_GITHUB, SourceBatch, SourceBatchResult,
     SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
     SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
-    SyncDecision,
+    SyncDecision, SyncedObject, is_schema_drift_denial, schema_quarantine_record_reason,
 };
 
 const SOURCE_LOCK_SEED: i64 = 665;
@@ -129,7 +129,7 @@ impl PostgresDb {
                 ));
             }
             return match stored.transaction.status {
-                SourceBatchStatus::Committed => {
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
                     let result = parse_stored_result(&stored)?;
                     transaction.commit()?;
                     Ok(OpenDisposition::Committed(Box::new(result)))
@@ -207,7 +207,7 @@ impl PostgresDb {
         };
 
         if batch.contract_version != SOURCE_BATCH_V2_VERSION {
-            preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)?;
+            preflight_cursor_and_delivery(&mut transaction, &binding.binding, batch)?;
         }
         let open_exists: bool = transaction
             .query_one(
@@ -319,7 +319,7 @@ impl PostgresDb {
             ));
         }
         match stored.transaction.status {
-            SourceBatchStatus::Committed => {
+            SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
                 let result = parse_stored_result(&stored)?;
                 transaction.commit()?;
                 return Ok(result);
@@ -346,6 +346,19 @@ impl PostgresDb {
         if let Err(error) = preflight {
             if !error.is_denial() {
                 return Err(error);
+            }
+            if is_schema_drift_denial(error.code()) {
+                let result = persist_schema_quarantine(
+                    &mut transaction,
+                    &binding.binding,
+                    batch,
+                    prepared,
+                    &stored,
+                    now_ms,
+                    &error,
+                )?;
+                transaction.commit()?;
+                return Ok(result);
             }
             if error.code() == Some("missing_range") {
                 mark_generation_recovery_required(
@@ -679,9 +692,8 @@ impl PostgresDb {
             load_latest_transaction(&mut transaction, &binding.binding.binding_id, "OPEN")
                 .map_err(|error| error.to_string())?
                 .map(|stored| stored.transaction);
-        let last_stored =
-            load_latest_transaction(&mut transaction, &binding.binding.binding_id, "COMMITTED")
-                .map_err(|error| error.to_string())?;
+        let last_stored = load_latest_closed_result(&mut transaction, &binding.binding.binding_id)
+            .map_err(|error| error.to_string())?;
         let last_result = last_stored
             .as_ref()
             .map(parse_stored_result)
@@ -753,11 +765,10 @@ fn lock_batch_identities(
     Ok(())
 }
 
-fn preflight_commit_state(
+fn preflight_cursor_and_delivery(
     transaction: &mut postgres::Transaction<'_>,
     binding: &SourceBinding,
     batch: &SourceBatch,
-    records: &[PreparedRecord],
 ) -> Result<(), ApplyError> {
     let checkpoint = load_checkpoint(transaction, &binding.binding_id)?;
     match checkpoint {
@@ -775,7 +786,22 @@ fn preflight_commit_state(
         }
         Some(_) | None => {}
     }
-    preflight_delivery_state(transaction, binding, batch)?;
+    preflight_delivery_state(transaction, binding, batch)
+}
+
+fn preflight_commit_state(
+    transaction: &mut postgres::Transaction<'_>,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+    records: &[PreparedRecord],
+) -> Result<(), ApplyError> {
+    preflight_cursor_and_delivery(transaction, binding, batch)?;
+    if binding.type_digest != batch.type_digest {
+        return Err(ApplyError::denied(
+            "binding_type_conflict",
+            "source binding cannot move across type revisions",
+        ));
+    }
 
     let mut object_ids = records
         .iter()
@@ -1353,6 +1379,7 @@ fn stored_batch_from_row(row: Row) -> Result<StoredBatch, ApplyError> {
         "OPEN" => SourceBatchStatus::Open,
         "COMMITTED" => SourceBatchStatus::Committed,
         "ABORTED" => SourceBatchStatus::Aborted,
+        "QUARANTINED" => SourceBatchStatus::Quarantined,
         _ => return Err(ApplyError::storage("invalid source batch status")),
     };
     let outcome: String = row.get(9);
@@ -1426,10 +1453,192 @@ fn optional_u64_from_i64(value: Option<i64>) -> Result<Option<u64>, ApplyError> 
     value.map(u64_from_i64).transpose()
 }
 
-fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
-    if stored.transaction.status != SourceBatchStatus::Committed || stored.result_json.is_empty() {
+fn load_latest_closed_result(
+    client: &mut impl GenericClient,
+    binding_id: &str,
+) -> Result<Option<StoredBatch>, ApplyError> {
+    let committed = load_latest_transaction(client, binding_id, "COMMITTED")?;
+    let quarantined = load_latest_transaction(client, binding_id, "QUARANTINED")?;
+    Ok(match (committed, quarantined) {
+        (None, None) => None,
+        (Some(result), None) | (None, Some(result)) => Some(result),
+        (Some(left), Some(right)) => {
+            let left_closed = left
+                .transaction
+                .closed_at_ms
+                .unwrap_or(left.transaction.opened_at_ms);
+            let right_closed = right
+                .transaction
+                .closed_at_ms
+                .unwrap_or(right.transaction.opened_at_ms);
+            if (left_closed, left.transaction.transaction_id.as_str())
+                >= (right_closed, right.transaction.transaction_id.as_str())
+            {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
+    })
+}
+
+fn persist_schema_quarantine(
+    transaction: &mut postgres::Transaction<'_>,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+    prepared: &PreparedBatch,
+    stored: &StoredBatch,
+    now_ms: i64,
+    error: &ApplyError,
+) -> Result<SourceBatchResult, ApplyError> {
+    let batch_reason = error.to_string();
+    let mut record_results = Vec::with_capacity(prepared.records.len());
+    for prepared_record in &prepared.records {
+        let identity = load_identity(
+            transaction,
+            &batch.namespace,
+            &prepared_record.source_id,
+            true,
+        )?;
+        let object = load_object(transaction, &prepared_record.object.object_id, true)?;
+        let admitted = identity.as_ref().map(|identity| SyncedObject {
+            object_id: identity.object_id.clone(),
+            type_name: identity.type_name.clone(),
+            source_id: prepared_record.source_id.clone(),
+            source_version: identity.source_version.clone(),
+            payload_digest: identity.payload_digest.clone(),
+            properties: object
+                .as_ref()
+                .map(|object| {
+                    object
+                        .properties
+                        .iter()
+                        .filter(|(key, _)| {
+                            !crate::db::object_sync::RESERVED_SYNC_PROPERTIES
+                                .contains(&key.as_str())
+                        })
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            tombstoned: false,
+            type_digest: identity.type_digest.clone(),
+        });
+        let reason = schema_quarantine_record_reason(
+            &binding.type_digest,
+            &batch.type_digest,
+            admitted.as_ref(),
+            &prepared_record.object,
+            &batch_reason,
+        );
+        let decision = SyncDecision::Reject {
+            reason: reason.clone(),
+        };
+        let decision_json =
+            serde_json::to_string(&decision).map_err(|err| ApplyError::storage(err.to_string()))?;
+        let lineage_json = serde_json::to_string(&prepared_record.lineage)
+            .map_err(|err| ApplyError::storage(err.to_string()))?;
+        transaction.execute(
+            "INSERT INTO sekai_source_record_results (
+                transaction_id, source_id, source_version, decision_json,
+                outcome, reason, lineage_json, source_sequence
+             ) VALUES ($1, $2, $3, $4, 'denial', $5, $6, $7)",
+            &[
+                &prepared.transaction_id,
+                &prepared_record.source_id,
+                &prepared_record.object.source_version,
+                &decision_json,
+                &reason,
+                &lineage_json,
+                &prepared_record.source_sequence.map(|value| value as i64),
+            ],
+        )?;
+        record_results.push(SourceRecordResult {
+            transaction_id: prepared.transaction_id.clone(),
+            source_id: prepared_record.source_id.clone(),
+            source_version: prepared_record.object.source_version.clone(),
+            decision,
+            outcome: OperationOutcome::Denial,
+            reason,
+            source_sequence: prepared_record.source_sequence,
+        });
+    }
+    let quarantined_transaction = SourceBatchTransaction {
+        transaction_id: prepared.transaction_id.clone(),
+        binding_id: prepared.binding_id.clone(),
+        namespace: batch.namespace.clone(),
+        producer_identity: batch.producer_identity.clone(),
+        idempotency_key: batch.idempotency_key.clone(),
+        batch_digest: batch.batch_digest.clone(),
+        current_cursor: batch.current_cursor.clone(),
+        proposed_next_cursor: batch.proposed_next_cursor.clone(),
+        status: SourceBatchStatus::Quarantined,
+        outcome: OperationOutcome::Denial,
+        opened_at_ms: stored.transaction.opened_at_ms,
+        closed_at_ms: Some(now_ms),
+        reason: batch_reason.clone(),
+        contract_version: batch.contract_version.clone(),
+        delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
+        sync_generation: batch
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.sync_generation),
+        source_feed_epoch: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.source_feed_epoch.clone()),
+        offset_start: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.offset_start),
+        offset_end: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.offset_end),
+        snapshot_complete: batch
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.snapshot_complete),
+    };
+    let result = SourceBatchResult {
+        transaction: quarantined_transaction,
+        records: record_results,
+        checkpoint_advanced: false,
+    };
+    let result_json =
+        serde_json::to_string(&result).map_err(|err| ApplyError::storage(err.to_string()))?;
+    let updated = transaction.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status = 'QUARANTINED', outcome = 'denial', closed_at_ms = $1,
+             reason = $2, result_json = $3
+         WHERE transaction_id = $4 AND status = 'OPEN'",
+        &[
+            &now_ms,
+            &batch_reason,
+            &result_json,
+            &prepared.transaction_id,
+        ],
+    )?;
+    if updated != 1 {
         return Err(ApplyError::storage(
-            "committed source batch is missing its stored result",
+            "open source batch changed during schema quarantine",
+        ));
+    }
+    transaction.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
+        &[&now_ms, &prepared.binding_id],
+    )?;
+    Ok(result)
+}
+
+fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
+    if !matches!(
+        stored.transaction.status,
+        SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+    ) || stored.result_json.is_empty()
+    {
+        return Err(ApplyError::storage(
+            "closed source batch is missing its stored result",
         ));
     }
     serde_json::from_str(&stored.result_json).map_err(|error| {

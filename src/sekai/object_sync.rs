@@ -433,6 +433,18 @@ pub enum SourceBatchStatus {
     Open,
     Committed,
     Aborted,
+    Quarantined,
+}
+
+impl SourceBatchStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Committed => "COMMITTED",
+            Self::Aborted => "ABORTED",
+            Self::Quarantined => "QUARANTINED",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -652,6 +664,72 @@ pub fn detect_identity_conflict(
         return Some("source identity mapped to a different object id".into());
     }
     None
+}
+
+/// Schema-drift denials are retained as quarantine evidence. Cursor, authority,
+/// and ambiguous lifecycle denials still fail closed before a stored result.
+pub fn is_schema_drift_denial(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("type_identity_conflict")
+            | Some("source_revision_conflict")
+            | Some("binding_type_conflict")
+    )
+}
+
+/// Classify an incoming projection against the admitted source identity using
+/// the compatible/breaking/unknown vocabulary from type-revision comparison.
+pub fn classify_source_record_compatibility(
+    admitted: Option<&SyncedObject>,
+    incoming: &SyncedObject,
+) -> crate::sekai::definition_diff::DefinitionCompatibilityClass {
+    use crate::sekai::definition_diff::DefinitionCompatibilityClass;
+    let Some(admitted) = admitted else {
+        return DefinitionCompatibilityClass::Compatible;
+    };
+    if detect_identity_conflict(admitted, incoming).is_some()
+        || admitted.type_name != incoming.type_name
+    {
+        return DefinitionCompatibilityClass::Breaking;
+    }
+    if admitted.source_version == incoming.source_version
+        && (admitted.payload_digest != incoming.payload_digest
+            || admitted.properties != incoming.properties)
+    {
+        return DefinitionCompatibilityClass::Breaking;
+    }
+    DefinitionCompatibilityClass::Compatible
+}
+
+/// Per-record quarantine reason. Compatible siblings in a quarantined batch
+/// are labeled `batch_quarantined` instead of inheriting another record's
+/// conflict code.
+pub fn schema_quarantine_record_reason(
+    binding_type_digest: &str,
+    batch_type_digest: &str,
+    admitted: Option<&SyncedObject>,
+    incoming: &SyncedObject,
+    batch_reason: &str,
+) -> String {
+    use crate::sekai::definition_diff::DefinitionCompatibilityClass;
+    if binding_type_digest != batch_type_digest {
+        return batch_reason.to_string();
+    }
+    match classify_source_record_compatibility(admitted, incoming) {
+        DefinitionCompatibilityClass::Breaking => {
+            if admitted.is_some_and(|admitted| {
+                detect_identity_conflict(admitted, incoming).is_some()
+                    || admitted.type_name != incoming.type_name
+            }) {
+                "type_identity_conflict: source identity conflicts with its bound type or graph object"
+                    .into()
+            } else {
+                "source_revision_conflict: immutable source version is bound to different payload content"
+                    .into()
+            }
+        }
+        _ => format!("batch_quarantined: {batch_reason}"),
+    }
 }
 
 fn validate_delivery_envelope(batch: &SourceBatch) -> Result<(), SourceBatchValidationError> {
@@ -1734,5 +1812,38 @@ mod tests {
         moved.type_digest = "unbound-revision".into();
         moved.object_id = object_id_for(&moved.type_digest, &moved.source_id);
         assert!(detect_identity_conflict(&upserted, &moved).is_some());
+        assert_eq!(
+            classify_source_record_compatibility(Some(&upserted), &moved),
+            crate::sekai::definition_diff::DefinitionCompatibilityClass::Breaking
+        );
+        assert!(is_schema_drift_denial(Some("type_identity_conflict")));
+        assert!(!is_schema_drift_denial(Some("stale_cursor")));
+    }
+
+    #[test]
+    fn additive_property_refresh_is_compatible() {
+        let admitted = match sync_github_record(issue(), GITHUB_OBJECT_SYNC_TYPE_DIGEST) {
+            SyncDecision::Upsert(object) => object,
+            other => panic!("expected upsert, got {other:?}"),
+        };
+        let mut refreshed = admitted.clone();
+        refreshed.source_version = "issue-node-v8".into();
+        refreshed
+            .properties
+            .insert("body".into(), "additive field".into());
+        assert_eq!(
+            classify_source_record_compatibility(Some(&admitted), &refreshed),
+            crate::sekai::definition_diff::DefinitionCompatibilityClass::Compatible
+        );
+        assert!(
+            schema_quarantine_record_reason(
+                GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+                GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+                Some(&admitted),
+                &refreshed,
+                "type_identity_conflict: sibling",
+            )
+            .starts_with("batch_quarantined:")
+        );
     }
 }
