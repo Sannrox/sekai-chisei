@@ -1524,6 +1524,44 @@ fn principals_can_query_restricted_properties(principals: &[String]) -> bool {
         .any(|principal| principal == "root" || principal == "local")
 }
 
+fn ensure_property_grant_query_allowed(
+    db: &RuntimeDb,
+    namespace: Option<&str>,
+    kind: Option<&str>,
+    properties: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), Status> {
+    db.reject_ungranted_property_query(namespace, kind, properties)
+        .map_err(|error| {
+            if error.starts_with("object_security_denied") {
+                Status::permission_denied("access denied")
+            } else {
+                Status::unavailable("object authorization unavailable")
+            }
+        })
+}
+
+fn enforce_property_grant_mutation(
+    db: &RuntimeDb,
+    existing: Option<&domain::Object>,
+    object: &mut domain::Object,
+) -> Result<(), Status> {
+    let Some(policy) = db
+        .active_object_policy(&object.namespace, &object.kind)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?
+    else {
+        return Ok(());
+    };
+    policy
+        .apply_property_grant_mutation(existing, object)
+        .map_err(|error| {
+            if error.starts_with("object_security_denied") {
+                Status::permission_denied("access denied")
+            } else {
+                Status::unavailable("object authorization unavailable")
+            }
+        })
+}
+
 fn ensure_property_query_allowed(
     schema: &schema::SchemaRegistry,
     principals: &[String],
@@ -1619,6 +1657,7 @@ fn redact_object_change_values(
     schema: &schema::SchemaRegistry,
     security: &SecurityChecker,
     principals: &[String],
+    policy: Option<&crate::sekai::object_security::ObjectSecurityPolicy>,
 ) -> ObjectChange {
     let object = domain::Object {
         id: object_id.into(),
@@ -1638,7 +1677,15 @@ fn redact_object_change_values(
     let should_redact = change
         .field
         .strip_prefix("properties.")
-        .is_some_and(|property| restricted.contains(property));
+        .is_some_and(|property| {
+            restricted.contains(property)
+                || policy.is_some_and(|policy| {
+                    !policy.allows_property_access(
+                        property,
+                        crate::sekai::object_security::PropertyGrantAccess::Read,
+                    )
+                })
+        });
     ObjectChange {
         id: change.id,
         object_id: change.object_id,
@@ -3924,6 +3971,16 @@ fn authorize_source_batch_object_policy(
                     crate::sekai::object_security::ObjectSecurityOperation::Sync,
                 ) {
                     return Err(Status::permission_denied("access denied"));
+                }
+                if policy.property_grants_enforced() {
+                    for property in record.properties.keys() {
+                        if !policy.allows_property_access(
+                            property,
+                            crate::sekai::object_security::PropertyGrantAccess::Write,
+                        ) {
+                            return Err(Status::permission_denied("access denied"));
+                        }
+                    }
                 }
             }
             Err(error) if error.starts_with("object_security_denied") => {
@@ -7469,6 +7526,13 @@ impl SekaiService for SekaiServiceImpl {
             .schema_definitions
             .snapshot()
             .map_err(map_schema_definition_lifecycle_error)?;
+        let property_policy = match object.as_ref() {
+            Some(object) => self
+                .db
+                .active_object_policy(&object.namespace, &object.kind)
+                .map_err(|_| Status::unavailable("object authorization unavailable"))?,
+            None => None,
+        };
         let changes = self
             .db
             .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
@@ -7483,6 +7547,7 @@ impl SekaiService for SekaiServiceImpl {
                         &schema,
                         &self.security,
                         &principals,
+                        property_policy.as_ref(),
                     )
                 } else {
                     ObjectChange {
@@ -10086,6 +10151,7 @@ mod tests {
                         crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
                     ],
                 }],
+                property_grants: None,
             };
             let revision = svc
                 .db
@@ -10231,6 +10297,7 @@ mod tests {
                 operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
+            property_grants: None,
         };
         let revision = svc
             .db
@@ -10935,6 +11002,7 @@ mod tests {
                 operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
+            property_grants: None,
         };
         let owned_component = crate::sekai::object_security::ObjectSecurityPolicy {
             contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
@@ -10948,6 +11016,7 @@ mod tests {
                     },
                 ],
             }],
+            property_grants: None,
         };
         let cluster_revision = svc
             .db
@@ -14706,6 +14775,7 @@ mod tests {
                 operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
+            property_grants: None,
         };
         let revision = svc
             .db

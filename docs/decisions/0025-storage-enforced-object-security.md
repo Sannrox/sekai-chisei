@@ -48,8 +48,9 @@ Activated namespaces apply the same compiled relation to remaining object
 consumers. Writes reauthorize current and proposed state against
 operation-specific rules inside the persist transaction. List pagination
 cursors bind principal context, namespace, activation digest, query digest,
-and expiry. Markings remain an additional narrowing layer. Property-level
-grants and richer rule vocabularies remain separate decisions.
+and expiry. Markings remain an additional narrowing layer. Explicit property
+grants after object access are recorded in ADR 0027. Richer rule vocabularies
+remain separate decisions.
 
 ## Validation
 

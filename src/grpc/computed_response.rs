@@ -52,6 +52,16 @@ impl SekaiServiceImpl {
             },
         )
         .map_err(Status::internal)?;
+        let object = self
+            .db
+            .project_object_property_grants(object)
+            .map_err(|error| {
+                if error.starts_with("object_security_denied") {
+                    Status::permission_denied("access denied")
+                } else {
+                    Status::unavailable("object authorization unavailable")
+                }
+            })?;
         Ok(redact_restricted_properties(
             object,
             &schema,

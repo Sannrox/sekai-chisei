@@ -248,6 +248,19 @@ impl PostgresDb {
         }))
     }
 
+    pub fn list_activated_object_security_namespaces(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT namespace FROM sekai_object_security_activations ORDER BY namespace",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
     pub fn has_object_security_activations(&self) -> Result<bool, String> {
         self.connection()?
             .query_one(
@@ -347,6 +360,36 @@ fn insert_revision(
         }
     }
     Ok(())
+}
+
+pub(crate) fn load_active_policy_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    kind: &str,
+) -> Result<Option<ObjectSecurityPolicy>, String> {
+    let digest = client
+        .query_opt(
+            "SELECT revision_digest FROM sekai_object_security_active_policies
+             WHERE namespace=$1 AND kind=$2",
+            &[&namespace, &kind],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get::<_, String>(0));
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+    let canonical = client
+        .query_opt(
+            "SELECT canonical_policy_json FROM sekai_object_security_revisions
+             WHERE namespace=$1 AND revision_digest=$2",
+            &[&namespace, &digest],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get::<_, Vec<u8>>(0));
+    let Some(canonical) = canonical else {
+        return Ok(None);
+    };
+    ObjectSecurityPolicy::from_canonical_input(&canonical).map(Some)
 }
 
 fn load_revision(

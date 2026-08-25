@@ -1301,6 +1301,7 @@ fn resolve_object_ref(
             reason: "acl_denied".into(),
         });
     }
+    let object = db.project_object_property_grants(object)?;
 
     let answer = json!({
         "capability": semantic::CAPABILITY_RESOLVE_REF,
@@ -1527,17 +1528,17 @@ fn redact_lookup_object(
         .iter()
         .any(|principal| matches!(principal.as_str(), "root" | "local"))
     {
-        return Ok(projected);
+        return db.project_object_property_grants(projected);
     }
     let is_admin = db
         .list_grants(&projected.id)?
         .iter()
         .any(|grant| principals.contains(&grant.principal) && matches!(grant.role, Role::Admin));
     if is_admin {
-        return Ok(projected);
+        return db.project_object_property_grants(projected);
     }
     let Some(object_type) = schema_registry.get(&projected.kind) else {
-        return Ok(projected);
+        return db.project_object_property_grants(projected);
     };
     let mut redacted = projected;
     for property in &object_type.properties {
@@ -1549,7 +1550,7 @@ fn redact_lookup_object(
                 .insert(property.name.clone(), "[redacted]".into());
         }
     }
-    Ok(redacted)
+    db.project_object_property_grants(redacted)
 }
 
 /// Run the lookup-first fixture suite against a prepared database.
