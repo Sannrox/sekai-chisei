@@ -14,6 +14,7 @@ pub const MAX_POLICY_BYTES: usize = 64 * 1024;
 pub const OBJECT_QUERY_CURSOR_TTL_MS: i64 = 5 * 60 * 1_000;
 const MAX_RULES: usize = 64;
 const MAX_PREDICATES: usize = 16;
+const MAX_PROPERTY_GRANTS: usize = 128;
 const MAX_VALUE_BYTES: usize = 1024;
 const OBJECT_QUERY_CURSOR_VERSION: &str = "sekai.object-query-cursor/v1";
 
@@ -78,6 +79,37 @@ pub struct ObjectSecurityRule {
     pub predicates: Vec<ObjectSecurityPredicate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PropertyGrantAccess {
+    Read,
+    Write,
+}
+
+impl PropertyGrantAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            _ => Err("unsupported object-security property grant access".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PropertyGrant {
+    pub property: String,
+    pub access: PropertyGrantAccess,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectSecurityPolicy {
@@ -85,6 +117,8 @@ pub struct ObjectSecurityPolicy {
     pub namespace: String,
     pub kind: String,
     pub rules: Vec<ObjectSecurityRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub property_grants: Option<Vec<PropertyGrant>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +338,22 @@ impl ObjectSecurityPolicy {
         }
         self.rules.sort_by_key(rule_key);
         self.rules.dedup();
+        if let Some(grants) = &mut self.property_grants {
+            if grants.len() > MAX_PROPERTY_GRANTS {
+                return Err(format!(
+                    "policy must contain at most {MAX_PROPERTY_GRANTS} property grants"
+                ));
+            }
+            for grant in grants.iter() {
+                validate_property(&grant.property)?;
+            }
+            grants.sort_by(|left, right| {
+                left.property
+                    .cmp(&right.property)
+                    .then(left.access.as_str().cmp(right.access.as_str()))
+            });
+            grants.dedup();
+        }
         Ok(self)
     }
 
@@ -355,13 +405,109 @@ impl ObjectSecurityPolicy {
         properties.dedup();
         properties
     }
+
+    pub fn property_grants_enforced(&self) -> bool {
+        self.property_grants.is_some()
+    }
+
+    pub fn allows_property_access(&self, property: &str, access: PropertyGrantAccess) -> bool {
+        match &self.property_grants {
+            None => true,
+            Some(grants) => grants
+                .iter()
+                .any(|grant| grant.property == property && grant.access == access),
+        }
+    }
+
+    pub fn project_visible_properties(&self, object: &mut Object) {
+        let Some(grants) = &self.property_grants else {
+            return;
+        };
+        let readable = grants
+            .iter()
+            .filter(|grant| grant.access == PropertyGrantAccess::Read)
+            .map(|grant| grant.property.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        object
+            .properties
+            .retain(|property, _| readable.contains(property.as_str()));
+    }
+
+    pub fn preserve_unwritable_properties(&self, existing: &Object, object: &mut Object) {
+        if !self.property_grants_enforced() {
+            return;
+        }
+        for (property, value) in &existing.properties {
+            if !self.allows_property_access(property, PropertyGrantAccess::Write)
+                && !object.properties.contains_key(property)
+            {
+                object.properties.insert(property.clone(), value.clone());
+            }
+        }
+    }
+
+    pub fn apply_property_grant_mutation(
+        &self,
+        existing: Option<&Object>,
+        object: &mut Object,
+    ) -> Result<(), String> {
+        if !self.property_grants_enforced() {
+            return Ok(());
+        }
+        if let Some(existing) = existing {
+            for (property, value) in &existing.properties {
+                if !self.allows_property_access(property, PropertyGrantAccess::Write) {
+                    object.properties.insert(property.clone(), value.clone());
+                }
+            }
+            for (property, value) in &object.properties {
+                if existing.properties.get(property) != Some(value)
+                    && !self.allows_property_access(property, PropertyGrantAccess::Write)
+                {
+                    return Err("object_security_denied: property mutation is not granted".into());
+                }
+            }
+            return Ok(());
+        }
+        for property in object.properties.keys() {
+            if !self.allows_property_access(property, PropertyGrantAccess::Write) {
+                return Err("object_security_denied: property mutation is not granted".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_json_shape(value: &serde_json::Value) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| "object-security policy must be a JSON object".to_string())?;
-    reject_unknown_keys(object, &["contract_version", "namespace", "kind", "rules"])?;
+    reject_unknown_keys(
+        object,
+        &[
+            "contract_version",
+            "namespace",
+            "kind",
+            "rules",
+            "property_grants",
+        ],
+    )?;
+    if let Some(grants) = object.get("property_grants") {
+        let grants = grants
+            .as_array()
+            .ok_or_else(|| "object-security property grants must be an array".to_string())?;
+        for grant in grants {
+            let grant = grant
+                .as_object()
+                .ok_or_else(|| "object-security property grant must be an object".to_string())?;
+            reject_unknown_keys(grant, &["property", "access"])?;
+            let access = grant
+                .get("access")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "object-security property grant access required".to_string())?;
+            PropertyGrantAccess::parse(access)?;
+        }
+    }
     let rules = object
         .get("rules")
         .and_then(serde_json::Value::as_array)
@@ -646,6 +792,151 @@ mod tests {
             &sample_object("bob"),
             ObjectSecurityOperation::Update
         ));
+    }
+
+    #[test]
+    fn omitted_property_grants_keep_v1_digest_and_expose_all_properties() {
+        let without_grants =
+            ObjectSecurityPolicy::from_canonical_input(&document(serde_json::json!(
+                [{"operation":"read","predicates":[{"kind":"allow_all"}]}]
+            )))
+            .unwrap();
+        assert!(!without_grants.property_grants_enforced());
+        assert!(without_grants.allows_property_access("secret", PropertyGrantAccess::Read));
+        assert!(without_grants.allows_property_access("secret", PropertyGrantAccess::Write));
+        let mut object = sample_object("alice");
+        object
+            .properties
+            .insert("secret".into(), "classified".into());
+        without_grants.project_visible_properties(&mut object);
+        assert_eq!(
+            object.properties.get("secret").map(String::as_str),
+            Some("classified")
+        );
+        let canonical =
+            serde_json::from_slice::<serde_json::Value>(&without_grants.canonical_bytes().unwrap())
+                .unwrap();
+        assert!(canonical.get("property_grants").is_none());
+    }
+
+    #[test]
+    fn explicit_property_grants_omit_hidden_values_and_deny_unknown_access() {
+        let mut input = serde_json::from_slice::<serde_json::Value>(&document(serde_json::json!([
+            {"operation":"read","predicates":[{"kind":"allow_all"}]}
+        ])))
+        .unwrap();
+        input["property_grants"] = serde_json::json!([
+            {"property":"owner","access":"write"},
+            {"property":"owner","access":"read"},
+            {"property":"state","access":"read"}
+        ]);
+        let policy =
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .unwrap();
+        assert!(policy.property_grants_enforced());
+        assert!(policy.allows_property_access("owner", PropertyGrantAccess::Read));
+        assert!(policy.allows_property_access("owner", PropertyGrantAccess::Write));
+        assert!(policy.allows_property_access("state", PropertyGrantAccess::Read));
+        assert!(!policy.allows_property_access("state", PropertyGrantAccess::Write));
+        assert!(!policy.allows_property_access("secret", PropertyGrantAccess::Read));
+        let mut object = sample_object("alice");
+        object.properties.insert("state".into(), "open".into());
+        object
+            .properties
+            .insert("secret".into(), "classified".into());
+        policy.project_visible_properties(&mut object);
+        assert_eq!(
+            object.properties.get("owner").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            object.properties.get("state").map(String::as_str),
+            Some("open")
+        );
+        assert!(!object.properties.contains_key("secret"));
+
+        input["property_grants"] = serde_json::json!([{"property":"owner","access":"admin"}]);
+        assert!(
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .is_err()
+        );
+        input["property_grants"] =
+            serde_json::json!([{"property":"owner","access":"read","extra":true}]);
+        assert!(
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .is_err()
+        );
+        input["property_grants"] = serde_json::json!([]);
+        let empty =
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .unwrap();
+        let mut hidden = sample_object("alice");
+        empty.project_visible_properties(&mut hidden);
+        assert!(hidden.properties.is_empty());
+    }
+
+    #[test]
+    fn property_grant_mutation_preserves_hidden_values_and_denies_ungranted_writes() {
+        let mut input = serde_json::from_slice::<serde_json::Value>(&document(serde_json::json!([
+            {"operation":"update","predicates":[{"kind":"allow_all"}]}
+        ])))
+        .unwrap();
+        input["property_grants"] = serde_json::json!([
+            {"property":"owner","access":"read"},
+            {"property":"owner","access":"write"}
+        ]);
+        let policy =
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .unwrap();
+        let existing = {
+            let mut object = sample_object("alice");
+            object
+                .properties
+                .insert("secret".into(), "classified".into());
+            object
+        };
+        let mut proposed = sample_object("alice");
+        policy
+            .apply_property_grant_mutation(Some(&existing), &mut proposed)
+            .unwrap();
+        assert_eq!(
+            proposed.properties.get("secret").map(String::as_str),
+            Some("classified")
+        );
+
+        proposed.properties.insert("secret".into(), "leaked".into());
+        policy
+            .apply_property_grant_mutation(Some(&existing), &mut proposed)
+            .unwrap();
+        assert_eq!(
+            proposed.properties.get("secret").map(String::as_str),
+            Some("classified")
+        );
+
+        let mut created = sample_object("alice");
+        created
+            .properties
+            .insert("secret".into(), "classified".into());
+        assert!(
+            policy
+                .apply_property_grant_mutation(None, &mut created)
+                .unwrap_err()
+                .contains("object_security_denied")
+        );
+
+        let mut inbound = sample_object("alice");
+        inbound
+            .properties
+            .insert("sync_source".into(), "github".into());
+        policy.preserve_unwritable_properties(&existing, &mut inbound);
+        assert_eq!(
+            inbound.properties.get("secret").map(String::as_str),
+            Some("classified")
+        );
+        assert_eq!(
+            inbound.properties.get("sync_source").map(String::as_str),
+            Some("github")
+        );
     }
 
     #[test]

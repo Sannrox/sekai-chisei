@@ -176,6 +176,12 @@ impl SekaiServiceImpl {
                 &schema,
                 &principals,
                 filter.kind.as_deref().unwrap_or_default(),
+                queried_properties.clone(),
+            )?;
+            ensure_property_grant_query_allowed(
+                &self.db,
+                filter.namespace.as_deref(),
+                filter.kind.as_deref(),
                 queried_properties,
             )?;
         }
@@ -393,6 +399,7 @@ impl SekaiServiceImpl {
                 .snapshot()
                 .map_err(map_schema_definition_lifecycle_error)?;
             ensure_property_query_allowed(&schema, &principals, &r.kind, [r.key.clone()])?;
+            ensure_property_grant_query_allowed(&self.db, None, Some(&r.kind), [r.key.clone()])?;
         }
         let objs = self
             .db
@@ -597,13 +604,20 @@ impl SekaiServiceImpl {
             .map_err(map_schema_definition_lifecycle_error)?;
         let queried_properties = gq.property_filter.keys().cloned().collect::<Vec<_>>();
         if gq.kind_filter.is_empty() {
-            ensure_property_query_allowed(&schema, &principals, "", queried_properties)?;
+            ensure_property_query_allowed(&schema, &principals, "", queried_properties.clone())?;
+            ensure_property_grant_query_allowed(&self.db, None, None, queried_properties)?;
         } else {
             for kind in &gq.kind_filter {
                 ensure_property_query_allowed(
                     &schema,
                     &principals,
                     kind,
+                    queried_properties.clone(),
+                )?;
+                ensure_property_grant_query_allowed(
+                    &self.db,
+                    None,
+                    Some(kind),
                     queried_properties.clone(),
                 )?;
             }

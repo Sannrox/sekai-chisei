@@ -29,6 +29,19 @@ relation. Synchronization uses `sync` rules. A `page_token` binds principal
 context, namespace, activation digest, query digest, and expiry; changed
 authority or policy rejects the cursor.
 
+Optional `property_grants` further restrict property visibility and mutation
+after object access succeeds. Omitting the field keeps v1 behavior: every
+property on an authorized object remains visible and writable under the
+object-level rules. When the field is present, including as an empty array,
+unmentioned properties have no grant. Hidden properties are omitted from
+authorized reads, context, export, lineage, and synchronization projections;
+they are never fetched for client-side masking. Filters, ordering, and
+aggregation that name an ungranted property fail closed without distinguishing
+hidden from absent properties. Creates and updates require a `write` grant to
+set or change a property; omitted unreadable properties are preserved from the
+stored object. Inbound synchronization requires a `write` grant for each source
+property. Unknown grant attributes or access tokens deny the policy.
+
 Only the trusted authenticated context supplies subjects and scopes. Request
 metadata is not authority. SQLite and PostgreSQL apply policy in SQL before a
 direct row, `FindByExternalId`, or `ListObjects` total, ordering, filter,
@@ -48,5 +61,5 @@ changes an unactivated namespace's request shape.
 Policy namespace and kind identities stay ASCII tokens (`[A-Za-z0-9_.:/-]`).
 Open-taxonomy kinds with spaces or other characters cannot be activated until
 a later identity migration. The v1 predicate vocabulary is unchanged; operation
-context, entitlements, and additional operators remain out of scope. Property
-and value-instance grants remain later issues.
+context, entitlements, and additional operators remain out of scope.
+Value-instance grants remain a later issue.

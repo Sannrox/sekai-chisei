@@ -436,6 +436,19 @@ impl SekaiDb {
         }))
     }
 
+    pub fn list_activated_object_security_namespaces(&self) -> Result<Vec<String>, String> {
+        let connection = self.conn();
+        let mut statement = connection
+            .prepare("SELECT namespace FROM sekai_object_security_activations ORDER BY namespace")
+            .map_err(|error| error.to_string())?;
+        let namespaces = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(namespaces)
+    }
+
     pub fn has_object_security_activations(&self) -> Result<bool, String> {
         self.conn()
             .query_row(
@@ -535,6 +548,38 @@ fn insert_revision_sqlite(
         }
     }
     Ok(())
+}
+
+pub(crate) fn load_active_policy_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    kind: &str,
+) -> Result<Option<ObjectSecurityPolicy>, String> {
+    let digest = connection
+        .query_row(
+            "SELECT revision_digest FROM sekai_object_security_active_policies
+             WHERE namespace=?1 AND kind=?2",
+            params![namespace, kind],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+    let canonical = connection
+        .query_row(
+            "SELECT canonical_policy_json FROM sekai_object_security_revisions
+             WHERE namespace=?1 AND revision_digest=?2",
+            params![namespace, digest],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(canonical) = canonical else {
+        return Ok(None);
+    };
+    ObjectSecurityPolicy::from_canonical_input(&canonical).map(Some)
 }
 
 pub(crate) fn predicate_columns(

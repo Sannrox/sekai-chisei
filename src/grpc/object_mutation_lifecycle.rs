@@ -170,6 +170,7 @@ impl SekaiServiceImpl {
             )?;
             drop(schema);
         }
+        enforce_property_grant_mutation(&self.db, None, &mut domain_object)?;
         enforce_object_operation_access(
             &self.db,
             &domain_object,
@@ -365,6 +366,7 @@ impl SekaiServiceImpl {
                 markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
                 "true".into(),
             );
+            enforce_property_grant_mutation(&self.db, existing.as_ref(), &mut domain_object)?;
         } else {
             self.require_schema_kind_loaded(&domain_object.kind)?;
             let schema = self
@@ -380,6 +382,7 @@ impl SekaiServiceImpl {
                     &mut domain_object,
                 )?;
             }
+            enforce_property_grant_mutation(&self.db, existing.as_ref(), &mut domain_object)?;
             schema
                 .validate(&domain_object)
                 .map_err(Status::invalid_argument)?;

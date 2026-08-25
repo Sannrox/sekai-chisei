@@ -86,9 +86,12 @@ predicates before rows, totals, ordering, filtering, limits, or offsets are
 materialized. Write rules reauthorize current and proposed state inside the
 persist transaction. Inactive namespaces retain existing behavior; activated
 namespaces deny missing or unsupported policy while ACLs, team boundaries, and
-markings remain narrowing layers. See
-[Object security policy](object-security.md) and
-[ADR 0025](decisions/0025-storage-enforced-object-security.md).
+markings remain narrowing layers. Optional property grants then omit hidden
+values from authorized projections and fail closed on ungranted filters and
+writes. See
+[Object security policy](object-security.md),
+[ADR 0025](decisions/0025-storage-enforced-object-security.md), and
+[ADR 0027](decisions/0027-explicit-property-grants.md).
 
 ### Chisei: governed decisions
 

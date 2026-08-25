@@ -407,7 +407,7 @@ impl PostgresDb {
                     &[&batch.namespace, &prepared_record.source_id],
                 )
                 .map_err(ApplyError::storage)?;
-            let object = Object {
+            let mut object = Object {
                 id: prepared_record.object.object_id.clone(),
                 kind: prepared_record.object.type_name.clone(),
                 name: prepared_record.display_name.clone(),
@@ -425,6 +425,18 @@ impl PostgresDb {
                     .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
                 updated: now_ms,
             };
+            if let Some(existing) = &before
+                && let Some(policy) = super::postgres_object_security::load_active_policy_postgres(
+                    &mut transaction,
+                    &object.namespace,
+                    &object.kind,
+                )
+                .map_err(ApplyError::storage)?
+            {
+                policy.preserve_unwritable_properties(existing, &mut object);
+            }
+            let properties_json = crate::domain::storage_properties_json(&object.properties)
+                .map_err(ApplyError::storage)?;
             transaction.execute(
                 "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)
@@ -442,7 +454,7 @@ impl PostgresDb {
                     &object.name,
                     &object.namespace,
                     &object.external_id,
-                    &prepared_record.properties_json,
+                    &properties_json,
                     &object.created,
                     &object.updated,
                 ],
@@ -831,9 +843,21 @@ fn preflight_commit_state(
                         "source identity conflicts with its bound type or graph object",
                     ));
                 }
-                let projected_properties =
+                let mut projected_properties =
                     serde_json::from_str::<HashMap<String, String>>(&record.properties_json)
                         .map_err(|error| ApplyError::storage(error.to_string()))?;
+                if let Some(policy) = super::postgres_object_security::load_active_policy_postgres(
+                    transaction,
+                    &object.namespace,
+                    &object.kind,
+                )
+                .map_err(ApplyError::storage)?
+                {
+                    let mut projected = object.clone();
+                    projected.properties = projected_properties;
+                    policy.preserve_unwritable_properties(object, &mut projected);
+                    projected_properties = projected.properties;
+                }
                 if identity.source_version == record.object.source_version
                     && (identity.payload_digest != record.object.payload_digest
                         || object.name != record.display_name

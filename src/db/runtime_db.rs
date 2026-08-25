@@ -45,7 +45,7 @@ use crate::sekai::lease::{Lease, LeaseError};
 use crate::sekai::ledger::*;
 use crate::sekai::object_security::{
     ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
-    PrincipalPolicyContext,
+    PrincipalPolicyContext, PropertyGrantAccess,
 };
 use crate::sekai::object_sync::{SourceBatch, SourceBatchResult, SourceSyncState};
 use crate::sekai::observation::{TaskObservation, TaskObservationBaseline, *};
@@ -188,6 +188,64 @@ impl RuntimeDb {
         ObjectSecurityPolicy::from_canonical_input(&revision.canonical_policy_json)
             .map(Some)
             .map_err(|_| "object_security_denied: active policy revision is invalid".into())
+    }
+
+    pub fn project_object_property_grants(&self, mut object: Object) -> Result<Object, String> {
+        if let Some(policy) = self.active_object_policy(&object.namespace, &object.kind)? {
+            policy.project_visible_properties(&mut object);
+        }
+        Ok(object)
+    }
+
+    pub fn reject_ungranted_property_query(
+        &self,
+        namespace: Option<&str>,
+        kind: Option<&str>,
+        properties: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<(), String> {
+        let properties = properties
+            .into_iter()
+            .map(|property| property.as_ref().to_string())
+            .filter(|property| !property.is_empty())
+            .collect::<Vec<_>>();
+        if properties.is_empty() {
+            return Ok(());
+        }
+        let namespaces = match namespace.filter(|value| !value.is_empty()) {
+            Some(namespace) => vec![namespace.to_string()],
+            None => self.list_activated_object_security_namespaces()?,
+        };
+        let kind = kind.filter(|value| !value.is_empty());
+        for namespace in namespaces {
+            let Some(activation) = self.get_object_security_activation(&namespace)? else {
+                continue;
+            };
+            let kinds = match kind {
+                Some(kind) if activation.policies.contains_key(kind) => vec![kind.to_string()],
+                Some(_) => continue,
+                None => activation.policies.keys().cloned().collect(),
+            };
+            for kind in kinds {
+                let policy = match self.active_object_policy(&namespace, &kind) {
+                    Ok(Some(policy)) => policy,
+                    Ok(None) => continue,
+                    Err(error) => return Err(error),
+                };
+                for property in &properties {
+                    if !policy.allows_property_access(property, PropertyGrantAccess::Read) {
+                        return Err("object_security_denied: property filter is not granted".into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_activated_object_security_namespaces(&self) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_activated_object_security_namespaces(),
+            Self::Postgres(db) => db.list_activated_object_security_namespaces(),
+        }
     }
 
     pub fn get_definition_revision(
@@ -3230,7 +3288,22 @@ impl RuntimeDb {
         excluded_kinds: &[&str],
         context: &PrincipalPolicyContext,
     ) -> Result<(Vec<Object>, i32), String> {
-        match self {
+        let mut queried = filter
+            .property_filters
+            .iter()
+            .map(|property_filter| property_filter.key.clone())
+            .collect::<Vec<_>>();
+        if let Some(property) = filter.order_by.strip_prefix("property:")
+            && !property.is_empty()
+        {
+            queried.push(property.to_string());
+        }
+        self.reject_ungranted_property_query(
+            filter.namespace.as_deref(),
+            filter.kind.as_deref(),
+            queried,
+        )?;
+        let (rows, total) = match self {
             Self::Sqlite(db) => db.list_objects_with_total_for_policy_context(
                 filter,
                 principals,
@@ -3243,7 +3316,8 @@ impl RuntimeDb {
                 excluded_kinds,
                 context,
             ),
-        }
+        }?;
+        Ok((rows, total))
     }
 
     pub fn list_objects_with_text_visibility(

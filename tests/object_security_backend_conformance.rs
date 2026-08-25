@@ -7,7 +7,8 @@ use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{KIND_CAPABILITY, ListFilter, Object, PropertyFilter};
 use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
-    ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext,
+    ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext, PropertyGrant,
+    PropertyGrantAccess,
 };
 
 fn policy(
@@ -23,6 +24,7 @@ fn policy(
             operation: ObjectSecurityOperation::Read,
             predicates,
         }],
+        property_grants: None,
     }
 }
 
@@ -236,6 +238,7 @@ fn exercise(db: RuntimeDb, namespace: &str) {
         contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
         namespace: namespace.into(),
         kind: "document".into(),
+        property_grants: None,
         rules: vec![
             ObjectSecurityRule {
                 operation: ObjectSecurityOperation::Read,
@@ -294,6 +297,70 @@ fn exercise(db: RuntimeDb, namespace: &str) {
     assert_eq!(
         db.object_query_cursor_key().unwrap(),
         db.object_query_cursor_key().unwrap()
+    );
+
+    let mut secret_object = object(namespace, "grant-secret", "grant-secret", "alice", "open");
+    secret_object
+        .properties
+        .insert("secret".into(), "classified".into());
+    db.create_object(&secret_object).unwrap();
+    let grants = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "document".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "state".into(),
+                access: PropertyGrantAccess::Read,
+            },
+        ]),
+    };
+    let grant_revision = db
+        .put_object_security_policy(&grants, "root", "put-grants", 13)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), grant_revision.revision_digest)]),
+        "root",
+        "activate-grants",
+        14,
+    )
+    .unwrap();
+    let projected = db
+        .project_object_property_grants(
+            db.get_object_with_policy_context(&object_id(namespace, "grant-secret"), &alice)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(!projected.properties.contains_key("secret"));
+    assert!(
+        db.list_objects_with_total_for_policy_context(
+            &ListFilter {
+                namespace: Some(namespace.into()),
+                kind: Some("document".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "secret".into(),
+                    op: "eq".into(),
+                    value: "classified".into(),
+                }],
+                limit: 10,
+                ..Default::default()
+            },
+            &["alice"],
+            &[],
+            &alice,
+        )
+        .unwrap_err()
+        .contains("object_security_denied")
     );
 }
 
@@ -464,6 +531,144 @@ fn sqlite_activation_audit_stores_mapping_digest() {
         )
         .unwrap();
     assert_eq!(digest, activation.activation_id);
+}
+
+#[test]
+fn sqlite_property_grants_omit_hidden_values_and_deny_ungranted_filters() {
+    let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+    let namespace = "grants";
+    let mut stored = object(namespace, "a", "alpha", "alice", "open");
+    stored
+        .properties
+        .insert("secret".into(), "classified".into());
+    db.create_object(&stored).unwrap();
+
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "document".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Write,
+            },
+            PropertyGrant {
+                property: "state".into(),
+                access: PropertyGrantAccess::Read,
+            },
+        ]),
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-grants", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), revision.revision_digest)]),
+        "root",
+        "activate-grants",
+        2,
+    )
+    .unwrap();
+
+    let alice = PrincipalPolicyContext {
+        subjects: vec!["alice".into()],
+        scopes: vec![],
+    };
+    let loaded = db
+        .project_object_property_grants(
+            db.get_object_with_policy_context(&object_id(namespace, "a"), &alice)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        loaded.properties.get("owner").map(String::as_str),
+        Some("alice")
+    );
+    assert_eq!(
+        loaded.properties.get("state").map(String::as_str),
+        Some("open")
+    );
+    assert!(!loaded.properties.contains_key("secret"));
+    let raw = db.get_object(&object_id(namespace, "a")).unwrap().unwrap();
+    assert_eq!(
+        raw.properties.get("secret").map(String::as_str),
+        Some("classified")
+    );
+
+    let (rows, total) = db
+        .list_objects_with_total_for_policy_context(
+            &ListFilter {
+                namespace: Some(namespace.into()),
+                kind: Some("document".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "state".into(),
+                    op: "eq".into(),
+                    value: "open".into(),
+                }],
+                limit: 10,
+                ..Default::default()
+            },
+            &["alice"],
+            &[],
+            &alice,
+        )
+        .unwrap();
+    assert_eq!(total, 1);
+    assert!(rows[0].properties.contains_key("secret"));
+    assert!(
+        !db.project_object_property_grants(rows[0].clone())
+            .unwrap()
+            .properties
+            .contains_key("secret")
+    );
+
+    assert!(
+        db.list_objects_with_total_for_policy_context(
+            &ListFilter {
+                namespace: Some(namespace.into()),
+                kind: Some("document".into()),
+                property_filters: vec![PropertyFilter {
+                    key: "secret".into(),
+                    op: "eq".into(),
+                    value: "classified".into(),
+                }],
+                limit: 10,
+                ..Default::default()
+            },
+            &["alice"],
+            &[],
+            &alice,
+        )
+        .unwrap_err()
+        .contains("object_security_denied")
+    );
+    assert!(
+        db.list_objects_with_total_for_policy_context(
+            &ListFilter {
+                property_filters: vec![PropertyFilter {
+                    key: "secret".into(),
+                    op: "eq".into(),
+                    value: "classified".into(),
+                }],
+                limit: 10,
+                ..Default::default()
+            },
+            &["alice"],
+            &[],
+            &alice,
+        )
+        .unwrap_err()
+        .contains("object_security_denied")
+    );
 }
 
 #[test]

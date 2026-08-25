@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Deny property access without an explicit grant on activated object-security
+  policies. Optional `property_grants` omit hidden values from authorized
+  reads, context, export, lineage, and sync projections; ungranted filters and
+  writes fail closed. Existing policies that omit the field keep v1 visibility.
 - Quarantine source batches that conflict with an admitted type identity or
   immutable source revision. The plane stores a `QUARANTINED` denial with
   per-record reasons, does not mutate objects or advance the checkpoint, and
