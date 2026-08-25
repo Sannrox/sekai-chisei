@@ -3626,11 +3626,7 @@ fn from_proto_source_batch(batch: SourceBatch) -> Result<source_sync_domain::Sou
 }
 
 fn source_batch_status(status: source_sync_domain::SourceBatchStatus) -> &'static str {
-    match status {
-        source_sync_domain::SourceBatchStatus::Open => "OPEN",
-        source_sync_domain::SourceBatchStatus::Committed => "COMMITTED",
-        source_sync_domain::SourceBatchStatus::Aborted => "ABORTED",
-    }
+    status.as_str()
 }
 
 fn source_operation_outcome(outcome: source_sync_domain::OperationOutcome) -> &'static str {
@@ -3827,22 +3823,36 @@ fn to_proto_source_sync_state(state: &source_sync_domain::SourceSyncState) -> So
 fn ensure_authoritative_source_result(
     result: &source_sync_domain::SourceBatchResult,
 ) -> Result<(), Status> {
-    if result.transaction.status != source_sync_domain::SourceBatchStatus::Committed
-        || result.transaction.outcome != source_sync_domain::OperationOutcome::Success
-        || result.records.iter().any(|record| {
-            record.outcome != source_sync_domain::OperationOutcome::Success
-                || matches!(
+    let committed_success = result.transaction.status
+        == source_sync_domain::SourceBatchStatus::Committed
+        && result.transaction.outcome == source_sync_domain::OperationOutcome::Success
+        && result.checkpoint_advanced
+        && result.records.iter().all(|record| {
+            record.outcome == source_sync_domain::OperationOutcome::Success
+                && !matches!(
                     record.decision,
                     source_sync_domain::SyncDecision::Conflict { .. }
                         | source_sync_domain::SyncDecision::Reject { .. }
                 )
-        })
-    {
-        return Err(Status::internal(
+        });
+    let quarantined_denial = result.transaction.status
+        == source_sync_domain::SourceBatchStatus::Quarantined
+        && result.transaction.outcome == source_sync_domain::OperationOutcome::Denial
+        && !result.checkpoint_advanced
+        && result.records.iter().all(|record| {
+            record.outcome == source_sync_domain::OperationOutcome::Denial
+                && matches!(
+                    record.decision,
+                    source_sync_domain::SyncDecision::Reject { .. }
+                )
+        });
+    if committed_success || quarantined_denial {
+        Ok(())
+    } else {
+        Err(Status::internal(
             "source sync returned a non-authoritative execution result",
-        ));
+        ))
     }
-    Ok(())
 }
 
 fn authorize_source_batch_object_policy(
@@ -9591,6 +9601,11 @@ mod tests {
             .into_inner()
             .result
             .unwrap();
+        assert_eq!(
+            first_result.transaction.as_ref().unwrap().status,
+            "COMMITTED"
+        );
+        assert!(first_result.checkpoint_advanced);
 
         let mut source_revision_conflict = source_batch(
             namespace,
@@ -9602,7 +9617,30 @@ mod tests {
         source_revision_conflict.records[0].payload_digest =
             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
         redigest_source_batch(&mut source_revision_conflict);
-        let source_revision_error = svc
+        let quarantined = svc
+            .apply_source_batch(with_named_principal(
+                ApplySourceBatchRequest {
+                    batch: Some(source_revision_conflict.clone()),
+                },
+                producer,
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(
+            quarantined.transaction.as_ref().unwrap().status,
+            "QUARANTINED"
+        );
+        assert!(!quarantined.checkpoint_advanced);
+        assert!(
+            quarantined.records[0]
+                .reason
+                .starts_with("source_revision_conflict:")
+        );
+        assert!(!quarantined.records[0].reason.contains("cccc"));
+        let replay = svc
             .apply_source_batch(with_named_principal(
                 ApplySourceBatchRequest {
                     batch: Some(source_revision_conflict),
@@ -9610,12 +9648,12 @@ mod tests {
                 producer,
             ))
             .await
-            .unwrap_err();
-        assert_eq!(
-            source_revision_error.code(),
-            tonic::Code::FailedPrecondition
-        );
-        assert!(!source_revision_error.message().contains("cccc"));
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(replay.transaction.as_ref().unwrap().status, "QUARANTINED");
+        assert!(!replay.checkpoint_advanced);
 
         let stale = source_batch(
             namespace,
@@ -9671,7 +9709,7 @@ mod tests {
         );
         assert_eq!(
             state_after_failures.last_result.as_ref(),
-            Some(&first_result)
+            Some(&quarantined)
         );
     }
 

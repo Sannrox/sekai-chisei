@@ -13,7 +13,8 @@ use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
     SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
     SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
-    SyncDecision, SyncedObject, sync_github_record,
+    SyncDecision, SyncedObject, is_schema_drift_denial, schema_quarantine_record_reason,
+    sync_github_record,
 };
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
@@ -31,7 +32,7 @@ const SOURCE_CHECKPOINTS_TABLE: &str = "sekai_source_checkpoints";
 #[cfg(test)]
 const SOURCE_GENERATIONS_TABLE: &str = "sekai_source_sync_generations";
 
-const RESERVED_SYNC_PROPERTIES: &[&str] = &[
+pub(crate) const RESERVED_SYNC_PROPERTIES: &[&str] = &[
     "sync_source",
     "sync_source_instance",
     "sync_source_id",
@@ -338,7 +339,7 @@ impl SekaiDb {
                     batch_json TEXT NOT NULL,
                     current_cursor TEXT NOT NULL,
                     proposed_next_cursor TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED')),
+                    status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED', 'QUARANTINED')),
                     outcome TEXT NOT NULL CHECK(outcome IN ('success', 'denial', 'unavailable')),
                     opened_at_ms INTEGER NOT NULL,
                     closed_at_ms INTEGER,
@@ -480,6 +481,7 @@ impl SekaiDb {
                 [],
             )
             .map_err(|error| error.to_string())?;
+        rebuild_source_batch_status_constraint(&self.conn())?;
         Ok(())
     }
 
@@ -561,7 +563,7 @@ impl SekaiDb {
                 ));
             }
             return match stored.transaction.status {
-                SourceBatchStatus::Committed => {
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
                     let result = parse_stored_result(&stored)?;
                     transaction.commit()?;
                     Ok(OpenDisposition::Committed(Box::new(result)))
@@ -636,7 +638,7 @@ impl SekaiDb {
         };
 
         if batch.contract_version != SOURCE_BATCH_V2_VERSION {
-            preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)?;
+            preflight_cursor_and_delivery(&transaction, &binding.binding, batch)?;
         }
 
         let open_exists: bool = transaction.query_row(
@@ -744,7 +746,9 @@ impl SekaiDb {
             ));
         }
         match stored.transaction.status {
-            SourceBatchStatus::Committed => return parse_stored_result(&stored),
+            SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
+                return parse_stored_result(&stored);
+            }
             SourceBatchStatus::Aborted => {
                 return Err(ApplyError::denied(
                     "batch_aborted",
@@ -766,6 +770,19 @@ impl SekaiDb {
         if let Err(error) = preflight {
             if !error.is_denial() {
                 return Err(error);
+            }
+            if is_schema_drift_denial(error.code()) {
+                let result = persist_schema_quarantine(
+                    &transaction,
+                    &binding.binding,
+                    batch,
+                    prepared,
+                    &stored,
+                    now_ms,
+                    &error,
+                )?;
+                transaction.commit()?;
+                return Ok(result);
             }
             if error.code() == Some("missing_range") {
                 mark_generation_recovery_required(
@@ -1097,7 +1114,7 @@ impl SekaiDb {
         let open_transaction = load_latest_transaction(&conn, &binding.binding.binding_id, "OPEN")
             .map_err(|error| error.to_string())?
             .map(|stored| stored.transaction);
-        let last_stored = load_latest_transaction(&conn, &binding.binding.binding_id, "COMMITTED")
+        let last_stored = load_latest_closed_result(&conn, &binding.binding.binding_id)
             .map_err(|error| error.to_string())?;
         let last_result = last_stored
             .as_ref()
@@ -1217,12 +1234,6 @@ pub(crate) fn validate_binding(
             "source binding belongs to a different authenticated producer",
         ));
     }
-    if binding.type_digest != batch.type_digest {
-        return Err(ApplyError::denied(
-            "binding_type_conflict",
-            "source binding cannot move across type revisions",
-        ));
-    }
     if binding.family != batch.family
         || binding.adapter_id != batch.adapter_id
         || binding.adapter_version != batch.adapter_version
@@ -1235,11 +1246,10 @@ pub(crate) fn validate_binding(
     Ok(())
 }
 
-fn preflight_commit_state(
+fn preflight_cursor_and_delivery(
     conn: &Connection,
     binding: &SourceBinding,
     batch: &SourceBatch,
-    records: &[PreparedRecord],
 ) -> Result<(), ApplyError> {
     let checkpoint = load_checkpoint(conn, &binding.binding_id)?;
     match checkpoint {
@@ -1257,7 +1267,22 @@ fn preflight_commit_state(
         }
         Some(_) | None => {}
     }
-    preflight_delivery_state(conn, binding, batch)?;
+    preflight_delivery_state(conn, binding, batch)
+}
+
+fn preflight_commit_state(
+    conn: &Connection,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+    records: &[PreparedRecord],
+) -> Result<(), ApplyError> {
+    preflight_cursor_and_delivery(conn, binding, batch)?;
+    if binding.type_digest != batch.type_digest {
+        return Err(ApplyError::denied(
+            "binding_type_conflict",
+            "source binding cannot move across type revisions",
+        ));
+    }
 
     for record in records {
         let identity = load_identity(conn, &batch.namespace, &record.source_id)?;
@@ -1814,6 +1839,7 @@ fn stored_batch_from_raw(raw: RawBatch) -> Result<StoredBatch, ApplyError> {
         "OPEN" => SourceBatchStatus::Open,
         "COMMITTED" => SourceBatchStatus::Committed,
         "ABORTED" => SourceBatchStatus::Aborted,
+        "QUARANTINED" => SourceBatchStatus::Quarantined,
         _ => return Err(ApplyError::Storage("invalid source batch status".into())),
     };
     let outcome = match raw.9.as_str() {
@@ -1905,10 +1931,241 @@ fn load_latest_transaction_any(
         .transpose()
 }
 
-fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
-    if stored.transaction.status != SourceBatchStatus::Committed || stored.result_json.is_empty() {
+fn rebuild_source_batch_status_constraint(conn: &Connection) -> Result<(), String> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type='table' AND name='sekai_source_batch_transactions'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("QUARANTINED") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "PRAGMA foreign_keys=OFF;
+         CREATE TABLE sekai_source_batch_transactions_new (
+            transaction_id TEXT PRIMARY KEY,
+            binding_id TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            producer_identity TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            batch_digest TEXT NOT NULL,
+            batch_json TEXT NOT NULL,
+            current_cursor TEXT NOT NULL,
+            proposed_next_cursor TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED', 'QUARANTINED')),
+            outcome TEXT NOT NULL CHECK(outcome IN ('success', 'denial', 'unavailable')),
+            opened_at_ms INTEGER NOT NULL,
+            closed_at_ms INTEGER,
+            reason TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '',
+            contract_version TEXT NOT NULL DEFAULT 'sekai.source-batch/v1',
+            delivery_mode TEXT,
+            sync_generation INTEGER,
+            feed_epoch TEXT,
+            offset_start INTEGER,
+            offset_end INTEGER,
+            snapshot_complete INTEGER,
+            UNIQUE(namespace, producer_identity, idempotency_key),
+            FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
+         );
+         INSERT INTO sekai_source_batch_transactions_new
+            SELECT * FROM sekai_source_batch_transactions;
+         DROP TABLE sekai_source_batch_transactions;
+         ALTER TABLE sekai_source_batch_transactions_new
+            RENAME TO sekai_source_batch_transactions;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_source_batches_one_open
+            ON sekai_source_batch_transactions(binding_id) WHERE status='OPEN';
+         CREATE INDEX IF NOT EXISTS idx_sekai_source_batches_history
+            ON sekai_source_batch_transactions(binding_id, opened_at_ms);
+         CREATE INDEX IF NOT EXISTS idx_sekai_source_batches_generation
+            ON sekai_source_batch_transactions(
+                binding_id, sync_generation, opened_at_ms
+            );
+         PRAGMA foreign_keys=ON;",
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn load_latest_closed_result(
+    conn: &Connection,
+    binding_id: &str,
+) -> Result<Option<StoredBatch>, ApplyError> {
+    let committed = load_latest_transaction(conn, binding_id, "COMMITTED")?;
+    let quarantined = load_latest_transaction(conn, binding_id, "QUARANTINED")?;
+    Ok(match (committed, quarantined) {
+        (None, None) => None,
+        (Some(result), None) | (None, Some(result)) => Some(result),
+        (Some(left), Some(right)) => {
+            let left_closed = left
+                .transaction
+                .closed_at_ms
+                .unwrap_or(left.transaction.opened_at_ms);
+            let right_closed = right
+                .transaction
+                .closed_at_ms
+                .unwrap_or(right.transaction.opened_at_ms);
+            if (left_closed, left.transaction.transaction_id.as_str())
+                >= (right_closed, right.transaction.transaction_id.as_str())
+            {
+                Some(left)
+            } else {
+                Some(right)
+            }
+        }
+    })
+}
+
+fn persist_schema_quarantine(
+    transaction: &rusqlite::Transaction<'_>,
+    binding: &SourceBinding,
+    batch: &SourceBatch,
+    prepared: &PreparedBatch,
+    stored: &StoredBatch,
+    now_ms: i64,
+    error: &ApplyError,
+) -> Result<SourceBatchResult, ApplyError> {
+    let batch_reason = error.to_string();
+    let mut record_results = Vec::with_capacity(prepared.records.len());
+    for prepared_record in &prepared.records {
+        let identity = load_identity(transaction, &batch.namespace, &prepared_record.source_id)?;
+        let object = load_object(transaction, &prepared_record.object.object_id)?;
+        let admitted = identity.as_ref().map(|identity| SyncedObject {
+            object_id: identity.object_id.clone(),
+            type_name: identity.type_name.clone(),
+            source_id: prepared_record.source_id.clone(),
+            source_version: identity.source_version.clone(),
+            payload_digest: identity.payload_digest.clone(),
+            properties: object
+                .as_ref()
+                .map(|object| {
+                    object
+                        .properties
+                        .iter()
+                        .filter(|(key, _)| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str()))
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            tombstoned: false,
+            type_digest: identity.type_digest.clone(),
+        });
+        let reason = schema_quarantine_record_reason(
+            &binding.type_digest,
+            &batch.type_digest,
+            admitted.as_ref(),
+            &prepared_record.object,
+            &batch_reason,
+        );
+        let decision = SyncDecision::Reject {
+            reason: reason.clone(),
+        };
+        let decision_json =
+            serde_json::to_string(&decision).map_err(|err| ApplyError::Storage(err.to_string()))?;
+        let lineage_json = serde_json::to_string(&prepared_record.lineage)
+            .map_err(|err| ApplyError::Storage(err.to_string()))?;
+        transaction.execute(
+            "INSERT INTO sekai_source_record_results (
+                transaction_id, source_id, source_version, decision_json,
+                outcome, reason, lineage_json, source_sequence
+             ) VALUES (?1, ?2, ?3, ?4, 'denial', ?5, ?6, ?7)",
+            params![
+                prepared.transaction_id,
+                prepared_record.source_id,
+                prepared_record.object.source_version,
+                decision_json,
+                reason,
+                lineage_json,
+                prepared_record.source_sequence.map(|value| value as i64),
+            ],
+        )?;
+        record_results.push(SourceRecordResult {
+            transaction_id: prepared.transaction_id.clone(),
+            source_id: prepared_record.source_id.clone(),
+            source_version: prepared_record.object.source_version.clone(),
+            decision,
+            outcome: OperationOutcome::Denial,
+            reason,
+            source_sequence: prepared_record.source_sequence,
+        });
+    }
+    let quarantined_transaction = SourceBatchTransaction {
+        transaction_id: prepared.transaction_id.clone(),
+        binding_id: prepared.binding_id.clone(),
+        namespace: batch.namespace.clone(),
+        producer_identity: batch.producer_identity.clone(),
+        idempotency_key: batch.idempotency_key.clone(),
+        batch_digest: batch.batch_digest.clone(),
+        current_cursor: batch.current_cursor.clone(),
+        proposed_next_cursor: batch.proposed_next_cursor.clone(),
+        status: SourceBatchStatus::Quarantined,
+        outcome: OperationOutcome::Denial,
+        opened_at_ms: stored.transaction.opened_at_ms,
+        closed_at_ms: Some(now_ms),
+        reason: batch_reason.clone(),
+        contract_version: batch.contract_version.clone(),
+        delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
+        sync_generation: batch
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.sync_generation),
+        source_feed_epoch: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.source_feed_epoch.clone()),
+        offset_start: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.offset_start),
+        offset_end: batch
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.offset_end),
+        snapshot_complete: batch
+            .delivery
+            .as_ref()
+            .map(|delivery| delivery.snapshot_complete),
+    };
+    let result = SourceBatchResult {
+        transaction: quarantined_transaction,
+        records: record_results,
+        checkpoint_advanced: false,
+    };
+    let result_json =
+        serde_json::to_string(&result).map_err(|err| ApplyError::Storage(err.to_string()))?;
+    let updated = transaction.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status='QUARANTINED', outcome='denial', closed_at_ms=?1,
+             reason=?2, result_json=?3
+         WHERE transaction_id=?4 AND status='OPEN'",
+        params![now_ms, batch_reason, result_json, prepared.transaction_id],
+    )?;
+    if updated != 1 {
         return Err(ApplyError::Storage(
-            "committed source batch is missing its stored result".into(),
+            "open source batch changed during schema quarantine".into(),
+        ));
+    }
+    transaction.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
+        params![now_ms, prepared.binding_id],
+    )?;
+    Ok(result)
+}
+
+fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
+    if !matches!(
+        stored.transaction.status,
+        SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+    ) || stored.result_json.is_empty()
+    {
+        return Err(ApplyError::Storage(
+            "closed source batch is missing its stored result".into(),
         ));
     }
     serde_json::from_str(&stored.result_json).map_err(|error| {
@@ -1928,7 +2185,7 @@ mod tests {
     use crate::sekai::object_sync::{
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
         GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
-        SOURCE_GITHUB, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+        SOURCE_GITHUB, SourceBatchStatus, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
         SourceSyncGenerationStatus,
     };
 
@@ -2445,15 +2702,28 @@ mod tests {
         let mut conflicting = batch("cursor:1", "cursor:2", "batch-2");
         conflicting.records[0].type_name = "PullRequest".into();
         redigest(&mut conflicting);
+        let quarantined = db.apply_source_batch(&conflicting, PRODUCER, 200).unwrap();
+        assert_eq!(
+            quarantined.transaction.status,
+            SourceBatchStatus::Quarantined
+        );
+        assert!(!quarantined.checkpoint_advanced);
         assert!(
-            db.apply_source_batch(&conflicting, PRODUCER, 200)
-                .unwrap_err()
+            quarantined.records[0]
+                .reason
                 .starts_with("type_identity_conflict:")
         );
+        let replay = db.apply_source_batch(&conflicting, PRODUCER, 250).unwrap();
+        assert_eq!(replay, quarantined);
         let after = db.get_object(&object_id).unwrap().unwrap();
         assert_eq!(after.kind, before.kind);
         assert_eq!(after.updated, before.updated);
         assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.last_result.as_ref(), Some(&quarantined));
     }
 
     #[test]
@@ -2472,9 +2742,15 @@ mod tests {
             "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
         conflicting.records[0].display_name = "Conflicting payload".into();
         redigest(&mut conflicting);
+        let quarantined = db.apply_source_batch(&conflicting, PRODUCER, 200).unwrap();
+        assert_eq!(
+            quarantined.transaction.status,
+            SourceBatchStatus::Quarantined
+        );
+        assert!(!quarantined.checkpoint_advanced);
         assert!(
-            db.apply_source_batch(&conflicting, PRODUCER, 200)
-                .unwrap_err()
+            quarantined.records[0]
+                .reason
                 .starts_with("source_revision_conflict:")
         );
 
@@ -2490,9 +2766,13 @@ mod tests {
             .properties
             .insert("state".into(), "closed".into());
         redigest(&mut forged_digest);
+        let forged = db
+            .apply_source_batch(&forged_digest, PRODUCER, 300)
+            .unwrap();
+        assert_eq!(forged.transaction.status, SourceBatchStatus::Quarantined);
         assert!(
-            db.apply_source_batch(&forged_digest, PRODUCER, 300)
-                .unwrap_err()
+            forged.records[0]
+                .reason
                 .starts_with("source_revision_conflict:")
         );
         let after_forged_digest = db.get_object(&object_id).unwrap().unwrap();
@@ -2705,5 +2985,85 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing migration column {table}.{column}");
         }
+    }
+
+    #[test]
+    fn upgrades_sqlite_status_check_to_allow_quarantine() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("legacy-status.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sekai_objects (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    namespace TEXT NOT NULL DEFAULT '',
+                    external_id TEXT NOT NULL DEFAULT '',
+                    properties TEXT NOT NULL DEFAULT '{}',
+                    created INTEGER NOT NULL,
+                    updated INTEGER NOT NULL
+                 );
+                 CREATE TABLE sekai_source_bindings (
+                    binding_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    producer_identity TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_instance TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    adapter_id TEXT NOT NULL,
+                    adapter_version TEXT NOT NULL,
+                    type_digest TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+                    updated_at_ms INTEGER NOT NULL,
+                    UNIQUE(namespace, source, source_instance)
+                 );
+                 CREATE TABLE sekai_source_batch_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    binding_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    producer_identity TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    batch_digest TEXT NOT NULL,
+                    batch_json TEXT NOT NULL,
+                    current_cursor TEXT NOT NULL,
+                    proposed_next_cursor TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('OPEN', 'COMMITTED', 'ABORTED')),
+                    outcome TEXT NOT NULL CHECK(outcome IN ('success', 'denial', 'unavailable')),
+                    opened_at_ms INTEGER NOT NULL,
+                    closed_at_ms INTEGER,
+                    reason TEXT NOT NULL,
+                    result_json TEXT NOT NULL DEFAULT '',
+                    UNIQUE(namespace, producer_identity, idempotency_key),
+                    FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let sql: String = db
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type='table' AND name='sekai_source_batch_transactions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sql.contains("QUARANTINED"), "{sql}");
+
+        let first = batch("", "cursor:1", "batch-1");
+        db.apply_source_batch(&first, PRODUCER, 100).unwrap();
+        let mut conflicting = batch("cursor:1", "cursor:2", "batch-2");
+        conflicting.records[0].type_name = "PullRequest".into();
+        redigest(&mut conflicting);
+        let quarantined = db.apply_source_batch(&conflicting, PRODUCER, 200).unwrap();
+        assert_eq!(
+            quarantined.transaction.status,
+            SourceBatchStatus::Quarantined
+        );
+        assert!(!quarantined.checkpoint_advanced);
     }
 }

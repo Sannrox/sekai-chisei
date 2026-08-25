@@ -218,17 +218,50 @@ fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     );
     revision_conflict.records[0].payload_digest = REFRESHED_PAYLOAD_DIGEST.into();
     redigest(&mut revision_conflict);
+    let quarantined = db
+        .apply_source_batch(&revision_conflict, &producer, 300)
+        .unwrap();
+    assert_eq!(
+        quarantined.transaction.status,
+        SourceBatchStatus::Quarantined
+    );
+    assert_eq!(quarantined.transaction.outcome, OperationOutcome::Denial);
+    assert!(!quarantined.checkpoint_advanced);
     assert!(
-        db.apply_source_batch(&revision_conflict, &producer, 300)
-            .unwrap_err()
+        quarantined.records[0]
+            .reason
             .starts_with("source_revision_conflict:")
     );
+    assert_eq!(
+        db.apply_source_batch(&revision_conflict, &producer, 310)
+            .unwrap(),
+        quarantined
+    );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
-    // Legacy v1 identity preflight runs before either backend inserts an OPEN
-    // transaction, so these denials must preserve the complete sync state.
-    assert_eq!(source_sync_state(db, prefix).unwrap(), page_one_state);
+    let after_conflict_state = source_sync_state(db, prefix).unwrap();
+    assert_eq!(after_conflict_state.checkpoint, page_one_state.checkpoint);
+    assert_eq!(
+        after_conflict_state.last_result.as_ref(),
+        Some(&quarantined)
+    );
     let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
     assert_object_unchanged(&after_conflict, &page_one_object);
+
+    let mut malformed = batch(prefix, "cursor:1", "cursor:malformed", "batch-malformed");
+    malformed.records[0]
+        .properties
+        .insert("sync_type_digest".into(), "forged".into());
+    redigest(&mut malformed);
+    assert!(
+        db.apply_source_batch(&malformed, &producer, 320)
+            .unwrap_err()
+            .starts_with("reserved_property:")
+    );
+    assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:1"));
+    assert_object_unchanged(
+        &db.projected_object(&object_id).unwrap().unwrap(),
+        &page_one_object,
+    );
 
     let mut page_two_batch = batch(prefix, "cursor:1", "cursor:2", "snapshot-page-2");
     page_two_batch.records[0].source_version = "node-v2".into();
@@ -341,13 +374,24 @@ fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     tombstone_type_conflict.records[0].type_name = "PullRequest".into();
     tombstone_type_conflict.records[0].source_version = "node-v4".into();
     redigest(&mut tombstone_type_conflict);
+    let type_quarantined = db
+        .apply_source_batch(&tombstone_type_conflict, &producer, 900)
+        .unwrap();
+    assert_eq!(
+        type_quarantined.transaction.status,
+        SourceBatchStatus::Quarantined
+    );
+    assert!(!type_quarantined.checkpoint_advanced);
     assert!(
-        db.apply_source_batch(&tombstone_type_conflict, &producer, 900)
-            .unwrap_err()
+        type_quarantined.records[0]
+            .reason
             .starts_with("type_identity_conflict:")
     );
     assert_eq!(checkpoint(db, prefix).as_deref(), Some("cursor:3"));
-    assert_eq!(source_sync_state(db, prefix).unwrap(), tombstone_state);
+    assert_eq!(
+        source_sync_state(db, prefix).unwrap().checkpoint,
+        tombstone_state.checkpoint
+    );
     let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
     assert_object_unchanged(&after_conflict, &tombstone_object);
 
@@ -384,12 +428,18 @@ fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     reversal_revision_conflict.records[0].payload_digest = REFRESHED_PAYLOAD_DIGEST.into();
     reversal_revision_conflict.records[0].display_name = "Conflicting reactivation".into();
     redigest(&mut reversal_revision_conflict);
-    assert!(
-        db.apply_source_batch(&reversal_revision_conflict, &producer, 1_100)
-            .unwrap_err()
-            .starts_with("source_revision_conflict:")
+    let reversal_quarantined = db
+        .apply_source_batch(&reversal_revision_conflict, &producer, 1_100)
+        .unwrap();
+    assert_eq!(
+        reversal_quarantined.transaction.status,
+        SourceBatchStatus::Quarantined
     );
-    assert_eq!(source_sync_state(db, prefix).unwrap(), reversal_state);
+    assert!(!reversal_quarantined.checkpoint_advanced);
+    assert_eq!(
+        source_sync_state(db, prefix).unwrap().checkpoint,
+        reversal_state.checkpoint
+    );
     let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
     assert_object_unchanged(&after_conflict, &reversal_object);
     assert_eq!(
@@ -407,12 +457,18 @@ fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     reversal_type_conflict.records[0].type_name = "PullRequest".into();
     reversal_type_conflict.records[0].source_version = "node-v5".into();
     redigest(&mut reversal_type_conflict);
-    assert!(
-        db.apply_source_batch(&reversal_type_conflict, &producer, 1_200)
-            .unwrap_err()
-            .starts_with("type_identity_conflict:")
+    let reversal_type_quarantined = db
+        .apply_source_batch(&reversal_type_conflict, &producer, 1_200)
+        .unwrap();
+    assert_eq!(
+        reversal_type_quarantined.transaction.status,
+        SourceBatchStatus::Quarantined
     );
-    assert_eq!(source_sync_state(db, prefix).unwrap(), reversal_state);
+    assert!(!reversal_type_quarantined.checkpoint_advanced);
+    assert_eq!(
+        source_sync_state(db, prefix).unwrap().checkpoint,
+        reversal_state.checkpoint
+    );
     let after_conflict = db.projected_object(&object_id).unwrap().unwrap();
     assert_object_unchanged(&after_conflict, &reversal_object);
     assert_eq!(
@@ -431,7 +487,7 @@ fn exercise_object_sync(db: &dyn ObjectSyncConformanceBackend, prefix: &str) {
     assert_eq!(state.checkpoint.unwrap().cursor, "cursor:4");
     assert_eq!(
         state.last_result.unwrap().transaction,
-        reversal_result.transaction
+        reversal_type_quarantined.transaction
     );
 }
 

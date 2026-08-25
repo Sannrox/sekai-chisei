@@ -1354,7 +1354,7 @@ message SourceBatchTransaction {
   string batch_digest = 6;
   string current_cursor = 7;
   string proposed_next_cursor = 8;
-  string status = 9; // OPEN | COMMITTED | ABORTED
+  string status = 9; // OPEN | COMMITTED | ABORTED | QUARANTINED
   string outcome = 10; // success | denial | unavailable | partial | unknown
   int64 opened_at_ms = 11;
   optional int64 closed_at_ms = 12;

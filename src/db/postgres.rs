@@ -54,6 +54,8 @@ const DEFINITION_PROPOSALS_SCHEMA: &str = include_str!("postgres/0033_definition
 const DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA: &str =
     include_str!("postgres/0034_definition_proposal_merge_evidence.sql");
 const OBJECT_QUERY_CURSOR_SCHEMA: &str = include_str!("postgres/0035_object_query_cursor.sql");
+const SOURCE_BATCH_QUARANTINE_SCHEMA: &str =
+    include_str!("postgres/0036_source_batch_quarantine.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -232,6 +234,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 34,
         name: "object_query_cursor",
         sql: OBJECT_QUERY_CURSOR_SCHEMA,
+    },
+    Migration {
+        version: 35,
+        name: "source_batch_quarantine",
+        sql: SOURCE_BATCH_QUARANTINE_SCHEMA,
     },
 ];
 
@@ -707,7 +714,11 @@ mod tests {
                 "missing PostgreSQL object-sync table {table}"
             );
         }
-        assert!(OBJECT_SYNC_SCHEMA.contains("status IN ('OPEN', 'COMMITTED', 'ABORTED')"));
+        assert!(
+            OBJECT_SYNC_SCHEMA
+                .contains("status IN ('OPEN', 'COMMITTED', 'ABORTED', 'QUARANTINED')")
+        );
+        assert!(SOURCE_BATCH_QUARANTINE_SCHEMA.contains("QUARANTINED"));
         assert!(OBJECT_SYNC_SCHEMA.contains("outcome IN ('success', 'denial', 'unavailable')"));
         assert!(!OBJECT_SYNC_SCHEMA.contains("unknown"));
         assert!(

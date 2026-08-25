@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Quarantine source batches that conflict with an admitted type identity or
+  immutable source revision. The plane stores a `QUARANTINED` denial with
+  per-record reasons, does not mutate objects or advance the checkpoint, and
+  returns that exact result on replay. Additive property refreshes still
+  commit; malformed reserved properties and invalid checkpoints fail closed
+  before mutation.
 - Classify two authorized definition revisions as compatible, conditional,
   breaking, or unknown with bounded member and property reasons. Added optional
   types and properties are compatible; new actions, controls, and marking
