@@ -1689,6 +1689,62 @@ message ClassifyDefinitionRevisionCompatibilityResponse {
   DefinitionRevisionCompatibility compatibility = 1;
 }
 
+message DefinitionFactMigrationBlock {
+  string object_id = 1;
+  string reason_code = 2;
+}
+
+message DefinitionFactMigrationObject {
+  string object_id = 1;
+  string kind = 2;
+  string outcome = 3;
+  repeated string stripped_properties = 4;
+}
+
+message DefinitionFactMigration {
+  string contract_version = 1;
+  string namespace = 2;
+  string migration_id = 3;
+  string from_revision_digest = 4;
+  string to_revision_digest = 5;
+  string compatibility_digest = 6;
+  string compatibility_class = 7;
+  string mode = 8;
+  string status = 9;
+  string checkpoint_object_id = 10;
+  int32 affected_count = 11;
+  int32 migrated_count = 12;
+  int32 blocked_count = 13;
+  repeated DefinitionFactMigrationBlock blocked = 14;
+  repeated DefinitionFactMigrationObject objects = 15;
+  string actor = 16;
+  int64 created_at_ms = 17;
+  int64 updated_at_ms = 18;
+  string result_digest = 19;
+}
+
+message ExecuteDefinitionFactMigrationRequest {
+  string namespace = 1;
+  string migration_id = 2;
+  string from_revision_digest = 3;
+  string to_revision_digest = 4;
+  string mode = 5;
+  string idempotency_key = 6;
+}
+
+message ExecuteDefinitionFactMigrationResponse {
+  DefinitionFactMigration migration = 1;
+}
+
+message GetDefinitionFactMigrationRequest {
+  string namespace = 1;
+  string migration_id = 2;
+}
+
+message GetDefinitionFactMigrationResponse {
+  DefinitionFactMigration migration = 1;
+}
+
 // A reusable, namespace-scoped lease. `generation` is a monotonically
 // increasing fencing number and `fencing_token` uniquely identifies the
 // acquisition. Downstream mutation executors must reject a generation older
@@ -1776,6 +1832,8 @@ service SekaiService {
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
+  rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);
+  rpc GetDefinitionFactMigration(GetDefinitionFactMigrationRequest) returns (GetDefinitionFactMigrationResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);

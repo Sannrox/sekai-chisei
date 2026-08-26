@@ -68,7 +68,8 @@ independently verifiable candidate.
 - Stale writers must reload the branch head and later rebase; the service will
   not manufacture an automatic merge.
 - Rollback never deletes revision history. After publication and fact binding
-  exist, rollback requires a superseding revision and an explicit migration.
+  exist, rollback requires a superseding revision and an explicit migration
+  (ADR 0028).
 
 ## Validation
 

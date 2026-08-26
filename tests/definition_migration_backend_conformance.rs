@@ -1,0 +1,377 @@
+use std::collections::HashMap;
+
+use sekai_chisei::db::sekai::SekaiDb;
+use sekai_chisei::domain::Object;
+use sekai_chisei::sekai::definition_branch::{
+    ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput,
+    DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
+};
+use sekai_chisei::sekai::definition_migration::{
+    ExecuteFactMigration, MODE_DRY_RUN, MODE_EXECUTE, MODE_ROLLBACK, STATUS_BLOCKED,
+    STATUS_COMMITTED, STATUS_DRY_RUN_COMPLETE, STATUS_ROLLED_BACK,
+};
+use sekai_chisei::sekai::definition_proposal::{
+    ApproveDefinitionProposal, CreateDefinitionProposal, MergeDefinitionProposal,
+};
+
+fn member(namespace: &str, json: &str) -> DefinitionMemberInput {
+    let mut input = DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Ticket".into(),
+        definition_json: json.into(),
+        member_digest: String::new(),
+    };
+    input.member_digest = input.prepare(namespace).unwrap().member_digest;
+    input
+}
+
+fn object(namespace: &str, id: &str, title: &str, secret: Option<&str>) -> Object {
+    let mut properties = HashMap::from([("title".into(), title.into())]);
+    if let Some(secret) = secret {
+        properties.insert("secret".into(), secret.into());
+    }
+    Object {
+        id: format!("{namespace}:{id}"),
+        kind: "Ticket".into(),
+        name: id.into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:{id}"),
+        properties,
+        created: 1,
+        updated: 1,
+    }
+}
+
+fn publish_breaking(db: &SekaiDb, namespace: &str) -> (String, String) {
+    let parent_member = member(
+        namespace,
+        r#"{"name":"Ticket","properties":["title","secret"]}"#,
+    );
+    let prepared = parent_member.prepare(namespace).unwrap();
+    let revision = prepare_revision(
+        namespace,
+        "",
+        [DefinitionRevisionMember {
+            member_kind: prepared.member_kind.clone(),
+            member_id: prepared.member_id.clone(),
+            member_digest: prepared.member_digest.clone(),
+        }],
+        true,
+        "root",
+        1,
+    )
+    .unwrap();
+    db.seed_published_definition_revision(&revision, &[prepared])
+        .unwrap();
+    let parent = revision.revision_digest.clone();
+    db.create_definition_branch(
+        &CreateDefinitionBranch {
+            namespace: namespace.into(),
+            branch_id: "migrate".into(),
+            parent_revision_digest: parent.clone(),
+            idempotency_key: "create".into(),
+        },
+        "author",
+        2,
+    )
+    .unwrap();
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(
+            &ApplyDefinitionBranchEdit {
+                namespace: namespace.into(),
+                branch_id: "migrate".into(),
+                expected_head_digest: parent.clone(),
+                upserts: vec![member(
+                    namespace,
+                    r#"{"name":"Ticket","properties":["title"]}"#,
+                )],
+                removals: Vec::new(),
+                idempotency_key: "edit".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected edit");
+    };
+    let candidate = result.revision.revision_digest.clone();
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "migrate".into(),
+            proposal_id: "mig".into(),
+            base_digest: parent.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "propose".into(),
+        },
+        "author",
+        4,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "mig".into(),
+            idempotency_key: "approve".into(),
+        },
+        "author",
+        5,
+    )
+    .unwrap();
+    db.merge_definition_proposal(
+        &MergeDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "mig".into(),
+            expected_published_digest: parent.clone(),
+            idempotency_key: "merge".into(),
+        },
+        "author",
+        6,
+    )
+    .unwrap();
+    (parent, candidate)
+}
+
+fn exercise(db: SekaiDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    db.create_object(&object(namespace, "open", "hello", Some("classified")))
+        .unwrap();
+    db.create_object(&object(namespace, "done", "kept", Some("x")))
+        .unwrap();
+
+    let dry = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m1".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: MODE_DRY_RUN.into(),
+        idempotency_key: "dry".into(),
+    };
+    let planned = db
+        .execute_definition_fact_migration(&dry, "author", 7)
+        .unwrap();
+    assert_eq!(
+        db.execute_definition_fact_migration(&dry, "author", 8)
+            .unwrap(),
+        planned
+    );
+    assert_eq!(planned.status, STATUS_DRY_RUN_COMPLETE);
+    assert_eq!(planned.affected_count, 2);
+    assert_eq!(planned.migrated_count, 0);
+    assert_eq!(planned.compatibility_class, "breaking");
+    let stored = db
+        .get_object(&format!("{namespace}:open"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.properties.get("secret").unwrap(), "classified");
+
+    let execute = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m1".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: MODE_EXECUTE.into(),
+        idempotency_key: "run".into(),
+    };
+    let committed = db
+        .execute_definition_fact_migration(&execute, "author", 9)
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    assert_eq!(committed.migrated_count, 2);
+    assert_eq!(
+        db.execute_definition_fact_migration(&execute, "author", 10)
+            .unwrap(),
+        committed
+    );
+    let migrated = db
+        .get_object(&format!("{namespace}:open"))
+        .unwrap()
+        .unwrap();
+    assert!(!migrated.properties.contains_key("secret"));
+    assert_eq!(migrated.properties.get("title").unwrap(), "hello");
+    assert_eq!(
+        db.get_definition_fact_migration(namespace, "m1")
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_COMMITTED
+    );
+
+    let rollback = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m1".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: MODE_ROLLBACK.into(),
+        idempotency_key: "undo".into(),
+    };
+    let rolled = db
+        .execute_definition_fact_migration(&rollback, "author", 11)
+        .unwrap();
+    assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    let restored = db
+        .get_object(&format!("{namespace}:open"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.properties.get("secret").unwrap(), "classified");
+
+    let missing = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "blocked".into(),
+        from_revision_digest: from,
+        to_revision_digest: to,
+        mode: MODE_EXECUTE.into(),
+        idempotency_key: "block".into(),
+    };
+    db.create_object(&object(namespace, "empty", "only-title", None))
+        .unwrap();
+    let blocked = db.execute_definition_fact_migration(&missing, "author", 12);
+    // empty object still has title; execute after rollback re-migrates remaining
+    // objects bound to from. The empty object is migratable. Use a required-property
+    // case via a second namespace in the unit tests; here assert replay/unknown
+    // still fail closed.
+    let _ = blocked;
+    let mut unknown = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "nope".into(),
+        from_revision_digest: format!("sha256:{}", "a".repeat(64)),
+        to_revision_digest: format!("sha256:{}", "b".repeat(64)),
+        mode: MODE_DRY_RUN.into(),
+        idempotency_key: "missing".into(),
+    };
+    assert!(
+        db.execute_definition_fact_migration(&unknown, "author", 13)
+            .unwrap_err()
+            .contains("definition_revision_not_found")
+    );
+    unknown.mode = "explode".into();
+    unknown.idempotency_key = "bad-mode".into();
+    assert!(
+        db.execute_definition_fact_migration(&unknown, "author", 14)
+            .unwrap_err()
+            .contains("fact_migration_unsupported_mode")
+    );
+}
+
+#[test]
+fn sqlite_definition_fact_migration_conformance() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    exercise(db, "fact-mig-sqlite");
+}
+
+#[test]
+fn sqlite_blocked_transform_does_not_mutate() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    let namespace = "blocked-ns";
+    let parent_member = member(namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    let prepared = parent_member.prepare(namespace).unwrap();
+    let revision = prepare_revision(
+        namespace,
+        "",
+        [DefinitionRevisionMember {
+            member_kind: prepared.member_kind.clone(),
+            member_id: prepared.member_id.clone(),
+            member_digest: prepared.member_digest.clone(),
+        }],
+        true,
+        "root",
+        1,
+    )
+    .unwrap();
+    db.seed_published_definition_revision(&revision, &[prepared])
+        .unwrap();
+    let parent = revision.revision_digest;
+    db.create_definition_branch(
+        &CreateDefinitionBranch {
+            namespace: namespace.into(),
+            branch_id: "req".into(),
+            parent_revision_digest: parent.clone(),
+            idempotency_key: "c".into(),
+        },
+        "author",
+        2,
+    )
+    .unwrap();
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(
+            &ApplyDefinitionBranchEdit {
+                namespace: namespace.into(),
+                branch_id: "req".into(),
+                expected_head_digest: parent.clone(),
+                upserts: vec![member(
+                    namespace,
+                    r#"{"name":"Ticket","properties":["title","severity"],"required":["severity"]}"#,
+                )],
+                removals: Vec::new(),
+                idempotency_key: "e".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected edit");
+    };
+    let candidate = result.revision.revision_digest;
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "req".into(),
+            proposal_id: "p".into(),
+            base_digest: parent.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "pr".into(),
+        },
+        "author",
+        4,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "p".into(),
+            idempotency_key: "ap".into(),
+        },
+        "author",
+        5,
+    )
+    .unwrap();
+    db.merge_definition_proposal(
+        &MergeDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "p".into(),
+            expected_published_digest: parent.clone(),
+            idempotency_key: "mg".into(),
+        },
+        "author",
+        6,
+    )
+    .unwrap();
+    db.create_object(&object(namespace, "t", "hello", None))
+        .unwrap();
+    let result = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "need-sev".into(),
+                from_revision_digest: parent,
+                to_revision_digest: candidate,
+                mode: MODE_EXECUTE.into(),
+                idempotency_key: "ex".into(),
+            },
+            "author",
+            7,
+        )
+        .unwrap();
+    assert_eq!(result.status, STATUS_BLOCKED);
+    assert_eq!(result.blocked_count, 1);
+    assert_eq!(result.blocked[0].reason_code, "missing_required");
+    let stored = db.get_object(&format!("{namespace}:t")).unwrap().unwrap();
+    assert_eq!(stored.properties.get("title").unwrap(), "hello");
+    assert!(!stored.properties.contains_key("severity"));
+}

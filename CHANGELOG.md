@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Execute one approved checkpointed fact migration from an ancestor definition
+  revision onto the published head. Dry-run plans without mutation; execute
+  strips removed properties and rebinds objects; blocked transforms leave
+  facts unchanged; rollback restores snapshots. Unknown, stale, or unapproved
+  breaking changes fail closed. Published definition revisions stay immutable.
 - Deny property access without an explicit grant on activated object-security
   policies. Optional `property_grants` omit hidden values from authorized
   reads, context, export, lineage, and sync projections; ungranted filters and

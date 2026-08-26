@@ -159,10 +159,15 @@ its immutable revision and audit evidence.
   changed members and property keys between two authorized revisions without
   returning definition bodies.
 - `ClassifyDefinitionRevisionCompatibility` classifies that same authorized
-  pair as compatible, conditional, breaking, or unknown. Fact migration remains
-  a separate contract.
-- Runtime facts and source bindings remain attached to their existing type
-  identities.
+  pair as compatible, conditional, breaking, or unknown.
+- `ExecuteDefinitionFactMigration` runs one approved checkpointed fact
+  migration from an ancestor revision onto the published head, with dry-run,
+  execute, resume-by-replay, and rollback. Unknown compatibility, stale
+  parents, and unapproved breaking or conditional changes fail closed. Blocked
+  transforms do not mutate objects. Published definition rows are never
+  rewritten. See [ADR 0028](decisions/0028-checkpointed-fact-migration.md).
+- Runtime objects of `object_type` members are rebound by that migration.
+  Source bindings remain attached to their existing type identities.
 - Package identity is not a runtime grant. Evaluation-plan digests on a
   proposal are frozen references, not a second merge protocol.
 

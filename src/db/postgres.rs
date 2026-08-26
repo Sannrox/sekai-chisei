@@ -56,6 +56,7 @@ const DEFINITION_PROPOSAL_MERGE_EVIDENCE_SCHEMA: &str =
 const OBJECT_QUERY_CURSOR_SCHEMA: &str = include_str!("postgres/0035_object_query_cursor.sql");
 const SOURCE_BATCH_QUARANTINE_SCHEMA: &str =
     include_str!("postgres/0036_source_batch_quarantine.sql");
+const FACT_MIGRATION_SCHEMA: &str = include_str!("postgres/0037_fact_migration.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -239,6 +240,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 35,
         name: "source_batch_quarantine",
         sql: SOURCE_BATCH_QUARANTINE_SCHEMA,
+    },
+    Migration {
+        version: 36,
+        name: "fact_migration",
+        sql: FACT_MIGRATION_SCHEMA,
     },
 ];
 
