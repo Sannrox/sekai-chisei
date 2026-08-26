@@ -8,14 +8,15 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, MAX_LIST_LIMIT, Object};
 use crate::sekai::audit::Decision;
+use crate::sekai::classification_lattice::evaluate_lattice_access;
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::federation_profile::{
     self, MembershipStatus, PolicyPackPin, TRUST_ROOT_NAMESPACE,
 };
 use crate::sekai::markings::{
-    MarkingDecision, OBJECT_CLASSIFICATION_PROPERTY, PRINCIPAL_PROFILE_KIND,
-    evaluate_marking_access, parse_optional_classification, principal_authority_from_profile,
-    principal_profile_external_id, trusted_service_authority,
+    MarkingDecision, OBJECT_CLASSIFICATION_PROPERTY, PRINCIPAL_PROFILE_KIND, object_marking_token,
+    parse_optional_classification, principal_authority_from_profile, principal_profile_external_id,
+    trusted_service_authority,
 };
 use crate::sekai::peer_import;
 use crate::shomei;
@@ -670,17 +671,28 @@ fn namespace_has_omitted_facts(
 }
 
 fn marking_denies_export(db: &RuntimeDb, actor: &str, object: &Object) -> Result<bool, String> {
+    let Some(token) = object_marking_token(object) else {
+        return Ok(false);
+    };
+    // Snapshots still carry only the evidence ordinal. Custom lattice tokens
+    // stay local until a later federation contract includes the lattice.
+    if parse_optional_classification(token)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ok(true);
+    }
     let authority = export_authority(db, actor)?;
-    let marking = object
-        .properties
-        .get(OBJECT_CLASSIFICATION_PROPERTY)
-        .map(String::as_str)
-        .unwrap_or("");
-    let classification = parse_optional_classification(marking)?;
-    Ok(
-        evaluate_marking_access("namespace-snapshot-export", classification, &authority).decision
-            == MarkingDecision::Deny,
+    let lattice = db.get_classification_lattice(&object.namespace)?;
+    Ok(evaluate_lattice_access(
+        "namespace-snapshot-export",
+        object_marking_token(object),
+        &authority,
+        lattice.as_ref(),
     )
+    .decision
+        == MarkingDecision::Deny)
 }
 
 fn fact_from_object(object: Object, source_site_id: &str) -> SnapshotFact {
@@ -891,7 +903,10 @@ fn grant_covers_fact(grant: &PeerNamespaceGrant, fact: &SnapshotFact) -> Result<
         .get(OBJECT_CLASSIFICATION_PROPERTY)
         .map(String::as_str)
         .unwrap_or("");
-    let classification = parse_optional_classification(marking)?;
+    let classification = match parse_optional_classification(marking) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(false),
+    };
     let ceiling = grant
         .max_classification
         .as_deref()
@@ -1485,6 +1500,51 @@ mod tests {
         let err =
             import_namespace_snapshot(&importer, "admin-b", "ops", &divergent, 11_400).unwrap_err();
         assert!(err.contains("stale"), "{err}");
+    }
+
+    #[test]
+    fn custom_lattice_tokens_stay_out_of_snapshots() {
+        let runtime = db();
+        let custom = Object {
+            id: "health-doc".into(),
+            kind: "document".into(),
+            name: "health".into(),
+            namespace: "ops".into(),
+            external_id: "ops:health".into(),
+            properties: std::collections::HashMap::from([(
+                OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "health".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        };
+        assert!(marking_denies_export(&runtime, "alice", &custom).unwrap());
+        let grant = PeerNamespaceGrant {
+            grant_id: "g1".into(),
+            peer_site_id: "site-a".into(),
+            namespace: "ops".into(),
+            object_kinds: Vec::new(),
+            max_classification: None,
+            not_before_ms: 0,
+            not_after_ms: None,
+            revoked: false,
+            revoked_at_ms: None,
+            granted_by: "admin".into(),
+            granted_at_ms: 1,
+        };
+        let fact = SnapshotFact {
+            object_id: custom.id.clone(),
+            kind: custom.kind.clone(),
+            name: custom.name.clone(),
+            namespace: custom.namespace.clone(),
+            external_id: custom.external_id.clone(),
+            properties: custom.properties.into_iter().collect(),
+            created: 1,
+            updated: 1,
+            source_site_id: "site-a".into(),
+            write_authority: false,
+        };
+        assert!(!grant_covers_fact(&grant, &fact).unwrap());
     }
 
     #[test]

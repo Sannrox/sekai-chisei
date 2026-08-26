@@ -45,6 +45,9 @@ treat inventory “complete” as dual-backend for these RPCs):
   [federation-profile.md](federation-profile.md));
 - purpose authorizations for `required_purpose` reads (`sekai.purpose-authorization/v1`;
   see [ADR 0031](decisions/0031-purpose-bound-reads.md));
+- classification lattice publication (`sekai.classification-lattice/v1`;
+  see [ADR 0032](decisions/0032-hierarchical-classifications.md)); PostgreSQL
+  get returns no lattice so the default ceiling remains;
 
 Evidence is checked in as:
 

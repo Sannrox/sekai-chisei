@@ -6,28 +6,51 @@ Namespace ACLs alone do not express classification of artifacts or
 purpose-based constraints on actions. v1 adds optional markings and purpose
 gates on top of existing grants.
 
-## Provisional vocabulary
+## Default vocabulary
 
-Classification lattice (reuses evidence classification order):
+Namespaces that never publish a lattice keep the evidence ordinal:
 
 `public` < `internal` < `confidential` < `restricted`
 
-This vocabulary is **provisional**. A later design discussion may refine or
-replace it; the storage keys and fail-open/fail-closed posture below are the
-stable contract for v1.
+That default is the stable contract for unmarked data. An activated namespace
+may replace it with `sekai.classification-lattice/v1`. See
+[ADR 0032](decisions/0032-hierarchical-classifications.md).
+
+## Namespace lattices
+
+Credential admins publish a lattice through `PutClassificationLattice` and
+inspect it through `GetClassificationLattice`. The document names tokens,
+parent edges (child → more-dominant parents), and explicit incomparable pairs.
+Dominance is reachability from the marking to the caller’s sealed ceiling.
+
+- **Unmarked objects** (missing or empty `access_marking`): no extra check.
+- **Unactivated namespaces**: unknown tokens stay unmarked; only the evidence
+  ordinal enforces clearance.
+- **Activated lattices**: unknown tokens, stale digest or namespace identity,
+  and incomparable joins fail closed. Hidden rows stay observationally
+  identical to absent rows.
+- Graph hops take the least upper bound of the path marking and the candidate.
+  If that join does not exist, the hop is denied.
+- Trusted service principals (`root`, `local`, `chisei-gateway`) remain an
+  explicit exception.
+- The sealed `classification_ceiling` is one global principal-profile token,
+  interpreted in the object’s namespace lattice. Do not reuse a custom token
+  name across lattices unless the same clearance is intended.
+
+SQLite stores the lattice. PostgreSQL get returns no lattice so the default
+ceiling stays in force; put is unavailable.
 
 ## Object markings
 
-Objects may set property **`access_marking`** to one of the lattice tokens.
+Objects may set property **`access_marking`** to a lattice token.
 (This is intentionally not named `classification`, which is already used for
 schema property redaction classes and free-form domain fields.)
 
-- **Unmarked objects** (missing, empty, or non-lattice value): no extra check
+- **Unmarked objects** (missing or empty value): no extra check
   (migration fail-open for existing data).
-- **Marked objects** (valid lattice token): principal must present a sufficient
-  `classification_ceiling` or be a trusted service principal
-  (`root`, `local`, `chisei-gateway`). Otherwise read and action targeting
-  fail closed with generic `access denied`.
+- **Marked objects**: principal must present a ceiling that dominates the
+  marking, or be a trusted service principal. Otherwise read and action
+  targeting fail closed with generic `access denied`.
 
 ## Principal profiles
 
@@ -81,6 +104,8 @@ leaking classification details in the RPC error.
 5. Purpose-bound reads require an activated object-security policy that names
    `required_purpose` plus a live `sekai.purpose-authorization/v1`. Principal
    `allowed_purposes` alone are not read authority.
+6. Operators who need compartments or extra tokens publish
+   `sekai.classification-lattice/v1` before marking objects with those tokens.
 
 ## Residual risks (v1)
 

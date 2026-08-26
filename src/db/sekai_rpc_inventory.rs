@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 119);
+        assert_eq!(inventory.entries.len(), 121);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
@@ -372,6 +372,8 @@ mod tests {
             "GetObjectSecurityActivation",
             "PutPurposeAuthorization",
             "RevokePurposeAuthorization",
+            "PutClassificationLattice",
+            "GetClassificationLattice",
         ] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }

@@ -1463,14 +1463,20 @@ fn lookup_object_readable(
     {
         return Ok(false);
     }
-    let marking = markings::object_classification(object)?;
-    if marking.is_none() {
+    if markings::object_marking_token(object).is_none() {
         return Ok(true);
     }
     let primary = principals.first().map(String::as_str).unwrap_or_default();
     let authority = lookup_principal_authority(primary, db)?;
+    let lattice = db.get_classification_lattice(&object.namespace)?;
     Ok(
-        markings::evaluate_marking_access("lookup-first", marking, &authority).decision
+        crate::sekai::classification_lattice::evaluate_lattice_access(
+            "lookup-first",
+            markings::object_marking_token(object),
+            &authority,
+            lattice.as_ref(),
+        )
+        .decision
             != markings::MarkingDecision::Deny,
     )
 }

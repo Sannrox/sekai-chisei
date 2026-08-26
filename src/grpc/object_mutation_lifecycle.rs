@@ -103,12 +103,7 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         let domain_object = from_proto_obj(&object);
-        if let Some(value) = domain_object
-            .properties
-            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
-        {
-            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
-        }
+        validate_written_access_marking(&self.db, &domain_object)?;
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(&self.db),
             |precondition| {
@@ -323,12 +318,7 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         let mut domain_object = from_proto_obj(&object);
-        if let Some(value) = domain_object
-            .properties
-            .get(markings::OBJECT_CLASSIFICATION_PROPERTY)
-        {
-            markings::parse_optional_classification(value).map_err(Status::invalid_argument)?;
-        }
+        validate_written_access_marking(&self.db, &domain_object)?;
         let request_object = domain_object.clone();
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(&self.db),
@@ -573,4 +563,15 @@ impl SekaiServiceImpl {
             .ensure_kind_loaded(kind)
             .map_err(map_schema_definition_lifecycle_error)
     }
+}
+
+fn validate_written_access_marking(db: &RuntimeDb, object: &domain::Object) -> Result<(), Status> {
+    let lattice = db
+        .get_classification_lattice(&object.namespace)
+        .map_err(|_| Status::unavailable("classification lattice unavailable"))?;
+    crate::sekai::classification_lattice::validate_written_marking_token(
+        markings::object_marking_token(object),
+        lattice.as_ref(),
+    )
+    .map_err(Status::invalid_argument)
 }

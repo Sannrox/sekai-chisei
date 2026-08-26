@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Evaluate object markings against an optional namespace-local
+  `sekai.classification-lattice/v1`. Dominance is reachability; hops take the
+  least upper bound and deny incomparable joins. Unknown tokens and stale
+  lattice identity fail closed. Unmarked data and namespaces that never
+  publish a lattice keep the evidence ordinal. Credential admins publish the
+  lattice through `PutClassificationLattice` and `GetClassificationLattice`.
+  SQLite stores it; PostgreSQL get stays empty so the default ceiling remains.
 - Require a scoped, expiring purpose authorization for governed reads when an
   activated object-security policy names `required_purpose`. Missing,
   incompatible, expired, wrong-actor, stale-activation, or out-of-scope purpose

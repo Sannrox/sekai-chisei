@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_DEPTH: i32 = 10;
 
-pub type ObjectAllowFn<'a> = dyn Fn(&Object) -> Result<bool, String> + 'a;
+pub type ObjectAllowFn<'a> =
+    dyn Fn(Option<&Object>, &Object) -> Result<Option<String>, String> + 'a;
 
 #[derive(Debug, Clone, Default)]
 pub struct GraphQuery {
@@ -73,9 +74,16 @@ pub fn traverse_with_policy_context(
     };
 
     let mut visited = HashSet::new();
-    visited.insert(start_id.clone());
+    visited.insert((start_id.clone(), String::new()));
     let mut frontier = VecDeque::new();
-    frontier.push_back(start_id);
+    frontier.push_back(start_id.clone());
+    let mut seen_objects = HashMap::new();
+    if let Some(start) = match policy_context {
+        Some(context) => db.get_object_with_policy_context(&start_id, context)?,
+        None => db.get_object(&start_id)?,
+    } {
+        seen_objects.insert(start_id.clone(), start);
+    }
     let mut result = GraphResult::default();
 
     for _ in 0..depth {
@@ -93,30 +101,38 @@ pub fn traverse_with_policy_context(
                         Direction::Outgoing => &link.to_id,
                         Direction::Incoming => &link.from_id,
                     };
-                    if visited.contains(target) {
-                        continue;
-                    }
-                    visited.insert(target.clone());
-
                     let obj = match policy_context {
                         Some(context) => db.get_object_with_policy_context(target, context)?,
                         None => db.get_object(target)?,
                     };
-                    if let Some(obj) = obj {
-                        if let Some(allow) = allow
-                            && !allow(&obj)?
-                        {
-                            continue;
-                        }
-                        next.push_back(target.clone());
-                        if matches_filters(
-                            &obj,
-                            &kind_set,
-                            &q.interface_filter,
-                            &q.property_filter,
-                            schema,
-                        ) {
+                    let Some(obj) = obj else {
+                        visited.insert((target.clone(), String::new()));
+                        continue;
+                    };
+                    let parent = seen_objects.get(&node_id);
+                    let visit_key = match allow {
+                        Some(allow) => match allow(parent, &obj)? {
+                            Some(key) => key,
+                            None => continue,
+                        },
+                        None => String::new(),
+                    };
+                    if !visited.insert((target.clone(), visit_key)) {
+                        continue;
+                    }
+                    next.push_back(target.clone());
+                    seen_objects.insert(target.clone(), obj.clone());
+                    if matches_filters(
+                        &obj,
+                        &kind_set,
+                        &q.interface_filter,
+                        &q.property_filter,
+                        schema,
+                    ) {
+                        if !result.objects.iter().any(|seen| seen.id == obj.id) {
                             result.objects.push(obj);
+                        }
+                        if !result.links.iter().any(|seen| seen.id == link.id) {
                             result.links.push(link);
                         }
                     }
@@ -312,6 +328,77 @@ mod tests {
         };
         let res = traverse(&db, &q, None).unwrap();
         assert_eq!(res.objects.len(), 0); // no "owns" links
+    }
+
+    #[test]
+    fn traverse_allow_receives_parent_and_can_deny_hops() {
+        let db = setup();
+        let q = GraphQuery {
+            start_id: "r1".into(),
+            max_depth: 2,
+            ..Default::default()
+        };
+        let res = traverse_with_policy_context(
+            &db,
+            &q,
+            None,
+            None,
+            Some(&|parent, object| {
+                Ok(
+                    (parent.is_some_and(|parent| parent.id == "r1") && object.id != "c2")
+                        .then(|| "ok".into()),
+                )
+            }),
+        )
+        .unwrap();
+        let ids = res
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"c1"));
+        assert!(!ids.contains(&"c2"));
+        assert!(!ids.contains(&"f1"));
+    }
+
+    #[test]
+    fn traverse_retries_target_after_denied_first_hop() {
+        let db = setup();
+        db.create_link(&Link {
+            id: "l4".into(),
+            from_id: "c2".into(),
+            to_id: "f1".into(),
+            relation: "contains".into(),
+            created: 0,
+        })
+        .unwrap();
+        let q = GraphQuery {
+            start_id: "r1".into(),
+            max_depth: 2,
+            ..Default::default()
+        };
+        let res = traverse_with_policy_context(
+            &db,
+            &q,
+            None,
+            None,
+            Some(&|parent, object| {
+                Ok(
+                    (!(parent.is_some_and(|parent| parent.id == "c1") && object.id == "f1"))
+                        .then(|| parent.map(|parent| parent.id.clone()).unwrap_or_default()),
+                )
+            }),
+        )
+        .unwrap();
+        let ids = res
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            ids.contains(&"f1"),
+            "a later permitted hop must still reach f1"
+        );
     }
 
     #[test]

@@ -36,8 +36,23 @@ pub struct PrincipalAuthority {
     pub principal: String,
     /// `None` means no explicit clearance was configured.
     pub classification_ceiling: Option<EvidenceClassification>,
+    /// Raw ceiling token; used by an activated namespace lattice.
+    #[serde(default)]
+    pub classification_token: Option<String>,
     /// Empty means no purpose allow-list is configured.
     pub allowed_purposes: BTreeSet<String>,
+}
+
+impl PrincipalAuthority {
+    pub fn classification_ceiling_token(&self) -> Option<String> {
+        self.classification_token
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.classification_ceiling
+                    .map(|value| value.as_str().to_string())
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,15 +110,25 @@ pub fn parse_classification(value: &str) -> Result<EvidenceClassification, Strin
 ///
 /// Unknown tokens are ignored (treated as unmarked) so free-form domain values
 /// on legacy objects never fail closed or hide data; only the provisional
-/// lattice tokens enforce clearance.
+/// lattice tokens enforce clearance. Activated namespace lattices evaluate the
+/// raw token instead; see `object_marking_token`.
 pub fn object_classification(object: &Object) -> Result<Option<EvidenceClassification>, String> {
-    match object.properties.get(OBJECT_CLASSIFICATION_PROPERTY) {
+    match object_marking_token(object) {
         None => Ok(None),
         Some(value) => match parse_optional_classification(value) {
             Ok(parsed) => Ok(parsed),
             Err(_) => Ok(None),
         },
     }
+}
+
+/// Raw `access_marking` token when present and non-empty.
+pub fn object_marking_token(object: &Object) -> Option<&str> {
+    object
+        .properties
+        .get(OBJECT_CLASSIFICATION_PROPERTY)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 /// Parse a principal authority snapshot from a principal profile object.
@@ -115,16 +140,29 @@ pub fn principal_authority_from_profile(
         return Ok(PrincipalAuthority {
             principal: principal.into(),
             classification_ceiling: None,
+            classification_token: None,
             allowed_purposes: BTreeSet::new(),
         });
     };
-    let ceiling = match profile
+    let token = profile
         .properties
         .get(PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY)
-    {
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let ceiling = match token.as_deref() {
         None => None,
-        Some(value) => parse_optional_classification(value)?,
+        Some(value) => parse_optional_classification(value).unwrap_or(None),
     };
+    if token.is_some() && ceiling.is_none() {
+        let raw = token.as_deref().unwrap_or_default();
+        if raw.len() > 256
+            || !raw
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "_-.:/".contains(character))
+        {
+            return Err("invalid classification_ceiling".into());
+        }
+    }
     let purposes = match profile.properties.get(PRINCIPAL_ALLOWED_PURPOSES_PROPERTY) {
         None => BTreeSet::new(),
         Some(raw) => parse_purpose_list(raw)?,
@@ -132,6 +170,7 @@ pub fn principal_authority_from_profile(
     Ok(PrincipalAuthority {
         principal: principal.into(),
         classification_ceiling: ceiling,
+        classification_token: token,
         allowed_purposes: purposes,
     })
 }
@@ -142,6 +181,7 @@ pub fn trusted_service_authority(principal: &str) -> Option<PrincipalAuthority> 
         Some(PrincipalAuthority {
             principal: principal.into(),
             classification_ceiling: Some(EvidenceClassification::Restricted),
+            classification_token: Some(EvidenceClassification::Restricted.as_str().into()),
             allowed_purposes: BTreeSet::new(), // empty allow-list is not consulted for trusted
         })
     } else {
@@ -311,6 +351,7 @@ mod tests {
         PrincipalAuthority {
             principal: "alice".into(),
             classification_ceiling: ceiling,
+            classification_token: ceiling.map(|value| value.as_str().into()),
             allowed_purposes: purposes.iter().map(|p| (*p).into()).collect(),
         }
     }

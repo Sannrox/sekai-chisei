@@ -2,8 +2,10 @@
 
 ## Status
 
-Accepted for v1 (#301). Vocabulary remains provisional pending a later
-design discussion if residency/federation needs a richer lattice.
+Accepted for v1 (#301). Vocabulary remains the default ceiling for unmarked
+data and namespaces that never publish a lattice. Activated namespaces may
+replace the single ordinal with a namespace-local lattice; see
+[ADR 0032](0032-hierarchical-classifications.md).
 
 The `ActionTypeDef.required_purpose` portion was retired when the pre-1.0 graph
 Action DSL was removed. Object markings and authoritative principal profiles

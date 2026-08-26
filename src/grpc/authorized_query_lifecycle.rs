@@ -6,7 +6,7 @@
 //! lineage reads.
 
 use super::*;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 impl SekaiServiceImpl {
     pub(super) async fn get_visible_object(
@@ -708,14 +708,42 @@ impl SekaiServiceImpl {
                 )?;
             }
         }
+        let authority = resolve_principal_authority(&self.db, &principals)?;
+        let start_lattice = self
+            .db
+            .get_classification_lattice(&start.namespace)
+            .map_err(|_| Status::unavailable("classification lattice unavailable"))?;
+        let start_digest = start_lattice
+            .as_ref()
+            .map(crate::sekai::classification_lattice::ClassificationLattice::digest)
+            .transpose()
+            .map_err(Status::internal)?;
+        let start_path = crate::sekai::classification_lattice::PathClassification {
+            namespace: start.namespace.clone(),
+            lattice_digest: start_digest,
+            token: markings::object_marking_token(&start).map(str::to_string),
+        };
+        let accumulated = std::cell::RefCell::new(HashMap::from([(
+            start.id.clone(),
+            BTreeSet::from([start_path]),
+        )]));
         let mut res = crate::sekai::query::traverse_with_policy_context(
             &self.db,
             &gq,
             Some(&schema),
             Some(&policy_context),
-            Some(&|object| {
-                purpose_kind_permitted(&self.db, &object.namespace, &object.kind, purpose.as_ref())
-                    .map_err(|status| status.to_string())
+            Some(&|parent, object| {
+                if !purpose_kind_permitted(
+                    &self.db,
+                    &object.namespace,
+                    &object.kind,
+                    purpose.as_ref(),
+                )
+                .map_err(|status| status.to_string())?
+                {
+                    return Ok(None);
+                }
+                hop_marking_permitted(&self.db, &authority, &accumulated, parent, object)
             }),
         )
         .map_err(|error| {
@@ -851,4 +879,93 @@ impl SekaiServiceImpl {
             }),
         }))
     }
+}
+
+fn hop_marking_permitted(
+    db: &RuntimeDb,
+    authority: &markings::PrincipalAuthority,
+    accumulated: &std::cell::RefCell<
+        HashMap<String, BTreeSet<crate::sekai::classification_lattice::PathClassification>>,
+    >,
+    parent: Option<&domain::Object>,
+    object: &domain::Object,
+) -> Result<Option<String>, String> {
+    if markings::is_trusted_service_principal(&authority.principal) {
+        return Ok(Some("trusted".into()));
+    }
+    let lattice = db.get_classification_lattice(&object.namespace)?;
+    let child_digest = lattice
+        .as_ref()
+        .map(crate::sekai::classification_lattice::ClassificationLattice::digest)
+        .transpose()?;
+    let parent_paths = parent
+        .map(|parent| {
+            accumulated
+                .borrow()
+                .get(&parent.id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    BTreeSet::from([crate::sekai::classification_lattice::PathClassification {
+                        namespace: parent.namespace.clone(),
+                        lattice_digest: None,
+                        token: markings::object_marking_token(parent).map(str::to_string),
+                    }])
+                })
+        })
+        .unwrap_or_default();
+    let child_token = markings::object_marking_token(object).map(str::to_string);
+    let mut added_key = None;
+    for parent_path in parent_paths {
+        if !crate::sekai::classification_lattice::path_marking_compatible(
+            Some(&parent_path),
+            &object.namespace,
+            child_digest.as_deref(),
+            child_token.as_deref(),
+        ) {
+            continue;
+        }
+        let inherit = parent_path.namespace == object.namespace;
+        let joined = match crate::sekai::classification_lattice::join_marking_tokens(
+            lattice.as_ref(),
+            inherit.then_some(parent_path.token.as_deref()).flatten(),
+            child_token.as_deref(),
+        ) {
+            Ok(Some(token)) => Some(token),
+            Ok(None)
+                if inherit
+                    && parent_path.token.is_some()
+                    && child_token.is_some()
+                    && lattice.is_some() =>
+            {
+                continue;
+            }
+            Ok(None) => child_token.clone(),
+            Err(_) if lattice.is_some() => continue,
+            Err(error) => return Err(error),
+        };
+        let result = crate::sekai::classification_lattice::evaluate_lattice_access(
+            "traverse-hop",
+            joined.as_deref(),
+            authority,
+            lattice.as_ref(),
+        );
+        if result.decision == markings::MarkingDecision::Deny {
+            continue;
+        }
+        let path = crate::sekai::classification_lattice::PathClassification {
+            namespace: object.namespace.clone(),
+            lattice_digest: child_digest.clone(),
+            token: joined,
+        };
+        let key = path.visit_key();
+        if accumulated
+            .borrow_mut()
+            .entry(object.id.clone())
+            .or_default()
+            .insert(path)
+        {
+            added_key = Some(key);
+        }
+    }
+    Ok(added_key)
 }

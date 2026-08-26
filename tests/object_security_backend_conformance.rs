@@ -5,6 +5,9 @@ use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{Direction, KIND_CAPABILITY, Link, ListFilter, Object, PropertyFilter};
+use sekai_chisei::sekai::classification_lattice::{
+    CLASSIFICATION_LATTICE_VERSION, ClassificationLattice,
+};
 use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
     ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext, PropertyGrant,
@@ -707,12 +710,54 @@ fn exercise_purpose_bound_reads(db: &RuntimeDb, namespace: &str) {
     );
 }
 
+fn exercise_classification_lattices(db: &RuntimeDb, namespace: &str) {
+    let lattice = ClassificationLattice {
+        contract_version: CLASSIFICATION_LATTICE_VERSION.into(),
+        namespace: namespace.into(),
+        tokens: vec![
+            "public".into(),
+            "internal".into(),
+            "confidential".into(),
+            "secret".into(),
+            "health".into(),
+        ],
+        parents: BTreeMap::from([
+            ("public".into(), vec!["internal".into()]),
+            ("internal".into(), vec!["confidential".into()]),
+            ("confidential".into(), vec!["secret".into()]),
+            ("health".into(), vec!["secret".into()]),
+        ]),
+        incomparable: vec![("confidential".into(), "health".into())],
+    };
+    match db.put_classification_lattice(&lattice, "root", 10) {
+        Ok(stored) => {
+            assert_eq!(stored.namespace, namespace);
+            let loaded = db.get_classification_lattice(namespace).unwrap().unwrap();
+            assert_eq!(loaded.digest().unwrap(), stored.digest().unwrap());
+            assert!(loaded.dominates("secret", "health").unwrap());
+            assert_eq!(loaded.join("confidential", "health").unwrap(), None);
+            let mut unknown = stored.clone();
+            unknown.contract_version = "sekai.classification-lattice/v2".into();
+            assert!(
+                db.put_classification_lattice(&unknown, "root", 11)
+                    .unwrap_err()
+                    .contains("unsupported classification lattice contract")
+            );
+        }
+        Err(error) if error.contains("unavailable") => {
+            assert!(db.get_classification_lattice(namespace).unwrap().is_none());
+        }
+        Err(error) => panic!("{error}"),
+    }
+}
+
 #[test]
 fn sqlite_object_security_conformance() {
     let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
     exercise(db.clone(), "object-security-sqlite");
     exercise_row_scoped_query_paths(&db, "row-scope-sqlite");
     exercise_purpose_bound_reads(&db, "purpose-sqlite");
+    exercise_classification_lattices(&db, "lattice-sqlite");
 }
 
 #[test]
@@ -1030,6 +1075,7 @@ fn postgres_object_security_conformance() {
     );
     exercise_row_scoped_query_paths(&db, &format!("row-scope-{}", uuid::Uuid::new_v4().simple()));
     exercise_purpose_bound_reads(&db, &format!("purpose-{}", uuid::Uuid::new_v4().simple()));
+    exercise_classification_lattices(&db, &format!("lattice-{}", uuid::Uuid::new_v4().simple()));
 
     let namespace = format!("object-security-put-race-{}", uuid::Uuid::new_v4().simple());
     let policy = Arc::new(policy(

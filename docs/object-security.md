@@ -5,9 +5,11 @@ scoped read policy. Operators install canonical JSON through
 `PutObjectSecurityPolicyRevision`, then atomically activate a complete
 kind-to-revision map through `ActivateObjectSecurityPolicies`. Inspection
 RPCs (`GetObjectSecurityPolicyRevision`, `GetObjectSecurityActivation`,
-`PutPurposeAuthorization`, `RevokePurposeAuthorization`) use the same
+`PutPurposeAuthorization`, `RevokePurposeAuthorization`,
+`PutClassificationLattice`, `GetClassificationLattice`) use the same
 credential-admin boundary as mutation. The server computes the content digest;
-generic object mutation cannot edit policy or purpose-authorization state.
+generic object mutation cannot edit policy, purpose-authorization, or lattice
+state.
 
 Inactive namespaces preserve existing ACL, team-namespace, and classification
 marking behavior. Activated namespaces fail closed when policy is absent,
@@ -59,7 +61,9 @@ wrong-actor, stale, or out-of-scope purpose omits the row. List cursors bind
 the presented purpose with the existing authority digest. Credential admins
 issue and revoke authorizations through `PutPurposeAuthorization` and
 `RevokePurposeAuthorization`. SQLite stores them; PostgreSQL fails closed as
-unavailable. Generic object writes reject NUL
+unavailable. Optional namespace classification lattices
+(`sekai.classification-lattice/v1`) are published the same way; see
+[classification markings](classification-markings.md). Generic object writes reject NUL
 property keys and values so new rows cannot poison PostgreSQL policy casts.
 
 `ListObjects` may span activated and unactivated namespaces. Its storage

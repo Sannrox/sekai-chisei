@@ -203,6 +203,14 @@ impl SekaiDb {
                     created_by TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     revoked_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS sekai_classification_lattices (
+                    namespace TEXT PRIMARY KEY,
+                    contract_version TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    lattice_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL
                 );",
             )
             .map_err(|error| error.to_string())
@@ -616,6 +624,83 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|error| error.to_string())
+    }
+
+    pub fn put_classification_lattice(
+        &self,
+        lattice: &crate::sekai::classification_lattice::ClassificationLattice,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::classification_lattice::ClassificationLattice, String> {
+        if actor.trim().is_empty() || now_ms <= 0 {
+            return Err("classification lattice actor or time is invalid".into());
+        }
+        let lattice = lattice.prepare()?;
+        let digest = lattice.digest()?;
+        let lattice_json = serde_json::to_string(&lattice).map_err(|error| error.to_string())?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_classification_lattices
+                 (namespace, contract_version, digest, lattice_json, created_by, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(namespace) DO UPDATE SET
+                    contract_version = excluded.contract_version,
+                    digest = excluded.digest,
+                    lattice_json = excluded.lattice_json,
+                    created_by = excluded.created_by,
+                    created_at_ms = excluded.created_at_ms",
+                params![
+                    lattice.namespace,
+                    lattice.contract_version,
+                    digest,
+                    lattice_json,
+                    actor,
+                    now_ms
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(lattice)
+    }
+
+    pub fn get_classification_lattice(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<crate::sekai::classification_lattice::ClassificationLattice>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT namespace, contract_version, digest, lattice_json
+                 FROM sekai_classification_lattices
+                 WHERE namespace = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let row = statement
+            .query_row(params![namespace], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored_namespace, contract_version, digest, lattice_json)) = row else {
+            return Ok(None);
+        };
+        if stored_namespace != namespace {
+            return Err("classification lattice namespace mismatch".into());
+        }
+        let lattice: crate::sekai::classification_lattice::ClassificationLattice =
+            serde_json::from_str(&lattice_json).map_err(|error| error.to_string())?;
+        let lattice = lattice.prepare()?;
+        if lattice.namespace != namespace || lattice.contract_version != contract_version {
+            return Err("classification lattice identity is stale".into());
+        }
+        if lattice.digest()? != digest {
+            return Err("classification lattice digest is stale".into());
+        }
+        Ok(Some(lattice))
     }
 }
 
