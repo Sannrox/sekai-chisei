@@ -446,6 +446,26 @@ message PutPurposeAuthorizationRequest { PurposeAuthorization authorization = 1;
 message PutPurposeAuthorizationResponse { PurposeAuthorization authorization = 1; }
 message RevokePurposeAuthorizationRequest { string authorization_id = 1; }
 message RevokePurposeAuthorizationResponse { PurposeAuthorization authorization = 1; }
+message ClassificationParentEdge {
+  string child = 1;
+  string parent = 2;
+}
+message ClassificationIncomparablePair {
+  string left = 1;
+  string right = 2;
+}
+message ClassificationLattice {
+  string contract_version = 1;
+  string namespace = 2;
+  repeated string tokens = 3;
+  repeated ClassificationParentEdge parents = 4;
+  repeated ClassificationIncomparablePair incomparable = 5;
+  string digest = 6;
+}
+message PutClassificationLatticeRequest { ClassificationLattice lattice = 1; }
+message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
+message GetClassificationLatticeRequest { string namespace = 1; }
+message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -1863,6 +1883,8 @@ service SekaiService {
   rpc GetObjectSecurityActivation(GetObjectSecurityActivationRequest) returns (GetObjectSecurityActivationResponse);
   rpc PutPurposeAuthorization(PutPurposeAuthorizationRequest) returns (PutPurposeAuthorizationResponse);
   rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
+  rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
+  rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

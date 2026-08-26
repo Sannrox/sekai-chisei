@@ -25,10 +25,19 @@ fn object_visible_to_actor(db: &RuntimeDb, object: &Object, actor: &str) -> Resu
     if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
         return Ok(false);
     }
-    let marking = markings::object_classification(object)?;
+    if markings::object_marking_token(object).is_none() {
+        return Ok(true);
+    }
     let authority = principal_authority(db, actor)?;
+    let lattice = db.get_classification_lattice(&object.namespace)?;
     Ok(
-        markings::evaluate_marking_access("evaluation-plan-read", marking, &authority).decision
+        crate::sekai::classification_lattice::evaluate_lattice_access(
+            "evaluation-plan-read",
+            markings::object_marking_token(object),
+            &authority,
+            lattice.as_ref(),
+        )
+        .decision
             != markings::MarkingDecision::Deny,
     )
 }

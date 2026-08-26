@@ -9,6 +9,7 @@ pub mod attestation;
 pub mod audit;
 pub mod capability;
 pub mod capacity;
+pub mod classification_lattice;
 pub mod compute;
 pub mod coordination;
 pub mod credentials;

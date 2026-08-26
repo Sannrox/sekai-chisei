@@ -594,17 +594,30 @@ fn resolve_principal_authority(
         .map_err(Status::internal)
 }
 
+fn load_classification_lattice(
+    db: &RuntimeDb,
+    namespace: &str,
+) -> Result<Option<crate::sekai::classification_lattice::ClassificationLattice>, Status> {
+    db.get_classification_lattice(namespace)
+        .map_err(|_| Status::unavailable("classification lattice unavailable"))
+}
+
 fn object_passes_marking(
     db: &RuntimeDb,
     object: &domain::Object,
     principals: &[String],
 ) -> Result<bool, Status> {
-    let marking = markings::object_classification(object).map_err(Status::invalid_argument)?;
-    if marking.is_none() {
+    if markings::object_marking_token(object).is_none() {
         return Ok(true);
     }
+    let lattice = load_classification_lattice(db, &object.namespace)?;
     let authority = resolve_principal_authority(db, principals)?;
-    let result = markings::evaluate_marking_access("visibility", marking, &authority);
+    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
+        "visibility",
+        markings::object_marking_token(object),
+        &authority,
+        lattice.as_ref(),
+    );
     Ok(result.decision != markings::MarkingDecision::Deny)
 }
 
@@ -980,20 +993,16 @@ fn validate_principal_profile_object(obj: &Object) -> Result<(), Status> {
             "principal_profile external_id must be {expected}"
         )));
     }
-    if let Some(ceiling) = obj
+    if obj
         .properties
-        .get(markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY)
-    {
-        markings::parse_optional_classification(ceiling).map_err(Status::invalid_argument)?;
-    }
-    if let Some(purposes) = obj
-        .properties
-        .get(markings::PRINCIPAL_ALLOWED_PURPOSES_PROPERTY)
+        .contains_key(markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY)
+        || obj
+            .properties
+            .contains_key(markings::PRINCIPAL_ALLOWED_PURPOSES_PROPERTY)
     {
         let domain = from_proto_obj(obj);
         markings::principal_authority_from_profile(&obj.name, Some(&domain))
             .map_err(Status::invalid_argument)?;
-        let _ = purposes;
     }
     Ok(())
 }
@@ -1004,9 +1013,26 @@ fn enforce_object_marking_access(
     principals: &[String],
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    let marking = markings::object_classification(object).map_err(Status::invalid_argument)?;
+    if markings::object_marking_token(object).is_none() {
+        return Ok(markings::MarkingCheckResult {
+            decision: markings::MarkingDecision::NotApplicable,
+            decision_id: format!(
+                "marking:{operation_id}:{}",
+                uuid::Uuid::new_v4().as_simple()
+            ),
+            object_classification: None,
+            principal_ceiling: None,
+            detail: "object has no classification marking".into(),
+        });
+    }
+    let lattice = load_classification_lattice(db, &object.namespace)?;
     let authority = resolve_principal_authority(db, principals)?;
-    let result = markings::evaluate_marking_access(operation_id, marking, &authority);
+    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
+        operation_id,
+        markings::object_marking_token(object),
+        &authority,
+        lattice.as_ref(),
+    );
     if result.decision == markings::MarkingDecision::Deny {
         // Generic denial — do not leak marking details to unauthorized callers.
         return Err(Status::permission_denied("access denied"));
@@ -5363,6 +5389,61 @@ impl SekaiService for SekaiServiceImpl {
         }))
     }
 
+    async fn put_classification_lattice(
+        &self,
+        req: Request<PutClassificationLatticeRequest>,
+    ) -> Result<Response<PutClassificationLatticeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let lattice = req
+            .into_inner()
+            .lattice
+            .ok_or_else(|| Status::invalid_argument("lattice required"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &lattice.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &lattice.namespace, true)?;
+        let lattice = from_proto_classification_lattice(lattice);
+        lattice.prepare().map_err(Status::invalid_argument)?;
+        let stored = self
+            .db
+            .put_classification_lattice(
+                &lattice,
+                principals.first().map(String::as_str).unwrap_or_default(),
+                now_millis(),
+            )
+            .map_err(map_classification_lattice_error)?;
+        Ok(Response::new(PutClassificationLatticeResponse {
+            lattice: Some(to_proto_classification_lattice(&stored)?),
+        }))
+    }
+
+    async fn get_classification_lattice(
+        &self,
+        req: Request<GetClassificationLatticeRequest>,
+    ) -> Result<Response<GetClassificationLatticeResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let namespace = req.into_inner().namespace;
+        enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &namespace, false)?;
+        check_team_namespace(&self.db, &principals, &namespace, false)?;
+        let lattice = self
+            .db
+            .get_classification_lattice(&namespace)
+            .map_err(map_classification_lattice_error)?
+            .ok_or_else(|| Status::not_found("not found"))?;
+        Ok(Response::new(GetClassificationLatticeResponse {
+            lattice: Some(to_proto_classification_lattice(&lattice)?),
+        }))
+    }
+
     async fn find_by_external_id(
         &self,
         req: Request<FindByExternalIdRequest>,
@@ -8236,6 +8317,73 @@ fn from_proto_purpose_authorization(
     }
 }
 
+fn map_classification_lattice_error(error: String) -> Status {
+    if error.contains("unavailable") || error.contains("stale") || error.contains("mismatch") {
+        Status::unavailable("classification lattice unavailable")
+    } else if error.contains("unsupported")
+        || error.contains("invalid")
+        || error.contains("unknown")
+        || error.contains("acyclic")
+        || error.contains("duplicate")
+    {
+        Status::invalid_argument(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn from_proto_classification_lattice(
+    lattice: ClassificationLattice,
+) -> crate::sekai::classification_lattice::ClassificationLattice {
+    let mut parents = BTreeMap::new();
+    for edge in lattice.parents {
+        parents
+            .entry(edge.child)
+            .or_insert_with(Vec::new)
+            .push(edge.parent);
+    }
+    crate::sekai::classification_lattice::ClassificationLattice {
+        contract_version: lattice.contract_version,
+        namespace: lattice.namespace,
+        tokens: lattice.tokens,
+        parents,
+        incomparable: lattice
+            .incomparable
+            .into_iter()
+            .map(|pair| (pair.left, pair.right))
+            .collect(),
+    }
+}
+
+fn to_proto_classification_lattice(
+    lattice: &crate::sekai::classification_lattice::ClassificationLattice,
+) -> Result<ClassificationLattice, Status> {
+    Ok(ClassificationLattice {
+        contract_version: lattice.contract_version.clone(),
+        namespace: lattice.namespace.clone(),
+        tokens: lattice.tokens.clone(),
+        parents: lattice
+            .parents
+            .iter()
+            .flat_map(|(child, parents)| {
+                parents.iter().map(|parent| ClassificationParentEdge {
+                    child: child.clone(),
+                    parent: parent.clone(),
+                })
+            })
+            .collect(),
+        incomparable: lattice
+            .incomparable
+            .iter()
+            .map(|(left, right)| ClassificationIncomparablePair {
+                left: left.clone(),
+                right: right.clone(),
+            })
+            .collect(),
+        digest: lattice.digest().map_err(Status::internal)?,
+    })
+}
+
 fn to_proto_purpose_authorization(
     authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,
 ) -> PurposeAuthorization {
@@ -10877,6 +11025,254 @@ mod tests {
             .object
             .unwrap();
         assert_eq!(trusted.id, "purpose-doc-a");
+    }
+
+    #[tokio::test]
+    async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
+        let svc = service();
+        let namespace = "lattice-ops";
+        let lattice = crate::sekai::classification_lattice::ClassificationLattice {
+            contract_version: crate::sekai::classification_lattice::CLASSIFICATION_LATTICE_VERSION
+                .into(),
+            namespace: namespace.into(),
+            tokens: vec![
+                "public".into(),
+                "internal".into(),
+                "confidential".into(),
+                "secret".into(),
+                "health".into(),
+            ],
+            parents: BTreeMap::from([
+                ("public".into(), vec!["internal".into()]),
+                ("internal".into(), vec!["confidential".into()]),
+                ("confidential".into(), vec!["secret".into()]),
+                ("health".into(), vec!["secret".into()]),
+            ]),
+            incomparable: vec![("confidential".into(), "health".into())],
+        };
+        let stored = svc
+            .put_classification_lattice(with_named_principal(
+                PutClassificationLatticeRequest {
+                    lattice: Some(to_proto_classification_lattice(&lattice).unwrap()),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lattice
+            .unwrap();
+        assert!(!stored.digest.is_empty());
+        let loaded = svc
+            .get_classification_lattice(with_named_principal(
+                GetClassificationLatticeRequest {
+                    namespace: namespace.into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .lattice
+            .unwrap();
+        assert_eq!(loaded.digest, stored.digest);
+
+        for (id, marking) in [
+            ("lattice-health", "health"),
+            ("lattice-confidential", "confidential"),
+            ("lattice-unknown", "unknown"),
+        ] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: "document".into(),
+                    name: id.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties: HashMap::from([(
+                        markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                        marking.into(),
+                    )]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        svc.db
+            .create_object(&domain::Object {
+                id: "legacy-unknown".into(),
+                kind: "document".into(),
+                name: "legacy".into(),
+                namespace: "legacy-ns".into(),
+                external_id: "legacy-ns:unknown".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "health".into(),
+                )]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        for (id, actor, ceiling) in [
+            ("principal-alice-secret", "alice", "secret"),
+            ("principal-bob-conf", "bob", "confidential"),
+        ] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+                    name: actor.into(),
+                    namespace: namespace.into(),
+                    external_id: markings::principal_profile_external_id(actor),
+                    properties: HashMap::from([
+                        (
+                            markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                            ceiling.into(),
+                        ),
+                        (
+                            markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                            "true".into(),
+                        ),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+            grant_object_role(&svc, id, "root", security::Role::Admin);
+        }
+
+        let unknown = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "lattice-unknown".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code(), tonic::Code::PermissionDenied);
+        assert_eq!(unknown.message(), "access denied");
+
+        let denied = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "lattice-health".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert_eq!(denied.message(), "access denied");
+
+        let allowed = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "lattice-health".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(allowed.id, "lattice-health");
+
+        let legacy = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "legacy-unknown".into(),
+                },
+                "bob",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(legacy.id, "legacy-unknown");
+
+        svc.db
+            .create_object(&domain::Object {
+                id: "foreign-health".into(),
+                kind: "document".into(),
+                name: "foreign".into(),
+                namespace: "foreign-ns".into(),
+                external_id: "foreign-ns:health".into(),
+                properties: HashMap::from([(
+                    markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                    "health".into(),
+                )]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_link(&domain::Link {
+                id: "lattice-hop".into(),
+                from_id: "lattice-confidential".into(),
+                to_id: "lattice-health".into(),
+                relation: "contains".into(),
+                created: 1,
+            })
+            .unwrap();
+        svc.db
+            .create_link(&domain::Link {
+                id: "lattice-foreign-hop".into(),
+                from_id: "lattice-confidential".into(),
+                to_id: "foreign-health".into(),
+                relation: "contains".into(),
+                created: 1,
+            })
+            .unwrap();
+        let traversed = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "lattice-confidential".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 1,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(
+            traversed.objects.is_empty(),
+            "incomparable or cross-namespace hops must not expand"
+        );
+        let trusted = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "lattice-confidential".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 1,
+                        ..Default::default()
+                    }),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        let trusted_ids = trusted
+            .objects
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(trusted_ids.contains(&"lattice-health"));
+        assert!(trusted_ids.contains(&"foreign-health"));
     }
 
     #[tokio::test]

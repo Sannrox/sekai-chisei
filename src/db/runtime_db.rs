@@ -211,6 +211,31 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_classification_lattice(
+        &self,
+        lattice: &crate::sekai::classification_lattice::ClassificationLattice,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::classification_lattice::ClassificationLattice, String> {
+        match self {
+            Self::Sqlite(db) => db.put_classification_lattice(lattice, actor, now_ms),
+            Self::Postgres(_) => Err(
+                "classification lattices are unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_classification_lattice(
+        &self,
+        namespace: &str,
+    ) -> Result<Option<crate::sekai::classification_lattice::ClassificationLattice>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_classification_lattice(namespace),
+            Self::Postgres(_) => Ok(None),
+        }
+    }
+
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
         match self {
             Self::Sqlite(db) => db.object_query_cursor_key(),

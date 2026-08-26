@@ -52,3 +52,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0029: Share namespaces through grant-scoped signed snapshots](0029-signed-namespace-snapshots.md)
 - [ADR 0030: Apply one compiled row predicate to every public query path](0030-row-scoped-query-access.md)
 - [ADR 0031: Require a scoped purpose authorization for governed reads](0031-purpose-bound-reads.md)
+- [ADR 0032: Evaluate markings against a namespace-local classification lattice](0032-hierarchical-classifications.md)
