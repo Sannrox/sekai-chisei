@@ -48,3 +48,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0025: Enforce activated object security in storage queries](0025-storage-enforced-object-security.md)
 - [ADR 0026: Publish change sets as governed branch proposals](0026-governed-branch-proposals.md)
 - [ADR 0027: Deny property access without an explicit grant](0027-explicit-property-grants.md)
+- [ADR 0028: Execute approved checkpointed fact migration](0028-checkpointed-fact-migration.md)

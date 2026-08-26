@@ -16,6 +16,7 @@ pub mod dataset;
 pub mod decision;
 pub mod deduplication;
 pub mod definition_branch;
+pub mod definition_migration;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;

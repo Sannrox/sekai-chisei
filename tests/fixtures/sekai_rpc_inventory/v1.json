@@ -233,6 +233,32 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ExecuteDefinitionFactMigration",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_migration_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetDefinitionFactMigration",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/definition_migration_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CreateObject",
       "kind": "persistent",
       "surfaces": [

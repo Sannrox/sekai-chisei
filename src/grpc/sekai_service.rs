@@ -3471,6 +3471,48 @@ fn to_proto_definition_revision_compatibility(
     }
 }
 
+fn to_proto_definition_fact_migration(
+    result: &crate::sekai::definition_migration::FactMigrationResult,
+) -> DefinitionFactMigration {
+    DefinitionFactMigration {
+        contract_version: result.contract_version.clone(),
+        namespace: result.namespace.clone(),
+        migration_id: result.migration_id.clone(),
+        from_revision_digest: result.from_revision_digest.clone(),
+        to_revision_digest: result.to_revision_digest.clone(),
+        compatibility_digest: result.compatibility_digest.clone(),
+        compatibility_class: result.compatibility_class.clone(),
+        mode: result.mode.clone(),
+        status: result.status.clone(),
+        checkpoint_object_id: result.checkpoint_object_id.clone(),
+        affected_count: result.affected_count,
+        migrated_count: result.migrated_count,
+        blocked_count: result.blocked_count,
+        blocked: result
+            .blocked
+            .iter()
+            .map(|block| DefinitionFactMigrationBlock {
+                object_id: block.object_id.clone(),
+                reason_code: block.reason_code.clone(),
+            })
+            .collect(),
+        objects: result
+            .objects
+            .iter()
+            .map(|object| DefinitionFactMigrationObject {
+                object_id: object.object_id.clone(),
+                kind: object.kind.clone(),
+                outcome: object.outcome.clone(),
+                stripped_properties: object.stripped_properties.clone(),
+            })
+            .collect(),
+        actor: result.actor.clone(),
+        created_at_ms: result.created_at_ms,
+        updated_at_ms: result.updated_at_ms,
+        result_digest: result.result_digest.clone(),
+    }
+}
+
 fn to_proto_definition_compatibility_reason(
     reason: &definition_diff_domain::DefinitionCompatibilityReason,
 ) -> DefinitionCompatibilityReason {
@@ -3511,6 +3553,7 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_branch_not_found")
         || error.starts_with("definition_member_not_found")
         || error.starts_with("definition_proposal_not_found")
+        || error.starts_with("fact_migration_not_found")
     {
         Status::not_found("definition resource unavailable")
     } else if error.starts_with("stale_definition_branch_head")
@@ -3522,6 +3565,13 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("foreign_authority_is_not_a_grant")
         || error.starts_with("incompatible_definition_proposal_candidate")
         || error.starts_with("definition_revision_conflict")
+        || error.starts_with("stale_definition_revision")
+        || error.starts_with("fact_migration_unknown")
+        || error.starts_with("fact_migration_unapproved")
+        || error.starts_with("fact_migration_no_change")
+        || error.starts_with("fact_migration_unsupported_mode")
+        || error.starts_with("fact_migration_not_committed")
+        || error.starts_with("fact_migration_limit")
     {
         Status::failed_precondition("definition write is not current")
     } else if error.starts_with("unknown_definition_construct") {
@@ -4884,6 +4934,81 @@ impl SekaiService for SekaiServiceImpl {
                 compatibility: Some(to_proto_definition_revision_compatibility(&compatibility)),
             },
         ))
+    }
+
+    async fn execute_definition_fact_migration(
+        &self,
+        req: Request<ExecuteDefinitionFactMigrationRequest>,
+    ) -> Result<Response<ExecuteDefinitionFactMigrationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let _ = load_authorized_definition_revisions(
+            self,
+            &principals,
+            &input.namespace,
+            &input.from_revision_digest,
+            &input.to_revision_digest,
+        )?;
+        let actor = principals.first().cloned().unwrap_or_default();
+        let result = self
+            .db
+            .execute_definition_fact_migration(
+                &crate::sekai::definition_migration::ExecuteFactMigration {
+                    namespace: input.namespace,
+                    migration_id: input.migration_id,
+                    from_revision_digest: input.from_revision_digest,
+                    to_revision_digest: input.to_revision_digest,
+                    mode: input.mode,
+                    idempotency_key: input.idempotency_key,
+                },
+                &actor,
+                now_millis(),
+            )
+            .map_err(map_definition_write_error)?;
+        Ok(Response::new(ExecuteDefinitionFactMigrationResponse {
+            migration: Some(to_proto_definition_fact_migration(&result)),
+        }))
+    }
+
+    async fn get_definition_fact_migration(
+        &self,
+        req: Request<GetDefinitionFactMigrationRequest>,
+    ) -> Result<Response<GetDefinitionFactMigrationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        authorize_source_sync_namespace(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let result = self
+            .db
+            .get_definition_fact_migration(&input.namespace, &input.migration_id)
+            .map_err(|_| Status::internal("definition fact migration unavailable"))?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        let _ = load_authorized_definition_revisions(
+            self,
+            &principals,
+            &result.namespace,
+            &result.from_revision_digest,
+            &result.to_revision_digest,
+        )?;
+        Ok(Response::new(GetDefinitionFactMigrationResponse {
+            migration: Some(to_proto_definition_fact_migration(&result)),
+        }))
     }
 
     async fn create_handoff(
