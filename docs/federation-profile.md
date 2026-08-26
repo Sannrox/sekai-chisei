@@ -91,6 +91,44 @@ true (and still under #290 verify rules).
 DB_PATH=data/site-a.db sekaictl admin federation leave --peer-site-id site-b
 ```
 
+## Namespace snapshots (#697)
+
+`sekai.namespace-snapshot/v1` shares **visible typed objects** between two
+independent planes. Each plane keeps local write and governance authority.
+
+1. Join and pin trust roots as above. A trust pin proves the peer key only.
+2. On the importing plane, grant the peer an explicit namespace scope:
+
+```text
+DB_PATH=data/site-b.db sekaictl admin federation grant-namespace \
+  --peer-site-id site-a --namespace ops --max-classification internal
+```
+
+3. Export a signed snapshot from the exporting plane. The signing key must
+   match the registered local site verifying key. Hidden or marking-denied
+   objects are omitted without a hidden count.
+
+```text
+DB_PATH=data/site-a.db sekaictl admin federation export-snapshot \
+  --namespace ops --output ./ops-snapshot.json \
+  --signing-key ./site-a-seed.hex \
+  --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:... \
+  --actor local
+```
+
+4. Import only when the peer is joined, healthy, granted, and the bundle
+   verifies. Imported facts are replicas (`write_authority=false`). A local
+   object with the same id is a conflict and is not overwritten.
+
+```text
+DB_PATH=data/site-b.db sekaictl admin federation set-health --peer-site-id site-a --health up
+DB_PATH=data/site-b.db sekaictl admin federation import-snapshot \
+  --namespace ops --bundle ./ops-snapshot.json
+```
+
+Ungranted, stale, tampered, revoked, hidden, or residency-conflicting bundles
+fail closed before local use. Re-importing the same digest is idempotent.
+
 ## Forbidden remote control
 
 Library guard: `federation_profile::evaluate_remote_control` and
@@ -116,6 +154,13 @@ sekaictl admin federation set-health ...
 sekaictl admin federation set-pack-pin ...
 sekaictl admin federation list-peers
 sekaictl admin federation import-availability ...
+sekaictl admin federation grant-namespace ...
+sekaictl admin federation revoke-namespace-grant ...
+sekaictl admin federation list-namespace-grants ...
+sekaictl admin federation export-snapshot ...
+sekaictl admin federation import-snapshot ...
+sekaictl admin federation list-snapshot-imports ...
+sekaictl admin federation show-snapshot-facts ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as
