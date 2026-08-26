@@ -29,6 +29,7 @@ pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;
 pub mod lease;
+mod namespace_snapshot_store;
 pub mod object_security;
 pub mod object_sync;
 pub mod ontology;

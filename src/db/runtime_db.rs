@@ -4480,6 +4480,136 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_federation_namespace_grant(
+        &self,
+        grant: &crate::sekai::namespace_snapshot::PeerNamespaceGrant,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_namespace_grant(grant),
+            Self::Postgres(_) => Err(
+                "put_federation_namespace_grant is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_federation_namespace_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<crate::sekai::namespace_snapshot::PeerNamespaceGrant>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_namespace_grant(grant_id),
+            Self::Postgres(_) => Err(
+                "get_federation_namespace_grant is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_federation_namespace_grants(
+        &self,
+        namespace: Option<&str>,
+        peer_site_id: Option<&str>,
+    ) -> Result<Vec<crate::sekai::namespace_snapshot::PeerNamespaceGrant>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_namespace_grants(namespace, peer_site_id),
+            Self::Postgres(_) => Err(
+                "list_federation_namespace_grants is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn reserve_federation_snapshot_sequence(&self, namespace: &str) -> Result<u64, String> {
+        match self {
+            Self::Sqlite(db) => db.reserve_federation_snapshot_sequence(namespace),
+            Self::Postgres(_) => Err(
+                "reserve_federation_snapshot_sequence is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn put_federation_snapshot_export(
+        &self,
+        export: &crate::sekai::namespace_snapshot::SnapshotExportRecord,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_snapshot_export(export),
+            Self::Postgres(_) => Err(
+                "put_federation_snapshot_export is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn put_federation_snapshot_import(
+        &self,
+        record: &crate::sekai::namespace_snapshot::SnapshotImportRecord,
+        facts: &[crate::sekai::namespace_snapshot::SnapshotFact],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_snapshot_import(record, facts),
+            Self::Postgres(_) => Err(
+                "put_federation_snapshot_import is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn get_federation_snapshot_import(
+        &self,
+        import_id: &str,
+    ) -> Result<Option<crate::sekai::namespace_snapshot::SnapshotImportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_snapshot_import(import_id),
+            Self::Postgres(_) => Err(
+                "get_federation_snapshot_import is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn latest_federation_snapshot_import(
+        &self,
+        peer_site_id: &str,
+        namespace: &str,
+    ) -> Result<Option<crate::sekai::namespace_snapshot::SnapshotImportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.latest_federation_snapshot_import(peer_site_id, namespace),
+            Self::Postgres(_) => Err(
+                "latest_federation_snapshot_import is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_federation_snapshot_imports(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::sekai::namespace_snapshot::SnapshotImportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_snapshot_imports(namespace),
+            Self::Postgres(_) => Err(
+                "list_federation_snapshot_imports is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
+    pub fn list_federation_snapshot_facts(
+        &self,
+        import_id: &str,
+    ) -> Result<Vec<crate::sekai::namespace_snapshot::SnapshotFact>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_snapshot_facts(import_id),
+            Self::Postgres(_) => Err(
+                "list_federation_snapshot_facts is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

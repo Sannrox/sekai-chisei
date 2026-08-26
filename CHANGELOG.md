@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Export and import bounded signed namespace snapshots under explicit peer
+  grants (`sekai.namespace-snapshot/v1`). Signatures prove identity only;
+  imports stay non-authoritative replicas. Ungranted, stale, tampered,
+  revoked, hidden, or residency-conflicting peer data fails closed. SQLite is
+  the reference store; PostgreSQL remains explicitly unavailable.
 - Execute one approved checkpointed fact migration from an ancestor definition
   revision onto the published head. Dry-run plans without mutation; execute
   strips removed properties and rebinds objects; blocked transforms leave
