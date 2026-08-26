@@ -58,4 +58,5 @@ pub mod security;
 pub mod semantic;
 pub mod sentinel;
 pub mod skillextract;
+pub mod source_webhook;
 pub(crate) mod work_unit_lifecycle;

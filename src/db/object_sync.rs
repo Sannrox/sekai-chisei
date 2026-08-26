@@ -447,7 +447,16 @@ impl SekaiDb {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_source_generations_one_current
                     ON sekai_source_sync_generations(binding_id)
-                    WHERE status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED');",
+                    WHERE status IN ('SNAPSHOTTING', 'ACTIVE', 'RECOVERY_REQUIRED');
+                CREATE TABLE IF NOT EXISTS sekai_source_webhook_keys (
+                    pin_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    source_instance TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    UNIQUE(namespace, source_instance, key_id)
+                );",
             )
             .map_err(|error| error.to_string())?;
         for statement in [

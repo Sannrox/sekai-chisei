@@ -20,13 +20,23 @@ An out-of-process adapter follows this loop:
    `sekai.source-batch/v1`.
 3. Persist that exact batch to the local source-adapter outbox before sending.
 4. Call `ApplySourceBatch` as one authenticated principal with namespace write
-   authority.
+   authority, or admit a signed webhook delivery that the plane maps onto the
+   same batch contract.
 5. Remove the outbox entry only when the response commits the same idempotency
    key, batch digest, and proposed cursor.
 
 The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
 perform no GitHub network requests.
+
+Signed push deliveries use the same identity. Pin a verifying key, then admit
+the bundle. The authenticated producer must match the envelope:
+
+```text
+sekaictl admin sync pin-webhook-key \
+  --namespace ops --source-instance owner/repo --key-id k1 --public-key-hex <hex>
+sekaictl admin sync admit-webhook --bundle ./delivery.json --actor connector/ops
+```
 
 ## Version 1 checkpointed snapshots
 
@@ -311,8 +321,12 @@ control-plane-owned cursor and offset.
 
 ## Non-goals
 
-Webhooks, snapshots, and ordered feeds remain separate collection transports
-into this contract. Ordered synchronization adds no pipeline, transform
+Signed webhook deliveries (`sekai.source-webhook-delivery/v1`) are a collection
+transport into this contract; see
+[ADR 0035](decisions/0035-source-webhook-transport.md). Pin a verifying key,
+then admit the signed bundle. The plane maps it onto one source batch whose
+idempotency key is the delivery id. Snapshots and ordered feeds remain the
+other collection transports. Ordered synchronization adds no pipeline, transform
 language, plugin runtime, connector marketplace, credential store,
 tombstone-by-absence, unrestricted write-back, or second source.
 

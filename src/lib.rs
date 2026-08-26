@@ -53,6 +53,7 @@ pub mod secrets;
 pub mod sekai;
 pub mod shomei;
 pub mod source_adapter_catalog;
+pub mod source_webhook_cli;
 pub mod substitution_report;
 pub mod team_cli;
 pub mod weekly_report;
