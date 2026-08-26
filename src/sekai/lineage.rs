@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Object};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,24 @@ pub fn get_lineage(
     object_id: &str,
     max_nodes: usize,
 ) -> Result<LineageResult, String> {
+    walk_lineage(db, object_id, max_nodes, None)
+}
+
+pub fn get_lineage_with_policy_context(
+    db: &SekaiDb,
+    object_id: &str,
+    max_nodes: usize,
+    context: &PrincipalPolicyContext,
+) -> Result<LineageResult, String> {
+    walk_lineage(db, object_id, max_nodes, Some(context))
+}
+
+fn walk_lineage(
+    db: &SekaiDb,
+    object_id: &str,
+    max_nodes: usize,
+    context: Option<&PrincipalPolicyContext>,
+) -> Result<LineageResult, String> {
     let max = if max_nodes == 0 {
         DEFAULT_MAX
     } else {
@@ -39,7 +58,11 @@ pub fn get_lineage(
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
-    let start = db.get_object(object_id)?.ok_or("object not found")?;
+    let start = match context {
+        Some(context) => db.get_object_with_policy_context(object_id, context)?,
+        None => db.get_object(object_id)?,
+    }
+    .ok_or("object not found")?;
     visited.insert(start.id.clone());
     queue.push_back(start.clone());
     result.nodes.push(LineageNode {
@@ -55,7 +78,10 @@ pub fn get_lineage(
         }
         // Traverse both directions for lineage relations
         for dir in [Direction::Outgoing, Direction::Incoming] {
-            let links = db.get_links(&node.id, "", &dir)?;
+            let links = match context {
+                Some(context) => db.get_links_with_policy_context(&node.id, "", &dir, context)?,
+                None => db.get_links(&node.id, "", &dir)?,
+            };
             for link in &links {
                 if !is_lineage_relation(&link.relation) {
                     continue;
@@ -69,7 +95,11 @@ pub fn get_lineage(
                 }
                 visited.insert(target_id.clone());
 
-                if let Some(obj) = db.get_object(target_id)? {
+                let obj = match context {
+                    Some(context) => db.get_object_with_policy_context(target_id, context)?,
+                    None => db.get_object(target_id)?,
+                };
+                if let Some(obj) = obj {
                     result.edges.push(LineageEdge {
                         from: link.from_id.clone(),
                         to: link.to_id.clone(),

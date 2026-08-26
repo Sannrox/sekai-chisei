@@ -43,9 +43,10 @@ stored object. Inbound synchronization requires a `write` grant for each source
 property. Unknown grant attributes or access tokens deny the policy.
 
 Only the trusted authenticated context supplies subjects and scopes. Request
-metadata is not authority. SQLite and PostgreSQL apply policy in SQL before a
-direct row, `FindByExternalId`, or `ListObjects` total, ordering, filter,
-limit, and offset is materialized. PostgreSQL parses property documents through `sekai_jsonb_object`, so
+metadata is not authority. SQLite and PostgreSQL apply one compiled read
+predicate in SQL before a direct row, `FindByExternalId`, `FindByProperty`,
+`ListObjects` total, ordering, filter, limit, offset, adjacency, traversal hop,
+or lineage expansion is materialized. PostgreSQL parses property documents through `sekai_jsonb_object`, so
 malformed or jsonb-rejected values are indeterminate and denied instead of
 aborting the query. Unauthorized direct reads are returned as absent. Markings
 and existing ACLs remain narrowing layers. Generic object writes reject NUL

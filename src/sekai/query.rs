@@ -2,6 +2,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -30,10 +31,26 @@ pub fn traverse(
     q: &GraphQuery,
     schema: Option<&SchemaRegistry>,
 ) -> Result<GraphResult, String> {
+    traverse_with_policy_context(db, q, schema, None)
+}
+
+pub fn traverse_with_policy_context(
+    db: &RuntimeDb,
+    q: &GraphQuery,
+    schema: Option<&SchemaRegistry>,
+    policy_context: Option<&PrincipalPolicyContext>,
+) -> Result<GraphResult, String> {
     let start_id = if !q.start_id.is_empty() {
         q.start_id.clone()
     } else if !q.start_external_id.is_empty() {
-        match db.find_by_external_id(&q.start_external_id)? {
+        let found = match policy_context {
+            Some(context) => db
+                .find_all_by_external_id_with_policy_context(&q.start_external_id, context)?
+                .into_iter()
+                .next(),
+            None => db.find_by_external_id(&q.start_external_id)?,
+        };
+        match found {
             Some(obj) => obj.id,
             None => return Ok(GraphResult::default()),
         }
@@ -62,7 +79,12 @@ pub fn traverse(
         let mut next = VecDeque::new();
         while let Some(node_id) = frontier.pop_front() {
             for rel in &rels {
-                let links = db.get_links(&node_id, rel, &q.direction)?;
+                let links = match policy_context {
+                    Some(context) => {
+                        db.get_links_with_policy_context(&node_id, rel, &q.direction, context)?
+                    }
+                    None => db.get_links(&node_id, rel, &q.direction)?,
+                };
                 for link in links {
                     let target = match &q.direction {
                         Direction::Outgoing => &link.to_id,
@@ -73,7 +95,11 @@ pub fn traverse(
                     }
                     visited.insert(target.clone());
 
-                    if let Some(obj) = db.get_object(target)? {
+                    let obj = match policy_context {
+                        Some(context) => db.get_object_with_policy_context(target, context)?,
+                        None => db.get_object(target)?,
+                    };
+                    if let Some(obj) = obj {
                         next.push_back(target.clone());
                         if matches_filters(
                             &obj,

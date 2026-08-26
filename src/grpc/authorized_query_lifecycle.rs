@@ -296,7 +296,7 @@ impl SekaiServiceImpl {
         let external_id = req.into_inner().external_id;
         let candidates = self
             .db
-            .find_all_by_external_id(&external_id)
+            .find_all_by_external_id_with_policy_context(&external_id, &policy_context)
             .map_err(Status::internal)?;
         let mut first_acl_denied = None;
         for candidate in candidates {
@@ -384,6 +384,7 @@ impl SekaiServiceImpl {
         req: Request<FindByPropertyRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
@@ -403,7 +404,7 @@ impl SekaiServiceImpl {
         }
         let objs = self
             .db
-            .find_by_property(&r.kind, &r.key, &r.value)
+            .find_by_property_with_policy_context(&r.kind, &r.key, &r.value, &policy_context)
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
         let filtered = self.security.filter_objects(&objs, &refs);
@@ -435,12 +436,13 @@ impl SekaiServiceImpl {
         req: Request<GetLinksRequest>,
     ) -> Result<Response<GetLinksResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -458,7 +460,7 @@ impl SekaiServiceImpl {
         };
         let links = self
             .db
-            .get_links(&root.id, &r.relation, &dir)
+            .get_links_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
         let links = links
             .into_iter()
@@ -489,11 +491,12 @@ impl SekaiServiceImpl {
         req: Request<GetLinkedObjectsRequest>,
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -511,7 +514,7 @@ impl SekaiServiceImpl {
         };
         let objs = self
             .db
-            .get_linked_objects(&root.id, &r.relation, &dir)
+            .get_linked_objects_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
         let objs = objs
             .into_iter()
@@ -536,6 +539,7 @@ impl SekaiServiceImpl {
         req: Request<TraverseRequest>,
     ) -> Result<Response<TraverseResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let q = req
             .into_inner()
@@ -557,31 +561,25 @@ impl SekaiServiceImpl {
         };
         let start = if !gq.start_id.is_empty() {
             self.db
-                .get_object(&gq.start_id)
+                .get_object_with_policy_context(&gq.start_id, &policy_context)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("not found"))?
         } else if !gq.start_external_id.is_empty() {
             let external_id = gq.start_external_id.clone();
-            if tenant_context.is_some() {
-                self.db
-                    .find_all_by_external_id(&external_id)
-                    .map_err(Status::internal)?
-                    .into_iter()
-                    .find(|candidate| {
-                        object_is_visible(
-                            &self.db,
-                            &self.security,
-                            candidate,
-                            &principals,
-                            tenant_context.as_ref(),
-                        )
-                    })
-            } else {
-                self.db
-                    .find_by_external_id(&external_id)
-                    .map_err(Status::internal)?
-            }
-            .ok_or(Status::not_found("not found"))?
+            self.db
+                .find_all_by_external_id_with_policy_context(&external_id, &policy_context)
+                .map_err(Status::internal)?
+                .into_iter()
+                .find(|candidate| {
+                    object_is_visible(
+                        &self.db,
+                        &self.security,
+                        candidate,
+                        &principals,
+                        tenant_context.as_ref(),
+                    )
+                })
+                .ok_or(Status::not_found("not found"))?
         } else {
             return Err(Status::invalid_argument(
                 "start_id or start_external_id required",
@@ -622,8 +620,13 @@ impl SekaiServiceImpl {
                 )?;
             }
         }
-        let mut res = crate::sekai::query::traverse(&self.db, &gq, Some(&schema))
-            .map_err(Status::internal)?;
+        let mut res = crate::sekai::query::traverse_with_policy_context(
+            &self.db,
+            &gq,
+            Some(&schema),
+            Some(&policy_context),
+        )
+        .map_err(Status::internal)?;
         drop(schema);
         res.objects.retain(|object| {
             object_is_visible(
@@ -649,11 +652,12 @@ impl SekaiServiceImpl {
         req: Request<GetLineageRequest>,
     ) -> Result<Response<GetLineageResponse>, Status> {
         let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
             .db
-            .get_object(&r.object_id)
+            .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let (root, _) = require_visible_read_root(
@@ -666,7 +670,7 @@ impl SekaiServiceImpl {
         )?;
         let mut res = self
             .db
-            .get_lineage(&root.id, r.max_nodes as usize)
+            .get_lineage_with_policy_context(&root.id, r.max_nodes as usize, &policy_context)
             .map_err(Status::internal)?;
         res.nodes.retain(|node| {
             object_is_visible(

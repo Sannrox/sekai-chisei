@@ -11,6 +11,8 @@ use crate::sekai::object_security::PrincipalPolicyContext;
 use postgres::IsolationLevel;
 
 const OBJECT_COLUMNS: &str = "id, kind, name, namespace, external_id, properties, created, updated";
+const OBJECT_COLUMNS_QUALIFIED: &str =
+    "o.id, o.kind, o.name, o.namespace, o.external_id, o.properties, o.created, o.updated";
 const LINK_COLUMNS: &str = "id, from_id, to_id, relation, created";
 const POSTGRES_PROPERTIES_UNUSABLE: &str = "sekai_jsonb_object(o.properties) IS NULL";
 
@@ -213,6 +215,23 @@ impl PostgresDb {
             .into_iter()
             .map(row_to_object)
             .collect()
+    }
+
+    pub fn find_all_by_external_id_with_policy_context(
+        &self,
+        external_id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let context = context.clone().normalized();
+        self.query_objects(
+            &format!(
+                "SELECT {OBJECT_COLUMNS_QUALIFIED} FROM sekai_objects o
+                 WHERE o.external_id = $1{}
+                 ORDER BY o.id",
+                postgres_object_security_filter("$2", "$3")
+            ),
+            &[&external_id, &context.subjects, &context.scopes],
+        )
     }
 
     pub fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
@@ -426,6 +445,28 @@ impl PostgresDb {
         )
     }
 
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        if !is_valid_property_key(key) {
+            return Err("invalid property key".into());
+        }
+        let context = context.clone().normalized();
+        self.query_objects(
+            &format!(
+                "SELECT {OBJECT_COLUMNS_QUALIFIED} FROM sekai_objects o
+                 WHERE o.kind = $1
+                   AND (sekai_jsonb_object(o.properties) ->> $2) = $3{}",
+                postgres_object_security_filter("$4", "$5")
+            ),
+            &[&kind, &key, &value, &context.subjects, &context.scopes],
+        )
+    }
+
     pub fn create_link(&self, link: &Link) -> Result<(), String> {
         self.connection()?
             .execute(
@@ -593,6 +634,98 @@ impl PostgresDb {
         Ok(objects)
     }
 
+    pub fn get_links_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Link>, String> {
+        let context = context.clone().normalized();
+        let neighbor = match direction {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match direction {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let (subjects, scopes) = if relation.is_empty() {
+            ("$2", "$3")
+        } else {
+            ("$3", "$4")
+        };
+        let relation_sql = if relation.is_empty() {
+            String::new()
+        } else {
+            " AND l.relation = $2".to_string()
+        };
+        let sql = format!(
+            "SELECT l.id, l.from_id, l.to_id, l.relation, l.created
+             FROM sekai_links l
+             JOIN sekai_objects o ON o.id = {neighbor}
+             WHERE {root} = $1{relation_sql}{}
+             ORDER BY l.relation, l.id, l.from_id, l.to_id",
+            postgres_object_security_filter(subjects, scopes)
+        );
+        if relation.is_empty() {
+            self.connection()?
+                .query(&sql, &[&object_id, &context.subjects, &context.scopes])
+                .map(|rows| rows.into_iter().map(row_to_link).collect())
+                .map_err(|error| error.to_string())
+        } else {
+            self.connection()?
+                .query(
+                    &sql,
+                    &[&object_id, &relation, &context.subjects, &context.scopes],
+                )
+                .map(|rows| rows.into_iter().map(row_to_link).collect())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let context = context.clone().normalized();
+        let neighbor = match direction {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match direction {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let (subjects, scopes) = if relation.is_empty() {
+            ("$2", "$3")
+        } else {
+            ("$3", "$4")
+        };
+        let relation_sql = if relation.is_empty() {
+            String::new()
+        } else {
+            " AND l.relation = $2".to_string()
+        };
+        let sql = format!(
+            "SELECT {OBJECT_COLUMNS_QUALIFIED} FROM sekai_links l
+             JOIN sekai_objects o ON o.id = {neighbor}
+             WHERE {root} = $1{relation_sql}{}",
+            postgres_object_security_filter(subjects, scopes)
+        );
+        if relation.is_empty() {
+            self.query_objects(&sql, &[&object_id, &context.subjects, &context.scopes])
+        } else {
+            self.query_objects(
+                &sql,
+                &[&object_id, &relation, &context.subjects, &context.scopes],
+            )
+        }
+    }
+
     pub fn get_lineage(&self, object_id: &str, max_nodes: usize) -> Result<LineageResult, String> {
         use std::collections::{HashSet, VecDeque};
         let max = if max_nodes == 0 {
@@ -627,6 +760,71 @@ impl PostgresDb {
                         continue;
                     }
                     if let Some(object) = self.get_object(target)? {
+                        result.edges.push(LineageEdge {
+                            from: link.from_id,
+                            to: link.to_id,
+                            relation: link.relation,
+                        });
+                        result.nodes.push(LineageNode {
+                            role: lineage_role(&object.kind),
+                            ephemeral: false,
+                            object: object.clone(),
+                        });
+                        queue.push_back(object);
+                    }
+                    if result.nodes.len() >= max {
+                        result.truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn get_lineage_with_policy_context(
+        &self,
+        object_id: &str,
+        max_nodes: usize,
+        context: &PrincipalPolicyContext,
+    ) -> Result<LineageResult, String> {
+        use std::collections::{HashSet, VecDeque};
+        let max = if max_nodes == 0 {
+            200
+        } else {
+            max_nodes.min(500)
+        };
+        let start = self
+            .get_object_with_policy_context(object_id, context)?
+            .ok_or("object not found")?;
+        let mut result = LineageResult::default();
+        let mut visited = HashSet::from([start.id.clone()]);
+        let mut queue = VecDeque::from([start.clone()]);
+        result.nodes.push(LineageNode {
+            role: lineage_role(&start.kind),
+            ephemeral: false,
+            object: start,
+        });
+        while let Some(object) = queue.pop_front() {
+            if result.nodes.len() >= max {
+                result.truncated = true;
+                break;
+            }
+            for direction in [Direction::Outgoing, Direction::Incoming] {
+                for link in
+                    self.get_links_with_policy_context(&object.id, "", &direction, context)?
+                {
+                    if !is_lineage_relation(&link.relation) {
+                        continue;
+                    }
+                    let target = match direction {
+                        Direction::Outgoing => &link.to_id,
+                        Direction::Incoming => &link.from_id,
+                    };
+                    if !visited.insert(target.clone()) {
+                        continue;
+                    }
+                    if let Some(object) = self.get_object_with_policy_context(target, context)? {
                         result.edges.push(LineageEdge {
                             from: link.from_id,
                             to: link.to_id,

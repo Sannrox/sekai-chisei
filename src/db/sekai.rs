@@ -1148,6 +1148,27 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn find_all_by_external_id_with_policy_context(
+        &self,
+        external_id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE external_id = ?1{} ORDER BY id",
+                sqlite_object_security_filter(1)
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(params![external_id, subjects, scopes], row_to_object)
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn find_by_property(
         &self,
         kind: &str,
@@ -1166,6 +1187,36 @@ impl SekaiDb {
             .query_map(params![kind, json_path, value], row_to_object)
             .map_err(|e| e.to_string())?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err("invalid property key".into());
+        }
+        let (subjects, scopes) = policy_context_json(context)?;
+        let conn = self.conn();
+        let json_path = format!("$.{}", key);
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE kind = ?1 AND json_extract(properties, ?2) = ?3{}",
+                sqlite_object_security_filter(3)
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(
+            params![kind, json_path, value, subjects, scopes],
+            row_to_object,
+        )
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
     }
 
     pub fn create_link(&self, l: &Link) -> Result<(), String> {
@@ -1440,6 +1491,90 @@ impl SekaiDb {
         }
         Ok(objects)
     }
+
+    pub fn get_links_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Link>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let neighbor = match dir {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match dir {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let start_param = if relation.is_empty() { 1 } else { 2 };
+        let mut sql = format!(
+            "SELECT l.id, l.from_id, l.to_id, l.relation, l.created
+             FROM sekai_links l
+             JOIN sekai_objects ON sekai_objects.id = {neighbor}
+             WHERE {root} = ?1"
+        );
+        if !relation.is_empty() {
+            sql.push_str(" AND l.relation = ?2");
+        }
+        sql.push_str(&sqlite_object_security_filter(start_param));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, subjects, scopes], row_to_link)
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map(params![object_id, relation, subjects, scopes], row_to_link)
+                .map_err(|e| e.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let (subjects, scopes) = policy_context_json(context)?;
+        let neighbor = match dir {
+            Direction::Outgoing => "l.to_id",
+            Direction::Incoming => "l.from_id",
+        };
+        let root = match dir {
+            Direction::Outgoing => "l.from_id",
+            Direction::Incoming => "l.to_id",
+        };
+        let start_param = if relation.is_empty() { 1 } else { 2 };
+        let mut sql = format!(
+            "SELECT sekai_objects.id, sekai_objects.kind, sekai_objects.name, sekai_objects.namespace,
+                    sekai_objects.external_id, sekai_objects.properties, sekai_objects.created, sekai_objects.updated
+             FROM sekai_links l
+             JOIN sekai_objects ON sekai_objects.id = {neighbor}
+             WHERE {root} = ?1"
+        );
+        if !relation.is_empty() {
+            sql.push_str(" AND l.relation = ?2");
+        }
+        sql.push_str(&sqlite_object_security_filter(start_param));
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = if relation.is_empty() {
+            stmt.query_map(params![object_id, subjects, scopes], row_to_object)
+                .map_err(|e| e.to_string())?
+        } else {
+            stmt.query_map(
+                params![object_id, relation, subjects, scopes],
+                row_to_object,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn require_authorized_link_endpoints(
@@ -1699,6 +1834,13 @@ fn build_marking_visibility_filter(
     }
     sql.push(')');
     (sql, params)
+}
+
+fn policy_context_json(context: &PrincipalPolicyContext) -> Result<(String, String), String> {
+    let context = context.clone().normalized();
+    let subjects = serde_json::to_string(&context.subjects).map_err(|error| error.to_string())?;
+    let scopes = serde_json::to_string(&context.scopes).map_err(|error| error.to_string())?;
+    Ok((subjects, scopes))
 }
 
 fn build_sqlite_object_security_filter(
