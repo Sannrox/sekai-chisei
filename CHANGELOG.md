@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Admit signed `sekai.source-webhook-delivery/v1` envelopes as collection
+  transport into the existing object-sync batch contract. The plane pins a
+  verifying key, fails closed on forged, expired, oversized, or unpinned
+  deliveries, and reuses the delivery id as the batch idempotency key.
+  `sekaictl admin sync` pins keys and admits bundles. SQLite stores pins;
+  PostgreSQL pin surfaces stay unavailable.
 - Preserve an immutable provenance chain from each imported namespace
   snapshot assertion to signed source evidence. Re-export appends signer,
   transform, and verification hops without rewriting earlier hops. Hidden,

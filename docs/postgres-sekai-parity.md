@@ -52,6 +52,9 @@ treat inventory “complete” as dual-backend for these RPCs):
   (`sekai.namespace-snapshot/v1`, `sekai.federation-provenance/v1`; see
   [ADR 0029](decisions/0029-signed-namespace-snapshots.md) and
   [ADR 0034](decisions/0034-cross-site-import-provenance.md));
+- source-webhook verifying-key pins (`sekai.source-webhook-delivery/v1`; see
+  [ADR 0035](decisions/0035-source-webhook-transport.md)); batch apply keeps its
+  existing dual-backend path;
 
 Evidence is checked in as:
 

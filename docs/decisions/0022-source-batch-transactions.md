@@ -66,7 +66,8 @@ decision rather than a library-only wrapper around the mapper.
 
 - Issue #665 owns the source-batch contract, source adapter SDK, persistence
   seam, and reusable conformance profile.
-- Snapshot, change-feed, and webhook transports in Issues #671, #672, and #673
+- Snapshot and change-feed transports in Issues #671 and #672. Webhook
+  transport is [ADR 0035](0035-source-webhook-transport.md).
   must submit through the same batch contract.
 - SQLite and reusable PostgreSQL implementations must share commit, abort,
   replay, conflict, and checkpoint conformance.

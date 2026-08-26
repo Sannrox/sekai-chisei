@@ -4746,6 +4746,46 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_source_webhook_key(
+        &self,
+        pin: &crate::sekai::source_webhook::SourceWebhookKeyPin,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_source_webhook_key(pin),
+            Self::Postgres(_) => Err(
+                "put_source_webhook_key is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn get_source_webhook_key(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+        key_id: &str,
+    ) -> Result<Option<crate::sekai::source_webhook::SourceWebhookKeyPin>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_source_webhook_key(namespace, source_instance, key_id),
+            Self::Postgres(_) => Err(
+                "get_source_webhook_key is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn list_source_webhook_keys(
+        &self,
+        namespace: Option<&str>,
+        source_instance: Option<&str>,
+    ) -> Result<Vec<crate::sekai::source_webhook::SourceWebhookKeyPin>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_source_webhook_keys(namespace, source_instance),
+            Self::Postgres(_) => Err(
+                "list_source_webhook_keys is unavailable on the PostgreSQL community runtime"
+                    .into(),
+            ),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

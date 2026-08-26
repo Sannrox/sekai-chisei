@@ -55,3 +55,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0032: Evaluate markings against a namespace-local classification lattice](0032-hierarchical-classifications.md)
 - [ADR 0033: Generate revision-pinned TypeScript ontology clients](0033-revision-pinned-typescript-ontology-clients.md)
 - [ADR 0034: Preserve an immutable provenance chain on imported assertions](0034-cross-site-import-provenance.md)
+- [ADR 0035: Admit signed source webhooks as object-sync transport](0035-source-webhook-transport.md)
