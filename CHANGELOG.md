@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Apply one compiled object-security read predicate to every public query
+  path. Property search, external-id lookup, links, linked objects, traversal,
+  and lineage omit hidden rows in storage before counts, pagination, or graph
+  expansion. Hidden rows stay observationally identical to absent rows. ACL,
+  team-namespace, and markings remain additional narrowing layers.
 - Export and import bounded signed namespace snapshots under explicit peer
   grants (`sekai.namespace-snapshot/v1`). Signatures prove identity only;
   imports stay non-authoritative replicas. Ungranted, stale, tampered,

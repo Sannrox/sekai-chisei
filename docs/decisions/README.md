@@ -50,3 +50,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0027: Deny property access without an explicit grant](0027-explicit-property-grants.md)
 - [ADR 0028: Execute approved checkpointed fact migration](0028-checkpointed-fact-migration.md)
 - [ADR 0029: Share namespaces through grant-scoped signed snapshots](0029-signed-namespace-snapshots.md)
+- [ADR 0030: Apply one compiled row predicate to every public query path](0030-row-scoped-query-access.md)

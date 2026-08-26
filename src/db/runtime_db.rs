@@ -1872,6 +1872,21 @@ impl RuntimeDb {
         }
     }
 
+    pub fn find_all_by_external_id_with_policy_context(
+        &self,
+        external_id: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.find_all_by_external_id_with_policy_context(external_id, context)
+            }
+            Self::Postgres(db) => {
+                db.find_all_by_external_id_with_policy_context(external_id, context)
+            }
+        }
+    }
+
     pub fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, String> {
         match self {
             Self::Sqlite(db) => db.find_by_external_id(external_id),
@@ -1888,6 +1903,21 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.find_by_property(kind, key, value),
             Self::Postgres(db) => db.find_by_property(kind, key, value),
+        }
+    }
+
+    pub fn find_by_property_with_policy_context(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &str,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_by_property_with_policy_context(kind, key, value, context),
+            Self::Postgres(db) => {
+                db.find_by_property_with_policy_context(kind, key, value, context)
+            }
         }
     }
 
@@ -2091,6 +2121,23 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_linked_objects_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.get_linked_objects_with_policy_context(object_id, relation, dir, context)
+            }
+            Self::Postgres(db) => {
+                db.get_linked_objects_with_policy_context(object_id, relation, dir, context)
+            }
+        }
+    }
+
     pub fn get_links(
         &self,
         object_id: &str,
@@ -2100,6 +2147,21 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_links(object_id, relation, dir),
             Self::Postgres(db) => db.get_links(object_id, relation, dir),
+        }
+    }
+
+    pub fn get_links_with_policy_context(
+        &self,
+        object_id: &str,
+        relation: &str,
+        dir: &Direction,
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Link>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_links_with_policy_context(object_id, relation, dir, context),
+            Self::Postgres(db) => {
+                db.get_links_with_policy_context(object_id, relation, dir, context)
+            }
         }
     }
 
@@ -4954,6 +5016,20 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => crate::sekai::lineage::get_lineage(db, object_id, max_nodes),
             Self::Postgres(db) => db.get_lineage(object_id, max_nodes),
+        }
+    }
+
+    pub fn get_lineage_with_policy_context(
+        &self,
+        object_id: &str,
+        max_nodes: usize,
+        context: &PrincipalPolicyContext,
+    ) -> Result<crate::sekai::lineage::LineageResult, String> {
+        match self {
+            Self::Sqlite(db) => crate::sekai::lineage::get_lineage_with_policy_context(
+                db, object_id, max_nodes, context,
+            ),
+            Self::Postgres(db) => db.get_lineage_with_policy_context(object_id, max_nodes, context),
         }
     }
 
