@@ -51,3 +51,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0028: Execute approved checkpointed fact migration](0028-checkpointed-fact-migration.md)
 - [ADR 0029: Share namespaces through grant-scoped signed snapshots](0029-signed-namespace-snapshots.md)
 - [ADR 0030: Apply one compiled row predicate to every public query path](0030-row-scoped-query-access.md)
+- [ADR 0031: Require a scoped purpose authorization for governed reads](0031-purpose-bound-reads.md)

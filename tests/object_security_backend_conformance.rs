@@ -8,7 +8,10 @@ use sekai_chisei::domain::{Direction, KIND_CAPABILITY, Link, ListFilter, Object,
 use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
     ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext, PropertyGrant,
-    PropertyGrantAccess,
+    PropertyGrantAccess, object_security_activation_digest,
+};
+use sekai_chisei::sekai::purpose_authorization::{
+    PURPOSE_AUTHORIZATION_VERSION, PurposeAuthorization,
 };
 use sekai_chisei::sekai::query::{self, GraphQuery};
 
@@ -26,6 +29,7 @@ fn policy(
             predicates,
         }],
         property_grants: None,
+        required_purpose: None,
     }
 }
 
@@ -266,6 +270,7 @@ fn exercise(db: RuntimeDb, namespace: &str) {
                 predicates: vec![ObjectSecurityPredicate::AllowAll],
             },
         ],
+        required_purpose: None,
     };
     let write_revision = db
         .put_object_security_policy(&write, "root", "put-write", 11)
@@ -323,6 +328,7 @@ fn exercise(db: RuntimeDb, namespace: &str) {
                 access: PropertyGrantAccess::Read,
             },
         ]),
+        required_purpose: None,
     };
     let grant_revision = db
         .put_object_security_policy(&grants, "root", "put-grants", 13)
@@ -526,6 +532,7 @@ fn exercise_row_scoped_query_paths(db: &RuntimeDb, namespace: &str) {
         },
         None,
         Some(&alice),
+        None,
     )
     .unwrap();
     let traversed_ids = traversed
@@ -554,11 +561,158 @@ fn exercise_row_scoped_query_paths(db: &RuntimeDb, namespace: &str) {
     assert!(!lineage_ids.contains(&alice_leaf.id));
 }
 
+fn exercise_purpose_bound_reads(db: &RuntimeDb, namespace: &str) {
+    db.create_object(&object(namespace, "doc", "doc", "alice", "open"))
+        .unwrap();
+    let mut purpose_policy = policy(
+        namespace,
+        "document",
+        vec![ObjectSecurityPredicate::AllowAll],
+    );
+    purpose_policy.required_purpose = Some("incident-response".into());
+    let revision = db
+        .put_object_security_policy(&purpose_policy, "root", "put-purpose", 1)
+        .unwrap();
+    let activation = db
+        .activate_object_security_policies(
+            namespace,
+            &BTreeMap::from([("document".into(), revision.revision_digest)]),
+            "root",
+            "activate-purpose",
+            2,
+        )
+        .unwrap();
+    let digest = object_security_activation_digest(&activation).unwrap();
+    let live = PurposeAuthorization {
+        contract_version: PURPOSE_AUTHORIZATION_VERSION.into(),
+        authorization_id: format!("{namespace}-live"),
+        actor: "alice".into(),
+        purpose: "incident-response".into(),
+        namespace: namespace.into(),
+        kind: "document".into(),
+        not_before_ms: 10,
+        not_after_ms: 20,
+        policy_activation_digest: digest.clone(),
+        created_by: "root".into(),
+        created_at_ms: 10,
+        revoked_at_ms: 0,
+    };
+    match db.put_purpose_authorization(&live) {
+        Ok(_) => {}
+        Err(error) if error.contains("unavailable") => return,
+        Err(error) => panic!("{error}"),
+    }
+    let mut unknown = live.clone();
+    unknown.authorization_id = format!("{namespace}-v2");
+    unknown.contract_version = "sekai.purpose-authorization/v2".into();
+    assert!(
+        db.put_purpose_authorization(&unknown)
+            .unwrap_err()
+            .contains("unsupported purpose authorization contract")
+    );
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            namespace,
+            "document",
+            &digest,
+            15
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert!(
+        db.find_purpose_authorization("alice", "analytics", namespace, "document", &digest, 15)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            namespace,
+            "document",
+            &digest,
+            21
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        db.find_purpose_authorization(
+            "bob",
+            "incident-response",
+            namespace,
+            "document",
+            &digest,
+            15
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            namespace,
+            "document",
+            "stale-activation",
+            15
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            "other",
+            "document",
+            &digest,
+            15
+        )
+        .unwrap()
+        .is_none()
+    );
+    let mut revoked = live.clone();
+    revoked.authorization_id = format!("{namespace}-revoked");
+    revoked.revoked_at_ms = 14;
+    db.put_purpose_authorization(&revoked).unwrap();
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            namespace,
+            "document",
+            &digest,
+            15
+        )
+        .unwrap()
+        .is_some_and(|found| found.authorization_id == live.authorization_id)
+    );
+    db.revoke_purpose_authorization(&live.authorization_id, 16)
+        .unwrap();
+    assert!(
+        db.find_purpose_authorization(
+            "alice",
+            "incident-response",
+            namespace,
+            "document",
+            &digest,
+            15
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
 #[test]
 fn sqlite_object_security_conformance() {
     let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
     exercise(db.clone(), "object-security-sqlite");
     exercise_row_scoped_query_paths(&db, "row-scope-sqlite");
+    exercise_purpose_bound_reads(&db, "purpose-sqlite");
 }
 
 #[test]
@@ -756,6 +910,7 @@ fn sqlite_property_grants_omit_hidden_values_and_deny_ungranted_filters() {
                 access: PropertyGrantAccess::Read,
             },
         ]),
+        required_purpose: None,
     };
     let revision = db
         .put_object_security_policy(&policy, "root", "put-grants", 1)
@@ -874,6 +1029,7 @@ fn postgres_object_security_conformance() {
         &format!("object-security-{}", uuid::Uuid::new_v4().simple()),
     );
     exercise_row_scoped_query_paths(&db, &format!("row-scope-{}", uuid::Uuid::new_v4().simple()));
+    exercise_purpose_bound_reads(&db, &format!("purpose-{}", uuid::Uuid::new_v4().simple()));
 
     let namespace = format!("object-security-put-race-{}", uuid::Uuid::new_v4().simple());
     let policy = Arc::new(policy(

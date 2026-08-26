@@ -11,8 +11,15 @@ impl SekaiServiceImpl {
         object: domain::Object,
         principals: &[String],
         tenant_context: Option<&RequestEnterpriseContext>,
+        purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     ) -> Result<domain::Object, Status> {
-        self.resolve_computed_for_response_with_policy(object, principals, None, tenant_context)
+        self.resolve_computed_for_response_with_policy(
+            object,
+            principals,
+            None,
+            tenant_context,
+            purpose,
+        )
     }
 
     pub(super) fn resolve_computed_for_response_with_policy(
@@ -21,6 +28,7 @@ impl SekaiServiceImpl {
         principals: &[String],
         policy_context: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
         tenant_context: Option<&RequestEnterpriseContext>,
+        purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     ) -> Result<domain::Object, Status> {
         let schema = self
             .schema_definitions
@@ -42,6 +50,11 @@ impl SekaiServiceImpl {
                 {
                     return Ok(false);
                 }
+                if !purpose_kind_permitted(&self.db, &candidate.namespace, &candidate.kind, purpose)
+                    .map_err(|status| status.to_string())?
+                {
+                    return Ok(false);
+                }
                 match policy_context {
                     Some(context) => Ok(self
                         .db
@@ -51,7 +64,15 @@ impl SekaiServiceImpl {
                 }
             },
         )
-        .map_err(Status::internal)?;
+        .map_err(|error| {
+            if error.contains("purpose authorization unavailable")
+                || error.contains("object authorization unavailable")
+            {
+                Status::unavailable(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
         let object = self
             .db
             .project_object_property_grants(object)
@@ -70,21 +91,13 @@ impl SekaiServiceImpl {
         ))
     }
 
-    pub(super) fn resolve_computed_for_responses(
-        &self,
-        objects: Vec<domain::Object>,
-        principals: &[String],
-        tenant_context: Option<&RequestEnterpriseContext>,
-    ) -> Result<Vec<domain::Object>, Status> {
-        self.resolve_computed_for_responses_with_policy(objects, principals, None, tenant_context)
-    }
-
     pub(super) fn resolve_computed_for_responses_with_policy(
         &self,
         objects: Vec<domain::Object>,
         principals: &[String],
         policy_context: Option<&crate::sekai::object_security::PrincipalPolicyContext>,
         tenant_context: Option<&RequestEnterpriseContext>,
+        purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     ) -> Result<Vec<domain::Object>, Status> {
         objects
             .into_iter()
@@ -94,6 +107,7 @@ impl SekaiServiceImpl {
                     principals,
                     policy_context,
                     tenant_context,
+                    purpose,
                 )
             })
             .collect()

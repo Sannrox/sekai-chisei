@@ -43,6 +43,8 @@ treat inventory “complete” as dual-backend for these RPCs):
   [capability catalog](capability-catalog.md));
 - multi-control-plane federation site/peer tables (see
   [federation-profile.md](federation-profile.md));
+- purpose authorizations for `required_purpose` reads (`sekai.purpose-authorization/v1`;
+  see [ADR 0031](decisions/0031-purpose-bound-reads.md));
 
 Evidence is checked in as:
 

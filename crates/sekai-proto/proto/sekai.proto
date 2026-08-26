@@ -428,6 +428,24 @@ message ActivateObjectSecurityPoliciesRequest {
 message ActivateObjectSecurityPoliciesResponse { ObjectSecurityActivation activation = 1; }
 message GetObjectSecurityActivationRequest { string namespace = 1; }
 message GetObjectSecurityActivationResponse { ObjectSecurityActivation activation = 1; }
+message PurposeAuthorization {
+  string contract_version = 1;
+  string authorization_id = 2;
+  string actor = 3;
+  string purpose = 4;
+  string namespace = 5;
+  string kind = 6;
+  int64 not_before_ms = 7;
+  int64 not_after_ms = 8;
+  string policy_activation_digest = 9;
+  string created_by = 10;
+  int64 created_at_ms = 11;
+  int64 revoked_at_ms = 12;
+}
+message PutPurposeAuthorizationRequest { PurposeAuthorization authorization = 1; }
+message PutPurposeAuthorizationResponse { PurposeAuthorization authorization = 1; }
+message RevokePurposeAuthorizationRequest { string authorization_id = 1; }
+message RevokePurposeAuthorizationResponse { PurposeAuthorization authorization = 1; }
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -1843,6 +1861,8 @@ service SekaiService {
   rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);
   rpc ActivateObjectSecurityPolicies(ActivateObjectSecurityPoliciesRequest) returns (ActivateObjectSecurityPoliciesResponse);
   rpc GetObjectSecurityActivation(GetObjectSecurityActivationRequest) returns (GetObjectSecurityActivationResponse);
+  rpc PutPurposeAuthorization(PutPurposeAuthorizationRequest) returns (PutPurposeAuthorizationResponse);
+  rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

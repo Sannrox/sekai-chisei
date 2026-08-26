@@ -162,6 +162,55 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_purpose_authorization(
+        &self,
+        authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,
+    ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
+        match self {
+            Self::Sqlite(db) => db.put_purpose_authorization(authorization),
+            Self::Postgres(_) => Err(
+                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn revoke_purpose_authorization(
+        &self,
+        authorization_id: &str,
+        revoked_at_ms: i64,
+    ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
+        match self {
+            Self::Sqlite(db) => db.revoke_purpose_authorization(authorization_id, revoked_at_ms),
+            Self::Postgres(_) => Err(
+                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn find_purpose_authorization(
+        &self,
+        actor: &str,
+        purpose: &str,
+        namespace: &str,
+        kind: &str,
+        activation_digest: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::purpose_authorization::PurposeAuthorization>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_purpose_authorization(
+                actor,
+                purpose,
+                namespace,
+                kind,
+                activation_digest,
+                now_ms,
+            ),
+            Self::Postgres(_) => Err(
+                "purpose authorizations are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {
         match self {
             Self::Sqlite(db) => db.object_query_cursor_key(),

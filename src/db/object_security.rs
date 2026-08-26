@@ -189,6 +189,20 @@ impl SekaiDb {
                 CREATE TABLE IF NOT EXISTS sekai_object_security_runtime_secrets (
                     name TEXT PRIMARY KEY,
                     secret_value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sekai_purpose_authorizations (
+                    authorization_id TEXT PRIMARY KEY,
+                    contract_version TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT '',
+                    not_before_ms INTEGER NOT NULL,
+                    not_after_ms INTEGER NOT NULL,
+                    policy_activation_digest TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    revoked_at_ms INTEGER NOT NULL DEFAULT 0
                 );",
             )
             .map_err(|error| error.to_string())
@@ -494,6 +508,141 @@ impl SekaiDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(cursor_key_from_secret(&secret))
     }
+
+    pub fn put_purpose_authorization(
+        &self,
+        authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,
+    ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
+        let authorization = authorization.prepare()?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_purpose_authorizations
+                 (authorization_id, contract_version, actor, purpose, namespace, kind,
+                  not_before_ms, not_after_ms, policy_activation_digest, created_by,
+                  created_at_ms, revoked_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    authorization.authorization_id,
+                    authorization.contract_version,
+                    authorization.actor,
+                    authorization.purpose,
+                    authorization.namespace,
+                    authorization.kind,
+                    authorization.not_before_ms,
+                    authorization.not_after_ms,
+                    authorization.policy_activation_digest,
+                    authorization.created_by,
+                    authorization.created_at_ms,
+                    authorization.revoked_at_ms
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(authorization)
+    }
+
+    pub fn revoke_purpose_authorization(
+        &self,
+        authorization_id: &str,
+        revoked_at_ms: i64,
+    ) -> Result<crate::sekai::purpose_authorization::PurposeAuthorization, String> {
+        if authorization_id.is_empty() || revoked_at_ms <= 0 {
+            return Err("purpose authorization revocation identity or time is invalid".into());
+        }
+        let updated = self
+            .conn()
+            .execute(
+                "UPDATE sekai_purpose_authorizations
+                 SET revoked_at_ms = ?1
+                 WHERE authorization_id = ?2 AND revoked_at_ms = 0",
+                params![revoked_at_ms, authorization_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("purpose authorization is missing or already revoked".into());
+        }
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT authorization_id, contract_version, actor, purpose, namespace, kind,
+                        not_before_ms, not_after_ms, policy_activation_digest, created_by,
+                        created_at_ms, revoked_at_ms
+                 FROM sekai_purpose_authorizations
+                 WHERE authorization_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_row(params![authorization_id], row_to_purpose_authorization)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn find_purpose_authorization(
+        &self,
+        actor: &str,
+        purpose: &str,
+        namespace: &str,
+        kind: &str,
+        activation_digest: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::purpose_authorization::PurposeAuthorization>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT authorization_id, contract_version, actor, purpose, namespace, kind,
+                        not_before_ms, not_after_ms, policy_activation_digest, created_by,
+                        created_at_ms, revoked_at_ms
+                 FROM sekai_purpose_authorizations
+                 WHERE actor=?1 AND purpose=?2 AND namespace=?3
+                   AND (kind='' OR kind=?4)
+                   AND policy_activation_digest=?5
+                   AND contract_version=?7
+                   AND revoked_at_ms=0
+                   AND not_before_ms<=?6 AND not_after_ms>=?6
+                 ORDER BY kind DESC, authorization_id
+                 LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_row(
+                params![
+                    actor,
+                    purpose,
+                    namespace,
+                    kind,
+                    activation_digest,
+                    now_ms,
+                    crate::sekai::purpose_authorization::PURPOSE_AUTHORIZATION_VERSION
+                ],
+                row_to_purpose_authorization,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn row_to_purpose_authorization(
+    row: &rusqlite::Row,
+) -> rusqlite::Result<crate::sekai::purpose_authorization::PurposeAuthorization> {
+    let authorization = crate::sekai::purpose_authorization::PurposeAuthorization {
+        authorization_id: row.get(0)?,
+        contract_version: row.get(1)?,
+        actor: row.get(2)?,
+        purpose: row.get(3)?,
+        namespace: row.get(4)?,
+        kind: row.get(5)?,
+        not_before_ms: row.get(6)?,
+        not_after_ms: row.get(7)?,
+        policy_activation_digest: row.get(8)?,
+        created_by: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        revoked_at_ms: row.get(11)?,
+    };
+    authorization.prepare().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        )
+    })
 }
 
 fn insert_revision_sqlite(
