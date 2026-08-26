@@ -129,6 +129,15 @@ DB_PATH=data/site-b.db sekaictl admin federation import-snapshot \
 Ungranted, stale, tampered, revoked, hidden, or residency-conflicting bundles
 fail closed before local use. Re-importing the same digest is idempotent.
 
+Each accepted assertion stores an immutable
+`sekai.federation-provenance/v1` chain back to signed source evidence. The
+exporter signs every hop. Re-export appends signer, transform, and verification
+hops and never rewrites earlier hops. Downstream import verifies each hop
+against an enabled trust root, so a relay cannot forge origin history.
+`show-snapshot-provenance` inspects a chain only when the caller can already
+read the imported fact. Hidden, missing, and revoked assertions return the same
+unavailable result. Signatures prove identity only.
+
 ## Forbidden remote control
 
 Library guard: `federation_profile::evaluate_remote_control` and
@@ -161,6 +170,7 @@ sekaictl admin federation export-snapshot ...
 sekaictl admin federation import-snapshot ...
 sekaictl admin federation list-snapshot-imports ...
 sekaictl admin federation show-snapshot-facts ...
+sekaictl admin federation show-snapshot-provenance ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as

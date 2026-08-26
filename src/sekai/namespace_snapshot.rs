@@ -26,6 +26,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const NAMESPACE_SNAPSHOT_CONTRACT: &str = "sekai.namespace-snapshot/v1";
+pub const PROVENANCE_CONTRACT: &str = "sekai.federation-provenance/v1";
+const HOP_SOURCE: &str = "source";
+const HOP_SIGNER: &str = "signer";
+const HOP_TRANSFORM: &str = "transform";
+const HOP_VERIFICATION: &str = "verification";
 pub const SNAPSHOT_DIGEST_ALGORITHM: &str = "sha256";
 pub const SNAPSHOT_SIGNATURE_ALGORITHM: &str = "ed25519";
 pub const GRANT_ACTION: &str = "federation.namespace_grant";
@@ -68,6 +73,32 @@ pub struct SnapshotFact {
     pub updated: i64,
     pub source_site_id: String,
     pub write_authority: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<ProvenanceHop>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenanceHop {
+    pub hop_kind: String,
+    pub site_id: String,
+    pub key_id: String,
+    #[serde(default)]
+    pub public_key_hex: String,
+    pub evidence_digest: String,
+    pub detail: String,
+    #[serde(default)]
+    pub predecessor_digest: String,
+    #[serde(default)]
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedFactProvenance {
+    pub contract_version: String,
+    pub object_id: String,
+    pub import_id: String,
+    pub snapshot_digest: String,
+    pub hops: Vec<ProvenanceHop>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,10 +321,18 @@ pub fn export_namespace_snapshot(
 
     let visible = collect_visible_facts(db, request)?;
     let hidden_omitted = namespace_has_omitted_facts(db, request, &visible)?;
-    let facts: Vec<SnapshotFact> = visible
+    let occupied = collect_local_object_ids(db, request)?;
+    let mut facts: Vec<SnapshotFact> = visible
         .into_iter()
         .map(|object| fact_from_object(object, &local.site_id))
         .collect();
+    let (replicas, replica_hidden) =
+        collect_imported_replica_facts(db, request, &occupied, now_ms)?;
+    facts.extend(replicas);
+    let hidden_omitted = hidden_omitted || replica_hidden;
+    for fact in &mut facts {
+        fact.provenance = bind_export_provenance(fact, &local, signing_key)?;
+    }
     if facts.len() > MAX_SNAPSHOT_FACTS {
         return Err(format!(
             "snapshot exceeds fact limit ({MAX_SNAPSHOT_FACTS})"
@@ -482,6 +521,11 @@ pub fn import_namespace_snapshot(
             conflicts.push(fact.object_id.clone());
             continue;
         }
+        if fact.provenance.is_empty() {
+            stored.push(fact.clone());
+            continue;
+        }
+        authenticate_fact_provenance(db, fact)?;
         stored.push(fact.clone());
     }
 
@@ -545,6 +589,45 @@ pub fn list_snapshot_facts(
         }
     }
     Ok(facts)
+}
+
+pub fn get_imported_fact_provenance(
+    db: &RuntimeDb,
+    import_id: &str,
+    object_id: &str,
+    now_ms: i64,
+) -> Result<ImportedFactProvenance, String> {
+    required("import id", import_id)?;
+    required("object id", object_id)?;
+    if now_ms < 0 {
+        return Err("read timestamp must be non-negative".into());
+    }
+    let record = db
+        .get_federation_snapshot_import(import_id)?
+        .ok_or_else(|| "imported assertion is unavailable".to_string())?;
+    let grants = require_live_import_authority(db, &record, now_ms)
+        .map_err(|_| "imported assertion is unavailable".to_string())?;
+    let fact = db
+        .list_federation_snapshot_facts(import_id)?
+        .into_iter()
+        .find(|item| item.object_id == object_id)
+        .ok_or_else(|| "imported assertion is unavailable".to_string())?;
+    let covered = grants.iter().try_fold(false, |allowed, grant| {
+        Ok::<bool, String>(allowed || grant_covers_fact(grant, &fact)?)
+    })?;
+    if !covered {
+        return Err("imported assertion is unavailable".into());
+    }
+    if fact.provenance.is_empty() {
+        return Err("imported assertion is unavailable".into());
+    }
+    Ok(ImportedFactProvenance {
+        contract_version: PROVENANCE_CONTRACT.into(),
+        object_id: fact.object_id,
+        import_id: record.import_id,
+        snapshot_digest: record.snapshot_digest,
+        hops: fact.provenance,
+    })
 }
 
 fn require_live_import_authority(
@@ -707,7 +790,303 @@ fn fact_from_object(object: Object, source_site_id: &str) -> SnapshotFact {
         updated: object.updated,
         source_site_id: source_site_id.into(),
         write_authority: false,
+        provenance: Vec::new(),
     }
+}
+
+fn collect_imported_replica_facts(
+    db: &RuntimeDb,
+    request: &ExportSnapshotRequest,
+    occupied: &BTreeSet<String>,
+    now_ms: i64,
+) -> Result<(Vec<SnapshotFact>, bool), String> {
+    let kinds: BTreeSet<String> = request.object_kinds.iter().cloned().collect();
+    let mut records = db.list_federation_snapshot_imports(Some(&request.namespace))?;
+    records.sort_by(|left, right| {
+        right
+            .imported_at_ms
+            .cmp(&left.imported_at_ms)
+            .then(right.sequence.cmp(&left.sequence))
+            .then(right.import_id.cmp(&left.import_id))
+    });
+    let mut facts = Vec::new();
+    let mut hidden_omitted = false;
+    for record in records {
+        let Ok(grants) = require_live_import_authority(db, &record, now_ms) else {
+            continue;
+        };
+        for fact in db.list_federation_snapshot_facts(&record.import_id)? {
+            if occupied.contains(&fact.object_id)
+                || facts
+                    .iter()
+                    .any(|item: &SnapshotFact| item.object_id == fact.object_id)
+            {
+                continue;
+            }
+            if !kinds.is_empty() && !kinds.contains(&fact.kind) {
+                continue;
+            }
+            if !grants.iter().try_fold(false, |allowed, grant| {
+                Ok::<bool, String>(allowed || grant_covers_fact(grant, &fact)?)
+            })? {
+                continue;
+            }
+            if marking_denies_export(db, &request.actor, &object_from_fact(&fact))? {
+                hidden_omitted = true;
+                continue;
+            }
+            facts.push(fact);
+        }
+    }
+    facts.sort_by(|left, right| left.object_id.cmp(&right.object_id));
+    Ok((facts, hidden_omitted))
+}
+
+fn collect_local_object_ids(
+    db: &RuntimeDb,
+    request: &ExportSnapshotRequest,
+) -> Result<BTreeSet<String>, String> {
+    let mut ids = BTreeSet::new();
+    let mut offset = 0;
+    loop {
+        let filter = ListFilter {
+            namespace: Some(request.namespace.clone()),
+            limit: MAX_LIST_LIMIT,
+            offset,
+            ..ListFilter::default()
+        };
+        let page = db.list_objects(&filter)?;
+        if page.is_empty() {
+            return Ok(ids);
+        }
+        offset += page.len() as i32;
+        for object in page {
+            ids.insert(object.id);
+        }
+    }
+}
+
+fn object_from_fact(fact: &SnapshotFact) -> Object {
+    Object {
+        id: fact.object_id.clone(),
+        kind: fact.kind.clone(),
+        name: fact.name.clone(),
+        namespace: fact.namespace.clone(),
+        external_id: fact.external_id.clone(),
+        properties: fact.properties.clone().into_iter().collect(),
+        created: fact.created,
+        updated: fact.updated,
+    }
+}
+
+fn validate_fact_provenance(
+    fact: &SnapshotFact,
+    bundle: &NamespaceSnapshotBundle,
+) -> Result<(), String> {
+    if fact.provenance.is_empty() {
+        if fact.source_site_id != bundle.manifest.exporter_site_id {
+            return Err("fact source site does not match exporter".into());
+        }
+        return Ok(());
+    }
+    validate_provenance_hops(&fact.provenance, &fact.source_site_id)
+}
+
+fn validate_provenance_hops(hops: &[ProvenanceHop], source_site_id: &str) -> Result<(), String> {
+    if hops.is_empty() {
+        return Err("provenance chain is empty".into());
+    }
+    let first = &hops[0];
+    if first.hop_kind != HOP_SOURCE || first.site_id != source_site_id {
+        return Err("provenance source hop does not match the assertion origin".into());
+    }
+    for hop in hops {
+        if !matches!(
+            hop.hop_kind.as_str(),
+            HOP_SOURCE | HOP_SIGNER | HOP_TRANSFORM | HOP_VERIFICATION
+        ) {
+            return Err("provenance hop kind is unsupported".into());
+        }
+        required("provenance site", &hop.site_id)?;
+        required("provenance evidence digest", &hop.evidence_digest)?;
+        if hop.detail.contains("hidden") {
+            return Err("provenance hop discloses hidden evidence".into());
+        }
+    }
+    Ok(())
+}
+
+fn bind_export_provenance(
+    fact: &SnapshotFact,
+    local: &federation_profile::LocalSiteIdentity,
+    signing_key: &SigningKey,
+) -> Result<Vec<ProvenanceHop>, String> {
+    let evidence_digest = fact_body_digest(fact)?;
+    let mut hops = fact.provenance.clone();
+    if hops.is_empty() {
+        if fact.source_site_id != local.site_id {
+            return Err("replica provenance chain is missing".into());
+        }
+        append_signed_hop(
+            &mut hops,
+            HOP_SOURCE,
+            "signed source snapshot",
+            local,
+            signing_key,
+            &evidence_digest,
+        )?;
+    } else {
+        authenticate_hops(hops.as_slice(), &fact.source_site_id)?;
+    }
+    append_signed_hop(
+        &mut hops,
+        HOP_SIGNER,
+        "peer snapshot signature",
+        local,
+        signing_key,
+        &evidence_digest,
+    )?;
+    append_signed_hop(
+        &mut hops,
+        HOP_TRANSFORM,
+        "non-authoritative replica projection",
+        local,
+        signing_key,
+        &evidence_digest,
+    )?;
+    append_signed_hop(
+        &mut hops,
+        HOP_VERIFICATION,
+        "grant and digest verification",
+        local,
+        signing_key,
+        &evidence_digest,
+    )?;
+    authenticate_hops(&hops, &fact.source_site_id)?;
+    Ok(hops)
+}
+
+fn append_signed_hop(
+    hops: &mut Vec<ProvenanceHop>,
+    hop_kind: &str,
+    detail: &str,
+    local: &federation_profile::LocalSiteIdentity,
+    signing_key: &SigningKey,
+    evidence_digest: &str,
+) -> Result<(), String> {
+    let predecessor_digest = match hops.last() {
+        Some(prior) => hop_binding_digest(prior)?,
+        None => String::new(),
+    };
+    hops.push(sign_hop(
+        ProvenanceHop {
+            hop_kind: hop_kind.into(),
+            site_id: local.site_id.clone(),
+            key_id: local.key_id.clone(),
+            public_key_hex: String::new(),
+            evidence_digest: evidence_digest.into(),
+            detail: detail.into(),
+            predecessor_digest,
+            signature_hex: String::new(),
+        },
+        signing_key,
+    )?);
+    Ok(())
+}
+
+fn authenticate_fact_provenance(db: &RuntimeDb, fact: &SnapshotFact) -> Result<(), String> {
+    authenticate_hops(&fact.provenance, &fact.source_site_id)?;
+    let expected = fact_body_digest(fact)?;
+    if fact.provenance[0].evidence_digest != expected {
+        return Err("provenance source digest does not match the assertion".into());
+    }
+    for hop in &fact.provenance {
+        require_trusted_hop(db, hop)?;
+    }
+    Ok(())
+}
+
+fn authenticate_hops(hops: &[ProvenanceHop], source_site_id: &str) -> Result<(), String> {
+    validate_provenance_hops(hops, source_site_id)?;
+    for hop in hops {
+        verify_hop_signature(hop)?;
+    }
+    validate_hop_chain(hops)
+}
+
+fn validate_hop_chain(hops: &[ProvenanceHop]) -> Result<(), String> {
+    let mut expected = String::new();
+    for hop in hops {
+        if hop.predecessor_digest != expected {
+            return Err("provenance hop predecessor does not match the prior hop".into());
+        }
+        expected = hop_binding_digest(hop)?;
+    }
+    Ok(())
+}
+
+fn hop_binding_digest(hop: &ProvenanceHop) -> Result<String, String> {
+    Ok(format!("sha256:{}", shomei::digest_serializable(hop)?))
+}
+
+fn require_trusted_hop(db: &RuntimeDb, hop: &ProvenanceHop) -> Result<(), String> {
+    let trusted = peer_import::list_trust_roots(db, TRUST_ROOT_NAMESPACE)?
+        .into_iter()
+        .any(|root| {
+            root.enabled
+                && root.site_identity == hop.site_id
+                && root.key_id == hop.key_id
+                && root
+                    .public_key_hex
+                    .eq_ignore_ascii_case(&hop.public_key_hex)
+        });
+    if trusted {
+        Ok(())
+    } else {
+        Err("provenance hop is not an enabled trust root".into())
+    }
+}
+
+fn fact_body_digest(fact: &SnapshotFact) -> Result<String, String> {
+    let mut body = fact.clone();
+    body.provenance.clear();
+    Ok(format!("sha256:{}", shomei::digest_serializable(&body)?))
+}
+
+fn sign_hop(mut hop: ProvenanceHop, signing_key: &SigningKey) -> Result<ProvenanceHop, String> {
+    hop.public_key_hex = encode_hex(signing_key.verifying_key().as_bytes());
+    hop.signature_hex.clear();
+    let bytes = shomei::canonical_json(&hop)?;
+    hop.signature_hex = encode_hex(&signing_key.sign(&bytes).to_bytes());
+    Ok(hop)
+}
+
+fn verify_hop_signature(hop: &ProvenanceHop) -> Result<(), String> {
+    if hop.signature_hex.trim().is_empty() {
+        return Err("provenance hop is not signed".into());
+    }
+    let public_bytes = decode_hex(&hop.public_key_hex)?;
+    let public_key = VerifyingKey::from_bytes(
+        public_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "provenance public key must be 32-byte ed25519 key hex".to_string())?,
+    )
+    .map_err(|error| format!("invalid provenance public key: {error}"))?;
+    let mut unsigned = hop.clone();
+    unsigned.signature_hex.clear();
+    let bytes = shomei::canonical_json(&unsigned)?;
+    let signature_bytes = decode_hex(&hop.signature_hex)?;
+    let signature_array: [u8; 64] = signature_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "provenance signature must be 64-byte ed25519 hex".to_string())?;
+    public_key
+        .verify(
+            &bytes,
+            &ed25519_dalek::Signature::from_bytes(&signature_array),
+        )
+        .map_err(|_| "provenance hop signature verification failed".to_string())
 }
 
 fn sign_namespace_snapshot(
@@ -766,8 +1145,13 @@ fn snapshot_verification_errors(
         if fact.write_authority {
             errors.push("fact claims write authority".into());
         }
-        if fact.source_site_id != bundle.manifest.exporter_site_id {
-            errors.push("fact source site does not match exporter".into());
+        if let Err(error) = validate_fact_provenance(fact, bundle) {
+            errors.push(error);
+        }
+        if !fact.provenance.is_empty()
+            && let Err(error) = authenticate_hops(&fact.provenance, &fact.source_site_id)
+        {
+            errors.push(error);
         }
     }
     match content_digest_for(bundle) {
@@ -1181,6 +1565,27 @@ mod tests {
         .unwrap();
     }
 
+    fn federate_relay_sink(sink: &RuntimeDb, origin_seed: u8) {
+        register_site(sink, "site-c", 3);
+        pin_peer_root(sink, "site-a", origin_seed);
+        pin_peer_root(sink, "site-b", 2);
+        join(sink, "site-b", 2);
+        grant_namespace(
+            sink,
+            "admin-c",
+            &GrantNamespaceRequest {
+                peer_site_id: "site-b".into(),
+                namespace: "ops".into(),
+                object_kinds: vec![],
+                max_classification: Some("internal".into()),
+                not_before_ms: 0,
+                not_after_ms: None,
+            },
+            3_100,
+        )
+        .unwrap();
+    }
+
     fn put_object(db: &RuntimeDb, id: &str, marking: Option<&str>) {
         let mut properties = HashMap::new();
         if let Some(marking) = marking {
@@ -1252,6 +1657,32 @@ mod tests {
         let facts = list_snapshot_facts(&importer, &imported.record.import_id, 4_100).unwrap();
         assert_eq!(facts.len(), 2);
         assert!(facts.iter().all(|fact| !fact.write_authority));
+        let chain =
+            get_imported_fact_provenance(&importer, &imported.record.import_id, "visible-1", 4_100)
+                .unwrap();
+        assert_eq!(chain.contract_version, PROVENANCE_CONTRACT);
+        assert_eq!(
+            chain
+                .hops
+                .iter()
+                .map(|hop| hop.hop_kind.as_str())
+                .collect::<Vec<_>>(),
+            [HOP_SOURCE, HOP_SIGNER, HOP_TRANSFORM, HOP_VERIFICATION]
+        );
+        assert_eq!(chain.hops[0].site_id, "site-a");
+        assert!(!chain.hops[1].evidence_digest.is_empty());
+        assert!(!chain.hops[1].signature_hex.is_empty());
+        assert_eq!(
+            get_imported_fact_provenance(&importer, &imported.record.import_id, "missing", 4_100)
+                .unwrap_err(),
+            get_imported_fact_provenance(
+                &importer,
+                &imported.record.import_id,
+                "hidden-never-exported",
+                4_100
+            )
+            .unwrap_err()
+        );
 
         let replay =
             import_namespace_snapshot(&importer, "admin-b", "ops", &bundle, 4_200).unwrap();
@@ -1263,11 +1694,200 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(
+            get_imported_fact_provenance(&importer, &replay.record.import_id, "visible-1", 4_200)
+                .unwrap()
+                .hops,
+            chain.hops
+        );
 
         let grants = list_namespace_grants(&importer, Some("ops"), Some("site-a")).unwrap();
         revoke_namespace_grant(&importer, "admin-b", &grants[0].grant_id, 4_300).unwrap();
         let err = list_snapshot_facts(&importer, &imported.record.import_id, 4_400).unwrap_err();
         assert!(err.contains("no longer authorized"), "{err}");
+        assert_eq!(
+            get_imported_fact_provenance(&importer, &imported.record.import_id, "visible-1", 4_400)
+                .unwrap_err(),
+            "imported assertion is unavailable"
+        );
+    }
+
+    #[test]
+    fn multi_hop_provenance_survives_reexport() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 20_000);
+        let imported = import_namespace_snapshot(&hop, "admin-b", "ops", &first, 20_100).unwrap();
+        assert_eq!(imported.record.status, "accepted");
+
+        let relayed = export_from(&hop, 2, 20_200);
+        assert_eq!(relayed.manifest.exporter_site_id, "site-b");
+        let relayed_fact = relayed
+            .facts
+            .iter()
+            .find(|fact| fact.object_id == "visible-1")
+            .expect("relayed replica");
+        assert_eq!(relayed_fact.source_site_id, "site-a");
+        assert!(!relayed_fact.provenance.is_empty());
+
+        let missing_origin = db();
+        register_site(&missing_origin, "site-c", 3);
+        pin_peer_root(&missing_origin, "site-b", 2);
+        join(&missing_origin, "site-b", 2);
+        grant_namespace(
+            &missing_origin,
+            "admin-c",
+            &GrantNamespaceRequest {
+                peer_site_id: "site-b".into(),
+                namespace: "ops".into(),
+                object_kinds: vec![],
+                max_classification: Some("internal".into()),
+                not_before_ms: 0,
+                not_after_ms: None,
+            },
+            20_300,
+        )
+        .unwrap();
+        let err = import_namespace_snapshot(&missing_origin, "admin-c", "ops", &relayed, 20_350)
+            .unwrap_err();
+        assert!(err.contains("trust root"), "{err}");
+
+        let sink = db();
+        federate_relay_sink(&sink, 1);
+        let second = import_namespace_snapshot(&sink, "admin-c", "ops", &relayed, 20_400).unwrap();
+        let chain =
+            get_imported_fact_provenance(&sink, &second.record.import_id, "visible-1", 20_400)
+                .unwrap();
+        let kinds = chain
+            .hops
+            .iter()
+            .map(|hop| hop.hop_kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                HOP_SOURCE,
+                HOP_SIGNER,
+                HOP_TRANSFORM,
+                HOP_VERIFICATION,
+                HOP_SIGNER,
+                HOP_TRANSFORM,
+                HOP_VERIFICATION
+            ]
+        );
+        assert_eq!(chain.hops[0].site_id, "site-a");
+        assert_eq!(chain.hops[1].site_id, "site-a");
+        assert_eq!(chain.hops[4].site_id, "site-b");
+        assert_eq!(
+            get_imported_fact_provenance(&sink, &second.record.import_id, "secret", 20_400)
+                .unwrap_err(),
+            "imported assertion is unavailable"
+        );
+    }
+
+    #[test]
+    fn tampered_prior_hops_fail_closed() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 21_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 21_100).unwrap();
+        let mut forged = export_from(&hop, 2, 21_200);
+        forged.facts[0].provenance[0].site_id = "forged-origin".into();
+        resign(&mut forged, 2, "site-b", "k1", 21_300);
+
+        let sink = db();
+        federate_relay_sink(&sink, 1);
+        let err = import_namespace_snapshot(&sink, "admin-c", "ops", &forged, 21_500).unwrap_err();
+        assert!(
+            err.contains("provenance") || err.contains("origin") || err.contains("signature"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replica_reexport_honors_exporter_visibility() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", Some("internal"));
+        let first = export_from(&exporter, 1, 22_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 22_100).unwrap();
+
+        let omitted = export_as(&hop, 2, 22_200, "exporter");
+        assert!(omitted.facts.is_empty(), "{omitted:?}");
+        assert!(omitted.manifest.hidden_omitted);
+
+        let included = export_from(&hop, 2, 22_300);
+        assert_eq!(included.facts.len(), 1);
+        assert_eq!(included.facts[0].object_id, "visible-1");
+    }
+
+    #[test]
+    fn replica_reexport_prefers_newest_imported_assertion() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 23_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 23_100).unwrap();
+
+        let mut updated = exporter.get_object("visible-1").unwrap().unwrap();
+        updated.name = "visible-1-newer".into();
+        updated.updated = 20;
+        exporter.update_object(&updated).unwrap();
+        let second = export_from(&exporter, 1, 23_200);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &second, 23_300).unwrap();
+
+        let relayed = export_from(&hop, 2, 23_400);
+        assert_eq!(relayed.facts.len(), 1);
+        assert_eq!(relayed.facts[0].name, "visible-1-newer");
+    }
+
+    #[test]
+    fn hidden_local_object_id_blocks_replica_reexport() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 24_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 24_100).unwrap();
+        put_object(&hop, "visible-1", Some("restricted"));
+
+        let omitted = export_as(&hop, 2, 24_200, "exporter");
+        assert!(
+            omitted
+                .facts
+                .iter()
+                .all(|fact| fact.object_id != "visible-1")
+        );
+        assert!(omitted.manifest.hidden_omitted);
+    }
+
+    #[test]
+    fn dropped_provenance_hop_fails_closed() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 25_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 25_100).unwrap();
+        let mut forged = export_from(&hop, 2, 25_200);
+        forged.facts[0].provenance.remove(2);
+        resign(&mut forged, 2, "site-b", "k1", 25_300);
+        let sink = db();
+        federate_relay_sink(&sink, 1);
+        let err = import_namespace_snapshot(&sink, "admin-c", "ops", &forged, 25_400).unwrap_err();
+        assert!(
+            err.contains("predecessor") || err.contains("provenance"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rewritten_replica_body_fails_source_digest_check() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 26_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 26_100).unwrap();
+        let mut forged = export_from(&hop, 2, 26_200);
+        forged.facts[0].name = "rewritten".into();
+        resign(&mut forged, 2, "site-b", "k1", 26_300);
+        let sink = db();
+        federate_relay_sink(&sink, 1);
+        let err = import_namespace_snapshot(&sink, "admin-c", "ops", &forged, 26_400).unwrap_err();
+        assert!(err.contains("digest") || err.contains("assertion"), "{err}");
     }
 
     #[test]
@@ -1284,6 +1904,28 @@ mod tests {
         let encoded = serde_json::to_string(&bundle).unwrap();
         assert!(!encoded.contains("hidden-1"));
         assert!(!encoded.contains("\"hidden_count\""));
+    }
+
+    #[test]
+    fn empty_provenance_is_omitted_from_serialized_facts() {
+        let fact = SnapshotFact {
+            object_id: "visible-1".into(),
+            kind: "asset".into(),
+            name: "visible-1".into(),
+            namespace: "ops".into(),
+            external_id: "asset:visible-1".into(),
+            properties: BTreeMap::new(),
+            created: 10,
+            updated: 10,
+            source_site_id: "site-a".into(),
+            write_authority: false,
+            provenance: Vec::new(),
+        };
+        let json = serde_json::to_string(&fact).unwrap();
+        assert!(
+            !json.contains("provenance"),
+            "empty provenance must stay omitted for legacy digest compatibility: {json}"
+        );
     }
 
     #[test]
@@ -1416,6 +2058,7 @@ mod tests {
             updated: 1,
             source_site_id: "site-a".into(),
             write_authority: false,
+            provenance: Vec::new(),
         });
         bundle.manifest.fact_count = bundle.facts.len() as u32;
         let err =
@@ -1491,7 +2134,10 @@ mod tests {
         resign(&mut forged, 1, "site-a", "k1", 11_200);
         let err =
             import_namespace_snapshot(&importer, "admin-b", "ops", &forged, 11_200).unwrap_err();
-        assert!(err.contains("exporter identity"), "{err}");
+        assert!(
+            err.contains("exporter identity") || err.contains("provenance"),
+            "{err}"
+        );
 
         put_object(&exporter, "visible-2", None);
         let mut divergent = export_from(&exporter, 1, 11_300);
@@ -1543,6 +2189,7 @@ mod tests {
             updated: 1,
             source_site_id: "site-a".into(),
             write_authority: false,
+            provenance: Vec::new(),
         };
         assert!(!grant_covers_fact(&grant, &fact).unwrap());
     }

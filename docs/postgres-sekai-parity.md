@@ -48,6 +48,10 @@ treat inventory “complete” as dual-backend for these RPCs):
 - classification lattice publication (`sekai.classification-lattice/v1`;
   see [ADR 0032](decisions/0032-hierarchical-classifications.md)); PostgreSQL
   get returns no lattice so the default ceiling remains;
+- signed namespace snapshots and imported assertion provenance
+  (`sekai.namespace-snapshot/v1`, `sekai.federation-provenance/v1`; see
+  [ADR 0029](decisions/0029-signed-namespace-snapshots.md) and
+  [ADR 0034](decisions/0034-cross-site-import-provenance.md));
 
 Evidence is checked in as:
 

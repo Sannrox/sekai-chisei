@@ -130,8 +130,8 @@ lives in the separate [research index](research/README.md).
 - [Context admission policy](context-admission-policy.md) — bounded,
   namespace-scoped context use rules. Gateway fat-decide fails closed when the
   policy is missing or unavailable.
-- [Federation profile](federation-profile.md) — multi-control-plane trust and
-  exchange contract.
+- [Federation profile](federation-profile.md) — multi-control-plane trust,
+  signed namespace snapshots, and imported assertion provenance.
 - [Region/site pins](region-pins.md) — single-writer pins for leases and online
   permit redemption.
 - [Budget topology](budget-topology.md) — supported multi-region budget modes.
