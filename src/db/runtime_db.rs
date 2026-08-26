@@ -4786,6 +4786,46 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_open_table_source(
+        &self,
+        source: &crate::sekai::open_table::OpenTableSource,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_open_table_source(source),
+            Self::Postgres(_) => Err(crate::sekai::open_table::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_open_table_source(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<crate::sekai::open_table::OpenTableSource>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_open_table_source(source_id),
+            Self::Postgres(_) => Err(crate::sekai::open_table::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_open_table_snapshot(
+        &self,
+        snapshot: &crate::sekai::open_table::OpenTableSnapshot,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_open_table_snapshot(snapshot),
+            Self::Postgres(_) => Err(crate::sekai::open_table::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_open_table_snapshot(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<crate::sekai::open_table::OpenTableSnapshot>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_open_table_snapshot(source_id),
+            Self::Postgres(_) => Err(crate::sekai::open_table::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

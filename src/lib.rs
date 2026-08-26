@@ -45,6 +45,7 @@ pub mod tenant_invitation;
 pub mod tenant_lifecycle;
 pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
+pub mod open_table_cli;
 pub mod receipt_cli;
 pub mod replay_cli;
 pub mod report_cli;

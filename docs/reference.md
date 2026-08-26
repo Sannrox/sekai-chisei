@@ -95,6 +95,8 @@ lives in the separate [research index](research/README.md).
 - [Inbound object sync](object-sync.md) — authenticated source batches,
   plane-owned checkpoints, GitHub Issue/PullRequest identity, replay, recovery,
   tombstones, retention, and rollback.
+- [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
+  authorized queries over registered Iceberg and Parquet snapshots.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,
