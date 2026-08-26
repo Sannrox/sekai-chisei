@@ -24,6 +24,7 @@ pub const MAX_DEFINITION_KIND_BYTES: usize = 64;
 const KNOWN_MEMBER_KINDS: &[&str] = &[
     "action_type",
     "control",
+    "function",
     "interface_type",
     "link_type",
     "object_type",

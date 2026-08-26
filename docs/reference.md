@@ -73,6 +73,8 @@ lives in the separate [research index](research/README.md).
   provider-profile matrix, including invocation and decide-input boundaries.
 - [Capability code generation](capability-codegen.md) — namespace-scoped
   generated client surfaces.
+- [Ontology TypeScript clients](ontology-codegen.md) — revision-pinned
+  selected object, link, action, and function types.
 
 ## Policy, actions, and evidence
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Generate a revision-pinned TypeScript ontology client from selected object,
+  link, action, and function members of one published definition revision.
+  The package embeds the digest and selected names only. Live gRPC
+  reauthorization remains the grant. Empty selection, unknown members, stale
+  pins, tampered packages, and excessive scope fail without catalog
+  disclosure. `function` is a first-class definition member kind.
 - Evaluate object markings against an optional namespace-local
   `sekai.classification-lattice/v1`. Dominance is reachability; hops take the
   least upper bound and deny incomparable joins. Unknown tokens and stale

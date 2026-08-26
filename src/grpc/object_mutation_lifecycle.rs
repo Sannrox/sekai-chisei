@@ -42,6 +42,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -82,6 +83,11 @@ impl SekaiServiceImpl {
         )?;
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
+        enforce_optional_ontology_revision_pin(
+            &self.db,
+            revision_pin.as_deref(),
+            &object.namespace,
+        )?;
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
                 &self.db,
@@ -220,6 +226,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -284,6 +291,11 @@ impl SekaiServiceImpl {
         )?;
         check_team_namespace(&self.db, &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
+        enforce_optional_ontology_revision_pin(
+            &self.db,
+            revision_pin.as_deref(),
+            &object.namespace,
+        )?;
         if let Some(existing) = &existing {
             enforce_object_operation_access(
                 &self.db,
@@ -444,6 +456,7 @@ impl SekaiServiceImpl {
         req: Request<GuardedDeleteObjectRequest>,
     ) -> Result<Response<GuardedDeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -469,6 +482,13 @@ impl SekaiServiceImpl {
             return Ok(Response::new(GuardedDeleteObjectResponse {}));
         }
         check_write(&self.security, &input.id, &principals)?;
+        if let Some(current) = &expected {
+            enforce_optional_ontology_revision_pin(
+                &self.db,
+                revision_pin.as_deref(),
+                &current.namespace,
+            )?;
+        }
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
                 &self.db,

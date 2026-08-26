@@ -8484,6 +8484,39 @@ fn principal_policy_context(
     principal_policy_context_from(&caller_principals(req), None)
 }
 
+fn ontology_revision_pin(req: &Request<impl std::any::Any>) -> Option<String> {
+    req.metadata()
+        .get("x-sekai-definition-revision")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn enforce_optional_ontology_revision_pin(
+    db: &RuntimeDb,
+    pin: Option<&str>,
+    namespace: &str,
+) -> Result<(), Status> {
+    let Some(pin) = pin.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if !crate::ontology_codegen::is_metadata_safe(pin) || namespace.is_empty() {
+        return Err(Status::failed_precondition(
+            "ontology client revision pin is stale",
+        ));
+    }
+    let live = db
+        .get_published_definition_revision(namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    match live {
+        Some(revision) if revision.published && revision.revision_digest == pin => Ok(()),
+        _ => Err(Status::failed_precondition(
+            "ontology client revision pin is stale",
+        )),
+    }
+}
+
 fn request_purpose_presentation(
     req: &Request<impl std::any::Any>,
     principals: &[String],
@@ -8927,6 +8960,20 @@ mod tests {
                 .code(),
             tonic::Code::PermissionDenied
         );
+    }
+
+    #[test]
+    fn optional_ontology_revision_pin_is_absent_or_current() {
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+        assert!(enforce_optional_ontology_revision_pin(&db, None, "demo").is_ok());
+        let err = enforce_optional_ontology_revision_pin(
+            &db,
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "demo",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(err.message(), "ontology client revision pin is stale");
     }
 
     #[test]

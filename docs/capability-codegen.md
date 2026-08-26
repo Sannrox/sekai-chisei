@@ -37,7 +37,9 @@ API stability on a fixed fixture catalog.
 ## Non-goals (v1)
 
 - Full multi-language OSDK surface (Python can wrap the same scope JSON later)
-- Per-field TypeScript interfaces from projected JSON Schema (method + scope
-  typing is v1; schema-to-TS input types are a follow-up)
 - Replacing gRPC as system of record
 - Treating catalog visibility as a runtime grant
+
+Schema-typed object, link, action, and function clients pinned to a published
+definition revision are generated separately; see
+[ontology-codegen.md](ontology-codegen.md).
