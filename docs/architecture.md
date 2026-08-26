@@ -356,7 +356,8 @@ work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Known community Postgres fail-closed exceptions include public
 audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,
-federation peer tables, and (on the Chisei side)
+federation peer tables, registered Iceberg/Parquet snapshot projections,
+and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`

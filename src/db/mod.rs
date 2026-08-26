@@ -33,6 +33,7 @@ mod namespace_snapshot_store;
 pub mod object_security;
 pub mod object_sync;
 pub mod ontology;
+mod open_table_store;
 mod peer_import_store;
 #[cfg(test)]
 mod portfolio_route_test_cases;

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Query typed authorized projections over registered Iceberg tables and
+  Parquet files as digest-pinned local snapshots. Hidden or unauthorized
+  columns fail the whole query; unrequested hidden fields are omitted.
+  Corrupt metadata, unsupported revisions, and foreign ownership fail closed.
+  `sekaictl admin tables` registers sources, admits snapshots, and queries.
+  SQLite is the reference store; PostgreSQL stays unavailable.
 - Admit signed `sekai.source-webhook-delivery/v1` envelopes as collection
   transport into the existing object-sync batch contract. The plane pins a
   verifying key, fails closed on forged, expired, oversized, or unpinned

@@ -55,6 +55,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - source-webhook verifying-key pins (`sekai.source-webhook-delivery/v1`; see
   [ADR 0035](decisions/0035-source-webhook-transport.md)); batch apply keeps its
   existing dual-backend path;
+- registered Iceberg and Parquet snapshot projections
+  (`sekai.open-table-source/v1`; see
+  [ADR 0036](decisions/0036-open-table-projections.md));
 
 Evidence is checked in as:
 

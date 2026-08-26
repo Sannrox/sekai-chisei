@@ -78,6 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::source_webhook_cli::run_sync_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "tables" => {
+            sekai_chisei::open_table_cli::run_tables_command(args.into_iter().skip(1).collect())
+                .await
+        }
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
@@ -392,6 +396,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("assurance"), Some("replay")) => ("replay", 3),
         (Some("federation"), _) => ("federation", 2),
         (Some("sync"), _) => ("sync", 2),
+        (Some("tables"), _) => ("tables", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -564,7 +569,10 @@ fn print_admin_usage() {
            sekaictl admin federation ...\n\
          \n\
          Sync:\n\
-           sekaictl admin sync ..."
+           sekaictl admin sync ...\n\
+         \n\
+         Tables:\n\
+           sekaictl admin tables ..."
     );
 }
 
@@ -589,6 +597,7 @@ fn expert_usage(command: &str) -> Option<String> {
         )),
         "federation" => Some(sekai_chisei::federation_cli::usage().to_string()),
         "sync" => Some(sekai_chisei::source_webhook_cli::usage().to_string()),
+        "tables" => Some(sekai_chisei::open_table_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -610,6 +619,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "replay" => Some("admin assurance replay"),
         "federation" => Some("admin federation"),
         "sync" => Some("admin sync"),
+        "tables" => Some("admin tables"),
         _ => None,
     }
 }
@@ -655,6 +665,7 @@ mod tests {
             (vec!["assurance", "replay"], "replay"),
             (vec!["federation"], "federation"),
             (vec!["sync"], "sync"),
+            (vec!["tables"], "tables"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -696,6 +707,7 @@ mod tests {
             "replay",
             "federation",
             "sync",
+            "tables",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));
