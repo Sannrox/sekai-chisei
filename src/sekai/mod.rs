@@ -20,6 +20,7 @@ pub mod definition_diff;
 pub mod definition_migration;
 pub mod definition_proposal;
 pub mod escalation;
+pub mod event_stream;
 pub mod evidence;
 pub(crate) mod evidence_admission_lifecycle;
 pub mod evidence_projection;

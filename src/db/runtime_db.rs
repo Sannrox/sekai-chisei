@@ -4826,6 +4826,50 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_event_stream_binding(
+        &self,
+        binding: &crate::sekai::event_stream::EventStreamBinding,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_event_stream_binding(binding),
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_event_stream_binding(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<crate::sekai::event_stream::EventStreamBinding>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_event_stream_binding(stream_id),
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn advance_event_stream_checkpoint(
+        &self,
+        next: &crate::sekai::event_stream::EventStreamCheckpoint,
+        expected: &crate::sekai::event_stream::EventStreamCheckpoint,
+        definition_digest: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.advance_event_stream_checkpoint(next, expected, definition_digest)
+            }
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_event_stream_checkpoint(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<crate::sekai::event_stream::EventStreamCheckpoint>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_event_stream_checkpoint(stream_id),
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

@@ -20,6 +20,7 @@ pub mod definition_migration;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
+mod event_stream_store;
 pub mod evidence;
 mod federation_store;
 pub mod function;

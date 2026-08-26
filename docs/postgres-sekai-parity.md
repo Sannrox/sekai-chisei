@@ -58,6 +58,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - registered Iceberg and Parquet snapshot projections
   (`sekai.open-table-source/v1`; see
   [ADR 0036](decisions/0036-open-table-projections.md));
+- event-stream projections and checkpoints
+  (`sekai.event-stream-projection/v1`; see
+  [ADR 0037](decisions/0037-event-stream-projections.md));
 
 Evidence is checked in as:
 

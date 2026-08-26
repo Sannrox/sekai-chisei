@@ -76,6 +76,8 @@ If you want to deploy or operate the control plane:
   identity.
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered table snapshots.
+- [Event-stream projections](event-streams.md) — ordered batches with durable
+  checkpoints and fail-closed replay.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,

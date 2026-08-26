@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Project typed events from registered streams with durable generation, epoch,
+  and offset checkpoints. Exact replay is idempotent; gaps, late offsets,
+  malformed batches, and foreign ownership fail without moving the checkpoint.
+  Hidden fields are omitted. `sekaictl admin streams` registers, projects, and
+  inspects checkpoints. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Query typed authorized projections over registered Iceberg tables and
   Parquet files as digest-pinned local snapshots. Hidden or unauthorized
   columns fail the whole query; unrequested hidden fields are omitted.
