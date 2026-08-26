@@ -47,6 +47,7 @@ pub mod ontology;
 pub mod parked_work;
 pub mod peer_import;
 pub mod propagation;
+pub mod purpose_authorization;
 pub mod query;
 pub mod relation_object;
 pub mod retention;

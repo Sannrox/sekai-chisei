@@ -6,11 +6,13 @@
 //! denial normalization, computed properties, and the canonical result projection.
 
 use super::*;
+use std::collections::HashSet;
 
 impl SekaiServiceImpl {
     pub(super) fn execute_retrieve_context(
         &self,
         principals: &[String],
+        purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
         inner: RetrieveContextRequest,
     ) -> Result<RetrieveContextResponse, Status> {
         let reasoning_started = std::time::Instant::now();
@@ -165,19 +167,38 @@ impl SekaiServiceImpl {
 
         query.initial_source_rows = ontology_source_rows;
         query.source_rows_truncated = ontology_source_truncated;
+        let purpose_error = std::cell::RefCell::new(None::<Status>);
+        let recorded_purposes = std::cell::RefCell::new(HashSet::new());
         let mut result = retrieval::retrieve_with_ontology_started(
             &self.db,
             &query,
             ontology.as_ref(),
             reasoning_started,
             |object| {
+                let purpose_ok = match purpose_allows_kind(
+                    &self.db,
+                    &object.namespace,
+                    &object.kind,
+                    purpose,
+                    &mut recorded_purposes.borrow_mut(),
+                ) {
+                    Ok(allowed) => allowed,
+                    Err(status) => {
+                        *purpose_error.borrow_mut() = Some(status);
+                        false
+                    }
+                };
                 self.security.can_access(&object.id, &principal_refs)
                     && check_team_namespace(&self.db, principals, &object.namespace, false).is_ok()
                     && object_passes_marking(&self.db, object, principals).unwrap_or(false)
+                    && purpose_ok
             },
             |object| is_reserved_governance_kind(&object.kind),
         )
         .map_err(map_retrieval_error)?;
+        if let Some(status) = purpose_error.into_inner() {
+            return Err(status);
+        }
 
         // A denied root remains observationally equivalent to a missing root.
         let denied_roots = result.denied_roots;
@@ -195,8 +216,13 @@ impl SekaiServiceImpl {
             result.truncated = true;
         }
         for candidate in &mut result.candidates {
-            candidate.object =
-                self.resolve_computed_for_response(candidate.object.clone(), principals, None)?;
+            candidate.object = self.resolve_computed_for_response_with_policy(
+                candidate.object.clone(),
+                principals,
+                None,
+                None,
+                purpose,
+            )?;
         }
 
         Ok(RetrieveContextResponse {

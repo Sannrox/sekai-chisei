@@ -6,6 +6,7 @@
 //! lineage reads.
 
 use super::*;
+use std::collections::HashSet;
 
 impl SekaiServiceImpl {
     pub(super) async fn get_visible_object(
@@ -14,6 +15,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let id = req.into_inner().id;
         let obj = self
@@ -22,6 +24,13 @@ impl SekaiServiceImpl {
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let namespace = obj.namespace.clone();
+        require_purpose_for_kind(
+            &self.db,
+            &namespace,
+            &obj.kind,
+            purpose.as_ref(),
+            &format!("get_object:{id}"),
+        )?;
         let visibility = require_visible_read_root(
             &self.db,
             &self.security,
@@ -67,6 +76,7 @@ impl SekaiServiceImpl {
             &principals,
             Some(&policy_context),
             tenant_context.as_ref(),
+            purpose.as_ref(),
         )?;
         Ok(Response::new(GetObjectResponse {
             object: Some(to_proto_obj(&obj)),
@@ -78,6 +88,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let invoked_capability = req
             .metadata()
@@ -187,8 +198,13 @@ impl SekaiServiceImpl {
         }
         // Token binds principal policy context, activation, and query. ACL,
         // team, and marking changes are re-applied when the page is served.
-        let principal_context_digest = policy_context
-            .digest()
+        let principal_context_digest =
+            crate::sekai::purpose_authorization::purpose_bound_context_digest(
+                &policy_context
+                    .digest()
+                    .map_err(|_| Status::permission_denied("access denied"))?,
+                purpose.as_ref().map(|presented| presented.purpose.as_str()),
+            )
             .map_err(|_| Status::permission_denied("access denied"))?;
         let query_digest = crate::sekai::object_security::object_query_digest(&filter)
             .map_err(Status::invalid_argument)?;
@@ -238,6 +254,7 @@ impl SekaiServiceImpl {
             &filter,
             &principals,
             &policy_context,
+            purpose.as_ref(),
             tenant_context.as_ref(),
             |objects, principals, tenant_context| {
                 self.resolve_computed_for_responses_with_policy(
@@ -245,6 +262,7 @@ impl SekaiServiceImpl {
                     principals,
                     Some(&policy_context),
                     tenant_context,
+                    purpose.as_ref(),
                 )
             },
         )?;
@@ -292,6 +310,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let external_id = req.into_inner().external_id;
         let candidates = self
@@ -299,6 +318,7 @@ impl SekaiServiceImpl {
             .find_all_by_external_id_with_policy_context(&external_id, &policy_context)
             .map_err(Status::internal)?;
         let mut first_acl_denied = None;
+        let mut recorded_purposes = HashSet::new();
         for candidate in candidates {
             if tenant_context.is_some()
                 && !object_is_visible(
@@ -319,6 +339,15 @@ impl SekaiServiceImpl {
                 continue;
             };
             let namespace = obj.namespace.clone();
+            if !purpose_allows_kind(
+                &self.db,
+                &namespace,
+                &obj.kind,
+                purpose.as_ref(),
+                &mut recorded_purposes,
+            )? {
+                continue;
+            }
             let visibility = require_visible_read_root(
                 &self.db,
                 &self.security,
@@ -369,6 +398,7 @@ impl SekaiServiceImpl {
                 &principals,
                 Some(&policy_context),
                 tenant_context.as_ref(),
+                purpose.as_ref(),
             )?;
             return Ok(Response::new(GetObjectResponse {
                 object: Some(to_proto_obj(&obj)),
@@ -385,6 +415,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
@@ -408,22 +439,31 @@ impl SekaiServiceImpl {
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
         let filtered = self.security.filter_objects(&objs, &refs);
-        let filtered = filtered
-            .into_iter()
-            .filter(|object| {
-                object_is_visible(
-                    &self.db,
-                    &self.security,
-                    object,
-                    &principals,
-                    tenant_context.as_ref(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let filtered = self.resolve_computed_for_responses(
-            filtered.into_iter().cloned().collect(),
+        let mut recorded_purposes = HashSet::new();
+        let mut visible = Vec::new();
+        for object in filtered {
+            if object_is_visible(
+                &self.db,
+                &self.security,
+                object,
+                &principals,
+                tenant_context.as_ref(),
+            ) && purpose_allows_kind(
+                &self.db,
+                &object.namespace,
+                &object.kind,
+                purpose.as_ref(),
+                &mut recorded_purposes,
+            )? {
+                visible.push(object.clone());
+            }
+        }
+        let filtered = self.resolve_computed_for_responses_with_policy(
+            visible,
             &principals,
+            Some(&policy_context),
             tenant_context.as_ref(),
+            purpose.as_ref(),
         )?;
         Ok(Response::new(ListObjectsResponse {
             objects: filtered.iter().map(to_proto_obj).collect(),
@@ -437,6 +477,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GetLinksResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
@@ -445,6 +486,13 @@ impl SekaiServiceImpl {
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        require_purpose_for_kind(
+            &self.db,
+            &root.namespace,
+            &root.kind,
+            purpose.as_ref(),
+            &format!("get_links:{}", r.object_id),
+        )?;
         let (root, _) = require_visible_read_root(
             &self.db,
             &self.security,
@@ -462,26 +510,37 @@ impl SekaiServiceImpl {
             .db
             .get_links_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
-        let links = links
-            .into_iter()
-            .filter(|link| {
-                [&link.from_id, &link.to_id].into_iter().all(|object_id| {
-                    self.db
-                        .get_object(object_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|object| {
-                            object_is_visible(
-                                &self.db,
-                                &self.security,
-                                &object,
-                                &principals,
-                                tenant_context.as_ref(),
-                            )
-                        })
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut recorded_purposes = HashSet::new();
+        let mut visible_links = Vec::new();
+        for link in links {
+            let mut keep = true;
+            for object_id in [&link.from_id, &link.to_id] {
+                let Some(object) = self.db.get_object(object_id).ok().flatten() else {
+                    keep = false;
+                    break;
+                };
+                if !object_is_visible(
+                    &self.db,
+                    &self.security,
+                    &object,
+                    &principals,
+                    tenant_context.as_ref(),
+                ) || !purpose_allows_kind(
+                    &self.db,
+                    &object.namespace,
+                    &object.kind,
+                    purpose.as_ref(),
+                    &mut recorded_purposes,
+                )? {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                visible_links.push(link);
+            }
+        }
+        let links = visible_links;
         Ok(Response::new(GetLinksResponse {
             links: links.iter().map(to_proto_link).collect(),
         }))
@@ -492,6 +551,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
@@ -499,6 +559,13 @@ impl SekaiServiceImpl {
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        require_purpose_for_kind(
+            &self.db,
+            &root.namespace,
+            &root.kind,
+            purpose.as_ref(),
+            &format!("get_linked_objects:{}", r.object_id),
+        )?;
         let (root, _) = require_visible_read_root(
             &self.db,
             &self.security,
@@ -516,20 +583,33 @@ impl SekaiServiceImpl {
             .db
             .get_linked_objects_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
-        let objs = objs
-            .into_iter()
-            .filter(|object| {
-                object_is_visible(
-                    &self.db,
-                    &self.security,
-                    object,
-                    &principals,
-                    tenant_context.as_ref(),
-                )
-            })
-            .collect();
-        let objs =
-            self.resolve_computed_for_responses(objs, &principals, tenant_context.as_ref())?;
+        let mut recorded_purposes = HashSet::new();
+        let mut visible_objs = Vec::new();
+        for object in objs {
+            if object_is_visible(
+                &self.db,
+                &self.security,
+                &object,
+                &principals,
+                tenant_context.as_ref(),
+            ) && purpose_allows_kind(
+                &self.db,
+                &object.namespace,
+                &object.kind,
+                purpose.as_ref(),
+                &mut recorded_purposes,
+            )? {
+                visible_objs.push(object);
+            }
+        }
+        let objs = visible_objs;
+        let objs = self.resolve_computed_for_responses_with_policy(
+            objs,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+            purpose.as_ref(),
+        )?;
         Ok(Response::new(GetLinkedObjectsResponse {
             objects: objs.iter().map(to_proto_obj).collect(),
         }))
@@ -540,6 +620,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<TraverseResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let q = req
             .into_inner()
@@ -586,6 +667,13 @@ impl SekaiServiceImpl {
             ));
         };
         let start_operation = format!("traverse:{}", start.id);
+        require_purpose_for_kind(
+            &self.db,
+            &start.namespace,
+            &start.kind,
+            purpose.as_ref(),
+            &start_operation,
+        )?;
         let (start, _) = require_visible_read_root(
             &self.db,
             &self.security,
@@ -625,21 +713,49 @@ impl SekaiServiceImpl {
             &gq,
             Some(&schema),
             Some(&policy_context),
+            Some(&|object| {
+                purpose_kind_permitted(&self.db, &object.namespace, &object.kind, purpose.as_ref())
+                    .map_err(|status| status.to_string())
+            }),
         )
-        .map_err(Status::internal)?;
+        .map_err(|error| {
+            if error.contains("purpose authorization unavailable")
+                || error.contains("object authorization unavailable")
+            {
+                Status::unavailable(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
         drop(schema);
-        res.objects.retain(|object| {
-            object_is_visible(
+        let mut recorded_purposes = HashSet::new();
+        let mut visible_objects = Vec::new();
+        for object in res.objects {
+            if object_is_visible(
                 &self.db,
                 &self.security,
-                object,
+                &object,
                 &principals,
                 tenant_context.as_ref(),
-            )
-        });
+            ) && purpose_allows_kind(
+                &self.db,
+                &object.namespace,
+                &object.kind,
+                purpose.as_ref(),
+                &mut recorded_purposes,
+            )? {
+                visible_objects.push(object);
+            }
+        }
+        res.objects = visible_objects;
         retain_reachable_visible_objects(&start.id, gq.direction, &mut res.objects, &mut res.links);
-        res.objects =
-            self.resolve_computed_for_responses(res.objects, &principals, tenant_context.as_ref())?;
+        res.objects = self.resolve_computed_for_responses_with_policy(
+            res.objects,
+            &principals,
+            Some(&policy_context),
+            tenant_context.as_ref(),
+            purpose.as_ref(),
+        )?;
         Ok(Response::new(TraverseResponse {
             result: Some(GraphResult {
                 objects: res.objects.iter().map(to_proto_obj).collect(),
@@ -653,6 +769,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GetLineageResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
@@ -660,6 +777,13 @@ impl SekaiServiceImpl {
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        require_purpose_for_kind(
+            &self.db,
+            &root.namespace,
+            &root.kind,
+            purpose.as_ref(),
+            &format!("get_lineage:{}", r.object_id),
+        )?;
         let (root, _) = require_visible_read_root(
             &self.db,
             &self.security,
@@ -672,20 +796,33 @@ impl SekaiServiceImpl {
             .db
             .get_lineage_with_policy_context(&root.id, r.max_nodes as usize, &policy_context)
             .map_err(Status::internal)?;
-        res.nodes.retain(|node| {
-            object_is_visible(
+        let mut recorded_purposes = HashSet::new();
+        let mut visible_nodes = Vec::new();
+        for node in res.nodes {
+            if object_is_visible(
                 &self.db,
                 &self.security,
                 &node.object,
                 &principals,
                 tenant_context.as_ref(),
-            )
-        });
+            ) && purpose_allows_kind(
+                &self.db,
+                &node.object.namespace,
+                &node.object.kind,
+                purpose.as_ref(),
+                &mut recorded_purposes,
+            )? {
+                visible_nodes.push(node);
+            }
+        }
+        res.nodes = visible_nodes;
         retain_reachable_visible_lineage(&root.id, &mut res.nodes, &mut res.edges);
-        let objects = self.resolve_computed_for_responses(
+        let objects = self.resolve_computed_for_responses_with_policy(
             res.nodes.iter().map(|node| node.object.clone()).collect(),
             &principals,
+            Some(&policy_context),
             tenant_context.as_ref(),
+            purpose.as_ref(),
         )?;
         let nodes = res
             .nodes

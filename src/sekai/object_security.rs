@@ -119,6 +119,8 @@ pub struct ObjectSecurityPolicy {
     pub rules: Vec<ObjectSecurityRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property_grants: Option<Vec<PropertyGrant>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_purpose: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +356,9 @@ impl ObjectSecurityPolicy {
             });
             grants.dedup();
         }
+        if let Some(purpose) = &self.required_purpose {
+            validate_identity("required_purpose", purpose)?;
+        }
         Ok(self)
     }
 
@@ -490,6 +495,7 @@ fn validate_json_shape(value: &serde_json::Value) -> Result<(), String> {
             "kind",
             "rules",
             "property_grants",
+            "required_purpose",
         ],
     )?;
     if let Some(grants) = object.get("property_grants") {

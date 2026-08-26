@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_DEPTH: i32 = 10;
 
+pub type ObjectAllowFn<'a> = dyn Fn(&Object) -> Result<bool, String> + 'a;
+
 #[derive(Debug, Clone, Default)]
 pub struct GraphQuery {
     pub start_id: String,
@@ -31,7 +33,7 @@ pub fn traverse(
     q: &GraphQuery,
     schema: Option<&SchemaRegistry>,
 ) -> Result<GraphResult, String> {
-    traverse_with_policy_context(db, q, schema, None)
+    traverse_with_policy_context(db, q, schema, None, None)
 }
 
 pub fn traverse_with_policy_context(
@@ -39,6 +41,7 @@ pub fn traverse_with_policy_context(
     q: &GraphQuery,
     schema: Option<&SchemaRegistry>,
     policy_context: Option<&PrincipalPolicyContext>,
+    allow: Option<&ObjectAllowFn<'_>>,
 ) -> Result<GraphResult, String> {
     let start_id = if !q.start_id.is_empty() {
         q.start_id.clone()
@@ -100,6 +103,11 @@ pub fn traverse_with_policy_context(
                         None => db.get_object(target)?,
                     };
                     if let Some(obj) = obj {
+                        if let Some(allow) = allow
+                            && !allow(&obj)?
+                        {
+                            continue;
+                        }
                         next.push_back(target.clone());
                         if matches_filters(
                             &obj,

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Require a scoped, expiring purpose authorization for governed reads when an
+  activated object-security policy names `required_purpose`. Missing,
+  incompatible, expired, wrong-actor, stale-activation, or out-of-scope purpose
+  denies before access. Credential admins issue and revoke
+  `sekai.purpose-authorization/v1` through `PutPurposeAuthorization` and
+  `RevokePurposeAuthorization`. SQLite stores the authorizations; PostgreSQL
+  fails closed as unavailable.
 - Apply one compiled object-security read predicate to every public query
   path. Property search, external-id lookup, links, linked objects, traversal,
   and lineage omit hidden rows in storage before counts, pagination, or graph

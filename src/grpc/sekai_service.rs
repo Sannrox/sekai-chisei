@@ -27,7 +27,7 @@ mod semantic_retrieval_lifecycle;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
@@ -903,6 +903,7 @@ fn list_objects_with_marking<F>(
     filter: &domain::ListFilter,
     principals: &[String],
     policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     tenant_context: Option<&RequestEnterpriseContext>,
     resolve: F,
 ) -> Result<(Vec<domain::Object>, i32), Status>
@@ -924,6 +925,7 @@ where
     let mut visible_index = 0usize;
     let mut collected = Vec::new();
     let mut visible_total = 0i32;
+    let mut recorded_purposes = HashSet::new();
     loop {
         let mut scan_filter = filter.clone();
         scan_filter.offset = scan_offset;
@@ -942,6 +944,15 @@ where
         let page_len = page.len() as i32;
         for object in page {
             if !object_passes_marking(db, &object, principals).unwrap_or(false) {
+                continue;
+            }
+            if !purpose_allows_kind(
+                db,
+                &object.namespace,
+                &object.kind,
+                purpose,
+                &mut recorded_purposes,
+            )? {
                 continue;
             }
             if visible_index >= requested_offset && collected.len() < requested_limit {
@@ -5301,6 +5312,57 @@ impl SekaiService for SekaiServiceImpl {
             activation: Some(to_proto_object_security_activation(&activation)),
         }))
     }
+
+    async fn put_purpose_authorization(
+        &self,
+        req: Request<PutPurposeAuthorizationRequest>,
+    ) -> Result<Response<PutPurposeAuthorizationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let authorization = req
+            .into_inner()
+            .authorization
+            .ok_or_else(|| Status::invalid_argument("authorization required"))?;
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &authorization.namespace,
+            true,
+        )?;
+        check_team_namespace(&self.db, &principals, &authorization.namespace, true)?;
+        let mut authorization = from_proto_purpose_authorization(authorization);
+        authorization.created_by = principals.first().cloned().unwrap_or_default();
+        authorization.created_at_ms = now_millis();
+        authorization.revoked_at_ms = 0;
+        authorization.prepare().map_err(Status::invalid_argument)?;
+        let stored = self
+            .db
+            .put_purpose_authorization(&authorization)
+            .map_err(map_purpose_authorization_error)?;
+        Ok(Response::new(PutPurposeAuthorizationResponse {
+            authorization: Some(to_proto_purpose_authorization(&stored)),
+        }))
+    }
+
+    async fn revoke_purpose_authorization(
+        &self,
+        req: Request<RevokePurposeAuthorizationRequest>,
+    ) -> Result<Response<RevokePurposeAuthorizationResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        require_credential_admin(&principals)?;
+        let authorization_id = req.into_inner().authorization_id;
+        let stored = self
+            .db
+            .revoke_purpose_authorization(&authorization_id, now_millis())
+            .map_err(map_purpose_authorization_error)?;
+        Ok(Response::new(RevokePurposeAuthorizationResponse {
+            authorization: Some(to_proto_purpose_authorization(&stored)),
+        }))
+    }
+
     async fn find_by_external_id(
         &self,
         req: Request<FindByExternalIdRequest>,
@@ -5359,7 +5421,8 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
-        let result = self.execute_retrieve_context(&principals, req.into_inner());
+        let purpose = request_purpose_presentation(&req, &principals);
+        let result = self.execute_retrieve_context(&principals, purpose.as_ref(), req.into_inner());
         match result {
             Ok(response) => {
                 if let Some((_, guard)) = receipt_guard.as_mut() {
@@ -5399,6 +5462,7 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
+        let purpose = request_purpose_presentation(&req, &principals);
         let inner = req.into_inner();
         let root = inner
             .root
@@ -5407,6 +5471,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            purpose.as_ref(),
             RetrieveContextRequest {
                 roots: vec![root],
                 relations: inner.relations,
@@ -5494,6 +5559,7 @@ impl SekaiService for SekaiServiceImpl {
         let operation_id = receipt_guard
             .as_ref()
             .map(|(operation_id, _)| operation_id.clone());
+        let purpose = request_purpose_presentation(&req, &principals);
         let inner = req.into_inner();
         let from = inner
             .from
@@ -5506,6 +5572,7 @@ impl SekaiService for SekaiServiceImpl {
             retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
         let retrieved = self.execute_retrieve_context(
             &principals,
+            purpose.as_ref(),
             RetrieveContextRequest {
                 roots: vec![from],
                 relations: inner.relations,
@@ -8136,6 +8203,58 @@ fn map_object_security_error(error: String) -> Status {
     }
 }
 
+fn map_purpose_authorization_error(error: String) -> Status {
+    if error.contains("unavailable") {
+        Status::unavailable("purpose authorization unavailable")
+    } else if error.contains("unsupported")
+        || error.contains("invalid")
+        || error.contains("missing")
+        || error.contains("already revoked")
+    {
+        Status::failed_precondition(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn from_proto_purpose_authorization(
+    authorization: PurposeAuthorization,
+) -> crate::sekai::purpose_authorization::PurposeAuthorization {
+    crate::sekai::purpose_authorization::PurposeAuthorization {
+        contract_version: authorization.contract_version,
+        authorization_id: authorization.authorization_id,
+        actor: authorization.actor,
+        purpose: authorization.purpose,
+        namespace: authorization.namespace,
+        kind: authorization.kind,
+        not_before_ms: authorization.not_before_ms,
+        not_after_ms: authorization.not_after_ms,
+        policy_activation_digest: authorization.policy_activation_digest,
+        created_by: authorization.created_by,
+        created_at_ms: authorization.created_at_ms,
+        revoked_at_ms: authorization.revoked_at_ms,
+    }
+}
+
+fn to_proto_purpose_authorization(
+    authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,
+) -> PurposeAuthorization {
+    PurposeAuthorization {
+        contract_version: authorization.contract_version.clone(),
+        authorization_id: authorization.authorization_id.clone(),
+        actor: authorization.actor.clone(),
+        purpose: authorization.purpose.clone(),
+        namespace: authorization.namespace.clone(),
+        kind: authorization.kind.clone(),
+        not_before_ms: authorization.not_before_ms,
+        not_after_ms: authorization.not_after_ms,
+        policy_activation_digest: authorization.policy_activation_digest.clone(),
+        created_by: authorization.created_by.clone(),
+        created_at_ms: authorization.created_at_ms,
+        revoked_at_ms: authorization.revoked_at_ms,
+    }
+}
+
 fn to_proto_object_security_revision(
     revision: &crate::sekai::object_security::ObjectSecurityPolicyRevision,
 ) -> ObjectSecurityPolicyRevision {
@@ -8215,6 +8334,178 @@ fn principal_policy_context(
     }
     // The community/insecure fallback remains explicit and carries no scopes.
     principal_policy_context_from(&caller_principals(req), None)
+}
+
+fn request_purpose_presentation(
+    req: &Request<impl std::any::Any>,
+    principals: &[String],
+) -> Option<crate::sekai::purpose_authorization::PurposePresentation> {
+    let actor = principals.first()?.clone();
+    let purpose = req
+        .metadata()
+        .get("x-sekai-purpose")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    Some(crate::sekai::purpose_authorization::PurposePresentation { actor, purpose })
+}
+
+fn require_purpose_for_kind(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+    presentation: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    operation_id: &str,
+) -> Result<(), Status> {
+    let decision = purpose_decision_for_kind(db, namespace, kind, presentation, operation_id)?;
+    if decision.decision == markings::MarkingDecision::Deny {
+        return Err(Status::not_found("not found"));
+    }
+    record_purpose_allow(db, presentation, operation_id, &decision)?;
+    Ok(())
+}
+
+fn purpose_allows_kind(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+    presentation: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    recorded: &mut HashSet<(String, String)>,
+) -> Result<bool, Status> {
+    let decision = purpose_decision_for_kind(db, namespace, kind, presentation, "purpose-filter")?;
+    if decision.decision == markings::MarkingDecision::Deny {
+        return Ok(false);
+    }
+    if decision.decision == markings::MarkingDecision::Allow
+        && recorded.insert((namespace.to_string(), kind.to_string()))
+    {
+        record_purpose_allow(
+            db,
+            presentation,
+            &format!("purpose-filter:{namespace}:{kind}"),
+            &decision,
+        )?;
+    }
+    Ok(true)
+}
+
+fn purpose_kind_permitted(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+    presentation: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> Result<bool, Status> {
+    let decision = purpose_decision_for_kind(db, namespace, kind, presentation, "purpose-source")?;
+    Ok(decision.decision != markings::MarkingDecision::Deny)
+}
+
+fn purpose_decision_for_kind(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+    presentation: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    operation_id: &str,
+) -> Result<crate::sekai::purpose_authorization::PurposeDecision, Status> {
+    let policy = match db.active_object_policy(namespace, kind) {
+        Ok(policy) => policy,
+        Err(error) if error.starts_with("object_security_denied") => {
+            return Ok(crate::sekai::purpose_authorization::PurposeDecision {
+                decision: markings::MarkingDecision::Deny,
+                decision_id: format!("purpose:{operation_id}:denied"),
+                required_purpose: String::new(),
+                detail: "object authorization denied".into(),
+            });
+        }
+        Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+    };
+    let Some(policy) = policy else {
+        return Ok(crate::sekai::purpose_authorization::PurposeDecision {
+            decision: markings::MarkingDecision::NotApplicable,
+            decision_id: format!("purpose:{operation_id}:n/a"),
+            required_purpose: String::new(),
+            detail: "kind does not require a purpose".into(),
+        });
+    };
+    let Some(required) = policy.required_purpose.as_deref() else {
+        return Ok(crate::sekai::purpose_authorization::PurposeDecision {
+            decision: markings::MarkingDecision::NotApplicable,
+            decision_id: format!("purpose:{operation_id}:n/a"),
+            required_purpose: String::new(),
+            detail: "kind does not require a purpose".into(),
+        });
+    };
+    let activation = db
+        .get_object_security_activation(namespace)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::unavailable("object authorization unavailable"))?;
+    let activation_digest =
+        crate::sekai::object_security::object_security_activation_digest(&activation)
+            .map_err(Status::internal)?;
+    let authorization = match presentation {
+        Some(presented)
+            if !markings::is_trusted_service_principal(&presented.actor)
+                && !presented.purpose.is_empty() =>
+        {
+            db.find_purpose_authorization(
+                &presented.actor,
+                &presented.purpose,
+                namespace,
+                kind,
+                &activation_digest,
+                now_millis(),
+            )
+            .map_err(|error| {
+                if error.contains("unavailable") {
+                    Status::unavailable("purpose authorization unavailable")
+                } else {
+                    Status::internal(error)
+                }
+            })?
+        }
+        _ => None,
+    };
+    Ok(
+        crate::sekai::purpose_authorization::evaluate_required_purpose(
+            crate::sekai::purpose_authorization::PurposeEvaluation {
+                operation_id,
+                required_purpose: Some(required),
+                presentation,
+                authorization: authorization.as_ref(),
+                namespace,
+                kind,
+                activation_digest: &activation_digest,
+                now_ms: now_millis(),
+            },
+        ),
+    )
+}
+
+fn record_purpose_allow(
+    db: &RuntimeDb,
+    presentation: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    operation_id: &str,
+    decision: &crate::sekai::purpose_authorization::PurposeDecision,
+) -> Result<(), Status> {
+    if decision.decision != markings::MarkingDecision::Allow {
+        return Ok(());
+    }
+    let actor = presentation
+        .map(|presented| presented.actor.as_str())
+        .unwrap_or_default();
+    let mut evidence = HashMap::new();
+    evidence.insert("required_purpose".into(), decision.required_purpose.clone());
+    evidence.insert("detail".into(), decision.detail.clone());
+    record_marking_or_purpose_decision(
+        db,
+        actor,
+        "purpose.read",
+        operation_id,
+        &decision.decision_id,
+        "allowed",
+        evidence,
+    )
 }
 
 fn request_tenant_context(
@@ -10277,6 +10568,7 @@ mod tests {
                     ],
                 }],
                 property_grants: None,
+                required_purpose: None,
             };
             let revision = svc
                 .db
@@ -10302,6 +10594,289 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::NotFound);
             assert_eq!(error.message(), "not found");
         }
+    }
+
+    fn with_named_principal_and_purpose<T>(
+        payload: T,
+        principal: &str,
+        purpose: &str,
+    ) -> Request<T> {
+        let mut req = with_named_principal(payload, principal);
+        req.metadata_mut()
+            .insert("x-sekai-purpose", MetadataValue::try_from(purpose).unwrap());
+        req
+    }
+
+    #[tokio::test]
+    async fn purpose_bound_reads_record_success_and_hide_denials() {
+        let svc = service();
+        let namespace = "purpose-bound";
+        for (id, name) in [("purpose-doc-a", "alpha"), ("purpose-doc-b", "beta")] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: "document".into(),
+                    name: name.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: namespace.into(),
+            kind: "document".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: None,
+            required_purpose: Some("incident-response".into()),
+        };
+        let revision = svc
+            .db
+            .put_object_security_policy(&policy, "root", "put-purpose-bound", 1)
+            .unwrap();
+        let activation = svc
+            .db
+            .activate_object_security_policies(
+                namespace,
+                &BTreeMap::from([("document".into(), revision.revision_digest)]),
+                "root",
+                "activate-purpose-bound",
+                2,
+            )
+            .unwrap();
+        let digest =
+            crate::sekai::object_security::object_security_activation_digest(&activation).unwrap();
+        let now = now_millis();
+        let live = crate::sekai::purpose_authorization::PurposeAuthorization {
+            contract_version: crate::sekai::purpose_authorization::PURPOSE_AUTHORIZATION_VERSION
+                .into(),
+            authorization_id: "pa-live".into(),
+            actor: "alice".into(),
+            purpose: "incident-response".into(),
+            namespace: namespace.into(),
+            kind: "document".into(),
+            not_before_ms: now.saturating_sub(1_000),
+            not_after_ms: now.saturating_add(60_000),
+            policy_activation_digest: digest,
+            created_by: "root".into(),
+            created_at_ms: now,
+            revoked_at_ms: 0,
+        };
+        svc.put_purpose_authorization(with_named_principal(
+            PutPurposeAuthorizationRequest {
+                authorization: Some(to_proto_purpose_authorization(&live)),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let missing = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        assert_eq!(missing.message(), "not found");
+
+        let incompatible = svc
+            .get_object(with_named_principal_and_purpose(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "alice",
+                "analytics",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(incompatible.code(), tonic::Code::NotFound);
+        assert_eq!(incompatible.message(), "not found");
+
+        let other_actor = svc
+            .get_object(with_named_principal_and_purpose(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "bob",
+                "incident-response",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(other_actor.code(), tonic::Code::NotFound);
+
+        let allowed = svc
+            .get_object(with_named_principal_and_purpose(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "alice",
+                "incident-response",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(allowed.id, "purpose-doc-a");
+
+        let decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                actor: Some("alice".into()),
+                action: Some("purpose.read".into()),
+                target_id: Some("get_object:purpose-doc-a".into()),
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, "allowed");
+        assert_eq!(
+            decisions[0]
+                .evidence
+                .get("required_purpose")
+                .map(String::as_str),
+            Some("incident-response")
+        );
+
+        let hidden_list = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hidden_list.total, 0);
+        assert!(hidden_list.objects.is_empty());
+
+        let first_page = svc
+            .list_objects(with_named_principal_and_purpose(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        order_by: "name".into(),
+                        limit: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+                "incident-response",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.objects.len(), 1);
+        assert!(!first_page.next_page_token.is_empty());
+        let list_decisions = svc
+            .db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                actor: Some("alice".into()),
+                action: Some("purpose.read".into()),
+                target_id: Some("purpose-filter:purpose-bound:document".into()),
+                after: 0,
+                limit: 10,
+                offset: 0,
+            })
+            .unwrap();
+        assert_eq!(list_decisions.len(), 1);
+        assert_eq!(list_decisions[0].outcome, "allowed");
+
+        let crossed = svc
+            .list_objects(with_named_principal_and_purpose(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        order_by: "name".into(),
+                        limit: 1,
+                        ..Default::default()
+                    }),
+                    page_token: first_page.next_page_token.clone(),
+                },
+                "alice",
+                "analytics",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(crossed.code(), tonic::Code::FailedPrecondition);
+
+        let second_page = svc
+            .list_objects(with_named_principal_and_purpose(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        order_by: "name".into(),
+                        limit: 1,
+                        ..Default::default()
+                    }),
+                    page_token: first_page.next_page_token,
+                },
+                "alice",
+                "incident-response",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.objects.len(), 1);
+        assert_ne!(first_page.objects[0].id, second_page.objects[0].id);
+
+        svc.revoke_purpose_authorization(with_named_principal(
+            RevokePurposeAuthorizationRequest {
+                authorization_id: live.authorization_id.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let revoked = svc
+            .get_object(with_named_principal_and_purpose(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "alice",
+                "incident-response",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(revoked.code(), tonic::Code::NotFound);
+
+        let trusted = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "purpose-doc-a".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(trusted.id, "purpose-doc-a");
     }
 
     #[tokio::test]
@@ -10423,6 +10998,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            required_purpose: None,
         };
         let revision = svc
             .db
@@ -11128,6 +11704,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            required_purpose: None,
         };
         let owned_component = crate::sekai::object_security::ObjectSecurityPolicy {
             contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
@@ -11142,6 +11719,7 @@ mod tests {
                 ],
             }],
             property_grants: None,
+            required_purpose: None,
         };
         let cluster_revision = svc
             .db
@@ -14901,6 +15479,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            required_purpose: None,
         };
         let revision = svc
             .db

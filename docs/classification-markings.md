@@ -78,6 +78,9 @@ leaking classification details in the RPC error.
    before marking objects or purpose-gating actions that those principals use.
 4. Purpose-gated action types only block callers once `required_purpose` is set
    on the action type definition.
+5. Purpose-bound reads require an activated object-security policy that names
+   `required_purpose` plus a live `sekai.purpose-authorization/v1`. Principal
+   `allowed_purposes` alone are not read authority.
 
 ## Residual risks (v1)
 

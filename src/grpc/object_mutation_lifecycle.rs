@@ -41,6 +41,7 @@ impl SekaiServiceImpl {
         req: Request<GuardedCreateObjectRequest>,
     ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -134,8 +135,12 @@ impl SekaiServiceImpl {
                 crate::sekai::object_security::ObjectSecurityOperation::Create,
                 &format!("guarded_create_object_replay:{}", created.id),
             )?;
-            let created =
-                self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
+            let created = self.resolve_computed_for_response(
+                created,
+                &principals,
+                tenant_context.as_ref(),
+                purpose.as_ref(),
+            )?;
             return Ok(Response::new(GuardedCreateObjectResponse {
                 object: Some(to_proto_obj(&created)),
             }));
@@ -203,8 +208,12 @@ impl SekaiServiceImpl {
             }
             self.security.add_grant(&grant);
         }
-        let created =
-            self.resolve_computed_for_response(created, &principals, tenant_context.as_ref())?;
+        let created = self.resolve_computed_for_response(
+            created,
+            &principals,
+            tenant_context.as_ref(),
+            purpose.as_ref(),
+        )?;
         Ok(Response::new(GuardedCreateObjectResponse {
             object: Some(to_proto_obj(&created)),
         }))
@@ -215,6 +224,7 @@ impl SekaiServiceImpl {
         req: Request<GuardedUpdateObjectRequest>,
     ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
         let principals = caller_principals(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
@@ -346,8 +356,12 @@ impl SekaiServiceImpl {
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object_replay:{}", updated.id),
             )?;
-            let updated =
-                self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
+            let updated = self.resolve_computed_for_response(
+                updated,
+                &principals,
+                tenant_context.as_ref(),
+                purpose.as_ref(),
+            )?;
             return Ok(Response::new(GuardedUpdateObjectResponse {
                 object: Some(to_proto_obj(&updated)),
             }));
@@ -424,8 +438,12 @@ impl SekaiServiceImpl {
                 now_millis(),
             )
             .map_err(map_mutation_persistence_error)?;
-        let updated =
-            self.resolve_computed_for_response(updated, &principals, tenant_context.as_ref())?;
+        let updated = self.resolve_computed_for_response(
+            updated,
+            &principals,
+            tenant_context.as_ref(),
+            purpose.as_ref(),
+        )?;
         Ok(Response::new(GuardedUpdateObjectResponse {
             object: Some(to_proto_obj(&updated)),
         }))

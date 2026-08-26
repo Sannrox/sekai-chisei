@@ -118,7 +118,7 @@ lives in the separate [research index](research/README.md).
 
 - [Object security policy](object-security.md) — immutable policy revisions,
   atomic namespace activation, storage-enforced reads, writes, remaining object
-  consumers, and authority-bound list cursors.
+  consumers, authority-bound list cursors, and purpose-bound reads.
 - [Classification markings](classification-markings.md) — provisional
   markings and purpose constraints.
 - [Compliance export](compliance-export.md) — governed audit and residency

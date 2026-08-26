@@ -351,6 +351,22 @@
       "product_tier": "core"
     },
     {
+      "rpc": "PutPurposeAuthorization",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "RevokePurposeAuthorization",
+      "kind": "persistent",
+      "surfaces": ["sekai.object-security"],
+      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "FindByExternalId",
       "kind": "persistent",
       "surfaces": [

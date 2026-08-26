@@ -4,9 +4,10 @@
 scoped read policy. Operators install canonical JSON through
 `PutObjectSecurityPolicyRevision`, then atomically activate a complete
 kind-to-revision map through `ActivateObjectSecurityPolicies`. Inspection
-RPCs (`GetObjectSecurityPolicyRevision`, `GetObjectSecurityActivation`) use
-the same credential-admin boundary as mutation. The server computes the
-content digest; generic object mutation cannot edit policy state.
+RPCs (`GetObjectSecurityPolicyRevision`, `GetObjectSecurityActivation`,
+`PutPurposeAuthorization`, `RevokePurposeAuthorization`) use the same
+credential-admin boundary as mutation. The server computes the content digest;
+generic object mutation cannot edit policy or purpose-authorization state.
 
 Inactive namespaces preserve existing ACL, team-namespace, and classification
 marking behavior. Activated namespaces fail closed when policy is absent,
@@ -49,7 +50,16 @@ predicate in SQL before a direct row, `FindByExternalId`, `FindByProperty`,
 or lineage expansion is materialized. PostgreSQL parses property documents through `sekai_jsonb_object`, so
 malformed or jsonb-rejected values are indeterminate and denied instead of
 aborting the query. Unauthorized direct reads are returned as absent. Markings
-and existing ACLs remain narrowing layers. Generic object writes reject NUL
+and existing ACLs remain narrowing layers. When an activated policy names
+`required_purpose`, public reads must present a live
+`sekai.purpose-authorization/v1` through `x-sekai-purpose`. The authorization
+is actor-bound, scoped, time-bounded, and pinned to the current activation
+digest; it is not an object grant. Missing, incompatible, expired,
+wrong-actor, stale, or out-of-scope purpose omits the row. List cursors bind
+the presented purpose with the existing authority digest. Credential admins
+issue and revoke authorizations through `PutPurposeAuthorization` and
+`RevokePurposeAuthorization`. SQLite stores them; PostgreSQL fails closed as
+unavailable. Generic object writes reject NUL
 property keys and values so new rows cannot poison PostgreSQL policy casts.
 
 `ListObjects` may span activated and unactivated namespaces. Its storage
