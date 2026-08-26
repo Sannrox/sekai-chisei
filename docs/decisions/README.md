@@ -57,3 +57,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0034: Preserve an immutable provenance chain on imported assertions](0034-cross-site-import-provenance.md)
 - [ADR 0035: Admit signed source webhooks as object-sync transport](0035-source-webhook-transport.md)
 - [ADR 0036: Query registered Iceberg and Parquet snapshots as projections](0036-open-table-projections.md)
+- [ADR 0037: Project typed events with durable stream checkpoints](0037-event-stream-projections.md)

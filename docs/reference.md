@@ -97,6 +97,8 @@ lives in the separate [research index](research/README.md).
   tombstones, retention, and rollback.
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered Iceberg and Parquet snapshots.
+- [Event-stream projections](event-streams.md) — ordered event batches with
+  durable checkpoints.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

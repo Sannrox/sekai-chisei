@@ -468,6 +468,18 @@ impl SekaiDb {
                     snapshot_digest TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     FOREIGN KEY(source_id) REFERENCES sekai_open_table_sources(source_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_event_stream_bindings (
+                    stream_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sekai_event_stream_checkpoints (
+                    stream_id TEXT PRIMARY KEY,
+                    committed_offset INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    FOREIGN KEY(stream_id) REFERENCES sekai_event_stream_bindings(stream_id)
                 );",
             )
             .map_err(|error| error.to_string())?;
