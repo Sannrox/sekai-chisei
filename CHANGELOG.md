@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Preserve an immutable provenance chain from each imported namespace
+  snapshot assertion to signed source evidence. Re-export appends signer,
+  transform, and verification hops without rewriting earlier hops. Hidden,
+  missing, and revoked assertions return the same unavailable result.
+  `sekaictl admin federation show-snapshot-provenance` inspects an authorized
+  chain. SQLite is the reference store; PostgreSQL stays unavailable.
 - Generate a revision-pinned TypeScript ontology client from selected object,
   link, action, and function members of one published definition revision.
   The package embeds the digest and selected names only. Live gRPC

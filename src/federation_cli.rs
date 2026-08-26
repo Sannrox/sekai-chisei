@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>"
+    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>\n  sekaictl admin federation show-snapshot-provenance --import-id <id> --object-id <id>"
 }
 
 pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -43,6 +43,9 @@ pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
             list_snapshot_imports(parse_list_imports(&args[1..])?).await
         }
         Some("show-snapshot-facts") => show_snapshot_facts(parse_show_facts(&args[1..])?).await,
+        Some("show-snapshot-provenance") => {
+            show_snapshot_provenance(parse_show_provenance(&args[1..])?).await
+        }
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -639,6 +642,25 @@ struct ShowFactsConfig {
     import_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct ShowProvenanceConfig {
+    import_id: String,
+    object_id: String,
+}
+
+async fn show_snapshot_provenance(config: ShowProvenanceConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let chain = namespace_snapshot::get_imported_fact_provenance(
+        db.as_ref(),
+        &config.import_id,
+        &config.object_id,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&chain)?);
+    Ok(())
+}
+
 async fn show_snapshot_facts(config: ShowFactsConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let facts = namespace_snapshot::list_snapshot_facts(
@@ -881,6 +903,29 @@ fn parse_show_facts(args: &[String]) -> Result<ShowFactsConfig, String> {
     }
     Ok(ShowFactsConfig {
         import_id: import_id.ok_or("--import-id is required")?,
+    })
+}
+
+fn parse_show_provenance(args: &[String]) -> Result<ShowProvenanceConfig, String> {
+    let mut import_id = None;
+    let mut object_id = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--import-id" => {
+                import_id = Some(require_value(args, i, "--import-id")?);
+                i += 2;
+            }
+            "--object-id" => {
+                object_id = Some(require_value(args, i, "--object-id")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown show-snapshot-provenance option {other}")),
+        }
+    }
+    Ok(ShowProvenanceConfig {
+        import_id: import_id.ok_or("--import-id is required")?,
+        object_id: object_id.ok_or("--object-id is required")?,
     })
 }
 

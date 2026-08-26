@@ -54,3 +54,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0031: Require a scoped purpose authorization for governed reads](0031-purpose-bound-reads.md)
 - [ADR 0032: Evaluate markings against a namespace-local classification lattice](0032-hierarchical-classifications.md)
 - [ADR 0033: Generate revision-pinned TypeScript ontology clients](0033-revision-pinned-typescript-ontology-clients.md)
+- [ADR 0034: Preserve an immutable provenance chain on imported assertions](0034-cross-site-import-provenance.md)

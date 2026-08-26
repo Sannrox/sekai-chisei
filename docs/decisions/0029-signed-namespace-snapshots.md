@@ -55,7 +55,8 @@ authorization.
 Operators can move a signed, inspectable namespace snapshot between two local
 planes without creating a shared transaction or remote control channel.
 Follow-up work may add PostgreSQL parity, gRPC transport, and the later
-conflict, provenance, and revocation Issues that depend on this contract.
+conflict and revocation Issues that depend on this contract. Imported
+assertion provenance is [ADR 0034](0034-cross-site-import-provenance.md).
 
 ## Validation
 
