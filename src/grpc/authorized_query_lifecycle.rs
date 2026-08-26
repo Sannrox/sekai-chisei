@@ -16,6 +16,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let id = req.into_inner().id;
         let obj = self
@@ -51,6 +52,7 @@ impl SekaiServiceImpl {
             }
             Err(status) => return Err(status),
         };
+        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &namespace)?;
         if marking.decision != markings::MarkingDecision::NotApplicable {
             let actor = principals.first().cloned().unwrap_or_default();
             let mut evidence = HashMap::new();
@@ -89,6 +91,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let invoked_capability = req
             .metadata()
@@ -111,9 +114,36 @@ impl SekaiServiceImpl {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let metadata_namespace = req
+            .metadata()
+            .get("x-sekai-namespace")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let inner = req.into_inner();
         let page_token = inner.page_token;
         let mut filter = parse_list_filter(inner.filter.unwrap_or_default())?;
+        if revision_pin.is_some() {
+            if let (Some(filter_namespace), Some(metadata_namespace)) =
+                (filter.namespace.as_deref(), metadata_namespace.as_deref())
+                && filter_namespace != metadata_namespace
+            {
+                return Err(Status::failed_precondition(
+                    "ontology client revision pin is stale",
+                ));
+            }
+            let list_namespace = filter
+                .namespace
+                .clone()
+                .or(metadata_namespace)
+                .unwrap_or_default();
+            enforce_optional_ontology_revision_pin(
+                &self.db,
+                revision_pin.as_deref(),
+                &list_namespace,
+            )?;
+        }
         if tenant_context.is_some() {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
@@ -311,6 +341,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let external_id = req.into_inner().external_id;
         let candidates = self
@@ -339,6 +370,11 @@ impl SekaiServiceImpl {
                 continue;
             };
             let namespace = obj.namespace.clone();
+            if enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &namespace)
+                .is_err()
+            {
+                continue;
+            }
             if !purpose_allows_kind(
                 &self.db,
                 &namespace,
@@ -416,6 +452,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
@@ -448,13 +485,20 @@ impl SekaiServiceImpl {
                 object,
                 &principals,
                 tenant_context.as_ref(),
-            ) && purpose_allows_kind(
+            ) && enforce_optional_ontology_revision_pin(
                 &self.db,
+                revision_pin.as_deref(),
                 &object.namespace,
-                &object.kind,
-                purpose.as_ref(),
-                &mut recorded_purposes,
-            )? {
+            )
+            .is_ok()
+                && purpose_allows_kind(
+                    &self.db,
+                    &object.namespace,
+                    &object.kind,
+                    purpose.as_ref(),
+                    &mut recorded_purposes,
+                )?
+            {
                 visible.push(object.clone());
             }
         }
@@ -478,6 +522,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
@@ -501,6 +546,7 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             &format!("get_links:{}", r.object_id),
         )?;
+        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -552,6 +598,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
@@ -574,6 +621,7 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             &format!("get_linked_objects:{}", r.object_id),
         )?;
+        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -621,6 +669,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let q = req
             .into_inner()
@@ -681,6 +730,11 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &start_operation,
+        )?;
+        enforce_optional_ontology_revision_pin(
+            &self.db,
+            revision_pin.as_deref(),
+            &start.namespace,
         )?;
         gq.start_id = start.id.clone();
         gq.start_external_id.clear();
@@ -798,6 +852,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
+        let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
         let r = req.into_inner();
         let root = self
@@ -820,6 +875,7 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             &format!("get_lineage:{}", r.object_id),
         )?;
+        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let mut res = self
             .db
             .get_lineage_with_policy_context(&root.id, r.max_nodes as usize, &policy_context)

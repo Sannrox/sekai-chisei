@@ -217,6 +217,12 @@ fn added_member_reason(change: &DefinitionMemberChange) -> DefinitionCompatibili
             "added_action_type",
             "",
         ),
+        "function" => reason(
+            DefinitionCompatibilityClass::Conditional,
+            change,
+            "added_function",
+            "",
+        ),
         "control" => reason(
             DefinitionCompatibilityClass::Conditional,
             change,

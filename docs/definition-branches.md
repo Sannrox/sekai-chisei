@@ -86,9 +86,10 @@ Classification vocabulary:
   `interface_type`, `ontology_class`, `ontology_relation`, or `link_type`
   members. Removing a required constraint without removing the property is
   compatible.
-- `conditional`: new `action_type` or `control` members, `access_marking`
-  changes, and known field changes such as `name` or `mode`. These require
-  live authorization or review before effect; they are not silent success.
+- `conditional`: new `action_type`, `function`, or `control` members,
+  `access_marking` changes, and known field changes such as `name` or `mode`.
+  These require live authorization or review before effect; they are not
+  silent success.
 - `breaking`: removed members, removed properties, and newly required
   properties. Breaking changes need an approved migration path before facts
   can follow the candidate.
@@ -110,6 +111,7 @@ member kinds:
 - `ontology_relation`
 - `link_type`
 - `action_type`
+- `function`
 - `control`
 
 Member identity binds the contract version, namespace, member kind, stable
