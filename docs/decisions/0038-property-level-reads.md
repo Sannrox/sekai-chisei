@@ -9,7 +9,8 @@
 - Superseded by: none
 - Related: [ADR 0027](0027-explicit-property-grants.md),
   [ADR 0030](0030-row-scoped-query-access.md),
-  [ADR 0044](0044-governed-geospatial-queries.md)
+  [ADR 0044](0044-governed-geospatial-queries.md),
+  [ADR 0049](0049-value-instance-access.md)
 
 ## Context
 
@@ -49,7 +50,7 @@ ADR 0027 already owns the grant. Projecting inside
 ## Consequences
 
 Operators who want property hiding install a policy revision that includes
-`property_grants`. Value-instance access remains #695.
+`property_grants`. Value-instance access is recorded in ADR 0049.
 
 ## Validation
 
