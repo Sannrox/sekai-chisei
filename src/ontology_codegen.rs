@@ -1,9 +1,9 @@
-//! Revision-pinned TypeScript ontology client codegen (#694).
+//! Revision-pinned TypeScript and Python ontology client codegen (#694, #698).
 //!
-//! Generates a typed TypeScript package from a **selected** subset of one
-//! published definition revision. The package embeds the revision digest and
-//! selected member identities. It never embeds credentials. Live gRPC
-//! invocation reauthorizes; discovery and generation are not grants.
+//! Generates a typed client from a **selected** subset of one published
+//! definition revision. The package embeds the revision digest and selected
+//! member identities. It never embeds credentials. Live gRPC invocation
+//! reauthorizes; discovery and generation are not grants.
 
 use crate::sekai::definition_branch::{DefinitionMember, DefinitionRevision};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,30 @@ const RESERVED_TS_NAMES: &[&str] = &[
     "invoke",
     "nativeMetadata",
     "scopeAllows",
+];
+
+const RESERVED_PY_NAMES: &[&str] = &[
+    "ALLOWED_MEMBERS",
+    "GENERATED_CONTRACT_VERSION",
+    "GENERATED_NAMESPACE",
+    "GENERATED_REVISION_DIGEST",
+    "NotRequired",
+    "OntologyInvocation",
+    "OntologyType",
+    "ScopedOntologyClient",
+    "TypedDict",
+    "ValueError",
+    "bind_live_revision",
+    "invoke",
+    "native_metadata",
+    "scope_allows",
+];
+
+const PYTHON_KEYWORDS: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "case", "class",
+    "continue", "def", "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
+    "import", "in", "is", "lambda", "match", "nonlocal", "not", "or", "pass", "raise", "return",
+    "try", "type", "while", "with", "yield",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,6 +96,13 @@ pub struct OntologyClientScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedOntologyClient {
     pub typescript: String,
+    pub scope: OntologyClientScope,
+    pub package_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedOntologyPythonClient {
+    pub python: String,
     pub scope: OntologyClientScope,
     pub package_digest: String,
 }
@@ -142,6 +173,17 @@ pub fn verify_ontology_client_package(
     Ok(())
 }
 
+pub fn verify_ontology_python_client_package(
+    package: &GeneratedOntologyPythonClient,
+    expected_digest: &str,
+) -> Result<(), OntologyCodegenError> {
+    let computed = python_package_digest(&package.python, &package.scope)?;
+    if computed != expected_digest || package.package_digest != expected_digest {
+        return Err(OntologyCodegenError::TamperedPackage);
+    }
+    Ok(())
+}
+
 /// Generate a TypeScript ontology client from one published revision and an
 /// explicit member selection. Failures do not disclose other catalog members.
 pub fn generate_ontology_typescript_client(
@@ -149,6 +191,42 @@ pub fn generate_ontology_typescript_client(
     members: &[DefinitionMember],
     selection: &OntologyClientSelection,
 ) -> Result<GeneratedOntologyClient, OntologyCodegenError> {
+    let (selected, scope) =
+        select_rendered_members(revision, members, selection, RESERVED_TS_NAMES, false)?;
+    let typescript = render_typescript(&selected, &scope);
+    let digest = package_digest(&typescript, &scope)?;
+    Ok(GeneratedOntologyClient {
+        typescript,
+        scope,
+        package_digest: digest,
+    })
+}
+
+/// Generate a Python ontology client from the same selection contract as
+/// TypeScript. Failures do not disclose other catalog members.
+pub fn generate_ontology_python_client(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+) -> Result<GeneratedOntologyPythonClient, OntologyCodegenError> {
+    let (selected, scope) =
+        select_rendered_members(revision, members, selection, RESERVED_PY_NAMES, true)?;
+    let python = render_python(&selected, &scope)?;
+    let digest = python_package_digest(&python, &scope)?;
+    Ok(GeneratedOntologyPythonClient {
+        python,
+        scope,
+        package_digest: digest,
+    })
+}
+
+fn select_rendered_members(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+    reserved_names: &[&str],
+    snake_methods: bool,
+) -> Result<(Vec<RenderedMember>, OntologyClientScope), OntologyCodegenError> {
     validate_context(selection)?;
     if selection.members.is_empty() {
         return Err(OntologyCodegenError::EmptySelection);
@@ -218,9 +296,13 @@ pub fn generate_ontology_typescript_client(
         if !is_metadata_safe(&member.member_kind) || !is_metadata_safe(&member.member_id) {
             return Err(OntologyCodegenError::UnsupportedProtocol);
         }
-        let rendered = render_member_types(member)?;
-        if RESERVED_TS_NAMES.contains(&rendered.type_name.as_str())
-            || RESERVED_TS_NAMES.contains(&rendered.method_name.as_str())
+        let mut rendered = render_member_types(member)?;
+        if snake_methods {
+            rendered.type_name = sanitize_py_type_name(&member.member_id);
+            rendered.method_name = sanitize_py_method_name(&member.member_id);
+        }
+        if reserved_names.contains(&rendered.type_name.as_str())
+            || reserved_names.contains(&rendered.method_name.as_str())
             || !type_names.insert(rendered.type_name.clone())
             || !method_names.insert(rendered.method_name.clone())
         {
@@ -235,13 +317,7 @@ pub fn generate_ontology_typescript_client(
         revision_digest: revision.revision_digest.clone(),
         selected_members: selection.members.clone(),
     };
-    let typescript = render_typescript(&selected, &scope);
-    let digest = package_digest(&typescript, &scope)?;
-    Ok(GeneratedOntologyClient {
-        typescript,
-        scope,
-        package_digest: digest,
-    })
+    Ok((selected, scope))
 }
 
 fn validate_context(selection: &OntologyClientSelection) -> Result<(), OntologyCodegenError> {
@@ -519,6 +595,202 @@ fn render_interface(member: &RenderedMember) -> String {
     format!("export interface {} {{\n{}}}\n\n", member.type_name, body)
 }
 
+fn render_python(
+    selected: &[RenderedMember],
+    scope: &OntologyClientScope,
+) -> Result<String, OntologyCodegenError> {
+    let mut classes = String::new();
+    let mut methods = String::new();
+    for member in selected {
+        classes.push_str(&render_typed_dict(member)?);
+        methods.push_str(&format!(
+            r#"
+    def {method}(self, operation_id: str, input: {type_name}) -> OntologyInvocation:
+        return invoke({kind}, {id}, operation_id, input)
+"#,
+            method = member.method_name,
+            type_name = member.type_name,
+            kind = js_string(&member.member_kind),
+            id = js_string(&member.member_id),
+        ));
+    }
+
+    let allowed = selected
+        .iter()
+        .map(|member| {
+            js_string(
+                &OntologyClientMemberRef::new(&member.member_kind, &member.member_id).scope_token(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let rendered = format!(
+        r#"# Generated by sekai-chisei ontology codegen. DO NOT EDIT.
+# contract_version={contract_version}
+# namespace={namespace}
+# revision_digest={revision_digest}
+
+from __future__ import annotations
+
+from typing import NotRequired, TypedDict
+
+GENERATED_CONTRACT_VERSION = {contract_version}
+GENERATED_NAMESPACE = {namespace}
+GENERATED_REVISION_DIGEST = {revision_digest}
+ALLOWED_MEMBERS = [{allowed}]
+
+{classes}class OntologyInvocation(TypedDict):
+    contract_version: str
+    namespace: str
+    revision_digest: str
+    member_kind: str
+    member_id: str
+    operation_id: str
+    input: dict[str, object]
+
+
+def scope_allows(member_kind: str, member_id: str) -> bool:
+    return f"{{member_kind}}:{{member_id}}" in ALLOWED_MEMBERS
+
+
+def bind_live_revision(live_revision_digest: str) -> None:
+    if live_revision_digest != GENERATED_REVISION_DIGEST:
+        raise ValueError("ontology client revision pin is stale")
+
+
+def invoke(member_kind: str, member_id: str, operation_id: str, input: object) -> OntologyInvocation:
+    if not scope_allows(member_kind, member_id):
+        raise ValueError("member is not in generated scope")
+    if not operation_id.strip():
+        raise ValueError("operation_id required")
+    payload = dict(input) if isinstance(input, dict) else {{}}
+    return {{
+        "contract_version": GENERATED_CONTRACT_VERSION,
+        "namespace": GENERATED_NAMESPACE,
+        "revision_digest": GENERATED_REVISION_DIGEST,
+        "member_kind": member_kind,
+        "member_id": member_id,
+        "operation_id": operation_id,
+        "input": payload,
+    }}
+
+
+def native_metadata(call: OntologyInvocation) -> dict[str, str]:
+    if not scope_allows(call["member_kind"], call["member_id"]):
+        raise ValueError("member is not in generated scope")
+    if (
+        call["namespace"] != GENERATED_NAMESPACE
+        or call["revision_digest"] != GENERATED_REVISION_DIGEST
+        or call["contract_version"] != GENERATED_CONTRACT_VERSION
+    ):
+        raise ValueError("invocation context does not match generated scope")
+    if not call["operation_id"].strip():
+        raise ValueError("operation_id required")
+    return {{
+        "x-sekai-namespace": call["namespace"],
+        "x-sekai-definition-revision": call["revision_digest"],
+        "x-sekai-member-kind": call["member_kind"],
+        "x-sekai-member-id": call["member_id"],
+        "x-sekai-operation-id": call["operation_id"],
+    }}
+
+
+class ScopedOntologyClient:
+{methods}"#,
+        contract_version = js_string(&scope.contract_version),
+        namespace = js_string(&scope.namespace),
+        revision_digest = js_string(&scope.revision_digest),
+        allowed = allowed,
+        classes = classes,
+        methods = methods,
+    );
+    Ok(rendered)
+}
+
+fn render_typed_dict(member: &RenderedMember) -> Result<String, OntologyCodegenError> {
+    if member.fields.is_empty() {
+        return Ok(format!(
+            "class {}(TypedDict):\n    pass\n\n",
+            member.type_name
+        ));
+    }
+    if member
+        .fields
+        .iter()
+        .any(|field| !is_safe_py_identifier(&field.name))
+    {
+        let mut entries = String::new();
+        for field in &member.fields {
+            let annotation = if field.required {
+                python_type(&field.ts_type)
+            } else {
+                format!("NotRequired[{}]", python_type(&field.ts_type))
+            };
+            entries.push_str(&format!(
+                "    {}: {},\n",
+                js_string(&field.name),
+                annotation
+            ));
+        }
+        return Ok(format!(
+            "{} = TypedDict({}, {{\n{}}})\n\n",
+            member.type_name,
+            js_string(&member.type_name),
+            entries
+        ));
+    }
+    let mut body = String::new();
+    for field in &member.fields {
+        let annotation = if field.required {
+            python_type(&field.ts_type)
+        } else {
+            format!("NotRequired[{}]", python_type(&field.ts_type))
+        };
+        body.push_str(&format!("    {}: {}\n", field.name, annotation));
+    }
+    Ok(format!(
+        "class {}(TypedDict):\n{}\n",
+        member.type_name, body
+    ))
+}
+
+fn python_type(ts_type: &str) -> String {
+    match ts_type {
+        "string" => "str".into(),
+        "number" => "float".into(),
+        "boolean" => "bool".into(),
+        "unknown[]" => "list[object]".into(),
+        "Record<string, unknown>" => "dict[str, object]".into(),
+        "unknown" => "object".into(),
+        _ => "object".into(),
+    }
+}
+
+fn python_package_digest(
+    python: &str,
+    scope: &OntologyClientScope,
+) -> Result<String, OntologyCodegenError> {
+    #[derive(Serialize)]
+    struct PackageIdentity<'a> {
+        contract_version: &'a str,
+        python: &'a str,
+        scope: &'a OntologyClientScope,
+    }
+    let canonical = crate::shomei::canonical_json_with_finite_numbers(&PackageIdentity {
+        contract_version: GENERATOR_CONTRACT_VERSION,
+        python,
+        scope,
+    })
+    .map_err(|_| OntologyCodegenError::UnsupportedProtocol)?;
+    let mut hasher = Sha256::new();
+    hasher.update(GENERATOR_CONTRACT_VERSION.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(b"ontology_client_python_package\n");
+    hasher.update(canonical);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
 fn package_digest(
     typescript: &str,
     scope: &OntologyClientScope,
@@ -554,6 +826,64 @@ fn sanitize_type_name(name: &str) -> String {
     } else {
         camel
     }
+}
+
+fn sanitize_py_type_name(name: &str) -> String {
+    let mut type_name = sanitize_type_name(name);
+    if PYTHON_KEYWORDS.contains(&type_name.as_str()) {
+        type_name = format!("Ontology{type_name}");
+    }
+    type_name
+}
+
+fn sanitize_py_method_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_underscore = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() && !previous_underscore && !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+            previous_underscore = false;
+        } else if !previous_underscore && !out.is_empty() {
+            out.push('_');
+            previous_underscore = true;
+        }
+    }
+    if out.is_empty() {
+        out = "member".into();
+    }
+    if out.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        out = format!("n{out}");
+    }
+    if PYTHON_KEYWORDS.contains(&out.as_str()) || out == "self" {
+        out = format!("member_{out}");
+    }
+    out
+}
+
+fn is_safe_py_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return false;
+    }
+    if PYTHON_KEYWORDS.contains(&name) || name == "self" {
+        return false;
+    }
+    // Class-body names starting with `__` and not ending with `__` are
+    // mangled (`__etag` becomes `_Ticket__etag`). Keep those keys on the
+    // wire via functional TypedDict syntax.
+    if name.starts_with("__") && !name.ends_with("__") {
+        return false;
+    }
+    true
 }
 
 fn sanitize_method_name(name: &str) -> String {
@@ -766,6 +1096,84 @@ mod tests {
     }
 
     #[test]
+    fn generates_stable_python_with_typescript_scope_parity() {
+        let (revision, members) = fixture_catalog();
+        let selection = selected(
+            &revision,
+            [
+                OntologyClientMemberRef::new("object_type", "Ticket"),
+                OntologyClientMemberRef::new("link_type", "AssignedTo"),
+                OntologyClientMemberRef::new("action_type", "Assign"),
+                OntologyClientMemberRef::new("function", "CountOpen"),
+            ],
+        );
+        let typescript =
+            generate_ontology_typescript_client(&revision, &members, &selection).unwrap();
+        let python = generate_ontology_python_client(&revision, &members, &selection).unwrap();
+        verify_ontology_python_client_package(&python, &python.package_digest).unwrap();
+        assert_eq!(python.scope, typescript.scope);
+        assert!(scope_allows(&python.scope, "object_type", "Ticket"));
+        assert!(!scope_allows(&python.scope, "object_type", "Hidden"));
+        assert!(python.python.contains("class Ticket(TypedDict)"));
+        assert!(python.python.contains("def count_open("));
+        assert!(!python.python.contains("Hidden"));
+        assert!(!python.python.contains("credential"));
+        assert!(!python.python.contains("token"));
+
+        let golden = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ontology_codegen/scoped_client.v1.py");
+        let expected = std::fs::read_to_string(&golden).expect("golden python fixture");
+        assert_eq!(
+            python.python, expected,
+            "generated python client drifted from golden fixture"
+        );
+    }
+
+    #[test]
+    fn python_shares_typescript_fail_closed_errors() {
+        let (revision, members) = fixture_catalog();
+        let missing = selected(
+            &revision,
+            [OntologyClientMemberRef::new("object_type", "Missing")],
+        );
+        let ts_err =
+            generate_ontology_typescript_client(&revision, &members, &missing).unwrap_err();
+        let py_err = generate_ontology_python_client(&revision, &members, &missing).unwrap_err();
+        assert!(matches!(ts_err, OntologyCodegenError::UnknownMember));
+        assert!(matches!(py_err, OntologyCodegenError::UnknownMember));
+        assert_eq!(ts_err.to_string(), py_err.to_string());
+        assert!(!py_err.to_string().contains("Hidden"));
+        assert!(!py_err.to_string().contains("Ticket"));
+    }
+
+    #[test]
+    fn golden_python_package_compiles_when_python_is_available() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ontology_codegen/scoped_client.v1.py");
+        let checked = Command::new("python3")
+            .args([
+                "-c",
+                "import pathlib,sys; p=pathlib.Path(sys.argv[1]); compile(p.read_text(), str(p), 'exec')",
+                fixture.to_str().expect("utf-8 fixture path"),
+            ])
+            .output();
+        let Ok(checked) = checked else {
+            return;
+        };
+        if !checked.status.success()
+            && String::from_utf8_lossy(&checked.stderr).contains("No such file")
+        {
+            return;
+        }
+        assert!(
+            checked.status.success(),
+            "golden Python package failed to compile: {}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    #[test]
     fn golden_package_typechecks_when_tsc_is_available() {
         let fixture_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ontology_codegen");
@@ -801,6 +1209,10 @@ mod tests {
             Err(OntologyCodegenError::RevisionPinMismatch)
         ));
         assert!(matches!(
+            generate_ontology_python_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::RevisionPinMismatch)
+        ));
+        assert!(matches!(
             bind_live_revision(
                 &OntologyClientScope {
                     contract_version: GENERATOR_CONTRACT_VERSION.into(),
@@ -817,20 +1229,20 @@ mod tests {
     #[test]
     fn unknown_and_hidden_members_fail_without_catalog_disclosure() {
         let (revision, members) = fixture_catalog();
-        let err = generate_ontology_typescript_client(
+        let selection = selected(
             &revision,
-            &members,
-            &selected(
-                &revision,
-                [OntologyClientMemberRef::new("object_type", "Missing")],
-            ),
-        )
-        .unwrap_err();
-        assert!(matches!(err, OntologyCodegenError::UnknownMember));
-        let message = err.to_string();
-        assert!(!message.contains("Hidden"));
-        assert!(!message.contains("Ticket"));
-        assert!(!message.contains(&revision.members[0].member_id));
+            [OntologyClientMemberRef::new("object_type", "Missing")],
+        );
+        for err in [
+            generate_ontology_typescript_client(&revision, &members, &selection).unwrap_err(),
+            generate_ontology_python_client(&revision, &members, &selection).unwrap_err(),
+        ] {
+            assert!(matches!(err, OntologyCodegenError::UnknownMember));
+            let message = err.to_string();
+            assert!(!message.contains("Hidden"));
+            assert!(!message.contains("Ticket"));
+            assert!(!message.contains(&revision.members[0].member_id));
+        }
     }
 
     #[test]
@@ -848,23 +1260,28 @@ mod tests {
             "Ticket",
         )]));
         let err = generate_ontology_typescript_client(&revision, &members, &selection).unwrap_err();
+        let py_err = generate_ontology_python_client(&revision, &members, &selection).unwrap_err();
         assert!(matches!(err, OntologyCodegenError::ExcessiveScope));
+        assert!(matches!(py_err, OntologyCodegenError::ExcessiveScope));
+        assert_eq!(err.to_string(), py_err.to_string());
         assert!(!err.to_string().contains("Hidden"));
+        assert!(!py_err.to_string().contains("Hidden"));
     }
 
     #[test]
     fn unpublished_revision_fails_closed() {
         let (mut revision, members) = fixture_catalog();
         revision.published = false;
+        let selection = selected(
+            &revision,
+            [OntologyClientMemberRef::new("object_type", "Ticket")],
+        );
         assert!(matches!(
-            generate_ontology_typescript_client(
-                &revision,
-                &members,
-                &selected(
-                    &revision,
-                    [OntologyClientMemberRef::new("object_type", "Ticket")]
-                )
-            ),
+            generate_ontology_typescript_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::UnpublishedRevision)
+        ));
+        assert!(matches!(
+            generate_ontology_python_client(&revision, &members, &selection),
             Err(OntologyCodegenError::UnpublishedRevision)
         ));
     }
@@ -894,13 +1311,40 @@ mod tests {
             verify_ontology_client_package(&generated, &expected),
             Err(OntologyCodegenError::TamperedPackage)
         ));
+
+        let mut python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        let python_expected = python.package_digest.clone();
+        python.python.push_str("\nleaked = True\n");
+        assert!(matches!(
+            verify_ontology_python_client_package(&python, &python_expected),
+            Err(OntologyCodegenError::TamperedPackage)
+        ));
+        python.package_digest = python_package_digest(&python.python, &python.scope).unwrap();
+        assert!(matches!(
+            verify_ontology_python_client_package(&python, &python_expected),
+            Err(OntologyCodegenError::TamperedPackage)
+        ));
+        assert_ne!(expected, python_expected);
     }
 
     #[test]
     fn empty_selection_fails_closed() {
         let (revision, members) = fixture_catalog();
+        let selection = selected(&revision, []);
         assert!(matches!(
-            generate_ontology_typescript_client(&revision, &members, &selected(&revision, [])),
+            generate_ontology_typescript_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::EmptySelection)
+        ));
+        assert!(matches!(
+            generate_ontology_python_client(&revision, &members, &selection),
             Err(OntologyCodegenError::EmptySelection)
         ));
     }
@@ -923,6 +1367,17 @@ mod tests {
         .unwrap();
         assert!(generated.typescript.contains("export interface Ticket"));
         assert!(!generated.typescript.contains("Hidden"));
+        let python = generate_ontology_python_client(
+            &revision,
+            &selected_only,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("class Ticket(TypedDict)"));
+        assert!(!python.python.contains("Hidden"));
     }
 
     #[test]
@@ -943,6 +1398,17 @@ mod tests {
         .unwrap();
         assert!(generated.typescript.contains("  title: unknown;"));
         assert!(!generated.typescript.contains("title?:"));
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("    title: object"));
+        assert!(!python.python.contains("title: NotRequired"));
     }
 
     #[test]
@@ -965,21 +1431,192 @@ mod tests {
         assert!(generated.typescript.contains("  URL?: string;"));
         assert!(!generated.typescript.contains("fooBar"));
         assert!(!generated.typescript.contains("uRL"));
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("\"foo-bar\": str"));
+        assert!(python.python.contains("\"URL\": NotRequired[str]"));
+        assert!(!python.python.contains("fooBar"));
+        assert!(!python.python.contains("uRL"));
+    }
+
+    #[test]
+    fn python_digit_member_ids_emit_valid_identifiers() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "123Ticket",
+            r#"{"name":"123Ticket","properties":{"title":{"type":"string"}}}"#,
+        )]);
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "123Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("class n123Ticket(TypedDict)"));
+        assert!(
+            python
+                .python
+                .contains("def n123_ticket(self, operation_id: str, input: n123Ticket)")
+        );
+        assert!(!python.python.contains("def 123"));
+    }
+
+    #[test]
+    fn python_keyword_property_keys_use_functional_typed_dict() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":{"for":{"type":"string"},"async":{"type":"boolean"}},"required":["for"]}"#,
+        )]);
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("Ticket = TypedDict(\"Ticket\""));
+        assert!(python.python.contains("\"for\": str"));
+        assert!(python.python.contains("\"async\": NotRequired[bool]"));
+        assert!(!python.python.contains("    for: str"));
+        assert!(!python.python.contains("    async: "));
+    }
+
+    #[test]
+    fn python_keyword_type_names_are_prefixed() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "None",
+            r#"{"name":"None","properties":{"title":{"type":"string"}}}"#,
+        )]);
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "None")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("class OntologyNone(TypedDict)"));
+        assert!(
+            python
+                .python
+                .contains("def none(self, operation_id: str, input: OntologyNone)")
+        );
+        assert!(!python.python.contains("class None("));
+    }
+
+    #[test]
+    fn python_reserved_typing_names_fail_closed() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "TypedDict",
+            r#"{"name":"TypedDict"}"#,
+        )]);
+        assert!(matches!(
+            generate_ontology_python_client(
+                &revision,
+                &members,
+                &selected(
+                    &revision,
+                    [OntologyClientMemberRef::new("object_type", "TypedDict")]
+                )
+            ),
+            Err(OntologyCodegenError::InvalidDefinition)
+        ));
+        let (revision, members) = published(&[member(
+            "object_type",
+            "ValueError",
+            r#"{"name":"ValueError"}"#,
+        )]);
+        assert!(matches!(
+            generate_ontology_python_client(
+                &revision,
+                &members,
+                &selected(
+                    &revision,
+                    [OntologyClientMemberRef::new("object_type", "ValueError")]
+                )
+            ),
+            Err(OntologyCodegenError::InvalidDefinition)
+        ));
+    }
+
+    #[test]
+    fn python_dunder_property_keys_use_functional_typed_dict() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":{"__meta":{"type":"string"}},"required":["__meta"]}"#,
+        )]);
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "Ticket")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("Ticket = TypedDict(\"Ticket\""));
+        assert!(python.python.contains("\"__meta\": str"));
+        assert!(!python.python.contains("    __meta: str"));
+    }
+
+    #[test]
+    fn python_keyword_member_ids_prefix_methods() {
+        let (revision, members) = published(&[member(
+            "object_type",
+            "if",
+            r#"{"name":"if","properties":{"title":{"type":"string"}}}"#,
+        )]);
+        let python = generate_ontology_python_client(
+            &revision,
+            &members,
+            &selected(
+                &revision,
+                [OntologyClientMemberRef::new("object_type", "if")],
+            ),
+        )
+        .unwrap();
+        assert!(python.python.contains("class If(TypedDict)"));
+        assert!(
+            python
+                .python
+                .contains("def member_if(self, operation_id: str, input: If)")
+        );
+        assert!(python.python.contains("invoke(\"object_type\", \"if\""));
+        assert!(!python.python.contains("    def if("));
     }
 
     #[test]
     fn non_ascii_identities_fail_closed() {
         let cafe = member("object_type", "Café", r#"{"name":"Cafe"}"#);
         let (revision, members) = published(&[cafe]);
+        let selection = selected(
+            &revision,
+            [OntologyClientMemberRef::new("object_type", "Café")],
+        );
         assert!(matches!(
-            generate_ontology_typescript_client(
-                &revision,
-                &members,
-                &selected(
-                    &revision,
-                    [OntologyClientMemberRef::new("object_type", "Café")]
-                )
-            ),
+            generate_ontology_typescript_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::InvalidContext(_))
+                | Err(OntologyCodegenError::UnsupportedProtocol)
+        ));
+        assert!(matches!(
+            generate_ontology_python_client(&revision, &members, &selection),
             Err(OntologyCodegenError::InvalidContext(_))
                 | Err(OntologyCodegenError::UnsupportedProtocol)
         ));
@@ -992,15 +1629,35 @@ mod tests {
             "OntologyInvocation",
             r#"{"name":"OntologyInvocation"}"#,
         )]);
+        let selection = selected(
+            &revision,
+            [OntologyClientMemberRef::new(
+                "object_type",
+                "OntologyInvocation",
+            )],
+        );
         assert!(matches!(
-            generate_ontology_typescript_client(
+            generate_ontology_typescript_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::InvalidDefinition)
+        ));
+        assert!(matches!(
+            generate_ontology_python_client(&revision, &members, &selection),
+            Err(OntologyCodegenError::InvalidDefinition)
+        ));
+        let (revision, members) = published(&[member(
+            "object_type",
+            "native_metadata",
+            r#"{"name":"native_metadata"}"#,
+        )]);
+        assert!(matches!(
+            generate_ontology_python_client(
                 &revision,
                 &members,
                 &selected(
                     &revision,
                     [OntologyClientMemberRef::new(
                         "object_type",
-                        "OntologyInvocation"
+                        "native_metadata"
                     )]
                 )
             ),
@@ -1018,6 +1675,17 @@ mod tests {
         let (revision, members) = published(&[control]);
         assert!(matches!(
             generate_ontology_typescript_client(
+                &revision,
+                &members,
+                &selected(
+                    &revision,
+                    [OntologyClientMemberRef::new("control", "retention")]
+                )
+            ),
+            Err(OntologyCodegenError::UnsupportedMemberKind)
+        ));
+        assert!(matches!(
+            generate_ontology_python_client(
                 &revision,
                 &members,
                 &selected(

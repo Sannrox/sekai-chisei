@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Generate a revision-pinned Python ontology client from the same selected
+  object, link, action, and function members as the TypeScript contract.
+  Shared selection, scope, and fail-closed errors stay identical. The
+  package embeds the digest and selected names only. Live gRPC
+  reauthorization remains the grant. Language-specific package identity
+  rejects a tampered Python payload. `tests/fixtures/ontology_codegen/scoped_client.v1.py`
+  is the golden. This adds no storage schema.
 - Govern documents as first-class objects with digest-bound content
   references and derived renditions. Admission, extraction provenance,
   bounded retrieval, hold, expiry, and deletion are namespace-scoped and
@@ -38,6 +45,12 @@
   missing, and revoked assertions return the same unavailable result.
   `sekaictl admin federation show-snapshot-provenance` inspects an authorized
   chain. SQLite is the reference store; PostgreSQL stays unavailable.
+- Generate a revision-pinned Python ontology client from the same selected
+  object, link, action, and function members as the TypeScript contract.
+  Shared fixtures prove names, types, errors, scopes, and package identity.
+  Live gRPC reauthorization remains the grant. Empty selection, unknown
+  members, stale pins, tampered packages, and excessive scope fail without
+  catalog disclosure. Published property keys are preserved.
 - Generate a revision-pinned TypeScript ontology client from selected object,
   link, action, and function members of one published definition revision.
   The package embeds the digest and selected names only. Live gRPC
