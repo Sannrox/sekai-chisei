@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use crate::sekai::federation_conflict;
 use crate::sekai::federation_profile::{
     self, JoinPeerRequest, LocalSiteIdentity, PeerHealth, PolicyPackPin, TRUST_ROOT_NAMESPACE,
 };
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>\n  sekaictl admin federation show-snapshot-provenance --import-id <id> --object-id <id>"
+    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>\n  sekaictl admin federation show-snapshot-provenance --import-id <id> --object-id <id>\n  sekaictl admin federation list-conflicts [--namespace <ns>]\n  sekaictl admin federation show-conflict --namespace <ns> --object-id <id>\n  sekaictl admin federation resolve-conflict --namespace <ns> --object-id <id> --claim-id <id> [--actor <principal>]\n  sekaictl admin federation reopen-conflict --namespace <ns> --object-id <id> [--actor <principal>]"
 }
 
 pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -46,6 +47,10 @@ pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("show-snapshot-provenance") => {
             show_snapshot_provenance(parse_show_provenance(&args[1..])?).await
         }
+        Some("list-conflicts") => list_conflicts(parse_list_conflicts(&args[1..])?).await,
+        Some("show-conflict") => show_conflict(parse_show_conflict(&args[1..])?).await,
+        Some("resolve-conflict") => resolve_conflict(parse_resolve_conflict(&args[1..])?).await,
+        Some("reopen-conflict") => reopen_conflict(parse_reopen_conflict(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -673,6 +678,78 @@ async fn show_snapshot_facts(config: ShowFactsConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ListConflictsConfig {
+    namespace: Option<String>,
+}
+
+async fn list_conflicts(config: ListConflictsConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let records = federation_conflict::list_conflicts(db.as_ref(), config.namespace.as_deref())
+        .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ShowConflictConfig {
+    namespace: String,
+    object_id: String,
+}
+
+async fn show_conflict(config: ShowConflictConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record =
+        federation_conflict::get_conflict(db.as_ref(), &config.namespace, &config.object_id)
+            .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ResolveConflictConfig {
+    namespace: String,
+    object_id: String,
+    claim_id: String,
+    actor: String,
+}
+
+async fn resolve_conflict(config: ResolveConflictConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record = federation_conflict::resolve_conflict(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &config.object_id,
+        &config.claim_id,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ReopenConflictConfig {
+    namespace: String,
+    object_id: String,
+    actor: String,
+}
+
+async fn reopen_conflict(config: ReopenConflictConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record = federation_conflict::reopen_conflict(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &config.object_id,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
 fn parse_grant_namespace(args: &[String]) -> Result<GrantNamespaceConfig, String> {
     let mut peer_site_id = None;
     let mut namespace = None;
@@ -926,6 +1003,108 @@ fn parse_show_provenance(args: &[String]) -> Result<ShowProvenanceConfig, String
     Ok(ShowProvenanceConfig {
         import_id: import_id.ok_or("--import-id is required")?,
         object_id: object_id.ok_or("--object-id is required")?,
+    })
+}
+
+fn parse_list_conflicts(args: &[String]) -> Result<ListConflictsConfig, String> {
+    let mut namespace = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown list-conflicts option {other}")),
+        }
+    }
+    Ok(ListConflictsConfig { namespace })
+}
+
+fn parse_show_conflict(args: &[String]) -> Result<ShowConflictConfig, String> {
+    let mut namespace = None;
+    let mut object_id = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--object-id" => {
+                object_id = Some(require_value(args, i, "--object-id")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown show-conflict option {other}")),
+        }
+    }
+    Ok(ShowConflictConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        object_id: object_id.ok_or("--object-id is required")?,
+    })
+}
+
+fn parse_resolve_conflict(args: &[String]) -> Result<ResolveConflictConfig, String> {
+    let mut namespace = None;
+    let mut object_id = None;
+    let mut claim_id = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--object-id" => {
+                object_id = Some(require_value(args, i, "--object-id")?);
+                i += 2;
+            }
+            "--claim-id" => {
+                claim_id = Some(require_value(args, i, "--claim-id")?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown resolve-conflict option {other}")),
+        }
+    }
+    Ok(ResolveConflictConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        object_id: object_id.ok_or("--object-id is required")?,
+        claim_id: claim_id.ok_or("--claim-id is required")?,
+        actor,
+    })
+}
+
+fn parse_reopen_conflict(args: &[String]) -> Result<ReopenConflictConfig, String> {
+    let mut namespace = None;
+    let mut object_id = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--object-id" => {
+                object_id = Some(require_value(args, i, "--object-id")?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown reopen-conflict option {other}")),
+        }
+    }
+    Ok(ReopenConflictConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        object_id: object_id.ok_or("--object-id is required")?,
+        actor,
     })
 }
 

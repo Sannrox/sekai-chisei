@@ -7,6 +7,8 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/697
 - Supersedes: none
 - Superseded by: none
+- Related: [ADR 0034](0034-cross-site-import-provenance.md),
+  [ADR 0041](0041-governed-federation-conflicts.md)
 
 ## Context
 

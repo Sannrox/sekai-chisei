@@ -61,3 +61,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0038: Authorize property-level reads before every public query surface](0038-property-level-reads.md)
 - [ADR 0039: Govern documents as objects with digest-bound renditions](0039-governed-documents.md)
 - [ADR 0040: Generate revision-pinned Python ontology clients](0040-revision-pinned-python-ontology-clients.md)
+- [ADR 0041: Preserve concurrent federation assertions as governed conflicts](0041-governed-federation-conflicts.md)

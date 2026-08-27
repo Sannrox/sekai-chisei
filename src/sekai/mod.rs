@@ -27,6 +27,7 @@ pub(crate) mod evidence_admission_lifecycle;
 pub mod evidence_projection;
 pub mod evidence_store;
 pub mod execution_evidence;
+pub mod federation_conflict;
 pub mod federation_profile;
 pub mod function;
 pub mod governed_action_type;

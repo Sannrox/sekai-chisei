@@ -118,7 +118,8 @@ DB_PATH=data/site-a.db sekaictl admin federation export-snapshot \
 
 4. Import only when the peer is joined, healthy, granted, and the bundle
    verifies. Imported facts are replicas (`write_authority=false`). A local
-   object with the same id is a conflict and is not overwritten.
+   object with the same id becomes a `sekai.federation-conflict/v1` record
+   that stores both claims. Import does not overwrite the local object.
 
 ```text
 DB_PATH=data/site-b.db sekaictl admin federation set-health --peer-site-id site-a --health up
@@ -137,6 +138,12 @@ against an enabled trust root, so a relay cannot forge origin history.
 `show-snapshot-provenance` inspects a chain only when the caller can already
 read the imported fact. Hidden, missing, and revoked assertions return the same
 unavailable result. Signatures prove identity only.
+
+A local collision admits a governed conflict. `list-conflicts` and
+`show-conflict` inspect both source identities and content digests.
+`resolve-conflict` records an explicit claim choice. `reopen-conflict`
+reverses that choice and keeps the prior resolution in history. Neither
+command rewrites the local object, the peer snapshot, or provenance hops.
 
 ## Forbidden remote control
 
@@ -171,6 +178,10 @@ sekaictl admin federation import-snapshot ...
 sekaictl admin federation list-snapshot-imports ...
 sekaictl admin federation show-snapshot-facts ...
 sekaictl admin federation show-snapshot-provenance ...
+sekaictl admin federation list-conflicts ...
+sekaictl admin federation show-conflict ...
+sekaictl admin federation resolve-conflict ...
+sekaictl admin federation reopen-conflict ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as
