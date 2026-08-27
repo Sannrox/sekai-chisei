@@ -4,7 +4,8 @@ use rusqlite::{OptionalExtension, params};
 
 use super::sekai::SekaiDb;
 use crate::sekai::event_stream::{
-    CHECKPOINT_CONFLICT, EventStreamBinding, EventStreamCheckpoint, PROJECT_UNAVAILABLE,
+    BATCH_GAP, BATCH_MALFORMED, CHECKPOINT_CONFLICT, EventStreamBinding, EventStreamCheckpoint,
+    PROJECT_UNAVAILABLE, StreamEvent, admitted_event_digest,
 };
 
 impl SekaiDb {
@@ -35,6 +36,11 @@ impl SekaiDb {
                 params![binding.stream_id],
             )
             .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM sekai_event_stream_admitted_events WHERE stream_id = ?1",
+                params![binding.stream_id],
+            )
+            .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
@@ -52,6 +58,7 @@ impl SekaiDb {
         next: &EventStreamCheckpoint,
         expected: &EventStreamCheckpoint,
         definition_digest: &str,
+        admitted: Option<&[StreamEvent]>,
     ) -> Result<(), String> {
         let json = serde_json::to_string(next)
             .map_err(|error| format!("encode event stream checkpoint: {error}"))?;
@@ -91,8 +98,34 @@ impl SekaiDb {
         if changed == 0 {
             return Err(CHECKPOINT_CONFLICT.into());
         }
+        if let Some(events) = admitted {
+            persist_admitted_events(&tx, next, events)?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn ensure_event_stream_admitted_events(
+        &self,
+        batch: &crate::sekai::event_stream::EventStreamBatch,
+    ) -> Result<(), String> {
+        persist_admitted_events_ignore(
+            &self.conn(),
+            &batch.stream_id,
+            batch.generation,
+            &batch.feed_epoch,
+            &batch.events,
+        )
+    }
+
+    pub fn verify_event_stream_admitted_events(
+        &self,
+        stream_id: &str,
+        generation: u64,
+        feed_epoch: &str,
+        events: &[StreamEvent],
+    ) -> Result<(), String> {
+        verify_admitted_events(&self.conn(), stream_id, generation, feed_epoch, events)
     }
 
     pub fn get_event_stream_checkpoint(
@@ -133,6 +166,79 @@ fn load_binding(
             .map_err(|error| format!("decode event stream binding: {error}"))
     })
     .transpose()
+}
+
+fn persist_admitted_events(
+    tx: &rusqlite::Transaction<'_>,
+    checkpoint: &EventStreamCheckpoint,
+    events: &[StreamEvent],
+) -> Result<(), String> {
+    persist_admitted_events_ignore(
+        tx,
+        &checkpoint.stream_id,
+        checkpoint.generation,
+        &checkpoint.feed_epoch,
+        events,
+    )
+}
+
+fn persist_admitted_events_ignore(
+    conn: &rusqlite::Connection,
+    stream_id: &str,
+    generation: u64,
+    feed_epoch: &str,
+    events: &[StreamEvent],
+) -> Result<(), String> {
+    let mut insert = conn
+        .prepare(
+            "INSERT OR IGNORE INTO sekai_event_stream_admitted_events
+                (stream_id, event_offset, generation, feed_epoch, event_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(|error| error.to_string())?;
+    for event in events {
+        insert
+            .execute(params![
+                stream_id,
+                event.offset as i64,
+                generation as i64,
+                feed_epoch,
+                admitted_event_digest(event)?,
+            ])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn verify_admitted_events(
+    conn: &rusqlite::Connection,
+    stream_id: &str,
+    generation: u64,
+    feed_epoch: &str,
+    events: &[StreamEvent],
+) -> Result<(), String> {
+    for event in events {
+        let stored: Option<(i64, String, String)> = conn
+            .query_row(
+                "SELECT generation, feed_epoch, event_digest
+                 FROM sekai_event_stream_admitted_events
+                 WHERE stream_id = ?1 AND event_offset = ?2",
+                params![stream_id, event.offset as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((stored_generation, stored_epoch, stored_digest)) = stored else {
+            return Err(BATCH_GAP.into());
+        };
+        if stored_generation as u64 != generation
+            || stored_epoch != feed_epoch
+            || stored_digest != admitted_event_digest(event)?
+        {
+            return Err(BATCH_MALFORMED.into());
+        }
+    }
+    Ok(())
 }
 
 fn definition_changed(existing: &EventStreamBinding, next: &EventStreamBinding) -> bool {

@@ -44,7 +44,7 @@ partial or unauthorized batch was rejected because it manufactures success.
 ## Consequences
 
 Operators register a stream, project ordered batches, and inspect the
-checkpoint. Follow-up work may add subscriptions (#691).
+checkpoint. Follow-up work added subscriptions in [ADR 0048](0048-governed-event-subscriptions.md).
 
 ## Validation
 

@@ -23,6 +23,7 @@ mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
 mod event_stream_store;
+mod event_subscription_store;
 pub mod evidence;
 mod federation_conflict_store;
 mod federation_revocation_store;
