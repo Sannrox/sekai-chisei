@@ -82,6 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::geospatial_cli::run_geospatial_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "quality" => {
+            sekai_chisei::quality_cli::run_quality_command(args.into_iter().skip(1).collect()).await
+        }
         "sync" => {
             sekai_chisei::source_webhook_cli::run_sync_command(args.into_iter().skip(1).collect())
                 .await
@@ -413,6 +416,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("federation"), _) => ("federation", 2),
         (Some("learning"), _) => ("learning", 2),
         (Some("geospatial"), _) => ("geospatial", 2),
+        (Some("quality"), _) => ("quality", 2),
         (Some("sync"), _) => ("sync", 2),
         (Some("tables"), _) => ("tables", 2),
         (Some("streams"), _) => ("streams", 2),
@@ -594,6 +598,9 @@ fn print_admin_usage() {
          Geospatial:\n\
            sekaictl admin geospatial ...\n\
          \n\
+         Quality:\n\
+           sekaictl admin quality ...\n\
+         \n\
          Sync:\n\
            sekaictl admin sync ...\n\
          \n\
@@ -630,6 +637,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "federation" => Some(sekai_chisei::federation_cli::usage().to_string()),
         "learning" => Some(sekai_chisei::learning_cli::usage().to_string()),
         "geospatial" => Some(sekai_chisei::geospatial_cli::usage().to_string()),
+        "quality" => Some(sekai_chisei::quality_cli::usage().to_string()),
         "sync" => Some(sekai_chisei::source_webhook_cli::usage().to_string()),
         "tables" => Some(sekai_chisei::open_table_cli::usage().to_string()),
         "streams" => Some(sekai_chisei::event_stream_cli::usage().to_string()),
@@ -704,6 +712,7 @@ mod tests {
             (vec!["federation"], "federation"),
             (vec!["learning"], "learning"),
             (vec!["geospatial"], "geospatial"),
+            (vec!["quality"], "quality"),
             (vec!["sync"], "sync"),
             (vec!["tables"], "tables"),
             (vec!["streams"], "streams"),
@@ -750,6 +759,7 @@ mod tests {
             "federation",
             "learning",
             "geospatial",
+            "quality",
             "sync",
             "tables",
             "streams",
