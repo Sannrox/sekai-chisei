@@ -68,3 +68,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0045: Evaluate versioned data-quality rules as content-bound results](0045-governed-data-quality-rules.md)
 - [ADR 0046: Expose bounded source health as an authorized projection](0046-bounded-source-health.md)
 - [ADR 0047: Push bounded virtual-table predicates with governed equivalence](0047-virtual-table-predicate-pushdown.md)
+- [ADR 0048: Expose governed event subscriptions with versioned cursors](0048-governed-event-subscriptions.md)

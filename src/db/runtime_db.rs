@@ -5016,10 +5016,36 @@ impl RuntimeDb {
         next: &crate::sekai::event_stream::EventStreamCheckpoint,
         expected: &crate::sekai::event_stream::EventStreamCheckpoint,
         definition_digest: &str,
+        admitted: Option<&[crate::sekai::event_stream::StreamEvent]>,
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => {
-                db.advance_event_stream_checkpoint(next, expected, definition_digest)
+                db.advance_event_stream_checkpoint(next, expected, definition_digest, admitted)
+            }
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn ensure_event_stream_admitted_events(
+        &self,
+        batch: &crate::sekai::event_stream::EventStreamBatch,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.ensure_event_stream_admitted_events(batch),
+            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn verify_event_stream_admitted_events(
+        &self,
+        stream_id: &str,
+        generation: u64,
+        feed_epoch: &str,
+        events: &[crate::sekai::event_stream::StreamEvent],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.verify_event_stream_admitted_events(stream_id, generation, feed_epoch, events)
             }
             Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
         }
@@ -5032,6 +5058,50 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_event_stream_checkpoint(stream_id),
             Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_event_subscription(
+        &self,
+        subscription: &crate::sekai::event_subscription::EventSubscription,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_event_subscription(subscription),
+            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_event_subscription(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+    ) -> Result<Option<crate::sekai::event_subscription::EventSubscription>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_event_subscription(namespace, subscription_id),
+            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn revoke_event_subscription_record(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+        owner: &str,
+    ) -> Result<crate::sekai::event_subscription::EventSubscription, String> {
+        match self {
+            Self::Sqlite(db) => db.revoke_event_subscription(namespace, subscription_id, owner),
+            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn advance_event_subscription_cursor(
+        &self,
+        next: &crate::sekai::event_subscription::EventSubscription,
+        expected: &crate::sekai::event_subscription::EventSubscription,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.advance_event_subscription_cursor(next, expected),
+            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
         }
     }
 

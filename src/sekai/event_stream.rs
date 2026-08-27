@@ -142,6 +142,24 @@ struct ProjectionPin<'a> {
     events: &'a [ProjectedStreamEvent],
 }
 
+#[derive(Serialize)]
+struct AdmittedEventPin<'a> {
+    offset: u64,
+    event_id: &'a str,
+    properties: &'a BTreeMap<String, String>,
+}
+
+pub fn admitted_event_digest(event: &StreamEvent) -> Result<String, String> {
+    Ok(format!(
+        "sha256:{}",
+        shomei::digest_serializable(&AdmittedEventPin {
+            offset: event.offset,
+            event_id: &event.event_id,
+            properties: &event.properties,
+        })?
+    ))
+}
+
 pub fn batch_digest_for(batch: &EventStreamBatch) -> Result<String, String> {
     Ok(format!(
         "sha256:{}",
@@ -210,6 +228,7 @@ pub fn project_event_batch(
     if let Some(projection) =
         decided_without_advance(&binding, batch, &authorized, &digest, &expected)?
     {
+        db.ensure_event_stream_admitted_events(batch)?;
         return Ok(projection);
     }
 
@@ -221,7 +240,12 @@ pub fn project_event_batch(
         committed_offset: batch.offset_end,
         last_batch_digest: digest.clone(),
     };
-    match db.advance_event_stream_checkpoint(&next, &expected, &binding.definition_digest) {
+    match db.advance_event_stream_checkpoint(
+        &next,
+        &expected,
+        &binding.definition_digest,
+        Some(&batch.events),
+    ) {
         Ok(()) => projection_result(&binding, batch, &authorized, events, next, "accepted"),
         Err(error) if error == CHECKPOINT_CONFLICT => {
             let latest = current_checkpoint(db, &batch.stream_id, batch)?;
@@ -366,7 +390,10 @@ fn validate_binding(
     Ok(validated)
 }
 
-fn validate_batch(binding: &EventStreamBinding, batch: &EventStreamBatch) -> Result<(), String> {
+pub(crate) fn validate_batch(
+    binding: &EventStreamBinding,
+    batch: &EventStreamBatch,
+) -> Result<(), String> {
     if batch.stream_id != binding.stream_id {
         return Err(PROJECT_UNAVAILABLE.into());
     }
@@ -424,7 +451,7 @@ fn typed_value(col_type: &str, value: &str) -> bool {
     }
 }
 
-fn stream_authority(db: &RuntimeDb, actor: &str) -> Result<PrincipalAuthority, String> {
+pub(crate) fn stream_authority(db: &RuntimeDb, actor: &str) -> Result<PrincipalAuthority, String> {
     if let Some(trusted) = trusted_service_authority(actor) {
         return Ok(trusted);
     }
@@ -455,7 +482,10 @@ fn stream_authority(db: &RuntimeDb, actor: &str) -> Result<PrincipalAuthority, S
     principal_authority_from_profile(actor, sealed.first().copied())
 }
 
-fn authorized_columns(binding: &EventStreamBinding, authority: &PrincipalAuthority) -> Vec<String> {
+pub(crate) fn authorized_columns(
+    binding: &EventStreamBinding,
+    authority: &PrincipalAuthority,
+) -> Vec<String> {
     binding
         .columns
         .iter()
@@ -474,7 +504,7 @@ fn column_visible(column: &EventStreamColumn, authority: &PrincipalAuthority) ->
             .is_some_and(|ceiling| ceiling >= marking)
 }
 
-fn project_events(
+pub(crate) fn project_events(
     batch: &EventStreamBatch,
     authorized: &[String],
 ) -> Result<Vec<ProjectedStreamEvent>, String> {
@@ -746,6 +776,7 @@ mod tests {
                         .unwrap()
                         .unwrap()
                         .definition_digest,
+                    None,
                 )
                 .unwrap_err(),
             CHECKPOINT_CONFLICT
@@ -775,6 +806,7 @@ mod tests {
                         .unwrap()
                         .unwrap(),
                     "sha256:stale-definition",
+                    None,
                 )
                 .unwrap_err(),
             CHECKPOINT_CONFLICT

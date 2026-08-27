@@ -22,6 +22,7 @@ pub mod definition_proposal;
 pub mod document;
 pub mod escalation;
 pub mod event_stream;
+pub mod event_subscription;
 pub mod evidence;
 pub(crate) mod evidence_admission_lifecycle;
 pub mod evidence_projection;

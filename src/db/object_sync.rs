@@ -481,6 +481,26 @@ impl SekaiDb {
                     record_json TEXT NOT NULL,
                     FOREIGN KEY(stream_id) REFERENCES sekai_event_stream_bindings(stream_id)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_event_stream_admitted_events (
+                    stream_id TEXT NOT NULL,
+                    event_offset INTEGER NOT NULL,
+                    generation INTEGER NOT NULL,
+                    feed_epoch TEXT NOT NULL,
+                    event_digest TEXT NOT NULL,
+                    PRIMARY KEY(stream_id, event_offset),
+                    FOREIGN KEY(stream_id) REFERENCES sekai_event_stream_bindings(stream_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_event_subscriptions (
+                    namespace TEXT NOT NULL,
+                    subscription_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, subscription_id)
+                );
+                DELETE FROM sekai_event_stream_checkpoints
+                WHERE stream_id NOT IN (
+                    SELECT DISTINCT stream_id FROM sekai_event_stream_admitted_events
+                );
                 CREATE TABLE IF NOT EXISTS sekai_governed_documents (
                     namespace TEXT NOT NULL,
                     document_id TEXT NOT NULL,

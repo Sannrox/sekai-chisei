@@ -85,7 +85,7 @@ If you want to deploy or operate the control plane:
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered table snapshots.
 - [Event-stream projections](event-streams.md) — ordered batches with durable
-  checkpoints and fail-closed replay.
+  checkpoints, consumer subscriptions, and fail-closed replay.
 - [Governed documents and renditions](documents.md) — digest-bound document
   objects with extraction provenance, hold, expiry, and deletion.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —

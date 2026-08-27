@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Expose authorized `sekai.event-subscription/v1` consumer cursors over
+  admitted event-stream projections. Pages bind stream identity, schema
+  revision, and definition digest. Exact replay is idempotent. Gaps, late
+  pages, hidden columns, foreign or unknown identifiers, revocation, and
+  expired retention fail before disclosure. `sekaictl admin streams`
+  subscribe, pull, cursor, and revoke. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Push eligible open-table predicates as a `sekai.virtual-pushdown/v1` plan.
   Authorized `eq`/`neq` filters may execute on the registered Iceberg or
   Parquet adapter. Residual numeric predicates stay local. Hidden, unknown, and

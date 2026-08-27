@@ -107,7 +107,7 @@ lives in the separate [research index](research/README.md).
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered Iceberg and Parquet snapshots.
 - [Event-stream projections](event-streams.md) — ordered event batches with
-  durable checkpoints.
+  durable checkpoints and versioned consumer subscriptions.
 - [Governed documents and renditions](documents.md) — digest-bound document
   objects with renditions, hold, expiry, and deletion.
 - [External-action execution](external-action-execution.md) — host lifecycle
