@@ -31,6 +31,7 @@ pub mod federation_conflict;
 pub mod federation_profile;
 pub mod federation_revocation;
 pub mod function;
+pub mod geospatial;
 pub mod governed_action_type;
 pub mod governed_facts;
 pub mod handoff;

@@ -8,7 +8,8 @@
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0027](0027-explicit-property-grants.md),
-  [ADR 0030](0030-row-scoped-query-access.md)
+  [ADR 0030](0030-row-scoped-query-access.md),
+  [ADR 0044](0044-governed-geospatial-queries.md)
 
 ## Context
 

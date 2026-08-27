@@ -71,6 +71,8 @@ If you want to deploy or operate the control plane:
   digest-bound, bounded evidence for release gates.
 - [Inspectable reversible learning changes](learning-changes.md) — evidence-bound
   proposal, approval, activation, and rollback lineage.
+- [Governed geospatial queries](geospatial-queries.md) — authorized point,
+  distance, contains, and intersects over named property claims.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable

@@ -32,6 +32,8 @@ The reusable `sekai.object-security` surface shares immutable policy
 revisions, exact replay, complete atomic activation, and SQL-enforced direct
 read/list predicates across SQLite and PostgreSQL. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test.
+`sekai.geospatial-query/v1` is a computed query on that authorized list:
+both backends share the same in-process evaluator after property grants.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):

@@ -90,7 +90,9 @@ markings remain narrowing layers. Optional property grants then omit hidden
 values from authorized projections and fail closed on ungranted filters and
 writes. Every public query operator authorizes those grants before count,
 match, sort, traverse, or export; see
-[ADR 0038](decisions/0038-property-level-reads.md). See
+[ADR 0038](decisions/0038-property-level-reads.md). Spatial comparison of
+named property claims uses the same grant check; see
+[ADR 0044](decisions/0044-governed-geospatial-queries.md). See
 [Object security policy](object-security.md),
 [ADR 0025](decisions/0025-storage-enforced-object-security.md), and
 [ADR 0027](decisions/0027-explicit-property-grants.md).

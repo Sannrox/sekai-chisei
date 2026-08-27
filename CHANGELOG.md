@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Query authorized `sekai.geospatial-value/v1` point and polygon claims as a
+  `sekai.geospatial-query/v1` effect. Operators are point, distance, contains,
+  and intersects. The named property is authorized before match, count, or
+  page. Hidden and unknown names share one unavailable result. Hidden and
+  absent objects are indistinguishable. Audit records operator, property,
+  namespace, and total — not coordinates. `sekaictl admin geospatial query`
+  is the operator surface. SQLite and the reusable PostgreSQL graph list
+  share the same in-process evaluator. This adds no spatial index table.
 - Give every learned proposal a governed `chisei.learning-change/v1` record
   with evidence, before-and-after comparison, approval, activation, and
   reversible supersession lineage. Stale, hidden, unknown, and lease-lost

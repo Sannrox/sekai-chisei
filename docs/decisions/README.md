@@ -64,3 +64,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0041: Preserve concurrent federation assertions as governed conflicts](0041-governed-federation-conflicts.md)
 - [ADR 0042: Revoke shared federation authority as governed objects](0042-governed-federation-revocation.md)
 - [ADR 0043: Keep learned changes inspectable and reversibly superseding](0043-reversible-learning-changes.md)
+- [ADR 0044: Query governed geospatial properties after property authorization](0044-governed-geospatial-queries.md)

@@ -7,6 +7,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/676 (#676)
 - Supersedes: none
 - Superseded by: none
+- Related: [ADR 0044](0044-governed-geospatial-queries.md)
 
 ## Context
 
