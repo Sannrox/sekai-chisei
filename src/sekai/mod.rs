@@ -66,4 +66,5 @@ pub mod sentinel;
 pub mod skillextract;
 pub mod source_health;
 pub mod source_webhook;
+pub mod virtual_pushdown;
 pub(crate) mod work_unit_lifecycle;

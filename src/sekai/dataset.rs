@@ -1,5 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +41,7 @@ pub struct Dataset {
     pub created: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowFilter {
     pub column: String,
     pub op: String,

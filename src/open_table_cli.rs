@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use crate::sekai::dataset::RowFilter;
 use crate::sekai::open_table::{self, OpenTableQuery, OpenTableSnapshot, OpenTableSource};
 use chrono::Utc;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin tables register --source <file> [--actor <principal>]\n  sekaictl admin tables admit-snapshot --snapshot <file> [--actor <principal>]\n  sekaictl admin tables query --source-id <id> [--column <name>]... [--snapshot-digest <digest>] [--classification-ceiling <token>] [--actor <principal>]\n  --classification-ceiling may only restrict a sealed principal profile"
+    "sekaictl admin tables register --source <file> [--actor <principal>]\n  sekaictl admin tables admit-snapshot --snapshot <file> [--actor <principal>]\n  sekaictl admin tables query --source-id <id> [--column <name>]... [--filter <column=op:value>]... [--snapshot-digest <digest>] [--classification-ceiling <token>] [--actor <principal>]\n  --classification-ceiling may only restrict a sealed principal profile"
 }
 
 pub async fn run_tables_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -66,6 +67,7 @@ async fn admit(config: AdmitConfig) -> Result<(), BoxErr> {
 struct QueryConfig {
     source_id: String,
     columns: Vec<String>,
+    filters: Vec<RowFilter>,
     snapshot_digest: Option<String>,
     classification_ceiling: Option<String>,
     actor: String,
@@ -79,9 +81,9 @@ async fn query(config: QueryConfig) -> Result<(), BoxErr> {
         &OpenTableQuery {
             source_id: config.source_id,
             columns: config.columns,
+            filters: config.filters,
             snapshot_digest: config.snapshot_digest,
             classification_ceiling: config.classification_ceiling,
-            ..Default::default()
         },
         Utc::now().timestamp_millis(),
     )
@@ -139,6 +141,7 @@ fn parse_admit(args: &[String]) -> Result<AdmitConfig, String> {
 fn parse_query(args: &[String]) -> Result<QueryConfig, String> {
     let mut source_id = None;
     let mut columns = Vec::new();
+    let mut filters = Vec::new();
     let mut snapshot_digest = None;
     let mut classification_ceiling = None;
     let mut actor = "operator".to_string();
@@ -151,6 +154,10 @@ fn parse_query(args: &[String]) -> Result<QueryConfig, String> {
             }
             "--column" => {
                 columns.push(require_value(args, i, "--column")?);
+                i += 2;
+            }
+            "--filter" => {
+                filters.push(parse_filter(&require_value(args, i, "--filter")?)?);
                 i += 2;
             }
             "--snapshot-digest" => {
@@ -171,9 +178,27 @@ fn parse_query(args: &[String]) -> Result<QueryConfig, String> {
     Ok(QueryConfig {
         source_id: source_id.ok_or("--source-id is required")?,
         columns,
+        filters,
         snapshot_digest,
         classification_ceiling,
         actor,
+    })
+}
+
+fn parse_filter(value: &str) -> Result<RowFilter, String> {
+    let (column, rest) = value
+        .split_once('=')
+        .ok_or_else(|| "filter must be column=op:value".to_string())?;
+    let (op, expected) = rest
+        .split_once(':')
+        .ok_or_else(|| "filter must be column=op:value".to_string())?;
+    if column.is_empty() || op.is_empty() {
+        return Err("filter must be column=op:value".into());
+    }
+    Ok(RowFilter {
+        column: column.into(),
+        op: op.into(),
+        value: expected.into(),
     })
 }
 

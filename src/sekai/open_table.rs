@@ -17,6 +17,7 @@ use crate::sekai::markings::{
     trusted_service_authority,
 };
 use crate::sekai::security::Role;
+use crate::sekai::virtual_pushdown::{self, VirtualPushdownPlan};
 use crate::shomei;
 
 pub const OPEN_TABLE_CONTRACT: &str = "sekai.open-table-source/v1";
@@ -90,6 +91,7 @@ pub struct OpenTableProjection {
     pub row_count: u32,
     pub projection_digest: String,
     pub rows: Vec<BTreeMap<String, String>>,
+    pub pushdown: VirtualPushdownPlan,
 }
 
 #[derive(Serialize)]
@@ -244,8 +246,17 @@ pub fn query_open_table(
         if !authorized_names.contains(&filter.column) {
             return Err(QUERY_UNAVAILABLE.into());
         }
-        if !matches!(filter.op.as_str(), "eq" | "neq") {
-            return Err("open table predicate is unsupported".into());
+        let class = virtual_pushdown::classify_predicate(&filter.op)?;
+        if class == virtual_pushdown::PredicateClass::Residual {
+            let col_type = source
+                .columns
+                .iter()
+                .find(|column| column.name == filter.column)
+                .map(|column| column.col_type.as_str())
+                .unwrap_or("");
+            if !virtual_pushdown::residual_column_is_numeric(col_type) {
+                return Err("open table predicate is unsupported".into());
+            }
         }
     }
 
@@ -254,19 +265,25 @@ pub fn query_open_table(
     } else {
         query.columns.clone()
     };
-
-    let mut rows = Vec::new();
-    for row in &snapshot.rows {
-        if !matches_filters(row, &query.filters)? {
-            continue;
-        }
-        let mut projected = BTreeMap::new();
-        for name in &projected_names {
-            let value = row.get(name).ok_or(SNAPSHOT_CORRUPT)?;
-            projected.insert(name.clone(), value.clone());
-        }
-        rows.push(projected);
-    }
+    let (pushed, residual) = virtual_pushdown::split_predicates(&query.filters)?;
+    let local_rows =
+        virtual_pushdown::evaluate_local(&snapshot.rows, &query.filters, &projected_names)?;
+    let adapter_rows = virtual_pushdown::evaluate_adapter(
+        &source.format,
+        &snapshot.rows,
+        &pushed,
+        &residual,
+        &projected_names,
+    )?;
+    let pushdown = virtual_pushdown::bind_plan(
+        &source.format,
+        &projected_names,
+        pushed,
+        residual,
+        &local_rows,
+        &adapter_rows,
+    )?;
+    let rows = local_rows;
 
     let definition_digest = definition_digest(&source)?;
     let projection_digest = format!(
@@ -289,6 +306,7 @@ pub fn query_open_table(
         row_count: u32::try_from(rows.len()).map_err(|error| error.to_string())?,
         projection_digest,
         rows,
+        pushdown,
     })
 }
 
@@ -468,21 +486,6 @@ fn column_visible(column: &OpenTableColumn, authority: &PrincipalAuthority) -> b
         .is_some_and(|ceiling| ceiling >= marking)
 }
 
-fn matches_filters(row: &BTreeMap<String, String>, filters: &[RowFilter]) -> Result<bool, String> {
-    for filter in filters {
-        let value = row.get(&filter.column).ok_or(SNAPSHOT_CORRUPT)?;
-        let matched = match filter.op.as_str() {
-            "eq" => value == &filter.value,
-            "neq" => value != &filter.value,
-            _ => return Err("open table predicate is unsupported".into()),
-        };
-        if !matched {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 fn definition_digest(source: &OpenTableSource) -> Result<String, String> {
     Ok(format!(
         "sha256:{}",
@@ -646,6 +649,13 @@ mod tests {
             assert_eq!(first.projection_digest, second.projection_digest);
             assert_eq!(first.rows, second.rows);
             assert_eq!(first.input_digest, snap.snapshot_digest);
+            assert!(first.pushdown.equivalent);
+            assert_eq!(first.pushdown.local_digest, first.pushdown.pushed_digest);
+            assert_eq!(first.pushdown.adapter, format);
+            assert_eq!(
+                first.pushdown.contract_version,
+                virtual_pushdown::PUSHDOWN_CONTRACT
+            );
         }
     }
 
@@ -868,20 +878,58 @@ mod tests {
             QUERY_UNAVAILABLE
         );
 
+        let residual = query_open_table(
+            &runtime,
+            "analyst",
+            &OpenTableQuery {
+                source_id: snap.source_id,
+                filters: vec![RowFilter {
+                    column: "id".into(),
+                    op: "gt".into(),
+                    value: "0".into(),
+                }],
+                ..Default::default()
+            },
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(residual.row_count, 2);
+        assert_eq!(residual.pushdown.residual_predicates[0].op, "gt");
+        assert!(residual.pushdown.pushed_predicates.is_empty());
+        assert!(residual.pushdown.equivalent);
+
         assert!(
             query_open_table(
                 &runtime,
                 "analyst",
                 &OpenTableQuery {
-                    source_id: snap.source_id,
+                    source_id: residual.source_id.clone(),
                     filters: vec![RowFilter {
                         column: "id".into(),
-                        op: "gt".into(),
-                        value: "0".into(),
+                        op: "contains".into(),
+                        value: "1".into(),
                     }],
                     ..Default::default()
                 },
-                2_000,
+                2_100,
+            )
+            .unwrap_err()
+            .contains("unsupported")
+        );
+        assert!(
+            query_open_table(
+                &runtime,
+                "analyst",
+                &OpenTableQuery {
+                    source_id: residual.source_id.clone(),
+                    filters: vec![RowFilter {
+                        column: "city".into(),
+                        op: "gt".into(),
+                        value: "10".into(),
+                    }],
+                    ..Default::default()
+                },
+                2_200,
             )
             .unwrap_err()
             .contains("unsupported")
@@ -898,24 +946,23 @@ mod tests {
         let empty_source = source_for(FORMAT_ICEBERG, &empty_snap);
         register_open_table(&empty_runtime, "analyst", &empty_source, 1_000).unwrap();
         admit_open_table_snapshot(&empty_runtime, "analyst", &empty_snap).unwrap();
-        assert!(
-            query_open_table(
-                &empty_runtime,
-                "analyst",
-                &OpenTableQuery {
-                    source_id: empty_snap.source_id,
-                    filters: vec![RowFilter {
-                        column: "id".into(),
-                        op: "gt".into(),
-                        value: "0".into(),
-                    }],
-                    ..Default::default()
-                },
-                2_000,
-            )
-            .unwrap_err()
-            .contains("unsupported")
-        );
+        let empty = query_open_table(
+            &empty_runtime,
+            "analyst",
+            &OpenTableQuery {
+                source_id: empty_snap.source_id,
+                filters: vec![RowFilter {
+                    column: "id".into(),
+                    op: "gt".into(),
+                    value: "0".into(),
+                }],
+                ..Default::default()
+            },
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(empty.row_count, 0);
+        assert_eq!(empty.pushdown.residual_predicates[0].op, "gt");
     }
 
     #[test]

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Push eligible open-table predicates as a `sekai.virtual-pushdown/v1` plan.
+  Authorized `eq`/`neq` filters may execute on the registered Iceberg or
+  Parquet adapter. Residual numeric predicates stay local. Hidden, unknown, and
+  sensitive columns fail before any row. The projection is admitted only when
+  local and adapter digests match. `sekaictl admin tables query --filter`
+  inspects the plan. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Report authorized `sekai.source-health/v1` checkpoint age, lag, last success,
   and a bounded failure class for each source. Health is a projection of
   existing object-sync state: it never writes a second checkpoint, stores
