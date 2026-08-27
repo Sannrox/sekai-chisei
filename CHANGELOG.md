@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Give every learned proposal a governed `chisei.learning-change/v1` record
+  with evidence, before-and-after comparison, approval, activation, and
+  reversible supersession lineage. Stale, hidden, unknown, and lease-lost
+  inputs fail closed. `sekaictl admin learning` proposes, inspects, approves,
+  activates, and rolls back. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Revoke peer, signer, grant, or snapshot-revision authority as governed
   `sekai.federation-revocation/v1` records. Local verify and import fail
   immediately. Snapshots, conflicts, and provenance stay retained.

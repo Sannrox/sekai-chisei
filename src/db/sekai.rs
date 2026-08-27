@@ -208,6 +208,7 @@ impl SekaiDb {
         self.migrate_evaluation_plans()?;
         self.migrate_evaluation_manifests()?;
         self.migrate_evaluation_executions()?;
+        self.migrate_learning_changes()?;
         self.migrate_governed_subject_provenance()?;
         self.migrate_kioku()?;
         self.drop_legacy_action_types()?;
