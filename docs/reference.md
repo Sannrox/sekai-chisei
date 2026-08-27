@@ -51,6 +51,8 @@ lives in the separate [research index](research/README.md).
 - [Inspectable reversible learning changes](learning-changes.md) — evidence-bound
   proposal, approval, activation, and rollback without rewriting source
   learning.
+- [Governed geospatial queries](geospatial-queries.md) — authorized spatial
+  comparison of named property claims after property grants.
 - [Team operations](team-operations.md) — namespace bootstrap and operator
   workflows.
 - [Performance benchmarks](performance-benchmarks.md) — reproduce the

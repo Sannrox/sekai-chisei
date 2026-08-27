@@ -40,7 +40,9 @@ unmentioned properties have no grant. Hidden properties are omitted from
 authorized reads, context, export, lineage, and synchronization projections;
 they are never fetched for client-side masking. Every public query operator
 authorizes named property predicates and sorts before count, match, sort,
-traverse, or export. Filters, ordering, aggregation, and traversal that name
+traverse, or export. Geospatial comparison (`sekai.geospatial-query/v1`)
+authorizes the named location property before match, count, or page; see
+[governed geospatial queries](geospatial-queries.md). Filters, ordering, aggregation, and traversal that name
 an ungranted property fail closed without distinguishing hidden from absent
 properties. Computed properties evaluate only after that authorized
 projection. Creates and updates require a `write` grant to
