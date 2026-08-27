@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Evaluate a versioned `chisei.data-quality-rule/v1` against a typed dataset
+  revision and retain a `chisei.data-quality-result/v1` receipt. Built-in
+  evaluators are digest pin, completeness, and row-count bound. Pass, fail,
+  missing, invalid, unknown, cancelled, and unavailable stay distinct and never
+  become pass. Replay returns the prior receipt. Restart completes cancelled
+  work without rewriting a closed result. `sekaictl admin quality` publishes,
+  evaluates, cancels, and restarts. SQLite is the reference store; PostgreSQL
+  stays unavailable.
 - Query authorized `sekai.geospatial-value/v1` point and polygon claims as a
   `sekai.geospatial-query/v1` effect. Operators are point, distance, contains,
   and intersects. The named property is authorized before match, count, or

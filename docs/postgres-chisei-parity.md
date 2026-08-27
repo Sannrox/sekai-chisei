@@ -18,6 +18,7 @@ explicit computed/query paths with named durable dependencies.
 | `chisei.policy` | Proven (graph objects) | `tests/chisei_policy_backend_conformance.rs` |
 | `chisei.approvals` | Proven for issue/revoke/policy; **online redeem SQLite-only** | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs` (issue/revoke paths); `RuntimeDb::redeem_permit` fails closed on Postgres |
 | `chisei.learning` | Proven for Kioku lifecycle; **Gunshi allocation state SQLite-only** | `tests/chisei_kioku_backend_conformance.rs`; see [gunshi-auto-allocation.md](gunshi-auto-allocation.md) |
+| `chisei.data-quality-rule` | **SQLite-only**; PostgreSQL fails closed | `src/chisei/data_quality.rs`; see [data-quality-rules.md](data-quality-rules.md) |
 | `chisei.observations` | Proven | eval sample harness |
 | `gateway.governance` | Proven | receipt aliases + gateway audit harness |
 

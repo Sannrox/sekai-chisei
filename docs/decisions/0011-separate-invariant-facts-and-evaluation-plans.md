@@ -7,6 +7,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/461
 - Supersedes: none
 - Superseded by: none
+- Related: [ADR 0045](0045-governed-data-quality-rules.md)
 
 ## Context
 

@@ -4850,6 +4850,67 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_data_quality_rule(
+        &self,
+        record: &crate::chisei::data_quality::DataQualityRule,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_data_quality_rule(record),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_data_quality_rule(
+        &self,
+        namespace: &str,
+        rule_id: &str,
+    ) -> Result<Option<crate::chisei::data_quality::DataQualityRule>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_data_quality_rule(namespace, rule_id),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_data_quality_rules(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::data_quality::DataQualityRule>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_data_quality_rules(namespace),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_data_quality_result(
+        &self,
+        record: &crate::chisei::data_quality::DataQualityResult,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_data_quality_result(record),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_data_quality_result(
+        &self,
+        result_id: &str,
+    ) -> Result<Option<crate::chisei::data_quality::DataQualityResult>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_data_quality_result(result_id),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_data_quality_results(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::data_quality::DataQualityResult>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_data_quality_results(namespace),
+            Self::Postgres(_) => Err(crate::chisei::data_quality::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn put_source_webhook_key(
         &self,
         pin: &crate::sekai::source_webhook::SourceWebhookKeyPin,

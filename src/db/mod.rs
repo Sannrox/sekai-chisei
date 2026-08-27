@@ -12,6 +12,7 @@ pub mod chisei_receipt;
 pub mod chisei_rpc_inventory;
 pub mod coordination;
 pub mod credential;
+mod data_quality_store;
 pub mod dataset;
 pub mod decision;
 pub mod deduplication;
