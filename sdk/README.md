@@ -18,7 +18,7 @@ and Python applications.
 For **namespace-scoped typed codegen** from a selected capability subset (issue
 #299), see `docs/capability-codegen.md` and
 `src/capability_codegen.rs`. For **revision-pinned schema-typed ontology
-clients** (issue #694), see `docs/ontology-codegen.md` and
+clients** (issues #694 and #698), see `docs/ontology-codegen.md` and
 `src/ontology_codegen.rs`.
 
 Callers may supply an operation ID (the core-loop helper generates one when it

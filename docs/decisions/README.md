@@ -60,3 +60,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0037: Project typed events with durable stream checkpoints](0037-event-stream-projections.md)
 - [ADR 0038: Authorize property-level reads before every public query surface](0038-property-level-reads.md)
 - [ADR 0039: Govern documents as objects with digest-bound renditions](0039-governed-documents.md)
+- [ADR 0040: Generate revision-pinned Python ontology clients](0040-revision-pinned-python-ontology-clients.md)

@@ -47,8 +47,8 @@ If you want to deploy or operate the control plane:
 - [Capability catalogs](capability-catalog.md) — native governed-surface
   discovery (`DiscoverCapabilities` `1.0`) and the HTTP provider-profile
   matrix (`chisei.provider-capabilities/v1`).
-- [Ontology TypeScript clients](ontology-codegen.md) — revision-pinned
-  selected object, link, action, and function types.
+- [Ontology TypeScript and Python clients](ontology-codegen.md) —
+  revision-pinned selected object, link, action, and function types.
 - [Governed actions](governed-action-types.md) — start of the action type,
   instance, effect, runtime claim, and evidence lifecycle.
 - [External-action execution](external-action-execution.md) — permits,

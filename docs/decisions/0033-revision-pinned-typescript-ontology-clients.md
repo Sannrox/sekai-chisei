@@ -7,7 +7,7 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/694
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0016](0016-versioned-rust-core-loop-client.md), [ADR 0019](0019-dual-capability-catalogs.md), [ADR 0024](0024-governed-definition-branches.md), [ADR 0027](0027-explicit-property-grants.md)
+- Related: [ADR 0016](0016-versioned-rust-core-loop-client.md), [ADR 0019](0019-dual-capability-catalogs.md), [ADR 0024](0024-governed-definition-branches.md), [ADR 0027](0027-explicit-property-grants.md), [ADR 0040](0040-revision-pinned-python-ontology-clients.md)
 
 ## Context
 
