@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Govern documents as first-class objects with digest-bound content
+  references and derived renditions. Admission, extraction provenance,
+  bounded retrieval, hold, expiry, and deletion are namespace-scoped and
+  fail closed on mismatched purpose, hidden fields, unknown formats, and
+  foreign ownership. `sekaictl admin documents` admits, attaches, retrieves,
+  holds, expires, and deletes. SQLite is the reference store; PostgreSQL
+  stays unavailable.
 - Authorize property-level reads before every public query surface. Named
   predicates and sorts fail closed whether the property is hidden or unknown.
   Hidden values are omitted from get, list, find, traverse, lineage, and

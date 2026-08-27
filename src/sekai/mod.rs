@@ -19,6 +19,7 @@ pub mod definition_branch;
 pub mod definition_diff;
 pub mod definition_migration;
 pub mod definition_proposal;
+pub mod document;
 pub mod escalation;
 pub mod event_stream;
 pub mod evidence;

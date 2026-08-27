@@ -99,6 +99,8 @@ lives in the separate [research index](research/README.md).
   authorized queries over registered Iceberg and Parquet snapshots.
 - [Event-stream projections](event-streams.md) — ordered event batches with
   durable checkpoints.
+- [Governed documents and renditions](documents.md) — digest-bound document
+  objects with renditions, hold, expiry, and deletion.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

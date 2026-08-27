@@ -360,6 +360,7 @@ reconciliation. Known community Postgres fail-closed exceptions include public
 audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,
 federation peer tables, registered Iceberg/Parquet snapshot projections,
 event-stream checkpoints,
+governed documents and renditions,
 and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.
 
