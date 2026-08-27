@@ -29,6 +29,15 @@ The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
 perform no GitHub network requests.
 
+Inspect authorized checkpoint age, lag, last success, and failure class without
+a second store or a live remote probe. See [source health](source-health.md)
+and [ADR 0046](decisions/0046-bounded-source-health.md):
+
+```text
+sekaictl admin sync health --namespace ops --source-instance owner/repo \
+  --type-digest <github-object-sync-type-digest>
+```
+
 Signed push deliveries use the same identity. Pin a verifying key, then admit
 the bundle. The authenticated producer must match the envelope:
 

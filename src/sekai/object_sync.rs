@@ -1176,7 +1176,7 @@ fn is_secret_key(key: &str) -> bool {
         || normalized.contains("authorization")
 }
 
-fn contains_secret_like_text(value: &str) -> bool {
+pub(crate) fn contains_secret_like_text(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     lower.contains("-----begin private key-----")
         || lower.contains("-----begin rsa private key-----")

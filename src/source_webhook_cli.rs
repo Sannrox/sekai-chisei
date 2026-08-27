@@ -1,7 +1,8 @@
-//! sekaictl admin sync webhook commands (#673).
+//! sekaictl admin sync webhook and source-health commands (#673, #685).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use crate::sekai::source_health::{self, report_source_health};
 use crate::sekai::source_webhook::{self, SourceWebhookDelivery};
 use chrono::Utc;
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]"
+    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]"
 }
 
 pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -17,6 +18,7 @@ pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("pin-webhook-key") => pin_key(parse_pin(&args[1..])?).await,
         Some("list-webhook-keys") => list_keys(parse_list(&args[1..])?).await,
         Some("admit-webhook") => admit(parse_admit(&args[1..])?).await,
+        Some("health") => health(parse_health(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -172,6 +174,80 @@ fn parse_admit(args: &[String]) -> Result<AdmitConfig, String> {
     }
     Ok(AdmitConfig {
         bundle: bundle.ok_or("--bundle is required")?,
+        actor,
+    })
+}
+
+struct HealthConfig {
+    namespace: String,
+    source_instance: String,
+    type_digest: String,
+    delayed_after_ms: Option<i64>,
+    actor: String,
+}
+
+async fn health(config: HealthConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let query = source_health::parse_source_health_query(
+        &config.namespace,
+        &config.source_instance,
+        &config.type_digest,
+        config.delayed_after_ms,
+        None,
+    )
+    .map_err(std::io::Error::other)?;
+    let report = report_source_health(
+        db.as_ref(),
+        &config.actor,
+        &query,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
+    let mut namespace = None;
+    let mut source_instance = None;
+    let mut type_digest = None;
+    let mut delayed_after_ms = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--source-instance" => {
+                source_instance = Some(require_value(args, i, "--source-instance")?);
+                i += 2;
+            }
+            "--type-digest" => {
+                type_digest = Some(require_value(args, i, "--type-digest")?);
+                i += 2;
+            }
+            "--delayed-after-ms" => {
+                delayed_after_ms = Some(
+                    require_value(args, i, "--delayed-after-ms")?
+                        .parse::<i64>()
+                        .map_err(|_| "--delayed-after-ms must be an integer".to_string())?,
+                );
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown health option {other}")),
+        }
+    }
+    Ok(HealthConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        source_instance: source_instance.ok_or("--source-instance is required")?,
+        type_digest: type_digest.ok_or("--type-digest is required")?,
+        delayed_after_ms,
         actor,
     })
 }

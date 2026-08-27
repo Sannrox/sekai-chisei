@@ -66,3 +66,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0043: Keep learned changes inspectable and reversibly superseding](0043-reversible-learning-changes.md)
 - [ADR 0044: Query governed geospatial properties after property authorization](0044-governed-geospatial-queries.md)
 - [ADR 0045: Evaluate versioned data-quality rules as content-bound results](0045-governed-data-quality-rules.md)
+- [ADR 0046: Expose bounded source health as an authorized projection](0046-bounded-source-health.md)

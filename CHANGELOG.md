@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Report authorized `sekai.source-health/v1` checkpoint age, lag, last success,
+  and a bounded failure class for each source. Health is a projection of
+  existing object-sync state: it never writes a second checkpoint, stores
+  credentials, or probes a remote connector. Hidden and unknown sources share
+  one unavailable result. Unknown versions, foreign identity, invalid
+  checkpoints, and ambiguous lifecycle fail closed. `sekaictl admin sync health`
+  is the operator surface. SQLite and reusable PostgreSQL share
+  `get_source_sync_state` and the same in-process projector.
 - Evaluate a versioned `chisei.data-quality-rule/v1` against a typed dataset
   revision and retain a `chisei.data-quality-result/v1` receipt. Built-in
   evaluators are digest pin, completeness, and row-count bound. Pass, fail,
