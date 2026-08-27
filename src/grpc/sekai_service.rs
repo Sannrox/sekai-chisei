@@ -16959,6 +16959,350 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn property_level_reads_omit_hidden_values_across_query_surfaces() {
+        let svc = service();
+        let namespace = "column-reads";
+        for (id, secret) in [("visible-a", "classified"), ("visible-b", "other")] {
+            svc.db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: "document".into(),
+                    name: id.into(),
+                    namespace: namespace.into(),
+                    external_id: format!("{namespace}:{id}"),
+                    properties: HashMap::from([
+                        ("owner".into(), "alice".into()),
+                        ("state".into(), "open".into()),
+                        ("note".into(), "visible".into()),
+                        ("secret".into(), secret.into()),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        svc.db
+            .create_link(&domain::Link {
+                id: "column-reads-link".into(),
+                from_id: "visible-a".into(),
+                to_id: "visible-b".into(),
+                relation: "contains".into(),
+                created: 1,
+            })
+            .unwrap();
+        let grants = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: namespace.into(),
+            kind: "document".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![
+                crate::sekai::object_security::PropertyGrant {
+                    property: "owner".into(),
+                    access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                },
+                crate::sekai::object_security::PropertyGrant {
+                    property: "state".into(),
+                    access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                },
+                crate::sekai::object_security::PropertyGrant {
+                    property: "note".into(),
+                    access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                },
+            ]),
+            required_purpose: None,
+        };
+        let revision = svc
+            .db
+            .put_object_security_policy(&grants, "root", "put-column-reads", 1)
+            .unwrap();
+        svc.db
+            .activate_object_security_policies(
+                namespace,
+                &BTreeMap::from([("document".into(), revision.revision_digest)]),
+                "root",
+                "activate-column-reads",
+                2,
+            )
+            .unwrap();
+
+        let loaded = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "visible-a".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert_eq!(
+            loaded.properties.get("note").map(String::as_str),
+            Some("visible")
+        );
+        assert!(!loaded.properties.contains_key("secret"));
+
+        let listed = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "note".into(),
+                            op: "eq".into(),
+                            value: "visible".into(),
+                        }],
+                        order_by: "property:state".into(),
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.total, 2);
+        assert!(
+            listed
+                .objects
+                .iter()
+                .all(|object| !object.properties.contains_key("secret")
+                    && object.properties.get("note").map(String::as_str) == Some("visible"))
+        );
+
+        let hidden_filter = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "secret".into(),
+                            op: "eq".into(),
+                            value: "classified".into(),
+                        }],
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        let unknown_filter = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "unknown".into(),
+                            op: "eq".into(),
+                            value: "missing".into(),
+                        }],
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_filter.code(), tonic::Code::PermissionDenied);
+        assert_eq!(hidden_filter.message(), unknown_filter.message());
+        assert_eq!(hidden_filter.message(), "access denied");
+
+        let hidden_sort = svc
+            .list_objects(with_named_principal(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: namespace.into(),
+                        kind: "document".into(),
+                        order_by: "property:secret".into(),
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_sort.code(), tonic::Code::PermissionDenied);
+        assert_eq!(hidden_sort.message(), "access denied");
+
+        let hidden_find = svc
+            .find_by_property(with_named_principal(
+                FindByPropertyRequest {
+                    kind: "document".into(),
+                    key: "secret".into(),
+                    value: "classified".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_find.code(), tonic::Code::PermissionDenied);
+        assert_eq!(hidden_find.message(), "access denied");
+
+        let found = svc
+            .find_by_property(with_named_principal(
+                FindByPropertyRequest {
+                    kind: "document".into(),
+                    key: "state".into(),
+                    value: "open".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .objects;
+        assert!(
+            found
+                .iter()
+                .filter(|object| object.namespace == namespace)
+                .all(|object| !object.properties.contains_key("secret"))
+        );
+
+        let hidden_traverse = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "visible-a".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 1,
+                        property_filter: HashMap::from([("secret".into(), "classified".into())]),
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden_traverse.code(), tonic::Code::PermissionDenied);
+        assert_eq!(hidden_traverse.message(), "access denied");
+
+        let traversed = svc
+            .traverse(with_named_principal(
+                TraverseRequest {
+                    query: Some(GraphQuery {
+                        start_id: "visible-a".into(),
+                        relations: vec!["contains".into()],
+                        direction: "outgoing".into(),
+                        max_depth: 1,
+                        ..Default::default()
+                    }),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert_eq!(traversed.objects.len(), 1);
+        assert!(!traversed.objects[0].properties.contains_key("secret"));
+
+        let lineage = svc
+            .get_lineage(with_named_principal(
+                GetLineageRequest {
+                    object_id: "visible-a".into(),
+                    max_nodes: 20,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .result
+            .unwrap();
+        assert!(
+            lineage
+                .nodes
+                .iter()
+                .filter_map(|node| node.object.as_ref())
+                .all(|object| !object.properties.contains_key("secret"))
+        );
+
+        let retrieved = svc
+            .retrieve_context(with_named_principal(
+                RetrieveContextRequest {
+                    roots: vec![ContextRoot {
+                        object_id: "visible-a".into(),
+                        ..Default::default()
+                    }],
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    max_depth: 1,
+                    max_objects: 20,
+                    max_links: 20,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            retrieved
+                .candidates
+                .iter()
+                .filter_map(|candidate| candidate.object.as_ref())
+                .all(|object| !object.properties.contains_key("secret"))
+        );
+
+        let mut revoked = grants;
+        revoked.property_grants = Some(vec![
+            crate::sekai::object_security::PropertyGrant {
+                property: "owner".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+            crate::sekai::object_security::PropertyGrant {
+                property: "state".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            },
+        ]);
+        let revoked_revision = svc
+            .db
+            .put_object_security_policy(&revoked, "root", "put-column-revoke", 3)
+            .unwrap();
+        svc.db
+            .activate_object_security_policies(
+                namespace,
+                &BTreeMap::from([("document".into(), revoked_revision.revision_digest)]),
+                "root",
+                "activate-column-revoke",
+                4,
+            )
+            .unwrap();
+        let after_revoke = svc
+            .get_object(with_named_principal(
+                GetObjectRequest {
+                    id: "visible-a".into(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        assert!(!after_revoke.properties.contains_key("note"));
+        assert!(!after_revoke.properties.contains_key("secret"));
+    }
+
+    #[tokio::test]
     async fn retrieve_context_rejects_ambiguous_roots() {
         let err = service()
             .retrieve_context(with_principal(RetrieveContextRequest {

@@ -30,6 +30,16 @@ impl SekaiServiceImpl {
         tenant_context: Option<&RequestEnterpriseContext>,
         purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     ) -> Result<domain::Object, Status> {
+        object = self
+            .db
+            .project_object_property_grants(object)
+            .map_err(|error| {
+                if error.starts_with("object_security_denied") {
+                    Status::permission_denied("access denied")
+                } else {
+                    Status::unavailable("object authorization unavailable")
+                }
+            })?;
         let schema = self
             .schema_definitions
             .snapshot()
@@ -65,7 +75,9 @@ impl SekaiServiceImpl {
             },
         )
         .map_err(|error| {
-            if error.contains("purpose authorization unavailable")
+            if error.starts_with("object_security_denied") {
+                Status::permission_denied("access denied")
+            } else if error.contains("purpose authorization unavailable")
                 || error.contains("object authorization unavailable")
             {
                 Status::unavailable(error)

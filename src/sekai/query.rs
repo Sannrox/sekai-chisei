@@ -84,6 +84,15 @@ pub fn traverse_with_policy_context(
     } {
         seen_objects.insert(start_id.clone(), start);
     }
+    if policy_context.is_some()
+        && let Some(start) = seen_objects.get(&start_id)
+    {
+        db.reject_ungranted_property_query(
+            Some(&start.namespace),
+            Some(&start.kind),
+            q.property_filter.keys(),
+        )?;
+    }
     let mut result = GraphResult::default();
 
     for _ in 0..depth {
@@ -122,6 +131,13 @@ pub fn traverse_with_policy_context(
                     }
                     next.push_back(target.clone());
                     seen_objects.insert(target.clone(), obj.clone());
+                    if policy_context.is_some() {
+                        db.reject_ungranted_property_query(
+                            Some(&obj.namespace),
+                            Some(&obj.kind),
+                            q.property_filter.keys(),
+                        )?;
+                    }
                     if matches_filters(
                         &obj,
                         &kind_set,

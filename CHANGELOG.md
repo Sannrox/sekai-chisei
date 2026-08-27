@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Authorize property-level reads before every public query surface. Named
+  predicates and sorts fail closed whether the property is hidden or unknown.
+  Hidden values are omitted from get, list, find, traverse, lineage, and
+  context projections and cannot feed computed properties. Revocation applies
+  on the next statement.
 - Project typed events from registered streams with durable generation, epoch,
   and offset checkpoints. Exact replay is idempotent; gaps, late offsets,
   malformed batches, and foreign ownership fail without moving the checkpoint.

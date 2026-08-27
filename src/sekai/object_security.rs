@@ -882,6 +882,40 @@ mod tests {
     }
 
     #[test]
+    fn hidden_and_unknown_property_reads_are_indistinguishable() {
+        let mut input = serde_json::from_slice::<serde_json::Value>(&document(serde_json::json!([
+            {"operation":"read","predicates":[{"kind":"allow_all"}]}
+        ])))
+        .unwrap();
+        input["property_grants"] = serde_json::json!([
+            {"property":"owner","access":"read"},
+            {"property":"state","access":"read"},
+            {"property":"note","access":"read"}
+        ]);
+        let policy =
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .unwrap();
+        let mut classified = sample_object("alice");
+        classified.properties.insert("state".into(), "open".into());
+        classified
+            .properties
+            .insert("note".into(), "visible".into());
+        classified
+            .properties
+            .insert("secret".into(), "classified".into());
+        let mut twin = sample_object("alice");
+        twin.properties.insert("state".into(), "open".into());
+        twin.properties.insert("note".into(), "visible".into());
+        twin.properties.insert("secret".into(), "other".into());
+        policy.project_visible_properties(&mut classified);
+        policy.project_visible_properties(&mut twin);
+        assert_eq!(classified.properties, twin.properties);
+        assert!(!classified.properties.contains_key("secret"));
+        assert!(!policy.allows_property_access("secret", PropertyGrantAccess::Read));
+        assert!(!policy.allows_property_access("unknown", PropertyGrantAccess::Read));
+    }
+
+    #[test]
     fn property_grant_mutation_preserves_hidden_values_and_denies_ungranted_writes() {
         let mut input = serde_json::from_slice::<serde_json::Value>(&document(serde_json::json!([
             {"operation":"update","predicates":[{"kind":"allow_all"}]}

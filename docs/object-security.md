@@ -38,9 +38,12 @@ property on an authorized object remains visible and writable under the
 object-level rules. When the field is present, including as an empty array,
 unmentioned properties have no grant. Hidden properties are omitted from
 authorized reads, context, export, lineage, and synchronization projections;
-they are never fetched for client-side masking. Filters, ordering, and
-aggregation that name an ungranted property fail closed without distinguishing
-hidden from absent properties. Creates and updates require a `write` grant to
+they are never fetched for client-side masking. Every public query operator
+authorizes named property predicates and sorts before count, match, sort,
+traverse, or export. Filters, ordering, aggregation, and traversal that name
+an ungranted property fail closed without distinguishing hidden from absent
+properties. Computed properties evaluate only after that authorized
+projection. Creates and updates require a `write` grant to
 set or change a property; omitted unreadable properties are preserved from the
 stored object. Inbound synchronization requires a `write` grant for each source
 property. Unknown grant attributes or access tokens deny the policy.

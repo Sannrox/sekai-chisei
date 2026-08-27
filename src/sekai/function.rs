@@ -159,21 +159,38 @@ where
 {
     let mut objects: Vec<Object> = Vec::new();
     let mut result = FunctionResult::default();
+    let mut last_kind = source.map(|object| object.kind.clone());
 
     for step in &f.pipeline {
         match step.op.as_str() {
             "self" => {
                 objects = match source {
-                    Some(object) if allow(object)? => vec![object.clone()],
+                    Some(object) if allow(object)? => {
+                        vec![db.project_object_property_grants(object.clone())?]
+                    }
                     _ => Vec::new(),
                 };
             }
             "filter" => {
+                reject_named_property(
+                    db,
+                    source
+                        .map(|object| object.namespace.as_str())
+                        .filter(|namespace| !namespace.is_empty()),
+                    if step.kind.is_empty() {
+                        None
+                    } else {
+                        Some(step.kind.as_str())
+                    },
+                    &step.property,
+                )?;
                 let filter = crate::domain::ListFilter {
                     kind: Some(step.kind.clone()),
                     ..Default::default()
                 };
                 let mut filtered = db.list_all_objects(&filter)?;
+                retain_and_project(db, &mut filtered, &allow)?;
+                reject_named_property_for_objects(db, &filtered, &step.property)?;
                 if !step.property.is_empty() && !step.value.is_empty() {
                     let val = resolve_param(&step.value, params);
                     filtered.retain(|o| {
@@ -183,7 +200,9 @@ where
                             .unwrap_or(false)
                     });
                 }
-                retain_allowed(&mut filtered, &allow)?;
+                if !step.kind.is_empty() {
+                    last_kind = Some(step.kind.clone());
+                }
                 objects = filtered;
             }
             "traverse" => {
@@ -197,10 +216,13 @@ where
                     let linked = db.get_linked_objects(&obj.id, &step.relation, &dir)?;
                     next.extend(linked);
                 }
-                retain_allowed(&mut next, &allow)?;
+                retain_and_project(db, &mut next, &allow)?;
                 objects = next;
             }
             "aggregate" => {
+                if matches!(step.func.as_str(), "sum" | "avg" | "min" | "max") {
+                    reject_pipeline_field(db, source, &objects, last_kind.as_deref(), &step.field)?;
+                }
                 let alias = if step.alias.is_empty() {
                     &step.func
                 } else {
@@ -243,7 +265,7 @@ where
                 result.aggregates.insert(alias.to_string(), val);
             }
             "transform" => {
-                // Keep only objects that have the field set
+                reject_pipeline_field(db, source, &objects, last_kind.as_deref(), &step.field)?;
                 objects.retain(|o| o.properties.contains_key(&step.field));
             }
             _ => {}
@@ -264,6 +286,81 @@ where
         }
     }
     *objects = allowed;
+    Ok(())
+}
+
+fn retain_and_project<F>(db: &RuntimeDb, objects: &mut Vec<Object>, allow: &F) -> Result<(), String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    retain_allowed(objects, allow)?;
+    for object in objects.iter_mut() {
+        *object = db.project_object_property_grants(object.clone())?;
+    }
+    Ok(())
+}
+
+fn reject_named_property(
+    db: &RuntimeDb,
+    namespace: Option<&str>,
+    kind: Option<&str>,
+    property: &str,
+) -> Result<(), String> {
+    if property.is_empty() {
+        return Ok(());
+    }
+    db.reject_ungranted_property_query(namespace, kind, [property])
+}
+
+fn reject_pipeline_field(
+    db: &RuntimeDb,
+    source: Option<&Object>,
+    objects: &[Object],
+    last_kind: Option<&str>,
+    property: &str,
+) -> Result<(), String> {
+    if property.is_empty() {
+        return Ok(());
+    }
+    if !objects.is_empty() {
+        return reject_named_property_for_objects(db, objects, property);
+    }
+    reject_named_property(
+        db,
+        source
+            .map(|object| object.namespace.as_str())
+            .filter(|namespace| !namespace.is_empty()),
+        last_kind.or(source.map(|object| object.kind.as_str())),
+        property,
+    )
+}
+
+fn reject_named_property_for_objects(
+    db: &RuntimeDb,
+    objects: &[Object],
+    property: &str,
+) -> Result<(), String> {
+    if property.is_empty() || objects.is_empty() {
+        return Ok(());
+    }
+    let mut scopes = objects
+        .iter()
+        .map(|object| (object.namespace.as_str(), object.kind.as_str()))
+        .collect::<Vec<_>>();
+    scopes.sort_unstable();
+    scopes.dedup();
+    for (namespace, kind) in scopes {
+        reject_named_property(
+            db,
+            if namespace.is_empty() {
+                None
+            } else {
+                Some(namespace)
+            },
+            Some(kind),
+            property,
+        )?;
+    }
     Ok(())
 }
 
@@ -662,5 +759,150 @@ mod tests {
         assert_eq!(loaded.name, f.name);
         assert_eq!(loaded.params.len(), 1);
         assert_eq!(db.list_functions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn computed_pipeline_denies_hidden_property_predicates_and_aggregates() {
+        use crate::sekai::object_security::{
+            OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+            ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+        };
+        use std::collections::BTreeMap;
+
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let namespace = "compute-grants";
+        db.create_object(&Object {
+            id: format!("{namespace}:worker"),
+            kind: "document".into(),
+            name: "worker".into(),
+            namespace: namespace.into(),
+            external_id: format!("{namespace}:worker"),
+            properties: HashMap::from([
+                ("owner".into(), "alice".into()),
+                ("salary".into(), "120".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let policy = ObjectSecurityPolicy {
+            contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: namespace.into(),
+            kind: "document".into(),
+            rules: vec![ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Read,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Read,
+            }]),
+            required_purpose: None,
+        };
+        let revision = db
+            .put_object_security_policy(&policy, "root", "put-compute-grants", 1)
+            .unwrap();
+        db.activate_object_security_policies(
+            namespace,
+            &BTreeMap::from([("document".into(), revision.revision_digest)]),
+            "root",
+            "activate-compute-grants",
+            2,
+        )
+        .unwrap();
+
+        let hidden_filter = Function {
+            name: "filter_salary".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![PipelineStep {
+                op: "filter".into(),
+                kind: "document".into(),
+                property: "salary".into(),
+                value: "120".into(),
+                relation: "".into(),
+                dir: "".into(),
+                func: "".into(),
+                field: "".into(),
+                alias: "".into(),
+            }],
+        };
+        assert!(
+            execute(&db, &hidden_filter, &HashMap::new())
+                .unwrap_err()
+                .contains("object_security_denied")
+        );
+
+        let hidden_sum = Function {
+            name: "sum_salary".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                step("filter", "document", "", "", ""),
+                PipelineStep {
+                    op: "aggregate".into(),
+                    kind: "".into(),
+                    property: "".into(),
+                    value: "".into(),
+                    relation: "".into(),
+                    dir: "".into(),
+                    func: "sum".into(),
+                    field: "salary".into(),
+                    alias: "total".into(),
+                },
+            ],
+        };
+        assert!(
+            execute(&db, &hidden_sum, &HashMap::new())
+                .unwrap_err()
+                .contains("object_security_denied")
+        );
+
+        let empty_then_sum = Function {
+            name: "empty_sum_salary".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                PipelineStep {
+                    op: "filter".into(),
+                    kind: "document".into(),
+                    property: "owner".into(),
+                    value: "nobody".into(),
+                    relation: "".into(),
+                    dir: "".into(),
+                    func: "".into(),
+                    field: "".into(),
+                    alias: "".into(),
+                },
+                PipelineStep {
+                    op: "aggregate".into(),
+                    kind: "".into(),
+                    property: "".into(),
+                    value: "".into(),
+                    relation: "".into(),
+                    dir: "".into(),
+                    func: "sum".into(),
+                    field: "salary".into(),
+                    alias: "total".into(),
+                },
+            ],
+        };
+        assert!(
+            execute(&db, &empty_then_sum, &HashMap::new())
+                .unwrap_err()
+                .contains("object_security_denied"),
+            "aggregating a hidden field must deny even when the prior filter is empty"
+        );
+
+        db.delete_object(&format!("{namespace}:worker")).unwrap();
+        assert!(
+            execute(&db, &hidden_filter, &HashMap::new())
+                .unwrap_err()
+                .contains("object_security_denied"),
+            "naming a hidden property must deny even when no rows survive"
+        );
     }
 }

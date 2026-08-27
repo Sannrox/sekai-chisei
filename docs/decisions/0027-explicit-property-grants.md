@@ -44,9 +44,9 @@ ADR 0025 rejected.
 ## Consequences
 
 Operators who want property hiding install a new policy revision that includes
-`property_grants` and activate it atomically. Value-instance access, purpose
-binding, hierarchical classifications, and richer predicate vocabularies remain
-separate Issues.
+`property_grants` and activate it atomically. Cross-surface property-level
+reads are recorded in ADR 0038. Value-instance access remains a separate
+Issue.
 
 ## Validation
 

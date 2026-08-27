@@ -564,6 +564,200 @@ fn exercise_row_scoped_query_paths(db: &RuntimeDb, namespace: &str) {
     assert!(!lineage_ids.contains(&alice_leaf.id));
 }
 
+fn exercise_property_level_reads(db: &RuntimeDb, namespace: &str) {
+    let mut classified = object(namespace, "visible-a", "visible-a", "alice", "open");
+    classified
+        .properties
+        .insert("note".into(), "visible".into());
+    classified
+        .properties
+        .insert("secret".into(), "classified".into());
+    let mut twin = object(namespace, "visible-b", "visible-b", "alice", "open");
+    twin.properties.insert("note".into(), "visible".into());
+    twin.properties.insert("secret".into(), "other".into());
+    db.create_object(&classified).unwrap();
+    db.create_object(&twin).unwrap();
+    db.create_link(&Link {
+        id: format!("{namespace}:a-to-b"),
+        from_id: classified.id.clone(),
+        to_id: twin.id.clone(),
+        relation: "contains".into(),
+        created: 1,
+    })
+    .unwrap();
+
+    let grants = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "document".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "state".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "note".into(),
+                access: PropertyGrantAccess::Read,
+            },
+        ]),
+        required_purpose: None,
+    };
+    let revision = db
+        .put_object_security_policy(&grants, "root", "put-column-reads", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), revision.revision_digest)]),
+        "root",
+        "activate-column-reads",
+        2,
+    )
+    .unwrap();
+
+    let alice = PrincipalPolicyContext {
+        subjects: vec!["alice".into()],
+        scopes: vec![],
+    };
+    let hidden_filter = db
+        .find_by_property_with_policy_context("document", "secret", "classified", &alice)
+        .unwrap_err();
+    let unknown_filter = db
+        .find_by_property_with_policy_context("document", "unknown", "missing", &alice)
+        .unwrap_err();
+    assert!(hidden_filter.contains("object_security_denied"));
+    assert_eq!(hidden_filter, unknown_filter);
+    assert!(
+        query::traverse_with_policy_context(
+            db,
+            &GraphQuery {
+                start_id: classified.id.clone(),
+                relations: vec!["contains".into()],
+                direction: Direction::Outgoing,
+                max_depth: 1,
+                property_filter: HashMap::from([("secret".into(), "classified".into())]),
+                ..Default::default()
+            },
+            None,
+            Some(&alice),
+            None,
+        )
+        .unwrap_err()
+        .contains("object_security_denied")
+    );
+    assert!(
+        db.list_objects_with_total_for_policy_context(
+            &ListFilter {
+                namespace: Some(namespace.into()),
+                kind: Some("document".into()),
+                order_by: "property:secret".into(),
+                limit: 10,
+                ..Default::default()
+            },
+            &["alice"],
+            &[],
+            &alice,
+        )
+        .unwrap_err()
+        .contains("object_security_denied")
+    );
+
+    let mut found = db
+        .find_by_property_with_policy_context("document", "state", "open", &alice)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.namespace == namespace)
+        .map(|row| db.project_object_property_grants(row).unwrap())
+        .collect::<Vec<_>>();
+    found.sort_by(|left, right| left.id.cmp(&right.id));
+    assert_eq!(
+        found.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+        vec![classified.id.clone(), twin.id.clone()]
+    );
+    assert!(
+        found
+            .iter()
+            .all(|row| !row.properties.contains_key("secret")
+                && row.properties.get("note").map(String::as_str) == Some("visible"))
+    );
+
+    let traversed = query::traverse_with_policy_context(
+        db,
+        &GraphQuery {
+            start_id: classified.id.clone(),
+            relations: vec!["contains".into()],
+            direction: Direction::Outgoing,
+            max_depth: 1,
+            ..Default::default()
+        },
+        None,
+        Some(&alice),
+        None,
+    )
+    .unwrap();
+    let projected_hop = db
+        .project_object_property_grants(traversed.objects[0].clone())
+        .unwrap();
+    assert_eq!(projected_hop.id, twin.id);
+    assert!(!projected_hop.properties.contains_key("secret"));
+
+    let lineage = db
+        .get_lineage_with_policy_context(&classified.id, 20, &alice)
+        .unwrap();
+    assert!(
+        lineage
+            .nodes
+            .iter()
+            .map(|node| db
+                .project_object_property_grants(node.object.clone())
+                .unwrap())
+            .all(|object| !object.properties.contains_key("secret"))
+    );
+
+    let mut revoked = grants;
+    revoked.property_grants = Some(vec![
+        PropertyGrant {
+            property: "owner".into(),
+            access: PropertyGrantAccess::Read,
+        },
+        PropertyGrant {
+            property: "state".into(),
+            access: PropertyGrantAccess::Read,
+        },
+    ]);
+    let revoked_revision = db
+        .put_object_security_policy(&revoked, "root", "put-column-revoke", 3)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("document".into(), revoked_revision.revision_digest)]),
+        "root",
+        "activate-column-revoke",
+        4,
+    )
+    .unwrap();
+    let after_revoke = db
+        .project_object_property_grants(
+            db.get_object_with_policy_context(&classified.id, &alice)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    assert!(!after_revoke.properties.contains_key("note"));
+    assert!(!after_revoke.properties.contains_key("secret"));
+    assert_eq!(
+        after_revoke.properties.get("state").map(String::as_str),
+        Some("open")
+    );
+}
+
 fn exercise_purpose_bound_reads(db: &RuntimeDb, namespace: &str) {
     db.create_object(&object(namespace, "doc", "doc", "alice", "open"))
         .unwrap();
@@ -756,6 +950,7 @@ fn sqlite_object_security_conformance() {
     let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
     exercise(db.clone(), "object-security-sqlite");
     exercise_row_scoped_query_paths(&db, "row-scope-sqlite");
+    exercise_property_level_reads(&db, "column-reads-sqlite");
     exercise_purpose_bound_reads(&db, "purpose-sqlite");
     exercise_classification_lattices(&db, "lattice-sqlite");
 }
@@ -1074,6 +1269,10 @@ fn postgres_object_security_conformance() {
         &format!("object-security-{}", uuid::Uuid::new_v4().simple()),
     );
     exercise_row_scoped_query_paths(&db, &format!("row-scope-{}", uuid::Uuid::new_v4().simple()));
+    exercise_property_level_reads(
+        &db,
+        &format!("column-reads-{}", uuid::Uuid::new_v4().simple()),
+    );
     exercise_purpose_bound_reads(&db, &format!("purpose-{}", uuid::Uuid::new_v4().simple()));
     exercise_classification_lattices(&db, &format!("lattice-{}", uuid::Uuid::new_v4().simple()));
 
