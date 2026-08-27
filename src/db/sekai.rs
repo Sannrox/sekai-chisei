@@ -342,7 +342,17 @@ impl SekaiDb {
                 object_id TEXT NOT NULL,
                 fact_json TEXT NOT NULL,
                 PRIMARY KEY (import_id, object_id)
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS sekai_federation_conflicts (
+                conflict_id TEXT PRIMARY KEY,
+                namespace TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                record_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_federation_conflicts_object
+                ON sekai_federation_conflicts(namespace, object_id);",
         )
         .map_err(|e| e.to_string())?;
         Ok(())

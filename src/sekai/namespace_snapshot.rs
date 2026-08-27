@@ -513,19 +513,34 @@ pub fn import_namespace_snapshot(
 
     let mut conflicts = Vec::new();
     let mut stored = Vec::new();
+    let mut pending_conflicts = Vec::new();
     for fact in &bundle.facts {
         if fact.write_authority {
             return Err("imported facts cannot claim write authority".into());
         }
-        if db.get_object(&fact.object_id)?.is_some() {
+        if !fact.provenance.is_empty() {
+            authenticate_fact_provenance(db, fact)?;
+        }
+        if let Some(local) = db.get_object(&fact.object_id)? {
+            let (record, dirty) = crate::sekai::federation_conflict::prepare_import_collision(
+                db,
+                &crate::sekai::federation_conflict::ImportCollision {
+                    actor: actor.into(),
+                    namespace: namespace.into(),
+                    local,
+                    peer_fact: fact.clone(),
+                    peer_site_id: root.site_identity.clone(),
+                    snapshot_digest: bundle.manifest.content_digest.clone(),
+                    import_id: import_id.clone(),
+                    now_ms,
+                },
+            )?;
+            if dirty {
+                pending_conflicts.push(record);
+            }
             conflicts.push(fact.object_id.clone());
             continue;
         }
-        if fact.provenance.is_empty() {
-            stored.push(fact.clone());
-            continue;
-        }
-        authenticate_fact_provenance(db, fact)?;
         stored.push(fact.clone());
     }
 
@@ -555,7 +570,12 @@ pub fn import_namespace_snapshot(
         imported_by: actor.into(),
         imported_at_ms: now_ms,
     };
-    db.put_federation_snapshot_import(&record, &stored)?;
+    pending_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+    pending_conflicts.dedup_by(|left, right| left.conflict_id == right.conflict_id);
+    db.put_federation_snapshot_import(&record, &stored, &pending_conflicts)?;
+    for conflict in &pending_conflicts {
+        crate::sekai::federation_conflict::audit_admission(db, actor, conflict, now_ms)?;
+    }
     audit_import(db, actor, &record, now_ms)?;
     Ok(SnapshotImportResult { record, conflicts })
 }
@@ -1137,6 +1157,13 @@ fn snapshot_verification_errors(
     }
     if bundle.manifest.fact_count as usize != bundle.facts.len() {
         errors.push("manifest fact_count does not match facts".into());
+    }
+    let mut seen_facts = BTreeSet::new();
+    for fact in &bundle.facts {
+        if !seen_facts.insert(fact.object_id.clone()) {
+            errors.push("snapshot facts contain duplicate object ids".into());
+            break;
+        }
     }
     for fact in &bundle.facts {
         if fact.namespace != bundle.manifest.namespace {
@@ -1876,6 +1903,28 @@ mod tests {
     }
 
     #[test]
+    fn colliding_fact_still_authenticates_provenance() {
+        let (exporter, hop) = two_planes();
+        put_object(&exporter, "visible-1", None);
+        let first = export_from(&exporter, 1, 25_000);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 25_100).unwrap();
+        let mut forged = export_from(&hop, 2, 25_200);
+        forged.facts[0].provenance.remove(2);
+        resign(&mut forged, 2, "site-b", "k1", 25_300);
+        let sink = db();
+        federate_relay_sink(&sink, 1);
+        put_object(&sink, "visible-1", None);
+        let err = import_namespace_snapshot(&sink, "admin-c", "ops", &forged, 25_400).unwrap_err();
+        assert!(
+            err.contains("predecessor") || err.contains("provenance"),
+            "{err}"
+        );
+        assert!(
+            crate::sekai::federation_conflict::get_conflict(&sink, "ops", "visible-1").is_err()
+        );
+    }
+
+    #[test]
     fn rewritten_replica_body_fails_source_digest_check() {
         let (exporter, hop) = two_planes();
         put_object(&exporter, "visible-1", None);
@@ -2085,6 +2134,10 @@ mod tests {
             import_namespace_snapshot(&importer, "admin-b", "ops", &clean, 10_300).unwrap();
         assert_eq!(imported.record.status, "conflict");
         assert_eq!(imported.conflicts, vec!["visible-1".to_string()]);
+        let conflict =
+            crate::sekai::federation_conflict::get_conflict(&importer, "ops", "visible-1").unwrap();
+        assert_eq!(conflict.claims.len(), 2);
+        assert_eq!(conflict.status, "open");
         let replay =
             import_namespace_snapshot(&importer, "admin-b", "ops", &clean, 10_400).unwrap();
         assert_eq!(replay.conflicts, imported.conflicts);

@@ -131,6 +131,7 @@ impl SekaiDb {
         &self,
         record: &SnapshotImportRecord,
         facts: &[SnapshotFact],
+        conflicts: &[crate::sekai::federation_conflict::FederationConflict],
     ) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode snapshot import: {error}"))?;
@@ -160,6 +161,30 @@ impl SekaiDb {
                 "INSERT INTO sekai_federation_snapshot_facts (import_id, object_id, fact_json)
                  VALUES (?1, ?2, ?3)",
                 params![record.import_id, fact.object_id, fact_json],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        for conflict in conflicts {
+            let conflict_json = serde_json::to_string(conflict)
+                .map_err(|error| format!("encode federation conflict: {error}"))?;
+            tx.execute(
+                "INSERT INTO sekai_federation_conflicts
+                    (conflict_id, namespace, object_id, status, record_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(conflict_id) DO UPDATE SET
+                    namespace = excluded.namespace,
+                    object_id = excluded.object_id,
+                    status = excluded.status,
+                    record_json = excluded.record_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    conflict.conflict_id,
+                    conflict.namespace,
+                    conflict.object_id,
+                    conflict.status,
+                    conflict_json,
+                    conflict.updated_at_ms,
+                ],
             )
             .map_err(|error| error.to_string())?;
         }

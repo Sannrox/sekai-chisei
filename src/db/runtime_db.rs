@@ -4684,9 +4684,10 @@ impl RuntimeDb {
         &self,
         record: &crate::sekai::namespace_snapshot::SnapshotImportRecord,
         facts: &[crate::sekai::namespace_snapshot::SnapshotFact],
+        conflicts: &[crate::sekai::federation_conflict::FederationConflict],
     ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.put_federation_snapshot_import(record, facts),
+            Self::Sqlite(db) => db.put_federation_snapshot_import(record, facts, conflicts),
             Self::Postgres(_) => Err(
                 "put_federation_snapshot_import is unavailable on the PostgreSQL community runtime"
                     .into(),
@@ -4744,6 +4745,42 @@ impl RuntimeDb {
                 "list_federation_snapshot_facts is unavailable on the PostgreSQL community runtime"
                     .into(),
             ),
+        }
+    }
+
+    pub fn put_federation_conflict(
+        &self,
+        record: &crate::sekai::federation_conflict::FederationConflict,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_conflict(record),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn get_federation_conflict(
+        &self,
+        conflict_id: &str,
+    ) -> Result<Option<crate::sekai::federation_conflict::FederationConflict>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_conflict(conflict_id),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn list_federation_conflicts(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::sekai::federation_conflict::FederationConflict>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_conflicts(namespace),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_conflict::POSTGRES_UNAVAILABLE.into())
+            }
         }
     }
 

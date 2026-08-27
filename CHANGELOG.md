@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Preserve concurrent federation assertions as governed
+  `sekai.federation-conflict/v1` records. Import stores both claims, never
+  overwrites the local object or peer snapshot, and requires an explicit
+  reversible resolution. Unknown, untrusted, and hidden peer data still fail
+  closed before admission. `sekaictl admin federation` lists, shows, resolves,
+  and reopens conflicts. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Generate a revision-pinned Python ontology client from the same selected
   object, link, action, and function members as the TypeScript contract.
   Shared selection, scope, and fail-closed errors stay identical. The

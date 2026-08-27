@@ -7,7 +7,8 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/700
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0029](0029-signed-namespace-snapshots.md)
+- Related: [ADR 0029](0029-signed-namespace-snapshots.md),
+  [ADR 0041](0041-governed-federation-conflicts.md)
 
 ## Context
 
