@@ -32,6 +32,7 @@ mod governed_subject_provenance;
 pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;
+mod learning_change_store;
 pub mod lease;
 mod namespace_snapshot_store;
 pub mod object_security;

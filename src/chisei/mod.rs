@@ -29,6 +29,7 @@ pub mod gunshi_feedback_eval;
 pub mod gunshi_optimization;
 pub mod gunshi_policy;
 pub mod kioku;
+pub mod learning_change;
 pub mod lookup_first;
 pub use sekai_provider::model_availability;
 pub mod model_routing;

@@ -69,6 +69,8 @@ If you want to deploy or operate the control plane:
   receipt-reconciled quality, variance, regression, and baseline projections.
 - [Evaluation gate evidence](evaluation-gate-evidence.md) — server-owned,
   digest-bound, bounded evidence for release gates.
+- [Inspectable reversible learning changes](learning-changes.md) — evidence-bound
+  proposal, approval, activation, and rollback lineage.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable

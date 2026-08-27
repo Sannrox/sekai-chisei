@@ -4820,6 +4820,36 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_learning_change(
+        &self,
+        record: &crate::chisei::learning_change::LearningChange,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_learning_change(record),
+            Self::Postgres(_) => Err(crate::chisei::learning_change::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_learning_change(
+        &self,
+        change_id: &str,
+    ) -> Result<Option<crate::chisei::learning_change::LearningChange>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_learning_change(change_id),
+            Self::Postgres(_) => Err(crate::chisei::learning_change::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_learning_changes(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<Vec<crate::chisei::learning_change::LearningChange>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_learning_changes(namespace),
+            Self::Postgres(_) => Err(crate::chisei::learning_change::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn put_source_webhook_key(
         &self,
         pin: &crate::sekai::source_webhook::SourceWebhookKeyPin,
