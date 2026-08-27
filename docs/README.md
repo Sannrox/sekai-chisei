@@ -80,6 +80,8 @@ If you want to deploy or operate the control plane:
 - [Inbound object sync](object-sync.md) — bounded source batches, durable
   commit/abort, plane-owned checkpoints, and fixed GitHub Issue/PullRequest
   identity.
+- [Bounded source health](source-health.md) — authorized checkpoint age, lag,
+  last success, and failure class projected from object-sync state.
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered table snapshots.
 - [Event-stream projections](event-streams.md) — ordered batches with durable

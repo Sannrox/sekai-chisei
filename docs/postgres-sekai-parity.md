@@ -34,6 +34,9 @@ read/list predicates across SQLite and PostgreSQL. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test.
 `sekai.geospatial-query/v1` is a computed query on that authorized list:
 both backends share the same in-process evaluator after property grants.
+`sekai.source-health/v1` is a computed projection of authorized
+`get_source_sync_state`: both backends share the same in-process classifier
+and add no health table.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
