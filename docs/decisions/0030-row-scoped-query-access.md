@@ -35,8 +35,8 @@ Revocation applies on the next statement. List cursors remain bound to
 principal context, activation, and query digest.
 
 Signature, discovery, and client filters are not authority. ACL, team-namespace,
-and markings remain additional narrowing layers. Property-level grants stay a
-later issue.
+and markings remain additional narrowing layers. Property-level reads are
+recorded in ADR 0038.
 
 ## Alternatives considered
 

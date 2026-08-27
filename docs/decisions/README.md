@@ -58,3 +58,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0035: Admit signed source webhooks as object-sync transport](0035-source-webhook-transport.md)
 - [ADR 0036: Query registered Iceberg and Parquet snapshots as projections](0036-open-table-projections.md)
 - [ADR 0037: Project typed events with durable stream checkpoints](0037-event-stream-projections.md)
+- [ADR 0038: Authorize property-level reads before every public query surface](0038-property-level-reads.md)

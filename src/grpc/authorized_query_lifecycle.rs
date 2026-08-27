@@ -744,8 +744,18 @@ impl SekaiServiceImpl {
             .map_err(map_schema_definition_lifecycle_error)?;
         let queried_properties = gq.property_filter.keys().cloned().collect::<Vec<_>>();
         if gq.kind_filter.is_empty() {
-            ensure_property_query_allowed(&schema, &principals, "", queried_properties.clone())?;
-            ensure_property_grant_query_allowed(&self.db, None, None, queried_properties)?;
+            ensure_property_query_allowed(
+                &schema,
+                &principals,
+                &start.kind,
+                queried_properties.clone(),
+            )?;
+            ensure_property_grant_query_allowed(
+                &self.db,
+                Some(&start.namespace),
+                Some(&start.kind),
+                queried_properties,
+            )?;
         } else {
             for kind in &gq.kind_filter {
                 ensure_property_query_allowed(
@@ -756,7 +766,7 @@ impl SekaiServiceImpl {
                 )?;
                 ensure_property_grant_query_allowed(
                     &self.db,
-                    None,
+                    Some(&start.namespace),
                     Some(kind),
                     queried_properties.clone(),
                 )?;

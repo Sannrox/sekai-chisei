@@ -88,7 +88,9 @@ persist transaction. Inactive namespaces retain existing behavior; activated
 namespaces deny missing or unsupported policy while ACLs, team boundaries, and
 markings remain narrowing layers. Optional property grants then omit hidden
 values from authorized projections and fail closed on ungranted filters and
-writes. See
+writes. Every public query operator authorizes those grants before count,
+match, sort, traverse, or export; see
+[ADR 0038](decisions/0038-property-level-reads.md). See
 [Object security policy](object-security.md),
 [ADR 0025](decisions/0025-storage-enforced-object-security.md), and
 [ADR 0027](decisions/0027-explicit-property-grants.md).

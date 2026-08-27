@@ -1987,6 +1987,7 @@ impl RuntimeDb {
         value: &str,
         context: &PrincipalPolicyContext,
     ) -> Result<Vec<Object>, String> {
+        self.reject_ungranted_property_query(None, Some(kind), [key])?;
         match self {
             Self::Sqlite(db) => db.find_by_property_with_policy_context(kind, key, value, context),
             Self::Postgres(db) => {
