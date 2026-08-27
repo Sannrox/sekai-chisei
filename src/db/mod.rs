@@ -24,6 +24,7 @@ mod evaluation_plan;
 mod event_stream_store;
 pub mod evidence;
 mod federation_conflict_store;
+mod federation_revocation_store;
 mod federation_store;
 pub mod function;
 mod governed_facts;

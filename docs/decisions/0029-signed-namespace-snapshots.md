@@ -8,7 +8,8 @@
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0034](0034-cross-site-import-provenance.md),
-  [ADR 0041](0041-governed-federation-conflicts.md)
+  [ADR 0041](0041-governed-federation-conflicts.md),
+  [ADR 0042](0042-governed-federation-revocation.md)
 
 ## Context
 

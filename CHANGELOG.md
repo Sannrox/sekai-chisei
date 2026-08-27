@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Revoke peer, signer, grant, or snapshot-revision authority as governed
+  `sekai.federation-revocation/v1` records. Local verify and import fail
+  immediately. Snapshots, conflicts, and provenance stay retained.
+  Propagation acknowledgement stays `unknown` until reconnect observes
+  `denied` or `reconciled`. `sekaictl admin federation` revokes, lists, and
+  inspects that evidence. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Preserve concurrent federation assertions as governed
   `sekai.federation-conflict/v1` records. Import stores both claims, never
   overwrites the local object or peer snapshot, and requires an explicit
