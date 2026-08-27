@@ -3,7 +3,8 @@
 Query typed authorized projections over registered Iceberg tables and Parquet
 files. The plane does not open external storage, hold source credentials, or
 run a general compute engine. See
-[ADR 0036](decisions/0036-open-table-projections.md) and the
+[ADR 0036](decisions/0036-open-table-projections.md),
+[ADR 0047](decisions/0047-virtual-table-predicate-pushdown.md), and the
 `projection` class in
 [Discussion 746](https://github.com/Sannrox/sekai-chisei/discussions/746).
 
@@ -31,8 +32,13 @@ Register a source document, admit the matching snapshot, then query:
 sekaictl admin tables register --source ./source.json --actor analyst
 sekaictl admin tables admit-snapshot --snapshot ./snapshot.json --actor analyst
 sekaictl admin tables query --source-id iceberg:events \
-  --column id --column city --classification-ceiling internal --actor analyst
+  --column id --column city --filter city=eq:berlin --classification-ceiling internal \
+  --actor analyst
 ```
+
+Eligible predicates (`eq`, `neq`) may push to the registered Iceberg or Parquet
+adapter. Residual numeric predicates (`gt`, `gte`, `lt`, `lte`) stay local. The
+projection is admitted only when the local and adapter result digests match.
 
 The registering and querying actor must be the registered owner. A later
 snapshot is a new digest: the same owner re-registers the expected digest,
