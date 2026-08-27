@@ -317,11 +317,12 @@ pub fn query_geospatial(
         db.list_objects_with_total_for_policy_context(&filter, &[actor], &[], &context)?;
     let mut matches = Vec::new();
     for object in candidates {
-        let Some(raw) = object.properties.get(&query.property) else {
+        let projected = db.project_object_property_grants(object)?;
+        let Some(raw) = projected.properties.get(&query.property) else {
             continue;
         };
         if evaluate_geospatial_match(raw, query) {
-            matches.push(db.project_object_property_grants(object)?);
+            matches.push(projected);
         }
     }
     matches.sort_by(|left, right| left.id.cmp(&right.id));
@@ -574,6 +575,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            value_instance_grants: None,
             required_purpose: None,
         };
         let revision = db

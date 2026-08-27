@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Enforce value-instance access as an optional `value_instance_grants` cell
+  grant on `sekai.object-security-policy/v1`. Row predicates and property
+  grants still run first. Named cells are authorized before find, list,
+  traverse, export, or derived evaluation. Property sorts and non-equality
+  filters fail closed while cell grants are enforced. Hidden and unknown
+  cells share one unavailable result. Twin objects that differ only in a
+  hidden cell are indistinguishable. Revocation applies on the next
+  statement.
+  SQLite is the reference store; reusable PostgreSQL shares the same
+  deny-before-query and in-process projection rules.
 - Expose authorized `sekai.event-subscription/v1` consumer cursors over
   admitted event-stream projections. Pages bind stream identity, schema
   revision, and definition digest. Exact replay is idempotent. Gaps, late

@@ -2,7 +2,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, Object};
-use crate::sekai::object_security::PrincipalPolicyContext;
+use crate::sekai::object_security::{PrincipalPolicyContext, PropertyGrantAccess};
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -92,6 +92,13 @@ pub fn traverse_with_policy_context(
             Some(&start.kind),
             q.property_filter.keys(),
         )?;
+        db.reject_ungranted_value_instance_query(
+            Some(&start.namespace),
+            Some(&start.kind),
+            q.property_filter
+                .iter()
+                .map(|(property, value)| (property.as_str(), value.as_str())),
+        )?;
     }
     let mut result = GraphResult::default();
 
@@ -137,6 +144,16 @@ pub fn traverse_with_policy_context(
                             Some(&obj.kind),
                             q.property_filter.keys(),
                         )?;
+                        db.reject_ungranted_value_instance_query(
+                            Some(&obj.namespace),
+                            Some(&obj.kind),
+                            q.property_filter
+                                .iter()
+                                .map(|(property, value)| (property.as_str(), value.as_str())),
+                        )?;
+                    }
+                    if !object_allows_value_instance_filters(db, &obj, &q.property_filter)? {
+                        continue;
                     }
                     if matches_filters(
                         &obj,
@@ -161,6 +178,22 @@ pub fn traverse_with_policy_context(
         }
     }
     Ok(result)
+}
+
+fn object_allows_value_instance_filters(
+    db: &RuntimeDb,
+    object: &Object,
+    prop_filter: &HashMap<String, String>,
+) -> Result<bool, String> {
+    if prop_filter.is_empty() {
+        return Ok(true);
+    }
+    let Some(policy) = db.active_object_policy(&object.namespace, &object.kind)? else {
+        return Ok(true);
+    };
+    Ok(prop_filter.iter().all(|(property, value)| {
+        policy.allows_value_instance_access(&object.id, property, value, PropertyGrantAccess::Read)
+    }))
 }
 
 fn matches_filters(

@@ -267,6 +267,7 @@ impl RuntimeDb {
     pub fn project_object_property_grants(&self, mut object: Object) -> Result<Object, String> {
         if let Some(policy) = self.active_object_policy(&object.namespace, &object.kind)? {
             policy.project_visible_properties(&mut object);
+            policy.project_visible_value_instances(&mut object);
         }
         Ok(object)
     }
@@ -313,6 +314,145 @@ impl RuntimeDb {
             }
         }
         Ok(())
+    }
+
+    pub fn reject_ungranted_value_instance_query(
+        &self,
+        namespace: Option<&str>,
+        kind: Option<&str>,
+        cells: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+    ) -> Result<(), String> {
+        let cells = cells
+            .into_iter()
+            .map(|(property, value)| (property.as_ref().to_string(), value.as_ref().to_string()))
+            .filter(|(property, _)| !property.is_empty())
+            .collect::<Vec<_>>();
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let namespaces = match namespace.filter(|value| !value.is_empty()) {
+            Some(namespace) => vec![namespace.to_string()],
+            None => self.list_activated_object_security_namespaces()?,
+        };
+        let kind = kind.filter(|value| !value.is_empty());
+        for namespace in namespaces {
+            let Some(activation) = self.get_object_security_activation(&namespace)? else {
+                continue;
+            };
+            let kinds = match kind {
+                Some(kind) if activation.policies.contains_key(kind) => vec![kind.to_string()],
+                Some(_) => continue,
+                None => activation.policies.keys().cloned().collect(),
+            };
+            for kind in kinds {
+                let policy = match self.active_object_policy(&namespace, &kind) {
+                    Ok(Some(policy)) => policy,
+                    Ok(None) => continue,
+                    Err(error) => return Err(error),
+                };
+                for (property, value) in &cells {
+                    if !policy.allows_value_instance_query(
+                        property,
+                        value,
+                        crate::sekai::object_security::PropertyGrantAccess::Read,
+                    ) {
+                        return Err("object_security_denied: property filter is not granted".into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_granted_value_instance_matches(
+        &self,
+        objects: Vec<Object>,
+        cells: &[(String, String)],
+    ) -> Result<Vec<Object>, String> {
+        if cells.is_empty() {
+            return Ok(objects);
+        }
+        let mut kept = Vec::with_capacity(objects.len());
+        for object in objects {
+            let Some(policy) = self.active_object_policy(&object.namespace, &object.kind)? else {
+                kept.push(object);
+                continue;
+            };
+            if cells.iter().all(|(property, value)| {
+                object.properties.get(property).is_some_and(|stored| {
+                    stored == value
+                        && policy.allows_value_instance_access(
+                            &object.id,
+                            property,
+                            stored,
+                            crate::sekai::object_security::PropertyGrantAccess::Read,
+                        )
+                })
+            }) {
+                kept.push(object);
+            }
+        }
+        Ok(kept)
+    }
+
+    fn value_instance_grants_active(
+        &self,
+        namespace: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<bool, String> {
+        let namespaces = match namespace.filter(|value| !value.is_empty()) {
+            Some(namespace) => vec![namespace.to_string()],
+            None => self.list_activated_object_security_namespaces()?,
+        };
+        let kind = kind.filter(|value| !value.is_empty());
+        for namespace in namespaces {
+            let Some(activation) = self.get_object_security_activation(&namespace)? else {
+                continue;
+            };
+            let kinds = match kind {
+                Some(kind) if activation.policies.contains_key(kind) => vec![kind.to_string()],
+                Some(_) => continue,
+                None => activation.policies.keys().cloned().collect(),
+            };
+            for kind in kinds {
+                if self
+                    .active_object_policy(&namespace, &kind)?
+                    .is_some_and(|policy| policy.value_instance_grants_enforced())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn reject_value_instance_sort(
+        &self,
+        namespace: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<(), String> {
+        // Storage ORDER BY would rank hidden cells. Fail closed while cell
+        // grants are enforced rather than sorting an unauthorized projection.
+        if self.value_instance_grants_active(namespace, kind)? {
+            return Err("object_security_denied: property filter is not granted".into());
+        }
+        Ok(())
+    }
+
+    fn reject_value_instance_filter_ops(
+        &self,
+        namespace: Option<&str>,
+        kind: Option<&str>,
+        filters: &[crate::domain::PropertyFilter],
+    ) -> Result<(), String> {
+        if filters
+            .iter()
+            .all(|filter| filter.op.is_empty() || filter.op == "eq")
+            || !self.value_instance_grants_active(namespace, kind)?
+        {
+            return Ok(());
+        }
+        Err("object_security_denied: property filter is not granted".into())
     }
 
     pub fn list_activated_object_security_namespaces(&self) -> Result<Vec<String>, String> {
@@ -1988,12 +2128,14 @@ impl RuntimeDb {
         context: &PrincipalPolicyContext,
     ) -> Result<Vec<Object>, String> {
         self.reject_ungranted_property_query(None, Some(kind), [key])?;
-        match self {
+        self.reject_ungranted_value_instance_query(None, Some(kind), [(key, value)])?;
+        let rows = match self {
             Self::Sqlite(db) => db.find_by_property_with_policy_context(kind, key, value, context),
             Self::Postgres(db) => {
                 db.find_by_property_with_policy_context(kind, key, value, context)
             }
-        }
+        }?;
+        self.retain_granted_value_instance_matches(rows, &[(key.to_string(), value.to_string())])
     }
 
     pub fn find_gateway_receipt_by_logical_operation_id(
@@ -3461,23 +3603,107 @@ impl RuntimeDb {
         self.reject_ungranted_property_query(
             filter.namespace.as_deref(),
             filter.kind.as_deref(),
-            queried,
+            queried.clone(),
         )?;
-        let (rows, total) = match self {
-            Self::Sqlite(db) => db.list_objects_with_total_for_policy_context(
-                filter,
-                principals,
-                excluded_kinds,
-                context,
-            ),
-            Self::Postgres(db) => db.list_objects_with_total_for_policy_context(
-                filter,
-                principals,
-                excluded_kinds,
-                context,
-            ),
-        }?;
-        Ok((rows, total))
+        if !filter
+            .order_by
+            .strip_prefix("property:")
+            .unwrap_or("")
+            .is_empty()
+        {
+            self.reject_value_instance_sort(filter.namespace.as_deref(), filter.kind.as_deref())?;
+        }
+        self.reject_value_instance_filter_ops(
+            filter.namespace.as_deref(),
+            filter.kind.as_deref(),
+            &filter.property_filters,
+        )?;
+        let cells = filter
+            .property_filters
+            .iter()
+            .map(|property_filter| (property_filter.key.clone(), property_filter.value.clone()))
+            .collect::<Vec<_>>();
+        self.reject_ungranted_value_instance_query(
+            filter.namespace.as_deref(),
+            filter.kind.as_deref(),
+            cells
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
+        let cell_page = !cells.is_empty()
+            && self.value_instance_grants_active(
+                filter.namespace.as_deref(),
+                filter.kind.as_deref(),
+            )?;
+        if !cell_page {
+            let (rows, total) = match self {
+                Self::Sqlite(db) => db.list_objects_with_total_for_policy_context(
+                    filter,
+                    principals,
+                    excluded_kinds,
+                    context,
+                ),
+                Self::Postgres(db) => db.list_objects_with_total_for_policy_context(
+                    filter,
+                    principals,
+                    excluded_kinds,
+                    context,
+                ),
+            }?;
+            return self
+                .retain_granted_value_instance_matches(rows, &cells)
+                .map(|rows| (rows, total));
+        }
+        // Paginate the authorized relation. Callers such as
+        // `list_objects_with_marking` overwrite offset/limit to their scan
+        // window (offset starts at 0) and apply the user page after marking
+        // and purpose filters. `limit == i32::MAX` means the full authorized
+        // set, matching storage `list_all_objects`.
+        let offset = usize::try_from(filter.offset.max(0)).unwrap_or(0);
+        let limit = if filter.limit == i32::MAX {
+            usize::MAX
+        } else if filter.limit <= 0 {
+            crate::domain::DEFAULT_LIST_LIMIT as usize
+        } else {
+            filter.limit.min(crate::domain::MAX_LIST_LIMIT) as usize
+        };
+        let mut authorized = Vec::new();
+        let mut total = 0usize;
+        let mut storage_offset = 0i32;
+        loop {
+            let mut storage_filter = filter.clone();
+            storage_filter.limit = crate::domain::MAX_LIST_LIMIT;
+            storage_filter.offset = storage_offset;
+            let (page, _) = match self {
+                Self::Sqlite(db) => db.list_objects_with_total_for_policy_context(
+                    &storage_filter,
+                    principals,
+                    excluded_kinds,
+                    context,
+                ),
+                Self::Postgres(db) => db.list_objects_with_total_for_policy_context(
+                    &storage_filter,
+                    principals,
+                    excluded_kinds,
+                    context,
+                ),
+            }?;
+            let page_len = page.len();
+            for object in self.retain_granted_value_instance_matches(page, &cells)? {
+                if total >= offset && authorized.len() < limit {
+                    authorized.push(object);
+                }
+                total = total.saturating_add(1);
+            }
+            if page_len < crate::domain::MAX_LIST_LIMIT as usize {
+                break;
+            }
+            storage_offset = storage_offset.saturating_add(crate::domain::MAX_LIST_LIMIT);
+            if storage_offset >= i32::MAX - crate::domain::MAX_LIST_LIMIT {
+                break;
+            }
+        }
+        Ok((authorized, i32::try_from(total).unwrap_or(i32::MAX)))
     }
 
     pub fn list_objects_with_text_visibility(

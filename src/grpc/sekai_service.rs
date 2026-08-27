@@ -4069,6 +4069,18 @@ fn authorize_source_batch_object_policy(
                         }
                     }
                 }
+                if policy.value_instance_grants_enforced() {
+                    for (property, value) in &record.properties {
+                        if !policy.allows_value_instance_access(
+                            &object.id,
+                            property,
+                            value,
+                            crate::sekai::object_security::PropertyGrantAccess::Write,
+                        ) {
+                            return Err(Status::permission_denied("access denied"));
+                        }
+                    }
+                }
             }
             Err(error) if error.starts_with("object_security_denied") => {
                 return Err(Status::permission_denied("access denied"));
@@ -10763,6 +10775,7 @@ mod tests {
                     ],
                 }],
                 property_grants: None,
+                value_instance_grants: None,
                 required_purpose: None,
             };
             let revision = svc
@@ -10829,6 +10842,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            value_instance_grants: None,
             required_purpose: Some("incident-response".into()),
         };
         let revision = svc
@@ -11441,6 +11455,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            value_instance_grants: None,
             required_purpose: None,
         };
         let revision = svc
@@ -12147,6 +12162,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            value_instance_grants: None,
             required_purpose: None,
         };
         let owned_component = crate::sekai::object_security::ObjectSecurityPolicy {
@@ -12162,6 +12178,7 @@ mod tests {
                 ],
             }],
             property_grants: None,
+            value_instance_grants: None,
             required_purpose: None,
         };
         let cluster_revision = svc
@@ -15922,6 +15939,7 @@ mod tests {
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
             property_grants: None,
+            value_instance_grants: None,
             required_purpose: None,
         };
         let revision = svc
@@ -17012,6 +17030,7 @@ mod tests {
                     access: crate::sekai::object_security::PropertyGrantAccess::Read,
                 },
             ]),
+            value_instance_grants: None,
             required_purpose: None,
         };
         let revision = svc

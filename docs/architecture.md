@@ -90,7 +90,10 @@ markings remain narrowing layers. Optional property grants then omit hidden
 values from authorized projections and fail closed on ungranted filters and
 writes. Every public query operator authorizes those grants before count,
 match, sort, traverse, or export; see
-[ADR 0038](decisions/0038-property-level-reads.md). Spatial comparison of
+[ADR 0038](decisions/0038-property-level-reads.md). Optional value-instance
+grants then authorize named cells before the value is examined; hidden and
+unknown cells share one unavailable result; see
+[ADR 0049](decisions/0049-value-instance-access.md). Spatial comparison of
 named property claims uses the same grant check; see
 [ADR 0044](decisions/0044-governed-geospatial-queries.md). See
 [Object security policy](object-security.md),

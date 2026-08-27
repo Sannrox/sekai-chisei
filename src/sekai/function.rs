@@ -184,6 +184,24 @@ where
                     },
                     &step.property,
                 )?;
+                let val = if !step.property.is_empty() && !step.value.is_empty() {
+                    Some(resolve_param(&step.value, params))
+                } else {
+                    None
+                };
+                if let Some(value) = &val {
+                    db.reject_ungranted_value_instance_query(
+                        source
+                            .map(|object| object.namespace.as_str())
+                            .filter(|namespace| !namespace.is_empty()),
+                        if step.kind.is_empty() {
+                            None
+                        } else {
+                            Some(step.kind.as_str())
+                        },
+                        [(step.property.as_str(), value.as_str())],
+                    )?;
+                }
                 let filter = crate::domain::ListFilter {
                     kind: Some(step.kind.clone()),
                     ..Default::default()
@@ -191,8 +209,7 @@ where
                 let mut filtered = db.list_all_objects(&filter)?;
                 retain_and_project(db, &mut filtered, &allow)?;
                 reject_named_property_for_objects(db, &filtered, &step.property)?;
-                if !step.property.is_empty() && !step.value.is_empty() {
-                    let val = resolve_param(&step.value, params);
+                if let Some(val) = val {
                     filtered.retain(|o| {
                         o.properties
                             .get(&step.property)
@@ -797,6 +814,7 @@ mod tests {
                 property: "owner".into(),
                 access: PropertyGrantAccess::Read,
             }]),
+            value_instance_grants: None,
             required_purpose: None,
         };
         let revision = db

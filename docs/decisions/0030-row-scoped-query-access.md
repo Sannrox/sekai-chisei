@@ -7,7 +7,9 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/677
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0044](0044-governed-geospatial-queries.md)
+- Related: [ADR 0038](0038-property-level-reads.md),
+  [ADR 0044](0044-governed-geospatial-queries.md),
+  [ADR 0049](0049-value-instance-access.md)
 
 ## Context
 
@@ -37,7 +39,7 @@ principal context, activation, and query digest.
 
 Signature, discovery, and client filters are not authority. ACL, team-namespace,
 and markings remain additional narrowing layers. Property-level reads are
-recorded in ADR 0038.
+recorded in ADR 0038. Value-instance access is recorded in ADR 0049.
 
 ## Alternatives considered
 

@@ -46,8 +46,8 @@ ADR 0025 rejected.
 
 Operators who want property hiding install a new policy revision that includes
 `property_grants` and activate it atomically. Cross-surface property-level
-reads are recorded in ADR 0038. Value-instance access remains a separate
-Issue.
+reads are recorded in ADR 0038. Value-instance access is recorded in
+ADR 0049.
 
 ## Validation
 
