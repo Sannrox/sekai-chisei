@@ -29,6 +29,7 @@ pub mod evidence_store;
 pub mod execution_evidence;
 pub mod federation_conflict;
 pub mod federation_profile;
+pub mod federation_revocation;
 pub mod function;
 pub mod governed_action_type;
 pub mod governed_facts;

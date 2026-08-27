@@ -6,6 +6,7 @@ use crate::sekai::federation_conflict;
 use crate::sekai::federation_profile::{
     self, JoinPeerRequest, LocalSiteIdentity, PeerHealth, PolicyPackPin, TRUST_ROOT_NAMESPACE,
 };
+use crate::sekai::federation_revocation;
 use crate::sekai::namespace_snapshot::{self, ExportSnapshotRequest, GrantNamespaceRequest};
 use crate::sekai::peer_import::PeerTrustRoot;
 use chrono::Utc;
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>\n  sekaictl admin federation show-snapshot-provenance --import-id <id> --object-id <id>\n  sekaictl admin federation list-conflicts [--namespace <ns>]\n  sekaictl admin federation show-conflict --namespace <ns> --object-id <id>\n  sekaictl admin federation resolve-conflict --namespace <ns> --object-id <id> --claim-id <id> [--actor <principal>]\n  sekaictl admin federation reopen-conflict --namespace <ns> --object-id <id> [--actor <principal>]"
+    "sekaictl admin federation register-site --site-id <id> --key-id <id> --public-key-hex <hex> [--region <label>] [--data-class <class>]... [--actor <principal>]\n  sekaictl admin federation show-site\n  sekaictl admin federation pin-trust-root --site-identity <id> --key-id <id> --public-key-hex <hex> [--namespace <ns>] [--actor <principal>]\n  sekaictl admin federation join --peer-site-id <id> --peer-key-id <id> --peer-public-key-hex <hex> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--region <label>] [--data-class <class>]... [--trust-namespace <ns>] [--actor <principal>]\n  sekaictl admin federation leave --peer-site-id <id> [--actor <principal>]\n  sekaictl admin federation set-health --peer-site-id <id> --health up|down|unknown\n  sekaictl admin federation set-pack-pin --peer-site-id <id> --pack-id <id> --pack-version <ver> --pack-digest <digest>\n  sekaictl admin federation list-peers\n  sekaictl admin federation import-availability --peer-site-id <id>\n  sekaictl admin federation grant-namespace --peer-site-id <id> --namespace <ns> [--kind <kind>]... [--max-classification <class>] [--not-before-ms <ts>] [--not-after-ms <ts>] [--actor <principal>]\n  sekaictl admin federation revoke-namespace-grant --grant-id <id> [--actor <principal>]\n  sekaictl admin federation list-namespace-grants [--namespace <ns>] [--peer-site-id <id>]\n  sekaictl admin federation export-snapshot --namespace <ns> --output <file> --signing-key <file> --pack-id <id> --pack-version <ver> --pack-digest <digest> [--kind <kind>]... [--actor <principal>] [--not-before-ms <ts>] [--not-after-ms <ts>]\n  sekaictl admin federation import-snapshot --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin federation list-snapshot-imports [--namespace <ns>]\n  sekaictl admin federation show-snapshot-facts --import-id <id>\n  sekaictl admin federation show-snapshot-provenance --import-id <id> --object-id <id>\n  sekaictl admin federation list-conflicts [--namespace <ns>]\n  sekaictl admin federation show-conflict --namespace <ns> --object-id <id>\n  sekaictl admin federation resolve-conflict --namespace <ns> --object-id <id> --claim-id <id> [--actor <principal>]\n  sekaictl admin federation reopen-conflict --namespace <ns> --object-id <id> [--actor <principal>]\n  sekaictl admin federation revoke-authority --kind peer|signer|grant|snapshot-revision --subject <id> --peer-site-id <id> [--reason <text>] [--actor <principal>]\n  sekaictl admin federation list-revocations [--kind peer|signer|grant|snapshot-revision]\n  sekaictl admin federation show-revocation --kind peer|signer|grant|snapshot-revision --subject <id>\n  sekaictl admin federation show-revocation-propagation --kind peer|signer|grant|snapshot-revision --subject <id>"
 }
 
 pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -51,6 +52,12 @@ pub async fn run_federation_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("show-conflict") => show_conflict(parse_show_conflict(&args[1..])?).await,
         Some("resolve-conflict") => resolve_conflict(parse_resolve_conflict(&args[1..])?).await,
         Some("reopen-conflict") => reopen_conflict(parse_reopen_conflict(&args[1..])?).await,
+        Some("revoke-authority") => revoke_authority(parse_revoke_authority(&args[1..])?).await,
+        Some("list-revocations") => list_revocations(parse_list_revocations(&args[1..])?).await,
+        Some("show-revocation") => show_revocation(parse_show_revocation(&args[1..])?).await,
+        Some("show-revocation-propagation") => {
+            show_revocation_propagation(parse_show_revocation(&args[1..])?).await
+        }
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -750,6 +757,70 @@ async fn reopen_conflict(config: ReopenConflictConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct RevokeAuthorityConfig {
+    kind: federation_revocation::SubjectKind,
+    subject_id: String,
+    peer_site_id: String,
+    reason: String,
+    actor: String,
+}
+
+async fn revoke_authority(config: RevokeAuthorityConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record = federation_revocation::revoke_authority(
+        db.as_ref(),
+        &config.actor,
+        &federation_revocation::RevokeAuthorityRequest {
+            kind: config.kind,
+            subject_id: config.subject_id,
+            peer_site_id: config.peer_site_id,
+            reason: config.reason,
+        },
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ListRevocationsConfig {
+    kind: Option<federation_revocation::SubjectKind>,
+}
+
+async fn list_revocations(config: ListRevocationsConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let records = federation_revocation::list_revocations(db.as_ref(), config.kind)
+        .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&records)?);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ShowRevocationConfig {
+    kind: federation_revocation::SubjectKind,
+    subject_id: String,
+}
+
+async fn show_revocation(config: ShowRevocationConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record =
+        federation_revocation::get_revocation(db.as_ref(), config.kind, &config.subject_id)
+            .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
+}
+
+async fn show_revocation_propagation(config: ShowRevocationConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let record =
+        federation_revocation::get_revocation(db.as_ref(), config.kind, &config.subject_id)
+            .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&record.propagation)?);
+    Ok(())
+}
+
 fn parse_grant_namespace(args: &[String]) -> Result<GrantNamespaceConfig, String> {
     let mut peer_site_id = None;
     let mut namespace = None;
@@ -1105,6 +1176,91 @@ fn parse_reopen_conflict(args: &[String]) -> Result<ReopenConflictConfig, String
         namespace: namespace.ok_or("--namespace is required")?,
         object_id: object_id.ok_or("--object-id is required")?,
         actor,
+    })
+}
+
+fn parse_revoke_authority(args: &[String]) -> Result<RevokeAuthorityConfig, String> {
+    let mut kind = None;
+    let mut subject_id = None;
+    let mut peer_site_id = None;
+    let mut reason = String::new();
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => {
+                kind = Some(federation_revocation::SubjectKind::parse(&require_value(
+                    args, i, "--kind",
+                )?)?);
+                i += 2;
+            }
+            "--subject" => {
+                subject_id = Some(require_value(args, i, "--subject")?);
+                i += 2;
+            }
+            "--peer-site-id" => {
+                peer_site_id = Some(require_value(args, i, "--peer-site-id")?);
+                i += 2;
+            }
+            "--reason" => {
+                reason = require_value(args, i, "--reason")?;
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown revoke-authority option {other}")),
+        }
+    }
+    Ok(RevokeAuthorityConfig {
+        kind: kind.ok_or("--kind is required")?,
+        subject_id: subject_id.ok_or("--subject is required")?,
+        peer_site_id: peer_site_id.ok_or("--peer-site-id is required")?,
+        reason,
+        actor,
+    })
+}
+
+fn parse_list_revocations(args: &[String]) -> Result<ListRevocationsConfig, String> {
+    let mut kind = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => {
+                kind = Some(federation_revocation::SubjectKind::parse(&require_value(
+                    args, i, "--kind",
+                )?)?);
+                i += 2;
+            }
+            other => return Err(format!("unknown list-revocations option {other}")),
+        }
+    }
+    Ok(ListRevocationsConfig { kind })
+}
+
+fn parse_show_revocation(args: &[String]) -> Result<ShowRevocationConfig, String> {
+    let mut kind = None;
+    let mut subject_id = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kind" => {
+                kind = Some(federation_revocation::SubjectKind::parse(&require_value(
+                    args, i, "--kind",
+                )?)?);
+                i += 2;
+            }
+            "--subject" => {
+                subject_id = Some(require_value(args, i, "--subject")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown show-revocation option {other}")),
+        }
+    }
+    Ok(ShowRevocationConfig {
+        kind: kind.ok_or("--kind is required")?,
+        subject_id: subject_id.ok_or("--subject is required")?,
     })
 }
 

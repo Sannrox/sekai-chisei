@@ -270,12 +270,34 @@ pub fn revoke_namespace_grant(
         .get_federation_namespace_grant(grant_id)?
         .ok_or_else(|| format!("unknown namespace grant {grant_id}"))?;
     if grant.revoked {
+        crate::sekai::federation_revocation::revoke_authority(
+            db,
+            actor,
+            &crate::sekai::federation_revocation::RevokeAuthorityRequest {
+                kind: crate::sekai::federation_revocation::SubjectKind::Grant,
+                subject_id: grant.grant_id.clone(),
+                peer_site_id: grant.peer_site_id.clone(),
+                reason: "namespace grant revoked".into(),
+            },
+            now_ms,
+        )?;
         return Ok(grant);
     }
     grant.revoked = true;
     grant.revoked_at_ms = Some(now_ms);
     db.put_federation_namespace_grant(&grant)?;
     audit_grant(db, actor, REVOKE_GRANT_ACTION, "revoked", &grant, now_ms)?;
+    crate::sekai::federation_revocation::revoke_authority(
+        db,
+        actor,
+        &crate::sekai::federation_revocation::RevokeAuthorityRequest {
+            kind: crate::sekai::federation_revocation::SubjectKind::Grant,
+            subject_id: grant.grant_id.clone(),
+            peer_site_id: grant.peer_site_id.clone(),
+            reason: "namespace grant revoked".into(),
+        },
+        now_ms,
+    )?;
     Ok(grant)
 }
 
@@ -474,8 +496,26 @@ pub fn import_namespace_snapshot(
         return Err("bundle residency conflicts with local or peer residency policy".into());
     }
 
+    crate::sekai::federation_revocation::deny_revoked_import(
+        db,
+        &crate::sekai::federation_revocation::ImportSubjects {
+            peer_site_id: root.site_identity.clone(),
+            signer_id: crate::sekai::federation_revocation::signer_subject(
+                &root.site_identity,
+                &root.key_id,
+            ),
+            snapshot_digest: bundle.manifest.content_digest.clone(),
+            now_ms,
+        },
+    )?;
+
     let grants = active_grants(db, &root.site_identity, namespace, now_ms)?;
     if grants.is_empty() {
+        crate::sekai::federation_revocation::observe_revoked_grants(
+            db,
+            &root.site_identity,
+            now_ms,
+        )?;
         return Err("no explicit namespace grant for peer".into());
     }
     if bundle.manifest.not_before_ms > now_ms
@@ -577,6 +617,12 @@ pub fn import_namespace_snapshot(
         crate::sekai::federation_conflict::audit_admission(db, actor, conflict, now_ms)?;
     }
     audit_import(db, actor, &record, now_ms)?;
+    crate::sekai::federation_revocation::reconcile_unpresented_revisions(
+        db,
+        &root.site_identity,
+        &bundle.manifest.content_digest,
+        now_ms,
+    )?;
     Ok(SnapshotImportResult { record, conflicts })
 }
 

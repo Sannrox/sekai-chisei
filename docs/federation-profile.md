@@ -145,6 +145,27 @@ A local collision admits a governed conflict. `list-conflicts` and
 reverses that choice and keeps the prior resolution in history. Neither
 command rewrites the local object, the peer snapshot, or provenance hops.
 
+## Authority revocation (#703)
+
+`sekai.federation-revocation/v1` withdraws peer, signer, grant, or
+snapshot-revision authority as a local governed object. Import and verify that
+depend on the subject fail immediately. Snapshots, conflicts, and provenance
+stay on the plane.
+
+```text
+DB_PATH=data/site-b.db sekaictl admin federation revoke-authority \
+  --kind peer --subject site-a --peer-site-id site-a --reason withdrawn
+DB_PATH=data/site-b.db sekaictl admin federation list-revocations
+DB_PATH=data/site-b.db sekaictl admin federation show-revocation-propagation \
+  --kind peer --subject site-a
+```
+
+Acknowledgement starts as `unknown` so a disconnected peer is not claimed to
+have received the withdrawal. A reconnect that still presents the subject
+records `denied`. A later accepted snapshot that no longer presents a revoked
+revision records `reconciled`. Reconnect cannot restore the withdrawn
+authority.
+
 ## Forbidden remote control
 
 Library guard: `federation_profile::evaluate_remote_control` and
@@ -182,6 +203,10 @@ sekaictl admin federation list-conflicts ...
 sekaictl admin federation show-conflict ...
 sekaictl admin federation resolve-conflict ...
 sekaictl admin federation reopen-conflict ...
+sekaictl admin federation revoke-authority ...
+sekaictl admin federation list-revocations ...
+sekaictl admin federation show-revocation ...
+sekaictl admin federation show-revocation-propagation ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as

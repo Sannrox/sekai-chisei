@@ -4784,6 +4784,42 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_federation_revocation(
+        &self,
+        record: &crate::sekai::federation_revocation::FederationRevocation,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_federation_revocation(record),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn get_federation_revocation(
+        &self,
+        revocation_id: &str,
+    ) -> Result<Option<crate::sekai::federation_revocation::FederationRevocation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_federation_revocation(revocation_id),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn list_federation_revocations(
+        &self,
+        subject_kind: Option<&str>,
+    ) -> Result<Vec<crate::sekai::federation_revocation::FederationRevocation>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_federation_revocations(subject_kind),
+            Self::Postgres(_) => {
+                Err(crate::sekai::federation_revocation::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
     pub fn put_source_webhook_key(
         &self,
         pin: &crate::sekai::source_webhook::SourceWebhookKeyPin,
