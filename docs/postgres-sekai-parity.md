@@ -61,6 +61,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - event-stream projections and checkpoints
   (`sekai.event-stream-projection/v1`; see
   [ADR 0037](decisions/0037-event-stream-projections.md));
+- governed documents and renditions
+  (`sekai.governed-document/v1`; see
+  [ADR 0039](decisions/0039-governed-documents.md));
 
 Evidence is checked in as:
 

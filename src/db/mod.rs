@@ -17,6 +17,7 @@ pub mod decision;
 pub mod deduplication;
 pub mod definition_branch;
 pub mod definition_migration;
+mod document_store;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;

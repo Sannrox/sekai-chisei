@@ -59,3 +59,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0036: Query registered Iceberg and Parquet snapshots as projections](0036-open-table-projections.md)
 - [ADR 0037: Project typed events with durable stream checkpoints](0037-event-stream-projections.md)
 - [ADR 0038: Authorize property-level reads before every public query surface](0038-property-level-reads.md)
+- [ADR 0039: Govern documents as objects with digest-bound renditions](0039-governed-documents.md)

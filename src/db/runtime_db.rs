@@ -4871,6 +4871,59 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_governed_document(
+        &self,
+        document: &crate::sekai::document::GovernedDocument,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_document(document),
+            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_governed_document(
+        &self,
+        namespace: &str,
+        document_id: &str,
+    ) -> Result<Option<crate::sekai::document::GovernedDocument>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_document(namespace, document_id),
+            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_governed_rendition(
+        &self,
+        rendition: &crate::sekai::document::DocumentRendition,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_rendition(rendition),
+            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_governed_renditions(
+        &self,
+        namespace: &str,
+        document_id: &str,
+    ) -> Result<Vec<crate::sekai::document::DocumentRendition>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_renditions(namespace, document_id),
+            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn delete_governed_renditions(
+        &self,
+        namespace: &str,
+        document_id: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_governed_renditions(namespace, document_id),
+            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_eval_run_record(&self, id: &str) -> Result<Option<eval::Run>, String> {
         match self {
             Self::Sqlite(db) => db.get_eval_run_record(id),

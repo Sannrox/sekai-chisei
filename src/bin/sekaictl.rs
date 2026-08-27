@@ -86,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::event_stream_cli::run_streams_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "documents" => {
+            sekai_chisei::document_cli::run_documents_command(args.into_iter().skip(1).collect())
+                .await
+        }
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
@@ -402,6 +406,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("sync"), _) => ("sync", 2),
         (Some("tables"), _) => ("tables", 2),
         (Some("streams"), _) => ("streams", 2),
+        (Some("documents"), _) => ("documents", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -580,7 +585,10 @@ fn print_admin_usage() {
            sekaictl admin tables ...\n\
          \n\
          Streams:\n\
-           sekaictl admin streams ..."
+           sekaictl admin streams ...\n\
+         \n\
+         Documents:\n\
+           sekaictl admin documents ..."
     );
 }
 
@@ -607,6 +615,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "sync" => Some(sekai_chisei::source_webhook_cli::usage().to_string()),
         "tables" => Some(sekai_chisei::open_table_cli::usage().to_string()),
         "streams" => Some(sekai_chisei::event_stream_cli::usage().to_string()),
+        "documents" => Some(sekai_chisei::document_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -630,6 +639,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "sync" => Some("admin sync"),
         "tables" => Some("admin tables"),
         "streams" => Some("admin streams"),
+        "documents" => Some("admin documents"),
         _ => None,
     }
 }
@@ -677,6 +687,7 @@ mod tests {
             (vec!["sync"], "sync"),
             (vec!["tables"], "tables"),
             (vec!["streams"], "streams"),
+            (vec!["documents"], "documents"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -720,6 +731,7 @@ mod tests {
             "sync",
             "tables",
             "streams",
+            "documents",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));
