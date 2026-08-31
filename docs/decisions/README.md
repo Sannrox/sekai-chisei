@@ -78,3 +78,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0055: Certify connectors against an immutable digest](0055-connector-certification.md)
 - [ADR 0056: Export warehouse projections with security-metadata pins](0056-warehouse-projections.md)
 - [ADR 0057: Export partitioned lakehouse snapshots with schema evolution](0057-lakehouse-snapshots.md)
+- [ADR 0058: Certify model-platform adapters against evaluation evidence](0058-model-platform-certification.md)

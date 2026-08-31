@@ -101,6 +101,8 @@ If you want to deploy or operate the control plane:
   incremental pages with replay, deletion, lineage, and security-metadata pins.
 - [Governed lakehouse snapshots](lakehouse-snapshots.md) — partitioned
   versioned snapshots with schema evolution, redaction, deletion, and re-import.
+- [Model-platform adapter certification](model-platform-certification.md) —
+  capability, streaming, usage, fallback, and receipt protocol evidence.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,

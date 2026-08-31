@@ -1,0 +1,14 @@
+{
+  "certification_id": "mp:responses",
+  "namespace": "ops",
+  "owner": "integrator",
+  "evidence_id": "ev:mp:responses",
+  "requested": ["streaming"],
+  "supported": ["streaming", "usage", "fallback", "receipt"],
+  "events": ["response.output_text.delta", "response.completed"],
+  "interrupted": false,
+  "input_tokens": 3,
+  "output_tokens": 2,
+  "retry_safety": "safe",
+  "operation_id": "op:mp:responses"
+}

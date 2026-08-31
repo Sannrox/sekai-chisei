@@ -307,3 +307,21 @@ conformance:
 ```sh
 cargo test --test lakehouse_snapshot_adapters
 ```
+
+## Model-platform adapters
+
+`model_responses.rs` and `model_messages.rs` map domain-neutral Responses
+and Messages protocol documents onto
+`sekai.model-platform-certification/v1`. They certify capability,
+streaming, usage, fallback, and receipt fixtures and pin
+`sekai.evaluation-evidence/v1`. Unsupported capability and ambiguous
+usage fail closed. Exact digest replay is idempotent. Revocation is
+terminal.
+
+The adapters never write graph, policy, budget, or receipt rows. Hidden
+fields, foreign tenants, and unknown versions fail closed. Offline
+conformance:
+
+```sh
+cargo test --test model_platform_adapters
+```

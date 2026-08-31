@@ -104,6 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+        "providers" => {
+            sekai_chisei::model_platform_cli::run_providers_command(
+                args.into_iter().skip(1).collect(),
+            )
+            .await
+        }
         "learning" => {
             sekai_chisei::learning_cli::run_learning_command(args.into_iter().skip(1).collect())
                 .await
@@ -474,6 +480,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("connectors"), _) => ("connectors", 2),
         (Some("warehouse"), _) => ("warehouse", 2),
         (Some("lakehouse"), _) => ("lakehouse", 2),
+        (Some("providers"), _) => ("providers", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -688,7 +695,10 @@ fn print_admin_usage() {
            sekaictl admin warehouse ...\n\
          \n\
          Lakehouse:\n\
-           sekaictl admin lakehouse ..."
+           sekaictl admin lakehouse ...\n\
+         \n\
+         Providers:\n\
+           sekaictl admin providers ..."
     );
 }
 
@@ -727,6 +737,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "connectors" => Some(sekai_chisei::connector_certification_cli::usage().to_string()),
         "warehouse" => Some(sekai_chisei::warehouse_projection_cli::usage().to_string()),
         "lakehouse" => Some(sekai_chisei::lakehouse_snapshot_cli::usage().to_string()),
+        "providers" => Some(sekai_chisei::model_platform_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -759,6 +770,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "connectors" => Some("admin connectors"),
         "warehouse" => Some("admin warehouse"),
         "lakehouse" => Some("admin lakehouse"),
+        "providers" => Some("admin providers"),
         _ => None,
     }
 }
@@ -818,6 +830,7 @@ mod tests {
             (vec!["connectors"], "connectors"),
             (vec!["warehouse"], "warehouse"),
             (vec!["lakehouse"], "lakehouse"),
+            (vec!["providers"], "providers"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -873,6 +886,7 @@ mod tests {
             "connectors",
             "warehouse",
             "lakehouse",
+            "providers",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));
