@@ -67,6 +67,7 @@ pub mod source_adapter_catalog;
 pub mod source_webhook_cli;
 pub mod substitution_report;
 pub mod team_cli;
+pub mod warehouse_projection_cli;
 pub mod weekly_report;
 pub mod weekly_report_cli;
 pub mod workflow_action_catalog;

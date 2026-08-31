@@ -119,6 +119,8 @@ lives in the separate [research index](research/README.md).
   workflow steps projected onto ActionInstance admission.
 - [Connector certification](connector-certification.md) — signed revocable
   verification of the catalogued GitHub object-sync connector.
+- [Governed warehouse projections](warehouse-projections.md) — snapshot and
+  incremental pages with replay, deletion, lineage, and security-metadata pins.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,

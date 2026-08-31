@@ -632,7 +632,23 @@ impl SekaiDb {
                     json_extract(record_json, '$.connector_id')
                 )
                 WHERE json_extract(record_json, '$.superseded_by') = ''
-                  AND json_extract(record_json, '$.revocation') = '';",
+                  AND json_extract(record_json, '$.revocation') = '';
+                CREATE TABLE IF NOT EXISTS sekai_warehouse_projections (
+                    namespace TEXT NOT NULL,
+                    projection_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, projection_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_warehouse_pages (
+                    namespace TEXT NOT NULL,
+                    projection_id TEXT NOT NULL,
+                    page_digest TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, projection_id, page_digest),
+                    FOREIGN KEY(namespace, projection_id)
+                        REFERENCES sekai_warehouse_projections(namespace, projection_id)
+                );",
             )
             .map_err(|error| error.to_string())?;
         for statement in [
