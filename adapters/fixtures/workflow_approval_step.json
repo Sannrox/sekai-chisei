@@ -1,0 +1,12 @@
+{
+  "request_id": "req:change-1",
+  "gate_id": "security",
+  "namespace": "ops",
+  "owner": "integrator",
+  "source_instance": "gate:change",
+  "decision": "open",
+  "cursor": 0,
+  "callback_id": "cb:req:change-1:security",
+  "callback_digest": "sha256:02ababababababababababababababababababababababababababababababab",
+  "usage_units": 1
+}

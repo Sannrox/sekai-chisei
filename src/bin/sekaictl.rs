@@ -80,6 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+        "workflow" => {
+            sekai_chisei::workflow_action_cli::run_workflow_command(
+                args.into_iter().skip(1).collect(),
+            )
+            .await
+        }
         "learning" => {
             sekai_chisei::learning_cli::run_learning_command(args.into_iter().skip(1).collect())
                 .await
@@ -446,6 +452,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("images"), _) => ("images", 2),
         (Some("sdk-packages"), _) => ("sdk-packages", 2),
         (Some("packages"), _) => ("packages", 2),
+        (Some("workflow"), _) => ("workflow", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -648,7 +655,10 @@ fn print_admin_usage() {
            sekaictl admin packages ...\n\
          \n\
          Network:\n\
-           sekaictl admin network ..."
+           sekaictl admin network ...\n\
+         \n\
+         Workflow:\n\
+           sekaictl admin workflow ..."
     );
 }
 
@@ -683,6 +693,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "sdk-packages" => Some(sekai_chisei::client_package_cli::usage().to_string()),
         "packages" => Some(sekai_chisei::capability_package_cli::usage().to_string()),
         "network" => Some(sekai_chisei::federation_network_cli::usage().to_string()),
+        "workflow" => Some(sekai_chisei::workflow_action_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -711,6 +722,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "sdk-packages" => Some("admin sdk-packages"),
         "packages" => Some("admin packages"),
         "network" => Some("admin network"),
+        "workflow" => Some("admin workflow"),
         _ => None,
     }
 }
@@ -766,6 +778,7 @@ mod tests {
             (vec!["sdk-packages"], "sdk-packages"),
             (vec!["packages"], "packages"),
             (vec!["network"], "network"),
+            (vec!["workflow"], "workflow"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -817,6 +830,7 @@ mod tests {
             "sdk-packages",
             "packages",
             "network",
+            "workflow",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));

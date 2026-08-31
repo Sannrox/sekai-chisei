@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Map external workflow steps onto ActionInstance admission through
+  `sekai.workflow-action-bridge/v1`. Two domain-neutral adapters project
+  job and approval steps. Submit, park, resume, cancel, and callback are
+  generation-fenced and idempotent. Adapters never receive policy, budget,
+  or receipt authority. `sekaictl admin workflow` submits, parks, resumes,
+  cancels, callbacks, and reconciles. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Exchange governed requests, evidence, and outcomes through bilateral
   `sekai.federation-network-contract/v1` contracts. Each plane keeps local
   write authority. Peer loss disconnects without deleting history; reconnect

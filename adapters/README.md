@@ -255,3 +255,21 @@ cargo run --example batch_responses_harness < response.sse
 Host executors reporting redeemed external actions use the same SDK and outbox.
 See [external-action execution evidence](../docs/external-action-execution.md)
 for the lifecycle schema, permit verification, and reconciliation contract.
+
+## Workflow-action adapters
+
+`workflow_job_step.rs` and `workflow_approval_step.rs` map domain-neutral
+job and approval documents onto `sekai.workflow-action-bridge/v1`. They
+use `workflow_action_sdk.rs` to persist the exact command in a local
+outbox before calling the plane. Submit still runs ActionInstance
+admission. Park, resume, cancel, and callback are generation-fenced on
+the binding. Receipts stay on the operation spine; adapters only
+reconcile them.
+
+The adapters never write graph, policy, budget, or receipt rows. Hidden
+fields, stale cursors, foreign owners, unknown versions, and ambiguous
+usage fail closed. Offline conformance:
+
+```sh
+cargo test --test workflow_action_adapters
+```

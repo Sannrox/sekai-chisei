@@ -1,0 +1,12 @@
+{
+  "job_id": "job:nightly",
+  "step_id": "build",
+  "namespace": "ops",
+  "owner": "integrator",
+  "source_instance": "runner:ci",
+  "runtime": "job",
+  "cursor": 0,
+  "callback_id": "cb:job:nightly:build",
+  "callback_digest": "sha256:01ababababababababababababababababababababababababababababababab",
+  "usage_units": 1
+}

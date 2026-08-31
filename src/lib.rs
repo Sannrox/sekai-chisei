@@ -68,3 +68,5 @@ pub mod substitution_report;
 pub mod team_cli;
 pub mod weekly_report;
 pub mod weekly_report_cli;
+pub mod workflow_action_catalog;
+pub mod workflow_action_cli;
