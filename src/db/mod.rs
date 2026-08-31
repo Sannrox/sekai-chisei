@@ -28,6 +28,7 @@ mod event_stream_store;
 mod event_subscription_store;
 pub mod evidence;
 mod federation_conflict_store;
+mod federation_network_store;
 mod federation_revocation_store;
 mod federation_store;
 pub mod function;

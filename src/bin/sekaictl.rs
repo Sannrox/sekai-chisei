@@ -74,6 +74,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::federation_cli::run_federation_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "network" => {
+            sekai_chisei::federation_network_cli::run_network_command(
+                args.into_iter().skip(1).collect(),
+            )
+            .await
+        }
         "learning" => {
             sekai_chisei::learning_cli::run_learning_command(args.into_iter().skip(1).collect())
                 .await
@@ -429,6 +435,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("assurance"), Some("provenance")) => ("provenance", 3),
         (Some("assurance"), Some("replay")) => ("replay", 3),
         (Some("federation"), _) => ("federation", 2),
+        (Some("network"), _) => ("network", 2),
         (Some("learning"), _) => ("learning", 2),
         (Some("geospatial"), _) => ("geospatial", 2),
         (Some("quality"), _) => ("quality", 2),
@@ -638,7 +645,10 @@ fn print_admin_usage() {
            sekaictl admin sdk-packages ...\n\
          \n\
          Capability packages:\n\
-           sekaictl admin packages ..."
+           sekaictl admin packages ...\n\
+         \n\
+         Network:\n\
+           sekaictl admin network ..."
     );
 }
 
@@ -672,6 +682,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "images" => Some(sekai_chisei::image_cli::usage().to_string()),
         "sdk-packages" => Some(sekai_chisei::client_package_cli::usage().to_string()),
         "packages" => Some(sekai_chisei::capability_package_cli::usage().to_string()),
+        "network" => Some(sekai_chisei::federation_network_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -699,6 +710,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "images" => Some("admin images"),
         "sdk-packages" => Some("admin sdk-packages"),
         "packages" => Some("admin packages"),
+        "network" => Some("admin network"),
         _ => None,
     }
 }
@@ -753,6 +765,7 @@ mod tests {
             (vec!["images"], "images"),
             (vec!["sdk-packages"], "sdk-packages"),
             (vec!["packages"], "packages"),
+            (vec!["network"], "network"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -803,6 +816,7 @@ mod tests {
             "images",
             "sdk-packages",
             "packages",
+            "network",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));

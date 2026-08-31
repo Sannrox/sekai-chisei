@@ -569,7 +569,23 @@ impl SekaiDb {
                     json_extract(record_json, '$.package_id')
                 )
                 WHERE json_extract(record_json, '$.superseded_by') = ''
-                  AND json_extract(record_json, '$.revocation') = '';",
+                  AND json_extract(record_json, '$.revocation') = '';
+                CREATE TABLE IF NOT EXISTS sekai_federation_network_contracts (
+                    namespace TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, contract_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_federation_network_exchanges (
+                    namespace TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    exchange_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, contract_id, exchange_id),
+                    FOREIGN KEY(namespace, contract_id)
+                        REFERENCES sekai_federation_network_contracts(namespace, contract_id)
+                );",
             )
             .map_err(|error| error.to_string())?;
         for statement in [
