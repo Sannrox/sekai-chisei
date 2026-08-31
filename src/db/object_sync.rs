@@ -516,6 +516,31 @@ impl SekaiDb {
                     PRIMARY KEY(namespace, document_id, rendition_id),
                     FOREIGN KEY(namespace, document_id)
                         REFERENCES sekai_governed_documents(namespace, document_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_governed_images (
+                    namespace TEXT NOT NULL,
+                    image_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, image_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_governed_image_renditions (
+                    namespace TEXT NOT NULL,
+                    image_id TEXT NOT NULL,
+                    rendition_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, image_id, rendition_id),
+                    FOREIGN KEY(namespace, image_id)
+                        REFERENCES sekai_governed_images(namespace, image_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_governed_image_annotations (
+                    namespace TEXT NOT NULL,
+                    image_id TEXT NOT NULL,
+                    annotation_id TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, image_id, annotation_id),
+                    FOREIGN KEY(namespace, image_id)
+                        REFERENCES sekai_governed_images(namespace, image_id)
                 );",
             )
             .map_err(|error| error.to_string())?;

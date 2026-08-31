@@ -88,6 +88,9 @@ If you want to deploy or operate the control plane:
   checkpoints, consumer subscriptions, and fail-closed replay.
 - [Governed documents and renditions](documents.md) — digest-bound document
   objects with extraction provenance, hold, expiry, and deletion.
+- [Governed images, renditions, and annotations](images.md) — digest-bound
+  image objects with thumbnails, derived metadata, annotations, hold, expiry,
+  and deletion.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,

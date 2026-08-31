@@ -72,6 +72,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - governed documents and renditions
   (`sekai.governed-document/v1`; see
   [ADR 0039](decisions/0039-governed-documents.md));
+- governed images, renditions, and annotations
+  (`sekai.governed-image/v1`; see
+  [ADR 0050](decisions/0050-governed-images.md));
 
 Evidence is checked in as:
 

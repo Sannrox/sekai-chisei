@@ -366,6 +366,7 @@ audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,
 federation peer tables, registered Iceberg/Parquet snapshot projections,
 event-stream checkpoints and subscriptions,
 governed documents and renditions,
+governed images, renditions, and annotations,
 and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.
 

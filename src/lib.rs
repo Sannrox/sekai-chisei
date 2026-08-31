@@ -50,6 +50,7 @@ pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
 pub mod document_cli;
 pub mod event_stream_cli;
+pub mod image_cli;
 pub mod open_table_cli;
 pub mod receipt_cli;
 pub mod replay_cli;
