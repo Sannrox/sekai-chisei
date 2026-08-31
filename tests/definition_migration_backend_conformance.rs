@@ -1,5 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use sekai_chisei::db::postgres::PostgresDb;
+use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::definition_branch::{
@@ -13,6 +16,18 @@ use sekai_chisei::sekai::definition_migration::{
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CreateDefinitionProposal, MergeDefinitionProposal,
 };
+use sekai_chisei::sekai::object_security::{
+    OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+    ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext, PropertyGrant,
+    PropertyGrantAccess,
+};
+
+fn ctx(actor: &str) -> PrincipalPolicyContext {
+    PrincipalPolicyContext {
+        subjects: vec![actor.into()],
+        scopes: vec![],
+    }
+}
 
 fn member(namespace: &str, json: &str) -> DefinitionMemberInput {
     let mut input = DefinitionMemberInput {
@@ -42,7 +57,7 @@ fn object(namespace: &str, id: &str, title: &str, secret: Option<&str>) -> Objec
     }
 }
 
-fn publish_breaking(db: &SekaiDb, namespace: &str) -> (String, String) {
+fn publish_breaking(db: &RuntimeDb, namespace: &str) -> (String, String) {
     let parent_member = member(
         namespace,
         r#"{"name":"Ticket","properties":["title","secret"]}"#,
@@ -135,7 +150,7 @@ fn publish_breaking(db: &SekaiDb, namespace: &str) -> (String, String) {
     (parent, candidate)
 }
 
-fn exercise(db: SekaiDb, namespace: &str) {
+fn exercise(db: RuntimeDb, namespace: &str) {
     let (from, to) = publish_breaking(&db, namespace);
     db.create_object(&object(namespace, "open", "hello", Some("classified")))
         .unwrap();
@@ -151,10 +166,10 @@ fn exercise(db: SekaiDb, namespace: &str) {
         idempotency_key: "dry".into(),
     };
     let planned = db
-        .execute_definition_fact_migration(&dry, "author", 7)
+        .execute_definition_fact_migration(&dry, "author", &ctx("author"), 7)
         .unwrap();
     assert_eq!(
-        db.execute_definition_fact_migration(&dry, "author", 8)
+        db.execute_definition_fact_migration(&dry, "author", &ctx("author"), 8)
             .unwrap(),
         planned
     );
@@ -177,14 +192,24 @@ fn exercise(db: SekaiDb, namespace: &str) {
         idempotency_key: "run".into(),
     };
     let committed = db
-        .execute_definition_fact_migration(&execute, "author", 9)
+        .execute_definition_fact_migration(&execute, "author", &ctx("author"), 9)
         .unwrap();
     assert_eq!(committed.status, STATUS_COMMITTED);
     assert_eq!(committed.migrated_count, 2);
     assert_eq!(
-        db.execute_definition_fact_migration(&execute, "author", 10)
+        db.execute_definition_fact_migration(&execute, "author", &ctx("author"), 10)
             .unwrap(),
         committed
+    );
+    assert!(
+        db.count_definition_fact_migration_audit(namespace, "m1")
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        !db.list_object_changes(&format!("{namespace}:open"), 16, 0)
+            .unwrap()
+            .is_empty()
     );
     let migrated = db
         .get_object(&format!("{namespace}:open"))
@@ -209,7 +234,7 @@ fn exercise(db: SekaiDb, namespace: &str) {
         idempotency_key: "undo".into(),
     };
     let rolled = db
-        .execute_definition_fact_migration(&rollback, "author", 11)
+        .execute_definition_fact_migration(&rollback, "author", &ctx("author"), 11)
         .unwrap();
     assert_eq!(rolled.status, STATUS_ROLLED_BACK);
     let restored = db
@@ -228,7 +253,7 @@ fn exercise(db: SekaiDb, namespace: &str) {
     };
     db.create_object(&object(namespace, "empty", "only-title", None))
         .unwrap();
-    let blocked = db.execute_definition_fact_migration(&missing, "author", 12);
+    let blocked = db.execute_definition_fact_migration(&missing, "author", &ctx("author"), 12);
     // empty object still has title; execute after rollback re-migrates remaining
     // objects bound to from. The empty object is migratable. Use a required-property
     // case via a second namespace in the unit tests; here assert replay/unknown
@@ -243,28 +268,41 @@ fn exercise(db: SekaiDb, namespace: &str) {
         idempotency_key: "missing".into(),
     };
     assert!(
-        db.execute_definition_fact_migration(&unknown, "author", 13)
+        db.execute_definition_fact_migration(&unknown, "author", &ctx("author"), 13)
             .unwrap_err()
             .contains("definition_revision_not_found")
     );
     unknown.mode = "explode".into();
     unknown.idempotency_key = "bad-mode".into();
     assert!(
-        db.execute_definition_fact_migration(&unknown, "author", 14)
+        db.execute_definition_fact_migration(&unknown, "author", &ctx("author"), 14)
             .unwrap_err()
             .contains("fact_migration_unsupported_mode")
     );
 }
 
+fn sqlite_db() -> RuntimeDb {
+    RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()))
+}
+
+fn postgres() -> PostgresDb {
+    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
+    } else {
+        PostgresDb::connect(&url, 8).unwrap()
+    }
+}
+
 #[test]
 fn sqlite_definition_fact_migration_conformance() {
-    let db = SekaiDb::new(":memory:").unwrap();
-    exercise(db, "fact-mig-sqlite");
+    exercise(sqlite_db(), "fact-mig-sqlite");
 }
 
 #[test]
 fn sqlite_blocked_transform_does_not_mutate() {
-    let db = SekaiDb::new(":memory:").unwrap();
+    let db = sqlite_db();
     let namespace = "blocked-ns";
     let parent_member = member(namespace, r#"{"name":"Ticket","properties":["title"]}"#);
     let prepared = parent_member.prepare(namespace).unwrap();
@@ -365,6 +403,7 @@ fn sqlite_blocked_transform_does_not_mutate() {
                 idempotency_key: "ex".into(),
             },
             "author",
+            &ctx("author"),
             7,
         )
         .unwrap();
@@ -374,4 +413,388 @@ fn sqlite_blocked_transform_does_not_mutate() {
     let stored = db.get_object(&format!("{namespace}:t")).unwrap().unwrap();
     assert_eq!(stored.properties.get("title").unwrap(), "hello");
     assert!(!stored.properties.contains_key("severity"));
+}
+
+#[test]
+fn sqlite_rollback_requires_stored_revision_identity() {
+    exercise_rollback_mismatch(sqlite_db(), "fact-mig-mismatch");
+}
+
+#[test]
+fn sqlite_fact_migration_omits_hidden_and_preserves_ungranted_properties() {
+    exercise_object_security_and_property_grants(sqlite_db(), "fact-mig-auth");
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_definition_fact_migration_conformance() {
+    let prefix = format!("pg-fact-mig-{}", uuid::Uuid::new_v4().simple());
+    let db = RuntimeDb::Postgres(Arc::new(postgres()));
+    exercise(db.clone(), &prefix);
+    exercise_rollback_mismatch(db.clone(), &format!("{prefix}-mismatch"));
+    exercise_object_security_and_property_grants(db.clone(), &format!("{prefix}-auth"));
+    exercise_rollback_denied_when_snapshot_hidden(db.clone(), &format!("{prefix}-hidden-rb"));
+    exercise_rollback_denied_when_ungranted_property_differs(db, &format!("{prefix}-grant-rb"));
+}
+
+fn exercise_rollback_mismatch(db: RuntimeDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    db.create_object(&object(namespace, "open", "hello", Some("classified")))
+        .unwrap();
+    let execute = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m-mismatch".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: MODE_EXECUTE.into(),
+        idempotency_key: "run".into(),
+    };
+    let committed = db
+        .execute_definition_fact_migration(&execute, "author", &ctx("author"), 9)
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    let mut rollback = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m-mismatch".into(),
+        from_revision_digest: format!("sha256:{}", "c".repeat(64)),
+        to_revision_digest: to,
+        mode: MODE_ROLLBACK.into(),
+        idempotency_key: "undo-wrong".into(),
+    };
+    let error = db
+        .execute_definition_fact_migration(&rollback, "author", &ctx("author"), 10)
+        .unwrap_err();
+    assert!(
+        error.contains("fact_migration_revision_mismatch"),
+        "{error}"
+    );
+    let migrated = db
+        .get_object(&format!("{namespace}:open"))
+        .unwrap()
+        .unwrap();
+    assert!(!migrated.properties.contains_key("secret"));
+    rollback.from_revision_digest = from.clone();
+    rollback.idempotency_key = "undo-right".into();
+    let rolled = db
+        .execute_definition_fact_migration(&rollback, "author", &ctx("author"), 11)
+        .unwrap();
+    assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    let rerun = ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m-mismatch".into(),
+        from_revision_digest: from,
+        to_revision_digest: rollback.to_revision_digest.clone(),
+        mode: MODE_EXECUTE.into(),
+        idempotency_key: "run-again".into(),
+    };
+    let committed_again = db
+        .execute_definition_fact_migration(&rerun, "author", &ctx("author"), 12)
+        .unwrap();
+    assert_eq!(committed_again.status, STATUS_COMMITTED);
+    assert!(
+        db.count_definition_fact_migration_audit(namespace, "m-mismatch")
+            .unwrap()
+            >= 3
+    );
+}
+
+fn exercise_object_security_and_property_grants(db: RuntimeDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    let mut visible = object(namespace, "mine", "hello", Some("classified"));
+    visible.properties.insert("owner".into(), "author".into());
+    let mut hidden = object(namespace, "theirs", "hidden", Some("keep-me"));
+    hidden.properties.insert("owner".into(), "bob".into());
+    db.create_object(&visible).unwrap();
+    db.create_object(&hidden).unwrap();
+
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "Ticket".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+                property: "owner".into(),
+            }],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Write,
+            },
+            PropertyGrant {
+                property: "owner".into(),
+                access: PropertyGrantAccess::Read,
+            },
+        ]),
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-mig-grants", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("Ticket".into(), revision.revision_digest)]),
+        "root",
+        "activate-mig-grants",
+        2,
+    )
+    .unwrap();
+
+    let committed = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "m-auth".into(),
+                from_revision_digest: from,
+                to_revision_digest: to,
+                mode: MODE_EXECUTE.into(),
+                idempotency_key: "run-auth".into(),
+            },
+            "author",
+            &ctx("author"),
+            9,
+        )
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    assert_eq!(committed.migrated_count, 1);
+    assert_eq!(committed.objects.len(), 1);
+    assert_eq!(committed.objects[0].object_id, format!("{namespace}:mine"));
+
+    let mine = db
+        .get_object(&format!("{namespace}:mine"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(mine.properties.get("title").unwrap(), "hello");
+    assert_eq!(mine.properties.get("secret").unwrap(), "classified");
+    assert_eq!(mine.properties.get("owner").unwrap(), "author");
+    assert!(
+        !committed.objects[0]
+            .stripped_properties
+            .iter()
+            .any(|property| property == "secret")
+    );
+    let theirs = db
+        .get_object(&format!("{namespace}:theirs"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(theirs.properties.get("secret").unwrap(), "keep-me");
+    assert!(
+        db.count_definition_fact_migration_audit(namespace, "m-auth")
+            .unwrap()
+            >= 1
+    );
+}
+
+#[test]
+fn sqlite_rollback_fails_closed_when_a_snapshot_is_hidden() {
+    exercise_rollback_denied_when_snapshot_hidden(sqlite_db(), "fact-mig-hidden-rb");
+}
+
+fn exercise_rollback_denied_when_snapshot_hidden(db: RuntimeDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    let mut visible = object(namespace, "mine", "hello", Some("classified"));
+    visible.properties.insert("owner".into(), "author".into());
+    let mut later_hidden = object(namespace, "later", "other", Some("keep-me"));
+    later_hidden.properties.insert("owner".into(), "bob".into());
+    db.create_object(&visible).unwrap();
+    db.create_object(&later_hidden).unwrap();
+    let committed = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "m-hidden-rb".into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to.clone(),
+                mode: MODE_EXECUTE.into(),
+                idempotency_key: "run".into(),
+            },
+            "author",
+            &ctx("author"),
+            9,
+        )
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    assert_eq!(committed.migrated_count, 2);
+
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "Ticket".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::SubjectEqualsProperty {
+                property: "owner".into(),
+            }],
+        }],
+        property_grants: None,
+    };
+    let revision = db
+        .put_object_security_policy(&policy, "root", "put-hidden-rb", 10)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("Ticket".into(), revision.revision_digest)]),
+        "root",
+        "activate-hidden-rb",
+        11,
+    )
+    .unwrap();
+
+    let error = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "m-hidden-rb".into(),
+                from_revision_digest: from,
+                to_revision_digest: to,
+                mode: MODE_ROLLBACK.into(),
+                idempotency_key: "undo".into(),
+            },
+            "author",
+            &ctx("author"),
+            12,
+        )
+        .unwrap_err();
+    assert!(error.contains("fact_migration_rollback_denied"), "{error}");
+    let stored = db
+        .get_definition_fact_migration(namespace, "m-hidden-rb")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, STATUS_COMMITTED);
+    let mine = db
+        .get_object(&format!("{namespace}:mine"))
+        .unwrap()
+        .unwrap();
+    assert!(!mine.properties.contains_key("secret"));
+}
+
+#[test]
+fn sqlite_rollback_fails_closed_when_ungranted_snapshot_differs() {
+    exercise_rollback_denied_when_ungranted_property_differs(sqlite_db(), "fact-mig-grant-rb");
+}
+
+fn exercise_rollback_denied_when_ungranted_property_differs(db: RuntimeDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    db.create_object(&object(namespace, "open", "hello", Some("classified")))
+        .unwrap();
+    let writable = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "Ticket".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Write,
+            },
+            PropertyGrant {
+                property: "secret".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "secret".into(),
+                access: PropertyGrantAccess::Write,
+            },
+        ]),
+    };
+    let writable_revision = db
+        .put_object_security_policy(&writable, "root", "put-writable", 1)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("Ticket".into(), writable_revision.revision_digest)]),
+        "root",
+        "activate-writable",
+        2,
+    )
+    .unwrap();
+    let committed = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "m-grant-rb".into(),
+                from_revision_digest: from.clone(),
+                to_revision_digest: to.clone(),
+                mode: MODE_EXECUTE.into(),
+                idempotency_key: "run".into(),
+            },
+            "author",
+            &ctx("author"),
+            9,
+        )
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    assert!(
+        committed.objects[0]
+            .stripped_properties
+            .iter()
+            .any(|property| property == "secret")
+    );
+
+    let readonly_secret = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: namespace.into(),
+        kind: "Ticket".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Read,
+            },
+            PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Write,
+            },
+            PropertyGrant {
+                property: "secret".into(),
+                access: PropertyGrantAccess::Read,
+            },
+        ]),
+    };
+    let readonly_revision = db
+        .put_object_security_policy(&readonly_secret, "root", "put-readonly", 10)
+        .unwrap();
+    db.activate_object_security_policies(
+        namespace,
+        &BTreeMap::from([("Ticket".into(), readonly_revision.revision_digest)]),
+        "root",
+        "activate-readonly",
+        11,
+    )
+    .unwrap();
+    let error = db
+        .execute_definition_fact_migration(
+            &ExecuteFactMigration {
+                namespace: namespace.into(),
+                migration_id: "m-grant-rb".into(),
+                from_revision_digest: from,
+                to_revision_digest: to,
+                mode: MODE_ROLLBACK.into(),
+                idempotency_key: "undo".into(),
+            },
+            "author",
+            &ctx("author"),
+            12,
+        )
+        .unwrap_err();
+    assert!(error.contains("fact_migration_rollback_denied"), "{error}");
+    let stored = db
+        .get_object(&format!("{namespace}:open"))
+        .unwrap()
+        .unwrap();
+    assert!(!stored.properties.contains_key("secret"));
 }

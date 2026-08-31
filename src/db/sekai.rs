@@ -1675,7 +1675,7 @@ fn build_sqlite_object_security_filter(
     ))
 }
 
-fn sqlite_object_security_filter(start_param: usize) -> String {
+pub(crate) fn sqlite_object_security_filter(start_param: usize) -> String {
     let subjects = start_param + 1;
     let scopes = start_param + 2;
     format!(

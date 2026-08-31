@@ -345,15 +345,39 @@ impl RuntimeDb {
         }
     }
 
+    pub fn seed_published_definition_revision(
+        &self,
+        revision: &DefinitionRevision,
+        members: &[DefinitionMember],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::seed_published_definition_revision(
+                db.as_ref(),
+                revision,
+                members,
+            ),
+            Self::Postgres(db) => DefinitionBranchBackend::seed_published_definition_revision(
+                db.as_ref(),
+                revision,
+                members,
+            ),
+        }
+    }
+
     pub fn execute_definition_fact_migration(
         &self,
         request: &crate::sekai::definition_migration::ExecuteFactMigration,
         actor: &str,
+        policy_context: &PrincipalPolicyContext,
         now_ms: i64,
     ) -> Result<crate::sekai::definition_migration::FactMigrationResult, String> {
         match self {
-            Self::Sqlite(db) => db.execute_definition_fact_migration(request, actor, now_ms),
-            Self::Postgres(db) => db.execute_definition_fact_migration(request, actor, now_ms),
+            Self::Sqlite(db) => {
+                db.execute_definition_fact_migration(request, actor, policy_context, now_ms)
+            }
+            Self::Postgres(db) => {
+                db.execute_definition_fact_migration(request, actor, policy_context, now_ms)
+            }
         }
     }
 
@@ -365,6 +389,17 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_definition_fact_migration(namespace, migration_id),
             Self::Postgres(db) => db.get_definition_fact_migration(namespace, migration_id),
+        }
+    }
+
+    pub fn count_definition_fact_migration_audit(
+        &self,
+        namespace: &str,
+        migration_id: &str,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.count_definition_fact_migration_audit(namespace, migration_id),
+            Self::Postgres(db) => db.count_definition_fact_migration_audit(namespace, migration_id),
         }
     }
 
