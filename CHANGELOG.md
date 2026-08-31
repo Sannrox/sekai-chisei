@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Certify capability packages as `sekai.capability-package-certification/v1`
+  objects. Each certification binds signer, manifest members, compatibility,
+  tests, and revocation to one independently verifiable digest. Replay of a
+  live certification is idempotent. Content or dependency change invalidates
+  verification. Recertification and revocation preserve history. Certification
+  is not a runtime grant. `sekaictl admin packages` certifies, retrieves,
+  verifies, and revokes. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Publish versioned `sekai.client-package/v1` objects for Rust, TypeScript,
   and Python clients. Each publication pins protocol, source, and package
   digests plus provenance. Replay of the same live identity is idempotent.

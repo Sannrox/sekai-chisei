@@ -555,7 +555,21 @@ impl SekaiDb {
                     json_extract(record_json, '$.language'),
                     json_extract(record_json, '$.package_name')
                 )
-                WHERE json_extract(record_json, '$.superseded_by') = '';",
+                WHERE json_extract(record_json, '$.superseded_by') = '';
+                CREATE TABLE IF NOT EXISTS sekai_capability_packages (
+                    namespace TEXT NOT NULL,
+                    certification_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, certification_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS sekai_capability_packages_live_identity
+                ON sekai_capability_packages(
+                    namespace,
+                    json_extract(record_json, '$.package_id')
+                )
+                WHERE json_extract(record_json, '$.superseded_by') = ''
+                  AND json_extract(record_json, '$.revocation') = '';",
             )
             .map_err(|error| error.to_string())?;
         for statement in [

@@ -8,6 +8,7 @@ pub(crate) mod action_work_lifecycle;
 pub mod attestation;
 pub mod audit;
 pub mod capability;
+pub mod capability_package;
 pub mod capacity;
 pub mod classification_lattice;
 pub mod client_package;
