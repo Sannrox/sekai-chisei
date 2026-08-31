@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Exchange governed requests, evidence, and outcomes through bilateral
+  `sekai.federation-network-contract/v1` contracts. Each plane keeps local
+  write authority. Peer loss disconnects without deleting history; reconnect
+  restores accepted status; revocation is terminal. Untrusted origin,
+  mismatched residency, and tampered envelopes fail closed.
+  `sekaictl admin network` accepts, exchanges, marks peer loss, reconnects,
+  and revokes. SQLite is the reference store; PostgreSQL stays unavailable.
 - Certify capability packages as `sekai.capability-package-certification/v1`
   objects. Each certification binds signer, manifest members, compatibility,
   tests, and revocation to one independently verifiable digest. Replay of a

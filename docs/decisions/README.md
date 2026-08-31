@@ -73,3 +73,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0050: Govern image assets with digest-bound renditions and annotations](0050-governed-images.md)
 - [ADR 0051: Publish versioned client packages with protocol and provenance pins](0051-versioned-client-packages.md)
 - [ADR 0052: Certify capability packages against an immutable digest](0052-capability-package-certification.md)
+- [ADR 0053: Exchange federation traffic through bilateral network contracts](0053-federation-network-contracts.md)

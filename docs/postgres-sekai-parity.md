@@ -81,6 +81,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - capability-package certifications
   (`sekai.capability-package-certification/v1`; see
   [ADR 0052](decisions/0052-capability-package-certification.md));
+- federation network contracts
+  (`sekai.federation-network-contract/v1`; see
+  [ADR 0053](decisions/0053-federation-network-contracts.md));
 
 Evidence is checked in as:
 

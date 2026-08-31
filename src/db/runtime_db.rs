@@ -5057,6 +5057,60 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_network_contract(
+        &self,
+        namespace: &str,
+        contract_id: &str,
+    ) -> Result<Option<crate::sekai::federation_network::NetworkContract>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_network_contract(namespace, contract_id),
+            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_network_contract(
+        &self,
+        contract: &crate::sekai::federation_network::NetworkContract,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_network_contract(contract),
+            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn cas_network_contract(
+        &self,
+        expected: &crate::sekai::federation_network::NetworkContract,
+        next: &crate::sekai::federation_network::NetworkContract,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.cas_network_contract(expected, next),
+            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_network_exchange(
+        &self,
+        namespace: &str,
+        contract_id: &str,
+        exchange_id: &str,
+    ) -> Result<Option<crate::sekai::federation_network::NetworkExchange>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_network_exchange(namespace, contract_id, exchange_id),
+            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn put_network_exchange(
+        &self,
+        item: &crate::sekai::federation_network::NetworkExchange,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_network_exchange(item),
+            Self::Postgres(_) => Err(crate::sekai::federation_network::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn get_federation_revocation(
         &self,
         revocation_id: &str,

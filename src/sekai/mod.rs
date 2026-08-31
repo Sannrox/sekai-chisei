@@ -31,6 +31,7 @@ pub mod evidence_projection;
 pub mod evidence_store;
 pub mod execution_evidence;
 pub mod federation_conflict;
+pub mod federation_network;
 pub mod federation_profile;
 pub mod federation_revocation;
 pub mod function;

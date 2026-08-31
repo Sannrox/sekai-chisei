@@ -368,6 +368,7 @@ event-stream checkpoints and subscriptions,
 governed documents and renditions,
 governed images, renditions, and annotations,
 capability-package certifications,
+federation network contracts,
 versioned client packages,
 and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.

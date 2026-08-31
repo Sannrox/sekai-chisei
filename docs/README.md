@@ -91,6 +91,8 @@ If you want to deploy or operate the control plane:
 - [Governed images, renditions, and annotations](images.md) — digest-bound
   image objects with thumbnails, derived metadata, annotations, hold, expiry,
   and deletion.
+- [Federation network contracts](federation-networks.md) — bilateral
+  request, evidence, and outcome exchange without local write authority.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,

@@ -8,6 +8,7 @@ pub mod compliance_export;
 pub mod config;
 pub use sekai_provider::content;
 pub mod federation_cli;
+pub mod federation_network_cli;
 pub mod geospatial_cli;
 pub use sekai_provider::cost_estimate;
 pub mod credential_cli;
