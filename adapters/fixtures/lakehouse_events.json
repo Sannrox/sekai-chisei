@@ -1,0 +1,18 @@
+{
+  "snapshot_id": "lh:events",
+  "namespace": "ops",
+  "owner": "integrator",
+  "purpose": "analytics",
+  "residency_class": "eu",
+  "trust_pin_digest": "sha256:01ababababababababababababababababababababababababababababababab",
+  "partitions": [
+    {
+      "day": "2026-08-30",
+      "rows": [{ "id": "1", "kind": "a" }]
+    },
+    {
+      "day": "2026-08-31",
+      "rows": [{ "id": "2", "kind": "b" }]
+    }
+  ]
+}

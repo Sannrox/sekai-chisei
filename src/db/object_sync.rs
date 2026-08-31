@@ -648,6 +648,13 @@ impl SekaiDb {
                     PRIMARY KEY(namespace, projection_id, page_digest),
                     FOREIGN KEY(namespace, projection_id)
                         REFERENCES sekai_warehouse_projections(namespace, projection_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_lakehouse_snapshots (
+                    namespace TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, snapshot_id)
                 );",
             )
             .map_err(|error| error.to_string())?;
