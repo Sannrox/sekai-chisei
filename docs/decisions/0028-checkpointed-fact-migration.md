@@ -31,9 +31,15 @@ an ancestor revision to the current published head.
    partial durable success. Exact replay returns the stored result.
 4. Objects already bound to the candidate are skipped. Foreign bindings and
    missing required properties or removed kinds are blocked transforms and
-   do not mutate. Rollback restores snapshots and prior bindings.
+   do not mutate. Rollback restores snapshots and prior bindings, and fails
+   closed unless the request names the stored parent and candidate.
 5. Published definition rows are never rewritten. Authorization of both
    revisions is rechecked at effect. Hidden revisions stay unavailable.
+   Execute rechecks live object-security read rules and property write grants
+   in the mutation transaction: hidden objects are omitted, ungranted
+   properties are not stripped, and audit plus object lineage share that
+   transaction. Get of a migration does not distinguish missing from
+   unauthorized revisions.
 
 ## Alternatives considered
 
@@ -51,4 +57,7 @@ stay out of this contract.
 
 Domain tests cover strip, missing-required, mixed-revision, unknown, and
 ancestor checks. SQLite/PostgreSQL conformance covers dry-run, execute,
-idempotent replay, rollback, and blocked transforms without mutating objects.
+idempotent replay, rollback identity, object-security omission, ungranted
+property preservation, audit-in-transaction, and blocked transforms without
+mutating objects. Get does not distinguish missing from unauthorized
+revisions.

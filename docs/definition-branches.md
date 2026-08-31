@@ -167,7 +167,12 @@ its immutable revision and audit evidence.
   execute, resume-by-replay, and rollback. Unknown compatibility, stale
   parents, and unapproved breaking or conditional changes fail closed. Blocked
   transforms do not mutate objects. Published definition rows are never
-  rewritten. See [ADR 0028](decisions/0028-checkpointed-fact-migration.md).
+  rewritten. Rollback names the stored parent and candidate. Live object and
+  property grants are rechecked at effect; hidden objects are omitted and
+  ungranted properties are not stripped. Mutation, audit, and object lineage
+  share one transaction. `GetDefinitionFactMigration` does not distinguish
+  missing from unauthorized revisions. See
+  [ADR 0028](decisions/0028-checkpointed-fact-migration.md).
 - Runtime objects of `object_type` members are rebound by that migration.
   Source bindings remain attached to their existing type identities.
 - Package identity is not a runtime grant. Evaluation-plan digests on a

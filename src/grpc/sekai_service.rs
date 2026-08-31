@@ -3608,6 +3608,9 @@ fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("fact_migration_no_change")
         || error.starts_with("fact_migration_unsupported_mode")
         || error.starts_with("fact_migration_not_committed")
+        || error.starts_with("fact_migration_revision_mismatch")
+        || error.starts_with("fact_migration_rollback_denied")
+        || error.starts_with("object_security_denied")
         || error.starts_with("fact_migration_limit")
     {
         Status::failed_precondition("definition write is not current")
@@ -3640,6 +3643,16 @@ mod definition_write_error_tests {
         );
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_ne!(status.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn fact_migration_revision_mismatch_is_failed_precondition() {
+        let status = map_definition_write_error(
+            "fact_migration_revision_mismatch: rollback must name the stored parent and candidate"
+                .into(),
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_ne!(status.code(), tonic::Code::Internal);
     }
 }
 
@@ -4992,6 +5005,7 @@ impl SekaiService for SekaiServiceImpl {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let tenant_context = request_tenant_context(&self.db, &req)?;
+        let policy_context = principal_policy_context(&req);
         let input = req.into_inner();
         authorize_source_sync_namespace(
             self,
@@ -5020,6 +5034,7 @@ impl SekaiService for SekaiServiceImpl {
                     idempotency_key: input.idempotency_key,
                 },
                 &actor,
+                &policy_context,
                 now_millis(),
             )
             .map_err(map_definition_write_error)?;
@@ -5046,18 +5061,23 @@ impl SekaiService for SekaiServiceImpl {
         let result = self
             .db
             .get_definition_fact_migration(&input.namespace, &input.migration_id)
-            .map_err(|_| Status::internal("definition fact migration unavailable"))?
-            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
-        let _ = load_authorized_definition_revisions(
+            .map_err(|_| Status::internal("definition resource unavailable"))?;
+        let Some(result) = result else {
+            return Err(Status::not_found("definition resource unavailable"));
+        };
+        match load_authorized_definition_revisions(
             self,
             &principals,
             &result.namespace,
             &result.from_revision_digest,
             &result.to_revision_digest,
-        )?;
-        Ok(Response::new(GetDefinitionFactMigrationResponse {
-            migration: Some(to_proto_definition_fact_migration(&result)),
-        }))
+        ) {
+            Ok(_) => Ok(Response::new(GetDefinitionFactMigrationResponse {
+                migration: Some(to_proto_definition_fact_migration(&result)),
+            })),
+            Err(status) if status.code() == tonic::Code::Internal => Err(status),
+            Err(_) => Err(Status::not_found("definition resource unavailable")),
+        }
     }
 
     async fn create_handoff(
@@ -9501,6 +9521,209 @@ mod tests {
         );
         assert!(!denied_classify.message().contains("Ticket"));
         assert!(!denied_classify.message().contains("body"));
+    }
+
+    #[tokio::test]
+    async fn definition_fact_migration_hides_unauthorized_revisions() {
+        let svc = service();
+        let namespace = "fact-mig-hide";
+        grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+        grant_source_namespace(&svc, namespace, "tester", security::Role::Viewer);
+        let ticket_admin = security::Grant {
+            id: "fact-mig-ticket-admin".into(),
+            object_id: schema_object_id("Ticket"),
+            principal: "root".into(),
+            role: security::Role::Admin,
+            created: 1,
+        };
+        svc.db.create_grant(&ticket_admin).unwrap();
+        svc.security.add_grant(&ticket_admin);
+
+        let parent_member = definition_branch_domain::DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket","properties":["title","secret"]}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare(namespace)
+        .unwrap();
+        let parent = definition_branch_domain::prepare_revision(
+            namespace,
+            "",
+            [definition_branch_domain::DefinitionRevisionMember {
+                member_kind: parent_member.member_kind.clone(),
+                member_id: parent_member.member_id.clone(),
+                member_digest: parent_member.member_digest.clone(),
+            }],
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        svc.db
+            .seed_published_definition_revision(&parent, &[parent_member])
+            .unwrap();
+        svc.create_definition_branch(with_named_principal(
+            CreateDefinitionBranchRequest {
+                namespace: namespace.into(),
+                branch_id: "migrate".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let applied = svc
+            .apply_definition_branch_edit(with_named_principal(
+                ApplyDefinitionBranchEditRequest {
+                    namespace: namespace.into(),
+                    branch_id: "migrate".into(),
+                    expected_head_digest: parent.revision_digest.clone(),
+                    upserts: vec![DefinitionMemberInput {
+                        member_kind: "object_type".into(),
+                        member_id: "Ticket".into(),
+                        definition_json: r#"{"name":"Ticket","properties":["title"]}"#.into(),
+                        member_digest: String::new(),
+                    }],
+                    removals: Vec::new(),
+                    idempotency_key: "edit-1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let candidate = applied.revision.unwrap().revision_digest;
+        svc.create_definition_proposal(with_named_principal(
+            CreateDefinitionProposalRequest {
+                namespace: namespace.into(),
+                branch_id: "migrate".into(),
+                proposal_id: "mig".into(),
+                base_digest: parent.revision_digest.clone(),
+                candidate_digest: candidate.clone(),
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "mig".into(),
+                idempotency_key: "approve-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "mig".into(),
+                expected_published_digest: parent.revision_digest.clone(),
+                idempotency_key: "merge-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        svc.db
+            .create_object(&crate::domain::Object {
+                id: format!("{namespace}:open"),
+                kind: "Ticket".into(),
+                name: "open".into(),
+                namespace: namespace.into(),
+                external_id: format!("{namespace}:open"),
+                properties: HashMap::from([
+                    ("title".into(), "hello".into()),
+                    ("secret".into(), "classified".into()),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+
+        let denied_execute = svc
+            .execute_definition_fact_migration(with_named_principal(
+                ExecuteDefinitionFactMigrationRequest {
+                    namespace: namespace.into(),
+                    migration_id: "m1".into(),
+                    from_revision_digest: parent.revision_digest.clone(),
+                    to_revision_digest: candidate.clone(),
+                    mode: "execute".into(),
+                    idempotency_key: "run".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            denied_execute.code() == tonic::Code::PermissionDenied
+                || denied_execute.code() == tonic::Code::NotFound,
+            "{}",
+            denied_execute.code()
+        );
+        assert!(!denied_execute.message().contains("classified"));
+
+        svc.execute_definition_fact_migration(with_named_principal(
+            ExecuteDefinitionFactMigrationRequest {
+                namespace: namespace.into(),
+                migration_id: "m1".into(),
+                from_revision_digest: parent.revision_digest.clone(),
+                to_revision_digest: candidate,
+                mode: "execute".into(),
+                idempotency_key: "run".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let missing = svc
+            .get_definition_fact_migration(with_named_principal(
+                GetDefinitionFactMigrationRequest {
+                    namespace: namespace.into(),
+                    migration_id: "missing".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap_err();
+        let hidden = svc
+            .get_definition_fact_migration(with_named_principal(
+                GetDefinitionFactMigrationRequest {
+                    namespace: namespace.into(),
+                    migration_id: "m1".into(),
+                },
+                "tester",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+        assert_eq!(hidden.code(), tonic::Code::NotFound);
+        assert_eq!(missing.message(), "definition resource unavailable");
+        assert_eq!(hidden.message(), missing.message());
+        assert!(!hidden.message().contains("classified"));
+        assert!(!hidden.message().contains(&parent.revision_digest));
+
+        let loaded = svc
+            .get_definition_fact_migration(with_named_principal(
+                GetDefinitionFactMigrationRequest {
+                    namespace: namespace.into(),
+                    migration_id: "m1".into(),
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .migration
+            .unwrap();
+        assert_eq!(loaded.status, "committed");
     }
 
     #[tokio::test]
