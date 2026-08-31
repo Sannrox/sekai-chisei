@@ -43,6 +43,7 @@ pub mod handoff;
 pub(crate) mod handoff_lifecycle;
 pub mod image;
 pub mod json;
+pub mod lakehouse_snapshot;
 pub mod learning;
 pub mod lease;
 pub(crate) mod lease_lifecycle;

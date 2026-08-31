@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Export governed lakehouse snapshots as `sekai.lakehouse-snapshot/v1`
+  records. Each snapshot pins partitions, additive schema versions, and
+  `sekai.security-metadata/v1` classification, purpose, residency, and
+  trust. Two domain-neutral adapters (`adapter.lakehouse.events`,
+  `adapter.lakehouse.metrics`) register a partitioned snapshot. Schema
+  upgrade is additive. Redaction and partition deletion are explicit
+  markers. Exact digest re-import is idempotent. Revocation is terminal.
+  Security metadata constrains visibility; it is not a grant. Hidden
+  columns, foreign tenants, and unknown versions fail closed.
+  `sekaictl admin lakehouse` registers, reimports, upgrades, redacts,
+  deletes, retrieves, and revokes. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Export governed warehouse projections as `sekai.warehouse-projection/v1`
   records. Each projection pins authorized columns and
   `sekai.security-metadata/v1` classification, purpose, residency, and

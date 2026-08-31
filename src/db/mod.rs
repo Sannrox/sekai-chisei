@@ -39,6 +39,7 @@ pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;
 mod image_store;
+mod lakehouse_snapshot_store;
 mod learning_change_store;
 pub mod lease;
 mod namespace_snapshot_store;

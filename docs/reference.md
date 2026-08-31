@@ -121,6 +121,8 @@ lives in the separate [research index](research/README.md).
   verification of the catalogued GitHub object-sync connector.
 - [Governed warehouse projections](warehouse-projections.md) — snapshot and
   incremental pages with replay, deletion, lineage, and security-metadata pins.
+- [Governed lakehouse snapshots](lakehouse-snapshots.md) — partitioned
+  versioned snapshots with schema evolution, redaction, deletion, and re-import.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,

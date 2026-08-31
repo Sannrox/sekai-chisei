@@ -55,6 +55,7 @@ pub mod connector_certification_cli;
 pub mod document_cli;
 pub mod event_stream_cli;
 pub mod image_cli;
+pub mod lakehouse_snapshot_cli;
 pub mod open_table_cli;
 pub mod receipt_cli;
 pub mod replay_cli;

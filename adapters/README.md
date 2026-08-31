@@ -290,3 +290,20 @@ closed. Offline conformance:
 ```sh
 cargo test --test warehouse_projection_adapters
 ```
+
+## Lakehouse snapshot adapters
+
+`lakehouse_events.rs` and `lakehouse_metrics.rs` map domain-neutral
+events and metrics documents onto `sekai.lakehouse-snapshot/v1`. They
+register partitioned snapshots, upgrade schema additively, redact
+columns, delete partitions, and re-import exact digests. Revocation is
+terminal. Security metadata constrains classification, purpose,
+residency, and trust; it is not a grant.
+
+The adapters never write graph, policy, budget, or receipt rows. Hidden
+columns, foreign tenants, and unknown versions fail closed. Offline
+conformance:
+
+```sh
+cargo test --test lakehouse_snapshot_adapters
+```
