@@ -78,6 +78,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - versioned client packages
   (`sekai.client-package/v1`; see
   [ADR 0051](decisions/0051-versioned-client-packages.md));
+- capability-package certifications
+  (`sekai.capability-package-certification/v1`; see
+  [ADR 0052](decisions/0052-capability-package-certification.md));
 
 Evidence is checked in as:
 

@@ -1,5 +1,6 @@
 pub mod action_governance;
 pub mod attestation;
+mod capability_package_store;
 pub mod chisei;
 pub mod chisei_budget;
 pub mod chisei_eval_backend;

@@ -5450,6 +5450,49 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_capability_package(
+        &self,
+        namespace: &str,
+        certification_id: &str,
+    ) -> Result<Option<crate::sekai::capability_package::CapabilityPackageCertification>, String>
+    {
+        match self {
+            Self::Sqlite(db) => db.get_capability_package(namespace, certification_id),
+            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_capability_packages(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::capability_package::CapabilityPackageCertification>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_capability_packages(namespace),
+            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn commit_capability_packages(
+        &self,
+        packages: &[&crate::sekai::capability_package::CapabilityPackageCertification],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.commit_capability_packages(packages),
+            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn cas_capability_package(
+        &self,
+        expected: &crate::sekai::capability_package::CapabilityPackageCertification,
+        next: &crate::sekai::capability_package::CapabilityPackageCertification,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.cas_capability_package(expected, next),
+            Self::Postgres(_) => Err(crate::sekai::capability_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn put_governed_image(
         &self,
         image: &crate::sekai::image::GovernedImage,
