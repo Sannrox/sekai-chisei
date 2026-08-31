@@ -20,7 +20,7 @@ fn postgres_stored_property_text(key_sql: &str) -> String {
     format!("(sekai_jsonb_object(o.properties) ->> {key_sql})")
 }
 
-fn postgres_object_security_filter(subjects: &str, scopes: &str) -> String {
+pub(crate) fn postgres_object_security_filter(subjects: &str, scopes: &str) -> String {
     format!(
         " AND (
             NOT EXISTS (
