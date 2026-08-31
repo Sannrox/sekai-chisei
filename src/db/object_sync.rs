@@ -618,7 +618,21 @@ impl SekaiDb {
                     PRIMARY KEY(namespace, binding_id, command, expected_cursor),
                     FOREIGN KEY(namespace, binding_id)
                         REFERENCES sekai_workflow_action_bindings(namespace, binding_id)
-                );",
+                );
+                CREATE TABLE IF NOT EXISTS sekai_connector_certifications (
+                    namespace TEXT NOT NULL,
+                    certification_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, certification_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS sekai_connector_certifications_live_identity
+                ON sekai_connector_certifications(
+                    namespace,
+                    json_extract(record_json, '$.connector_id')
+                )
+                WHERE json_extract(record_json, '$.superseded_by') = ''
+                  AND json_extract(record_json, '$.revocation') = '';",
             )
             .map_err(|error| error.to_string())?;
         for statement in [

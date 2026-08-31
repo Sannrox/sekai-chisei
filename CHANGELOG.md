@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Certify the catalogued GitHub object-sync connector as a
+  `sekai.connector-certification/v1` record. Certification binds producer,
+  type digest, signer, and tests to one independently verifiable digest.
+  It is not a runtime grant. Exact replay is idempotent. Package or test
+  change invalidates verification. Recertification and revocation preserve
+  history. Secrets and hidden fields fail closed. `sekaictl admin connectors`
+  certifies, retrieves, verifies, and revokes. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Map external workflow steps onto ActionInstance admission through
   `sekai.workflow-action-bridge/v1`. Two domain-neutral adapters project
   job and approval steps. Submit, park, resume, cancel, and callback are
