@@ -5315,6 +5315,44 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_autonomous_envelope(
+        &self,
+        namespace: &str,
+        envelope_id: &str,
+    ) -> Result<Option<crate::sekai::autonomous_envelope::AutonomousEnvelope>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_autonomous_envelope(namespace, envelope_id),
+            Self::Postgres(_) => {
+                Err(crate::sekai::autonomous_envelope::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn put_autonomous_envelope(
+        &self,
+        envelope: &crate::sekai::autonomous_envelope::AutonomousEnvelope,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_autonomous_envelope(envelope),
+            Self::Postgres(_) => {
+                Err(crate::sekai::autonomous_envelope::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn cas_autonomous_envelope(
+        &self,
+        expected: &crate::sekai::autonomous_envelope::AutonomousEnvelope,
+        next: &crate::sekai::autonomous_envelope::AutonomousEnvelope,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.cas_autonomous_envelope(expected, next),
+            Self::Postgres(_) => {
+                Err(crate::sekai::autonomous_envelope::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
     pub fn get_federation_revocation(
         &self,
         revocation_id: &str,

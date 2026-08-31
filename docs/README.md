@@ -103,6 +103,8 @@ If you want to deploy or operate the control plane:
   versioned snapshots with schema evolution, redaction, deletion, and re-import.
 - [Model-platform adapter certification](model-platform-certification.md) —
   capability, streaming, usage, fallback, and receipt protocol evidence.
+- [Bounded autonomous envelopes](autonomous-envelopes.md) — signed current
+  pins for state, policy, model, prompt, evidence, budget, and lease.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,

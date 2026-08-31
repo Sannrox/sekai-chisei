@@ -75,6 +75,24 @@ pub fn compute_request_digest(
     parameters_json: &str,
     evidence_submission_ids: &[String],
 ) -> Result<String, String> {
+    compute_request_digest_with_envelope(
+        namespace,
+        type_id,
+        version,
+        parameters_json,
+        evidence_submission_ids,
+        "",
+    )
+}
+
+pub(crate) fn compute_request_digest_with_envelope(
+    namespace: &str,
+    type_id: &str,
+    version: &str,
+    parameters_json: &str,
+    evidence_submission_ids: &[String],
+    autonomous_envelope_id: &str,
+) -> Result<String, String> {
     reject_duplicate_parameter_keys(parameters_json)?;
     let params: serde_json::Value = serde_json::from_str(parameters_json)
         .map_err(|e| format!("parameters_json must be JSON: {e}"))?;
@@ -84,13 +102,22 @@ pub fn compute_request_digest(
     let mut evidence = evidence_submission_ids.to_vec();
     evidence.sort();
     evidence.dedup();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "namespace": namespace,
         "type_id": type_id,
         "version": version,
         "parameters": params,
         "evidence_submission_ids": evidence,
     });
+    let envelope_id = autonomous_envelope_id.trim();
+    if !envelope_id.is_empty() {
+        body.as_object_mut()
+            .expect("request digest body is an object")
+            .insert(
+                "autonomous_envelope_id".into(),
+                serde_json::Value::String(envelope_id.to_string()),
+            );
+    }
     let canonical = serde_json::to_string(&body).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());

@@ -325,3 +325,21 @@ conformance:
 ```sh
 cargo test --test model_platform_adapters
 ```
+
+## Autonomy envelope adapters
+
+`autonomy_simulate.rs` and `autonomy_evaluate.rs` map domain-neutral
+simulation and evaluation documents onto
+`sekai.autonomous-envelope/v1`. They admit a signed envelope whose
+state, policy, model, prompt, evidence, simulation, budget, and lease
+pins are current. Exact digest replay is idempotent. Stop is
+idempotent. Rollback supersedes history. Lease loss and receipt
+invalidation block further live admission.
+
+The adapters never write graph, policy, budget, or receipt rows. Hidden
+fields, stale pins, foreign tenants, and unknown versions fail closed.
+Offline conformance:
+
+```sh
+cargo test --test autonomous_envelope_adapters
+```

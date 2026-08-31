@@ -79,3 +79,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0056: Export warehouse projections with security-metadata pins](0056-warehouse-projections.md)
 - [ADR 0057: Export partitioned lakehouse snapshots with schema evolution](0057-lakehouse-snapshots.md)
 - [ADR 0058: Certify model-platform adapters against evaluation evidence](0058-model-platform-certification.md)
+- [ADR 0059: Admit autonomous actions only inside a signed current envelope](0059-autonomous-envelopes.md)

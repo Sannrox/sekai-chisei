@@ -662,6 +662,13 @@ impl SekaiDb {
                     owner TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY(namespace, certification_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_autonomous_envelopes (
+                    namespace TEXT NOT NULL,
+                    envelope_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, envelope_id)
                 );",
             )
             .map_err(|error| error.to_string())?;

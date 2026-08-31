@@ -6288,6 +6288,7 @@ impl SekaiService for SekaiServiceImpl {
                 evidence_submission_ids: inner.evidence_submission_ids,
                 request_id: inner.request_id,
                 ontology_digest: inner.ontology_digest,
+                autonomous_envelope_id: String::new(),
             },
             &actor,
             now_millis(),

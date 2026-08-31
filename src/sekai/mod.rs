@@ -7,6 +7,7 @@ pub mod action_policy;
 pub(crate) mod action_work_lifecycle;
 pub mod attestation;
 pub mod audit;
+pub mod autonomous_envelope;
 pub mod capability;
 pub mod capability_package;
 pub mod capacity;

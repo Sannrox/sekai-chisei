@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Admit autonomous Actions only inside a signed
+  `sekai.autonomous-envelope/v1` whose state, policy, model, prompt,
+  evidence, simulation, budget, and lease pins are current. Two
+  domain-neutral adapters (`adapter.autonomy.simulate`,
+  `adapter.autonomy.evaluate`) admit the envelope. Exact digest replay
+  is idempotent. Stop is idempotent. Rollback supersedes history. Lease
+  loss and receipt invalidation block further live admission. Stale
+  pins fail closed. The envelope is not a grant.
+  `sekaictl admin autonomy` admits, inspects, stops, rolls back, notes
+  lease loss, and invalidates receipts. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Certify model-platform adapters as `sekai.model-platform-certification/v1`
   records that pin `sekai.evaluation-evidence/v1`. Two domain-neutral
   adapters (`adapter.model.responses`, `adapter.model.messages`) pass
