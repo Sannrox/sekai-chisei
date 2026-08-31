@@ -101,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::document_cli::run_documents_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "images" => {
+            sekai_chisei::image_cli::run_images_command(args.into_iter().skip(1).collect()).await
+        }
         "receipt" => {
             sekai_chisei::receipt_cli::run_receipt_command(args.into_iter().skip(1).collect()).await
         }
@@ -421,6 +424,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("tables"), _) => ("tables", 2),
         (Some("streams"), _) => ("streams", 2),
         (Some("documents"), _) => ("documents", 2),
+        (Some("images"), _) => ("images", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -611,7 +615,10 @@ fn print_admin_usage() {
            sekaictl admin streams ...\n\
          \n\
          Documents:\n\
-           sekaictl admin documents ..."
+           sekaictl admin documents ...\n\
+         \n\
+         Images:\n\
+           sekaictl admin images ..."
     );
 }
 
@@ -642,6 +649,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "tables" => Some(sekai_chisei::open_table_cli::usage().to_string()),
         "streams" => Some(sekai_chisei::event_stream_cli::usage().to_string()),
         "documents" => Some(sekai_chisei::document_cli::usage().to_string()),
+        "images" => Some(sekai_chisei::image_cli::usage().to_string()),
         _ => None,
     }
 }
@@ -666,6 +674,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "tables" => Some("admin tables"),
         "streams" => Some("admin streams"),
         "documents" => Some("admin documents"),
+        "images" => Some("admin images"),
         _ => None,
     }
 }
@@ -717,6 +726,7 @@ mod tests {
             (vec!["tables"], "tables"),
             (vec!["streams"], "streams"),
             (vec!["documents"], "documents"),
+            (vec!["images"], "images"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -764,6 +774,7 @@ mod tests {
             "tables",
             "streams",
             "documents",
+            "images",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));

@@ -110,6 +110,9 @@ lives in the separate [research index](research/README.md).
   durable checkpoints and versioned consumer subscriptions.
 - [Governed documents and renditions](documents.md) — digest-bound document
   objects with renditions, hold, expiry, and deletion.
+- [Governed images, renditions, and annotations](images.md) — digest-bound
+  image objects with thumbnails, derived metadata, annotations, hold, expiry,
+  and deletion.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

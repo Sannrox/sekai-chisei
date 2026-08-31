@@ -49,8 +49,8 @@ credentials and remote failure would become authority.
 ## Consequences
 
 Operators admit documents, attach renditions, retrieve authorized fields, and
-apply hold, expiry, and deletion through `sekaictl admin documents`. Follow-up
-work may add image assets (#696) after this object contract exists.
+apply hold, expiry, and deletion through `sekaictl admin documents`. Image
+assets are recorded in [ADR 0050](0050-governed-images.md).
 
 ## Validation
 

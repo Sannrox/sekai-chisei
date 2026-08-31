@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Govern images as first-class `sekai.governed-image/v1` objects with
+  digest-bound content references, thumbnail and derived-metadata renditions,
+  and bounded region/label annotations. Admission, retrieval, hold, expiry,
+  and deletion are namespace-scoped. Requesting `bytes` or `binary`, a hidden
+  or unknown field, a mismatched purpose, or a foreign owner fails as
+  unavailable before disclosure. `sekaictl admin images` admits, attaches,
+  retrieves, holds, expires, and deletes. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Enforce value-instance access as an optional `value_instance_grants` cell
   grant on `sekai.object-security-policy/v1`. Row predicates and property
   grants still run first. Named cells are authorized before find, list,
