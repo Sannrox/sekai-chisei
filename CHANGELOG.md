@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Certify model-platform adapters as `sekai.model-platform-certification/v1`
+  records that pin `sekai.evaluation-evidence/v1`. Two domain-neutral
+  adapters (`adapter.model.responses`, `adapter.model.messages`) pass
+  capability, streaming, usage, fallback, and receipt protocol fixtures.
+  Unsupported capability and ambiguous usage fail closed. Exact digest
+  replay is idempotent. Revocation is terminal. Certification is not a
+  runtime grant. `sekaictl admin providers` certifies, retrieves,
+  verifies, and revokes. SQLite is the reference store; PostgreSQL stays
+  unavailable.
 - Export governed lakehouse snapshots as `sekai.lakehouse-snapshot/v1`
   records. Each snapshot pins partitions, additive schema versions, and
   `sekai.security-metadata/v1` classification, purpose, residency, and

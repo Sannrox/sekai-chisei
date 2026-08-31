@@ -1,0 +1,14 @@
+{
+  "certification_id": "mp:messages",
+  "namespace": "ops",
+  "owner": "integrator",
+  "evidence_id": "ev:mp:messages",
+  "requested": ["streaming"],
+  "supported": ["streaming", "usage", "fallback", "receipt"],
+  "events": ["content_block_delta", "message_stop"],
+  "interrupted": false,
+  "input_tokens": 3,
+  "output_tokens": 2,
+  "retry_safety": "safe",
+  "operation_id": "op:mp:messages"
+}

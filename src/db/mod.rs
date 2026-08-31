@@ -42,6 +42,7 @@ mod image_store;
 mod lakehouse_snapshot_store;
 mod learning_change_store;
 pub mod lease;
+mod model_platform_store;
 mod namespace_snapshot_store;
 pub mod object_security;
 pub mod object_sync;

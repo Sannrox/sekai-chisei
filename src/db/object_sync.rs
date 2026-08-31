@@ -655,6 +655,13 @@ impl SekaiDb {
                     owner TEXT NOT NULL,
                     record_json TEXT NOT NULL,
                     PRIMARY KEY(namespace, snapshot_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_model_platform_certifications (
+                    namespace TEXT NOT NULL,
+                    certification_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, certification_id)
                 );",
             )
             .map_err(|error| error.to_string())?;
