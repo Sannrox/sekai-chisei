@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Export governed warehouse projections as `sekai.warehouse-projection/v1`
+  records. Each projection pins authorized columns and
+  `sekai.security-metadata/v1` classification, purpose, residency, and
+  trust. Two domain-neutral adapters (`adapter.warehouse.orders`,
+  `adapter.warehouse.inventory`) register a projection, export a
+  snapshot, then contiguous incremental pages that may tombstone rows.
+  Exact last-page replay is idempotent. Revocation is terminal. Security
+  metadata constrains visibility; it is not a grant. Hidden columns,
+  stale cursors, foreign tenants, and unknown versions fail closed.
+  `sekaictl admin warehouse` registers, exports, retrieves, and revokes.
+  SQLite is the reference store; PostgreSQL stays unavailable.
 - Certify the catalogued GitHub object-sync connector as a
   `sekai.connector-certification/v1` record. Certification binds producer,
   type digest, signer, and tests to one independently verifiable digest.

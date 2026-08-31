@@ -76,3 +76,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0053: Exchange federation traffic through bilateral network contracts](0053-federation-network-contracts.md)
 - [ADR 0054: Map workflow steps through ActionInstance admission](0054-workflow-action-bridge.md)
 - [ADR 0055: Certify connectors against an immutable digest](0055-connector-certification.md)
+- [ADR 0056: Export warehouse projections with security-metadata pins](0056-warehouse-projections.md)

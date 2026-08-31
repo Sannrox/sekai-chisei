@@ -1,0 +1,11 @@
+{
+  "projection_id": "wh:inventory",
+  "namespace": "ops",
+  "owner": "integrator",
+  "purpose": "analytics",
+  "residency_class": "eu",
+  "trust_pin_digest": "sha256:01ababababababababababababababababababababababababababababababab",
+  "rows": [
+    { "id": "1", "sku": "a" }
+  ]
+}

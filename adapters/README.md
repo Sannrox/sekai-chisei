@@ -273,3 +273,20 @@ usage fail closed. Offline conformance:
 ```sh
 cargo test --test workflow_action_adapters
 ```
+
+## Warehouse projection adapters
+
+`warehouse_orders.rs` and `warehouse_inventory.rs` map domain-neutral
+orders and inventory documents onto `sekai.warehouse-projection/v1`.
+They register a projection, export a snapshot, then contiguous
+incremental pages that may tombstone rows. Exact last-page replay is
+idempotent. Revocation is terminal. Security metadata constrains
+classification, purpose, residency, and trust; it is not a grant.
+
+The adapters never write graph, policy, budget, or receipt rows. Hidden
+columns, stale cursors, foreign tenants, and unknown versions fail
+closed. Offline conformance:
+
+```sh
+cargo test --test warehouse_projection_adapters
+```
