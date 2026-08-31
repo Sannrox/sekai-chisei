@@ -585,6 +585,39 @@ impl SekaiDb {
                     PRIMARY KEY(namespace, contract_id, exchange_id),
                     FOREIGN KEY(namespace, contract_id)
                         REFERENCES sekai_federation_network_contracts(namespace, contract_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_workflow_action_bindings (
+                    namespace TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, binding_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS sekai_workflow_action_bindings_identity
+                ON sekai_workflow_action_bindings(
+                    namespace,
+                    json_extract(record_json, '$.profile_id'),
+                    json_extract(record_json, '$.source_instance'),
+                    json_extract(record_json, '$.step_id')
+                );
+                CREATE TABLE IF NOT EXISTS sekai_workflow_action_callbacks (
+                    namespace TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    cursor_value INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, binding_id, cursor_value),
+                    FOREIGN KEY(namespace, binding_id)
+                        REFERENCES sekai_workflow_action_bindings(namespace, binding_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_workflow_action_commands (
+                    namespace TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    command TEXT NOT NULL,
+                    expected_cursor INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, binding_id, command, expected_cursor),
+                    FOREIGN KEY(namespace, binding_id)
+                        REFERENCES sekai_workflow_action_bindings(namespace, binding_id)
                 );",
             )
             .map_err(|error| error.to_string())?;

@@ -93,6 +93,8 @@ If you want to deploy or operate the control plane:
   and deletion.
 - [Federation network contracts](federation-networks.md) — bilateral
   request, evidence, and outcome exchange without local write authority.
+- [Governed workflow-action bridge](workflow-actions.md) — external
+  workflow steps projected onto ActionInstance admission.
 - [Capability-package certification](capability-packages.md) — signer,
   manifest, compatibility, tests, and revocation bound to one digest.
 - [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,
