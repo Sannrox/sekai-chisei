@@ -6,6 +6,7 @@
 - Discussion: [Issue #523](https://github.com/Sannrox/sekai-chisei/issues/523)
 - Supersedes: none
 - Superseded by: none
+- Related: [ADR 0051](0051-versioned-client-packages.md)
 
 ## Context
 

@@ -75,6 +75,9 @@ treat inventory “complete” as dual-backend for these RPCs):
 - governed images, renditions, and annotations
   (`sekai.governed-image/v1`; see
   [ADR 0050](decisions/0050-governed-images.md));
+- versioned client packages
+  (`sekai.client-package/v1`; see
+  [ADR 0051](decisions/0051-versioned-client-packages.md));
 
 Evidence is checked in as:
 

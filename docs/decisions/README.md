@@ -71,3 +71,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0048: Expose governed event subscriptions with versioned cursors](0048-governed-event-subscriptions.md)
 - [ADR 0049: Enforce value-instance access as a cell grant](0049-value-instance-access.md)
 - [ADR 0050: Govern image assets with digest-bound renditions and annotations](0050-governed-images.md)
+- [ADR 0051: Publish versioned client packages with protocol and provenance pins](0051-versioned-client-packages.md)
