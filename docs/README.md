@@ -91,6 +91,8 @@ If you want to deploy or operate the control plane:
 - [Governed images, renditions, and annotations](images.md) — digest-bound
   image objects with thumbnails, derived metadata, annotations, hold, expiry,
   and deletion.
+- [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,
+  and Python clients with protocol, source, package, and provenance pins.
 - [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
   matched claim-only/framed comparison with digest-bound metrics and gates.
 - [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,

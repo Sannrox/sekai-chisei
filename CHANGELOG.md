@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Publish versioned `sekai.client-package/v1` objects for Rust, TypeScript,
+  and Python clients. Each publication pins protocol, source, and package
+  digests plus provenance. Replay of the same live identity is idempotent.
+  A later version supersedes the previous publication; the same version cannot
+  be silently replaced. Tampered digests, unknown languages, stale contracts,
+  and foreign owners fail as unavailable. `sekaictl admin sdk-packages`
+  publishes, retrieves, verifies, and smokes. SQLite is the reference store;
+  PostgreSQL stays unavailable.
 - Govern images as first-class `sekai.governed-image/v1` objects with
   digest-bound content references, thumbnail and derived-metadata renditions,
   and bounded region/label annotations. Admission, retrieval, hold, expiry,

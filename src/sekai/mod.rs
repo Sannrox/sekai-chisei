@@ -10,6 +10,7 @@ pub mod audit;
 pub mod capability;
 pub mod capacity;
 pub mod classification_lattice;
+pub mod client_package;
 pub mod compute;
 pub mod coordination;
 pub mod credentials;

@@ -10,6 +10,7 @@ pub mod chisei_portfolio;
 pub mod chisei_portfolio_backend;
 pub mod chisei_receipt;
 pub mod chisei_rpc_inventory;
+mod client_package_store;
 pub mod coordination;
 pub mod credential;
 mod data_quality_store;

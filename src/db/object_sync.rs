@@ -541,7 +541,21 @@ impl SekaiDb {
                     PRIMARY KEY(namespace, image_id, annotation_id),
                     FOREIGN KEY(namespace, image_id)
                         REFERENCES sekai_governed_images(namespace, image_id)
-                );",
+                );
+                CREATE TABLE IF NOT EXISTS sekai_client_packages (
+                    namespace TEXT NOT NULL,
+                    package_id TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, package_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS sekai_client_packages_live_identity
+                ON sekai_client_packages(
+                    namespace,
+                    json_extract(record_json, '$.language'),
+                    json_extract(record_json, '$.package_name')
+                )
+                WHERE json_extract(record_json, '$.superseded_by') = '';",
             )
             .map_err(|error| error.to_string())?;
         for statement in [

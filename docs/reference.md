@@ -113,6 +113,8 @@ lives in the separate [research index](research/README.md).
 - [Governed images, renditions, and annotations](images.md) — digest-bound
   image objects with thumbnails, derived metadata, annotations, hold, expiry,
   and deletion.
+- [Versioned client packages](sdk-packages.md) — published Rust, TypeScript,
+  and Python clients with protocol, source, package, and provenance pins.
 - [External-action execution](external-action-execution.md) — host lifecycle
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,

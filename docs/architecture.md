@@ -367,6 +367,7 @@ federation peer tables, registered Iceberg/Parquet snapshot projections,
 event-stream checkpoints and subscriptions,
 governed documents and renditions,
 governed images, renditions, and annotations,
+versioned client packages,
 and (on the Chisei side)
 online permit redeem and Gunshi allocation state — see the parity guides.
 

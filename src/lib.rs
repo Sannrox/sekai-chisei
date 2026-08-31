@@ -48,6 +48,7 @@ pub mod tenant_invitation;
 pub mod tenant_lifecycle;
 pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
+pub mod client_package_cli;
 pub mod document_cli;
 pub mod event_stream_cli;
 pub mod image_cli;

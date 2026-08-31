@@ -5419,6 +5419,37 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_client_package(
+        &self,
+        namespace: &str,
+        package_id: &str,
+    ) -> Result<Option<crate::sekai::client_package::ClientPackage>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_client_package(namespace, package_id),
+            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn list_client_packages(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::client_package::ClientPackage>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_client_packages(namespace),
+            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn commit_client_packages(
+        &self,
+        packages: &[&crate::sekai::client_package::ClientPackage],
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.commit_client_packages(packages),
+            Self::Postgres(_) => Err(crate::sekai::client_package::POSTGRES_UNAVAILABLE.into()),
+        }
+    }
+
     pub fn put_governed_image(
         &self,
         image: &crate::sekai::image::GovernedImage,
