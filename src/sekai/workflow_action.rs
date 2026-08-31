@@ -256,6 +256,7 @@ pub fn submit_step(
                 evidence_submission_ids: Vec::new(),
                 request_id: String::new(),
                 ontology_digest: String::new(),
+                autonomous_envelope_id: String::new(),
             },
             actor,
             now_ms,

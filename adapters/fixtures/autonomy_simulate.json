@@ -1,0 +1,13 @@
+{
+  "envelope_id": "auto:simulate",
+  "namespace": "ops",
+  "owner": "operator",
+  "state_digest": "sha256:01ababababababababababababababababababababababababababababababab",
+  "policy_digest": "sha256:02ababababababababababababababababababababababababababababababab",
+  "model_digest": "sha256:03ababababababababababababababababababababababababababababababab",
+  "prompt_digest": "sha256:04ababababababababababababababababababababababababababababababab",
+  "evidence_digest": "sha256:05ababababababababababababababababababababababababababababababab",
+  "simulation_digest": "sha256:06ababababababababababababababababababababababababababababababab",
+  "budget_digest": "sha256:07ababababababababababababababababababababababababababababababab",
+  "lease_digest": "sha256:08ababababababababababababababababababababababababababababababab"
+}

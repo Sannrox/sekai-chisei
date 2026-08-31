@@ -13,8 +13,8 @@ use crate::chisei::receipt::{
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
-    ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION, compute_request_digest,
-    submit_budget_subject, validate_parameters_json,
+    ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION,
+    compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
 };
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
@@ -32,6 +32,7 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub evidence_submission_ids: Vec<String>,
     pub request_id: String,
     pub ontology_digest: String,
+    pub autonomous_envelope_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +78,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         validate_parameters_json(&request.parameters_json)
             .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
 
-        let mut evidence_ids = request.evidence_submission_ids;
+        let mut evidence_ids = request.evidence_submission_ids.clone();
         evidence_ids.sort();
         evidence_ids.dedup();
         if evidence_ids.iter().any(|id| id.trim().is_empty()) {
@@ -85,12 +86,14 @@ impl<'a> ActionInstanceAdmission<'a> {
                 "evidence_submission_ids must not contain empty ids".into(),
             ));
         }
-        let request_digest = compute_request_digest(
+        let envelope_id = autonomous_envelope_id(&request)?;
+        let request_digest = compute_request_digest_with_envelope(
             &namespace,
             &request.type_id,
             &request.version,
             &request.parameters_json,
             &evidence_ids,
+            &envelope_id,
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
 
@@ -107,6 +110,19 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ));
             }
             return self.completed_replay(existing);
+        }
+
+        // New admissions consume a live signed envelope. Replay of an already
+        // admitted request stays idempotent after stop, rollback, lease loss,
+        // or receipt invalidation. The envelope is not a runtime grant.
+        if request.type_id.starts_with("autonomous.") || !envelope_id.is_empty() {
+            crate::sekai::autonomous_envelope::require_live_envelope(
+                self.db,
+                actor,
+                &namespace,
+                &envelope_id,
+            )
+            .map_err(ActionInstanceAdmissionError::FailedPrecondition)?;
         }
 
         let type_def = self
@@ -568,6 +584,32 @@ fn has_pending_runtime_dispatch(effects: Option<&[action_effect::ActionEffect]>)
     })
 }
 
+fn autonomous_envelope_id(
+    request: &ActionInstanceAdmissionRequest,
+) -> Result<String, ActionInstanceAdmissionError> {
+    let explicit = request.autonomous_envelope_id.trim();
+    let from_parameters = match serde_json::from_str::<serde_json::Value>(&request.parameters_json)
+    {
+        Ok(serde_json::Value::Object(map)) => map
+            .get("autonomous_envelope_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    };
+    if !explicit.is_empty() && !from_parameters.is_empty() && explicit != from_parameters {
+        return Err(ActionInstanceAdmissionError::InvalidArgument(
+            "autonomous_envelope_id conflict".into(),
+        ));
+    }
+    Ok(if !explicit.is_empty() {
+        explicit.to_string()
+    } else {
+        from_parameters
+    })
+}
+
 fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmissionError> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -636,6 +678,7 @@ mod tests {
             evidence_submission_ids: vec!["evidence-2".into(), "evidence-1".into()],
             request_id: String::new(),
             ontology_digest: String::new(),
+            autonomous_envelope_id: String::new(),
         }
     }
 
@@ -697,6 +740,119 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_action_requires_a_live_envelope() {
+        use crate::sekai::autonomous_envelope::{
+            AutonomousEnvelope, AutonomousPins, ENVELOPE_CONTRACT, PROFILE_SIMULATE,
+            PROFILE_VERSION, RECEIPT_CURRENT, STATUS_LIVE, admit_envelope, envelope_digest_for,
+            stop_envelope,
+        };
+        use ed25519_dalek::Signer;
+        use sha2::{Digest, Sha256};
+
+        let db = setup();
+        db.put_governed_action_type(
+            GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "autonomous.simulate".into(),
+                version: "1".into(),
+                description: "bounded autonomous simulate".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string"},"autonomous_envelope_id":{"type":"string"}},"required":["runtime"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                object_kind: String::new(),
+                object_mutation: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+            },
+            "operator",
+            1,
+        )
+        .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut missing = request(r#"{"runtime":"shikigami"}"#);
+        missing.type_id = "autonomous.simulate".into();
+        missing.idempotency_key = "auto-missing".into();
+        assert!(matches!(
+            admission.admit(missing, "alice", 10),
+            Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+        ));
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let digest = |tag: u8| format!("sha256:{tag:02x}{}", "ab".repeat(31));
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let mut envelope = AutonomousEnvelope {
+            contract_version: ENVELOPE_CONTRACT.into(),
+            envelope_id: "auto:sim".into(),
+            namespace: "acme".into(),
+            owner: "alice".into(),
+            adapter_id: PROFILE_SIMULATE.into(),
+            adapter_version: PROFILE_VERSION.into(),
+            pins: AutonomousPins {
+                state_digest: digest(1),
+                policy_digest: digest(2),
+                model_digest: digest(3),
+                prompt_digest: digest(4),
+                evidence_digest: digest(5),
+                simulation_digest: digest(6),
+                budget_digest: digest(7),
+                lease_digest: digest(8),
+            },
+            signer_id: "signer:ops".into(),
+            signer_digest: format!("sha256:{:x}", Sha256::digest(public_key)),
+            public_key_hex: hex(&public_key),
+            signature_hex: String::new(),
+            envelope_digest: String::new(),
+            receipt_digest: String::new(),
+            receipt_status: RECEIPT_CURRENT.into(),
+            status: STATUS_LIVE.into(),
+            predecessor_id: String::new(),
+            admitted_by: String::new(),
+            admitted_at_ms: 0,
+        };
+        envelope.envelope_digest = envelope_digest_for(&envelope).unwrap();
+        envelope.signature_hex = hex(&signing_key
+            .sign(envelope.envelope_digest.as_bytes())
+            .to_bytes());
+        admit_envelope(&db, "alice", &envelope, 1_000).unwrap();
+
+        let mut live = request(r#"{"runtime":"shikigami"}"#);
+        live.type_id = "autonomous.simulate".into();
+        live.idempotency_key = "auto-live".into();
+        live.autonomous_envelope_id = "auto:sim".into();
+        admission.admit(live.clone(), "alice", 20).unwrap();
+
+        let mut other = live.clone();
+        other.autonomous_envelope_id = "auto:other".into();
+        assert!(matches!(
+            admission.admit(other, "alice", 25),
+            Err(ActionInstanceAdmissionError::AlreadyExists(_))
+        ));
+
+        stop_envelope(&db, "alice", "acme", "auto:sim", 30).unwrap();
+        let replayed = admission.admit(live, "alice", 40).unwrap();
+        assert!(replayed.replay);
+
+        let mut stopped = request(r#"{"runtime":"shikigami"}"#);
+        stopped.type_id = "autonomous.simulate".into();
+        stopped.idempotency_key = "auto-stopped".into();
+        stopped.autonomous_envelope_id = "auto:sim".into();
+        assert!(matches!(
+            admission.admit(stopped, "alice", 50),
+            Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+        ));
+    }
+
+    #[test]
     fn notify_only_admission_completes_the_receipt() {
         let db = setup();
         db.put_governed_action_type(
@@ -733,6 +889,7 @@ mod tests {
                     evidence_submission_ids: Vec::new(),
                     request_id: "operation-notify".into(),
                     ontology_digest: ONTOLOGY_DIGEST.into(),
+                    autonomous_envelope_id: String::new(),
                 },
                 "alice",
                 10,
@@ -898,6 +1055,7 @@ mod tests {
             evidence_submission_ids: Vec::new(),
             request_id: "operation-record".into(),
             ontology_digest: ONTOLOGY_DIGEST.into(),
+            autonomous_envelope_id: String::new(),
         }
     }
 
