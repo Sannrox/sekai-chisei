@@ -79,6 +79,14 @@ contract.
 
 No schema migration, public RPC, or persistence change is required.
 
+## Related research
+
+[Issue #817](https://github.com/Sannrox/sekai-chisei/issues/817) recommends
+additive registered descriptors with immutable namespaced keys. That research
+does not supersede this decision. Production admission remains GitHub
+Issue/PullRequest until a later accepted ADR. See
+[research/817-source-type-admission.md](../research/817-source-type-admission.md).
+
 ## Validation
 
 - `sync_github_record` continues to reject non-GitHub sources and any

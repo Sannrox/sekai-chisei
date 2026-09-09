@@ -74,6 +74,7 @@ pub mod semantic;
 pub mod sentinel;
 pub mod skillextract;
 pub mod source_health;
+pub mod source_type_descriptor;
 pub mod source_webhook;
 pub mod virtual_pushdown;
 pub mod warehouse_projection;
