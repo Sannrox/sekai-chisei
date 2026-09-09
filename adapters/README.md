@@ -93,6 +93,11 @@ through `cargo test --test evidence_adapters`.
 
 ## GitHub object sync
 
+The end-to-end runner
+[`examples/source_writeback.rs`](../examples/source_writeback.rs) uses this
+normalizer against a loopback Issue/executor fixture. See
+[source-writeback-example.md](../docs/source-writeback-example.md).
+
 `github_object_sync.rs` is the fixed source adapter for normalized GitHub Issue
 and PullRequest fixtures. It is not an evidence adapter and does not appear in
 `ListEvidenceAdapters`. Issues and pull requests share the repository number

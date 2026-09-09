@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Run one GitHub Issue through inbound object sync, a governed Action,
+  permit-backed loopback write-back, source readback, and receipt
+  inspection with `cargo run --locked --example source_writeback`. The
+  loopback fixture keeps its record version and applied-effect counter
+  outside the control-plane database. Stale source versions, revoked
+  authorization, identical-intent replay, lost executor responses, and
+  control-plane restart are asserted. The fixture Issue may describe a
+  service incident; it does not add an Incident source type or a
+  production connector.
 - Admit autonomous Actions only inside a signed
   `sekai.autonomous-envelope/v1` whose state, policy, model, prompt,
   evidence, simulation, budget, and lease pins are current. Two
