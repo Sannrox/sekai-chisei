@@ -35,7 +35,7 @@ reference pages.
 | [Next query-time entailment constructs](658-query-time-entailment-constructs.md) | Keep the ADR 0001 profile; inverse and disjointness stay metadata; reopen only with unmet demand and PostgreSQL advertising the same profile |
 | [Governed hypothetical overlay after 1.0](660-hypothetical-overlay.md) | Keep the EvaluateScenario removal; hypothesis remains vocabulary, not a live overlay |
 | [Type-bound derived-fact admission](659-derived-fact-admission.md) | Functions stay read-only; derived views stay query-time; no derived-fact kind or digest |
-| [Additive source-type admission](817-source-type-admission.md) | Recommend registered descriptors with namespaced keys; do not supersede ADR 0021; production admission stays GitHub Issue/PR |
+| [Additive source-type admission](817-source-type-admission.md) | Accepted in [ADR 0060](../decisions/0060-additive-source-type-descriptors.md); GitHub profile unchanged; #818 registers descriptors |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
