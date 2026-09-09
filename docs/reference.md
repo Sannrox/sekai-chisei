@@ -24,6 +24,9 @@ lives in the separate [research index](research/README.md).
 - [Responses harness profile](responses-harness-profile.md) — supported
   request, streaming, and error behavior.
 - [Examples](../examples/README.md) — runnable, domain-neutral integrations.
+- [Source write-back example](source-writeback-example.md) — isolated GitHub
+  Issue sync, permit-backed loopback mutation, readback, and receipt
+  verification.
 - [External reference adapters](../adapters/README.md) — separate versioned
   evidence and source-sync contracts, durable outboxes, and offline fixtures.
 - [Social observation evidence adapters](social-evidence-adapters.md) —

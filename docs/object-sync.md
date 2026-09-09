@@ -328,6 +328,15 @@ source-sync tables, generation state, and final checkpoint from the same
 database snapshot, then let the adapter resume from that restored
 control-plane-owned cursor and offset.
 
+## Runnable write-back example
+
+`cargo run --locked --example source_writeback` starts an isolated SQLite
+control plane and a loopback GitHub Issue/executor fixture. It exercises
+initial sync, refresh, one conditional write-back, source-version conflict,
+revoked authorization, lost executor response, and restart. The fixture Issue
+may describe a service incident; it does not add an Incident source type. See
+[source-writeback-example.md](source-writeback-example.md).
+
 ## Non-goals
 
 Signed webhook deliveries (`sekai.source-webhook-delivery/v1`) are a collection

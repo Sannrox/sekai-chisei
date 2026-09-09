@@ -155,3 +155,21 @@ An integration can persist the same objects and links through `SekaiService`,
 then submit the operation through the Chisei gateway or native execution API.
 Incident tooling remains an adapter around the control plane rather than part of
 its ontology.
+
+## source_writeback
+
+[source_writeback.rs](source_writeback.rs) runs one GitHub Issue through inbound
+object sync, a governed Action, permit-backed loopback write-back, source
+readback, and receipt inspection. The fixture Issue may describe a service
+incident; the admitted source type stays GitHub Issue/PullRequest. The loopback
+source keeps its record version and applied-effect counter outside the
+control-plane database.
+
+```bash
+cargo run --locked --example source_writeback
+cargo test --locked --test source_writeback_example
+```
+
+See [the fixture walkthrough](../docs/source-writeback-example.md) for the
+failure cases: stale source version, revoked authorization, identical-intent
+replay, lost executor response, and control-plane restart.

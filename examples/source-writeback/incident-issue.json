@@ -1,0 +1,13 @@
+{
+  "repository": "acme/ops",
+  "kind": "Issue",
+  "number": 42,
+  "revision": "issue-42-v1",
+  "title": "Service checkout latency incident",
+  "state": "open",
+  "deleted": false,
+  "observed_at_ms": 1700000100000,
+  "properties": {
+    "author": "ops-bot"
+  }
+}
