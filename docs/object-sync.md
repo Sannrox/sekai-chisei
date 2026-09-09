@@ -168,7 +168,10 @@ The digest is SHA-256 of
 Any other digest fails as `unbound_type_revision` before source binding or
 mutation. A configurable or additional revision requires a separate design
 decision and authoritative registration lifecycle; v1 does not infer a
-revision from caller input.
+revision from caller input. [Issue #817](https://github.com/Sannrox/sekai-chisei/issues/817)
+recommends additive registered descriptors with namespaced keys and does not
+change this admitted profile; see
+[research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the
 idempotency key and both cursors. For v2 it also includes the complete delivery

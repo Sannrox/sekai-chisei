@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Recommend additive registered source-type descriptors with immutable
+  namespaced keys, proven by two local synthetic kinds. The research
+  spike does not admit a second production source, change
+  `ApplySourceBatch`, or supersede ADR 0021. GitHub Issue/PullRequest
+  remains the only catalog-advertised object-sync profile. Free-form
+  record names cannot infer a descriptor.
 - Run one GitHub Issue through inbound object sync, a governed Action,
   permit-backed loopback write-back, source readback, and receipt
   inspection with `cargo run --locked --example source_writeback`. The
