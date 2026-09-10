@@ -81,10 +81,12 @@ No schema migration, public RPC, or persistence change is required.
 
 ## Related research
 
-[Issue #817](https://github.com/Sannrox/sekai-chisei/issues/817) recommends
-additive registered descriptors with immutable namespaced keys. That research
-does not supersede this decision. Production admission remains GitHub
-Issue/PullRequest until a later accepted ADR. See
+[Issue #817](https://github.com/Sannrox/sekai-chisei/issues/817) recommended
+additive registered descriptors. [ADR 0060](0060-additive-source-type-descriptors.md)
+accepts that mechanism. This decision is not superseded: GitHub
+Issue/PullRequest identity stays the only code-owned profile, extra GitHub
+kinds stay rejected under `github:{owner}/{repo}#{number}`, and there is no
+second adapter family. See
 [research/817-source-type-admission.md](../research/817-source-type-admission.md).
 
 ## Validation

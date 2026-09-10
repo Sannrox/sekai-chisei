@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Accept additive registered source-type descriptors
+  ([ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md)).
+  Later kinds use `{source}:{instance}#{record_kind}/{immutable_key}`.
+  GitHub Issue/PullRequest identity stays `github:{owner}/{repo}#{number}`.
+  ADR 0021 is not superseded. #818 implements registration.
 - Recommend additive registered source-type descriptors with immutable
   namespaced keys, proven by two local synthetic kinds. The research
   spike does not admit a second production source, change

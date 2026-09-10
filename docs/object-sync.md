@@ -168,9 +168,10 @@ The digest is SHA-256 of
 Any other digest fails as `unbound_type_revision` before source binding or
 mutation. A configurable or additional revision requires a separate design
 decision and authoritative registration lifecycle; v1 does not infer a
-revision from caller input. [Issue #817](https://github.com/Sannrox/sekai-chisei/issues/817)
-recommends additive registered descriptors with namespaced keys and does not
-change this admitted profile; see
+revision from caller input. [ADR 0060](decisions/0060-additive-source-type-descriptors.md)
+accepts additive registered descriptors beside this profile. GitHub identity
+and discovery stay unchanged. #818 implements register, inspect, and retire
+without rewriting the GitHub profile. See
 [research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the

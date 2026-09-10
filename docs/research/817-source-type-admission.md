@@ -7,13 +7,13 @@ reusing GitHub's identity space.
 ## Recommendation
 
 Recommend **additive registered descriptors** with immutable namespaced keys.
-Do **not** accept that contract in this issue. Do **not** supersede
-[ADR 0021](../decisions/0021-defer-second-object-sync-source.md). Production
-`ApplySourceBatch` remains bound to the code-owned GitHub Issue/PullRequest
-digest.
+[ADR 0060](../decisions/0060-additive-source-type-descriptors.md) accepts that
+mechanism. It does **not** supersede
+[ADR 0021](../decisions/0021-defer-second-object-sync-source.md). Until #818
+registers a descriptor, production `ApplySourceBatch` remains bound to the
+code-owned GitHub Issue/PullRequest digest.
 
-A later Design Discussion, then an accepted ADR, is required before #818 may
-register descriptors. Until then:
+Accepted rules:
 
 - Keep `source_control.object_sync` catalog-advertised as GitHub only.
 - Reject inference from free-form record names, display titles, or unregistered
@@ -57,19 +57,20 @@ RPC, catalog profile, or second production source.
 | Catalog | `built_in_source_adapters` still advertises only GitHub |
 | Production mapper | `sync_github_record` rejects synthetic sources and foreign digests |
 
-## Unresolved questions for Design Discussion
+## Design Discussion
 
-1. Who may register, retire, or refuse a descriptor, and whether identity is
-   immutable after first commit.
-2. Whether additive descriptors stay in `source_control.object_sync` or need a
-   distinct family.
-3. Persistence and dual-backend catalog rows for #818; this spike has none.
-4. Whether GitHub is ever rewritten as a registered descriptor. Recommendation:
-   not in the first accepted ADR.
-5. How operators inspect unadmitted descriptors without disclosing hidden
-   records or secret-bearing cursors.
+ADR 0060 records the accepted answers:
 
-#818 should implement only the descriptor contract that discussion accepts.
+1. Authenticated namespace administration registers, retires, or refuses.
+   Identity is immutable after the first successful put.
+2. Descriptors stay in `source_control.object_sync`.
+3. #818 persists the catalog on SQLite; PostgreSQL stays unavailable until a
+   later parity Issue.
+4. GitHub is not rewritten as a registered descriptor in this ADR.
+5. Inspection returns bounded identity fields only. Unknown or unadmitted
+   descriptors cannot authorize batches and fail without disclosure.
+
+#818 implements register, inspect, and retire under ADR 0060.
 
 ## Validation
 

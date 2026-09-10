@@ -80,3 +80,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0057: Export partitioned lakehouse snapshots with schema evolution](0057-lakehouse-snapshots.md)
 - [ADR 0058: Certify model-platform adapters against evaluation evidence](0058-model-platform-certification.md)
 - [ADR 0059: Admit autonomous actions only inside a signed current envelope](0059-autonomous-envelopes.md)
+- [ADR 0060: Admit later object-sync kinds through additive registered descriptors](0060-additive-source-type-descriptors.md)

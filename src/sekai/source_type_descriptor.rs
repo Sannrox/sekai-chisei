@@ -1,8 +1,9 @@
-//! Proposed additive source-type descriptor identity (#817).
+//! Additive source-type descriptor identity (ADR 0060, Issue #817).
 //!
-//! This module is the research spike for an additive registration contract. It
-//! is not wired into `ApplySourceBatch`. Production admission remains the
-//! code-owned GitHub Issue/PullRequest profile until a later accepted ADR.
+//! This module is the research spike for the accepted additive registration
+//! contract. It is not wired into `ApplySourceBatch`. Production admission
+//! remains the code-owned GitHub Issue/PullRequest profile until #818
+//! persists a registered descriptor.
 
 use crate::sekai::object_sync::{
     FAMILY_OBJECT_SYNC, MAX_SOURCE_IDENTIFIER_BYTES, SOURCE_GITHUB, SourceRecord, SyncDecision,
