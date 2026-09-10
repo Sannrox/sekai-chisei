@@ -16,6 +16,15 @@ use sekai_chisei::sekai::evidence::{
 use sekai_chisei::sekai::evidence_store::{
     EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
 };
+use sekai_chisei::sekai::object_security::{
+    OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+    ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext,
+};
+use sekai_chisei::sekai::object_sync::{
+    ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatch,
+    SourceBatchStatus, SourceRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -113,6 +122,10 @@ fn main() -> Result<(), String> {
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("parse benchmark manifest {manifest_path}: {error}"))?;
     validate_manifest(&manifest)?;
+    let workloads = selected_workloads(&manifest)?;
+    for workload in &workloads {
+        drop(workload_factory(workload)?);
+    }
 
     let report = Report {
         contract_version: REPORT_VERSION,
@@ -126,10 +139,9 @@ fn main() -> Result<(), String> {
         },
         build_profile: required_metadata("SEKAI_BENCH_PROFILE")?,
         crate_version: env!("CARGO_PKG_VERSION"),
-        results: manifest
-            .workloads
+        results: selected_workloads(&manifest)?
             .iter()
-            .map(run_workload)
+            .map(|workload| run_workload(workload))
             .collect::<Result<Vec<_>, _>>()?,
         uncertainty: "Sample standard deviation and relative standard deviation describe run-to-run variance; provider delay is excluded because all fixtures are local.",
     };
@@ -146,6 +158,34 @@ fn required_metadata(name: &str) -> Result<String, String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("{name} is required for reproducible benchmark metadata"))
+}
+
+fn selected_workloads(manifest: &Manifest) -> Result<Vec<&Workload>, String> {
+    let Some(filter) = env::var("SEKAI_BENCH_ONLY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(manifest.workloads.iter().collect());
+    };
+    let wanted = filter
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    let selected = manifest
+        .workloads
+        .iter()
+        .filter(|workload| wanted.contains(&workload.id.as_str()))
+        .collect::<Vec<_>>();
+    if selected.len() != wanted.len() {
+        return Err(format!(
+            "SEKAI_BENCH_ONLY includes unknown workload ids: {filter}"
+        ));
+    }
+    if selected.is_empty() {
+        return Err("SEKAI_BENCH_ONLY selected no workloads".into());
+    }
+    Ok(selected)
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
@@ -191,7 +231,6 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
                 workload.id
             ));
         }
-        drop(workload_factory(workload)?);
     }
     Ok(())
 }
@@ -266,6 +305,11 @@ fn workload_factory(workload: &Workload) -> Result<Benchmark, String> {
         "gunshi_advisory_planning" => gunshi_benchmark()?,
         "mixed_persistence_reconciliation" => {
             persistence_benchmark(workload.concurrency, workload.dataset_size)?
+        }
+        "concurrent_source_ingestion_small"
+        | "concurrent_source_ingestion_medium"
+        | "concurrent_source_ingestion_large" => {
+            source_ingestion_benchmark(workload.concurrency, workload.dataset_size)?
         }
         "provider_failure_fallback" => retry_benchmark(workload.dataset_size),
         "report_attestation_export" => attestation_benchmark(workload.dataset_size),
@@ -646,6 +690,191 @@ fn persistence_benchmark(concurrency: usize, dataset_size: usize) -> Result<Benc
             thread
                 .join()
                 .map_err(|_| "persistence benchmark worker panicked".to_string())??;
+        }
+        Ok(())
+    }))
+}
+
+fn source_ingestion_record(number: u64, version: &str, hidden: bool) -> SourceRecord {
+    let visibility = if hidden { "hidden" } else { "visible" };
+    SourceRecord {
+        source: SOURCE_GITHUB.into(),
+        source_instance: "acme/ops".into(),
+        external_id: number.to_string(),
+        source_version: version.into(),
+        type_name: "Issue".into(),
+        display_name: format!("synthetic issue {number}"),
+        payload_digest: format!("sha256:{:064x}", number),
+        properties: BTreeMap::from([
+            ("state".into(), "open".into()),
+            ("visibility".into(), visibility.into()),
+        ]),
+        deleted: false,
+        observed_at_ms: 10,
+        source_sequence: None,
+    }
+}
+
+fn source_ingestion_batch(
+    current: &str,
+    next: &str,
+    key: &str,
+    records: Vec<SourceRecord>,
+) -> Result<SourceBatch, String> {
+    let mut batch = SourceBatch {
+        contract_version: SOURCE_BATCH_VERSION.into(),
+        namespace: "ops".into(),
+        producer_identity: "connector/github-primary".into(),
+        source: SOURCE_GITHUB.into(),
+        source_instance: "acme/ops".into(),
+        family: FAMILY_OBJECT_SYNC.into(),
+        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC.into(),
+        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+        type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+        current_cursor: current.into(),
+        proposed_next_cursor: next.into(),
+        idempotency_key: key.into(),
+        batch_digest: String::new(),
+        collected_at_ms: 20,
+        records,
+        delivery: None,
+    };
+    batch.batch_digest = batch
+        .canonical_digest()
+        .map_err(|error| error.to_string())?;
+    Ok(batch)
+}
+
+fn source_ingestion_benchmark(
+    concurrency: usize,
+    dataset_size: usize,
+) -> Result<Benchmark, String> {
+    if dataset_size < 2 || !dataset_size.is_multiple_of(2) {
+        return Err("source ingestion dataset_size must be even".into());
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("sekai-source-ingestion-benchmark-")
+        .tempdir()
+        .map_err(|error| format!("create source ingestion benchmark directory: {error}"))?;
+    let path = directory.path().join("sekai.db");
+    let db = Arc::new(SekaiDb::new(
+        path.to_str().ok_or("benchmark path is not UTF-8")?,
+    )?);
+    let records = (1..=dataset_size as u64)
+        .map(|number| source_ingestion_record(number, "issue-v1", number % 2 == 0))
+        .collect();
+    let seed = source_ingestion_batch("", "cursor:1", "seed", records)?;
+    let admitted = db.apply_source_batch(&seed, "connector/github-primary", 100)?;
+    if admitted.transaction.status != SourceBatchStatus::Committed {
+        return Err("source ingestion seed did not commit".into());
+    }
+    let policy = ObjectSecurityPolicy {
+        contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "ops".into(),
+        kind: "Issue".into(),
+        rules: vec![ObjectSecurityRule {
+            operation: ObjectSecurityOperation::Read,
+            predicates: vec![ObjectSecurityPredicate::PropertyEquals {
+                property: "visibility".into(),
+                value: "visible".into(),
+            }],
+        }],
+        property_grants: None,
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = db.put_object_security_policy(&policy, "local", "put-visibility", 110)?;
+    db.activate_object_security_policies(
+        "ops",
+        &BTreeMap::from([("Issue".into(), revision.revision_digest)]),
+        "local",
+        "activate-visibility",
+        120,
+    )?;
+    let sequence = Arc::new(AtomicU64::new(1));
+    let state = PersistenceState {
+        db: Some(db),
+        _directory: directory,
+    };
+    Ok(Box::new(move || {
+        let mut threads = Vec::with_capacity(concurrency);
+        for worker in 0..concurrency {
+            let db = Arc::clone(state.db.as_ref().expect("benchmark database is live"));
+            let sequence = Arc::clone(&sequence);
+            threads.push(std::thread::spawn(move || -> Result<(), String> {
+                if worker % 2 == 0 {
+                    let step = sequence.fetch_add(1, Ordering::Relaxed);
+                    let number = ((step * 2) - 1) % dataset_size as u64;
+                    let number = if number == 0 { 1 } else { number };
+                    retry_database_pressure(|| {
+                        let current = db
+                            .get_source_sync_state(
+                                "ops",
+                                "acme/ops",
+                                GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+                            )?
+                            .and_then(|state| state.checkpoint)
+                            .map(|checkpoint| checkpoint.cursor)
+                            .unwrap_or_default();
+                        let next = format!("cursor:refresh-{step}");
+                        let batch = source_ingestion_batch(
+                            &current,
+                            &next,
+                            &format!("refresh-{step}"),
+                            vec![source_ingestion_record(
+                                number,
+                                &format!("issue-v{step}"),
+                                false,
+                            )],
+                        )?;
+                        match db.apply_source_batch(
+                            &batch,
+                            "connector/github-primary",
+                            200 + step as i64,
+                        ) {
+                            Ok(result)
+                                if result.transaction.status == SourceBatchStatus::Committed =>
+                            {
+                                Ok(())
+                            }
+                            Err(error) if error.starts_with("stale_cursor:") => Ok(()),
+                            Ok(result) => Err(result.transaction.reason),
+                            Err(error) => Err(error),
+                        }
+                    })?;
+                } else {
+                    let context = PrincipalPolicyContext {
+                        subjects: vec!["viewer".into()],
+                        scopes: vec![],
+                    };
+                    let (objects, _) = retry_database_pressure(|| {
+                        db.list_objects_with_total_for_policy_context(
+                            &ListFilter {
+                                namespace: Some("ops".into()),
+                                kind: Some("Issue".into()),
+                                limit: 8,
+                                offset: 0,
+                                ..Default::default()
+                            },
+                            &["viewer"],
+                            &[],
+                            &context,
+                        )
+                    })?;
+                    if objects.iter().any(|object| {
+                        object.properties.get("visibility").map(String::as_str) == Some("hidden")
+                    }) {
+                        return Err("unauthorized disclosure of hidden source object".into());
+                    }
+                    black_box(objects);
+                }
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| "source ingestion benchmark worker panicked".to_string())??;
         }
         Ok(())
     }))

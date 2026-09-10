@@ -1,0 +1,10 @@
+{
+  "contract_version": "sekai.performance-manifest/v1",
+  "fixture_version": "sekai.source-ingestion-workloads/v1",
+  "description": "Deterministic concurrent source refresh and authorized pagination. Measurement substrate only; regression thresholds are not adopted.",
+  "workloads": [
+    {"id":"concurrent_source_ingestion_small","description":"Concurrent GitHub object-sync refresh and authorized Issue list over a small synthetic graph with visible and hidden records.","category":"source_ingestion","dataset_size":8,"concurrency":4,"operations_per_iteration":4,"warmup_iterations":2,"sample_iterations":20,"fixture":"synthetic GitHub Issue graph with visibility policy","observes":["ingestion_throughput","checkpoint_lag","query_latency","memory"],"budgets":{"p50_latency_us":500000,"p95_latency_us":1000000,"p99_latency_us":2000000}},
+    {"id":"concurrent_source_ingestion_medium","description":"Concurrent GitHub object-sync refresh and authorized Issue list over a medium synthetic graph with visible and hidden records.","category":"source_ingestion","dataset_size":32,"concurrency":4,"operations_per_iteration":4,"warmup_iterations":2,"sample_iterations":20,"fixture":"synthetic GitHub Issue graph with visibility policy","observes":["ingestion_throughput","checkpoint_lag","query_latency","memory"],"budgets":{"p50_latency_us":750000,"p95_latency_us":1500000,"p99_latency_us":3000000}},
+    {"id":"concurrent_source_ingestion_large","description":"Concurrent GitHub object-sync refresh and authorized Issue list over a large synthetic graph with visible and hidden records.","category":"source_ingestion","dataset_size":96,"concurrency":4,"operations_per_iteration":4,"warmup_iterations":2,"sample_iterations":10,"fixture":"synthetic GitHub Issue graph with visibility policy","observes":["ingestion_throughput","checkpoint_lag","query_latency","memory"],"budgets":{"p50_latency_us":1500000,"p95_latency_us":3000000,"p99_latency_us":5000000}}
+  ]
+}

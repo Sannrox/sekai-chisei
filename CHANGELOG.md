@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Measure concurrent source refresh and authorized object pagination over
+  deterministic small, medium, and large synthetic graphs (#824). Hidden
+  records stay omitted; foreign source cursors and changed query/policy
+  digests fail closed. The additive
+  `benchmarks/manifest-source-ingestion-v1.json` suite records throughput,
+  checkpoint lag, query latency, and memory observations without adopting
+  regression thresholds.
 - Apply snapshot and ordered-change batches for a live registered source-type
   descriptor with the same transactional identity, checkpoint, and quarantine
   lifecycle as GitHub ([ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md),
