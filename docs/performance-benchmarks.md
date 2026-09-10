@@ -36,6 +36,27 @@ variance. A later optimization may change a budget only with a documented
 workload or product reason. Gating and CI wiring are described under
 [Measured before/after results](#measured-beforeafter-results) below.
 
+Concurrent source ingestion is an additive measurement suite, not a replacement
+for the adoption workloads. It refreshes synthetic GitHub Issue records while
+authorized viewers paginate visible objects. Hidden records must stay omitted,
+and a foreign source cursor or a changed query/policy digest must fail closed
+instead of silently advancing. Capture a first baseline before adopting any
+regression threshold; incomplete runs are failures, not passes:
+
+```bash
+SEKAI_BENCH_HARDWARE="$(sysctl -n machdep.cpu.brand_string), $(sysctl -n hw.memsize) bytes RAM" \
+SEKAI_BENCH_OS="$(sw_vers -productName) $(sw_vers -productVersion)" \
+SEKAI_BENCH_RUSTC="$(rustc --version)" \
+SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+SEKAI_BENCH_PROFILE=release \
+cargo bench --bench control_plane -- benchmarks/manifest-source-ingestion-v1.json \
+  > benchmarks/baseline-source-ingestion.json
+```
+
+Do not wire `perf-gate --enforce` to this manifest until at least three
+quiet-machine reports exist. The wide latency budgets in the manifest are
+run-completeness bounds, not capacity claims.
+
 The concurrent persistence workload uses a temporary file-backed WAL database.
 Its benchmark-local pressure recovery is capped at 20 attempts with a one
 millisecond backoff; exhausting that bound fails the run instead of hiding
