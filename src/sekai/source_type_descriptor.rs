@@ -1,7 +1,7 @@
 //! Additive source-type descriptor identity and SQLite catalog (ADR 0060, #818).
 //!
 //! Register, inspect, and retire persist beside the code-owned GitHub profile.
-//! Registered descriptors do not authorize `ApplySourceBatch`.
+//! Live registered descriptors may authorize `ApplySourceBatch` (#819).
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::object_sync::{
@@ -111,9 +111,6 @@ pub fn infer_descriptor_from_name(_name: &str) -> Result<ProposedSourceTypeDescr
 }
 
 /// Project one record through a proposed registered descriptor.
-///
-/// This is the research mapper. It does not admit batches through
-/// `ApplySourceBatch`.
 pub fn project_registered_record(
     descriptor: &ProposedSourceTypeDescriptor,
     record: SourceRecord,

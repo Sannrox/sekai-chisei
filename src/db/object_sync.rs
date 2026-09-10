@@ -10,11 +10,14 @@ use crate::domain::Object;
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 use crate::sekai::object_lineage::{ObjectLineage, bind_sync_lineage};
 use crate::sekai::object_sync::{
-    OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
-    SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
-    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
-    SyncDecision, SyncedObject, is_schema_drift_denial, schema_quarantine_record_reason,
-    sync_github_record,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch,
+    SourceBatchResult, SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint,
+    SourceDeliveryMode, SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus,
+    SourceSyncState, SyncDecision, SyncedObject, is_schema_drift_denial,
+    schema_quarantine_record_reason, sync_github_record,
+};
+use crate::sekai::source_type_descriptor::{
+    ProposedSourceTypeDescriptor, STATUS_LIVE, project_registered_record,
 };
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
@@ -199,8 +202,41 @@ pub(crate) struct PreparedBatch {
     pub(crate) records: Vec<PreparedRecord>,
 }
 
+#[derive(Debug)]
+pub(crate) enum SourceBatchMapper {
+    Github,
+    Registered(ProposedSourceTypeDescriptor),
+}
+
+impl SourceBatchMapper {
+    fn project(
+        &self,
+        record: crate::sekai::object_sync::SourceRecord,
+        type_digest: &str,
+    ) -> SyncDecision {
+        match self {
+            Self::Github => sync_github_record(record, type_digest),
+            Self::Registered(descriptor) => project_registered_record(descriptor, record)
+                .unwrap_or_else(|reason| SyncDecision::Reject { reason }),
+        }
+    }
+}
+
+pub(crate) fn mapper_for_github_or_unbound(
+    batch: &SourceBatch,
+) -> Result<SourceBatchMapper, ApplyError> {
+    if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        Ok(SourceBatchMapper::Github)
+    } else {
+        Err(ApplyError::denied(
+            "unbound_type_revision",
+            "type_digest is not bound to an admitted source type",
+        ))
+    }
+}
+
 impl PreparedBatch {
-    pub(crate) fn new(batch: &SourceBatch) -> Result<Self, ApplyError> {
+    pub(crate) fn new(batch: &SourceBatch, mapper: &SourceBatchMapper) -> Result<Self, ApplyError> {
         let mut records = Vec::with_capacity(batch.records.len());
         for record in &batch.records {
             if record
@@ -213,7 +249,7 @@ impl PreparedBatch {
                     "record properties contain a plane-owned object-sync metadata key",
                 ));
             }
-            let decision = sync_github_record(record.clone(), &batch.type_digest);
+            let decision = mapper.project(record.clone(), &batch.type_digest);
             let object = match &decision {
                 SyncDecision::Upsert(object) | SyncDecision::Tombstone(object) => object.clone(),
                 SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
@@ -748,7 +784,10 @@ impl SekaiDb {
         if now_ms <= 0 {
             return Err("invalid_timestamp: now_ms must be positive".into());
         }
-        let prepared = PreparedBatch::new(batch).map_err(|error| error.to_string())?;
+        let mapper = self
+            .source_batch_mapper(batch)
+            .map_err(|error| error.to_string())?;
+        let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
         match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
@@ -765,6 +804,52 @@ impl SekaiDb {
                 )
                 .map_err(|error| error.to_string()),
         }
+    }
+
+    fn source_batch_mapper(&self, batch: &SourceBatch) -> Result<SourceBatchMapper, ApplyError> {
+        if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+            return Ok(SourceBatchMapper::Github);
+        }
+        let stored = self
+            .get_source_type_descriptor(&batch.namespace, &batch.type_digest)
+            .map_err(ApplyError::Storage)?;
+        let Some(stored) = stored else {
+            return Err(ApplyError::denied(
+                "unbound_type_revision",
+                "type_digest is not bound to an admitted source type",
+            ));
+        };
+        if stored.status != STATUS_LIVE
+            || stored.source != batch.source
+            || stored.digest != batch.type_digest
+            || stored.family != batch.family
+        {
+            return Err(ApplyError::denied(
+                "unbound_type_revision",
+                "type_digest is not bound to an admitted source type",
+            ));
+        }
+        let expected_kind = batch
+            .records
+            .first()
+            .map(|record| record.type_name.as_str())
+            .unwrap_or_default();
+        if stored.record_kind != expected_kind {
+            return Err(ApplyError::denied(
+                "unbound_type_revision",
+                "type_digest is not bound to an admitted source type",
+            ));
+        }
+        Ok(SourceBatchMapper::Registered(
+            ProposedSourceTypeDescriptor {
+                contract_version: stored.contract_version,
+                family: stored.family,
+                source: stored.source,
+                record_kind: stored.record_kind,
+                schema_revision: stored.schema_revision,
+                digest: stored.digest,
+            },
+        ))
     }
 
     fn persist_source_batch_open(
@@ -1341,7 +1426,7 @@ impl SekaiDb {
                         family, adapter_id, adapter_version, type_digest, created_at_ms,
                         active, updated_at_ms
                  FROM sekai_source_bindings
-                 WHERE namespace=?1 AND source='github'
+                 WHERE namespace=?1
                    AND source_instance=?2 AND type_digest=?3
                  ORDER BY binding_id LIMIT 1",
                 params![namespace, source_instance, type_digest],
@@ -2783,7 +2868,7 @@ mod tests {
         let snapshot = snapshot_batch("", "cursor:snapshot", "snapshot-1", 1, true, Some(40));
         {
             let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
-            let prepared = PreparedBatch::new(&snapshot).unwrap();
+            let prepared = PreparedBatch::new(&snapshot, &SourceBatchMapper::Github).unwrap();
             assert!(matches!(
                 db.persist_source_batch_open(&snapshot, &prepared, 100)
                     .unwrap(),
@@ -2847,7 +2932,7 @@ mod tests {
         let batch = batch("", "cursor:1", "batch-1");
         {
             let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
-            let prepared = PreparedBatch::new(&batch).unwrap();
+            let prepared = PreparedBatch::new(&batch, &SourceBatchMapper::Github).unwrap();
             assert!(matches!(
                 db.persist_source_batch_open(&batch, &prepared, 100)
                     .unwrap(),
@@ -2894,6 +2979,29 @@ mod tests {
                 .starts_with("idempotency_conflict:")
         );
         assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+    }
+
+    #[test]
+    fn postgres_mapper_fails_closed_for_non_github_digest() {
+        assert!(matches!(
+            mapper_for_github_or_unbound(&batch("", "cursor:1", "batch-1")),
+            Ok(SourceBatchMapper::Github)
+        ));
+        let mut registered = batch("", "cursor:1", "batch-1");
+        registered.source = "synthetic.pager".into();
+        registered.adapter_id = crate::sekai::object_sync::ADAPTER_REGISTERED_OBJECT_SYNC.into();
+        registered.adapter_version =
+            crate::sekai::object_sync::ADAPTER_REGISTERED_OBJECT_SYNC_VERSION.into();
+        registered.type_digest = OTHER_TYPE_DIGEST.into();
+        registered.records[0].source = "synthetic.pager".into();
+        registered.records[0].type_name = "Alert".into();
+        redigest(&mut registered);
+        assert_eq!(
+            mapper_for_github_or_unbound(&registered)
+                .unwrap_err()
+                .code(),
+            Some("unbound_type_revision")
+        );
     }
 
     #[test]
@@ -3115,7 +3223,7 @@ mod tests {
     fn commit_precondition_failure_aborts_open_without_checkpoint() {
         let db = db();
         let batch = batch("", "cursor:1", "batch-1");
-        let prepared = PreparedBatch::new(&batch).unwrap();
+        let prepared = PreparedBatch::new(&batch, &SourceBatchMapper::Github).unwrap();
         db.persist_source_batch_open(&batch, &prepared, 100)
             .unwrap();
         db.conn()

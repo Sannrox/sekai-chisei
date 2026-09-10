@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Apply snapshot and ordered-change batches for a live registered source-type
+  descriptor with the same transactional identity, checkpoint, and quarantine
+  lifecycle as GitHub ([ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md),
+  #819). Identity is `{source}:{instance}#{record_kind}/{immutable_key}`.
+  Unknown, retired, or unadmitted descriptors fail closed. PostgreSQL
+  registered-type apply stays unavailable. GitHub Issue/PullRequest identity
+  and dual-backend apply stay unchanged.
 - Register, inspect, and retire one admitted source-type descriptor on SQLite
   (`sekai.source-type-descriptor/v1`,
   [ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md)).

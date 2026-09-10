@@ -3290,6 +3290,27 @@ fn require_canonical_source_namespace(namespace: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn require_admitted_source_type(
+    db: &RuntimeDb,
+    namespace: &str,
+    type_digest: &str,
+) -> Result<(), Status> {
+    if type_digest == source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Ok(());
+    }
+    match db.get_source_type_descriptor(namespace, type_digest) {
+        Ok(Some(stored))
+            if stored.status == crate::sekai::source_type_descriptor::STATUS_LIVE
+                && stored.digest == type_digest =>
+        {
+            Ok(())
+        }
+        _ => Err(Status::failed_precondition(
+            "source type revision is not bound",
+        )),
+    }
+}
+
 fn validate_source_sync_lookup(input: &GetSourceSyncStateRequest) -> Result<(), Status> {
     require_canonical_source_namespace(&input.namespace)?;
     if input.source_instance.is_empty()
@@ -3301,7 +3322,10 @@ fn validate_source_sync_lookup(input: &GetSourceSyncStateRequest) -> Result<(), 
             "canonical source instance required",
         ));
     }
-    if input.type_digest != source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+    if input.type_digest.is_empty()
+        || input.type_digest.len() > source_sync_domain::MAX_SOURCE_IDENTIFIER_BYTES
+        || input.type_digest.trim() != input.type_digest
+    {
         return Err(Status::failed_precondition(
             "source type revision is not bound",
         ));
@@ -4057,7 +4081,14 @@ fn authorize_source_batch_object_policy(
     let context = principal_policy_context_from(principals, tenant_context);
     let mut authorized = Vec::new();
     for record in &batch.records {
-        let source_id = record.source_id();
+        let source_id = if batch.type_digest == source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+            record.source_id()
+        } else {
+            format!(
+                "{}:{}#{}/{}",
+                batch.source, batch.source_instance, record.type_name, record.external_id
+            )
+        };
         for existing in db
             .find_all_by_external_id(&source_id)
             .map_err(|_| Status::unavailable("object authorization unavailable"))?
@@ -4496,6 +4527,7 @@ impl SekaiService for SekaiServiceImpl {
             &input.namespace,
             false,
         )?;
+        require_admitted_source_type(&self.db, &input.namespace, &input.type_digest)?;
         let state = self
             .db
             .get_source_sync_state(&input.namespace, &input.source_instance, &input.type_digest)
