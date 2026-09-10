@@ -9,9 +9,10 @@ reusing GitHub's identity space.
 Recommend **additive registered descriptors** with immutable namespaced keys.
 [ADR 0060](../decisions/0060-additive-source-type-descriptors.md) accepts that
 mechanism. It does **not** supersede
-[ADR 0021](../decisions/0021-defer-second-object-sync-source.md). Until #818
-registers a descriptor, production `ApplySourceBatch` remains bound to the
-code-owned GitHub Issue/PullRequest digest.
+[ADR 0021](../decisions/0021-defer-second-object-sync-source.md). #818 persists
+register, inspect, and retire on SQLite. Production `ApplySourceBatch` remains
+bound to the code-owned GitHub Issue/PullRequest digest until a later Issue
+applies batches for registered types.
 
 Accepted rules:
 
@@ -77,4 +78,5 @@ ADR 0060 records the accepted answers:
 ```bash
 cargo test --locked source_type_descriptor --offline
 cargo test --locked --test source_type_descriptor_research --offline
+cargo test --locked --test source_type_descriptor_catalog --offline
 ```

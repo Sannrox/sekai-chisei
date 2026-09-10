@@ -212,7 +212,9 @@ revision, `sekai.source-type-revision/v1` at digest
 `sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
 The adapter SDK resumes bounded snapshot pages or ordered ranges from the
 control-plane-owned checkpoint without adding a third RPC or another catalog
-contract.
+contract. Later kinds are registered beside this profile through
+`sekai.source-type-descriptor/v1`; they are not advertised here and do not
+change GitHub Issue/PullRequest identity.
 
 Ordered capability is explicit, not inferred from `source = "github"`. An
 adapter may advertise `change_feed` only when its source transport provides a

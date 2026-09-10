@@ -5468,6 +5468,45 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_source_type_descriptor(
+        &self,
+        namespace: &str,
+        digest: &str,
+    ) -> Result<Option<crate::sekai::source_type_descriptor::StoredSourceTypeDescriptor>, String>
+    {
+        match self {
+            Self::Sqlite(db) => db.get_source_type_descriptor(namespace, digest),
+            Self::Postgres(_) => {
+                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn put_source_type_descriptor(
+        &self,
+        descriptor: &crate::sekai::source_type_descriptor::StoredSourceTypeDescriptor,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_source_type_descriptor(descriptor),
+            Self::Postgres(_) => {
+                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
+    pub fn cas_source_type_descriptor(
+        &self,
+        expected: &crate::sekai::source_type_descriptor::StoredSourceTypeDescriptor,
+        next: &crate::sekai::source_type_descriptor::StoredSourceTypeDescriptor,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.cas_source_type_descriptor(expected, next),
+            Self::Postgres(_) => {
+                Err(crate::sekai::source_type_descriptor::POSTGRES_UNAVAILABLE.into())
+            }
+        }
+    }
+
     pub fn put_source_webhook_key(
         &self,
         pin: &crate::sekai::source_webhook::SourceWebhookKeyPin,

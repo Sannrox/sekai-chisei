@@ -1,18 +1,22 @@
-//! Additive source-type descriptor identity (ADR 0060, Issue #817).
+//! Additive source-type descriptor identity and SQLite catalog (ADR 0060, #818).
 //!
-//! This module is the research spike for the accepted additive registration
-//! contract. It is not wired into `ApplySourceBatch`. Production admission
-//! remains the code-owned GitHub Issue/PullRequest profile until #818
-//! persists a registered descriptor.
+//! Register, inspect, and retire persist beside the code-owned GitHub profile.
+//! Registered descriptors do not authorize `ApplySourceBatch`.
 
+use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::object_sync::{
     FAMILY_OBJECT_SYNC, MAX_SOURCE_IDENTIFIER_BYTES, SOURCE_GITHUB, SourceRecord, SyncDecision,
-    SyncedObject, object_id_for,
+    SyncedObject, contains_secret_like_text, object_id_for,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SOURCE_TYPE_DESCRIPTOR_CONTRACT: &str = "sekai.source-type-descriptor/v1";
+pub const STATUS_LIVE: &str = "live";
+pub const STATUS_RETIRED: &str = "retired";
+pub const DESCRIPTOR_UNAVAILABLE: &str = "source-type descriptor is unavailable";
+pub const POSTGRES_UNAVAILABLE: &str =
+    "source-type descriptors are unavailable on the PostgreSQL community runtime";
 
 /// One proposed registered source kind. One descriptor admits exactly one
 /// record kind and one schema revision.
@@ -170,6 +174,198 @@ pub fn synthetic_cmdb_service_v1() -> ProposedSourceTypeDescriptor {
 
 pub fn synthetic_pager_alert_v2() -> ProposedSourceTypeDescriptor {
     ProposedSourceTypeDescriptor::prepare("synthetic.pager", "Alert", "v2").expect("pager v2")
+}
+
+/// Durable catalog row. Inspection returns [SourceTypeDescriptorIdentity], not
+/// this record: owner and timestamps stay off the inspect surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredSourceTypeDescriptor {
+    pub contract_version: String,
+    pub namespace: String,
+    pub family: String,
+    pub source: String,
+    pub record_kind: String,
+    pub schema_revision: String,
+    pub digest: String,
+    pub status: String,
+    pub admitted_by: String,
+    pub admitted_at_ms: i64,
+    #[serde(default)]
+    pub retired_by: String,
+    #[serde(default)]
+    pub retired_at_ms: i64,
+}
+
+/// Bounded inspect view: identity and lifecycle only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceTypeDescriptorIdentity {
+    pub contract_version: String,
+    pub namespace: String,
+    pub family: String,
+    pub source: String,
+    pub record_kind: String,
+    pub schema_revision: String,
+    pub digest: String,
+    pub status: String,
+}
+
+pub fn inspect_identity(stored: &StoredSourceTypeDescriptor) -> SourceTypeDescriptorIdentity {
+    SourceTypeDescriptorIdentity {
+        contract_version: stored.contract_version.clone(),
+        namespace: stored.namespace.clone(),
+        family: stored.family.clone(),
+        source: stored.source.clone(),
+        record_kind: stored.record_kind.clone(),
+        schema_revision: stored.schema_revision.clone(),
+        digest: stored.digest.clone(),
+        status: stored.status.clone(),
+    }
+}
+
+pub fn register_source_type_descriptor(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    descriptor: &ProposedSourceTypeDescriptor,
+    now_ms: i64,
+) -> Result<SourceTypeDescriptorIdentity, String> {
+    let stored = prepare_registration(actor, namespace, descriptor, now_ms)?;
+    if let Some(existing) = db.get_source_type_descriptor(&stored.namespace, &stored.digest)? {
+        return replay_or_conflict(&existing, &stored);
+    }
+    match db.put_source_type_descriptor(&stored) {
+        Ok(()) => Ok(inspect_identity(&stored)),
+        Err(error) if error == POSTGRES_UNAVAILABLE => Err(error),
+        Err(error) if error == DESCRIPTOR_UNAVAILABLE => {
+            let existing = db
+                .get_source_type_descriptor(&stored.namespace, &stored.digest)?
+                .ok_or(DESCRIPTOR_UNAVAILABLE)?;
+            replay_or_conflict(&existing, &stored)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn inspect_source_type_descriptor(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    digest: &str,
+) -> Result<SourceTypeDescriptorIdentity, String> {
+    let stored = owned_descriptor(db, actor, namespace, digest)?;
+    Ok(inspect_identity(&stored))
+}
+
+pub fn retire_source_type_descriptor(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    digest: &str,
+    now_ms: i64,
+) -> Result<SourceTypeDescriptorIdentity, String> {
+    require_positive_timestamp(now_ms)?;
+    let current = owned_descriptor(db, actor, namespace, digest)?;
+    if current.status != STATUS_LIVE {
+        return Err(DESCRIPTOR_UNAVAILABLE.into());
+    }
+    let mut next = current.clone();
+    next.status = STATUS_RETIRED.into();
+    next.retired_by = actor.into();
+    next.retired_at_ms = now_ms;
+    db.cas_source_type_descriptor(&current, &next)?;
+    Ok(inspect_identity(&next))
+}
+
+fn prepare_registration(
+    actor: &str,
+    namespace: &str,
+    descriptor: &ProposedSourceTypeDescriptor,
+    now_ms: i64,
+) -> Result<StoredSourceTypeDescriptor, String> {
+    required("actor", actor)?;
+    require_registered_token("namespace", namespace)?;
+    reject_secret(actor)?;
+    reject_secret(namespace)?;
+    require_positive_timestamp(now_ms)?;
+    descriptor.validate()?;
+    reject_secret(&descriptor.source)?;
+    reject_secret(&descriptor.record_kind)?;
+    reject_secret(&descriptor.schema_revision)?;
+    reject_secret(&descriptor.digest)?;
+    Ok(StoredSourceTypeDescriptor {
+        contract_version: descriptor.contract_version.clone(),
+        namespace: namespace.into(),
+        family: descriptor.family.clone(),
+        source: descriptor.source.clone(),
+        record_kind: descriptor.record_kind.clone(),
+        schema_revision: descriptor.schema_revision.clone(),
+        digest: descriptor.digest.clone(),
+        status: STATUS_LIVE.into(),
+        admitted_by: actor.into(),
+        admitted_at_ms: now_ms,
+        retired_by: String::new(),
+        retired_at_ms: 0,
+    })
+}
+
+fn owned_descriptor(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    digest: &str,
+) -> Result<StoredSourceTypeDescriptor, String> {
+    required("actor", actor)?;
+    require_registered_token("namespace", namespace)?;
+    reject_secret(actor)?;
+    reject_secret(namespace)?;
+    reject_secret(digest)?;
+    db.get_source_type_descriptor(namespace, digest)?
+        .ok_or_else(|| DESCRIPTOR_UNAVAILABLE.into())
+}
+
+fn replay_or_conflict(
+    existing: &StoredSourceTypeDescriptor,
+    proposed: &StoredSourceTypeDescriptor,
+) -> Result<SourceTypeDescriptorIdentity, String> {
+    if existing.status != STATUS_LIVE
+        || existing.namespace != proposed.namespace
+        || existing.family != proposed.family
+        || existing.source != proposed.source
+        || existing.record_kind != proposed.record_kind
+        || existing.schema_revision != proposed.schema_revision
+        || existing.digest != proposed.digest
+        || existing.admitted_by != proposed.admitted_by
+        || existing.contract_version != proposed.contract_version
+    {
+        return Err(DESCRIPTOR_UNAVAILABLE.into());
+    }
+    Ok(inspect_identity(existing))
+}
+
+fn require_positive_timestamp(now_ms: i64) -> Result<(), String> {
+    if now_ms <= 0 {
+        Err("timestamp must be positive".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn required(label: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{label} is required"))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_secret(value: &str) -> Result<(), String> {
+    if contains_secret_like_text(value) {
+        Err(DESCRIPTOR_UNAVAILABLE.into())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +702,102 @@ mod tests {
             }
             other => panic!("expected reject, got {other:?}"),
         }
+    }
+
+    fn catalog_db() -> RuntimeDb {
+        RuntimeDb::memory()
+    }
+
+    #[test]
+    fn register_inspect_and_retire_one_admitted_descriptor() {
+        let db = catalog_db();
+        let pager = synthetic_pager_alert_v1();
+        let admitted = register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        assert_eq!(admitted.source, "synthetic.pager");
+        assert_eq!(admitted.record_kind, "Alert");
+        assert_eq!(admitted.status, STATUS_LIVE);
+        assert_eq!(admitted.digest, pager.digest);
+        let inspected =
+            inspect_source_type_descriptor(&db, "local", "ops", &admitted.digest).unwrap();
+        assert_eq!(inspected, admitted);
+        let replay = register_source_type_descriptor(&db, "local", "ops", &pager, 11).unwrap();
+        assert_eq!(replay.digest, admitted.digest);
+        let retired =
+            retire_source_type_descriptor(&db, "local", "ops", &admitted.digest, 12).unwrap();
+        assert_eq!(retired.status, STATUS_RETIRED);
+        assert_eq!(
+            register_source_type_descriptor(&db, "local", "ops", &pager, 13).unwrap_err(),
+            DESCRIPTOR_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn conflicting_reuse_and_unauthorized_inspect_fail_without_disclosure() {
+        let db = catalog_db();
+        let pager = synthetic_pager_alert_v1();
+        let admitted = register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        let cmdb = synthetic_cmdb_service_v1();
+        let mut colliding = cmdb.clone();
+        colliding.source = pager.source.clone();
+        colliding.record_kind = pager.record_kind.clone();
+        colliding.schema_revision = pager.schema_revision.clone();
+        colliding.digest = pager.digest.clone();
+        assert_eq!(
+            register_source_type_descriptor(&db, "other", "ops", &colliding, 11).unwrap_err(),
+            DESCRIPTOR_UNAVAILABLE
+        );
+        assert_eq!(
+            inspect_source_type_descriptor(&db, "other", "ops", &admitted.digest).unwrap(),
+            admitted
+        );
+        assert_eq!(
+            inspect_source_type_descriptor(&db, "local", "ops", "sha256:deadbeef").unwrap_err(),
+            DESCRIPTOR_UNAVAILABLE
+        );
+        assert_eq!(
+            inspect_source_type_descriptor(&db, "local", "missing", &admitted.digest).unwrap_err(),
+            DESCRIPTOR_UNAVAILABLE
+        );
+        assert!(
+            register_source_type_descriptor(&db, "local", "ops", &pager, 10)
+                .unwrap()
+                .digest
+                == admitted.digest
+        );
+    }
+
+    #[test]
+    fn inspect_returns_bounded_identity_fields_only() {
+        let db = catalog_db();
+        let pager = synthetic_pager_alert_v1();
+        let admitted = register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        let json = serde_json::to_string(&admitted).unwrap();
+        assert!(!json.contains("admitted_by"));
+        assert!(!json.contains("retired_by"));
+        assert!(!json.contains("cursor"));
+        assert!(!json.contains("payload"));
+        assert!(!json.contains("secret"));
+        assert!(json.contains(&pager.digest));
+        assert_eq!(admitted.family, FAMILY_OBJECT_SYNC);
+        assert_eq!(built_in_source_adapters().len(), 1);
+        assert_eq!(built_in_source_adapters()[0].source, SOURCE_GITHUB);
+        assert_ne!(admitted.digest, GITHUB_OBJECT_SYNC_TYPE_DIGEST);
+    }
+
+    #[test]
+    fn secret_like_registration_is_unavailable() {
+        let db = catalog_db();
+        let pager = synthetic_pager_alert_v1();
+        assert_eq!(
+            register_source_type_descriptor(
+                &db,
+                "ghp_exampletokenvalue0123456789ab",
+                "ops",
+                &pager,
+                10
+            )
+            .unwrap_err(),
+            DESCRIPTOR_UNAVAILABLE
+        );
     }
 }

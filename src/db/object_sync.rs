@@ -457,6 +457,18 @@ impl SekaiDb {
                     enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
                     UNIQUE(namespace, source_instance, key_id)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_source_type_descriptors (
+                    namespace TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    record_kind TEXT NOT NULL,
+                    schema_revision TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('live', 'retired')),
+                    owner TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, digest),
+                    UNIQUE(namespace, source, record_kind, schema_revision)
+                );
                 CREATE TABLE IF NOT EXISTS sekai_open_table_sources (
                     source_id TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,

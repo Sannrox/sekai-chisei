@@ -170,8 +170,19 @@ mutation. A configurable or additional revision requires a separate design
 decision and authoritative registration lifecycle; v1 does not infer a
 revision from caller input. [ADR 0060](decisions/0060-additive-source-type-descriptors.md)
 accepts additive registered descriptors beside this profile. GitHub identity
-and discovery stay unchanged. #818 implements register, inspect, and retire
-without rewriting the GitHub profile. See
+and discovery stay unchanged. Register, inspect, and retire one later kind
+through `RegisterSourceTypeDescriptor` / `InspectSourceTypeDescriptor` /
+`RetireSourceTypeDescriptor` or:
+
+```text
+sekaictl admin sync register-descriptor --namespace ops --descriptor ./pager.json
+sekaictl admin sync inspect-descriptor --namespace ops --digest sha256:...
+sekaictl admin sync retire-descriptor --namespace ops --digest sha256:...
+```
+
+SQLite stores the catalog. PostgreSQL stays unavailable. A registered
+descriptor does not authorize `ApplySourceBatch`; that remains GitHub-only
+until a later Issue. GitHub is not rewritten as a registered descriptor. See
 [research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the

@@ -1,0 +1,8 @@
+{
+  "contract_version": "sekai.source-type-descriptor/v1",
+  "family": "source_control.object_sync",
+  "source": "synthetic.pager",
+  "record_kind": "Alert",
+  "schema_revision": "v1",
+  "digest": "sha256:ba9a0d237a11a0222fd78f353c0f97f566befa32a77c7ce93f99670200020fde"
+}

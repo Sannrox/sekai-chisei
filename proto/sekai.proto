@@ -1497,6 +1497,43 @@ message GetSourceSyncStateResponse {
   SourceSyncState state = 2;
 }
 
+// Additive registered source-type descriptors (ADR 0060 / #818). Inspection
+// returns bounded identity fields only. GitHub Issue/PullRequest stays the
+// code-owned profile and is not stored as a registered descriptor.
+message SourceTypeDescriptor {
+  string contract_version = 1;
+  string namespace = 2;
+  string family = 3;
+  string source = 4;
+  string record_kind = 5;
+  string schema_revision = 6;
+  string digest = 7;
+  string status = 8; // live | retired
+}
+message RegisterSourceTypeDescriptorRequest {
+  string namespace = 1;
+  string source = 2;
+  string record_kind = 3;
+  string schema_revision = 4;
+}
+message RegisterSourceTypeDescriptorResponse {
+  SourceTypeDescriptor descriptor = 1;
+}
+message InspectSourceTypeDescriptorRequest {
+  string namespace = 1;
+  string digest = 2;
+}
+message InspectSourceTypeDescriptorResponse {
+  SourceTypeDescriptor descriptor = 1;
+}
+message RetireSourceTypeDescriptorRequest {
+  string namespace = 1;
+  string digest = 2;
+}
+message RetireSourceTypeDescriptorResponse {
+  SourceTypeDescriptor descriptor = 1;
+}
+
 // One canonical definition document changed on a governed branch. The server
 // recomputes member_digest from the namespace, identity, and canonical JSON.
 message DefinitionMemberInput {
@@ -1859,6 +1896,9 @@ service SekaiService {
   rpc TakeoverExpiredLease(TakeoverExpiredLeaseRequest) returns (TakeoverExpiredLeaseResponse);
   rpc ApplySourceBatch(ApplySourceBatchRequest) returns (ApplySourceBatchResponse);
   rpc GetSourceSyncState(GetSourceSyncStateRequest) returns (GetSourceSyncStateResponse);
+  rpc RegisterSourceTypeDescriptor(RegisterSourceTypeDescriptorRequest) returns (RegisterSourceTypeDescriptorResponse);
+  rpc InspectSourceTypeDescriptor(InspectSourceTypeDescriptorRequest) returns (InspectSourceTypeDescriptorResponse);
+  rpc RetireSourceTypeDescriptor(RetireSourceTypeDescriptorRequest) returns (RetireSourceTypeDescriptorResponse);
   rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
   rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
   rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);

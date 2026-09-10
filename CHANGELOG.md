@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Register, inspect, and retire one admitted source-type descriptor on SQLite
+  (`sekai.source-type-descriptor/v1`,
+  [ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md)).
+  `RegisterSourceTypeDescriptor`, `InspectSourceTypeDescriptor`, and
+  `RetireSourceTypeDescriptor` require authenticated namespace administration.
+  Inspection returns bounded identity fields only. Unknown or unadmitted
+  descriptors cannot authorize `ApplySourceBatch`. PostgreSQL stays unavailable.
+  GitHub Issue/PullRequest identity stays `github:{owner}/{repo}#{number}`.
+  `sekaictl admin sync register-descriptor|inspect-descriptor|retire-descriptor`
+  is the operator surface. ADR 0021 is not superseded.
 - Accept additive registered source-type descriptors
   ([ADR 0060](docs/decisions/0060-additive-source-type-descriptors.md)).
   Later kinds use `{source}:{instance}#{record_kind}/{immutable_key}`.
