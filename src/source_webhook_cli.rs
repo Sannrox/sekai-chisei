@@ -1,4 +1,5 @@
-//! sekaictl admin sync webhook and source-health commands (#673, #685).
+//! sekaictl admin sync webhook, source-health, and descriptor commands
+//! (#673, #685, #818).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
@@ -10,7 +11,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]"
+    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]\n  sekaictl admin sync register-descriptor --namespace <ns> --descriptor <file> [--actor <principal>]\n  sekaictl admin sync inspect-descriptor --namespace <ns> --digest <digest> [--actor <principal>]\n  sekaictl admin sync retire-descriptor --namespace <ns> --digest <digest> [--actor <principal>]"
 }
 
 pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -19,6 +20,13 @@ pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("list-webhook-keys") => list_keys(parse_list(&args[1..])?).await,
         Some("admit-webhook") => admit(parse_admit(&args[1..])?).await,
         Some("health") => health(parse_health(&args[1..])?).await,
+        Some("register-descriptor") => {
+            register_descriptor(parse_register_descriptor(&args[1..])?).await
+        }
+        Some("inspect-descriptor") => {
+            inspect_descriptor(parse_inspect_descriptor(&args[1..])?).await
+        }
+        Some("retire-descriptor") => retire_descriptor(parse_retire_descriptor(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -248,6 +256,130 @@ fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
         source_instance: source_instance.ok_or("--source-instance is required")?,
         type_digest: type_digest.ok_or("--type-digest is required")?,
         delayed_after_ms,
+        actor,
+    })
+}
+
+struct RegisterDescriptorConfig {
+    namespace: String,
+    descriptor: PathBuf,
+    actor: String,
+}
+
+async fn register_descriptor(config: RegisterDescriptorConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let proposed: crate::sekai::source_type_descriptor::ProposedSourceTypeDescriptor =
+        serde_json::from_slice(&std::fs::read(&config.descriptor)?)?;
+    let admitted = crate::sekai::source_type_descriptor::register_source_type_descriptor(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &proposed,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&admitted)?);
+    Ok(())
+}
+
+fn parse_register_descriptor(args: &[String]) -> Result<RegisterDescriptorConfig, String> {
+    let mut namespace = None;
+    let mut descriptor = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--descriptor" => {
+                descriptor = Some(PathBuf::from(require_value(args, i, "--descriptor")?));
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown register-descriptor option {other}")),
+        }
+    }
+    Ok(RegisterDescriptorConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        descriptor: descriptor.ok_or("--descriptor is required")?,
+        actor,
+    })
+}
+
+struct InspectDescriptorConfig {
+    namespace: String,
+    digest: String,
+    actor: String,
+}
+
+async fn inspect_descriptor(config: InspectDescriptorConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let admitted = crate::sekai::source_type_descriptor::inspect_source_type_descriptor(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &config.digest,
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&admitted)?);
+    Ok(())
+}
+
+fn parse_inspect_descriptor(args: &[String]) -> Result<InspectDescriptorConfig, String> {
+    parse_namespace_digest(args, "inspect-descriptor")
+}
+
+async fn retire_descriptor(config: InspectDescriptorConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let admitted = crate::sekai::source_type_descriptor::retire_source_type_descriptor(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &config.digest,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&admitted)?);
+    Ok(())
+}
+
+fn parse_retire_descriptor(args: &[String]) -> Result<InspectDescriptorConfig, String> {
+    parse_namespace_digest(args, "retire-descriptor")
+}
+
+fn parse_namespace_digest(
+    args: &[String],
+    command: &str,
+) -> Result<InspectDescriptorConfig, String> {
+    let mut namespace = None;
+    let mut digest = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--digest" => {
+                digest = Some(require_value(args, i, "--digest")?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown {command} option {other}")),
+        }
+    }
+    Ok(InspectDescriptorConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        digest: digest.ok_or("--digest is required")?,
         actor,
     })
 }

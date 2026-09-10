@@ -2767,6 +2767,52 @@ fn to_proto_lease(lease: &crate::sekai::lease::Lease) -> Lease {
     }
 }
 
+fn authorize_source_type_namespace_admin(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    namespace: &str,
+) -> Result<String, Status> {
+    require_authenticated(principals)?;
+    if principals
+        .iter()
+        .any(|principal| matches!(principal.as_str(), "root" | "local"))
+    {
+        return principals
+            .first()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("principal required"));
+    }
+    let canonical = namespace.trim();
+    if canonical.is_empty() || canonical != namespace {
+        return Err(Status::permission_denied("namespace access denied"));
+    }
+    check_team_namespace(&service.db, principals, canonical, true)?;
+    let boundary = service
+        .db
+        .find_namespace_boundary(canonical)
+        .map_err(Status::internal)?;
+    let team_managed = boundary.as_ref().is_some_and(|object| {
+        object
+            .properties
+            .get("team_managed")
+            .is_some_and(|value| value == "true")
+    });
+    if !team_managed {
+        return Err(Status::permission_denied("namespace access denied"));
+    }
+    let memberships = team_namespace_memberships(&service.db, principals)?;
+    let is_admin = memberships.iter().any(|(member_namespace, role)| {
+        member_namespace == canonical && matches!(role, security::Role::Admin)
+    });
+    if !is_admin {
+        return Err(Status::permission_denied("namespace access denied"));
+    }
+    principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))
+}
+
 fn authorize_namespace_action_admin(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -4457,6 +4503,92 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(GetSourceSyncStateResponse {
             found: state.is_some(),
             state: state.as_ref().map(to_proto_source_sync_state),
+        }))
+    }
+
+    async fn register_source_type_descriptor(
+        &self,
+        req: Request<RegisterSourceTypeDescriptorRequest>,
+    ) -> Result<Response<RegisterSourceTypeDescriptorResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let actor = authorize_source_type_namespace_admin(self, &principals, &input.namespace)?;
+        let proposed = crate::sekai::source_type_descriptor::ProposedSourceTypeDescriptor::prepare(
+            input.source,
+            input.record_kind,
+            input.schema_revision,
+        )
+        .map_err(map_source_type_descriptor_error)?;
+        let descriptor = crate::sekai::source_type_descriptor::register_source_type_descriptor(
+            &self.db,
+            &actor,
+            &input.namespace,
+            &proposed,
+            now_millis(),
+        )
+        .map_err(map_source_type_descriptor_error)?;
+        Ok(Response::new(RegisterSourceTypeDescriptorResponse {
+            descriptor: Some(to_proto_source_type_descriptor(&descriptor)),
+        }))
+    }
+
+    async fn inspect_source_type_descriptor(
+        &self,
+        req: Request<InspectSourceTypeDescriptorRequest>,
+    ) -> Result<Response<InspectSourceTypeDescriptorResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            false,
+        )?;
+        let actor = authorize_source_type_namespace_admin(self, &principals, &input.namespace)?;
+        let descriptor = crate::sekai::source_type_descriptor::inspect_source_type_descriptor(
+            &self.db,
+            &actor,
+            &input.namespace,
+            &input.digest,
+        )
+        .map_err(map_source_type_descriptor_error)?;
+        Ok(Response::new(InspectSourceTypeDescriptorResponse {
+            descriptor: Some(to_proto_source_type_descriptor(&descriptor)),
+        }))
+    }
+
+    async fn retire_source_type_descriptor(
+        &self,
+        req: Request<RetireSourceTypeDescriptorRequest>,
+    ) -> Result<Response<RetireSourceTypeDescriptorResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let input = req.into_inner();
+        enforce_namespace_tenant_context(
+            &self.db,
+            tenant_context.as_ref(),
+            &input.namespace,
+            true,
+        )?;
+        let actor = authorize_source_type_namespace_admin(self, &principals, &input.namespace)?;
+        let descriptor = crate::sekai::source_type_descriptor::retire_source_type_descriptor(
+            &self.db,
+            &actor,
+            &input.namespace,
+            &input.digest,
+            now_millis(),
+        )
+        .map_err(map_source_type_descriptor_error)?;
+        Ok(Response::new(RetireSourceTypeDescriptorResponse {
+            descriptor: Some(to_proto_source_type_descriptor(&descriptor)),
         }))
     }
 
@@ -8314,6 +8446,38 @@ fn map_object_security_error(error: String) -> Status {
         Status::invalid_argument(error)
     } else {
         Status::internal(error)
+    }
+}
+
+fn map_source_type_descriptor_error(error: String) -> Status {
+    if error.contains("unavailable") {
+        Status::unavailable("source-type descriptor is unavailable")
+    } else if error.contains("unsupported")
+        || error.contains("must remain")
+        || error.contains("stays the code-owned")
+        || error.contains("canonical registered token")
+        || error.contains("required")
+        || error.contains("cannot be inferred")
+        || error.contains("timestamp")
+    {
+        Status::invalid_argument(error)
+    } else {
+        Status::unavailable("source-type descriptor is unavailable")
+    }
+}
+
+fn to_proto_source_type_descriptor(
+    descriptor: &crate::sekai::source_type_descriptor::SourceTypeDescriptorIdentity,
+) -> SourceTypeDescriptor {
+    SourceTypeDescriptor {
+        contract_version: descriptor.contract_version.clone(),
+        namespace: descriptor.namespace.clone(),
+        family: descriptor.family.clone(),
+        source: descriptor.source.clone(),
+        record_kind: descriptor.record_kind.clone(),
+        schema_revision: descriptor.schema_revision.clone(),
+        digest: descriptor.digest.clone(),
+        status: descriptor.status.clone(),
     }
 }
 

@@ -96,6 +96,7 @@ pub mod reusable;
 pub mod runtime_db;
 pub mod sekai;
 pub mod sekai_rpc_inventory;
+mod source_type_descriptor_store;
 mod source_webhook_store;
 pub mod team_namespace;
 mod warehouse_projection_store;

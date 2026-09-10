@@ -90,6 +90,45 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "RegisterSourceTypeDescriptor",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/source_type_descriptor_catalog.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "InspectSourceTypeDescriptor",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/source_type_descriptor_catalog.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RetireSourceTypeDescriptor",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service.rs",
+        "tests/source_type_descriptor_catalog.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "CreateDefinitionBranch",
       "kind": "persistent",
       "surfaces": [
