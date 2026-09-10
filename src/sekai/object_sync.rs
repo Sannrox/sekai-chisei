@@ -15,14 +15,17 @@ pub const SOURCE_GITHUB: &str = "github";
 pub const FAMILY_OBJECT_SYNC: &str = "source_control.object_sync";
 pub const ADAPTER_GITHUB_OBJECT_SYNC: &str = "adapter.github.object_sync";
 pub const ADAPTER_GITHUB_OBJECT_SYNC_VERSION: &str = "1.0.0";
+pub const ADAPTER_REGISTERED_OBJECT_SYNC: &str = "adapter.registered.object_sync";
+pub const ADAPTER_REGISTERED_OBJECT_SYNC_VERSION: &str = "1.0.0";
 pub const GITHUB_OBJECT_SYNC_TYPE_DIGEST: &str =
     "sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a";
 pub const GITHUB_OBJECT_SYNC_RECORD_TYPES: &[&str] = &["Issue", "PullRequest"];
 
-/// The only source type revision admitted by the v1 object-sync contract.
+/// The code-owned GitHub Issue/PullRequest type revision.
 ///
 /// The digest is SHA-256 over the newline-delimited contract version, family,
-/// source, and ordered record types, including the final newline.
+/// source, and ordered record types, including the final newline. Live
+/// registered descriptors use a separate digest and identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceTypeRevisionDescriptor {
     pub contract_version: &'static str,
@@ -336,32 +339,36 @@ impl SourceBatch {
         require_bounded_identifier("producer_identity", &self.producer_identity)?;
         require_bounded_identifier("source_instance", &self.source_instance)?;
         require_bounded_identifier("idempotency_key", &self.idempotency_key)?;
-        if self.source != SOURCE_GITHUB {
-            return Err(SourceBatchValidationError::new(
-                "foreign_source",
-                "source must be github",
-            ));
-        }
-        validate_github_repository(&self.source_instance)?;
         if self.family != FAMILY_OBJECT_SYNC {
             return Err(SourceBatchValidationError::new(
                 "foreign_family",
                 "family must be source_control.object_sync",
             ));
         }
-        if self.adapter_id != ADAPTER_GITHUB_OBJECT_SYNC
-            || self.adapter_version != ADAPTER_GITHUB_OBJECT_SYNC_VERSION
-        {
-            return Err(SourceBatchValidationError::new(
-                "unsupported_adapter",
-                "adapter must be adapter.github.object_sync at version 1.0.0",
-            ));
-        }
-        if self.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST {
-            return Err(SourceBatchValidationError::new(
-                "unbound_type_revision",
-                "type_digest is not bound to the code-owned GitHub object-sync revision",
-            ));
+        if self.source == SOURCE_GITHUB || self.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+            if self.source != SOURCE_GITHUB {
+                return Err(SourceBatchValidationError::new(
+                    "foreign_source",
+                    "source must be github",
+                ));
+            }
+            validate_github_repository(&self.source_instance)?;
+            if self.adapter_id != ADAPTER_GITHUB_OBJECT_SYNC
+                || self.adapter_version != ADAPTER_GITHUB_OBJECT_SYNC_VERSION
+            {
+                return Err(SourceBatchValidationError::new(
+                    "unsupported_adapter",
+                    "adapter must be adapter.github.object_sync at version 1.0.0",
+                ));
+            }
+            if self.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+                return Err(SourceBatchValidationError::new(
+                    "unbound_type_revision",
+                    "type_digest is not bound to the code-owned GitHub object-sync revision",
+                ));
+            }
+        } else {
+            validate_registered_batch_envelope(self)?;
         }
         require_cursor("current_cursor", &self.current_cursor, true)?;
         require_cursor("proposed_next_cursor", &self.proposed_next_cursor, false)?;
@@ -382,11 +389,14 @@ impl SourceBatch {
         for (index, record) in self.records.iter().enumerate() {
             validate_record(record, index, self)?;
             if !source_ids.insert(record.external_id.as_str()) {
+                let repeated = if self.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+                    "a GitHub number"
+                } else {
+                    "an identity"
+                };
                 return Err(SourceBatchValidationError::new(
                     "ambiguous_record_identity",
-                    format!(
-                        "records[{index}] repeats a GitHub number already present in the batch"
-                    ),
+                    format!("records[{index}] repeats {repeated} already present in the batch"),
                 ));
             }
         }
@@ -960,17 +970,44 @@ fn validate_record(
         &format!("records[{index}].external_id"),
         &record.external_id,
     )?;
-    validate_github_number(&record.external_id)?;
+    if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        validate_github_number(&record.external_id)?;
+        if !matches!(record.type_name.as_str(), "Issue" | "PullRequest") {
+            return Err(SourceBatchValidationError::new(
+                "unsupported_record_type",
+                format!("records[{index}] must be an Issue or PullRequest"),
+            ));
+        }
+    } else {
+        require_registered_record_token(
+            &format!("records[{index}].external_id"),
+            &record.external_id,
+            false,
+        )?;
+        require_registered_record_token(
+            &format!("records[{index}].type_name"),
+            &record.type_name,
+            false,
+        )?;
+        if record.type_name == "Issue" || record.type_name == "PullRequest" {
+            return Err(SourceBatchValidationError::new(
+                "unsupported_record_type",
+                format!("records[{index}] cannot reuse GitHub Issue or PullRequest"),
+            ));
+        }
+        if let Some(expected) = batch.records.first()
+            && record.type_name != expected.type_name
+        {
+            return Err(SourceBatchValidationError::new(
+                "mixed_record_type",
+                format!("records[{index}] does not match the registered record kind"),
+            ));
+        }
+    }
     require_bounded_identifier(
         &format!("records[{index}].source_version"),
         &record.source_version,
     )?;
-    if !matches!(record.type_name.as_str(), "Issue" | "PullRequest") {
-        return Err(SourceBatchValidationError::new(
-            "unsupported_record_type",
-            format!("records[{index}] must be an Issue or PullRequest"),
-        ));
-    }
     require_bounded_text(
         &format!("records[{index}].display_name"),
         &record.display_name,
@@ -1029,6 +1066,50 @@ fn require_db_u64(label: &str, value: u64) -> Result<(), SourceBatchValidationEr
         return Err(SourceBatchValidationError::new(
             "delivery_position_out_of_range",
             format!("{label} exceeds the supported delivery position range"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registered_batch_envelope(
+    batch: &SourceBatch,
+) -> Result<(), SourceBatchValidationError> {
+    require_digest("type_digest", &batch.type_digest)?;
+    if batch.source == SOURCE_GITHUB {
+        return Err(SourceBatchValidationError::new(
+            "foreign_source",
+            "registered source batches cannot reuse github",
+        ));
+    }
+    require_registered_record_token("source", &batch.source, false)?;
+    require_registered_record_token("source_instance", &batch.source_instance, true)?;
+    if batch.adapter_id != ADAPTER_REGISTERED_OBJECT_SYNC
+        || batch.adapter_version != ADAPTER_REGISTERED_OBJECT_SYNC_VERSION
+    {
+        return Err(SourceBatchValidationError::new(
+            "unsupported_adapter",
+            "adapter must be adapter.registered.object_sync at version 1.0.0",
+        ));
+    }
+    Ok(())
+}
+
+fn require_registered_record_token(
+    label: &str,
+    value: &str,
+    allow_slash: bool,
+) -> Result<(), SourceBatchValidationError> {
+    if value.is_empty()
+        || value.len() > MAX_SOURCE_IDENTIFIER_BYTES
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.contains('#')
+        || value.contains(':')
+        || (value.contains('/') && !allow_slash)
+    {
+        return Err(SourceBatchValidationError::new(
+            "invalid_source_instance",
+            format!("{label} is not a canonical registered token"),
         ));
     }
     Ok(())
@@ -1844,6 +1925,95 @@ mod tests {
                 "type_identity_conflict: sibling",
             )
             .starts_with("batch_quarantined:")
+        );
+    }
+
+    fn valid_registered_batch() -> SourceBatch {
+        let mut batch = SourceBatch {
+            contract_version: SOURCE_BATCH_VERSION.into(),
+            namespace: "ops".into(),
+            producer_identity: "connector/pager".into(),
+            source: "synthetic.pager".into(),
+            source_instance: "ops-local".into(),
+            family: FAMILY_OBJECT_SYNC.into(),
+            adapter_id: ADAPTER_REGISTERED_OBJECT_SYNC.into(),
+            adapter_version: ADAPTER_REGISTERED_OBJECT_SYNC_VERSION.into(),
+            type_digest: format!("sha256:{}", "a".repeat(64)),
+            current_cursor: String::new(),
+            proposed_next_cursor: "cursor:1".into(),
+            idempotency_key: "pager-1".into(),
+            batch_digest: String::new(),
+            collected_at_ms: 20,
+            records: vec![SourceRecord {
+                source: "synthetic.pager".into(),
+                source_instance: "ops-local".into(),
+                external_id: "42".into(),
+                source_version: "alert-v1".into(),
+                type_name: "Alert".into(),
+                display_name: "checkout latency".into(),
+                payload_digest: PAYLOAD_DIGEST.into(),
+                properties: BTreeMap::from([("title".into(), "checkout latency".into())]),
+                deleted: false,
+                observed_at_ms: 10,
+                source_sequence: None,
+            }],
+            delivery: None,
+        };
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    #[test]
+    fn registered_envelope_validates_without_catalog_liveness() {
+        valid_registered_batch().validate().unwrap();
+    }
+
+    #[test]
+    fn registered_batches_reject_github_kinds_and_mixed_record_types() {
+        let mut github_kind = valid_registered_batch();
+        github_kind.records[0].type_name = "Issue".into();
+        github_kind.batch_digest = github_kind.canonical_digest().unwrap();
+        assert_eq!(
+            github_kind.validate().unwrap_err().code,
+            "unsupported_record_type"
+        );
+
+        let mut mixed = valid_registered_batch();
+        let mut service = mixed.records[0].clone();
+        service.external_id = "43".into();
+        service.type_name = "Service".into();
+        mixed.records.push(service);
+        mixed.batch_digest = mixed.canonical_digest().unwrap();
+        assert_eq!(mixed.validate().unwrap_err().code, "mixed_record_type");
+    }
+
+    #[test]
+    fn registered_batches_cannot_reuse_github_source_or_adapter() {
+        let mut github_source = valid_registered_batch();
+        github_source.source = SOURCE_GITHUB.into();
+        github_source.source_instance = "acme/ops".into();
+        github_source.adapter_id = ADAPTER_GITHUB_OBJECT_SYNC.into();
+        github_source.adapter_version = ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into();
+        github_source.records[0].source = SOURCE_GITHUB.into();
+        github_source.records[0].source_instance = "acme/ops".into();
+        github_source.batch_digest = github_source.canonical_digest().unwrap();
+        assert_eq!(
+            github_source.validate().unwrap_err().code,
+            "unbound_type_revision"
+        );
+
+        let mut github_digest = valid_registered_batch();
+        github_digest.type_digest = GITHUB_OBJECT_SYNC_TYPE_DIGEST.into();
+        github_digest.batch_digest = github_digest.canonical_digest().unwrap();
+        assert_eq!(github_digest.validate().unwrap_err().code, "foreign_source");
+
+        let mut github_adapter = valid_registered_batch();
+        github_adapter.adapter_id = ADAPTER_GITHUB_OBJECT_SYNC.into();
+        github_adapter.adapter_version = ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into();
+        github_adapter.batch_digest = github_adapter.canonical_digest().unwrap();
+        assert_eq!(
+            github_adapter.validate().unwrap_err().code,
+            "unsupported_adapter"
         );
     }
 }

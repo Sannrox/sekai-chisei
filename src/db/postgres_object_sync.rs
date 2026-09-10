@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
-    ApplyError, PreparedBatch, PreparedRecord, require_authorized_object_snapshot, validate_binding,
+    ApplyError, PreparedBatch, PreparedRecord, mapper_for_github_or_unbound,
+    require_authorized_object_snapshot, validate_binding,
 };
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
@@ -78,7 +79,8 @@ impl PostgresDb {
         if now_ms <= 0 {
             return Err("invalid_timestamp: now_ms must be positive".into());
         }
-        let prepared = PreparedBatch::new(batch).map_err(|error| error.to_string())?;
+        let mapper = mapper_for_github_or_unbound(batch).map_err(|error| error.to_string())?;
+        let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
         match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?

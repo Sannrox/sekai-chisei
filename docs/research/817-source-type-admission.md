@@ -11,8 +11,8 @@ Recommend **additive registered descriptors** with immutable namespaced keys.
 mechanism. It does **not** supersede
 [ADR 0021](../decisions/0021-defer-second-object-sync-source.md). #818 persists
 register, inspect, and retire on SQLite. Production `ApplySourceBatch` remains
-bound to the code-owned GitHub Issue/PullRequest digest until a later Issue
-applies batches for registered types.
+bound to the code-owned GitHub Issue/PullRequest digest except for a live
+registered descriptor admitted by #819.
 
 Accepted rules:
 

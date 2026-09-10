@@ -2,11 +2,13 @@
 
 Inbound object sync admits bounded source batches and advances
 control-plane-owned generation, offset, and cursor state only when every
-object, audit, lineage, result, and checkpoint write commits. The first and
-only source profile is GitHub Issue/PullRequest under
-`source_control.object_sync`. See
-[ADR 0022](decisions/0022-source-batch-transactions.md) and
-[ADR 0021](decisions/0021-defer-second-object-sync-source.md). The ordered-feed
+object, audit, lineage, result, and checkpoint write commits. GitHub
+Issue/PullRequest remains the catalog-advertised production profile under
+`source_control.object_sync`. A live registered descriptor may also apply
+batches with identity `{source}:{instance}#{record_kind}/{immutable_key}`.
+See [ADR 0022](decisions/0022-source-batch-transactions.md),
+[ADR 0021](decisions/0021-defer-second-object-sync-source.md), and
+[ADR 0060](decisions/0060-additive-source-type-descriptors.md). The ordered-feed
 design rationale is in
 [ADR 0023](decisions/0023-generation-fenced-source-change-feeds.md).
 
@@ -180,9 +182,13 @@ sekaictl admin sync inspect-descriptor --namespace ops --digest sha256:...
 sekaictl admin sync retire-descriptor --namespace ops --digest sha256:...
 ```
 
-SQLite stores the catalog. PostgreSQL stays unavailable. A registered
-descriptor does not authorize `ApplySourceBatch`; that remains GitHub-only
-until a later Issue. GitHub is not rewritten as a registered descriptor. See
+SQLite stores the catalog. PostgreSQL stays unavailable. A **live** registered
+descriptor may authorize `ApplySourceBatch` with identity
+`{source}:{instance}#{record_kind}/{immutable_key}` and the same transactional
+lifecycle as GitHub. Unknown, retired, or unadmitted descriptors fail as
+`unbound_type_revision` without disclosure. PostgreSQL registered-type apply
+stays unavailable; GitHub apply remains dual-backend. GitHub is not rewritten
+as a registered descriptor. See
 [research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the
