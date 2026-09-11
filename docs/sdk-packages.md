@@ -46,3 +46,8 @@ names it. The superseded record stays inspectable and fails smoke.
 | Unknown contract version | `client package protocol is unsupported` |
 
 SQLite stores publications. PostgreSQL surfaces stay unavailable.
+
+Local artifacts, publication records, and registry packages are different
+objects. Current `main` proves local install of the in-tree TypeScript and
+Python facades plus `sekai-client` (#840). It does not upload crates.io, npm,
+or PyPI bytes.
