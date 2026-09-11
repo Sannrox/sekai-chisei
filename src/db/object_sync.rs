@@ -17,8 +17,17 @@ use crate::sekai::object_sync::{
     schema_quarantine_record_reason, sync_github_record,
 };
 use crate::sekai::source_type_descriptor::{
-    ProposedSourceTypeDescriptor, STATUS_LIVE, project_registered_record,
+    ProposedSourceTypeDescriptor, STATUS_LIVE, StoredSourceTypeDescriptor,
+    project_registered_record,
 };
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SOURCE_BATCH_MAPPER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_SOURCE_BATCH_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
 
@@ -787,14 +796,18 @@ impl SekaiDb {
         let mapper = self
             .source_batch_mapper(batch)
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        take_after_source_batch_mapper_hook();
         let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
         match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
         {
             OpenDisposition::Committed(result) => Ok(*result),
-            OpenDisposition::Open => self
-                .commit_source_batch(
+            OpenDisposition::Open => {
+                #[cfg(test)]
+                take_after_source_batch_open_hook();
+                self.commit_source_batch(
                     batch,
                     &prepared,
                     authenticated_producer,
@@ -802,7 +815,8 @@ impl SekaiDb {
                     expected_policy_generation,
                     authorized_objects,
                 )
-                .map_err(|error| error.to_string()),
+                .map_err(|error| error.to_string())
+            }
         }
     }
 
@@ -814,31 +828,10 @@ impl SekaiDb {
             .get_source_type_descriptor(&batch.namespace, &batch.type_digest)
             .map_err(ApplyError::Storage)?;
         let Some(stored) = stored else {
-            return Err(ApplyError::denied(
-                "unbound_type_revision",
-                "type_digest is not bound to an admitted source type",
-            ));
+            return Err(unbound_type_revision());
         };
-        if stored.status != STATUS_LIVE
-            || stored.source != batch.source
-            || stored.digest != batch.type_digest
-            || stored.family != batch.family
-        {
-            return Err(ApplyError::denied(
-                "unbound_type_revision",
-                "type_digest is not bound to an admitted source type",
-            ));
-        }
-        let expected_kind = batch
-            .records
-            .first()
-            .map(|record| record.type_name.as_str())
-            .unwrap_or_default();
-        if stored.record_kind != expected_kind {
-            return Err(ApplyError::denied(
-                "unbound_type_revision",
-                "type_digest is not bound to an admitted source type",
-            ));
+        if !registered_descriptor_matches_batch(&stored, batch) {
+            return Err(unbound_type_revision());
         }
         Ok(SourceBatchMapper::Registered(
             ProposedSourceTypeDescriptor {
@@ -896,6 +889,11 @@ impl SekaiDb {
                             )
                         })?;
                     validate_binding(&binding.binding, batch)?;
+                    if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
+                        abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
+                        transaction.commit()?;
+                        return Err(error);
+                    }
                     transaction.commit()?;
                     Ok(OpenDisposition::Open)
                 }
@@ -905,6 +903,8 @@ impl SekaiDb {
                 )),
             };
         }
+
+        require_live_registered_descriptor(&transaction, batch)?;
 
         let binding = match load_binding_by_source(
             &transaction,
@@ -1083,6 +1083,11 @@ impl SekaiDb {
                 "open transaction has no stable source binding",
             )
         })?;
+        if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
+            abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
+            transaction.commit()?;
+            return Err(error);
+        }
         let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
             preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)
         });
@@ -2501,6 +2506,94 @@ fn persist_schema_quarantine(
     Ok(result)
 }
 
+fn unbound_type_revision() -> ApplyError {
+    ApplyError::denied(
+        "unbound_type_revision",
+        "type_digest is not bound to an admitted source type",
+    )
+}
+
+fn registered_descriptor_matches_batch(
+    stored: &StoredSourceTypeDescriptor,
+    batch: &SourceBatch,
+) -> bool {
+    let expected_kind = batch
+        .records
+        .first()
+        .map(|record| record.type_name.as_str())
+        .unwrap_or_default();
+    stored.source == batch.source
+        && stored.digest == batch.type_digest
+        && stored.family == batch.family
+        && stored.record_kind == expected_kind
+}
+
+fn registered_descriptor_authorizes_batch(
+    stored: &StoredSourceTypeDescriptor,
+    batch: &SourceBatch,
+) -> bool {
+    stored.status == STATUS_LIVE && registered_descriptor_matches_batch(stored, batch)
+}
+
+fn require_live_registered_descriptor(
+    transaction: &rusqlite::Transaction<'_>,
+    batch: &SourceBatch,
+) -> Result<(), ApplyError> {
+    if batch.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Ok(());
+    }
+    let json: Option<String> = transaction
+        .query_row(
+            "SELECT record_json FROM sekai_source_type_descriptors
+             WHERE namespace = ?1 AND digest = ?2",
+            params![batch.namespace, batch.type_digest],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Err(unbound_type_revision());
+    };
+    let stored: StoredSourceTypeDescriptor = serde_json::from_str(&json)
+        .map_err(|error| ApplyError::storage(format!("decode source-type descriptor: {error}")))?;
+    if !registered_descriptor_authorizes_batch(&stored, batch) {
+        return Err(unbound_type_revision());
+    }
+    Ok(())
+}
+
+fn abort_open_source_batch(
+    transaction: &rusqlite::Transaction<'_>,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+    error: &ApplyError,
+) -> Result<(), ApplyError> {
+    transaction.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET status='ABORTED', outcome='denial', closed_at_ms=?1, reason=?2
+         WHERE transaction_id=?3 AND status='OPEN'",
+        params![now_ms, error.to_string(), prepared.transaction_id],
+    )?;
+    transaction.execute(
+        "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
+        params![now_ms, prepared.binding_id],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn take_after_source_batch_mapper_hook() {
+    if let Some(hook) = AFTER_SOURCE_BATCH_MAPPER.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn take_after_source_batch_open_hook() {
+    if let Some(hook) = AFTER_SOURCE_BATCH_OPEN.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
 fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
     if !matches!(
         stored.transaction.status,
@@ -3431,5 +3524,163 @@ mod tests {
             SourceBatchStatus::Quarantined
         );
         assert!(!quarantined.checkpoint_advanced);
+    }
+
+    fn pager_alert_record() -> SourceRecord {
+        SourceRecord {
+            source: "synthetic.pager".into(),
+            source_instance: "ops-local".into(),
+            external_id: "42".into(),
+            source_version: "alert-v1".into(),
+            type_name: "Alert".into(),
+            display_name: "checkout latency".into(),
+            payload_digest: PAYLOAD_DIGEST.into(),
+            properties: BTreeMap::from([("title".into(), "checkout latency".into())]),
+            deleted: false,
+            observed_at_ms: 10,
+            source_sequence: None,
+        }
+    }
+
+    fn pager_alert_batch(digest: &str, key: &str) -> crate::sekai::object_sync::SourceBatch {
+        use crate::sekai::object_sync::{
+            ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, SourceBatch,
+        };
+        let mut batch = SourceBatch {
+            contract_version: SOURCE_BATCH_VERSION.into(),
+            namespace: "ops".into(),
+            producer_identity: "connector/pager".into(),
+            source: "synthetic.pager".into(),
+            source_instance: "ops-local".into(),
+            family: FAMILY_OBJECT_SYNC.into(),
+            adapter_id: ADAPTER_REGISTERED_OBJECT_SYNC.into(),
+            adapter_version: ADAPTER_REGISTERED_OBJECT_SYNC_VERSION.into(),
+            type_digest: digest.into(),
+            current_cursor: String::new(),
+            proposed_next_cursor: "cursor:1".into(),
+            idempotency_key: key.into(),
+            batch_digest: String::new(),
+            collected_at_ms: 20,
+            records: vec![pager_alert_record()],
+            delivery: None,
+        };
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    fn batch_status_for(db: &RuntimeDb, key: &str) -> Option<String> {
+        let RuntimeDb::Sqlite(db) = db else {
+            panic!("expected sqlite runtime");
+        };
+        db.conn()
+            .query_row(
+                "SELECT status FROM sekai_source_batch_transactions
+                 WHERE idempotency_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    #[test]
+    fn retire_between_catalog_read_and_open_fails_closed_without_durable_open() {
+        use crate::sekai::source_type_descriptor::{
+            register_source_type_descriptor, retire_source_type_descriptor,
+            synthetic_pager_alert_v1,
+        };
+
+        let db = RuntimeDb::memory();
+        let pager = synthetic_pager_alert_v1();
+        register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        let batch = pager_alert_batch(&pager.digest, "retire-before-open");
+        AFTER_SOURCE_BATCH_MAPPER.with(|cell| {
+            let db = db.clone();
+            let digest = pager.digest.clone();
+            *cell.borrow_mut() = Some(Box::new(move || {
+                retire_source_type_descriptor(&db, "local", "ops", &digest, 20).unwrap();
+            }));
+        });
+
+        let err = db
+            .apply_source_batch(&batch, "connector/pager", 100)
+            .unwrap_err();
+        assert!(err.starts_with("unbound_type_revision:"), "{err}");
+        assert!(
+            db.get_source_sync_state("ops", "ops-local", &pager.digest)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(batch_status_for(&db, "retire-before-open"), None);
+    }
+
+    #[test]
+    fn retire_between_open_and_commit_aborts_without_checkpoint_advance() {
+        use crate::sekai::source_type_descriptor::{
+            register_source_type_descriptor, retire_source_type_descriptor,
+            synthetic_pager_alert_v1,
+        };
+
+        let db = RuntimeDb::memory();
+        let pager = synthetic_pager_alert_v1();
+        register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        let batch = pager_alert_batch(&pager.digest, "retire-before-commit");
+        AFTER_SOURCE_BATCH_OPEN.with(|cell| {
+            let db = db.clone();
+            let digest = pager.digest.clone();
+            *cell.borrow_mut() = Some(Box::new(move || {
+                retire_source_type_descriptor(&db, "local", "ops", &digest, 20).unwrap();
+            }));
+        });
+
+        let err = db
+            .apply_source_batch(&batch, "connector/pager", 100)
+            .unwrap_err();
+        assert!(err.starts_with("unbound_type_revision:"), "{err}");
+        let state = db
+            .get_source_sync_state("ops", "ops-local", &pager.digest)
+            .unwrap()
+            .expect("open creates a binding before the aborted commit");
+        assert!(state.checkpoint.is_none());
+        assert!(state.open_transaction.is_none());
+        assert_eq!(
+            batch_status_for(&db, "retire-before-commit").as_deref(),
+            Some("ABORTED")
+        );
+    }
+
+    #[test]
+    fn committed_registered_replay_survives_later_retire() {
+        use crate::sekai::source_type_descriptor::{
+            register_source_type_descriptor, retire_source_type_descriptor,
+            synthetic_pager_alert_v1,
+        };
+
+        let db = RuntimeDb::memory();
+        let pager = synthetic_pager_alert_v1();
+        register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
+        let batch = pager_alert_batch(&pager.digest, "replay-after-retire");
+        let admitted = db
+            .apply_source_batch(&batch, "connector/pager", 100)
+            .unwrap();
+        assert_eq!(admitted.transaction.status, SourceBatchStatus::Committed);
+        retire_source_type_descriptor(&db, "local", "ops", &pager.digest, 20).unwrap();
+        let replayed = db
+            .apply_source_batch(&batch, "connector/pager", 300)
+            .unwrap();
+        assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
+        assert_eq!(
+            replayed.transaction.transaction_id,
+            admitted.transaction.transaction_id
+        );
+        assert_eq!(
+            db.get_source_sync_state("ops", "ops-local", &pager.digest)
+                .unwrap()
+                .unwrap()
+                .checkpoint
+                .unwrap()
+                .cursor,
+            "cursor:1"
+        );
     }
 }

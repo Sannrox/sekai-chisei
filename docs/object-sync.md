@@ -185,10 +185,13 @@ sekaictl admin sync retire-descriptor --namespace ops --digest sha256:...
 SQLite stores the catalog. PostgreSQL stays unavailable. A **live** registered
 descriptor may authorize `ApplySourceBatch` with identity
 `{source}:{instance}#{record_kind}/{immutable_key}` and the same transactional
-lifecycle as GitHub. Unknown, retired, or unadmitted descriptors fail as
-`unbound_type_revision` without disclosure. PostgreSQL registered-type apply
-stays unavailable; GitHub apply remains dual-backend. GitHub is not rewritten
-as a registered descriptor. See
+lifecycle as GitHub. Apply re-reads live catalog status inside the Immediate
+transactions that open and commit a batch. A concurrent retire fails closed as
+`unbound_type_revision` before durable advance. Exact replay of an already
+committed or quarantined batch is unchanged after retirement. Unknown, retired,
+or unadmitted descriptors fail as `unbound_type_revision` without disclosure.
+PostgreSQL registered-type apply stays unavailable; GitHub apply remains
+dual-backend. GitHub is not rewritten as a registered descriptor. See
 [research/817-source-type-admission.md](research/817-source-type-admission.md).
 
 The canonical batch digest includes all replay-relevant input, including the

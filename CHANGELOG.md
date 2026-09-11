@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Re-validate live registered source-type catalog status inside the Immediate
+  write transactions that open and commit `ApplySourceBatch` (#830). A
+  concurrent retire after the pre-transaction catalog read fails closed as
+  `unbound_type_revision` before durable advance. Exact committed or
+  quarantined replay is unchanged after retirement. PostgreSQL registered-type
+  apply stays unavailable.
 - Prove isolated Rust, TypeScript, and Python consumers can install pinned
   local SDK artifacts and share the native core-loop identity (#840). Tampered
   or incompatible protocol/source/package digests fail closed. Registry
