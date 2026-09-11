@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Publish one object and Action integration contract map
+  ([docs/integration-contract.md](docs/integration-contract.md), #834).
+  Supported rows name the owning service, RPC, maintained guide, and
+  executable proof. ObjectSet, application preview, subscriptions, MCP, and
+  registry packages are recorded as gaps.
 - Measure concurrent source refresh and authorized object pagination over
   deterministic small, medium, and large synthetic graphs (#824). Hidden
   records stay omitted; foreign source cursors and changed query/policy

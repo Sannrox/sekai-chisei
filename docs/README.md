@@ -15,15 +15,17 @@ If you want to run the project locally:
 
 If you want to build an agent or SDK integration:
 
-1. Read the [architecture overview](architecture.md) to understand the Sekai,
+1. Read the [object and Action integration contract](integration-contract.md)
+   for supported versus planned surfaces.
+2. Read the [architecture overview](architecture.md) to understand the Sekai,
    Chisei, interface, and runtime boundaries.
-2. Use the [capability catalogs](capability-catalog.md) — native
+3. Use the [capability catalogs](capability-catalog.md) — native
    `DiscoverCapabilities` contract `1.0` for governed surfaces, and
    `chisei.provider-capabilities/v1` for the HTTP provider-profile matrix —
    together with the native [`proto/`](../proto/) contract.
-3. Check the [available-model discovery contract](available-models.md) when the
+4. Check the [available-model discovery contract](available-models.md) when the
    integration executes model calls.
-4. Use [bounded content execution](content-execution.md) for ordered text,
+5. Use [bounded content execution](content-execution.md) for ordered text,
    image, audio, or document descriptors without changing the text RPC.
 
 To connect an existing Codex, Claude Code, OpenAI-compatible, or
@@ -38,6 +40,8 @@ If you want to deploy or operate the control plane:
 
 ## Core concepts
 
+- [Object and Action integration contract](integration-contract.md) —
+  supported object reads, Action invocation, and receipt inspection.
 - [Architecture](architecture.md) — ownership, trust boundaries, data model,
   and governed entry paths.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
