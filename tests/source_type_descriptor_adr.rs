@@ -51,3 +51,33 @@ fn related_docs_point_at_accepted_additive_descriptors() {
         "research #817 must record that ADR 0060 accepted the recommendation"
     );
 }
+
+fn markdown_section<'a>(text: &'a str, heading: &str) -> &'a str {
+    let start = text
+        .find(heading)
+        .unwrap_or_else(|| panic!("missing heading {heading}"));
+    let after = &text[start + heading.len()..];
+    let end = after.find("\n## ").unwrap_or(after.len());
+    &text[start..start + heading.len() + end]
+}
+
+#[test]
+fn identity_section_lists_github_and_registered_grammars() {
+    let section = markdown_section(OBJECT_SYNC, "## Identity and deletion");
+    assert!(
+        section.contains("github:{owner}/{repo}#{number}"),
+        "Identity must keep the GitHub grammar"
+    );
+    assert!(
+        section.contains("{source}:{instance}#{record_kind}/{immutable_key}"),
+        "Identity must list the registered grammar"
+    );
+    assert!(
+        section.contains("source=github") && section.contains("cannot be registered"),
+        "Identity must separate github registration from the GitHub profile"
+    );
+    assert!(
+        !section.contains("Source identity is `github:{owner}/{repo}#{number}`."),
+        "Identity must not claim GitHub as the exclusive source identity"
+    );
+}
