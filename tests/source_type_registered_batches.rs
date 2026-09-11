@@ -178,19 +178,17 @@ fn unadmitted_retired_and_duplicate_identities_leave_state_unchanged() {
     );
 
     register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
-    db.apply_source_batch(
-        &pager_batch(
-            &pager.digest,
-            "",
-            "cursor:1",
-            "live-1",
-            alert("7", "alert-v1", PAYLOAD_A, false),
-        ),
-        PRODUCER,
-        200,
-    )
-    .unwrap();
+    let live = pager_batch(
+        &pager.digest,
+        "",
+        "cursor:1",
+        "live-1",
+        alert("7", "alert-v1", PAYLOAD_A, false),
+    );
+    db.apply_source_batch(&live, PRODUCER, 200).unwrap();
     retire_source_type_descriptor(&db, "local", "ops", &pager.digest, 20).unwrap();
+    let replayed = db.apply_source_batch(&live, PRODUCER, 250).unwrap();
+    assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
     let retired = db
         .apply_source_batch(
             &pager_batch(
