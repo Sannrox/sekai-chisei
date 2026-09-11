@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Document both admitted object-sync identity grammars in
+  [docs/object-sync.md](docs/object-sync.md) Identity (#831). GitHub
+  Issue/PullRequest stays `github:{owner}/{repo}#{number}`. Live registered
+  descriptors use `{source}:{instance}#{record_kind}/{immutable_key}`.
+  `source=github` cannot be registered; registered kinds cannot be Issue or
+  PullRequest. ADR 0021 is not superseded.
 - Re-validate live registered source-type catalog status inside the Immediate
   write transactions that open and commit `ApplySourceBatch` (#830). A
   concurrent retire after the pre-transaction catalog read fails closed as

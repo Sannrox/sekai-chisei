@@ -246,9 +246,16 @@ authoritative evidence.
 
 ## Identity and deletion
 
-- Source identity is `github:{owner}/{repo}#{number}`. The server requires a
-  lowercase canonical two-part GitHub repository and a positive canonical
-  decimal number; adapter-side validation is not trusted.
+Object-sync identity has two admitted grammars. They share the
+`{source}:{instance}#…` skeleton, but the plane separates them at admission:
+`source=github` cannot be registered, and registered kinds cannot be `Issue` or
+`PullRequest`. GitHub identity and discovery stay unchanged.
+
+- GitHub Issue/PullRequest identity is `github:{owner}/{repo}#{number}`. The
+  server requires a lowercase canonical two-part GitHub repository and a
+  positive canonical decimal number; adapter-side validation is not trusted.
+- A live registered descriptor uses
+  `{source}:{instance}#{record_kind}/{immutable_key}`.
 - Object id is derived from `type_digest` plus source identity.
 - Issue and PullRequest share GitHub's repository number space. A pull request
   and its issue number are one identity, and a batch cannot submit both.
