@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Isolated SDK consumer staging pins `sekai-proto` as a sibling path, rewrites
+  TypeScript fixtures like Python, re-hashes protocol/source/package bytes from
+  disk, and includes `chisei.proto` in the protocol digest (#844). cargo, npm,
+  and pip registry installs are still not claimed.
 - Isolated SDK consumer proof fails closed without `python3`, `node`, or
   `rustc`, and asserts live core-loop identity from those processes in a
   tempfile (#843). Static fixture `include_str` is not the parity proof.

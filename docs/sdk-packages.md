@@ -48,7 +48,8 @@ names it. The superseded record stays inspectable and fails smoke.
 SQLite stores publications. PostgreSQL surfaces stay unavailable.
 
 Local artifacts, publication records, and registry packages are different
-objects. Current `main` stages isolated Rust, TypeScript, and Python trees and
-runs language identity probes from that tempfile (#840, #843). It does not
-claim cargo, npm, or pip install graphs, and it does not upload crates.io, npm,
-or PyPI bytes.
+objects. Current `main` stages isolated Rust, TypeScript, and Python trees,
+pins `sekai-proto` beside the Rust client, rewrites consumer fixtures onto
+local copies, and re-hashes protocol (`sekai.proto` and `chisei.proto`), source,
+and package bytes from disk (#840, #843, #844). It does not claim cargo, npm, or
+pip registry installs, and it does not upload crates.io, npm, or PyPI bytes.
