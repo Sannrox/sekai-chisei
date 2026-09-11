@@ -81,3 +81,20 @@ fn identity_section_lists_github_and_registered_grammars() {
         "Identity must not claim GitHub as the exclusive source identity"
     );
 }
+
+#[test]
+fn batch_section_admits_github_digest_or_live_registered_descriptor() {
+    let section = markdown_section(OBJECT_SYNC, "## Batch contract");
+    assert!(
+        section.contains("sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a"),
+        "Batch must keep the code-owned GitHub digest"
+    );
+    assert!(
+        section.contains("live") && section.contains("registered descriptor"),
+        "Batch must admit a live registered descriptor beside GitHub"
+    );
+    assert!(
+        !section.contains("Any other digest fails as `unbound_type_revision`"),
+        "Batch must not claim every non-GitHub digest fails"
+    );
+}

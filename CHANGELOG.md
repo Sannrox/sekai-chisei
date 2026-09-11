@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Clarify the object-sync Batch contract admits the code-owned GitHub digest
+  or a live registered descriptor (#832). A digest that is neither the GitHub
+  profile nor a live catalog entry still fails as `unbound_type_revision`.
+  GitHub identity stays unchanged. ADR 0021 is not superseded.
 - Document both admitted object-sync identity grammars in
   [docs/object-sync.md](docs/object-sync.md) Identity (#831). GitHub
   Issue/PullRequest stays `github:{owner}/{repo}#{number}`. Live registered

@@ -156,7 +156,7 @@ version, and type revision. `current_cursor` must be empty for the first batch
 and must exactly equal the last committed cursor thereafter. The adapter may
 propose `proposed_next_cursor`; only the control plane persists it.
 
-The current object-sync profile admits exactly one code-owned type revision:
+The GitHub object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;
 - family: `source_control.object_sync`;
@@ -167,13 +167,15 @@ The current object-sync profile admits exactly one code-owned type revision:
 
 The digest is SHA-256 of
 `sekai.source-type-revision/v1\nsource_control.object_sync\ngithub\nIssue\nPullRequest\n`.
-Any other digest fails as `unbound_type_revision` before source binding or
-mutation. A configurable or additional revision requires a separate design
-decision and authoritative registration lifecycle; v1 does not infer a
+A GitHub batch whose `type_digest` is not this digest fails as
+`unbound_type_revision` before source binding or mutation. v1 does not infer a
 revision from caller input. [ADR 0060](decisions/0060-additive-source-type-descriptors.md)
-accepts additive registered descriptors beside this profile. GitHub identity
-and discovery stay unchanged. Register, inspect, and retire one later kind
-through `RegisterSourceTypeDescriptor` / `InspectSourceTypeDescriptor` /
+accepts additive registered descriptors beside this profile. A digest that is
+not the GitHub profile digest is admitted only when a **live** registered
+descriptor authorizes it. Unknown, retired, or unadmitted descriptors fail as
+`unbound_type_revision` without disclosure. GitHub identity and discovery stay
+unchanged. Register, inspect, and retire one later kind through
+`RegisterSourceTypeDescriptor` / `InspectSourceTypeDescriptor` /
 `RetireSourceTypeDescriptor` or:
 
 ```text
