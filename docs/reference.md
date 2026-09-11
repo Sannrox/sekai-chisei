@@ -6,6 +6,8 @@ lives in the separate [research index](research/README.md).
 
 ## Run and integrate
 
+- [Object and Action integration contract](integration-contract.md) —
+  supported versus planned object, Action, and receipt surfaces.
 - [Ontology definitions](ontology.md) — define a domain, seed governed facts,
   run an operation, and inspect its receipt.
 - [Capability catalogs](capability-catalog.md) — native `DiscoverCapabilities`
