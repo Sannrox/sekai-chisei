@@ -33,13 +33,15 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-fn stage_consumers() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
+fn stage_consumers() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
     let root = TempDir::new().unwrap();
     let rust = root.path().join("rust");
     let typescript = root.path().join("typescript");
     let python = root.path().join("python");
     let proto = root.path().join("proto");
+    let proto_crate = root.path().join("sekai-proto");
     copy_tree(Path::new("crates/sekai-client"), &rust);
+    copy_tree(Path::new("crates/sekai-proto"), &proto_crate);
     copy_tree(Path::new("sdk/typescript"), &typescript);
     copy_tree(Path::new("sdk/python"), &python);
     copy_tree(Path::new("proto"), &proto);
@@ -55,7 +57,29 @@ fn stage_consumers() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
     )
     .unwrap();
     fs::copy("tests/fixtures/sdk_core_loop/v1.json", rust.join("v1.json")).unwrap();
-    (root, rust, typescript, python, proto)
+    (root, rust, typescript, python, proto, proto_crate)
+}
+
+fn protocol_from_disk(proto: &Path) -> String {
+    let mut protocol = String::new();
+    for name in ["sekai.proto", "chisei.proto"] {
+        protocol.push_str(&fs::read_to_string(proto.join(name)).unwrap());
+        protocol.push('\n');
+    }
+    protocol
+}
+
+fn artifacts_from_disk(
+    proto: &Path,
+    source_root: &Path,
+    package_file: &Path,
+) -> sekai_chisei::sekai::client_package::PackageArtifacts {
+    artifacts_from(
+        &protocol_from_disk(proto),
+        &tree_text(source_root),
+        &fs::read(package_file).unwrap(),
+    )
+    .unwrap()
 }
 
 fn require_tool(name: &str) {
@@ -137,7 +161,22 @@ fn tree_text(root: &Path) -> String {
 
 #[test]
 fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
-    let (_root, rust, typescript, python, proto) = stage_consumers();
+    let (_root, rust, typescript, python, proto, proto_crate) = stage_consumers();
+    rewrite_python_fixture(&python);
+    rewrite_typescript_fixture(&typescript);
+    assert!(proto_crate.join("Cargo.toml").is_file());
+    let rust_manifest = fs::read_to_string(rust.join("Cargo.toml")).unwrap();
+    assert!(
+        rust_manifest.contains("path = \"../sekai-proto\""),
+        "staged sekai-client must pin sekai-proto as a sibling path"
+    );
+    assert!(
+        rust.join("..")
+            .join("sekai-proto")
+            .join("Cargo.toml")
+            .is_file()
+    );
+
     let rust_src = tree_text(&rust);
     let ts_src = tree_text(&typescript);
     let py_src = tree_text(&python);
@@ -147,20 +186,20 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
             "consumer imported server implementation"
         );
         assert!(!blob.contains("src/grpc/sekai_service.rs"));
+        assert!(
+            !blob.contains("../../tests/fixtures/sdk_core_loop/v1.json"),
+            "staged consumer still points at the repository fixture"
+        );
     }
     assert!(rust_src.contains("sekai.sdk-core-loop/v1"));
     assert!(ts_src.contains("sekai.sdk-core-loop/v1"));
     assert!(py_src.contains("sekai.sdk-core-loop/v1"));
 
-    let proto_bytes = fs::read_to_string(proto.join("sekai.proto")).unwrap();
     let rust_lib = fs::read(rust.join("src/lib.rs")).unwrap();
-    let ts_client = fs::read(typescript.join("client.ts")).unwrap();
-    let py_client = fs::read(python.join("sekai_client.py")).unwrap();
-
     let db = RuntimeDb::memory();
-    let rust_art = artifacts_from(&proto_bytes, &rust_src, &rust_lib).unwrap();
-    let ts_art = artifacts_from(&proto_bytes, &ts_src, &ts_client).unwrap();
-    let py_art = artifacts_from(&proto_bytes, &py_src, &py_client).unwrap();
+    let rust_art = artifacts_from_disk(&proto, &rust, &rust.join("src/lib.rs"));
+    let ts_art = artifacts_from_disk(&proto, &typescript, &typescript.join("client.ts"));
+    let py_art = artifacts_from_disk(&proto, &python, &python.join("sekai_client.py"));
     publish_client_package(
         &db,
         ACTOR,
@@ -191,10 +230,19 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
     )
     .unwrap();
 
+    let rust_art_disk = artifacts_from_disk(&proto, &rust, &rust.join("src/lib.rs"));
+    let ts_art_disk = artifacts_from_disk(&proto, &typescript, &typescript.join("client.ts"));
+    let py_art_disk = artifacts_from_disk(&proto, &python, &python.join("sekai_client.py"));
+    assert_eq!(rust_art.protocol, rust_art_disk.protocol);
+    assert_eq!(rust_art.source, rust_art_disk.source);
+    assert_eq!(rust_art.package, rust_art_disk.package);
+    assert_eq!(ts_art.protocol, ts_art_disk.protocol);
+    assert_eq!(py_art.protocol, py_art_disk.protocol);
+
     for (id, artifacts) in [
-        ("pkg:rust-0.1.0", &rust_art),
-        ("pkg:typescript-0.1.0", &ts_art),
-        ("pkg:python-0.1.0", &py_art),
+        ("pkg:rust-0.1.0", &rust_art_disk),
+        ("pkg:typescript-0.1.0", &ts_art_disk),
+        ("pkg:python-0.1.0", &py_art_disk),
     ] {
         let verified = verify_client_package(&db, ACTOR, "sdk", id, artifacts).unwrap();
         assert_eq!(verified.catalog_version, "catalog-v1");
@@ -203,13 +251,13 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
 
     let mut tampered = rust_lib.clone();
     tampered[0] ^= 0xff;
-    let bad = artifacts_from(&proto_bytes, &rust_src, &tampered).unwrap();
+    let bad = artifacts_from(&protocol_from_disk(&proto), &tree_text(&rust), &tampered).unwrap();
     assert_eq!(
         verify_client_package(&db, ACTOR, "sdk", "pkg:rust-0.1.0", &bad).unwrap_err(),
         PACKAGE_UNAVAILABLE
     );
 
-    let foreign_proto = artifacts_from("other-protocol", &rust_src, &rust_lib).unwrap();
+    let foreign_proto = artifacts_from("other-protocol", &tree_text(&rust), &rust_lib).unwrap();
     assert_eq!(
         verify_client_package(&db, ACTOR, "sdk", "pkg:rust-0.1.0", &foreign_proto).unwrap_err(),
         PACKAGE_UNAVAILABLE
@@ -219,7 +267,6 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
     require_tool("node");
     require_tool("rustc");
 
-    rewrite_python_fixture(&python);
     run_in(
         &python,
         "python3",
@@ -299,5 +346,19 @@ fn rewrite_python_fixture(python: &Path) {
         "(Path(__file__).with_name(\"v1.json\"))",
     );
     assert_ne!(source, rewritten, "python fixture path was not isolated");
+    fs::write(path, rewritten).unwrap();
+}
+
+fn rewrite_typescript_fixture(typescript: &Path) {
+    let path = typescript.join("client.test.ts");
+    let source = fs::read_to_string(&path).unwrap();
+    let rewritten = source.replace(
+        "new URL(\"../../tests/fixtures/sdk_core_loop/v1.json\", import.meta.url)",
+        "new URL(\"./v1.json\", import.meta.url)",
+    );
+    assert_ne!(
+        source, rewritten,
+        "typescript fixture path was not isolated"
+    );
     fs::write(path, rewritten).unwrap();
 }
