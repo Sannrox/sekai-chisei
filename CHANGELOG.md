@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Prove isolated Rust, TypeScript, and Python consumers can install pinned
+  local SDK artifacts and share the native core-loop identity (#840). Tampered
+  or incompatible protocol/source/package digests fail closed. Registry
+  publication is not claimed.
 - Publish one object and Action integration contract map
   ([docs/integration-contract.md](docs/integration-contract.md), #834).
   Supported rows name the owning service, RPC, maintained guide, and

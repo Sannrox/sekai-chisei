@@ -41,7 +41,10 @@ Use HTTPS for remote targets. Plain HTTP is accepted only for loopback targets
 unless `allowInsecureRemote` is explicitly enabled by the host application.
 When the package is installed outside this repository, pass `protoRoot` to the
 canonical checkout's `proto/` directory; the SDK intentionally does not bundle
-a second protocol snapshot.
+a second protocol snapshot. Publication records from
+`sekaictl admin sdk-packages` pin protocol, source, and package digests; they
+are not registry downloads. Isolated consumer proof lives in
+`tests/sdk_external_consumer.rs` (#840).
 
 ```ts
 import { SekaiChiseiClient } from "@sannrox/sekai-chisei-sdk";
