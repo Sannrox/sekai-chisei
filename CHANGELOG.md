@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Isolated SDK consumer proof fails closed without `python3`, `node`, or
+  `rustc`, and asserts live core-loop identity from those processes in a
+  tempfile (#843). Static fixture `include_str` is not the parity proof.
+  cargo/npm/pip install graphs remain #844.
 - Clarify the object-sync Batch contract admits the code-owned GitHub digest
   or a live registered descriptor (#832). A digest that is neither the GitHub
   profile nor a live catalog entry still fails as `unbound_type_revision`.

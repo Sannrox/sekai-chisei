@@ -44,7 +44,9 @@ canonical checkout's `proto/` directory; the SDK intentionally does not bundle
 a second protocol snapshot. Publication records from
 `sekaictl admin sdk-packages` pin protocol, source, and package digests; they
 are not registry downloads. Isolated consumer proof lives in
-`tests/sdk_external_consumer.rs` (#840).
+`tests/sdk_external_consumer.rs` (#840, #843). It fails closed without
+`python3`, `node`, and `rustc`, and it does not claim registry or
+cargo/npm/pip install graphs.
 
 ```ts
 import { SekaiChiseiClient } from "@sannrox/sekai-chisei-sdk";

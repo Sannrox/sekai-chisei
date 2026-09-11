@@ -54,7 +54,41 @@ fn stage_consumers() -> (TempDir, PathBuf, PathBuf, PathBuf, PathBuf) {
         typescript.join("v1.json"),
     )
     .unwrap();
+    fs::copy("tests/fixtures/sdk_core_loop/v1.json", rust.join("v1.json")).unwrap();
     (root, rust, typescript, python, proto)
+}
+
+fn require_tool(name: &str) {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|error| panic!("{name} is required for isolated consumer proof: {error}"));
+}
+
+fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("{program} failed to spawn in {}: {error}", dir.display()));
+    assert!(
+        output.status.success(),
+        "{program} {:?} in {} failed: {}\n{}",
+        args,
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    String::from_utf8(output.stdout).expect("utf8 stdout")
+}
+
+fn assert_live_identity(label: &str, stdout: &str) {
+    for needle in ["operation-1", "service-1", "plan-1"] {
+        assert!(
+            stdout.contains(needle),
+            "{label} stdout missing {needle}: {stdout}"
+        );
+    }
 }
 
 fn package(
@@ -181,26 +215,80 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
         PACKAGE_UNAVAILABLE
     );
 
-    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
-    assert_eq!(fixture["version"], "sekai.sdk-core-loop/v1");
-    assert_eq!(fixture["operation_id"], "operation-1");
-    assert_eq!(fixture["objects"][0]["id"], "service-1");
-    assert_eq!(fixture["plan"]["plan_id"], "plan-1");
-    assert_eq!(fixture["receipt"]["complete"], true);
+    require_tool("python3");
+    require_tool("node");
+    require_tool("rustc");
 
     rewrite_python_fixture(&python);
-    let python_status = Command::new("python3")
-        .current_dir(&python)
-        .args(["-m", "unittest", "test_sekai_client.py", "-v"])
-        .status();
-    match python_status {
-        Ok(status) if status.success() => {}
-        Ok(status) => panic!("isolated python consumer failed: {status}"),
-        Err(_) => {
-            // Digest, tamper, and isolation checks already ran. The Python
-            // core-loop spawn needs python3 on PATH (present on CI).
-        }
-    }
+    run_in(
+        &python,
+        "python3",
+        &["-m", "unittest", "test_sekai_client.py", "-v"],
+    );
+
+    fs::write(
+        rust.join("identity_probe.rs"),
+        r#"fn first_string_field(text: &str, key: &str) -> String {
+    let needle = format!("\"{key}\": \"");
+    let start = text.find(&needle).unwrap_or_else(|| panic!("{key}")) + needle.len();
+    let end = text[start..].find('"').expect("closing quote");
+    text[start..start + end].to_string()
+}
+
+fn main() {
+    let text = std::fs::read_to_string("v1.json").expect("v1.json");
+    println!("{}", first_string_field(&text, "operation_id"));
+    println!("{}", first_string_field(&text, "id"));
+    println!("{}", first_string_field(&text, "plan_id"));
+}
+"#,
+    )
+    .unwrap();
+    run_in(
+        &rust,
+        "rustc",
+        &["identity_probe.rs", "-o", "identity_probe"],
+    );
+    let rust_out = run_in(&rust, "./identity_probe", &[]);
+    assert_live_identity("rust", &rust_out);
+
+    let ts_out = run_in(
+        &typescript,
+        "node",
+        &[
+            "--input-type=module",
+            "-e",
+            "import fs from 'node:fs'; const j = JSON.parse(fs.readFileSync('v1.json','utf8')); for (const v of [j.operation_id, j.objects[0].id, j.plan.plan_id]) console.log(v);",
+        ],
+    );
+    assert_live_identity("typescript", &ts_out);
+
+    let python_ids = run_in(
+        &python,
+        "python3",
+        &[
+            "-c",
+            "import json; j=json.load(open('v1.json')); print(j['operation_id']); print(j['objects'][0]['id']); print(j['plan']['plan_id'])",
+        ],
+    );
+    assert_live_identity("python", &python_ids);
+    assert_eq!(
+        rust_out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>(),
+        python_ids
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ts_out.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(),
+        python_ids
+            .lines()
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+    );
 }
 
 fn rewrite_python_fixture(python: &Path) {
