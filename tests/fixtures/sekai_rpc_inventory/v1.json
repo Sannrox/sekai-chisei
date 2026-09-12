@@ -1015,6 +1015,34 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "DescribeObjectAction",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/action_describe_preview.rs",
+        "src/grpc/sekai_service.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "PreviewObjectAction",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/action_describe_preview.rs",
+        "src/grpc/sekai_service.rs",
+        "docs/governed-action-instances.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionInstance",
       "kind": "persistent",
       "surfaces": [
