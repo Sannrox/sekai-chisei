@@ -161,6 +161,20 @@ export interface OperationReceipt {
   [key: string]: unknown;
 }
 
+export interface QualityTrendReport {
+  version: string;
+  semantic_digest: string;
+  namespace: string;
+  since_ms: number;
+  until_ms: number;
+  [key: string]: unknown;
+}
+
+export interface GetQualityTrendResponse {
+  report?: QualityTrendReport;
+  [key: string]: unknown;
+}
+
 export interface SeedFactsInput {
   namespace: string;
   objects: readonly FactObject[];
@@ -718,6 +732,27 @@ export class SekaiChiseiClient {
       retryable: options.retryable ?? true,
     });
     return response as OperationReceipt;
+  }
+
+  async getQualityTrend(
+    request: { namespace: string; since_ms: number; until_ms: number },
+    options: CallOptions = {},
+  ): Promise<GetQualityTrendResponse> {
+    const namespace = requiredText("namespace", request.namespace, 200);
+    if (!Number.isFinite(request.since_ms) || !Number.isFinite(request.until_ms)) {
+      throw new SdkError("invalid_argument", "quality trend requires since_ms and until_ms");
+    }
+    const response = await this.callUnary("chisei", "GetQualityTrend", {
+      namespace,
+      since_ms: request.since_ms,
+      until_ms: request.until_ms,
+    }, {
+      ...options,
+      namespace,
+      capability: options.capability ?? "chisei.quality.read",
+      retryable: options.retryable ?? true,
+    });
+    return response as GetQualityTrendResponse;
   }
 
   async runCoreLoop(input: CoreLoopInput): Promise<CoreLoopResult> {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expose `ChiseiService.GetQualityTrend`, an authenticated projection of the
+  canonical quality-trend reducer (#821). CLI and RPC share one semantic
+  digest; clients must not reimplement reduction. Denied namespaces and
+  over-limit windows fail closed.
 - Add `sekaictl admin sync inspect-quarantine`, `preview-batch`, and
   `apply-batch` for the latest quarantined source result (#820). Inspection and
   preview are observational; re-admission is existing `ApplySourceBatch`. A

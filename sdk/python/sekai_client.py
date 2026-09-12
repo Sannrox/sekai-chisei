@@ -144,6 +144,18 @@ class OperationReceipt(TypedDict, total=False):
     missing_surfaces: list[str]
 
 
+class QualityTrendReport(TypedDict, total=False):
+    version: str
+    semantic_digest: str
+    namespace: str
+    since_ms: int
+    until_ms: int
+
+
+class GetQualityTrendResponse(TypedDict, total=False):
+    report: QualityTrendReport
+
+
 @dataclass(frozen=True)
 class CallContext:
     namespace: str | None = None
@@ -630,6 +642,33 @@ class SekaiChiseiClient:
             timeout_seconds=options.timeout_seconds,
             retryable=True if options.retryable is None else options.retryable,
             request_id=request_id,
+        ))
+        return response
+
+    def get_quality_trend(
+        self,
+        namespace: str,
+        since_ms: int,
+        until_ms: int,
+        *,
+        options: CallOptions = CallOptions(),
+    ) -> GetQualityTrendResponse:
+        namespace = _required_text("namespace", namespace, 200)
+        response = self.call_unary("chisei", "GetQualityTrend", {
+            "namespace": namespace,
+            "since_ms": since_ms,
+            "until_ms": until_ms,
+        }, CallOptions(
+            context=CallContext(
+                namespace=namespace,
+                capability=options.context.capability or "chisei.quality.read",
+                operation_id=options.context.operation_id,
+                catalog_version=options.context.catalog_version,
+                metadata=options.context.metadata,
+            ),
+            timeout_seconds=options.timeout_seconds,
+            retryable=True if options.retryable is None else options.retryable,
+            request_id=options.request_id,
         ))
         return response
 

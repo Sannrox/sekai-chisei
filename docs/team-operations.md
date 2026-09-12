@@ -14,8 +14,10 @@ sekaictl report quality \
   --output reports/acme-quality.json
 ```
 
-The report keeps allow, deny, unknown, unavailable, cancelled, running,
-partial-population, missing-dependency, and invalid-receipt states distinct.
+Authenticated clients can read the same report through
+`ChiseiService.GetQualityTrend`. The report keeps allow, deny, unknown,
+unavailable, cancelled, running, partial-population, missing-dependency, and
+invalid-receipt states distinct.
 Its totals reconcile to the selected receipt window. Baselines require an
 earlier closed point with the same exact evaluator and canonical input digest,
 including the subject revision, direct evidence, dependency results, and

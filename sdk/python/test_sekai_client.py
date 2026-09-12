@@ -41,6 +41,16 @@ class FixtureTransport:
             return {"plan": FIXTURE["plan"]}
         if service == "chisei" and method == "GetOperationReceipt":
             return FIXTURE["receipt"]
+        if service == "chisei" and method == "GetQualityTrend":
+            return {
+                "report": {
+                    "version": "chisei.evaluation-quality-trend/v1",
+                    "semantic_digest": "sha256:quality",
+                    "namespace": request["namespace"],
+                    "since_ms": request["since_ms"],
+                    "until_ms": request["until_ms"],
+                }
+            }
         raise AssertionError(f"unexpected fixture unary {service}.{method}")
 
     def stream(self, service, method, request, options):
@@ -214,6 +224,15 @@ class CoreLoopSdkTest(unittest.TestCase):
         stream = sdk(transport).execute_plan_stream(FIXTURE["plan"])
         stream.cancel()
         self.assertTrue(transport.source.cancelled)
+
+    def test_python_reads_quality_trends_through_get_quality_trend(self):
+        transport = FixtureTransport()
+        response = sdk(transport).get_quality_trend(FIXTURE["namespace"], 1, 2)
+        self.assertEqual(response["report"]["semantic_digest"], "sha256:quality")
+        service, method, request, options = transport.calls[0]
+        self.assertEqual((service, method), ("chisei", "GetQualityTrend"))
+        self.assertEqual(request["namespace"], FIXTURE["namespace"])
+        self.assertEqual(options.metadata["x-sekai-capability"], "chisei.quality.read")
 
 
 if __name__ == "__main__":

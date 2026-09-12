@@ -112,6 +112,18 @@ export interface OperationReceipt {
     missing_surfaces: readonly string[];
     [key: string]: unknown;
 }
+export interface QualityTrendReport {
+    version: string;
+    semantic_digest: string;
+    namespace: string;
+    since_ms: number;
+    until_ms: number;
+    [key: string]: unknown;
+}
+export interface GetQualityTrendResponse {
+    report?: QualityTrendReport;
+    [key: string]: unknown;
+}
 export interface SeedFactsInput {
     namespace: string;
     objects: readonly FactObject[];
@@ -198,5 +210,10 @@ export declare class SekaiChiseiClient {
         caller_scope?: string;
         attempt?: number;
     }, options?: CallOptions): Promise<OperationReceipt>;
+    getQualityTrend(request: {
+        namespace: string;
+        since_ms: number;
+        until_ms: number;
+    }, options?: CallOptions): Promise<GetQualityTrendResponse>;
     runCoreLoop(input: CoreLoopInput): Promise<CoreLoopResult>;
 }

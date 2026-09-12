@@ -608,6 +608,133 @@ fn external_host_context(
     }
 }
 
+fn map_quality_trend_error(error: String) -> Status {
+    if error == "namespace access denied" {
+        Status::permission_denied(error)
+    } else if error == "invalid namespace"
+        || error == "until_ms must be greater than since_ms"
+        || error == "quality trend window exceeds one year"
+    {
+        Status::invalid_argument(error)
+    } else if error.contains("receipt limit exceeded") {
+        Status::resource_exhausted(error)
+    } else {
+        Status::internal(error)
+    }
+}
+
+fn quality_trend_report_to_proto(
+    report: &crate::quality_trend::QualityTrendReport,
+) -> QualityTrendReport {
+    QualityTrendReport {
+        version: report.version.clone(),
+        source_receipt_version: report.source_receipt_version.clone(),
+        authority: report.authority.clone(),
+        namespace: report.namespace.clone(),
+        since_ms: report.since_ms,
+        until_ms: report.until_ms,
+        totals: Some(QualityTrendTotals {
+            receipts_scanned: report.totals.receipts_scanned,
+            ignored_non_evaluation_receipts: report.totals.ignored_non_evaluation_receipts,
+            evaluation_receipts: report.totals.evaluation_receipts,
+            baseline_history_receipts: report.totals.baseline_history_receipts,
+            baseline_history_valid_executions: report.totals.baseline_history_valid_executions,
+            baseline_history_missing_dependencies: report
+                .totals
+                .baseline_history_missing_dependencies,
+            baseline_history_invalid_executions: report.totals.baseline_history_invalid_executions,
+            valid_executions: report.totals.valid_executions,
+            missing_dependencies: report.totals.missing_dependencies,
+            invalid_executions: report.totals.invalid_executions,
+            allow: report.totals.allow,
+            deny: report.totals.deny,
+            unknown: report.totals.unknown,
+            unavailable: report.totals.unavailable,
+            cancelled: report.totals.cancelled,
+            running: report.totals.running,
+            partial_executions: report.totals.partial_executions,
+            trend_points: report.totals.trend_points,
+            step_pass: report.totals.step_pass,
+            step_fail: report.totals.step_fail,
+            step_unknown: report.totals.step_unknown,
+            step_unavailable: report.totals.step_unavailable,
+            step_error: report.totals.step_error,
+            step_skipped: report.totals.step_skipped,
+            stochastic_complete_populations: report.totals.stochastic_complete_populations,
+            stochastic_low_sample_populations: report.totals.stochastic_low_sample_populations,
+            baseline_compared: report.totals.baseline_compared,
+            baseline_missing: report.totals.baseline_missing,
+            baseline_incomparable: report.totals.baseline_incomparable,
+            baseline_unavailable: report.totals.baseline_unavailable,
+            regressed: report.totals.regressed,
+            improved: report.totals.improved,
+            unchanged: report.totals.unchanged,
+            regression_unavailable: report.totals.regression_unavailable,
+            hidden_dimensions: report.totals.hidden_dimensions,
+            missing_dimensions: report.totals.missing_dimensions,
+        }),
+        series: report
+            .series
+            .iter()
+            .map(|series| QualityTrendSeries {
+                key: Some(QualityTrendSeriesKey {
+                    plan_digest: series.key.plan_digest.clone(),
+                    node_id: series.key.node_id.clone(),
+                    evaluator_definition_digest: series.key.evaluator_definition_digest.clone(),
+                    implementation_digest: series.key.implementation_digest.clone(),
+                    provider: series.key.provider.clone(),
+                    model: series.key.model.clone(),
+                    agent: series.key.agent.clone(),
+                }),
+                points: series
+                    .points
+                    .iter()
+                    .map(|point| QualityTrendPoint {
+                        operation_id: point.operation_id.clone(),
+                        manifest_digest: point.manifest_digest.clone(),
+                        started_at_ms: point.started_at_ms,
+                        completed_at_ms: point.completed_at_ms,
+                        evaluation_time_ms: point.evaluation_time_ms,
+                        evaluator_input_digest: point.evaluator_input_digest.clone(),
+                        subject_content_digest: point.subject_content_digest.clone(),
+                        subject_identity_state: point.subject_identity_state.clone(),
+                        evidence_set_digest: point.evidence_set_digest.clone(),
+                        evidence_digest_count: point.evidence_digest_count,
+                        evidence_identity_state: point.evidence_identity_state.clone(),
+                        dependency_result_set_digest: point.dependency_result_set_digest.clone(),
+                        dependency_result_digest_count: point.dependency_result_digest_count,
+                        dependency_result_identity_state: point
+                            .dependency_result_identity_state
+                            .clone(),
+                        execution_status: point.execution_status.clone(),
+                        gate_verdict: point.gate_verdict.clone(),
+                        gate_reason_code: point.gate_reason_code.clone(),
+                        step_status: point.step_status.clone(),
+                        step_reason_code: point.step_reason_code.clone(),
+                        classification: point.classification.clone(),
+                        population_state: point.population_state.clone(),
+                        trial_count: point.trial_count,
+                        completed_trial_count: point.completed_trial_count,
+                        mean_score_micros: point.mean_score_micros,
+                        pass_rate_basis_points: point.pass_rate_basis_points,
+                        score_variance_micros_squared: point.score_variance_micros_squared,
+                        aggregation_rule: point.aggregation_rule.clone(),
+                        baseline_state: point.baseline_state.clone(),
+                        baseline_operation_id: point.baseline_operation_id.clone(),
+                        mean_score_delta_micros: point.mean_score_delta_micros,
+                        pass_rate_delta_basis_points: point.pass_rate_delta_basis_points,
+                        variance_delta_micros_squared: point
+                            .variance_delta_micros_squared
+                            .map(|value| value.to_string()),
+                        regression: point.regression.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        semantic_digest: report.semantic_digest.clone(),
+    }
+}
+
 fn require_namespace_access(db: &RuntimeDb, actor: &str, namespace: &str) -> Result<(), Status> {
     let namespace = canonical_namespace(namespace)?;
     if matches!(actor, "root" | "local") {
@@ -4071,6 +4198,27 @@ impl ChiseiService for ChiseiServiceImpl {
                 .into_iter()
                 .map(|surface| surface.as_str().to_string())
                 .collect(),
+        }))
+    }
+
+    async fn get_quality_trend(
+        &self,
+        req: Request<GetQualityTrendRequest>,
+    ) -> Result<Response<GetQualityTrendResponse>, Status> {
+        let actor = authenticated_actor(&req);
+        let request = req.into_inner();
+        let namespace = canonical_namespace(&request.namespace)?.to_string();
+        require_namespace_access(&self.db, &actor, &namespace)?;
+        let report = crate::quality_trend::query_quality_trends(
+            &self.db,
+            &actor,
+            &namespace,
+            request.since_ms,
+            request.until_ms,
+        )
+        .map_err(map_quality_trend_error)?;
+        Ok(Response::new(GetQualityTrendResponse {
+            report: Some(quality_trend_report_to_proto(&report)),
         }))
     }
 
@@ -7607,6 +7755,103 @@ mod tests {
         assert_eq!(quality.totals.valid_executions, 1);
         assert_eq!(quality.totals.allow, 1);
         assert_eq!(quality.totals.baseline_missing, 1);
+        let mut trend_req = Request::new(GetQualityTrendRequest {
+            namespace: "acme".into(),
+            since_ms: receipt.started_at_ms.saturating_sub(1),
+            until_ms: receipt
+                .completed_at_ms
+                .unwrap_or(receipt.started_at_ms)
+                .saturating_add(1),
+        });
+        trend_req
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let remote = svc
+            .get_quality_trend(trend_req)
+            .await
+            .unwrap()
+            .into_inner()
+            .report
+            .unwrap();
+        assert_eq!(remote.semantic_digest, quality.semantic_digest);
+        assert_eq!(remote.version, crate::quality_trend::QUALITY_TREND_VERSION);
+        assert!(!remote.semantic_digest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_quality_trend_denies_hidden_namespaces_and_invalid_windows() {
+        let svc = evaluation_execution_service(0);
+        let mut denied = Request::new(GetQualityTrendRequest {
+            namespace: "secret".into(),
+            since_ms: 0,
+            until_ms: 100,
+        });
+        denied
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        let error = svc.get_quality_trend(denied).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "namespace access denied");
+        assert!(!error.message().contains("secret"));
+
+        let mut invalid = Request::new(GetQualityTrendRequest {
+            namespace: "acme".into(),
+            since_ms: 100,
+            until_ms: 100,
+        });
+        invalid
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let error = svc.get_quality_trend(invalid).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_quality_trend_matches_canonical_reducer_digest() {
+        let svc = evaluation_execution_service(0);
+        let canonical =
+            crate::quality_trend::query_quality_trends(&svc.db, "local", "acme", 0, 100).unwrap();
+        let mut authorized = Request::new(GetQualityTrendRequest {
+            namespace: "acme".into(),
+            since_ms: 0,
+            until_ms: 100,
+        });
+        authorized
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let response = svc
+            .get_quality_trend(authorized)
+            .await
+            .unwrap()
+            .into_inner()
+            .report
+            .unwrap();
+        assert_eq!(response.semantic_digest, canonical.semantic_digest);
+        assert_eq!(response.version, canonical.version);
+        assert_eq!(response.namespace, "acme");
+
+        let mut denied = Request::new(GetQualityTrendRequest {
+            namespace: "acme".into(),
+            since_ms: 0,
+            until_ms: 100,
+        });
+        denied
+            .metadata_mut()
+            .insert("x-principal", "mallory".parse().unwrap());
+        let error = svc.get_quality_trend(denied).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "namespace access denied");
+
+        let mut invalid = Request::new(GetQualityTrendRequest {
+            namespace: "acme".into(),
+            since_ms: 100,
+            until_ms: 100,
+        });
+        invalid
+            .metadata_mut()
+            .insert("x-principal", "local".parse().unwrap());
+        let invalid = svc.get_quality_trend(invalid).await.unwrap_err();
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

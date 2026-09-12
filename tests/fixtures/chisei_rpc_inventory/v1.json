@@ -206,6 +206,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "GetQualityTrend",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/quality_trend.rs",
+        "src/grpc/chisei_service.rs",
+        "docs/evaluation-quality-trends.md"
+      ],
+      "durable_dependencies": [
+        "chisei.execution"
+      ],
+      "product_tier": "core"
+    },
+    {
       "rpc": "GetSampleObservation",
       "kind": "query",
       "surfaces": [],

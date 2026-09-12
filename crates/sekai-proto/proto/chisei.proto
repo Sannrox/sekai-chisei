@@ -1394,6 +1394,115 @@ message GovernedSubjectProvenanceTrustRoot {
   string public_key = 4;
 }
 
+// Authenticated projection of the canonical quality-trend reducer (#821).
+// The RPC does not persist a dashboard. Clients must not reimplement reduction.
+message GetQualityTrendRequest {
+  string namespace = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3;
+}
+message QualityTrendTotals {
+  uint64 receipts_scanned = 1;
+  uint64 ignored_non_evaluation_receipts = 2;
+  uint64 evaluation_receipts = 3;
+  uint64 baseline_history_receipts = 4;
+  uint64 baseline_history_valid_executions = 5;
+  uint64 baseline_history_missing_dependencies = 6;
+  uint64 baseline_history_invalid_executions = 7;
+  uint64 valid_executions = 8;
+  uint64 missing_dependencies = 9;
+  uint64 invalid_executions = 10;
+  uint64 allow = 11;
+  uint64 deny = 12;
+  uint64 unknown = 13;
+  uint64 unavailable = 14;
+  uint64 cancelled = 15;
+  uint64 running = 16;
+  uint64 partial_executions = 17;
+  uint64 trend_points = 18;
+  uint64 step_pass = 19;
+  uint64 step_fail = 20;
+  uint64 step_unknown = 21;
+  uint64 step_unavailable = 22;
+  uint64 step_error = 23;
+  uint64 step_skipped = 24;
+  uint64 stochastic_complete_populations = 25;
+  uint64 stochastic_low_sample_populations = 26;
+  uint64 baseline_compared = 27;
+  uint64 baseline_missing = 28;
+  uint64 baseline_incomparable = 29;
+  uint64 baseline_unavailable = 30;
+  uint64 regressed = 31;
+  uint64 improved = 32;
+  uint64 unchanged = 33;
+  uint64 regression_unavailable = 34;
+  uint64 hidden_dimensions = 35;
+  uint64 missing_dimensions = 36;
+}
+message QualityTrendSeriesKey {
+  string plan_digest = 1;
+  string node_id = 2;
+  string evaluator_definition_digest = 3;
+  string implementation_digest = 4;
+  string provider = 5;
+  string model = 6;
+  string agent = 7;
+}
+message QualityTrendPoint {
+  string operation_id = 1;
+  string manifest_digest = 2;
+  int64 started_at_ms = 3;
+  optional int64 completed_at_ms = 4;
+  int64 evaluation_time_ms = 5;
+  string evaluator_input_digest = 6;
+  string subject_content_digest = 7;
+  string subject_identity_state = 8;
+  string evidence_set_digest = 9;
+  uint32 evidence_digest_count = 10;
+  string evidence_identity_state = 11;
+  string dependency_result_set_digest = 12;
+  uint32 dependency_result_digest_count = 13;
+  string dependency_result_identity_state = 14;
+  string execution_status = 15;
+  string gate_verdict = 16;
+  string gate_reason_code = 17;
+  string step_status = 18;
+  string step_reason_code = 19;
+  string classification = 20;
+  string population_state = 21;
+  optional uint32 trial_count = 22;
+  optional uint32 completed_trial_count = 23;
+  optional uint32 mean_score_micros = 24;
+  optional uint32 pass_rate_basis_points = 25;
+  optional uint64 score_variance_micros_squared = 26;
+  optional string aggregation_rule = 27;
+  string baseline_state = 28;
+  optional string baseline_operation_id = 29;
+  optional int64 mean_score_delta_micros = 30;
+  optional int64 pass_rate_delta_basis_points = 31;
+  // Exact signed i128 encoded as decimal text; empty means absent.
+  optional string variance_delta_micros_squared = 32;
+  string regression = 33;
+}
+message QualityTrendSeries {
+  QualityTrendSeriesKey key = 1;
+  repeated QualityTrendPoint points = 2;
+}
+message QualityTrendReport {
+  string version = 1;
+  string source_receipt_version = 2;
+  string authority = 3;
+  string namespace = 4;
+  int64 since_ms = 5;
+  int64 until_ms = 6;
+  QualityTrendTotals totals = 7;
+  repeated QualityTrendSeries series = 8;
+  string semantic_digest = 9;
+}
+message GetQualityTrendResponse {
+  QualityTrendReport report = 1;
+}
+
 // --- Service ---
 
 // Governed decisions for agent operations: context, policy, budgets, routing,
@@ -1429,6 +1538,7 @@ service ChiseiService {
   rpc ExecuteContentPlanStream(ExecuteContentPlanRequest) returns (stream ExecuteContentPlanStreamEvent);
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
+  rpc GetQualityTrend(GetQualityTrendRequest) returns (GetQualityTrendResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
   rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);
   rpc IssueGunshiRecommendations(IssueGunshiRecommendationsRequest) returns (IssueGunshiRecommendationsResponse);
