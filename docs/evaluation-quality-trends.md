@@ -1,8 +1,14 @@
 # Evaluation quality trends
 
-`sekaictl report quality` projects model and agent quality evidence from
-authorized canonical evaluation receipts. It is a read-only operator report,
-not a second evaluation store or a replacement for the fixed gate reducer.
+`sekaictl report quality` and `ChiseiService.GetQualityTrend` project model
+and agent quality evidence from authorized canonical evaluation receipts. They
+are the same read-only projection, not a second evaluation store or a
+replacement for the fixed gate reducer. Authenticated clients and SDKs call
+the RPC; they do not reimplement reduction.
+
+Issue: [#821](https://github.com/Sannrox/sekai-chisei/issues/821)  
+Decision: [ADR 0062](decisions/0062-quality-trend-read-api.md)  
+Discussion: [#854](https://github.com/Sannrox/sekai-chisei/discussions/854)
 
 ## Query a quality window
 
@@ -22,6 +28,11 @@ The command reads the backend selected by `DB_PATH` or
 `--principal` or `SEKAI_PRINCIPAL` must match the authenticated principal.
 Without a credential, only the trusted local bootstrap principal is available.
 Namespace authorization is checked before receipts are listed.
+
+Authenticated remote callers use the same window on `GetQualityTrend`.
+TypeScript `getQualityTrend` and Python `get_quality_trend` are thin facades
+over that RPC. They do not copy the reducer. CLI and RPC share one
+`semantic_digest` for the same authorized receipt set.
 
 The window cannot exceed 366 days. More than 4,096 receipts fails the query
 instead of returning a partial dashboard. Open receipts remain harvestable
@@ -91,7 +102,8 @@ states. A partial population is always `low_sample` and never becomes pass.
 
 The `semantic_digest` covers the window, reconciled totals, series keys, points,
 and baseline results. Repeating a query over the same authorized receipt set
-returns the same digest.
+returns the same digest. The CLI and `GetQualityTrend` share that digest for
+identical authorized receipt sets.
 
 ## Freshness, recovery, and retention
 

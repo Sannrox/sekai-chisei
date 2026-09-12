@@ -30,6 +30,17 @@ class FixtureTransport implements RpcTransport {
     if (service === "sekai" && method === "CreateLink") return { link: request.link };
     if (service === "chisei" && method === "PlanExecution") return { plan: fixture.plan };
     if (service === "chisei" && method === "GetOperationReceipt") return fixture.receipt;
+    if (service === "chisei" && method === "GetQualityTrend") {
+      return {
+        report: {
+          version: "chisei.evaluation-quality-trend/v1",
+          semantic_digest: "sha256:quality",
+          namespace: request.namespace,
+          since_ms: request.since_ms,
+          until_ms: request.until_ms,
+        },
+      };
+    }
     throw new Error(`unexpected fixture unary ${service}.${method}`);
   }
 
@@ -188,4 +199,17 @@ test("TypeScript passes cancellation through the streaming transport", async () 
   const pending = iterator.next();
   controller.abort();
   await assert.rejects(pending, (error: unknown) => error instanceof SdkError && error.code === "cancelled");
+});
+
+test("TypeScript reads quality trends through GetQualityTrend", async () => {
+  const transport = new FixtureTransport();
+  const response = await client(transport).getQualityTrend({
+    namespace: fixture.namespace,
+    since_ms: 1,
+    until_ms: 2,
+  });
+  assert.equal(response.report?.semantic_digest, "sha256:quality");
+  assert.equal(transport.calls[0]?.service, "chisei");
+  assert.equal(transport.calls[0]?.method, "GetQualityTrend");
+  assert.equal(transport.calls[0]?.options.metadata["x-sekai-capability"], "chisei.quality.read");
 });

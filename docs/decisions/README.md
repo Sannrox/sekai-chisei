@@ -82,3 +82,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0059: Admit autonomous actions only inside a signed current envelope](0059-autonomous-envelopes.md)
 - [ADR 0060: Admit later object-sync kinds through additive registered descriptors](0060-additive-source-type-descriptors.md)
 - [ADR 0061: Inspect and preview quarantined source repairs without a second admission plane](0061-quarantine-repair-preview.md)
+- [ADR 0062: Expose quality trends as an authenticated read projection](0062-quality-trend-read-api.md)

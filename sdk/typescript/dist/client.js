@@ -466,6 +466,23 @@ export class SekaiChiseiClient {
         });
         return response;
     }
+    async getQualityTrend(request, options = {}) {
+        const namespace = requiredText("namespace", request.namespace, 200);
+        if (!Number.isFinite(request.since_ms) || !Number.isFinite(request.until_ms)) {
+            throw new SdkError("invalid_argument", "quality trend requires since_ms and until_ms");
+        }
+        const response = await this.callUnary("chisei", "GetQualityTrend", {
+            namespace,
+            since_ms: request.since_ms,
+            until_ms: request.until_ms,
+        }, {
+            ...options,
+            namespace,
+            capability: options.capability ?? "chisei.quality.read",
+            retryable: options.retryable ?? true,
+        });
+        return response;
+    }
     async runCoreLoop(input) {
         const namespace = requiredText("namespace", input.namespace, 200);
         const op = operationId(input.operationId);

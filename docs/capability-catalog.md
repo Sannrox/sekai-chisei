@@ -260,8 +260,10 @@ metadata, oversized frames, and revoked catalog access fail closed. The adapter
 never invents success; timeouts and unknown effects reconcile through
 `GetOperationReceipt`.
 
-The SDK bindings under `sdk/` consume the same serialized projection. Every
-binding fails closed on version drift and binds these native metadata fields:
+The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
+`getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and
+call `GetQualityTrend`; they do not reimplement the reducer. Every binding fails
+closed on version drift and binds these native metadata fields:
 
 - `x-principal`
 - `x-sekai-namespace`
