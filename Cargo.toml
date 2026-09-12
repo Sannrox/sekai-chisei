@@ -93,6 +93,10 @@ fs2 = "0.4.3"
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 tempfile = "3"
 
+[[bin]]
+name = "sekai-mcp"
+path = "src/bin/sekai_mcp.rs"
+
 [[bench]]
 name = "control_plane"
 harness = false

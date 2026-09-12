@@ -80,7 +80,7 @@ pub async fn connect_sekai_as_gateway_with_timeout(
     connect_sekai_with_token(target, auth_token, timeout).await
 }
 
-async fn connect_sekai_with_token(
+pub async fn connect_sekai_with_token(
     target: &str,
     auth_token: Option<String>,
     timeout: Option<Duration>,

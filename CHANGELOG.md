@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Ship `sekai-mcp`, a stdio MCP projection host over `GetObject`,
+  `SubmitActionInstance`, and `GetOperationReceipt` (#839). Discovery is not a
+  grant; credentials stay in the host environment; unknown mappings, forged
+  reserved metadata, and oversized frames fail closed.
 - Isolated SDK consumer staging pins `sekai-proto` as a sibling path, rewrites
   TypeScript fixtures like Python, re-hashes protocol/source/package bytes from
   disk, and includes `chisei.proto` in the protocol digest (#844). cargo, npm,
