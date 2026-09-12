@@ -17,8 +17,29 @@ receipt / harvest spine.
 | --- | --- |
 | Instance record | `ActionInstance` |
 | Submit / admit | `SubmitActionInstance` |
+| Object-bound describe | `DescribeObjectAction` |
+| Object-bound preview | `PreviewObjectAction` |
 | Read by id or key | `GetActionInstance` |
 | List | `ListActionInstances` |
+
+## Describe and preview
+
+Issue: [#836](https://github.com/Sannrox/sekai-chisei/issues/836).  
+Decision: [ADR 0063](decisions/0063-object-action-describe-preview.md).  
+Discussion: [#857](https://github.com/Sannrox/sekai-chisei/discussions/857).
+
+`DescribeObjectAction` and `PreviewObjectAction` are observational projections
+over an authorized object and an enabled update-bound `GovernedActionType`.
+They never persist an instance, write an object, redeem a permit, or become
+submit authority. Deliberate execution stays `SubmitActionInstance`.
+Reconciliation stays `GetOperationReceipt`.
+
+Describe requires object-read authorization, not action-admin. Preview uses the
+same submit authorization as admission, then rechecks live object revision,
+Action version, closed parameter schema, policy, and budget. A preview digest
+is not a permit. Stale object or Action state fails closed. Hidden objects and
+types share one unavailable shape. Compensation is explicit `unsupported`
+unless a type already stores a supported contract.
 
 ## Admission flow
 

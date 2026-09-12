@@ -4260,6 +4260,93 @@ fn map_source_sync_apply_error(error: String) -> Status {
     }
 }
 
+fn visible_action_object(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    namespace: &str,
+    object_id: &str,
+) -> Result<crate::domain::Object, Status> {
+    let unavailable = || Status::permission_denied("object action unavailable");
+    let namespace = namespace.trim();
+    let object_id = object_id.trim();
+    if namespace.is_empty() || object_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "namespace and object_id are required",
+        ));
+    }
+    let object = service
+        .db
+        .get_object_with_policy_context(object_id, policy_context)
+        .map_err(Status::internal)?
+        .ok_or_else(unavailable)?;
+    if object.namespace != namespace {
+        return Err(unavailable());
+    }
+    require_visible_read_root(
+        &service.db,
+        &service.security,
+        object,
+        principals,
+        tenant_context,
+        &format!("object_action:{object_id}"),
+    )
+    .map(|(object, _)| object)
+    .map_err(|_| unavailable())
+}
+
+fn map_object_action_projection_error(
+    error: crate::sekai::action_describe_preview::ObjectActionProjectionError,
+) -> Status {
+    match error {
+        crate::sekai::action_describe_preview::ObjectActionProjectionError::Unavailable => {
+            Status::permission_denied("object action unavailable")
+        }
+        crate::sekai::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
+            message,
+        ) => Status::invalid_argument(message),
+    }
+}
+
+fn object_action_description_to_proto(
+    description: crate::sekai::action_describe_preview::ObjectActionDescription,
+) -> DescribeObjectActionResponse {
+    DescribeObjectActionResponse {
+        namespace: description.namespace,
+        object_id: description.object_id,
+        object_updated_ms: description.object_updated_ms,
+        object_revision: description.object_revision,
+        type_id: description.type_id,
+        version: description.version,
+        parameter_schema_json: description.parameter_schema_json,
+        allowed_effect_kinds: description.allowed_effect_kinds,
+        object_kind: description.object_kind,
+        object_mutation: description.object_mutation,
+        enabled: description.enabled,
+        preview_supported: description.preview_supported,
+        compensation: description.compensation,
+    }
+}
+
+fn object_action_preview_to_proto(
+    preview: crate::sekai::action_describe_preview::ObjectActionPreview,
+) -> PreviewObjectActionResponse {
+    PreviewObjectActionResponse {
+        outcome: preview.outcome,
+        reason_code: preview.reason_code,
+        request_digest: preview.request_digest,
+        object_revision: preview.object_revision,
+        object_updated_ms: preview.object_updated_ms,
+        type_id: preview.type_id,
+        version: preview.version,
+        policy_decision: preview.policy_decision,
+        budget_decision: preview.budget_decision,
+        approval_state: preview.approval_state,
+        compensation: preview.compensation,
+    }
+}
+
 fn authorize_action_instance_submit(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -6471,6 +6558,73 @@ impl SekaiService for SekaiServiceImpl {
             instance: Some(to_proto_action_instance(&outcome.instance)),
             replay: outcome.replay,
         }))
+    }
+
+    async fn describe_object_action(
+        &self,
+        req: Request<DescribeObjectActionRequest>,
+    ) -> Result<Response<DescribeObjectActionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        require_authenticated(&principals)?;
+        let inner = req.into_inner();
+        let object = visible_action_object(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &inner.namespace,
+            &inner.object_id,
+        )?;
+        let description = crate::sekai::action_describe_preview::describe_object_action(
+            &self.db,
+            &object,
+            &inner.type_id,
+            &inner.version,
+        )
+        .map_err(map_object_action_projection_error)?;
+        Ok(Response::new(object_action_description_to_proto(
+            description,
+        )))
+    }
+
+    async fn preview_object_action(
+        &self,
+        req: Request<PreviewObjectActionRequest>,
+    ) -> Result<Response<PreviewObjectActionResponse>, Status> {
+        let principals = caller_principals(&req);
+        let policy_context = principal_policy_context(&req);
+        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let actor = authorize_action_instance_submit(self, &principals, &req.get_ref().namespace)?;
+        let inner = req.into_inner();
+        let object = visible_action_object(
+            self,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &inner.namespace,
+            &inner.object_id,
+        )?;
+        let preview = crate::sekai::action_describe_preview::preview_object_action(
+            &self.db,
+            self.budget.as_ref().map(std::convert::AsRef::as_ref),
+            crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
+                actor: &actor,
+                object: &object,
+                type_id: &inner.type_id,
+                version: &inner.version,
+                parameters_json: &inner.parameters_json,
+                expected_object_updated_ms: inner.expected_object_updated_ms,
+                expected_object_revision: &inner.expected_object_revision,
+                evidence_submission_ids: &inner.evidence_submission_ids,
+            },
+        )
+        .map_err(map_object_action_projection_error)?;
+        if preview.outcome == crate::sekai::action_describe_preview::PREVIEW_UNAVAILABLE {
+            return Err(Status::permission_denied("object action unavailable"));
+        }
+        Ok(Response::new(object_action_preview_to_proto(preview)))
     }
 
     async fn get_action_instance(
@@ -14399,6 +14553,139 @@ mod tests {
             .expect("receipt");
         assert_eq!(receipt.ontology_digest.as_deref(), Some(digest));
         assert!(receipt.completeness().complete);
+    }
+
+    #[tokio::test]
+    async fn describe_and_preview_object_action_are_observational() {
+        let svc = service();
+        grant_action_admin(&svc);
+        svc.db
+            .upsert_object_type(&crate::sekai::schema::ObjectType {
+                kind: "customer_record".into(),
+                description: "fixture".into(),
+                properties: vec![],
+                is_builtin: false,
+                implements: vec![],
+            })
+            .unwrap();
+        let object = crate::domain::Object {
+            id: "cust-preview".into(),
+            kind: "customer_record".into(),
+            name: "Northwind".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 10,
+            updated: 20,
+        };
+        svc.db.create_object(&object).unwrap();
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "customer.record.update".into(),
+                version: "1".into(),
+                description: "Update one customer".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+                object_kind: "customer_record".into(),
+                object_mutation: "update".into(),
+            }),
+            request_id: "put-update".into(),
+        }))
+        .await
+        .unwrap();
+
+        let first = svc
+            .describe_object_action(with_principal(DescribeObjectActionRequest {
+                namespace: "acme".into(),
+                object_id: "cust-preview".into(),
+                type_id: "customer.record.update".into(),
+                version: "1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let second = svc
+            .describe_object_action(with_principal(DescribeObjectActionRequest {
+                namespace: "acme".into(),
+                object_id: "cust-preview".into(),
+                type_id: "customer.record.update".into(),
+                version: "1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.parameter_schema_json, second.parameter_schema_json);
+        assert_eq!(first.object_revision, second.object_revision);
+        assert!(first.preview_supported);
+        assert_eq!(first.compensation, "unsupported");
+
+        let preview = svc
+            .preview_object_action(with_principal(PreviewObjectActionRequest {
+                namespace: "acme".into(),
+                object_id: "cust-preview".into(),
+                type_id: "customer.record.update".into(),
+                version: "1".into(),
+                parameters_json: r#"{"object_id":"cust-preview","name":"Updated"}"#.into(),
+                expected_object_updated_ms: first.object_updated_ms,
+                expected_object_revision: first.object_revision.clone(),
+                evidence_submission_ids: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(preview.outcome, "valid");
+        assert!(!preview.request_digest.is_empty());
+        assert_eq!(
+            svc.db
+                .list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            svc.db.get_object("cust-preview").unwrap().unwrap().name,
+            "Northwind"
+        );
+
+        let stale = svc
+            .preview_object_action(with_principal(PreviewObjectActionRequest {
+                namespace: "acme".into(),
+                object_id: "cust-preview".into(),
+                type_id: "customer.record.update".into(),
+                version: "1".into(),
+                parameters_json: r#"{"object_id":"cust-preview"}"#.into(),
+                expected_object_updated_ms: first.object_updated_ms + 1,
+                expected_object_revision: String::new(),
+                evidence_submission_ids: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stale.outcome, "stale");
+
+        let hidden = svc
+            .describe_object_action(with_named_principal(
+                DescribeObjectActionRequest {
+                    namespace: "acme".into(),
+                    object_id: "missing".into(),
+                    type_id: "customer.record.update".into(),
+                    version: "1".into(),
+                },
+                "mallory",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hidden.code(), tonic::Code::PermissionDenied);
+        assert_eq!(hidden.message(), "object action unavailable");
+        assert!(!hidden.message().contains("missing"));
     }
 
     #[tokio::test]

@@ -63,7 +63,8 @@ Coverage:
 | Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `src/sekai/client_package.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
 | ObjectSet query | planned | Sekai | — | — | [#835](https://github.com/Sannrox/sekai-chisei/issues/835) |
-| Application Action preview | planned | Chisei | — | — | [#836](https://github.com/Sannrox/sekai-chisei/issues/836) |
+| Application Action describe | supported | Sekai | `SekaiService.DescribeObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
+| Application Action preview | supported | Sekai | `SekaiService.PreviewObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
 | Object-change subscription | planned | Sekai | — | — | [#838](https://github.com/Sannrox/sekai-chisei/issues/838) |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
@@ -125,7 +126,6 @@ These names appear in platform sequencing Issues. They are **not** integration
 contracts on current `main`:
 
 - composable ObjectSet queries ([#835](https://github.com/Sannrox/sekai-chisei/issues/835));
-- one public Action description/preview contract ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
-- first-class Action approval RPC (admission may persist `denied` instead);
+- first-class Action approval RPC (admission may persist `denied` instead; preview reports `require_approval` without granting it) ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
 - authorized object-change subscriptions ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
 - downloadable registry packages (publication records are not registry bytes).

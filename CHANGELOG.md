@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `SekaiService.DescribeObjectAction` and `PreviewObjectAction` as
+  observational projections over object-bound governed Actions (#836). Preview
+  is not a permit; submit remains `SubmitActionInstance`. Stale object or
+  Action state and hidden objects fail closed.
 - Expose `ChiseiService.GetQualityTrend`, an authenticated projection of the
   canonical quality-trend reducer (#821). CLI and RPC share one semantic
   digest; clients must not reimplement reduction. Denied namespaces and

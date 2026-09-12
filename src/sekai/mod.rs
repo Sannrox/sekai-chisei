@@ -1,4 +1,5 @@
 pub mod action;
+pub mod action_describe_preview;
 pub mod action_effect;
 pub mod action_instance;
 pub mod action_instance_admission;

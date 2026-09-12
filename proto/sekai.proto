@@ -808,6 +808,53 @@ message SubmitActionInstanceResponse {
   ActionInstance instance = 1;
   bool replay = 2;
 }
+
+// Observational object-bound Action describe/preview (#836).
+// Preview is not a permit. Submit remains SubmitActionInstance.
+message DescribeObjectActionRequest {
+  string namespace = 1;
+  string object_id = 2;
+  string type_id = 3;
+  string version = 4;
+}
+message DescribeObjectActionResponse {
+  string namespace = 1;
+  string object_id = 2;
+  int64 object_updated_ms = 3;
+  string object_revision = 4;
+  string type_id = 5;
+  string version = 6;
+  string parameter_schema_json = 7;
+  repeated string allowed_effect_kinds = 8;
+  string object_kind = 9;
+  string object_mutation = 10;
+  bool enabled = 11;
+  bool preview_supported = 12;
+  string compensation = 13;
+}
+message PreviewObjectActionRequest {
+  string namespace = 1;
+  string object_id = 2;
+  string type_id = 3;
+  string version = 4;
+  string parameters_json = 5;
+  int64 expected_object_updated_ms = 6;
+  string expected_object_revision = 7;
+  repeated string evidence_submission_ids = 8;
+}
+message PreviewObjectActionResponse {
+  string outcome = 1;
+  string reason_code = 2;
+  string request_digest = 3;
+  string object_revision = 4;
+  int64 object_updated_ms = 5;
+  string type_id = 6;
+  string version = 7;
+  string policy_decision = 8;
+  string budget_decision = 9;
+  string approval_state = 10;
+  string compensation = 11;
+}
 message GetActionInstanceRequest {
   string instance_id = 1;
   // Optional alternate lookup when instance_id empty.
@@ -1983,6 +2030,8 @@ service SekaiService {
   rpc SetGovernedActionTypeEnabled(SetGovernedActionTypeEnabledRequest) returns (SetGovernedActionTypeEnabledResponse);
   // Governed ActionInstance admission (#397).
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
+  rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
+  rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // Typed effects on admitted ActionInstances (#398).
