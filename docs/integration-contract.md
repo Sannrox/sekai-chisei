@@ -29,7 +29,8 @@ Coverage:
 - **Rust** means `sekaictl`, examples, or the crate API.
 - **TypeScript / Python** means the thin facades under [`sdk/`](../sdk/README.md).
   Those facades do not bundle a second proto snapshot.
-- **MCP** is not a shipped adapter.
+- **MCP** is the `sekai-mcp` stdio projection host over the v1 object, Action,
+  and receipt allowlist. It is not a second protocol package.
 
 <!-- integration-contract-rows -->
 
@@ -64,7 +65,7 @@ Coverage:
 | Application Action preview | planned | Chisei | — | — | [#836](https://github.com/Sannrox/sekai-chisei/issues/836) |
 | Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
 | Object-change subscription | planned | Sekai | — | — | [#838](https://github.com/Sannrox/sekai-chisei/issues/838) |
-| MCP adapter | planned | Interface | — | — | [#839](https://github.com/Sannrox/sekai-chisei/issues/839) |
+| MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
 | Registry-published SDK | unavailable | Interface | — | [sdk-packages.md](sdk-packages.md) | `docs/sdk-packages.md` |
 
 <!-- /integration-contract-rows -->
@@ -115,7 +116,7 @@ and publication records are.
 | Action submit | yes | not a typed helper | not a typed helper | yes | see [postgres-sekai-parity.md](postgres-sekai-parity.md) |
 | Plan / receipt | yes | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |
 | Client-package records | `sekaictl admin sdk-packages` | publication metadata only | publication metadata only | yes | unavailable |
-| MCP | no | no | no | — | — |
+| MCP | `sekai-mcp` | MCP stdio host | MCP stdio host | — | — |
 
 ## Gaps (not shipped)
 
@@ -126,5 +127,4 @@ contracts on current `main`:
 - one public Action description/preview contract ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
 - first-class Action approval RPC (admission may persist `denied` instead);
 - authorized object-change subscriptions ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
-- executable MCP adapter ([#839](https://github.com/Sannrox/sekai-chisei/issues/839));
 - downloadable registry packages (publication records are not registry bytes).

@@ -173,3 +173,15 @@ cargo test --locked --test source_writeback_example
 See [the fixture walkthrough](../docs/source-writeback-example.md) for the
 failure cases: stale source version, revoked authorization, identical-intent
 replay, lost executor response, and control-plane restart.
+
+## mcp_adapter
+
+[mcp_adapter.rs](mcp_adapter.rs) is an independent MCP client against
+newline-delimited MCP stdio framing. It lists the v1 allowlist, reads a typed object, submits
+one governed Action, and inspects the canonical receipt on an isolated SQLite
+plane. The live `sekai-mcp` binary uses the same framing over stdio.
+
+```bash
+cargo run --locked --example mcp_adapter
+cargo test --locked --test mcp_adapter
+```

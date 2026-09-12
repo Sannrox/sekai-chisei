@@ -36,6 +36,9 @@ fn rpc_exists(rpc: &str) -> bool {
     if rpc.contains("sekaictl") {
         return Path::new("docs/sdk-packages.md").exists();
     }
+    if rpc.contains("sekai-mcp") {
+        return Path::new("src/bin/sekai_mcp.rs").exists();
+    }
     let name = rpc
         .rsplit('.')
         .next()
@@ -100,13 +103,12 @@ fn supported_rows_link_protocol_docs_and_proof() {
 #[test]
 fn gaps_are_named_and_not_claimed_as_shipped() {
     let lowered = DOC.to_ascii_lowercase();
-    for gap in ["objectset", "preview", "subscription", "mcp adapter"] {
+    for gap in ["objectset", "preview", "subscription"] {
         assert!(lowered.contains(gap), "missing gap {gap}");
     }
     assert!(DOC.contains("#835"));
     assert!(DOC.contains("#836"));
     assert!(DOC.contains("#838"));
-    assert!(DOC.contains("#839"));
     let compact = DOC.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(compact.contains("does not add a protocol package"));
     assert!(compact.contains("or browser access to server credentials"));

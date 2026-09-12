@@ -31,6 +31,7 @@ pub mod launch;
 pub mod learning_cli;
 pub mod lookup_gate_cli;
 pub use sekai_provider::llm;
+pub mod mcp_adapter;
 pub mod memory_cli;
 pub mod models_cli;
 pub mod obs;
