@@ -20,3 +20,7 @@ mutation. Replay of the same durable state is identical. Restart reads the
 current checkpoint. Audit records class, namespace, failure class, and
 outcome — not cursors. SQLite and reusable PostgreSQL share
 `get_source_sync_state` and the same in-process projector.
+
+Inspect the latest quarantined result and preview a correction without a second
+write plane. See [source quarantine](source-quarantine.md) and
+[ADR 0061](decisions/0061-quarantine-repair-preview.md).

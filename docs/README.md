@@ -88,6 +88,8 @@ If you want to deploy or operate the control plane:
   object → governed Action → loopback write-back → receipt fixture.
 - [Bounded source health](source-health.md) — authorized checkpoint age, lag,
   last success, and failure class projected from object-sync state.
+- [Source quarantine inspect and repair preview](source-quarantine.md) —
+  sanitized latest-quarantine inspection and observational repair preview.
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered table snapshots.
 - [Event-stream projections](event-streams.md) — ordered batches with durable

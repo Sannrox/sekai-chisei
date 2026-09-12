@@ -1,9 +1,13 @@
-//! sekaictl admin sync webhook, source-health, and descriptor commands
-//! (#673, #685, #818).
+//! sekaictl admin sync webhook, source-health, quarantine, and descriptor
+//! commands (#673, #685, #818, #820).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use crate::sekai::object_sync::SourceBatch;
 use crate::sekai::source_health::{self, report_source_health};
+use crate::sekai::source_quarantine::{
+    self, apply_corrected_source_batch, inspect_latest_quarantine, preview_source_batch,
+};
 use crate::sekai::source_webhook::{self, SourceWebhookDelivery};
 use chrono::Utc;
 use std::path::PathBuf;
@@ -11,7 +15,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]\n  sekaictl admin sync register-descriptor --namespace <ns> --descriptor <file> [--actor <principal>]\n  sekaictl admin sync inspect-descriptor --namespace <ns> --digest <digest> [--actor <principal>]\n  sekaictl admin sync retire-descriptor --namespace <ns> --digest <digest> [--actor <principal>]"
+    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]\n  sekaictl admin sync inspect-quarantine --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>]\n  sekaictl admin sync preview-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync apply-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync register-descriptor --namespace <ns> --descriptor <file> [--actor <principal>]\n  sekaictl admin sync inspect-descriptor --namespace <ns> --digest <digest> [--actor <principal>]\n  sekaictl admin sync retire-descriptor --namespace <ns> --digest <digest> [--actor <principal>]"
 }
 
 pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -20,6 +24,11 @@ pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("list-webhook-keys") => list_keys(parse_list(&args[1..])?).await,
         Some("admit-webhook") => admit(parse_admit(&args[1..])?).await,
         Some("health") => health(parse_health(&args[1..])?).await,
+        Some("inspect-quarantine") => {
+            inspect_quarantine(parse_inspect_quarantine(&args[1..])?).await
+        }
+        Some("preview-batch") => preview_batch(parse_batch(&args[1..], "preview-batch")?).await,
+        Some("apply-batch") => apply_batch(parse_batch(&args[1..], "apply-batch")?).await,
         Some("register-descriptor") => {
             register_descriptor(parse_register_descriptor(&args[1..])?).await
         }
@@ -258,6 +267,127 @@ fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
         delayed_after_ms,
         actor,
     })
+}
+
+async fn inspect_quarantine(config: InspectQuarantineConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let query = source_quarantine::parse_source_quarantine_query(
+        &config.namespace,
+        &config.source_instance,
+        &config.type_digest,
+    )
+    .map_err(std::io::Error::other)?;
+    let report = inspect_latest_quarantine(
+        db.as_ref(),
+        &config.actor,
+        &query,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn parse_inspect_quarantine(args: &[String]) -> Result<InspectQuarantineConfig, String> {
+    let mut namespace = None;
+    let mut source_instance = None;
+    let mut type_digest = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, i, "--namespace")?);
+                i += 2;
+            }
+            "--source-instance" => {
+                source_instance = Some(require_value(args, i, "--source-instance")?);
+                i += 2;
+            }
+            "--type-digest" => {
+                type_digest = Some(require_value(args, i, "--type-digest")?);
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown inspect-quarantine option {other}")),
+        }
+    }
+    Ok(InspectQuarantineConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        source_instance: source_instance.ok_or("--source-instance is required")?,
+        type_digest: type_digest.ok_or("--type-digest is required")?,
+        actor,
+    })
+}
+
+struct InspectQuarantineConfig {
+    namespace: String,
+    source_instance: String,
+    type_digest: String,
+    actor: String,
+}
+
+struct BatchConfig {
+    batch: PathBuf,
+    actor: String,
+}
+
+async fn preview_batch(config: BatchConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let batch = load_source_batch(&config.batch)?;
+    let report = preview_source_batch(
+        db.as_ref(),
+        &config.actor,
+        &batch,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+async fn apply_batch(config: BatchConfig) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let batch = load_source_batch(&config.batch)?;
+    let report = apply_corrected_source_batch(
+        db.as_ref(),
+        &config.actor,
+        &batch,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn parse_batch(args: &[String], command: &str) -> Result<BatchConfig, String> {
+    let mut batch = None;
+    let mut actor = "operator".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--batch" => {
+                batch = Some(PathBuf::from(require_value(args, i, "--batch")?));
+                i += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, i, "--actor")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown {command} option {other}")),
+        }
+    }
+    Ok(BatchConfig {
+        batch: batch.ok_or("--batch is required")?,
+        actor,
+    })
+}
+
+fn load_source_batch(path: &PathBuf) -> Result<SourceBatch, BoxErr> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
 struct RegisterDescriptorConfig {
