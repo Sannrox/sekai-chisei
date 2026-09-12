@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `sekaictl admin sync inspect-quarantine`, `preview-batch`, and
+  `apply-batch` for the latest quarantined source result (#820). Inspection and
+  preview are observational; re-admission is existing `ApplySourceBatch`. A
+  stale preview cannot overwrite a newer checkpoint or type revision.
 - Ship `sekai-mcp`, a stdio MCP projection host over `GetObject`,
   `SubmitActionInstance`, and `GetOperationReceipt` (#839). Discovery is not a
   grant; credentials stay in the host environment; unknown mappings, forged

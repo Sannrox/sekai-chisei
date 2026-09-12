@@ -38,7 +38,15 @@ and [ADR 0046](decisions/0046-bounded-source-health.md):
 ```text
 sekaictl admin sync health --namespace ops --source-instance owner/repo \
   --type-digest <github-object-sync-type-digest>
+sekaictl admin sync inspect-quarantine --namespace ops --source-instance owner/repo \
+  --type-digest <github-object-sync-type-digest>
+sekaictl admin sync preview-batch --batch ./repair.json
+sekaictl admin sync apply-batch --batch ./repair.json
 ```
+
+Inspect and preview are observational. Re-admission stays `ApplySourceBatch`.
+See [source quarantine](source-quarantine.md) and
+[ADR 0061](decisions/0061-quarantine-repair-preview.md).
 
 Signed push deliveries use the same identity. Pin a verifying key, then admit
 the bundle. The authenticated producer must match the envelope:

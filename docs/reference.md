@@ -109,6 +109,9 @@ lives in the separate [research index](research/README.md).
   tombstones, retention, and rollback.
 - [Bounded source health](source-health.md) — authorized checkpoint age, lag,
   last success, and bounded failure class over durable sync state.
+- [Source quarantine inspect and repair preview](source-quarantine.md) —
+  sanitized latest-quarantine inspection, observational preview, and
+  re-admission through `ApplySourceBatch`.
 - [Registered Iceberg and Parquet projections](open-tables.md) — digest-pinned
   authorized queries over registered Iceberg and Parquet snapshots.
 - [Event-stream projections](event-streams.md) — ordered event batches with
