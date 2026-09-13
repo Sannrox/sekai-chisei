@@ -1812,6 +1812,25 @@ message CompareDefinitionRevisionsRequest {
 message CompareDefinitionRevisionsResponse {
   DefinitionRevisionDiff diff = 1;
 }
+message DefinitionConsumerImpactPath {
+  string owner = 1;
+  string resource_identity = 2;
+  string member_kind = 3;
+  string member_id = 4;
+  string property = 5;
+  string source_locator = 6;
+}
+message ReportDefinitionConsumerImpactRequest {
+  string namespace = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+}
+message ReportDefinitionConsumerImpactResponse {
+  string completeness = 1;
+  string from_revision_digest = 2;
+  string to_revision_digest = 3;
+  repeated DefinitionConsumerImpactPath impacts = 4;
+}
 
 message DefinitionCompatibilityReason {
   string class = 1;
@@ -1985,6 +2004,7 @@ service SekaiService {
   rpc CloseDefinitionProposal(CloseDefinitionProposalRequest) returns (CloseDefinitionProposalResponse);
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);
+  rpc ReportDefinitionConsumerImpact(ReportDefinitionConsumerImpactRequest) returns (ReportDefinitionConsumerImpactResponse);
   rpc ClassifyDefinitionRevisionCompatibility(ClassifyDefinitionRevisionCompatibilityRequest) returns (ClassifyDefinitionRevisionCompatibilityResponse);
   rpc ExecuteDefinitionFactMigration(ExecuteDefinitionFactMigrationRequest) returns (ExecuteDefinitionFactMigrationResponse);
   rpc GetDefinitionFactMigration(GetDefinitionFactMigrationRequest) returns (GetDefinitionFactMigrationResponse);

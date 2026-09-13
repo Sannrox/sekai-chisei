@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `SekaiService.ReportDefinitionConsumerImpact` for authorized
+  consumer paths joined to `CompareDefinitionRevisions` (#837). Only
+  explicit `sekai.definition-consumer-binding/v1` registrations are
+  consulted. Completeness is explicit; zero visible dependents is not
+  proof of zero impact.
 - Add `SekaiService.EvaluateObjectSet` for revision-bound
   `sekai.object-set/v1` descriptors (#835). Evaluation uses existing
   authorized list and one-hop traverse. A descriptor, page, or cursor is

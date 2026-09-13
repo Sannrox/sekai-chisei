@@ -101,6 +101,9 @@ If you want to deploy or operate the control plane:
   and deletion.
 - [Federation network contracts](federation-networks.md) — bilateral
   request, evidence, and outcome exchange without local write authority.
+- [Authorized consumer impact](definition-consumer-impact.md) —
+  registered definition-consumer bindings joined to revision comparison.
+  Zero visible dependents is not proof of zero impact.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` descriptors evaluated through authorized list and
   one-hop traverse. A page is not authority.
