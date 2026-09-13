@@ -10,6 +10,8 @@ mod capability_discovery;
 mod catalog_invocation;
 #[path = "computed_response.rs"]
 mod computed_response;
+#[path = "definition_consumer_impact.rs"]
+mod definition_consumer_impact;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
 #[path = "object_set_query.rs"]
@@ -5213,6 +5215,13 @@ impl SekaiService for SekaiServiceImpl {
         Ok(Response::new(CompareDefinitionRevisionsResponse {
             diff: Some(to_proto_definition_revision_diff(&diff)),
         }))
+    }
+
+    async fn report_definition_consumer_impact(
+        &self,
+        req: Request<ReportDefinitionConsumerImpactRequest>,
+    ) -> Result<Response<ReportDefinitionConsumerImpactResponse>, Status> {
+        self.report_visible_definition_consumer_impact(req).await
     }
 
     async fn classify_definition_revision_compatibility(

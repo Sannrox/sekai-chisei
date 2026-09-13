@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
         let inventory = SekaiRpcInventory::load().expect("inventory must validate");
-        assert_eq!(inventory.entries.len(), 127);
+        assert_eq!(inventory.entries.len(), 128);
         for rpc in ["GetGovernedFactVersion", "ResolveInvariantSet"] {
             assert!(inventory.entry(rpc).is_some(), "missing {rpc}");
         }
@@ -392,6 +392,7 @@ mod tests {
         assert!(inventory.entry("CloseDefinitionProposal").is_some());
         assert!(inventory.entry("GetPublishedDefinitionRevision").is_some());
         assert!(inventory.entry("CompareDefinitionRevisions").is_some());
+        assert!(inventory.entry("ReportDefinitionConsumerImpact").is_some());
         assert!(
             inventory
                 .entry("ClassifyDefinitionRevisionCompatibility")

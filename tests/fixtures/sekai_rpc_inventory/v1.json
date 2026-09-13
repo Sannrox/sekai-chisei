@@ -259,6 +259,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ReportDefinitionConsumerImpact",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/definition_consumer_impact.rs",
+        "src/grpc/definition_consumer_impact.rs",
+        "docs/definition-consumer-impact.md"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch",
+        "sekai.graph"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ClassifyDefinitionRevisionCompatibility",
       "kind": "persistent",
       "surfaces": [
