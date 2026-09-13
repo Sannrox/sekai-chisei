@@ -153,7 +153,10 @@ SEKAI_TEST_POSTGRES_URL=... \
   cargo test --test object_security_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test postgres_workflow_transition_matrix postgres_concurrent_callback_and_cancel_race -- --ignored --nocapture
+  cargo test postgres_workflow_transition_matrix -- --ignored --nocapture
+
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test postgres_concurrent_callback_and_cancel_race -- --ignored --nocapture
 ```
 
 The ordered-feed migration is additive and one-way on both backends. Version 1
