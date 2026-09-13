@@ -8,6 +8,8 @@ lives in the separate [research index](research/README.md).
 
 - [Object and Action integration contract](integration-contract.md) —
   supported versus planned object, Action, and receipt surfaces.
+- [Public RPC maturity](rpc-maturity.md) — backend and consumer
+  classification for every public RPC, plus the default-off experimental gate.
 - [Ontology definitions](ontology.md) — define a domain, seed governed facts,
   run an operation, and inspect its receipt.
 - [Capability catalogs](capability-catalog.md) — native `DiscoverCapabilities`

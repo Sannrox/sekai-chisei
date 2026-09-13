@@ -42,6 +42,8 @@ If you want to deploy or operate the control plane:
 
 - [Object and Action integration contract](integration-contract.md) —
   supported object reads, Action invocation, and receipt inspection.
+- [Public RPC maturity](rpc-maturity.md) — stable, experimental, and
+  remove-classified RPCs, and the default-off experimental gate.
 - [Architecture](architecture.md) — ownership, trust boundaries, data model,
   and governed entry paths.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,

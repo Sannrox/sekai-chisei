@@ -1,0 +1,1458 @@
+{
+  "version": "sekai.rpc-maturity/v1",
+  "issue": 871,
+  "stable_limit": 60,
+  "experimental_env": "SEKAI_EXPERIMENTAL_RPCS",
+  "experimental_feature": "experimental-rpcs",
+  "entries": [
+    {
+      "service": "SekaiService",
+      "rpc": "AcquireLease",
+      "storage_path": "sekai.leases",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetLease",
+      "storage_path": "sekai.leases",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RefreshLease",
+      "storage_path": "sekai.leases",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReleaseLease",
+      "storage_path": "sekai.leases",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "TakeoverExpiredLease",
+      "storage_path": "sekai.leases",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ApplySourceBatch",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSourceSyncState",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RegisterSourceTypeDescriptor",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "InspectSourceTypeDescriptor",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RetireSourceTypeDescriptor",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateDefinitionBranch",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetDefinitionBranch",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ApplyDefinitionBranchEdit",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateDefinitionProposal",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetDefinitionProposal",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ApproveDefinitionProposal",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "MergeDefinitionProposal",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CloseDefinitionProposal",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetPublishedDefinitionRevision",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CompareDefinitionRevisions",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReportDefinitionConsumerImpact",
+      "storage_path": "sekai.definition-branch, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ClassifyDefinitionRevisionCompatibility",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ExecuteDefinitionFactMigration",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetDefinitionFactMigration",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateObject",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "sdk, host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetObject",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "host, example",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UpdateObject",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteObject",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListObjects",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "EvaluateObjectSet",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReadObjectChangeSubscription",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutObjectSecurityPolicyRevision",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetObjectSecurityPolicyRevision",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ActivateObjectSecurityPolicies",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetObjectSecurityActivation",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutPurposeAuthorization",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RevokePurposeAuthorization",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutClassificationLattice",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetClassificationLattice",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "FindByExternalId",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "FindByProperty",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateLink",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteLink",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetLinks",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetLinkedObjects",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "Traverse",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RetrieveContext",
+      "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ExpandRelations",
+      "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ExplainDerivation",
+      "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DiscoverCapabilities",
+      "storage_path": "sekai.graph, sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetGovernedFactVersion",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ResolveInvariantSet",
+      "storage_path": "sekai.graph, sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListSchemaTypes",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateSchemaType",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListOntologyClasses",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetOntologyClass",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateOntologyClass",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteOntologyClass",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListOntologyRelations",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetOntologyRelation",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateOntologyRelation",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteOntologyRelation",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateFunction",
+      "storage_path": "sekai.function-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListFunctions",
+      "storage_path": "sekai.function-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateDataset",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UpdateDataset",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListDatasets",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AppendRows",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "QueryRows",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateVirtualTable",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListVirtualTables",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateGrant",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteGrant",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListGrants",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CheckAccess",
+      "storage_path": "sekai.authorization",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "EnsureTeamNamespace",
+      "storage_path": "sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RecordDecision",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListDecisions",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListObjectChanges",
+      "storage_path": "sekai.audit, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetAttestation",
+      "storage_path": "sekai.attestations, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListAttestations",
+      "storage_path": "sekai.attestations, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "VerifyAttestation",
+      "storage_path": "sekai.attestations, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutGovernedActionType",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetGovernedActionType",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListGovernedActionTypes",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SetGovernedActionTypeEnabled",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SubmitActionInstance",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "host, example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DescribeObjectAction",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PreviewObjectAction",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetActionInstance",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListActionInstances",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetActionEffect",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListActionEffects",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListClaimableActionWork",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ClaimActionWork",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HeartbeatActionClaim",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AckActionWork",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReportActionClaimEvent",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SetActionPolicy",
+      "storage_path": "sekai.action-definitions, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetActionPolicy",
+      "storage_path": "sekai.action-definitions, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListActionPolicies",
+      "storage_path": "sekai.action-definitions, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetLineage",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateContentionScope",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "UpdateContentionScope",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetContentionScope",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListContentionScopes",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListWorkUnits",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "TryAdmitWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HeartbeatWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CompleteWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "FailWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CancelWorkUnit",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListReservations",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListRunEvents",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReconcileWorkUnits",
+      "storage_path": "sekai.coordination",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateCredential",
+      "storage_path": "sekai.credentials",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RotateCredential",
+      "storage_path": "sekai.credentials",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RevokeCredential",
+      "storage_path": "sekai.credentials",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListCredentials",
+      "storage_path": "sekai.credentials",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetProvenanceReport",
+      "storage_path": "sekai.audit, sekai.evidence, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RegisterEvidenceSchema",
+      "storage_path": "sekai.evidence",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListEvidenceAdapters",
+      "storage_path": "sekai.evidence",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SubmitEvidence",
+      "storage_path": "sekai.evidence",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetEvidenceSubmission",
+      "storage_path": "sekai.evidence",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListEvidenceSubmissions",
+      "storage_path": "sekai.evidence",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "CreateHandoff",
+      "storage_path": "sekai.handoffs",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RevokeHandoff",
+      "storage_path": "sekai.handoffs",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "EvaluateGovernedSubject",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ExportGovernedSubjectProvenance",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ExecuteEvaluationManifest",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "CancelEvaluationExecution",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "AuthorizeExternalAction",
+      "storage_path": "chisei.approvals",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "TransitionExternalAction",
+      "storage_path": "chisei.approvals",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RedeemExternalActionPermit",
+      "storage_path": "chisei.approvals",
+      "real_backend": "yes",
+      "consumer": "example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "SetExternalActionPolicy",
+      "storage_path": "chisei.approvals",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RecordUsage",
+      "storage_path": "chisei.budget",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "SetBudgetLimit",
+      "storage_path": "chisei.budget",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "DecideGatewayExecution",
+      "storage_path": "chisei.policy, chisei.budget",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "SetNamespacePolicy",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetEffectivePolicySummary",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PlanExecution",
+      "storage_path": "chisei.policy, chisei.budget, chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ExecutePlanStream",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PlanContentExecution",
+      "storage_path": "chisei.policy, chisei.budget, chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ExecuteContentPlanStream",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ReportOperationEvent",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetOperationReceipt",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk, host",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetQualityTrend",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListKiokuCandidates",
+      "storage_path": "chisei.learning",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ReviewKiokuMemory",
+      "storage_path": "chisei.learning",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "IssueGunshiRecommendations",
+      "storage_path": "chisei.learning, chisei.execution",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "SetGunshiAllocationPolicy",
+      "storage_path": "chisei.learning",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetGunshiAllocationStatus",
+      "storage_path": "chisei.learning",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ClaimGatewayDispatch",
+      "storage_path": "gateway.governance, chisei.execution",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PutEvaluatorDefinition",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "PutEvaluationPlan",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ResolveEvaluationPlan",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetEvaluationGateEvidence",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RunLookupFirstPromotionGate",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetSampleObservation",
+      "storage_path": "chisei.observations",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "remove",
+      "product_tier": "experimental"
+    }
+  ]
+}

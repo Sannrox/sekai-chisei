@@ -18947,6 +18947,26 @@ mod tests {
                 .iter()
                 .any(|entry| entry.product_tier != "core")
         );
+
+        let experimental = core
+            .capabilities
+            .iter()
+            .find(|entry| entry.name == crate::rpc_maturity::EXPERIMENTAL_CAPABILITY)
+            .expect("core catalog reports the experimental RPC gate");
+        let enabled = crate::rpc_maturity::experimental_rpcs_enabled();
+        assert_eq!(experimental.product_tier, "core");
+        assert_eq!(
+            experimental.lifecycle_state,
+            if enabled { "active" } else { "disabled" }
+        );
+        assert_eq!(
+            experimental
+                .limits
+                .iter()
+                .find(|limit| limit.name == "enabled")
+                .map(|limit| limit.value),
+            Some(u64::from(enabled))
+        );
     }
 
     #[tokio::test]

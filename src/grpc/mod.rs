@@ -20,6 +20,7 @@ use crate::db::sekai::PrincipalCredential;
 use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
+use crate::rpc_maturity::RpcMaturityLayer;
 use crate::runtime_backend::RuntimeBackend;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
@@ -32,6 +33,7 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status, metadata::MetadataValue};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
+use tower::Layer;
 
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 const CREDENTIAL_ID_HEADER: &str = "x-sekai-credential-id";
@@ -557,11 +559,17 @@ where
     server
         .add_service(health_service)
         .add_service(InterceptedService::new(
-            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
+            RpcMaturityLayer::from_env().layer(
+                pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
+            ),
             interceptor.clone(),
         ))
         .add_service(InterceptedService::new(
-            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc.clone()),
+            RpcMaturityLayer::from_env().layer(
+                pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
+                    chisei_svc.clone(),
+                ),
+            ),
             interceptor,
         ))
         .serve(addr)
@@ -610,11 +618,17 @@ where
         .layer(MetricsLayer)
         .add_service(health_service)
         .add_service(InterceptedService::new(
-            pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
+            RpcMaturityLayer::from_env().layer(
+                pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
+            ),
             interceptor.clone(),
         ))
         .add_service(InterceptedService::new(
-            pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc.clone()),
+            RpcMaturityLayer::from_env().layer(
+                pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
+                    chisei_svc.clone(),
+                ),
+            ),
             interceptor,
         ))
         .serve_with_incoming(UnixListenerStream::new(listener))

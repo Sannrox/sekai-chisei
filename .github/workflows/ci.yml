@@ -30,6 +30,9 @@ jobs:
       - name: Assert compatibility matrix
         run: cargo test --locked --test compatibility_matrix
 
+      - name: Assert RPC maturity table
+        run: cargo test --locked --test rpc_maturity
+
       - name: Verify standalone ontology dependencies
         shell: bash
         run: |

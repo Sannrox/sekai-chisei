@@ -65,6 +65,7 @@ pub mod open_table_cli;
 pub mod receipt_cli;
 pub mod replay_cli;
 pub mod report_cli;
+pub mod rpc_maturity;
 pub mod runtime_backend;
 pub mod secrets;
 pub mod sekai;

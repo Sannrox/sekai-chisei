@@ -20,6 +20,7 @@ template.
 | `OPS_BIND` | `127.0.0.1` | Health, metrics, and operator console bind address |
 | `OPS_PORT` | `9464` | Health, metrics, and console port; set empty to disable |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
+| `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, and the gateway; never bootstraps server authority |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
