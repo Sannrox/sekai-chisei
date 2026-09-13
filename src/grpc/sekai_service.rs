@@ -12,6 +12,8 @@ mod catalog_invocation;
 mod computed_response;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
+#[path = "object_set_query.rs"]
+mod object_set_query;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
 #[path = "schema_definition_lifecycle.rs"]
@@ -5494,6 +5496,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
         self.list_visible_objects(req).await
+    }
+
+    async fn evaluate_object_set(
+        &self,
+        req: Request<EvaluateObjectSetRequest>,
+    ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        self.evaluate_visible_object_set(req).await
     }
     async fn put_object_security_policy_revision(
         &self,

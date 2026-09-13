@@ -86,3 +86,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0063: Describe and preview object-bound Actions without a second admission plane](0063-object-action-describe-preview.md)
 - [ADR 0064: Persist event projections and subscriptions on PostgreSQL without a second authority plane](0064-event-stream-postgres-parity.md)
 - [ADR 0065: Persist workflow bindings and callbacks on PostgreSQL without a second admission plane](0065-workflow-action-postgres-parity.md)
+- [ADR 0066: Evaluate revision-bound ObjectSet descriptors without a query language](0066-object-set-evaluate.md)

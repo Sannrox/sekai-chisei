@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add `SekaiService.EvaluateObjectSet` for revision-bound
+  `sekai.object-set/v1` descriptors (#835). Evaluation uses existing
+  authorized list and one-hop traverse. A descriptor, page, or cursor is
+  not authority; stale definition pins and hidden predicates fail closed.
 - Persist workflow-action bindings, callbacks, and command replay on
   community PostgreSQL with the same generation-fenced transition as SQLite
   (#823). Concurrent callback and cancel cannot double-advance a binding.

@@ -57,6 +57,7 @@ pub mod namespace_snapshot;
 pub mod object_lineage;
 pub mod object_mutation;
 pub mod object_security;
+pub mod object_set;
 pub mod object_sync;
 pub mod observation;
 pub mod ontology;

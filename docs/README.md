@@ -101,6 +101,9 @@ If you want to deploy or operate the control plane:
   and deletion.
 - [Federation network contracts](federation-networks.md) — bilateral
   request, evidence, and outcome exchange without local write authority.
+- [Revision-bound ObjectSet evaluation](object-set.md) — typed
+  `sekai.object-set/v1` descriptors evaluated through authorized list and
+  one-hop traverse. A page is not authority.
 - [Governed workflow-action bridge](workflow-actions.md) — external
   workflow steps projected onto ActionInstance admission.
 - [Connector certification](connector-certification.md) — signed revocable

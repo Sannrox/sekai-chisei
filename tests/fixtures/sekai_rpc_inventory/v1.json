@@ -358,6 +358,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "EvaluateObjectSet",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/object_set.rs",
+        "src/grpc/object_set_query.rs",
+        "docs/object-set.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "core"
+    },
+    {
       "rpc": "PutObjectSecurityPolicyRevision",
       "kind": "persistent",
       "surfaces": ["sekai.object-security"],
