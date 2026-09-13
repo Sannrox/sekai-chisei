@@ -34,6 +34,7 @@ impl SekaiServiceImpl {
             .iter()
             .map(object_query_capability)
             .collect::<Vec<_>>();
+        entries.push(evaluate_object_set_capability());
         entries.push(traverse_capability());
         entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
@@ -81,7 +82,7 @@ fn capability_product_tier(name: &str) -> &'static str {
         semantic::CAPABILITY_EXPAND_RELATIONS
         | semantic::CAPABILITY_RETRIEVE_CONTEXT
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
-        "sekai.relations.traverse" => "core",
+        "sekai.relations.traverse" | "sekai.objects.evaluate_set" => "core",
         other if other.starts_with("sekai.objects.query.") => "core",
         other if other.starts_with("sekai.actions.") => "advanced",
         other if other.contains("kioku") => "experimental",
@@ -104,6 +105,28 @@ fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry 
         "object_acl".into(),
     ];
     entry.object_type = Some(to_proto_schema_type(object_type));
+    entry
+}
+
+fn evaluate_object_set_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.objects.evaluate_set".into(),
+        "Evaluate a revision-bound ObjectSet descriptor through authorized list and one-hop traverse.".into(),
+        "query",
+        "sekai.EvaluateObjectSetRequest",
+        "sekai.EvaluateObjectSetResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "schema_visibility".into(),
+        "object_acl".into(),
+        "definition_revision".into(),
+    ];
+    entry.limits = vec![CapabilityLimit {
+        name: "max_filters".into(),
+        value: crate::sekai::object_set::MAX_PROPERTY_FILTERS as u64,
+    }];
     entry
 }
 

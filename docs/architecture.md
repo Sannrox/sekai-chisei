@@ -99,6 +99,9 @@ named property claims uses the same grant check; see
 [Object security policy](object-security.md),
 [ADR 0025](decisions/0025-storage-enforced-object-security.md), and
 [ADR 0027](decisions/0027-explicit-property-grants.md).
+Revision-bound ObjectSet evaluation composes that authorized list subset
+with one declared hop; see [ObjectSet](object-set.md) and
+[ADR 0066](decisions/0066-object-set-evaluate.md).
 
 ### Chisei: governed decisions
 

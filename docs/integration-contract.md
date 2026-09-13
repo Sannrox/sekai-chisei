@@ -62,7 +62,7 @@ Coverage:
 | Quality-trend report | supported | Chisei | `ChiseiService.GetQualityTrend` | [evaluation-quality-trends.md](evaluation-quality-trends.md) | `src/grpc/chisei_service.rs` |
 | Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `src/sekai/client_package.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
-| ObjectSet query | planned | Sekai | — | — | [#835](https://github.com/Sannrox/sekai-chisei/issues/835) |
+| ObjectSet query (#835) | supported | Sekai | `SekaiService.EvaluateObjectSet` | [object-set.md](object-set.md) | `src/grpc/object_set_query.rs` |
 | Application Action describe | supported | Sekai | `SekaiService.DescribeObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Application Action preview | supported | Sekai | `SekaiService.PreviewObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
@@ -81,9 +81,10 @@ Coverage:
    (`GetPublishedDefinitionRevision`).
 2. **Query.** Authenticate, pass a canonical namespace, and call
    `DiscoverCapabilities` then `ListObjects` / `GetObject` /
-   `FindByExternalId`. Object-security activation is rechecked per row.
-   Page tokens are bound to principal, namespace, policy activation, and
-   query digest; a changed digest fails closed.
+   `FindByExternalId` / `EvaluateObjectSet`. Object-security activation is
+   rechecked per row. Page tokens are bound to principal, namespace, policy
+   activation, and query digest; a changed digest fails closed. A descriptor
+   or cached ObjectSet is not authority.
 3. **Invoke.** Register a `GovernedActionType`, then
    `SubmitActionInstance`. Send `x-sekai-capability` and
    `x-sekai-namespace` as in [capability-catalog.md](capability-catalog.md).
@@ -106,7 +107,7 @@ and publication records are.
 | Pinned revisions | Definition members and ontology codegen pin a published digest. |
 | Deprecation | Disable a `GovernedActionType` version; do not rewrite it. Retired source-type descriptors cannot authorize batches. |
 | Errors | Denials are generic (`access denied`, `unavailable`). Hidden names are not disclosed. |
-| Pagination | `ListObjects` uses signed page tokens. Offset without a namespace is not a live-authorization cursor. |
+| Pagination | `ListObjects` and `EvaluateObjectSet` use signed page tokens. Offset without a namespace is not a live-authorization cursor. |
 | Live authorization | Catalog visibility is not a grant. Object list, Action submit, and receipt read recheck the caller. |
 | Dual catalogs | Native `DiscoverCapabilities` and HTTP `chisei.provider-capabilities/v1` are different documents. Mixing them in `capability_requirements_json` fails `capability_unsupported`. |
 
@@ -125,7 +126,6 @@ and publication records are.
 These names appear in platform sequencing Issues. They are **not** integration
 contracts on current `main`:
 
-- composable ObjectSet queries ([#835](https://github.com/Sannrox/sekai-chisei/issues/835));
 - first-class Action approval RPC (admission may persist `denied` instead; preview reports `require_approval` without granting it) ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
 - authorized object-change subscriptions ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
 - downloadable registry packages (publication records are not registry bytes).
