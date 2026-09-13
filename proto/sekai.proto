@@ -420,6 +420,44 @@ message EvaluateObjectSetResponse {
   string next_page_token = 6;
   bool authority = 7;
 }
+message ObjectChangeSubscriptionScope {
+  string namespace = 1;
+  string kind = 2;
+  repeated string object_ids = 3;
+  repeated PropertyFilter property_filters = 4;
+}
+message ObjectChangeEvent {
+  uint64 offset = 1;
+  string event_id = 2;
+  string object_id = 3;
+  string kind = 4;
+  string op = 5;
+  string field = 6;
+  int64 committed_at_ms = 7;
+}
+message ReadObjectChangeSubscriptionRequest {
+  string subscription_id = 1;
+  ObjectChangeSubscriptionScope scope = 2;
+  string snapshot_revision = 3;
+  int32 limit = 4;
+  int64 retention_ms = 5;
+  string last_page_digest = 6;
+  bool revoke = 7;
+}
+message ReadObjectChangeSubscriptionResponse {
+  string contract_version = 1;
+  string subscription_id = 2;
+  string stream_id = 3;
+  string outcome = 4;
+  string snapshot_revision = 5;
+  uint64 generation = 6;
+  string feed_epoch = 7;
+  uint64 committed_offset = 8;
+  string page_digest = 9;
+  repeated ObjectChangeEvent events = 10;
+  bool authority = 11;
+  string disconnect_reason = 12;
+}
 message ObjectSecurityPolicyRevision {
   string namespace = 1;
   string kind = 2;
@@ -2014,6 +2052,7 @@ service SekaiService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc EvaluateObjectSet(EvaluateObjectSetRequest) returns (EvaluateObjectSetResponse);
+  rpc ReadObjectChangeSubscription(ReadObjectChangeSubscriptionRequest) returns (ReadObjectChangeSubscriptionResponse);
   rpc PutObjectSecurityPolicyRevision(PutObjectSecurityPolicyRevisionRequest) returns (PutObjectSecurityPolicyRevisionResponse);
   rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);
   rpc ActivateObjectSecurityPolicies(ActivateObjectSecurityPoliciesRequest) returns (ActivateObjectSecurityPoliciesResponse);

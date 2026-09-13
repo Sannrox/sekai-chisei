@@ -35,6 +35,7 @@ impl SekaiServiceImpl {
             .map(object_query_capability)
             .collect::<Vec<_>>();
         entries.push(evaluate_object_set_capability());
+        entries.push(object_change_subscription_capability());
         entries.push(traverse_capability());
         entries.push(expand_relations_capability());
         entries.push(retrieve_context_capability());
@@ -127,6 +128,33 @@ fn evaluate_object_set_capability() -> CapabilityEntry {
         name: "max_filters".into(),
         value: crate::sekai::object_set::MAX_PROPERTY_FILTERS as u64,
     }];
+    entry
+}
+
+fn object_change_subscription_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.objects.read_change_subscription".into(),
+        "Read a plane-owned page of committed object create, update, and delete facts.".into(),
+        "query",
+        "sekai.ReadObjectChangeSubscriptionRequest",
+        "sekai.ReadObjectChangeSubscriptionResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "object_acl".into(),
+        "event_subscription".into(),
+    ];
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_page".into(),
+            value: crate::sekai::object_change_subscription::MAX_PAGE as u64,
+        },
+        CapabilityLimit {
+            name: "max_backlog".into(),
+            value: crate::sekai::object_change_subscription::MAX_BACKLOG as u64,
+        },
+    ];
     entry
 }
 

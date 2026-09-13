@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add `SekaiService.ReadObjectChangeSubscription` for plane-owned
+  create/update/delete pages over `sekai.event-subscription/v1` cursors
+  (#838). Clients snapshot, then stream. Caller-supplied pages are not
+  object authority; a gap, expiry, or authorization change requires
+  resnapshot. Slow consumers disconnect explicitly.
 - Add `SekaiService.ReportDefinitionConsumerImpact` for authorized
   consumer paths joined to `CompareDefinitionRevisions` (#837). Only
   explicit `sekai.definition-consumer-binding/v1` registrations are

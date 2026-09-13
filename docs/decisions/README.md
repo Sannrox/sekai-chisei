@@ -88,3 +88,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0065: Persist workflow bindings and callbacks on PostgreSQL without a second admission plane](0065-workflow-action-postgres-parity.md)
 - [ADR 0066: Evaluate revision-bound ObjectSet descriptors without a query language](0066-object-set-evaluate.md)
 - [ADR 0067: Report consumer impact from registered declarations only](0067-definition-consumer-impact.md)
+- [ADR 0068: Deliver object-change subscriptions from committed facts](0068-object-change-subscriptions.md)

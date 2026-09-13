@@ -66,7 +66,7 @@ Coverage:
 | Application Action describe | supported | Sekai | `SekaiService.DescribeObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Application Action preview | supported | Sekai | `SekaiService.PreviewObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
-| Object-change subscription | planned | Sekai | — | — | [#838](https://github.com/Sannrox/sekai-chisei/issues/838) |
+| Object-change subscription (#838) | supported | Sekai | `SekaiService.ReadObjectChangeSubscription` | [object-change-subscriptions.md](object-change-subscriptions.md) | `src/grpc/object_change_subscription.rs` |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
 | Registry-published SDK | unavailable | Interface | — | [sdk-packages.md](sdk-packages.md) | `docs/sdk-packages.md` |
 
