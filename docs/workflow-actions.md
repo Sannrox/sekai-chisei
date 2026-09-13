@@ -49,6 +49,8 @@ action type and version.
 | Unknown, foreign, stale, hidden, or usage-ambiguous step | `workflow action is unavailable` |
 | Unknown contract revision | `workflow action revision is unsupported` |
 
-SQLite stores bindings and callbacks. PostgreSQL surfaces stay unavailable.
+SQLite and PostgreSQL store the same bindings, callbacks, and command
+replay rows. Each accepted transition shares one transaction. See
+[ADR 0065](decisions/0065-workflow-action-postgres-parity.md).
 Adapters persist a local outbox and never write graph, policy, budget, or
 receipt rows.

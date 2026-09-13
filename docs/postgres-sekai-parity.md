@@ -38,6 +38,13 @@ both backends share the same in-process evaluator after property grants.
 `get_source_sync_state`: both backends share the same in-process classifier
 and add no health table.
 
+The reusable workflow-action bridge stores share the same binding, callback,
+and command-replay identities across SQLite and PostgreSQL. Every accepted
+submit, park, callback, or cancel shares the `commit_workflow_transition`
+transaction. PostgreSQL serializes writers with a transaction-scoped advisory
+lock; expected-binding equality remains the commit rule. See
+[ADR 0065](decisions/0065-workflow-action-postgres-parity.md).
+
 The reusable event-stream projection and subscription stores share the same
 binding, checkpoint, admitted-event, and cursor identities across SQLite and
 PostgreSQL. Every accepted checkpoint or cursor change shares the transaction
@@ -144,6 +151,9 @@ SEKAI_TEST_POSTGRES_URL=... \
 
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test --test object_security_backend_conformance -- --ignored
+
+SEKAI_TEST_POSTGRES_URL=... \
+  cargo test postgres_workflow_transition_matrix postgres_concurrent_callback_and_cancel_race -- --ignored --nocapture
 ```
 
 The ordered-feed migration is additive and one-way on both backends. Version 1

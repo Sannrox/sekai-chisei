@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Persist workflow-action bindings, callbacks, and command replay on
+  community PostgreSQL with the same generation-fenced transition as SQLite
+  (#823). Concurrent callback and cancel cannot double-advance a binding.
 - Persist event-stream projections and subscriptions on community PostgreSQL
   with the same compare-and-swap pins as SQLite (#822). Checkpoint advancement
   and cursor writes share one transaction with their event commitments; a
