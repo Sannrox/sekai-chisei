@@ -387,6 +387,21 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ReadObjectChangeSubscription",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/object_change_subscription.rs",
+        "src/grpc/object_change_subscription.rs",
+        "docs/object-change-subscriptions.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "PutObjectSecurityPolicyRevision",
       "kind": "persistent",
       "surfaces": ["sekai.object-security"],

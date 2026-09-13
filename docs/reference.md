@@ -116,6 +116,8 @@ lives in the separate [research index](research/README.md).
   authorized queries over registered Iceberg and Parquet snapshots.
 - [Event-stream projections](event-streams.md) — ordered event batches with
   durable checkpoints and versioned consumer subscriptions.
+- [Object-change subscriptions](object-change-subscriptions.md) —
+  plane-owned create/update/delete pages over those same cursors.
 - [Governed documents and renditions](documents.md) — digest-bound document
   objects with renditions, hold, expiry, and deletion.
 - [Governed images, renditions, and annotations](images.md) — digest-bound

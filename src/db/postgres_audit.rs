@@ -257,6 +257,95 @@ impl PostgresDb {
         Ok(before)
     }
 
+    pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
+        self.connection()?
+            .query_one(
+                "SELECT COALESCE(MAX(c.audit_seq), 0)
+                 FROM sekai_object_changes c
+                 LEFT JOIN sekai_objects o ON o.id = c.object_id
+                 WHERE o.namespace = $1
+                    OR EXISTS (
+                      SELECT 1 FROM sekai_object_changes n
+                      WHERE n.object_id = c.object_id
+                        AND n.field = '_namespace'
+                        AND n.old_value = $1
+                    )",
+                &[&namespace],
+            )
+            .map(|row| row.get::<_, i64>(0).max(0) as u64)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn object_change_oldest_seq(&self, namespace: &str) -> Result<u64, String> {
+        self.connection()?
+            .query_one(
+                "SELECT COALESCE(MIN(c.audit_seq), 0)
+                 FROM sekai_object_changes c
+                 LEFT JOIN sekai_objects o ON o.id = c.object_id
+                 WHERE o.namespace = $1
+                    OR EXISTS (
+                      SELECT 1 FROM sekai_object_changes n
+                      WHERE n.object_id = c.object_id
+                        AND n.field = '_namespace'
+                        AND n.old_value = $1
+                    )",
+                &[&namespace],
+            )
+            .map(|row| row.get::<_, i64>(0).max(0) as u64)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_committed_object_mutations_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: i32,
+    ) -> Result<Vec<(ObjectChange, u64, String, String)>, String> {
+        let limit = if limit > 0 { limit } else { 64 };
+        let after = i64::try_from(after_seq).map_err(|error| error.to_string())?;
+        self.connection()?
+            .query(
+                "SELECT c.id, c.object_id, c.field, c.old_value, c.new_value, c.changed_by,
+                        c.timestamp, COALESCE(o.kind, ''), COALESCE(o.namespace, ''), c.audit_seq
+                 FROM sekai_object_changes c
+                 LEFT JOIN sekai_objects o ON o.id = c.object_id
+                 WHERE c.audit_seq > $1
+                   AND (
+                     o.namespace = $2
+                     OR EXISTS (
+                       SELECT 1 FROM sekai_object_changes n
+                       WHERE n.object_id = c.object_id
+                         AND n.field = '_namespace'
+                         AND n.old_value = $2
+                     )
+                   )
+                 ORDER BY c.audit_seq ASC
+                 LIMIT $3",
+                &[&after, &namespace, &limit],
+            )
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            ObjectChange {
+                                id: row.get(0),
+                                object_id: row.get(1),
+                                field: row.get(2),
+                                old_value: row.get(3),
+                                new_value: row.get(4),
+                                changed_by: row.get(5),
+                                timestamp: row.get(6),
+                            },
+                            row.get::<_, i64>(9).max(0) as u64,
+                            row.get(7),
+                            row.get(8),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
+    }
+
     pub fn list_object_changes(
         &self,
         object_id: &str,

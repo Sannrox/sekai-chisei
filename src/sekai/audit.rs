@@ -1132,6 +1132,99 @@ impl SekaiDb {
             .map_err(|e| e.to_string())
     }
 
+    pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT COALESCE(MAX(c.rowid), 0)
+             FROM sekai_object_changes c
+             LEFT JOIN sekai_objects o ON o.id = c.object_id
+             WHERE o.namespace = ?1
+                OR EXISTS (
+                    SELECT 1 FROM sekai_object_changes n
+                    WHERE n.object_id = c.object_id
+                      AND n.field = '_namespace'
+                      AND n.old_value = ?1
+                )",
+            params![namespace],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|seq| seq.max(0) as u64)
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn object_change_oldest_seq(&self, namespace: &str) -> Result<u64, String> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT COALESCE(MIN(c.rowid), 0)
+             FROM sekai_object_changes c
+             LEFT JOIN sekai_objects o ON o.id = c.object_id
+             WHERE o.namespace = ?1
+                OR EXISTS (
+                    SELECT 1 FROM sekai_object_changes n
+                    WHERE n.object_id = c.object_id
+                      AND n.field = '_namespace'
+                      AND n.old_value = ?1
+                )",
+            params![namespace],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|seq| seq.max(0) as u64)
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn list_committed_object_mutations_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: i32,
+    ) -> Result<Vec<(ObjectChange, u64, String, String)>, String> {
+        let conn = self.conn();
+        let effective_limit = if limit > 0 { limit } else { 64 };
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.object_id, c.field, c.old_value, c.new_value, c.changed_by,
+                        c.timestamp, COALESCE(o.kind, ''), COALESCE(o.namespace, ''), c.rowid
+                 FROM sekai_object_changes c
+                 LEFT JOIN sekai_objects o ON o.id = c.object_id
+                 WHERE c.rowid > ?1
+                   AND (
+                     o.namespace = ?2
+                     OR EXISTS (
+                       SELECT 1 FROM sekai_object_changes n
+                       WHERE n.object_id = c.object_id
+                         AND n.field = '_namespace'
+                         AND n.old_value = ?2
+                     )
+                   )
+                 ORDER BY c.rowid ASC
+                 LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![after_seq as i64, namespace, effective_limit],
+                |row| {
+                    Ok((
+                        ObjectChange {
+                            id: row.get(0)?,
+                            object_id: row.get(1)?,
+                            field: row.get(2)?,
+                            old_value: row.get(3)?,
+                            new_value: row.get(4)?,
+                            changed_by: row.get(5)?,
+                            timestamp: row.get(6)?,
+                        },
+                        row.get::<_, i64>(9)?.max(0) as u64,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn object_change_kind(&self, object_id: &str) -> Result<Option<String>, String> {
         let conn = self.conn();
         let marker = conn

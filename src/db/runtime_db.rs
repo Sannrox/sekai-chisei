@@ -3900,6 +3900,48 @@ impl RuntimeDb {
         }
     }
 
+    pub fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
+        match self {
+            Self::Sqlite(db) => db.object_change_watermark(namespace),
+            Self::Postgres(db) => db.object_change_watermark(namespace),
+        }
+    }
+
+    pub fn object_change_oldest_seq(&self, namespace: &str) -> Result<u64, String> {
+        match self {
+            Self::Sqlite(db) => db.object_change_oldest_seq(namespace),
+            Self::Postgres(db) => db.object_change_oldest_seq(namespace),
+        }
+    }
+
+    pub fn list_committed_object_mutations_after(
+        &self,
+        namespace: &str,
+        after_seq: u64,
+        limit: i32,
+    ) -> Result<Vec<crate::sekai::object_change_subscription::CommittedObjectMutation>, String>
+    {
+        let rows = match self {
+            Self::Sqlite(db) => {
+                db.list_committed_object_mutations_after(namespace, after_seq, limit)
+            }
+            Self::Postgres(db) => {
+                db.list_committed_object_mutations_after(namespace, after_seq, limit)
+            }
+        }?;
+        Ok(rows
+            .into_iter()
+            .map(|(change, seq, object_kind, object_namespace)| {
+                crate::sekai::object_change_subscription::CommittedObjectMutation {
+                    change,
+                    seq,
+                    object_kind,
+                    object_namespace,
+                }
+            })
+            .collect())
+    }
+
     pub fn list_work_units(&self, filter: &WorkUnitFilter) -> Result<Vec<WorkUnit>, String> {
         match self {
             Self::Sqlite(db) => db.list_work_units(filter),

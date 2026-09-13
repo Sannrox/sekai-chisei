@@ -107,6 +107,9 @@ If you want to deploy or operate the control plane:
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` descriptors evaluated through authorized list and
   one-hop traverse. A page is not authority.
+- [Object-change subscriptions](object-change-subscriptions.md) —
+  plane-owned create/update/delete pages over event-subscription cursors.
+  Snapshot, then stream; a page is not authority.
 - [Governed workflow-action bridge](workflow-actions.md) — external
   workflow steps projected onto ActionInstance admission.
 - [Connector certification](connector-certification.md) — signed revocable

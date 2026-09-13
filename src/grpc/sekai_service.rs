@@ -12,6 +12,8 @@ mod catalog_invocation;
 mod computed_response;
 #[path = "definition_consumer_impact.rs"]
 mod definition_consumer_impact;
+#[path = "object_change_subscription.rs"]
+mod object_change_subscription;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
 #[path = "object_set_query.rs"]
@@ -5512,6 +5514,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<EvaluateObjectSetRequest>,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         self.evaluate_visible_object_set(req).await
+    }
+    async fn read_object_change_subscription(
+        &self,
+        req: Request<ReadObjectChangeSubscriptionRequest>,
+    ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
+        self.read_visible_object_change_subscription(req).await
     }
     async fn put_object_security_policy_revision(
         &self,

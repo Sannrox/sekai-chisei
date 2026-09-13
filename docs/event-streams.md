@@ -58,3 +58,8 @@ Hidden fields are omitted. Partial output is discarded. SQLite and PostgreSQL
 store the same bindings, checkpoints, admitted event commitments, and
 subscriptions. Each accepted write shares one transaction. See
 [ADR 0064](decisions/0064-event-stream-postgres-parity.md).
+
+Committed object create/update/delete delivery reuses the same subscription
+contract through `ReadObjectChangeSubscription`. See
+[object-change subscriptions](object-change-subscriptions.md) and
+[ADR 0068](decisions/0068-object-change-subscriptions.md).
