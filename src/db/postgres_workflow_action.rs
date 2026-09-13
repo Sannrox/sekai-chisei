@@ -210,11 +210,10 @@ fn load_binding(
 }
 
 fn constraint_unavailable(error: postgres::Error) -> String {
-    let text = error.to_string();
-    if text.to_ascii_lowercase().contains("unique") {
+    if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
         WORKFLOW_UNAVAILABLE.into()
     } else {
-        text
+        error.to_string()
     }
 }
 
@@ -324,6 +323,30 @@ mod tests {
                 .commit_workflow_transition(None, &submitted, None, &submit_cmd)
                 .unwrap_err(),
             WORKFLOW_UNAVAILABLE
+        );
+
+        let mut colliding = submitted.clone();
+        colliding.binding_id = format!("sha256:{scope}-other");
+        colliding.instance_id = format!("inst:{scope}-other");
+        colliding.operation_id = format!("op:{scope}-other");
+        colliding.idempotency_key = format!("idemp:{scope}-other");
+        colliding.binding_digest = format!("sha256:bind:{scope}-other:0");
+        assert_eq!(
+            runtime
+                .commit_workflow_transition(
+                    None,
+                    &colliding,
+                    None,
+                    &command(&colliding, COMMAND_SUBMIT, 0),
+                )
+                .unwrap_err(),
+            WORKFLOW_UNAVAILABLE
+        );
+        assert_eq!(
+            runtime
+                .get_workflow_binding(&colliding.namespace, &colliding.binding_id)
+                .unwrap(),
+            None
         );
 
         let mut parked = submitted.clone();
