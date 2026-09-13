@@ -497,7 +497,7 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "stable",
+      "classification": "experimental",
       "product_tier": "core"
     },
     {
@@ -506,7 +506,7 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "stable",
+      "classification": "experimental",
       "product_tier": "core"
     },
     {
@@ -533,7 +533,7 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "stable",
+      "classification": "experimental",
       "product_tier": "core"
     },
     {
@@ -542,7 +542,7 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "stable",
+      "classification": "experimental",
       "product_tier": "core"
     },
     {
@@ -586,8 +586,8 @@
       "rpc": "CreateDataset",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -595,8 +595,8 @@
       "rpc": "UpdateDataset",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -613,8 +613,8 @@
       "rpc": "AppendRows",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -622,8 +622,8 @@
       "rpc": "QueryRows",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {

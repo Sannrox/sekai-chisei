@@ -413,6 +413,36 @@ mod tests {
                 .filter(|entry| entry.real_backend == "fixture only")
                 .all(|entry| entry.classification != RpcClassification::Stable)
         );
+        for rpc in [
+            "CreateDataset",
+            "UpdateDataset",
+            "AppendRows",
+            "QueryRows",
+            "DecideGatewayExecution",
+            "RecordUsage",
+            "ClaimGatewayDispatch",
+        ] {
+            assert_eq!(
+                table.classification_of(rpc),
+                Some(RpcClassification::Stable),
+                "{rpc} is used by the gateway host"
+            );
+        }
+        for rpc in [
+            "CreateDataset",
+            "UpdateDataset",
+            "AppendRows",
+            "QueryRows",
+            "DecideGatewayExecution",
+            "RecordUsage",
+            "ClaimGatewayDispatch",
+        ] {
+            assert_eq!(
+                table.classification_of(rpc),
+                Some(RpcClassification::Stable),
+                "{rpc} is used by the gateway host"
+            );
+        }
     }
 
     #[test]
