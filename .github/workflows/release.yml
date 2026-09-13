@@ -20,6 +20,23 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  compatibility-matrix:
+    name: Upload compatibility matrix
+    needs: sekai-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate compatibility matrix
+        run: cargo run --locked --bin sekaictl -- admin compatibility generate --out compatibility.json
+      - name: Upload compatibility.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" compatibility.json --clobber
+
   sekai-binaries:
     name: sekai (${{ matrix.target }})
     needs: sekai-release
