@@ -27,6 +27,9 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
+      - name: Assert compatibility matrix
+        run: cargo test --locked --test compatibility_matrix
+
       - name: Verify standalone ontology dependencies
         shell: bash
         run: |

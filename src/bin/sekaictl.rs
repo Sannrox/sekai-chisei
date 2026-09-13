@@ -152,6 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
             .await
         }
+        "compatibility" => {
+            sekai_chisei::compatibility_cli::run_compatibility_command(
+                args.into_iter().skip(1).collect(),
+            )
+            .await
+        }
         "packages" => {
             sekai_chisei::capability_package_cli::run_packages_command(
                 args.into_iter().skip(1).collect(),
@@ -481,6 +487,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("documents"), _) => ("documents", 2),
         (Some("images"), _) => ("images", 2),
         (Some("sdk-packages"), _) => ("sdk-packages", 2),
+        (Some("compatibility"), _) => ("compatibility", 2),
         (Some("packages"), _) => ("packages", 2),
         (Some("workflow"), _) => ("workflow", 2),
         (Some("connectors"), _) => ("connectors", 2),
@@ -686,6 +693,9 @@ fn print_admin_usage() {
          SDK packages:\n\
            sekaictl admin sdk-packages ...\n\
          \n\
+         Compatibility:\n\
+           sekaictl admin compatibility ...\n\
+         \n\
          Capability packages:\n\
            sekaictl admin packages ...\n\
          \n\
@@ -741,6 +751,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "documents" => Some(sekai_chisei::document_cli::usage().to_string()),
         "images" => Some(sekai_chisei::image_cli::usage().to_string()),
         "sdk-packages" => Some(sekai_chisei::client_package_cli::usage().to_string()),
+        "compatibility" => Some(sekai_chisei::compatibility_cli::usage().to_string()),
         "packages" => Some(sekai_chisei::capability_package_cli::usage().to_string()),
         "network" => Some(sekai_chisei::federation_network_cli::usage().to_string()),
         "workflow" => Some(sekai_chisei::workflow_action_cli::usage().to_string()),
@@ -775,6 +786,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "documents" => Some("admin documents"),
         "images" => Some("admin images"),
         "sdk-packages" => Some("admin sdk-packages"),
+        "compatibility" => Some("admin compatibility"),
         "packages" => Some("admin packages"),
         "network" => Some("admin network"),
         "workflow" => Some("admin workflow"),
@@ -836,6 +848,7 @@ mod tests {
             (vec!["documents"], "documents"),
             (vec!["images"], "images"),
             (vec!["sdk-packages"], "sdk-packages"),
+            (vec!["compatibility"], "compatibility"),
             (vec!["packages"], "packages"),
             (vec!["network"], "network"),
             (vec!["workflow"], "workflow"),
@@ -893,6 +906,7 @@ mod tests {
             "documents",
             "images",
             "sdk-packages",
+            "compatibility",
             "packages",
             "network",
             "workflow",

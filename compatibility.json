@@ -1,0 +1,13 @@
+{
+  "contract_version": "sekai.compatibility-matrix/v1",
+  "server_version": "1.0.1",
+  "proto_revision": "sha256:4eee6a44463ccc2d1b08d345ab915d91700191c277662c079e51ea8ded808c15",
+  "minimum_compatible_server": "1.0.1",
+  "packages": {
+    "sekai-chisei": "1.0.1",
+    "sekai-proto": "1.0.1",
+    "sekai-client": "0.1.2",
+    "typescript": "0.1.0",
+    "python": "0.1.0"
+  }
+}

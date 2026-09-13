@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Publish `compatibility.json` (`sekai.compatibility-matrix/v1`) as a
+  projection of shipped server, proto, and SDK versions (#873).
+  `sekaictl admin compatibility check` reports on-matrix or off-matrix and
+  names the expected revision. Vendored TypeScript copies stay off-matrix
+  until replaced by a package pin.
 - Stamp one caller operation identity (`x-sekai-operation-id` /
   `request_id`) on the inbound span, the operation receipt, and the
   object-change event for a governed action (#886). Mismatched header and

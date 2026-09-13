@@ -61,6 +61,7 @@ Coverage:
 | Operation receipt | supported | Chisei | `ChiseiService.GetOperationReceipt` | [ontology.md](ontology.md) | `sdk/typescript/client.test.ts` |
 | Quality-trend report | supported | Chisei | `ChiseiService.GetQualityTrend` | [evaluation-quality-trends.md](evaluation-quality-trends.md) | `src/grpc/chisei_service.rs` |
 | Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `src/sekai/client_package.rs` |
+| Compatibility matrix (#873) | supported | Interface | `compatibility.json` via `sekaictl admin compatibility` | [sdk-packages.md](sdk-packages.md) | `src/compatibility_matrix.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
 | ObjectSet query (#835) | supported | Sekai | `SekaiService.EvaluateObjectSet` | [object-set.md](object-set.md) | `src/grpc/object_set_query.rs` |
 | Application Action describe | supported | Sekai | `SekaiService.DescribeObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |

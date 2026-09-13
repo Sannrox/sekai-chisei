@@ -11,7 +11,7 @@ futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sekai-provider = { version = "1.0.0", path = "../sekai-provider" }
-sekai-proto = { version = "1.0.0", path = "../sekai-proto" }
+sekai-proto = { version = "1.0.1", path = "../sekai-proto" }
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tower = { version = "0.5", features = ["util"] }
