@@ -76,7 +76,9 @@ those entries through the canonical RPC named by `input_type` and send
 `x-sekai-capability` with the discovered capability name. Action and semantic
 calls also send `x-sekai-namespace`; object-query calls use the namespace in
 their existing filter. An optional `x-sekai-operation-id` supplies caller
-correlation and is atomically reserved before an effectful action. The server
+correlation and is atomically reserved before an effectful action. The same
+identity is stamped on the inbound span, the receipt, and the object-change
+event; see [operation-correlation.md](operation-correlation.md). The server
 generates one when omitted and returns the effective identifier on successful
 response metadata. Callers that need to correlate a refused or failed RPC must
 supply the header, because generic gRPC error propagation does not guarantee

@@ -48,6 +48,10 @@ where
         // derived from the request, so correlating two spans cannot reveal
         // that they touched the same namespace or content.
         let correlation = crate::obs::correlation::Correlation::new_operation();
+        let caller_operation = crate::obs::correlation::caller_operation_id(req.headers())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let span = info_span!(
             "grpc",
             grpc_service = %grpc_service,
@@ -55,6 +59,7 @@ where
             stage = crate::obs::correlation::Stage::Operation.as_str(),
             operation = %correlation.operation,
             attempt = correlation.attempt,
+            sekai.operation_id = caller_operation.as_str(),
             otel.kind = "server",
         );
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Stamp one caller operation identity (`x-sekai-operation-id` /
+  `request_id`) on the inbound span, the operation receipt, and the
+  object-change event for a governed action (#886). Mismatched header and
+  request id fail closed.
 - Add `SekaiService.ReadObjectChangeSubscription` for plane-owned
   create/update/delete pages over `sekai.event-subscription/v1` cursors
   (#838). Clients snapshot, then stream. Caller-supplied pages are not

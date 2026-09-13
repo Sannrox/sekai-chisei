@@ -16,6 +16,13 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use http::HeaderMap;
+
+/// Caller-supplied cross-plane operation identity. Opaque; never derived
+/// from request content. Distinct from the generated [`CorrelationId`].
+pub const OPERATION_METADATA: &str = "x-sekai-operation-id";
+pub const SPAN_OPERATION_FIELD: &str = "sekai.operation_id";
+
 /// Stage of work a span describes. Closed so span names stay bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
@@ -86,6 +93,22 @@ pub struct Correlation {
     pub operation: CorrelationId,
     /// Attempt number within the operation, starting at 1.
     pub attempt: u32,
+}
+
+/// Read a validated caller operation identity from request headers.
+pub fn caller_operation_id(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers.get(OPERATION_METADATA) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| "operation identity must be ASCII".to_string())?;
+    let identity = crate::sekai::operation_correlation::normalize_identity(raw)?;
+    if identity.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(identity))
+    }
 }
 
 impl Correlation {
@@ -171,6 +194,23 @@ mod tests {
         let mut correlation = Correlation::new_operation();
         correlation.attempt = u32::MAX;
         assert_eq!(correlation.next_attempt().attempt, u32::MAX);
+    }
+
+    #[test]
+    fn caller_header_is_accepted_when_opaque() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(OPERATION_METADATA, "op-cross-plane-1".parse().unwrap());
+        assert_eq!(
+            caller_operation_id(&headers).unwrap().as_deref(),
+            Some("op-cross-plane-1")
+        );
+    }
+
+    #[test]
+    fn caller_header_with_whitespace_is_rejected() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(OPERATION_METADATA, "op with space".parse().unwrap());
+        assert!(caller_operation_id(&headers).is_err());
     }
 
     #[test]

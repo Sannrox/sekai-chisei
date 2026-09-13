@@ -209,6 +209,9 @@ message ObjectChange {
   string new_value = 5;
   string changed_by = 6;
   int64 timestamp = 7;
+  // Plane-stamped operation identity when the change was produced by a
+  // governed action. Empty for mutations that have no bound operation.
+  string operation_id = 8;
 }
 
 // A versioned description of an existing native query or retrieval surface.
@@ -434,6 +437,7 @@ message ObjectChangeEvent {
   string op = 5;
   string field = 6;
   int64 committed_at_ms = 7;
+  string operation_id = 8;
 }
 message ReadObjectChangeSubscriptionRequest {
   string subscription_id = 1;
