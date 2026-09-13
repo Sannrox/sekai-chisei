@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Persist event-stream projections and subscriptions on community PostgreSQL
+  with the same compare-and-swap pins as SQLite (#822). Checkpoint advancement
+  and cursor writes share one transaction with their event commitments; a
+  concurrent miss is a typed conflict, not last-write-wins.
 - Add `SekaiService.DescribeObjectAction` and `PreviewObjectAction` as
   observational projections over object-bound governed Actions (#836). Preview
   is not a permit; submit remains `SubmitActionInstance`. Stale object or

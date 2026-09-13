@@ -272,6 +272,17 @@ fn current_checkpoint(
         }))
 }
 
+pub(crate) fn replay_checkpoint_matches_batch(
+    checkpoint: &EventStreamCheckpoint,
+    batch: &EventStreamBatch,
+) -> bool {
+    checkpoint.stream_id == batch.stream_id
+        && checkpoint.generation == batch.generation
+        && checkpoint.feed_epoch == batch.feed_epoch
+        && checkpoint.last_batch_digest == batch.content_digest
+        && checkpoint.committed_offset >= batch.offset_end
+}
+
 fn decided_without_advance(
     binding: &EventStreamBinding,
     batch: &EventStreamBatch,

@@ -5593,7 +5593,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_event_stream_binding(binding),
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.put_event_stream_binding(binding),
         }
     }
 
@@ -5603,7 +5603,7 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::event_stream::EventStreamBinding>, String> {
         match self {
             Self::Sqlite(db) => db.get_event_stream_binding(stream_id),
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.get_event_stream_binding(stream_id),
         }
     }
 
@@ -5618,7 +5618,9 @@ impl RuntimeDb {
             Self::Sqlite(db) => {
                 db.advance_event_stream_checkpoint(next, expected, definition_digest, admitted)
             }
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                db.advance_event_stream_checkpoint(next, expected, definition_digest, admitted)
+            }
         }
     }
 
@@ -5628,7 +5630,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.ensure_event_stream_admitted_events(batch),
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.ensure_event_stream_admitted_events(batch),
         }
     }
 
@@ -5643,7 +5645,9 @@ impl RuntimeDb {
             Self::Sqlite(db) => {
                 db.verify_event_stream_admitted_events(stream_id, generation, feed_epoch, events)
             }
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                db.verify_event_stream_admitted_events(stream_id, generation, feed_epoch, events)
+            }
         }
     }
 
@@ -5653,7 +5657,7 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::event_stream::EventStreamCheckpoint>, String> {
         match self {
             Self::Sqlite(db) => db.get_event_stream_checkpoint(stream_id),
-            Self::Postgres(_) => Err(crate::sekai::event_stream::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.get_event_stream_checkpoint(stream_id),
         }
     }
 
@@ -5663,7 +5667,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_event_subscription(subscription),
-            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.put_event_subscription(subscription),
         }
     }
 
@@ -5674,7 +5678,7 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::event_subscription::EventSubscription>, String> {
         match self {
             Self::Sqlite(db) => db.get_event_subscription(namespace, subscription_id),
-            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.get_event_subscription(namespace, subscription_id),
         }
     }
 
@@ -5686,7 +5690,7 @@ impl RuntimeDb {
     ) -> Result<crate::sekai::event_subscription::EventSubscription, String> {
         match self {
             Self::Sqlite(db) => db.revoke_event_subscription(namespace, subscription_id, owner),
-            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.revoke_event_subscription(namespace, subscription_id, owner),
         }
     }
 
@@ -5697,7 +5701,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.advance_event_subscription_cursor(next, expected),
-            Self::Postgres(_) => Err(crate::sekai::event_subscription::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.advance_event_subscription_cursor(next, expected),
         }
     }
 
