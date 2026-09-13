@@ -5,7 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use super::sekai::SekaiDb;
 use crate::sekai::event_stream::{
     BATCH_GAP, BATCH_MALFORMED, CHECKPOINT_CONFLICT, EventStreamBinding, EventStreamCheckpoint,
-    PROJECT_UNAVAILABLE, StreamEvent, admitted_event_digest,
+    PROJECT_UNAVAILABLE, StreamEvent, admitted_event_digest, replay_checkpoint_matches_batch,
 };
 
 impl SekaiDb {
@@ -109,13 +109,35 @@ impl SekaiDb {
         &self,
         batch: &crate::sekai::event_stream::EventStreamBatch,
     ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let json: Option<String> = tx
+            .query_row(
+                "SELECT record_json FROM sekai_event_stream_checkpoints WHERE stream_id = ?1",
+                params![batch.stream_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let checkpoint = json
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|error| format!("decode event stream checkpoint: {error}"))
+            })
+            .transpose()?
+            .ok_or(CHECKPOINT_CONFLICT)?;
+        if !replay_checkpoint_matches_batch(&checkpoint, batch) {
+            return Err(CHECKPOINT_CONFLICT.into());
+        }
         persist_admitted_events_ignore(
-            &self.conn(),
+            &tx,
             &batch.stream_id,
             batch.generation,
             &batch.feed_epoch,
             &batch.events,
-        )
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn verify_event_stream_admitted_events(

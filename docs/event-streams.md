@@ -54,5 +54,7 @@ commitments are cleared so the next project starts at offset 1.
 | Page already committed with a different digest | `event subscription page is late` |
 | Idle cursor older than the retention bound | `event subscription retention window elapsed` |
 
-Hidden fields are omitted. Partial output is discarded. SQLite stores
-bindings, checkpoints, and subscriptions; PostgreSQL stays unavailable.
+Hidden fields are omitted. Partial output is discarded. SQLite and PostgreSQL
+store the same bindings, checkpoints, admitted event commitments, and
+subscriptions. Each accepted write shares one transaction. See
+[ADR 0064](decisions/0064-event-stream-postgres-parity.md).

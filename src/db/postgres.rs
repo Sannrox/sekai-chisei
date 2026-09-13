@@ -58,6 +58,7 @@ const SOURCE_BATCH_QUARANTINE_SCHEMA: &str =
     include_str!("postgres/0036_source_batch_quarantine.sql");
 const FACT_MIGRATION_SCHEMA: &str = include_str!("postgres/0037_fact_migration.sql");
 const FACT_MIGRATION_AUDIT_SCHEMA: &str = include_str!("postgres/0038_fact_migration_audit.sql");
+const EVENT_STREAMS_SCHEMA: &str = include_str!("postgres/0039_event_streams.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -251,6 +252,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 37,
         name: "fact_migration_audit",
         sql: FACT_MIGRATION_AUDIT_SCHEMA,
+    },
+    Migration {
+        version: 38,
+        name: "event_streams",
+        sql: EVENT_STREAMS_SCHEMA,
     },
 ];
 
@@ -733,6 +739,17 @@ mod tests {
         assert!(SOURCE_BATCH_QUARANTINE_SCHEMA.contains("QUARANTINED"));
         assert!(OBJECT_SYNC_SCHEMA.contains("outcome IN ('success', 'denial', 'unavailable')"));
         assert!(!OBJECT_SYNC_SCHEMA.contains("unknown"));
+        for table in [
+            "sekai_event_stream_bindings",
+            "sekai_event_stream_checkpoints",
+            "sekai_event_stream_admitted_events",
+            "sekai_event_subscriptions",
+        ] {
+            assert!(
+                EVENT_STREAMS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL event-stream table {table}"
+            );
+        }
         assert!(
             DEFINITION_PROPOSALS_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_definition_proposals")

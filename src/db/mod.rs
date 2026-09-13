@@ -26,6 +26,8 @@ mod document_store;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
+#[cfg(test)]
+mod event_backend_conformance;
 mod event_stream_store;
 mod event_subscription_store;
 pub mod evidence;
@@ -70,6 +72,7 @@ mod postgres_eval;
 mod postgres_evaluation_execution;
 mod postgres_evaluation_manifest;
 mod postgres_evaluation_plan;
+mod postgres_event_stream;
 mod postgres_evidence;
 mod postgres_external_action;
 mod postgres_external_permit;

@@ -84,6 +84,11 @@ impl SekaiDb {
             .map_err(|error| format!("encode event subscription: {error}"))?;
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let current = load_subscription(&tx, &next.namespace, &next.subscription_id)?
+            .ok_or(CURSOR_CONFLICT)?;
+        if current != *expected {
+            return Err(CURSOR_CONFLICT.into());
+        }
         let binding = load_stream_binding(&tx, &next.stream_id)?;
         if binding.is_none_or(|stream| stream.definition_digest != next.definition_digest) {
             return Err(CURSOR_CONFLICT.into());

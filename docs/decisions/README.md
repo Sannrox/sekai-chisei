@@ -84,3 +84,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0061: Inspect and preview quarantined source repairs without a second admission plane](0061-quarantine-repair-preview.md)
 - [ADR 0062: Expose quality trends as an authenticated read projection](0062-quality-trend-read-api.md)
 - [ADR 0063: Describe and preview object-bound Actions without a second admission plane](0063-object-action-describe-preview.md)
+- [ADR 0064: Persist event projections and subscriptions on PostgreSQL without a second authority plane](0064-event-stream-postgres-parity.md)

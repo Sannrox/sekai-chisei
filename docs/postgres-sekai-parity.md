@@ -38,6 +38,15 @@ both backends share the same in-process evaluator after property grants.
 `get_source_sync_state`: both backends share the same in-process classifier
 and add no health table.
 
+The reusable event-stream projection and subscription stores share the same
+binding, checkpoint, admitted-event, and cursor identities across SQLite and
+PostgreSQL. Every accepted checkpoint or cursor change shares the transaction
+that commits the compare-and-swap pins and, for projections, the event
+commitments. PostgreSQL serializes writers with a transaction-scoped advisory
+lock; the CAS predicates remain the commit rule. Normal CI runs SQLite;
+PostgreSQL conformance remains an ignored isolated-database test. See
+[ADR 0064](decisions/0064-event-stream-postgres-parity.md).
+
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
 
@@ -66,12 +75,6 @@ treat inventory “complete” as dual-backend for these RPCs):
 - registered Iceberg and Parquet snapshot projections
   (`sekai.open-table-source/v1`; see
   [ADR 0036](decisions/0036-open-table-projections.md));
-- event-stream projections and checkpoints
-  (`sekai.event-stream-projection/v1`; see
-  [ADR 0037](decisions/0037-event-stream-projections.md));
-- event subscriptions and consumer cursors
-  (`sekai.event-subscription/v1`; see
-  [ADR 0048](decisions/0048-governed-event-subscriptions.md));
 - governed documents and renditions
   (`sekai.governed-document/v1`; see
   [ADR 0039](decisions/0039-governed-documents.md));

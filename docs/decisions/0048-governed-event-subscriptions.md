@@ -7,7 +7,8 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/691
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0037](0037-event-stream-projections.md)
+- Related: [ADR 0037](0037-event-stream-projections.md),
+  [ADR 0064](0064-event-stream-postgres-parity.md)
 
 ## Context
 
@@ -49,8 +50,9 @@ manufacture success.
 ## Consequences
 
 Operators can subscribe, pull, inspect, and revoke a consumer cursor without
-changing the producer checkpoint. Follow-up work may add gRPC transport or
-PostgreSQL parity.
+changing the producer checkpoint. PostgreSQL persistence parity is
+[ADR 0064](0064-event-stream-postgres-parity.md). Follow-up work may add gRPC
+transport.
 
 ## Validation
 

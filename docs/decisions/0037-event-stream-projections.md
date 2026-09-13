@@ -9,6 +9,7 @@
 - Superseded by: none
 - Related: [ADR 0023](0023-generation-fenced-source-change-feeds.md),
   [ADR 0036](0036-open-table-projections.md),
+  [ADR 0064](0064-event-stream-postgres-parity.md),
   Discussion [746](https://github.com/Sannrox/sekai-chisei/discussions/746)
 
 ## Context
@@ -45,6 +46,7 @@ partial or unauthorized batch was rejected because it manufactures success.
 
 Operators register a stream, project ordered batches, and inspect the
 checkpoint. Follow-up work added subscriptions in [ADR 0048](0048-governed-event-subscriptions.md).
+PostgreSQL persistence parity is [ADR 0064](0064-event-stream-postgres-parity.md).
 
 ## Validation
 
