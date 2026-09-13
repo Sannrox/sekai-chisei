@@ -64,6 +64,7 @@ pub mod object_sync;
 pub mod observation;
 pub mod ontology;
 pub mod open_table;
+pub mod operation_correlation;
 pub mod parked_work;
 pub mod peer_import;
 pub mod propagation;

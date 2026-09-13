@@ -88,7 +88,10 @@ The control plane and gateway export tracing spans through the standard
 `tracing` subscriber. The `/metrics` endpoint remains the Prometheus metrics
 surface; OpenTelemetry does not replace it. W3C `traceparent`/`tracestate`
 context is accepted at trusted HTTP and gRPC boundaries and propagated to the
-control plane, but is stripped before requests reach model providers. OTLP
+control plane, but is stripped before requests reach model providers.
+Caller-supplied `x-sekai-operation-id` is the cross-plane operation identity
+stamped on `sekai.operation_id`, the receipt, and the object-change event;
+see [operation-correlation.md](operation-correlation.md). OTLP
 headers, provider credentials, request content, and other credential-bearing
 values must not be placed in spans or logs. The durable operation receipt and
 its digest remain the authoritative operation record; exported traces are

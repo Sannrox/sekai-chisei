@@ -1745,6 +1745,7 @@ fn redact_object_change_values(
         },
         changed_by: change.changed_by,
         timestamp: change.timestamp,
+        operation_id: String::new(),
     }
 }
 
@@ -6543,42 +6544,65 @@ impl SekaiService for SekaiServiceImpl {
 
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(&self.db, &req)?;
-        let inner = req.into_inner();
+        let header_operation_id = Self::catalog_metadata_value(
+            &req,
+            crate::sekai::operation_correlation::OPERATION_METADATA,
+        );
+        let mut inner = req.into_inner();
         let namespace = inner.namespace.trim().to_string();
         if namespace.is_empty() {
             return Err(Status::invalid_argument("namespace required"));
         }
         let actor = authorize_action_instance_submit(self, &principals, &namespace)?;
         enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), &namespace, true)?;
+        let operation_id = crate::sekai::operation_correlation::bind_submit_identity(
+            header_operation_id.as_deref(),
+            &inner.request_id,
+        )
+        .map_err(Status::invalid_argument)?;
+        inner.request_id = operation_id.clone();
+        let span = tracing::info_span!(
+            "governed_action",
+            sekai.operation_id = operation_id.as_str()
+        );
+        tracing::debug!(
+            parent: &span,
+            sekai.operation_id = operation_id.as_str(),
+            "governed action identity bound"
+        );
 
-        let outcome = ActionInstanceAdmission::new(
-            &self.db,
-            self.budget.as_ref().map(std::convert::AsRef::as_ref),
-        )
-        .admit(
-            ActionInstanceAdmissionRequest {
-                namespace,
-                type_id: inner.type_id,
-                version: inner.version,
-                parameters_json: inner.parameters_json,
-                idempotency_key: inner.idempotency_key,
-                evidence_submission_ids: inner.evidence_submission_ids,
-                request_id: inner.request_id,
-                ontology_digest: inner.ontology_digest,
-                autonomous_envelope_id: String::new(),
-            },
-            &actor,
-            now_millis(),
-        )
-        .map_err(|error| match error {
-            ActionInstanceAdmissionError::InvalidArgument(message) => {
-                Status::invalid_argument(message)
-            }
-            ActionInstanceAdmissionError::FailedPrecondition(message) => {
-                Status::failed_precondition(message)
-            }
-            ActionInstanceAdmissionError::AlreadyExists(message) => Status::already_exists(message),
-            ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
+        let outcome = span.in_scope(|| {
+            ActionInstanceAdmission::new(
+                &self.db,
+                self.budget.as_ref().map(std::convert::AsRef::as_ref),
+            )
+            .admit(
+                ActionInstanceAdmissionRequest {
+                    namespace,
+                    type_id: inner.type_id,
+                    version: inner.version,
+                    parameters_json: inner.parameters_json,
+                    idempotency_key: inner.idempotency_key,
+                    evidence_submission_ids: inner.evidence_submission_ids,
+                    request_id: inner.request_id,
+                    ontology_digest: inner.ontology_digest,
+                    autonomous_envelope_id: String::new(),
+                },
+                &actor,
+                now_millis(),
+            )
+            .map_err(|error| match error {
+                ActionInstanceAdmissionError::InvalidArgument(message) => {
+                    Status::invalid_argument(message)
+                }
+                ActionInstanceAdmissionError::FailedPrecondition(message) => {
+                    Status::failed_precondition(message)
+                }
+                ActionInstanceAdmissionError::AlreadyExists(message) => {
+                    Status::already_exists(message)
+                }
+                ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
+            })
         })?;
         Ok(Response::new(SubmitActionInstanceResponse {
             instance: Some(to_proto_action_instance(&outcome.instance)),
@@ -8183,13 +8207,20 @@ impl SekaiService for SekaiServiceImpl {
                 .map_err(|_| Status::unavailable("object authorization unavailable"))?,
             None => None,
         };
+        let operation_id = crate::sekai::operation_correlation::operation_ids_for_objects(
+            &self.db,
+            &[inner.object_id.clone()].into_iter().collect(),
+        )
+        .map_err(Status::internal)?
+        .remove(&inner.object_id)
+        .unwrap_or_default();
         let changes = self
             .db
             .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
             .map_err(Status::internal)?
             .into_iter()
             .map(|change| {
-                if let Some(kind) = object_kind.as_deref() {
+                let mut mapped = if let Some(kind) = object_kind.as_deref() {
                     redact_object_change_values(
                         change,
                         &inner.object_id,
@@ -8208,8 +8239,11 @@ impl SekaiService for SekaiServiceImpl {
                         new_value: change.new_value,
                         changed_by: change.changed_by,
                         timestamp: change.timestamp,
+                        operation_id: String::new(),
                     }
-                }
+                };
+                mapped.operation_id = operation_id.clone();
+                mapped
             })
             .collect();
         Ok(Response::new(ListObjectChangesResponse { changes }))
@@ -9592,6 +9626,62 @@ mod tests {
         req.metadata_mut()
             .insert("x-principal", MetadataValue::try_from(principal).unwrap());
         req
+    }
+
+    fn with_operation_identity<T>(payload: T, operation_id: &str) -> Request<T> {
+        let mut req = with_principal(payload);
+        req.metadata_mut().insert(
+            crate::sekai::operation_correlation::OPERATION_METADATA,
+            MetadataValue::try_from(operation_id).unwrap(),
+        );
+        req.metadata_mut().insert(
+            crate::sekai::operation_correlation::TRACEPARENT,
+            MetadataValue::try_from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .unwrap(),
+        );
+        req
+    }
+
+    fn span_operation_id(logs: &str, expected: &str) -> String {
+        if logs.contains(&format!("sekai.operation_id=\"{expected}\""))
+            || logs.contains(&format!("sekai.operation_id={expected}"))
+        {
+            expected.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    async fn capture_submit_logs<F, Fut>(work: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log buffer").write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        work().await;
+        String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs")
     }
 
     const SOURCE_TYPE_DIGEST: &str = source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST;
@@ -14579,6 +14669,123 @@ mod tests {
             .expect("receipt");
         assert_eq!(receipt.ontology_digest.as_deref(), Some(digest));
         assert!(receipt.completeness().complete);
+    }
+
+    #[tokio::test]
+    async fn submit_action_instance_propagates_one_operation_identity() {
+        let svc = service();
+        grant_ontology_admin(&svc);
+        grant_action_admin(&svc);
+
+        let mut class = ontology_class("CustomerRecord");
+        class.mapped_kind = "customer_record".into();
+        svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+            class: Some(class),
+        }))
+        .await
+        .unwrap();
+        svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "acme".into(),
+                type_id: "customer.record.create".into(),
+                version: "1".into(),
+                description: "Create one customer record".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"name":{"type":"string"}},"required":["object_id"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                policy_scope: String::new(),
+                budget_scope: String::new(),
+                enabled: true,
+                created_by: String::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                disabled_at_ms: 0,
+                object_kind: "customer_record".into(),
+                object_mutation: "create".into(),
+            }),
+            request_id: "put-record-corr".into(),
+        }))
+        .await
+        .unwrap();
+
+        let operation_id = "op-cross-plane-1";
+        let digest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let logs = capture_submit_logs(|| async {
+            svc.submit_action_instance(with_operation_identity(
+                SubmitActionInstanceRequest {
+                    namespace: "acme".into(),
+                    type_id: "customer.record.create".into(),
+                    version: "1".into(),
+                    parameters_json: r#"{"object_id":"rec-corr-1","name":"Northwind"}"#.into(),
+                    idempotency_key: "record-corr-1".into(),
+                    evidence_submission_ids: Vec::new(),
+                    request_id: operation_id.into(),
+                    ontology_digest: digest.into(),
+                },
+                operation_id,
+            ))
+            .await
+            .unwrap();
+        })
+        .await;
+        assert!(
+            logs.contains("sekai.operation_id") && logs.contains(operation_id),
+            "span must carry the caller identity: {logs}"
+        );
+
+        let receipt = svc
+            .db
+            .get_operation_receipt(operation_id)
+            .unwrap()
+            .expect("receipt");
+        let changes = svc
+            .list_object_changes(with_principal(ListObjectChangesRequest {
+                object_id: "rec-corr-1".into(),
+                limit: 16,
+                offset: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .changes;
+        let object_change = changes
+            .iter()
+            .find(|change| !change.operation_id.is_empty())
+            .expect("object-change event");
+        crate::sekai::operation_correlation::OperationCarriers {
+            span: span_operation_id(&logs, operation_id),
+            receipt: receipt.operation_id,
+            object_change_event: object_change.operation_id.clone(),
+        }
+        .require_same_identity(operation_id)
+        .expect("span, receipt, and object-change event must share the identity");
+    }
+
+    #[tokio::test]
+    async fn submit_action_instance_rejects_mismatched_operation_header() {
+        let svc = service();
+        grant_action_admin(&svc);
+        let error = svc
+            .submit_action_instance(with_operation_identity(
+                SubmitActionInstanceRequest {
+                    namespace: "acme".into(),
+                    type_id: "customer.record.create".into(),
+                    version: "1".into(),
+                    parameters_json: r#"{"object_id":"rec-corr-mismatch"}"#.into(),
+                    idempotency_key: "record-corr-mismatch".into(),
+                    evidence_submission_ids: Vec::new(),
+                    request_id: "op-a".into(),
+                    ontology_digest: String::new(),
+                },
+                "op-b",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains("must match request_id"),
+            "{}",
+            error.message()
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 //! page is never object authority. Snapshot, then stream; a gap or expiry
 //! requires resnapshot.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -75,6 +75,7 @@ pub struct ObjectChangeEvent {
     pub op: String,
     pub field: String,
     pub committed_at_ms: i64,
+    pub operation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +266,19 @@ pub fn read_object_change_subscription(
     if raw.len() > MAX_BACKLOG as usize {
         return disconnect_slow(&subscription, &request.snapshot_revision);
     }
-    let events = project_events(&scope, visible, &raw, subscription.cursor.committed_offset)?;
+    let operation_ids = crate::sekai::operation_correlation::operation_ids_for_objects(
+        db,
+        &raw.iter()
+            .map(|mutation| mutation.change.object_id.clone())
+            .collect(),
+    )?;
+    let events = project_events(
+        &scope,
+        visible,
+        &raw,
+        subscription.cursor.committed_offset,
+        &operation_ids,
+    )?;
     let limit = page_limit(request.limit);
     let page_events = events.into_iter().take(limit).collect::<Vec<_>>();
     if page_events.is_empty() {
@@ -533,6 +546,7 @@ fn project_events(
     visible: &[Object],
     mutations: &[CommittedObjectMutation],
     prior_offset: u64,
+    operation_ids: &HashMap<String, String>,
 ) -> Result<Vec<ObjectChangeEvent>, String> {
     let mut events = Vec::new();
     let mut offset = prior_offset;
@@ -584,6 +598,10 @@ fn project_events(
                 String::new()
             },
             committed_at_ms: mutation.change.timestamp,
+            operation_id: operation_ids
+                .get(&mutation.change.object_id)
+                .cloned()
+                .unwrap_or_default(),
         });
     }
     Ok(events)

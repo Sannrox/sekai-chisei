@@ -132,6 +132,7 @@ impl SekaiServiceImpl {
                     op: event.op,
                     field: event.field,
                     committed_at_ms: event.committed_at_ms,
+                    operation_id: event.operation_id,
                 })
                 .collect(),
             authority: false,
