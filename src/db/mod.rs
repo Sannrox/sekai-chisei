@@ -92,6 +92,7 @@ mod postgres_portfolio;
 mod postgres_retention;
 mod postgres_schema;
 mod postgres_team_namespace;
+mod postgres_workflow_action;
 pub mod replica_conformance;
 pub mod replica_safety;
 pub mod retention;

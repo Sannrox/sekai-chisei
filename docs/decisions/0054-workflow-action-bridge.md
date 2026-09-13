@@ -7,7 +7,8 @@
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/709 (#709)
 - Supersedes: none
 - Superseded by: none
-- Related: [ADR 0013](0013-governed-external-evaluator-adapters.md)
+- Related: [ADR 0013](0013-governed-external-evaluator-adapters.md),
+  [ADR 0065](0065-workflow-action-postgres-parity.md)
 
 ## Context
 
@@ -31,7 +32,7 @@ reconcile them.
 Hidden fields, unknown versions, foreign owners, stale cursors or
 callbacks, ambiguous usage, and missing authority fail closed. Exact
 command replay is idempotent. SQLite is the reference store. PostgreSQL
-stays unavailable.
+persistence is [ADR 0065](0065-workflow-action-postgres-parity.md).
 
 ## Alternatives considered
 
@@ -46,7 +47,8 @@ receipts remain plane-owned.
 Operators submit, park, resume, cancel, callback, get, and reconcile
 through `sekaictl admin workflow`. Reference adapters persist an outbox
 command and call the plane; they never write graph, policy, budget, or
-receipt rows.
+receipt rows. PostgreSQL persistence parity is
+[ADR 0065](0065-workflow-action-postgres-parity.md).
 
 ## Validation
 

@@ -5118,7 +5118,7 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::workflow_action::WorkflowActionBinding>, String> {
         match self {
             Self::Sqlite(db) => db.get_workflow_binding(namespace, binding_id),
-            Self::Postgres(_) => Err(crate::sekai::workflow_action::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.get_workflow_binding(namespace, binding_id),
         }
     }
 
@@ -5130,7 +5130,7 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::workflow_action::WorkflowCallback>, String> {
         match self {
             Self::Sqlite(db) => db.get_workflow_callback(namespace, binding_id, cursor),
-            Self::Postgres(_) => Err(crate::sekai::workflow_action::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.get_workflow_callback(namespace, binding_id, cursor),
         }
     }
 
@@ -5145,7 +5145,9 @@ impl RuntimeDb {
             Self::Sqlite(db) => {
                 db.get_workflow_command(namespace, binding_id, command, expected_cursor)
             }
-            Self::Postgres(_) => Err(crate::sekai::workflow_action::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                db.get_workflow_command(namespace, binding_id, command, expected_cursor)
+            }
         }
     }
 
@@ -5158,7 +5160,7 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.commit_workflow_transition(expected, next, callback, command),
-            Self::Postgres(_) => Err(crate::sekai::workflow_action::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => db.commit_workflow_transition(expected, next, callback, command),
         }
     }
 

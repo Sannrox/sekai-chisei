@@ -994,6 +994,41 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_job_adapter_shares_the_governed_lifecycle() {
+        let runtime = postgres_runtime();
+        runtime
+            .put_governed_action_type(job_type(), "operator", 1)
+            .unwrap();
+        runtime
+            .put_governed_action_type(approval_type(), "operator", 1)
+            .unwrap();
+        let mut job = job_envelope();
+        job.source_instance = format!("runner:{}", uuid::Uuid::new_v4());
+        job.step_id = format!("job:{}/build", job.source_instance);
+        job.callback_id = format!("cb:{}", job.step_id.replace('/', ":"));
+        lifecycle(&runtime, job);
+    }
+
+    fn postgres_runtime() -> RuntimeDb {
+        use crate::db::postgres::PostgresDb;
+        use std::sync::Arc;
+
+        let database_url = std::env::var("SEKAI_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            panic!("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database")
+        });
+        let db = if let Ok(ca_certificate_path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        };
+        RuntimeDb::Postgres(Arc::new(db))
+    }
+
+    #[test]
     fn hidden_fields_unknown_versions_and_ambiguous_usage_fail_closed() {
         let runtime = setup();
         let mut hidden = serde_json::to_value(job_envelope()).unwrap();

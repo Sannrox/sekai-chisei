@@ -59,6 +59,7 @@ const SOURCE_BATCH_QUARANTINE_SCHEMA: &str =
 const FACT_MIGRATION_SCHEMA: &str = include_str!("postgres/0037_fact_migration.sql");
 const FACT_MIGRATION_AUDIT_SCHEMA: &str = include_str!("postgres/0038_fact_migration_audit.sql");
 const EVENT_STREAMS_SCHEMA: &str = include_str!("postgres/0039_event_streams.sql");
+const WORKFLOW_ACTIONS_SCHEMA: &str = include_str!("postgres/0040_workflow_actions.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -257,6 +258,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 38,
         name: "event_streams",
         sql: EVENT_STREAMS_SCHEMA,
+    },
+    Migration {
+        version: 39,
+        name: "workflow_actions",
+        sql: WORKFLOW_ACTIONS_SCHEMA,
     },
 ];
 
@@ -750,6 +756,17 @@ mod tests {
                 "missing PostgreSQL event-stream table {table}"
             );
         }
+        for table in [
+            "sekai_workflow_action_bindings",
+            "sekai_workflow_action_callbacks",
+            "sekai_workflow_action_commands",
+        ] {
+            assert!(
+                WORKFLOW_ACTIONS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL workflow-action table {table}"
+            );
+        }
+        assert!(WORKFLOW_ACTIONS_SCHEMA.contains("sekai_workflow_action_bindings_identity"));
         assert!(
             DEFINITION_PROPOSALS_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_definition_proposals")
