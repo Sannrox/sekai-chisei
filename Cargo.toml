@@ -26,6 +26,7 @@ resolver = "2"
 default = []
 secret-command = []
 gateway-test-support = []
+experimental-rpcs = []
 
 [dependencies]
 # gRPC

@@ -15,7 +15,11 @@ that credentials must not exceed.
 2. **Project** entries with `capability_projection` (or export the same JSON
    contract).
 3. **Select** capability names the client is allowed to call.
-4. **Generate** TypeScript via `sekai_chisei::capability_codegen::generate_typescript_client`.
+4. **Generate** TypeScript via
+   `sekai_chisei::capability_codegen::generate_stable_typescript_client`
+   for the stable RPC set, or `generate_typescript_client` for an explicit
+   selection. Stable generation omits experimental and remove-classified
+   backing RPCs without a denylist.
 5. **Authenticate** with a principal credential; do not embed secrets in the
    generated client.
 6. **Invoke** through native gRPC using `nativeMetadata` headers. The server

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Classify every public RPC as `stable`, `experimental`, or `remove` from
+  backend and consumer evidence (#871). The default build invokes at most 60
+  stable RPCs. Experimental and remove-classified RPCs keep their wire
+  contract but require `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+  feature. `DiscoverCapabilities` reports `sekai.rpc.experimental` on the
+  core pack; visibility is not a grant.
 - Publish `compatibility.json` (`sekai.compatibility-matrix/v1`) as a
   projection of shipped server, proto, and SDK versions (#873).
   `sekaictl admin compatibility check` reports on-matrix or off-matrix and

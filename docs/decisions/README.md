@@ -91,3 +91,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0068: Deliver object-change subscriptions from committed facts](0068-object-change-subscriptions.md)
 - [ADR 0069: Stamp one caller operation identity on spans, receipts, and object changes](0069-operation-correlation.md)
 - [ADR 0070: Publish a compatibility matrix as a projection of shipped metadata](0070-compatibility-matrix.md)
+- [ADR 0071: Classify public RPCs by backend and consumer evidence](0071-rpc-maturity.md)

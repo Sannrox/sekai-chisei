@@ -65,6 +65,30 @@ pub fn scope_allows(scope: &CapabilityScopeManifest, capability: &str) -> bool {
     scope.allowed_capabilities.contains(capability)
 }
 
+/// Generate a TypeScript client from every **stable** capability in `catalog`.
+///
+/// Experimental and remove-classified backing RPCs are omitted automatically.
+/// Callers do not pass a denylist.
+pub fn generate_stable_typescript_client(
+    catalog: &[ProjectedCapability],
+    context: &ProjectionContext,
+    catalog_version_pin: Option<String>,
+) -> Result<GeneratedClient, CodegenError> {
+    let capability_names = catalog
+        .iter()
+        .filter(|capability| crate::rpc_maturity::capability_is_stable(&capability.name))
+        .map(|capability| capability.name.clone())
+        .collect();
+    generate_typescript_client(
+        catalog,
+        &CodegenSelection {
+            context: context.clone(),
+            capability_names,
+            catalog_version_pin,
+        },
+    )
+}
+
 /// Generate a TypeScript client from projected capabilities and an explicit
 /// selection. Fails closed on empty selection, pin mismatch, or missing names.
 pub fn generate_typescript_client(
@@ -415,5 +439,32 @@ mod tests {
             generate_typescript_client(&[capability], &selection),
             Err(CodegenError::CatalogPinMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn stable_generation_omits_experimental_without_a_denylist() {
+        let catalog = vec![
+            fixture_capability("sekai.action.assign_color"),
+            fixture_capability("sekai.semantic.expand_relations"),
+            fixture_capability("chisei.kioku.candidates.list"),
+        ];
+        let generated = generate_stable_typescript_client(
+            &catalog,
+            &catalog[0].context,
+            Some("sha256:fixture-catalog".into()),
+        )
+        .unwrap();
+        assert!(scope_allows(&generated.scope, "sekai.action.assign_color"));
+        assert!(!scope_allows(
+            &generated.scope,
+            "sekai.semantic.expand_relations"
+        ));
+        assert!(!scope_allows(
+            &generated.scope,
+            "chisei.kioku.candidates.list"
+        ));
+        assert!(generated.typescript.contains("sekaiActionAssignColor"));
+        assert!(!generated.typescript.contains("expand_relations"));
+        assert!(!generated.typescript.contains("kioku"));
     }
 }

@@ -41,6 +41,9 @@ impl SekaiServiceImpl {
         entries.push(retrieve_context_capability());
         entries.push(explain_derivation_capability());
         entries.push(kioku_candidates_capability());
+        entries.push(experimental_rpc_capability(
+            crate::rpc_maturity::experimental_rpcs_enabled(),
+        ));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -80,6 +83,7 @@ fn base_capability(
 /// Orthogonal to backend inventory completeness.
 fn capability_product_tier(name: &str) -> &'static str {
     match name {
+        crate::rpc_maturity::EXPERIMENTAL_CAPABILITY => "core",
         semantic::CAPABILITY_EXPAND_RELATIONS
         | semantic::CAPABILITY_RETRIEVE_CONTEXT
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
@@ -360,6 +364,23 @@ fn kioku_candidates_capability() -> CapabilityEntry {
     entry.limits = vec![CapabilityLimit {
         name: "max_results".into(),
         value: 100,
+    }];
+    entry
+}
+
+fn experimental_rpc_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::rpc_maturity::EXPERIMENTAL_CAPABILITY.into(),
+        "Explicit capability to invoke experimental or remove-classified RPCs. Off by default; visibility is not a grant."
+            .into(),
+        "runtime",
+        "sekai.DiscoverCapabilitiesRequest",
+        "sekai.DiscoverCapabilitiesResponse",
+    );
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.limits = vec![CapabilityLimit {
+        name: "enabled".into(),
+        value: u64::from(enabled),
     }];
     entry
 }

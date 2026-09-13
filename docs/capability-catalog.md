@@ -127,6 +127,12 @@ request the full authorized catalog, or name `advanced` or `experimental`
 explicitly. Each `CapabilityEntry` also carries `product_tier` for client-side
 filtering.
 
+`product_tier` is **not** wire maturity. [rpc-maturity.md](rpc-maturity.md)
+classifies every public RPC as `stable`, `experimental`, or `remove`. The
+core pack always includes `sekai.rpc.experimental`; `lifecycle_state` is
+`disabled` unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+build feature is on. Visibility of that entry is not a grant.
+
 Each entry advertises:
 
 - protobuf input and output types;
