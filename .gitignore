@@ -37,3 +37,6 @@ data/local-credential.json
 data/evidence-adapter-outbox/
 data/source-adapter-outbox/
 docs/plans/
+
+# Delivery lane worktrees (docs/project-operating-system.md, "Parallel delivery lanes")
+/.worktrees/

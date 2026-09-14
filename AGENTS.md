@@ -16,6 +16,17 @@ Use `.env.example` as the configuration reference. Important variables include `
 
 GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
 
+Each delivered Issue is one lane: one claim branch `<type>/<issue>` on GitHub,
+one worktree at `.worktrees/issue-<issue>` (or a dedicated clone on another
+machine), one Pull Request, one owner. Claims live on GitHub because lanes run
+on several machines; claim with
+`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>` before
+implementing. Agents never switch, reset, or stash the primary checkout;
+inspect `git status -sb` and `git worktree list` before Git or GitHub work and
+preserve other lanes. The "Parallel delivery lanes" section of
+`docs/project-operating-system.md` defines claims, the lane limit, collision
+surfaces, and serialized Git mutations.
+
 ## Ontology Policy
 
 For work involving portable ontology definitions, classes, relations, provenance, validation, import, export, or structural queries, always use the project-local `sekai-ontology` Skill in `.agents/skills/sekai-ontology/`.
