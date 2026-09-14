@@ -39,6 +39,12 @@ fn rpc_exists(rpc: &str) -> bool {
     if rpc.contains("sekai-mcp") {
         return Path::new("src/bin/sekai_mcp.rs").exists();
     }
+    if rpc.contains("POST /") || rpc.contains("/mcp") {
+        return Path::new("src/http_projection.rs").exists();
+    }
+    if rpc.contains("TypeScript") || rpc.contains("goldens") {
+        return Path::new("src/http_codegen.rs").exists();
+    }
     let name = rpc
         .rsplit('.')
         .next()

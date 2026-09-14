@@ -28,9 +28,12 @@ Coverage:
   [postgres-chisei-parity.md](postgres-chisei-parity.md).
 - **Rust** means `sekaictl`, examples, or the crate API.
 - **TypeScript / Python** means the thin facades under [`sdk/`](../sdk/README.md).
-  Those facades do not bundle a second proto snapshot.
-- **MCP** is the `sekai-mcp` stdio projection host over the v1 object, Action,
-  and receipt allowlist. It is not a second protocol package.
+  Those facades do not bundle a second proto snapshot. Generated HTTP clients
+  (`sdk/typescript/http.ts`, `sdk/python/sekai_http.py`) call the same RPCs
+  over the in-process HTTP/JSON projection.
+- **MCP** is the `sekai-mcp` stdio projection host and the HTTP `/mcp`
+  JSON-RPC endpoint on `SEKAI_HTTP_PORT`. Both reuse bearer identity. They
+  are not a second protocol package.
 
 <!-- integration-contract-rows -->
 
@@ -70,6 +73,9 @@ Coverage:
 | Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
 | Object-change subscription (#838) | supported | Sekai | `SekaiService.ReadObjectChangeSubscription` | [object-change-subscriptions.md](object-change-subscriptions.md) | `src/grpc/object_change_subscription.rs` |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
+| HTTP/JSON ontology projection (#875) | supported | Interface | `POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
+| HTTP MCP projection (#875) | supported | Interface | `POST /mcp` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
+| Generated HTTP clients (#875) | supported | Interface | TypeScript / Python / Rust goldens | [sdk-packages.md](sdk-packages.md) | `src/http_codegen.rs` |
 | Registry-published SDK | unavailable | Interface | — | [sdk-packages.md](sdk-packages.md) | `docs/sdk-packages.md` |
 
 <!-- /integration-contract-rows -->

@@ -1,7 +1,9 @@
 # Sekai/Chisei SDKs
 
 The SDKs are thin, server-side facades over the existing native gRPC contracts.
-They do not add a REST route, replace gRPC, discover authority, make policy
+Generated HTTP clients (`typescript/http.ts`, `python/sekai_http.py`) call the
+same stable unary RPCs over the in-process HTTP/JSON projection. They do not
+add a REST resource model, replace gRPC, discover authority, make policy
 decisions, or hold credentials beyond the in-memory bearer token needed to
 attach request metadata. Every call is still authorized by the control plane.
 

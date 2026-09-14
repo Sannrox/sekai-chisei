@@ -19,12 +19,14 @@ template.
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path; set empty to disable |
 | `OPS_BIND` | `127.0.0.1` | Health, metrics, and operator console bind address |
 | `OPS_PORT` | `9464` | Health, metrics, and console port; set empty to disable |
+| `SEKAI_HTTP_BIND` | `127.0.0.1` | HTTP/JSON projection of stable gRPC; loopback unless `SEKAI_ALLOW_PLAINTEXT=1` |
+| `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, and the gateway; never bootstraps server authority |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
-| `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for `sekai-mcp`; no MCP network bind |
+| `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |

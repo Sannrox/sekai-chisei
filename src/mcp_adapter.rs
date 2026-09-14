@@ -15,7 +15,7 @@ pub use in_process::{InProcessSurface, SyntheticHostReport, run_synthetic_host};
 pub use protocol::{PROTOCOL_VERSION, handle_message, well_known_tools};
 pub use surface::{
     AdapterError, CatalogSnapshot, FixtureObject, FixtureSurface, NativeRpc, NativeSurface,
-    SdkSurface,
+    SdkSurface, dispatch_native, status_error,
 };
 
 use std::sync::Arc;

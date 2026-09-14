@@ -1060,6 +1060,8 @@ mod tests {
             sekai_bind: None,
             ops_port: None,
             ops_bind: "127.0.0.1".into(),
+            http_port: None,
+            http_bind: "127.0.0.1".into(),
             sekai_socket: None,
             db_path: ":memory:".into(),
             anthropic_api_key: None,
