@@ -198,9 +198,6 @@ pub struct PolicySnapshot {
 pub fn compile_object_access(
     request: PolicyCompileRequest<'_>,
 ) -> Result<CompiledObjectAccess, String> {
-    if request.namespace.is_empty() || request.kind.is_empty() {
-        return Err("policy decision requires namespace and kind".into());
-    }
     let context = request.context.clone().normalized();
     let principal_digest = context.digest()?;
     let policy_revision_digest = match request.policy {
