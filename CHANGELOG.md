@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Accept audience-bound, one-use signed identity assertions that fill the
+  existing `AuthenticatedContext` (#888,
+  [ADR 0078](docs/decisions/0078-audience-bound-assertions.md)). No configured
+  authority stays community and tenant-free. Caller-selected tenant headers
+  fail closed. The in-process extension trait stays until this path has
+  documented parity. `compatibility.json` names
+  `sekai.identity-assertion/v1`.
 - Compile every object read and write through one crate-visible policy
   decision point over the shipped v1 vocabularies (#885,
   [ADR 0076](docs/decisions/0076-compiling-policy-entry.md)). Mandatory

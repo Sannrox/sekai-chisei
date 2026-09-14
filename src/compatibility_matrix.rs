@@ -24,6 +24,8 @@ pub struct CompatibilityMatrix {
     pub server_version: String,
     pub proto_revision: String,
     pub minimum_compatible_server: String,
+    #[serde(default)]
+    pub identity_assertion_contract: String,
     pub packages: CompatibilityPackages,
 }
 
@@ -115,6 +117,8 @@ impl CompatibilityMatrix {
             server_version: server_version.clone(),
             proto_revision,
             minimum_compatible_server: server_version.clone(),
+            identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
+                .into(),
             packages: CompatibilityPackages {
                 sekai_chisei: server_version,
                 sekai_proto,
@@ -148,6 +152,12 @@ impl CompatibilityMatrix {
         require_token("python", &self.packages.python)?;
         if !self.proto_revision.starts_with("sha256:") || self.proto_revision.len() <= 7 {
             return Err("compatibility matrix proto_revision is missing".into());
+        }
+        if !self.identity_assertion_contract.is_empty()
+            && self.identity_assertion_contract
+                != crate::identity_assertion::IDENTITY_ASSERTION_VERSION
+        {
+            return Err("compatibility matrix identity assertion contract is unsupported".into());
         }
         if self.packages.sekai_chisei != self.server_version {
             return Err(
@@ -1014,6 +1024,8 @@ mod tests {
             server_version: "1.0.1".into(),
             proto_revision: "sha256:proto".into(),
             minimum_compatible_server: "1.0.1".into(),
+            identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
+                .into(),
             packages: CompatibilityPackages {
                 sekai_chisei: "1.0.1".into(),
                 sekai_proto: "1.0.1".into(),
