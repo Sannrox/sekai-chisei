@@ -408,15 +408,10 @@ pub(super) fn evaluate_active_object_policy(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> Result<Option<bool>, Status> {
-    match db.active_object_policy(&object.namespace, &object.kind) {
-        Ok(None) => Ok(None),
-        Ok(Some(policy)) => {
-            let context = principal_policy_context_from(principals, tenant_context);
-            Ok(Some(policy.allows(&context, object, operation)))
-        }
-        Err(error) if error.starts_with("object_security_denied") => Ok(Some(false)),
-        Err(_) => Err(Status::unavailable("object authorization unavailable")),
-    }
+    Ok(Some(
+        decide_object_access(db, object, principals, tenant_context, operation)?.outcome
+            == crate::sekai::policy_decision::PolicyOutcome::Allow,
+    ))
 }
 pub(super) fn object_passes_security_policy(
     db: &RuntimeDb,
@@ -428,11 +423,10 @@ pub(super) fn object_passes_security_policy(
     if is_reserved_governance_kind(&object.kind) {
         return object_passes_marking(db, object, principals);
     }
-    match evaluate_active_object_policy(db, object, principals, tenant_context, operation)? {
-        Some(false) => Ok(false),
-        Some(true) => object_passes_marking(db, object, principals),
-        None => object_passes_marking(db, object, principals),
-    }
+    Ok(
+        decide_object_access(db, object, principals, tenant_context, operation)?.outcome
+            == crate::sekai::policy_decision::PolicyOutcome::Allow,
+    )
 }
 pub(super) fn enforce_object_operation_access(
     db: &RuntimeDb,
@@ -442,15 +436,77 @@ pub(super) fn enforce_object_operation_access(
     operation: crate::sekai::object_security::ObjectSecurityOperation,
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    if let Some(allowed) =
-        evaluate_active_object_policy(db, object, principals, tenant_context, operation)?
-    {
-        if !allowed {
-            return Err(Status::permission_denied("access denied"));
-        }
-        return enforce_object_marking_access(db, object, principals, operation_id);
+    let decision = decide_object_access(db, object, principals, tenant_context, operation)?;
+    let record = crate::sekai::policy_decision::PolicyDecisionRecord {
+        event_id: format!("{operation_id}:{}", uuid::Uuid::new_v4().as_simple()),
+        decision: decision.clone(),
+        created_at_ms: now_millis(),
+    };
+    db.record_policy_decision(&record)
+        .map_err(|_| Status::unavailable("policy decision audit unavailable"))?;
+    if decision.outcome != crate::sekai::policy_decision::PolicyOutcome::Allow {
+        return Err(Status::permission_denied("access denied"));
     }
     enforce_object_marking_access(db, object, principals, operation_id)
+}
+
+pub(super) fn decide_object_access(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> Result<crate::sekai::policy_decision::PolicyDecision, Status> {
+    let policy = match db.active_object_policy(&object.namespace, &object.kind) {
+        Ok(policy) => policy,
+        Err(error) if error.starts_with("object_security_denied") => {
+            return Ok(crate::sekai::policy_decision::PolicyDecision {
+                contract_version: crate::sekai::policy_decision::POLICY_DECISION_CONTRACT.into(),
+                namespace: object.namespace.clone(),
+                object_kind: object.kind.clone(),
+                object_id: object.id.clone(),
+                operation: operation.as_str().into(),
+                principal: principals.first().cloned().unwrap_or_default(),
+                principal_digest: String::new(),
+                activation_digest: String::new(),
+                policy_revision_digest: String::new(),
+                outcome: crate::sekai::policy_decision::PolicyOutcome::Deny,
+                denied_by: Some(crate::sekai::policy_decision::PolicyLayer::ObjectRow),
+            });
+        }
+        Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+    };
+    let lattice = load_classification_lattice(db, &object.namespace)?;
+    let authority = resolve_principal_authority(db, principals)?;
+    let context = principal_policy_context_from(principals, tenant_context);
+    let activation = db
+        .get_object_security_activation(&object.namespace)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+    let activation_digest = match activation.as_ref() {
+        Some(activation) => {
+            crate::sekai::object_security::object_security_activation_digest(activation)
+                .unwrap_or_else(|_| "legacy".into())
+        }
+        None => "legacy".into(),
+    };
+    let compiled = crate::sekai::policy_decision::compile_object_access(
+        crate::sekai::policy_decision::PolicyCompileRequest {
+            namespace: &object.namespace,
+            kind: &object.kind,
+            operation,
+            context: &context,
+            authority: &authority,
+            lattice: lattice.as_ref(),
+            policy: policy.as_ref(),
+            activation_digest: &activation_digest,
+            purpose: None,
+            purpose_authorization: None,
+            now_ms: now_millis(),
+            namespace_granted: true,
+        },
+    )
+    .map_err(Status::internal)?;
+    Ok(compiled.decide(object))
 }
 pub(super) fn ensure_policy_driving_update_allowed(
     db: &RuntimeDb,

@@ -3,7 +3,18 @@
 `sekai.object-security-policy/v1` is an immutable, namespace- and object-kind
 scoped read policy. Operators install canonical JSON through
 `PutObjectSecurityPolicyRevision`, then atomically activate a complete
-kind-to-revision map through `ActivateObjectSecurityPolicies`. Inspection
+kind-to-revision map through `ActivateObjectSecurityPolicies`.
+
+Every object read and write compiles the already-shipped v1 vocabularies
+through one crate-visible decision point (`compile_object_access`,
+[ADR 0076](decisions/0076-compiling-policy-entry.md)). Mandatory markings stay
+mandatory. Discretionary namespace grants, row rules, purpose, property grants,
+and value-instance grants narrow after that. Storage SQL applies the compiled
+row and marking residuals before materialization; it is a projection, not a
+second authority. `SimulateObjectPolicyChange` is a read projection over
+activation digests and never mutates. `QueryObjectPolicyAudit` returns allow or
+deny with policy identities and revision; export omits hidden values. Both RPCs
+are experimental. Inspection
 RPCs (`GetObjectSecurityPolicyRevision`, `GetObjectSecurityActivation`,
 `PutPurposeAuthorization`, `RevokePurposeAuthorization`,
 `PutClassificationLattice`, `GetClassificationLattice`) use the same

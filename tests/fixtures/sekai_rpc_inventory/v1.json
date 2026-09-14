@@ -466,6 +466,30 @@
       "product_tier": "core"
     },
     {
+      "rpc": "SimulateObjectPolicyChange",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/policy_decision.rs",
+        "src/grpc/sekai_service_rpc_objects.rs",
+        "docs/object-security.md"
+      ],
+      "durable_dependencies": ["sekai.object-security"],
+      "product_tier": "core"
+    },
+    {
+      "rpc": "QueryObjectPolicyAudit",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/policy_decision.rs",
+        "src/grpc/sekai_service_rpc_objects.rs",
+        "docs/object-security.md"
+      ],
+      "durable_dependencies": ["sekai.object-security"],
+      "product_tier": "core"
+    },
+    {
       "rpc": "FindByExternalId",
       "kind": "persistent",
       "surfaces": [

@@ -8,6 +8,10 @@ use crate::db::postgres::PostgresDb;
 use crate::sekai::object_security::{
     ObjectSecurityActivation, ObjectSecurityPolicy, ObjectSecurityPolicyRevision,
 };
+use crate::sekai::policy_decision::{
+    POLICY_DECISION_CONTRACT, PolicyDecision, PolicyDecisionQuery, PolicyDecisionRecord,
+    PolicyLayer, PolicyOutcome,
+};
 
 impl PostgresDb {
     pub fn put_object_security_policy(
@@ -269,6 +273,103 @@ impl PostgresDb {
             )
             .map(|row| row.get(0))
             .map_err(|error| error.to_string())
+    }
+
+    pub fn record_policy_decision(&self, record: &PolicyDecisionRecord) -> Result<(), String> {
+        let denied_by = record
+            .decision
+            .denied_by
+            .map(|layer| layer.as_str().to_string())
+            .unwrap_or_default();
+        let outcome = record.decision.outcome.as_str().to_string();
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_policy_decision_audit
+                 (event_id, namespace, object_kind, object_id, operation, principal,
+                  principal_digest, activation_digest, policy_revision_digest, outcome,
+                  denied_by, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &record.event_id,
+                    &record.decision.namespace,
+                    &record.decision.object_kind,
+                    &record.decision.object_id,
+                    &record.decision.operation,
+                    &record.decision.principal,
+                    &record.decision.principal_digest,
+                    &record.decision.activation_digest,
+                    &record.decision.policy_revision_digest,
+                    &outcome,
+                    &denied_by,
+                    &record.created_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn query_policy_decisions(
+        &self,
+        query: &PolicyDecisionQuery,
+    ) -> Result<Vec<PolicyDecisionRecord>, String> {
+        let limit = if query.limit <= 0 {
+            100i32
+        } else {
+            query.limit.min(1000)
+        };
+        let offset = query.offset.max(0);
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT event_id, namespace, object_kind, object_id, operation, principal,
+                        principal_digest, activation_digest, policy_revision_digest, outcome,
+                        denied_by, created_at_ms
+                 FROM sekai_policy_decision_audit
+                 WHERE namespace=$1
+                   AND ($2 = '' OR principal=$2)
+                   AND ($3 = '' OR object_id=$3)
+                   AND ($4 <= 0 OR created_at_ms >= $4)
+                   AND ($5 <= 0 OR created_at_ms <= $5)
+                 ORDER BY created_at_ms ASC, event_id ASC
+                 LIMIT $6 OFFSET $7",
+                &[
+                    &query.namespace,
+                    &query.principal,
+                    &query.object_id,
+                    &query.from_ms,
+                    &query.to_ms,
+                    &(limit as i64),
+                    &(offset as i64),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            let outcome: String = row.get(9);
+            let denied_by: String = row.get(10);
+            records.push(PolicyDecisionRecord {
+                event_id: row.get(0),
+                created_at_ms: row.get(11),
+                decision: PolicyDecision {
+                    contract_version: POLICY_DECISION_CONTRACT.into(),
+                    namespace: row.get(1),
+                    object_kind: row.get(2),
+                    object_id: row.get(3),
+                    operation: row.get(4),
+                    principal: row.get(5),
+                    principal_digest: row.get(6),
+                    activation_digest: row.get(7),
+                    policy_revision_digest: row.get(8),
+                    outcome: PolicyOutcome::parse(&outcome)?,
+                    denied_by: if denied_by.is_empty() {
+                        None
+                    } else {
+                        Some(PolicyLayer::parse(&denied_by)?)
+                    },
+                },
+            });
+        }
+        Ok(records)
     }
 
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {

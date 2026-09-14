@@ -86,6 +86,8 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.PutClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.GetClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.FindByProperty` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.CreateLink` | `sekai.graph` | yes | sdk | `stable` |

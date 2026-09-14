@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Compile every object read and write through one crate-visible policy
+  decision point over the shipped v1 vocabularies (#885,
+  [ADR 0076](docs/decisions/0076-compiling-policy-entry.md)). Mandatory
+  markings stay mandatory; grants, purpose, property, and value-instance
+  rules narrow after that. `SimulateObjectPolicyChange` is a read
+  projection and never a grant. `QueryObjectPolicyAudit` returns allow or
+  deny with policy identities and revision and omits hidden values. Both
+  RPCs stay experimental.
 - Let a `GovernedActionType` declare closed submission criteria and a
   declared effect-kind subset (#883,
   [ADR 0077](docs/decisions/0077-action-type-criteria.md)). Preview names a
