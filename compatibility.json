@@ -1,7 +1,7 @@
 {
   "contract_version": "sekai.compatibility-matrix/v1",
   "server_version": "1.0.1",
-  "proto_revision": "sha256:9f8df3daaca046b99007b867ed715e2a342a17727c2ae9d3f3efd57dd19063ff",
+  "proto_revision": "sha256:aaabd393e69d103e4b1101c6b0903385d9c1ccea372b6912babfc379d119414a",
   "minimum_compatible_server": "1.0.1",
   "packages": {
     "sekai-chisei": "1.0.1",
