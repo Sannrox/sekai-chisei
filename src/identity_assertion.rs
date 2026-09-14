@@ -6,7 +6,7 @@
 //! headers never construct or widen context.
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -64,14 +64,14 @@ pub struct IdentityAssertion {
     pub nonce: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AssertionAuthority {
     pub issuer: String,
     pub audience: String,
     key: Vec<u8>,
     pub clock_skew_secs: i64,
     pub allowed_scopes: BTreeSet<String>,
-    replayed: Mutex<HashSet<String>>,
+    replayed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AssertionAuthority {
@@ -86,7 +86,7 @@ impl AssertionAuthority {
             key: key.into(),
             clock_skew_secs: DEFAULT_SKEW_SECS,
             allowed_scopes: BTreeSet::from(["sekai.read".into(), "sekai.write".into()]),
-            replayed: Mutex::new(HashSet::new()),
+            replayed: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

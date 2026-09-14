@@ -408,15 +408,14 @@ pub(super) fn evaluate_active_object_policy(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> Result<Option<bool>, Status> {
-    match db.active_object_policy(&object.namespace, &object.kind) {
-        Ok(None) => Ok(None),
-        Ok(Some(policy)) => {
-            let context = principal_policy_context_from(principals, tenant_context);
-            Ok(Some(policy.allows(&context, object, operation)))
-        }
-        Err(error) if error.starts_with("object_security_denied") => Ok(Some(false)),
-        Err(_) => Err(Status::unavailable("object authorization unavailable")),
-    }
+    let decision = decide_object_access(db, object, principals, tenant_context, operation)?;
+    Ok(match (decision.outcome, decision.denied_by) {
+        (crate::sekai::policy_decision::PolicyOutcome::Allow, _) => Some(true),
+        // Marking denials stay on the marking path so they remain
+        // PermissionDenied rather than NotFound.
+        (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking)) => None,
+        _ => Some(false),
+    })
 }
 pub(super) fn object_passes_security_policy(
     db: &RuntimeDb,
@@ -441,23 +440,20 @@ pub(super) fn enforce_object_operation_access(
     operation: crate::sekai::object_security::ObjectSecurityOperation,
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    if let Ok(decision) = decide_object_access(db, object, principals, tenant_context, operation) {
-        let record = crate::sekai::policy_decision::PolicyDecisionRecord {
-            event_id: format!("{operation_id}:{}", uuid::Uuid::new_v4().as_simple()),
-            decision,
-            created_at_ms: now_millis(),
-        };
-        let _ = db.record_policy_decision(&record);
-    }
-    if let Some(allowed) =
-        evaluate_active_object_policy(db, object, principals, tenant_context, operation)?
-    {
-        if !allowed {
-            return Err(Status::permission_denied("access denied"));
+    let decision = decide_object_access(db, object, principals, tenant_context, operation)?;
+    let record = crate::sekai::policy_decision::PolicyDecisionRecord {
+        event_id: format!("{operation_id}:{}", uuid::Uuid::new_v4().as_simple()),
+        decision: decision.clone(),
+        created_at_ms: now_millis(),
+    };
+    let _ = db.record_policy_decision(&record);
+    match (decision.outcome, decision.denied_by) {
+        (crate::sekai::policy_decision::PolicyOutcome::Allow, _)
+        | (_, Some(crate::sekai::policy_decision::PolicyLayer::Marking)) => {
+            enforce_object_marking_access(db, object, principals, operation_id)
         }
-        return enforce_object_marking_access(db, object, principals, operation_id);
+        _ => Err(Status::permission_denied("access denied")),
     }
-    enforce_object_marking_access(db, object, principals, operation_id)
 }
 
 pub(super) fn decide_object_access(

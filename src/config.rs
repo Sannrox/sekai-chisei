@@ -52,6 +52,11 @@ pub struct Config {
     pub site_id: String,
     /// Multi-region budget topology (#294). Default `single_region`.
     pub budget_topology: BudgetTopologyConfig,
+    /// Optional audience-bound assertion authority (#888). All three of issuer,
+    /// audience, and HMAC key must be set together; partial config is refused.
+    pub assertion_issuer: Option<String>,
+    pub assertion_audience: Option<String>,
+    pub assertion_hmac_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +129,32 @@ impl Config {
                 warn!(error = %err, "invalid budget topology config; using single_region");
                 BudgetTopologyConfig::single_region()
             }),
+            assertion_issuer: optional_env("SEKAI_ASSERTION_ISSUER"),
+            assertion_audience: optional_env("SEKAI_ASSERTION_AUDIENCE"),
+            assertion_hmac_key: optional_env("SEKAI_ASSERTION_HMAC_KEY"),
+        }
+    }
+
+    pub fn assertion_authority(
+        &self,
+    ) -> Result<Option<crate::identity_assertion::AssertionAuthority>, String> {
+        match (
+            self.assertion_issuer.as_deref(),
+            self.assertion_audience.as_deref(),
+            self.assertion_hmac_key.as_deref(),
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(issuer), Some(audience), Some(key))
+                if !issuer.is_empty() && !audience.is_empty() && !key.is_empty() =>
+            {
+                Ok(Some(crate::identity_assertion::AssertionAuthority::new(
+                    issuer, audience, key.as_bytes(),
+                )))
+            }
+            _ => Err(
+                "assertion authority requires SEKAI_ASSERTION_ISSUER, SEKAI_ASSERTION_AUDIENCE, and SEKAI_ASSERTION_HMAC_KEY together"
+                    .into(),
+            ),
         }
     }
 
@@ -270,6 +301,9 @@ mod tests {
         let mut config = Config::from_env();
         config.sekai_bind = None;
         config.insecure = false;
+        config.assertion_issuer = None;
+        config.assertion_audience = None;
+        config.assertion_hmac_key = None;
         config
     }
 
@@ -319,5 +353,19 @@ mod tests {
         assert!(validate_site_id("   ").is_err());
         assert!(validate_site_id("region*").is_err());
         assert!(validate_site_id("region?").is_err());
+    }
+
+    #[test]
+    fn assertion_authority_requires_all_three_or_none() {
+        let mut config = test_config();
+        assert!(config.assertion_authority().unwrap().is_none());
+        config.assertion_issuer = Some("https://issuer.test".into());
+        assert!(config.assertion_authority().is_err());
+        config.assertion_audience = Some("https://sekai.test".into());
+        assert!(config.assertion_authority().is_err());
+        config.assertion_hmac_key = Some("test-hmac-key".into());
+        let authority = config.assertion_authority().unwrap().expect("installed");
+        assert_eq!(authority.issuer, "https://issuer.test");
+        assert_eq!(authority.audience, "https://sekai.test");
     }
 }

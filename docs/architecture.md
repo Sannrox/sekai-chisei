@@ -297,9 +297,12 @@ runtime endpoints. Validated human and machine credentials converge on one
 internal authenticated context; caller metadata never constructs that context.
 A configured authority may issue a short-lived, audience-bound, one-use
 assertion (`sekai.identity-assertion/v1`) that fills the same context;
-see [ADR 0078](decisions/0078-audience-bound-assertions.md). No authority
-configured stays community behavior. Caller-selected tenant headers fail
-closed.
+see [ADR 0078](decisions/0078-audience-bound-assertions.md). The live
+`TokenAuthInterceptor` verifies `sia1.` tokens when
+`SEKAI_ASSERTION_ISSUER`, `SEKAI_ASSERTION_AUDIENCE`, and
+`SEKAI_ASSERTION_HMAC_KEY` are set together. Partial config is refused.
+No authority configured stays community behavior. Caller-selected tenant
+headers fail closed.
 
 - Namespace and object access control apply when data is read or mutated.
 - Gateway virtual keys and control-plane credentials identify principals; raw

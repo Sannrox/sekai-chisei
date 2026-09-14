@@ -81,6 +81,9 @@ fn ollama_config(db_path: String) -> Config {
         governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
         site_id: "local".into(),
         budget_topology: Default::default(),
+        assertion_issuer: None,
+        assertion_audience: None,
+        assertion_hmac_key: None,
     }
 }
 
@@ -257,6 +260,9 @@ async fn grpc_chat_round_trip_with_local_ollama() {
         governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
         site_id: "local".into(),
         budget_topology: Default::default(),
+        assertion_issuer: None,
+        assertion_audience: None,
+        assertion_hmac_key: None,
     };
     let model = e2e_model();
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
@@ -367,6 +373,9 @@ async fn delegation_chain_keeps_private_context_local() {
         governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
         site_id: "local".into(),
         budget_topology: Default::default(),
+        assertion_issuer: None,
+        assertion_audience: None,
+        assertion_hmac_key: None,
     };
     let local_model = e2e_model();
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(

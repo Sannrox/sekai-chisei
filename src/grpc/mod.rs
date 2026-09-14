@@ -46,11 +46,44 @@ pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 }
 
 impl TokenAuthInterceptor {
     pub fn new(store: Arc<PrincipalCredentialStore>, db: Arc<RuntimeDb>) -> Self {
-        Self { store, db }
+        Self {
+            store,
+            db,
+            assertion_authority: None,
+        }
+    }
+
+    pub fn with_assertion_authority(
+        mut self,
+        assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    ) -> Self {
+        self.assertion_authority = assertion_authority;
+        self
+    }
+
+    pub fn from_runtime(
+        store: Arc<PrincipalCredentialStore>,
+        db: Arc<RuntimeDb>,
+        assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+    ) -> Self {
+        Self::new(store, db).with_assertion_authority(assertion_authority)
+    }
+
+    pub fn from_config(
+        store: Arc<PrincipalCredentialStore>,
+        db: Arc<RuntimeDb>,
+        config: &Config,
+    ) -> Result<Self, String> {
+        Ok(Self::from_runtime(
+            store,
+            db,
+            config.assertion_authority()?.map(Arc::new),
+        ))
     }
 
     /// Resolve a raw bearer token to an active principal credential.
@@ -101,125 +134,171 @@ fn reject_unauthorized() {
     );
 }
 
+fn assertion_reject_status(reject: crate::identity_assertion::AssertionReject) -> Status {
+    match reject {
+        crate::identity_assertion::AssertionReject::CallerTenantHeader => {
+            Status::failed_precondition("caller-selected tenant header")
+        }
+        crate::identity_assertion::AssertionReject::Issuer => {
+            Status::unauthenticated("invalid assertion issuer")
+        }
+        crate::identity_assertion::AssertionReject::Audience => {
+            Status::unauthenticated("invalid assertion audience")
+        }
+        crate::identity_assertion::AssertionReject::Signature => {
+            Status::unauthenticated("invalid assertion signature")
+        }
+        crate::identity_assertion::AssertionReject::Expiry => {
+            Status::unauthenticated("assertion expired")
+        }
+        crate::identity_assertion::AssertionReject::Replay => {
+            Status::unauthenticated("assertion replay")
+        }
+        crate::identity_assertion::AssertionReject::ScopeEscalation => {
+            Status::permission_denied("assertion scope escalation")
+        }
+    }
+}
+
+fn finish_authenticated(
+    mut req: Request<()>,
+    authenticated_context: crate::enterprise::AuthenticatedContext,
+    enterprise_scoped: bool,
+) -> Result<Request<()>, Status> {
+    let principal = authenticated_context.principal.subject.clone();
+    let credential_id = authenticated_context.principal.credential_id.clone();
+    if !valid_single_principal(&principal) {
+        reject_unauthorized();
+        return Err(Status::unauthenticated("invalid principal identity"));
+    }
+
+    while req.metadata_mut().remove("x-principal").is_some() {}
+    while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
+    while req.metadata_mut().remove(CREDENTIAL_ID_HEADER).is_some() {}
+    while req.metadata_mut().remove(TENANT_CONTEXT_HEADER).is_some() {}
+    req.metadata_mut().insert(
+        "x-principal",
+        MetadataValue::from_str(&principal).map_err(|_| {
+            reject_unauthorized();
+            Status::unauthenticated("invalid principal metadata value")
+        })?,
+    );
+    req.metadata_mut().insert(
+        AUTH_SOURCE_HEADER,
+        MetadataValue::from_static(if enterprise_scoped {
+            "enterprise"
+        } else {
+            "token"
+        }),
+    );
+    req.metadata_mut().insert(
+        CREDENTIAL_ID_HEADER,
+        MetadataValue::from_str(&credential_id)
+            .map_err(|_| Status::unauthenticated("invalid credential identity"))?,
+    );
+    if enterprise_scoped {
+        if let Some(tenant) = authenticated_context.tenant.as_ref() {
+            req.metadata_mut().insert(
+                TENANT_CONTEXT_HEADER,
+                MetadataValue::from_str(&tenant.tenant_id)
+                    .map_err(|_| Status::unauthenticated("invalid tenant identity"))?,
+            );
+        }
+        let method = req
+            .extensions()
+            .get::<tonic::GrpcMethod<'_>>()
+            .map(|method| method.method());
+        if method.is_none_or(|method| !enterprise_namespace_method(method)) {
+            return Err(Status::permission_denied(
+                "RPC is not available to enterprise-scoped credentials",
+            ));
+        }
+    }
+    req.extensions_mut().insert(authenticated_context);
+    Ok(req)
+}
+
 impl tonic::service::Interceptor for TokenAuthInterceptor {
-    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         let Some(token) = Self::parse_bearer_token(req.metadata()) else {
             reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
         };
-        if crate::identity_assertion::is_assertion_token(&token)
-            && req.metadata().get(TENANT_CONTEXT_HEADER).is_some()
-        {
-            reject_unauthorized();
-            return Err(Status::failed_precondition("caller-selected tenant header"));
+        if crate::identity_assertion::is_assertion_token(&token) {
+            let tenant_header = req
+                .metadata()
+                .get(TENANT_CONTEXT_HEADER)
+                .map(|value| value.to_str().unwrap_or("invalid"));
+            match &self.assertion_authority {
+                Some(authority) => {
+                    let now = chrono::Utc::now().timestamp();
+                    let authenticated_context = authority
+                        .verify(&token, now, tenant_header)
+                        .map_err(|reject| {
+                            reject_unauthorized();
+                            assertion_reject_status(reject)
+                        })?;
+                    let enterprise_scoped = authenticated_context.tenant.is_some();
+                    return finish_authenticated(req, authenticated_context, enterprise_scoped);
+                }
+                None if tenant_header.is_some() => {
+                    reject_unauthorized();
+                    return Err(Status::failed_precondition("caller-selected tenant header"));
+                }
+                None => {}
+            }
         }
 
         let enterprise_result = self
             .db
             .enterprise_extension()
             .map(|extension| extension.authenticate_context(&token));
-        let (principal, credential_id, authenticated_context, enterprise_scoped) =
-            match enterprise_result {
-                Some(Ok(context)) => {
-                    let extension_version = self
-                        .db
-                        .enterprise_extension()
-                        .expect("enterprise authentication requires an installed extension")
-                        .contract_version();
-                    if extension_version != crate::enterprise::IDENTITY_EXTENSION_VERSION
-                        || context.contract_version != extension_version
-                    {
-                        reject_unauthorized();
-                        return Err(Status::failed_precondition(
-                            "unsupported enterprise identity contract version",
-                        ));
-                    }
-                    if context.expires_at <= chrono::Utc::now().timestamp() {
-                        reject_unauthorized();
-                        return Err(Status::unauthenticated(
-                            "enterprise authenticated context expired",
-                        ));
-                    }
-                    (
-                        context.principal.subject.clone(),
-                        context.principal.credential_id.clone(),
-                        context,
-                        true,
-                    )
-                }
-                Some(Err(crate::enterprise::ExtensionError::CredentialNotFound)) | None => {
-                    let credential = self.resolve_credential(&token).ok_or_else(|| {
-                        reject_unauthorized();
-                        Status::unauthenticated("invalid token")
-                    })?;
-                    let principal = crate::enterprise::AuthenticatedPrincipal {
-                        subject: credential.principal,
-                        credential_id: credential.id,
-                    };
-                    (
-                        principal.subject.clone(),
-                        principal.credential_id.clone(),
-                        crate::enterprise::AuthenticatedContext::machine(principal),
-                        false,
-                    )
-                }
-                Some(Err(crate::enterprise::ExtensionError::Unavailable(message))) => {
-                    return Err(Status::unavailable(message));
-                }
-                Some(Err(_)) => {
+        let (authenticated_context, enterprise_scoped) = match enterprise_result {
+            Some(Ok(context)) => {
+                let extension_version = self
+                    .db
+                    .enterprise_extension()
+                    .expect("enterprise authentication requires an installed extension")
+                    .contract_version();
+                if extension_version != crate::enterprise::IDENTITY_EXTENSION_VERSION
+                    || context.contract_version != extension_version
+                {
                     reject_unauthorized();
-                    return Err(Status::unauthenticated("invalid token"));
+                    return Err(Status::failed_precondition(
+                        "unsupported enterprise identity contract version",
+                    ));
                 }
-            };
-        if !valid_single_principal(&principal) {
-            reject_unauthorized();
-            return Err(Status::unauthenticated("invalid principal identity"));
-        }
-
-        while req.metadata_mut().remove("x-principal").is_some() {}
-        while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
-        while req.metadata_mut().remove(CREDENTIAL_ID_HEADER).is_some() {}
-        while req.metadata_mut().remove(TENANT_CONTEXT_HEADER).is_some() {}
-        req.metadata_mut().insert(
-            "x-principal",
-            MetadataValue::from_str(&principal).map_err(|_| {
+                if context.expires_at <= chrono::Utc::now().timestamp() {
+                    reject_unauthorized();
+                    return Err(Status::unauthenticated(
+                        "enterprise authenticated context expired",
+                    ));
+                }
+                (context, true)
+            }
+            Some(Err(crate::enterprise::ExtensionError::CredentialNotFound)) | None => {
+                let credential = self.resolve_credential(&token).ok_or_else(|| {
+                    reject_unauthorized();
+                    Status::unauthenticated("invalid token")
+                })?;
+                let principal = crate::enterprise::AuthenticatedPrincipal {
+                    subject: credential.principal,
+                    credential_id: credential.id,
+                };
+                (
+                    crate::enterprise::AuthenticatedContext::machine(principal),
+                    false,
+                )
+            }
+            Some(Err(crate::enterprise::ExtensionError::Unavailable(message))) => {
+                return Err(Status::unavailable(message));
+            }
+            Some(Err(_)) => {
                 reject_unauthorized();
-                Status::unauthenticated("invalid principal metadata value")
-            })?,
-        );
-        req.metadata_mut().insert(
-            AUTH_SOURCE_HEADER,
-            MetadataValue::from_static(if enterprise_scoped {
-                "enterprise"
-            } else {
-                "token"
-            }),
-        );
-        req.metadata_mut().insert(
-            CREDENTIAL_ID_HEADER,
-            MetadataValue::from_str(&credential_id)
-                .map_err(|_| Status::unauthenticated("invalid credential identity"))?,
-        );
-        if enterprise_scoped {
-            if let Some(tenant) = authenticated_context.tenant.as_ref() {
-                req.metadata_mut().insert(
-                    TENANT_CONTEXT_HEADER,
-                    MetadataValue::from_str(&tenant.tenant_id)
-                        .map_err(|_| Status::unauthenticated("invalid tenant identity"))?,
-                );
+                return Err(Status::unauthenticated("invalid token"));
             }
-            let method = req
-                .extensions()
-                .get::<tonic::GrpcMethod<'_>>()
-                .map(|method| method.method());
-            if method.is_none_or(|method| !enterprise_namespace_method(method)) {
-                return Err(Status::permission_denied(
-                    "RPC is not available to enterprise-scoped credentials",
-                ));
-            }
-        }
-        req.extensions_mut().insert(authenticated_context);
-        Ok(req)
+        };
+        finish_authenticated(req, authenticated_context, enterprise_scoped)
     }
 }
 
@@ -352,24 +431,39 @@ pub fn run(
     // returned future is polled. The PostgreSQL backend uses synchronous
     // clients, so service construction must not acquire or release them from
     // inside Tokio.
-    let (db, provider_registry_state_path, credential_store, (sekai_svc, chisei_svc)) =
-        (|| -> Result<_, std::io::Error> {
-            backend
-                .capabilities()
-                .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
-                .map_err(std::io::Error::other)?;
-            let db = backend.database();
-            let provider_registry_state_path =
-                crate::provider_profile::provider_registry_state_path(&config.db_path);
-            let credential_store = Arc::new(PrincipalCredentialStore::new());
-            credential_store.load(&active_credentials);
+    let (
+        db,
+        provider_registry_state_path,
+        credential_store,
+        assertion_authority,
+        (sekai_svc, chisei_svc),
+    ) = (|| -> Result<_, std::io::Error> {
+        backend
+            .capabilities()
+            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+            .map_err(std::io::Error::other)?;
+        let db = backend.database();
+        let provider_registry_state_path =
+            crate::provider_profile::provider_registry_state_path(&config.db_path);
+        let credential_store = Arc::new(PrincipalCredentialStore::new());
+        credential_store.load(&active_credentials);
 
-            if let Some(socket_path) = config.sekai_socket.as_deref() {
-                ensure_local_gateway_credential(socket_path, &db)?;
-            }
-            let services = build_services(&config, db.clone());
-            Ok((db, provider_registry_state_path, credential_store, services))
-        })()?;
+        if let Some(socket_path) = config.sekai_socket.as_deref() {
+            ensure_local_gateway_credential(socket_path, &db)?;
+        }
+        let assertion_authority = config
+            .assertion_authority()
+            .map_err(std::io::Error::other)?
+            .map(Arc::new);
+        let services = build_services(&config, db.clone());
+        Ok((
+            db,
+            provider_registry_state_path,
+            credential_store,
+            assertion_authority,
+            services,
+        ))
+    })()?;
 
     Ok(async move {
         spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
@@ -381,6 +475,7 @@ pub fn run(
                 db.clone(),
                 provider_registry_state_path.clone(),
                 credential_store.clone(),
+                assertion_authority.clone(),
             )
             .await?;
         }
@@ -397,7 +492,11 @@ pub fn run(
                     http_port,
                     sekai_svc.clone(),
                     chisei_svc.clone(),
-                    TokenAuthInterceptor::new(credential_store.clone(), db.clone()),
+                    TokenAuthInterceptor::from_runtime(
+                        credential_store.clone(),
+                        db.clone(),
+                        assertion_authority.clone(),
+                    ),
                 )
                 .await?;
             } else {
@@ -424,7 +523,11 @@ pub fn run(
                     // Force transport identity on UDS (same as TCP insecure):
                     // never trust client-supplied x-principal without a bearer.
                     local: LocalInterceptor::new(true),
-                    token: TokenAuthInterceptor::new(credential_store.clone(), db.clone()),
+                    token: TokenAuthInterceptor::from_runtime(
+                        credential_store.clone(),
+                        db.clone(),
+                        assertion_authority.clone(),
+                    ),
                 },
                 health_service.clone(),
             );
@@ -438,6 +541,7 @@ pub fn run(
                     &tcp_mode,
                     credential_store,
                     db,
+                    assertion_authority,
                     health_service,
                 );
                 return tokio::select! {
@@ -464,6 +568,7 @@ pub fn run(
             &tcp_mode,
             credential_store,
             db,
+            assertion_authority,
             health_service,
         )
         .await
@@ -519,6 +624,7 @@ async fn run_tcp<H>(
     tcp_mode: &GrpcTcpMode,
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     health_service: H,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -540,7 +646,7 @@ where
             config,
             sekai_svc,
             chisei_svc,
-            TokenAuthInterceptor::new(credential_store, db),
+            TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
             health_service,
         )
         .await
@@ -866,6 +972,189 @@ mod tests {
         );
         let error = interceptor.call(request).unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
+    }
+
+    fn test_assertion_authority() -> crate::identity_assertion::AssertionAuthority {
+        crate::identity_assertion::AssertionAuthority::new(
+            "https://issuer.test",
+            "https://sekai.test",
+            b"test-hmac-key",
+        )
+    }
+
+    fn test_assertion_claims(
+        nonce: &str,
+        expires_at: i64,
+    ) -> crate::identity_assertion::IdentityAssertion {
+        crate::identity_assertion::IdentityAssertion {
+            contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+            issuer: "https://issuer.test".into(),
+            audience: "https://sekai.test".into(),
+            subject: "subject-a".into(),
+            credential_id: "credential-a".into(),
+            credential_kind: "human_session".into(),
+            tenant_id: None,
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            expires_at,
+            nonce: nonce.into(),
+        }
+    }
+
+    fn interceptor_with_authority(
+        authority: crate::identity_assertion::AssertionAuthority,
+    ) -> TokenAuthInterceptor {
+        TokenAuthInterceptor::from_runtime(
+            Arc::new(PrincipalCredentialStore::new()),
+            in_memory_db(),
+            Some(Arc::new(authority)),
+        )
+    }
+
+    fn bearer_request(token: &str) -> Request<()> {
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}")).expect("bearer metadata"),
+        );
+        request
+    }
+
+    #[test]
+    fn token_auth_interceptor_valid_assertion_fills_authenticated_context() {
+        let authority = test_assertion_authority();
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let token = authority
+            .sign(&test_assertion_claims("n-ok", expires_at))
+            .unwrap();
+        let mut interceptor = interceptor_with_authority(authority);
+        let request = interceptor.call(bearer_request(&token)).unwrap();
+        let context = request
+            .extensions()
+            .get::<crate::enterprise::AuthenticatedContext>()
+            .expect("assertion must fill AuthenticatedContext on the interceptor path");
+        assert_eq!(context.principal.subject, "subject-a");
+        assert_eq!(context.principal.credential_id, "credential-a");
+        assert_eq!(context.scopes, ["sekai.read", "sekai.write"]);
+        assert_eq!(context.issuer, "https://issuer.test");
+        assert_eq!(context.resource, "https://sekai.test");
+        assert!(context.tenant.is_none());
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "subject-a"
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get(AUTH_SOURCE_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "token"
+        );
+    }
+
+    #[test]
+    fn token_auth_interceptor_rejects_each_assertion_class() {
+        let authority = test_assertion_authority();
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let mut interceptor = interceptor_with_authority(authority.clone());
+
+        let token = authority
+            .sign(&test_assertion_claims("n-header", expires_at))
+            .unwrap();
+        let mut request = bearer_request(&token);
+        request.metadata_mut().insert(
+            TENANT_CONTEXT_HEADER,
+            MetadataValue::from_static("tenant-evil"),
+        );
+        let error = interceptor.call(request).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "caller-selected tenant header");
+
+        let mut bad_iss = test_assertion_claims("n-iss", expires_at);
+        bad_iss.issuer = "https://other.test".into();
+        let error = interceptor
+            .call(bearer_request(&authority.sign(&bad_iss).unwrap()))
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "invalid assertion issuer");
+
+        let mut bad_aud = test_assertion_claims("n-aud", expires_at);
+        bad_aud.audience = "https://other.test".into();
+        let error = interceptor
+            .call(bearer_request(&authority.sign(&bad_aud).unwrap()))
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "invalid assertion audience");
+
+        let mut token = authority
+            .sign(&test_assertion_claims("n-sig", expires_at))
+            .unwrap();
+        token.push('x');
+        let error = interceptor.call(bearer_request(&token)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "invalid assertion signature");
+
+        let expired = authority
+            .sign(&test_assertion_claims(
+                "n-exp",
+                chrono::Utc::now().timestamp() - 120,
+            ))
+            .unwrap();
+        let error = interceptor.call(bearer_request(&expired)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "assertion expired");
+
+        let replay = authority
+            .sign(&test_assertion_claims("n-replay", expires_at))
+            .unwrap();
+        interceptor.call(bearer_request(&replay)).unwrap();
+        let error = interceptor.call(bearer_request(&replay)).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "assertion replay");
+
+        let mut escalate = test_assertion_claims("n-scope", expires_at);
+        escalate.scopes = vec!["sekai.admin".into()];
+        let error = interceptor
+            .call(bearer_request(&authority.sign(&escalate).unwrap()))
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        assert_eq!(error.message(), "assertion scope escalation");
+    }
+
+    #[test]
+    fn token_auth_interceptor_from_config_installs_authority() {
+        let mut config = base_config();
+        config.assertion_issuer = Some("https://issuer.test".into());
+        config.assertion_audience = Some("https://sekai.test".into());
+        config.assertion_hmac_key = Some("test-hmac-key".into());
+        let mut interceptor = TokenAuthInterceptor::from_config(
+            Arc::new(PrincipalCredentialStore::new()),
+            in_memory_db(),
+            &config,
+        )
+        .unwrap();
+        let authority = test_assertion_authority();
+        let token = authority
+            .sign(&test_assertion_claims(
+                "n-config",
+                chrono::Utc::now().timestamp() + 60,
+            ))
+            .unwrap();
+        let context = interceptor
+            .call(bearer_request(&token))
+            .unwrap()
+            .extensions()
+            .get::<crate::enterprise::AuthenticatedContext>()
+            .cloned()
+            .expect("config-installed authority must verify on the interceptor path");
+        assert_eq!(context.principal.subject, "subject-a");
+        assert_eq!(context.scopes, ["sekai.read", "sekai.write"]);
     }
 
     #[test]

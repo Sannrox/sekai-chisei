@@ -747,4 +747,100 @@ mod policy_decision_rpc_tests {
         assert!(!export.contains("hidden-doc-a"));
         assert!(!export.contains("hidden-doc-b"));
     }
+
+    fn purpose_required_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "contract_version": "sekai.object-security-policy/v1",
+            "namespace": "acme",
+            "kind": "document",
+            "required_purpose": "review",
+            "rules": [{"operation":"read","predicates":[{"kind":"allow_all"}]}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn compiled_decide_is_live_object_access_authority() {
+        let svc = service();
+        let alice = document("doc-purpose", "alice");
+        svc.db.create_object(&alice).unwrap();
+        let revision = put_object_security_policy_revision(
+            &svc,
+            admin(PutObjectSecurityPolicyRevisionRequest {
+                canonical_policy_json: purpose_required_json(),
+                idempotency_key: "put-purpose".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap();
+        activate_object_security_policies(
+            &svc,
+            admin(ActivateObjectSecurityPoliciesRequest {
+                namespace: "acme".into(),
+                policies: vec![ObjectSecurityPolicyBinding {
+                    kind: "document".into(),
+                    revision_digest: revision.revision_digest,
+                }],
+                idempotency_key: "act-purpose".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let policy = svc
+            .db
+            .active_object_policy("acme", "document")
+            .unwrap()
+            .expect("activated");
+        let context = principal_policy_context_from(&["alice".into()], None);
+        assert!(
+            policy.allows(
+                &context,
+                &alice,
+                crate::sekai::object_security::ObjectSecurityOperation::Read
+            ),
+            "pre-PDP row evaluator would allow this principal"
+        );
+
+        let decision = decide_object_access(
+            &svc.db,
+            &alice,
+            &["alice".into()],
+            None,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+        )
+        .unwrap();
+        assert_eq!(
+            decision.outcome,
+            crate::sekai::policy_decision::PolicyOutcome::Deny
+        );
+        assert_eq!(
+            decision.denied_by,
+            Some(crate::sekai::policy_decision::PolicyLayer::Purpose)
+        );
+        assert_eq!(
+            evaluate_active_object_policy(
+                &svc.db,
+                &alice,
+                &["alice".into()],
+                None,
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+            )
+            .unwrap(),
+            Some(false)
+        );
+        let err = enforce_object_operation_access(
+            &svc.db,
+            &alice,
+            &["alice".into()],
+            None,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            "read-purpose",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 }
