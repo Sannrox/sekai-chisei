@@ -10,7 +10,7 @@
 - Related: [ADR 0020](0020-shared-type-revisions-and-object-sync.md),
   [ADR 0036](0036-open-table-projections.md),
   [ADR 0037](0037-event-stream-projections.md),
-  Discussion [907](https://github.com/Sannrox/sekai-chisei/discussions/907)
+  [ADR 0073](0073-source-and-action-objects.md)
 
 ## Context
 
@@ -25,7 +25,8 @@ and table format should do that.
    owned by the plane. Incremental dataset materialization is a missing
    *class* of that profile, not a missing product.
 2. Transform outputs are datasets or pinned snapshots. They do not mint
-   type-revision object identity (Discussion 907).
+   type-revision object identity
+   ([ADR 0073](0073-source-and-action-objects.md)).
 3. Lineage and a receipt are required on every run. Secrets do not live in
    transform documents.
 4. This ADR does not pick an engine, table format, or cluster. #880 stays

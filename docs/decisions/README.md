@@ -93,6 +93,7 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0070: Publish a compatibility matrix as a projection of shipped metadata](0070-compatibility-matrix.md)
 - [ADR 0071: Classify public RPCs by backend and consumer evidence](0071-rpc-maturity.md)
 - [ADR 0072: Keep ontology functions on an in-process host API](0072-in-process-function-host.md)
+- [ADR 0073: Typed objects are source-backed and Action-written](0073-source-and-action-objects.md)
 - [ADR 0074: Governed transforms are plane-owned and write datasets](0074-plane-owned-transforms.md)
 - [ADR 0075: HTTP/JSON ontology is a projection of stable gRPC](0075-http-ontology-projection.md)
 - [ADR 0076: One compiling policy decision point over shipped v1 vocabularies](0076-compiling-policy-entry.md)
