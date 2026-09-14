@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Record accepted Design Discussions for transforms, the HTTP ontology
+  projection, one compiling policy entry, Action-type criteria, audience-bound
+  assertions, and evaluation-gated promotion (Discussions 908, 902, 903, 904,
+  905, 901; [ADR 0074](docs/decisions/0074-plane-owned-transforms.md)–[0079](docs/decisions/0079-evaluation-promotion-gate.md)).
+  Dual runtime storage stays measurement-gated (Discussion 906). No engine or
+  vendor runtime is named.
 - Record that ontology functions are an in-process host API: grow the
   existing `CreateFunction` pipeline; never run them as an agent harness;
   isolate guest code later behind that same host without picking an engine
