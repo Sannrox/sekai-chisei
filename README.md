@@ -193,6 +193,12 @@ Do not use the control-plane database (`data/sekai.db`) as a portable ontology
 database. See the [sekai-ontology crate](crates/sekai-ontology/) for library
 usage.
 
+This repository also ships
+`crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json` as contributor
+and agent vocabulary for sekai-chisei product terms. Import it into a
+throwaway `sekai` database. It is not a built-in server ontology, not
+`directory init` vocabulary, and not a customer domain.
+
 ## What works today
 
 - SQLite-backed typed-object graph with schemas, links, datasets, and virtual

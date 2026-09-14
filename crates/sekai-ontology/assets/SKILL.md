@@ -66,3 +66,41 @@ stale facts when `--prune` is explicit.
 
 Treat ontology output as structured repository evidence. Preserve provenance in
 answers, and do not infer facts that the ontology does not contain.
+
+## Product vocabulary (this repository)
+
+This repository ships a versioned portable pack at
+`crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`. It is
+contributor and agent vocabulary for sekai-chisei. It is not a built-in
+server ontology, not part of `init` or `directory init`, and not a customer
+domain.
+
+When the pack is present, do not answer from memory for these questions:
+
+1. What is Sekai, and what is Chisei?
+2. What is the portable ontology database, and how is it distinct from
+   `data/sekai.db`?
+3. What is a Receipt, and what does it record?
+4. What is a governed Action, and what is it related to?
+5. What is a directory fact vs an ontology class?
+
+Decision procedure (shipping commands only):
+
+1. Select a throwaway file with `--db <tmp>`. Never use `data/sekai.db`.
+2. `sekai --db <tmp> init`
+3. `sekai --db <tmp> import crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`
+4. `sekai --db <tmp> --json validate` — stop if `data.valid` is not true.
+5. Answer with `explain`, `query`, or `ask` and keep every provenance
+   `source` and `locator`:
+   - `explain Sekai` and `explain Chisei`, or `ask "what is Sekai"` /
+     `ask "what is Chisei"`
+   - `explain "Portable Ontology Database"` and
+     `query "Portable Ontology Database" --relation distinct_from`
+   - `explain Receipt` and `ask "what does Receipt record"`
+   - `explain "Governed Action"` and `ask "what is related to Governed Action"`
+   - `explain "Directory Fact"` and `explain "Ontology Class"`
+6. If a class, relation, or provenance record is missing, report absence.
+   Do not infer.
+
+The query result is the evidence. Prose in VISION.md or this skill is not a
+substitute when the pack imported cleanly.

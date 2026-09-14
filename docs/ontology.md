@@ -105,6 +105,14 @@ unknown-service case demonstrates the fail-closed fallback boundary. This is
 an example domain, not product ontology: the classes, custom kinds, relations,
 and objects exist only in the checked-in pack and are not server built-ins.
 
+This repository also ships a portable `sekai` CLI pack at
+`crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json` for contributor
+and agent vocabulary (Sekai vs Chisei, portable `.sekai/knowledge.db` vs
+`data/sekai.db`, receipts, governed Actions, directory facts vs ontology
+classes). Import it with `sekai --db <tmp> import`. It is not applied through
+`sekaictl` ontology commands, not part of `directory init`, and not a server
+builtin.
+
 Domain concepts stay in **your** fixtures, not in core protos. ADR 0003
 `ontology inspect` remains a separate static HTML snapshot path.
 
