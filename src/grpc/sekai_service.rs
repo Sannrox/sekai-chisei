@@ -593,6 +593,20 @@ impl SekaiService for SekaiServiceImpl {
         rpc_objects::get_classification_lattice(self, req).await
     }
 
+    async fn simulate_object_policy_change(
+        &self,
+        req: Request<SimulateObjectPolicyChangeRequest>,
+    ) -> Result<Response<SimulateObjectPolicyChangeResponse>, Status> {
+        rpc_objects::simulate_object_policy_change(self, req).await
+    }
+
+    async fn query_object_policy_audit(
+        &self,
+        req: Request<QueryObjectPolicyAuditRequest>,
+    ) -> Result<Response<QueryObjectPolicyAuditResponse>, Status> {
+        rpc_objects::query_object_policy_audit(self, req).await
+    }
+
     async fn find_by_external_id(
         &self,
         req: Request<FindByExternalIdRequest>,

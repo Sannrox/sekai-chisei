@@ -537,6 +537,54 @@ message PutClassificationLatticeRequest { ClassificationLattice lattice = 1; }
 message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
+message PolicySimulationDifference {
+  string principal = 1;
+  string object_id = 2;
+  string object_kind = 3;
+  string property = 4;
+  string current_outcome = 5;
+  string candidate_outcome = 6;
+}
+message SimulateObjectPolicyChangeRequest {
+  string namespace = 1;
+  repeated ObjectSecurityPolicyBinding candidate_policies = 2;
+  string operation = 3;
+  repeated string principals = 4;
+  int32 limit = 5;
+}
+message SimulateObjectPolicyChangeResponse {
+  string namespace = 1;
+  string current_activation_digest = 2;
+  string candidate_digest = 3;
+  repeated PolicySimulationDifference differences = 4;
+}
+message ObjectPolicyAuditEvent {
+  string event_id = 1;
+  string namespace = 2;
+  string object_kind = 3;
+  string object_id = 4;
+  string operation = 5;
+  string principal = 6;
+  string principal_digest = 7;
+  string activation_digest = 8;
+  string policy_revision_digest = 9;
+  string outcome = 10;
+  string denied_by = 11;
+  int64 created_at_ms = 12;
+}
+message QueryObjectPolicyAuditRequest {
+  string namespace = 1;
+  string principal = 2;
+  string object_id = 3;
+  int64 from_ms = 4;
+  int64 to_ms = 5;
+  int32 limit = 6;
+  int32 offset = 7;
+}
+message QueryObjectPolicyAuditResponse {
+  repeated ObjectPolicyAuditEvent events = 1;
+  bytes export_json = 2;
+}
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -2079,6 +2127,8 @@ service SekaiService {
   rpc RevokePurposeAuthorization(RevokePurposeAuthorizationRequest) returns (RevokePurposeAuthorizationResponse);
   rpc PutClassificationLattice(PutClassificationLatticeRequest) returns (PutClassificationLatticeResponse);
   rpc GetClassificationLattice(GetClassificationLatticeRequest) returns (GetClassificationLatticeResponse);
+  rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
+  rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
   rpc FindByExternalId(FindByExternalIdRequest) returns (GetObjectResponse);
   rpc FindByProperty(FindByPropertyRequest) returns (ListObjectsResponse);
 

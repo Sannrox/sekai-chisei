@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 pub(super) async fn create_object(
     service: &SekaiServiceImpl,
@@ -307,6 +308,223 @@ pub(super) async fn get_classification_lattice(
         lattice: Some(to_proto_classification_lattice(&lattice)?),
     }))
 }
+
+pub(super) async fn simulate_object_policy_change(
+    service: &SekaiServiceImpl,
+    req: Request<SimulateObjectPolicyChangeRequest>,
+) -> Result<Response<SimulateObjectPolicyChangeResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    enforce_namespace_tenant_context(
+        &service.db,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    let operation = if input.operation.trim().is_empty() {
+        crate::sekai::object_security::ObjectSecurityOperation::Read
+    } else {
+        crate::sekai::object_security::ObjectSecurityOperation::parse(&input.operation)
+            .map_err(Status::invalid_argument)?
+    };
+    let current_activation = service
+        .db
+        .get_object_security_activation(&input.namespace)
+        .map_err(map_object_security_error)?;
+    let current =
+        snapshot_from_activation(&service.db, &input.namespace, current_activation.as_ref())?;
+    let mut candidate_policies = BTreeMap::new();
+    for binding in &input.candidate_policies {
+        if binding.kind.trim().is_empty() || binding.revision_digest.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "each candidate policy kind and revision is required",
+            ));
+        }
+        let revision = service
+            .db
+            .get_object_security_policy(&input.namespace, &binding.revision_digest)
+            .map_err(map_object_security_error)?
+            .ok_or_else(|| Status::not_found("candidate policy revision not found"))?;
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
+            &revision.canonical_policy_json,
+        )
+        .map_err(Status::invalid_argument)?;
+        if policy.kind != binding.kind {
+            return Err(Status::invalid_argument(
+                "candidate policy kind does not match stored revision",
+            ));
+        }
+        if candidate_policies
+            .insert(binding.kind.clone(), policy)
+            .is_some()
+        {
+            return Err(Status::invalid_argument(
+                "each candidate policy kind must appear exactly once",
+            ));
+        }
+    }
+    let candidate = crate::sekai::policy_decision::PolicySnapshot {
+        namespace: input.namespace.clone(),
+        activation_digest: "candidate".into(),
+        policies: candidate_policies,
+        lattice: current.lattice.clone(),
+    };
+    let objects = service
+        .db
+        .list_objects(&crate::domain::ListFilter {
+            namespace: Some(input.namespace.clone()),
+            limit: if input.limit > 0 { input.limit } else { 10_000 },
+            ..crate::domain::ListFilter::default()
+        })
+        .map_err(Status::internal)?;
+    let mut simulated = Vec::new();
+    let named = if input.principals.is_empty() {
+        principals.clone()
+    } else {
+        input.principals.clone()
+    };
+    for principal in named {
+        let authority = resolve_principal_authority(&service.db, std::slice::from_ref(&principal))?;
+        simulated.push(crate::sekai::policy_decision::SimulatedPrincipal {
+            principal: principal.clone(),
+            context: crate::sekai::object_security::PrincipalPolicyContext {
+                subjects: vec![principal],
+                scopes: Vec::new(),
+            }
+            .normalized(),
+            authority,
+            purpose: None,
+            purpose_authorization: None,
+            namespace_granted: true,
+        });
+    }
+    let report = crate::sekai::policy_decision::simulate_policy_change(
+        &objects,
+        &simulated,
+        &current,
+        &candidate,
+        operation,
+        now_millis(),
+    )
+    .map_err(Status::internal)?;
+    Ok(Response::new(SimulateObjectPolicyChangeResponse {
+        namespace: report.namespace,
+        current_activation_digest: report.current_activation_digest,
+        candidate_digest: report.candidate_digest,
+        differences: report
+            .differences
+            .into_iter()
+            .map(|diff| PolicySimulationDifference {
+                principal: diff.principal,
+                object_id: diff.object_id,
+                object_kind: diff.object_kind,
+                property: diff.property,
+                current_outcome: diff.current_outcome.as_str().into(),
+                candidate_outcome: diff.candidate_outcome.as_str().into(),
+            })
+            .collect(),
+    }))
+}
+
+pub(super) async fn query_object_policy_audit(
+    service: &SekaiServiceImpl,
+    req: Request<QueryObjectPolicyAuditRequest>,
+) -> Result<Response<QueryObjectPolicyAuditResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    enforce_namespace_tenant_context(
+        &service.db,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    let records = service
+        .db
+        .query_policy_decisions(&crate::sekai::policy_decision::PolicyDecisionQuery {
+            namespace: input.namespace,
+            principal: input.principal,
+            object_id: input.object_id,
+            from_ms: input.from_ms,
+            to_ms: input.to_ms,
+            limit: input.limit,
+            offset: input.offset,
+        })
+        .map_err(Status::internal)?;
+    let events: Vec<ObjectPolicyAuditEvent> = records
+        .iter()
+        .map(|record| ObjectPolicyAuditEvent {
+            event_id: record.event_id.clone(),
+            namespace: record.decision.namespace.clone(),
+            object_kind: record.decision.object_kind.clone(),
+            object_id: record.decision.object_id.clone(),
+            operation: record.decision.operation.clone(),
+            principal: record.decision.principal.clone(),
+            principal_digest: record.decision.principal_digest.clone(),
+            activation_digest: record.decision.activation_digest.clone(),
+            policy_revision_digest: record.decision.policy_revision_digest.clone(),
+            outcome: record.decision.outcome.as_str().into(),
+            denied_by: record
+                .decision
+                .denied_by
+                .map(|layer| layer.as_str().to_string())
+                .unwrap_or_default(),
+            created_at_ms: record.created_at_ms,
+        })
+        .collect();
+    let export_json =
+        serde_json::to_vec(&events).map_err(|error| Status::internal(error.to_string()))?;
+    Ok(Response::new(QueryObjectPolicyAuditResponse {
+        events,
+        export_json,
+    }))
+}
+
+fn snapshot_from_activation(
+    db: &crate::db::runtime_db::RuntimeDb,
+    namespace: &str,
+    activation: Option<&crate::sekai::object_security::ObjectSecurityActivation>,
+) -> Result<crate::sekai::policy_decision::PolicySnapshot, Status> {
+    let mut policies = BTreeMap::new();
+    let activation_digest = match activation {
+        Some(activation) => {
+            for (kind, digest) in &activation.policies {
+                let revision = db
+                    .get_object_security_policy(namespace, digest)
+                    .map_err(map_object_security_error)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition("active policy revision unavailable")
+                    })?;
+                let policy =
+                    crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
+                        &revision.canonical_policy_json,
+                    )
+                    .map_err(|_| {
+                        Status::failed_precondition("active policy revision is invalid")
+                    })?;
+                policies.insert(kind.clone(), policy);
+            }
+            crate::sekai::object_security::object_security_activation_digest(activation)
+                .map_err(Status::internal)?
+        }
+        None => "legacy".into(),
+    };
+    Ok(crate::sekai::policy_decision::PolicySnapshot {
+        namespace: namespace.into(),
+        activation_digest,
+        policies,
+        lattice: db
+            .get_classification_lattice(namespace)
+            .map_err(|_| Status::unavailable("classification lattice unavailable"))?,
+    })
+}
 pub(super) async fn find_by_external_id(
     service: &SekaiServiceImpl,
     req: Request<FindByExternalIdRequest>,
@@ -342,4 +560,191 @@ pub(super) async fn get_linked_objects(
     req: Request<GetLinkedObjectsRequest>,
 ) -> Result<Response<GetLinkedObjectsResponse>, Status> {
     service.get_visible_linked_objects(req).await
+}
+
+#[cfg(test)]
+mod policy_decision_rpc_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tonic::metadata::MetadataValue;
+
+    fn service() -> SekaiServiceImpl {
+        SekaiServiceImpl::new(Arc::new(crate::db::runtime_db::RuntimeDb::Sqlite(
+            Arc::new(crate::db::sekai::SekaiDb::new(":memory:").unwrap()),
+        )))
+    }
+
+    fn admin<T>(payload: T) -> Request<T> {
+        let mut req = Request::new(payload);
+        req.metadata_mut()
+            .insert("x-principal", MetadataValue::try_from("local").unwrap());
+        req
+    }
+
+    fn document(id: &str, owner: &str) -> crate::domain::Object {
+        crate::domain::Object {
+            id: id.into(),
+            kind: "document".into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: format!("doc:{id}"),
+            properties: HashMap::from([
+                ("owner".into(), owner.into()),
+                ("secret".into(), format!("hidden-{id}")),
+            ]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    fn allow_all_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "contract_version": "sekai.object-security-policy/v1",
+            "namespace": "acme",
+            "kind": "document",
+            "rules": [{"operation":"read","predicates":[{"kind":"allow_all"}]}]
+        }))
+        .unwrap()
+    }
+
+    fn owner_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "contract_version": "sekai.object-security-policy/v1",
+            "namespace": "acme",
+            "kind": "document",
+            "rules": [{"operation":"read","predicates":[{"kind":"subject_equals_property","property":"owner"}]}],
+            "property_grants": [{"property":"owner","access":"read"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn simulate_and_audit_rpcs_omit_hidden_values() {
+        let svc = service();
+        svc.db.create_object(&document("doc-a", "alice")).unwrap();
+        svc.db.create_object(&document("doc-b", "bob")).unwrap();
+        let broad = put_object_security_policy_revision(
+            &svc,
+            admin(PutObjectSecurityPolicyRevisionRequest {
+                canonical_policy_json: allow_all_json(),
+                idempotency_key: "put-broad".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap();
+        let owner = put_object_security_policy_revision(
+            &svc,
+            admin(PutObjectSecurityPolicyRevisionRequest {
+                canonical_policy_json: owner_json(),
+                idempotency_key: "put-owner".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap();
+        activate_object_security_policies(
+            &svc,
+            admin(ActivateObjectSecurityPoliciesRequest {
+                namespace: "acme".into(),
+                policies: vec![ObjectSecurityPolicyBinding {
+                    kind: "document".into(),
+                    revision_digest: broad.revision_digest,
+                }],
+                idempotency_key: "act-broad".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let simulated = simulate_object_policy_change(
+            &svc,
+            admin(SimulateObjectPolicyChangeRequest {
+                namespace: "acme".into(),
+                candidate_policies: vec![ObjectSecurityPolicyBinding {
+                    kind: "document".into(),
+                    revision_digest: owner.revision_digest.clone(),
+                }],
+                operation: "read".into(),
+                principals: vec!["alice".into(), "bob".into()],
+                limit: 100,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            simulated.differences.iter().any(|diff| {
+                diff.principal == "alice" && diff.object_id == "doc-b" && diff.property.is_empty()
+            }),
+            "{simulated:?}"
+        );
+        let payload = serde_json::to_string(&simulated.differences).unwrap();
+        assert!(!payload.contains("hidden-doc-a"));
+        assert!(!payload.contains("hidden-doc-b"));
+
+        activate_object_security_policies(
+            &svc,
+            admin(ActivateObjectSecurityPoliciesRequest {
+                namespace: "acme".into(),
+                policies: vec![ObjectSecurityPolicyBinding {
+                    kind: "document".into(),
+                    revision_digest: owner.revision_digest,
+                }],
+                idempotency_key: "act-owner".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let alice = document("doc-a", "alice");
+        enforce_object_operation_access(
+            &svc.db,
+            &alice,
+            &["alice".into()],
+            None,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            "read-alice",
+        )
+        .unwrap();
+        let bob_err = enforce_object_operation_access(
+            &svc.db,
+            &alice,
+            &["bob".into()],
+            None,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            "read-bob",
+        );
+        assert!(bob_err.is_err());
+
+        let audit = query_object_policy_audit(
+            &svc,
+            admin(QueryObjectPolicyAuditRequest {
+                namespace: "acme".into(),
+                principal: "alice".into(),
+                object_id: String::new(),
+                from_ms: 0,
+                to_ms: 0,
+                limit: 20,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            audit
+                .events
+                .iter()
+                .any(|event| event.principal == "alice" && event.outcome == "allow")
+        );
+        let export = String::from_utf8(audit.export_json).unwrap();
+        assert!(!export.contains("hidden-doc-a"));
+        assert!(!export.contains("hidden-doc-b"));
+    }
 }

@@ -68,6 +68,7 @@ pub mod open_table;
 pub mod operation_correlation;
 pub mod parked_work;
 pub mod peer_import;
+pub mod policy_decision;
 pub mod propagation;
 pub mod purpose_authorization;
 pub mod query;

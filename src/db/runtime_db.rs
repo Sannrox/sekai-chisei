@@ -162,6 +162,26 @@ impl RuntimeDb {
         }
     }
 
+    pub fn record_policy_decision(
+        &self,
+        record: &crate::sekai::policy_decision::PolicyDecisionRecord,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.record_policy_decision(record),
+            Self::Postgres(db) => db.record_policy_decision(record),
+        }
+    }
+
+    pub fn query_policy_decisions(
+        &self,
+        query: &crate::sekai::policy_decision::PolicyDecisionQuery,
+    ) -> Result<Vec<crate::sekai::policy_decision::PolicyDecisionRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.query_policy_decisions(query),
+            Self::Postgres(db) => db.query_policy_decisions(query),
+        }
+    }
+
     pub fn put_purpose_authorization(
         &self,
         authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,

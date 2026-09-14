@@ -211,7 +211,25 @@ impl SekaiDb {
                     lattice_json TEXT NOT NULL,
                     created_by TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL
-                );",
+                );
+                CREATE TABLE IF NOT EXISTS sekai_policy_decision_audit (
+                    event_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    object_kind TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    principal TEXT NOT NULL,
+                    principal_digest TEXT NOT NULL,
+                    activation_digest TEXT NOT NULL,
+                    policy_revision_digest TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    denied_by TEXT NOT NULL DEFAULT '',
+                    created_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_policy_decision_audit_ns_principal
+                    ON sekai_policy_decision_audit(namespace, principal, created_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_policy_decision_audit_ns_object
+                    ON sekai_policy_decision_audit(namespace, object_id, created_at_ms);",
             )
             .map_err(|error| error.to_string())
     }
@@ -479,6 +497,140 @@ impl SekaiDb {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())
+    }
+
+    pub fn record_policy_decision(
+        &self,
+        record: &crate::sekai::policy_decision::PolicyDecisionRecord,
+    ) -> Result<(), String> {
+        let denied_by = record
+            .decision
+            .denied_by
+            .map(|layer| layer.as_str().to_string())
+            .unwrap_or_default();
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_policy_decision_audit
+                 (event_id, namespace, object_kind, object_id, operation, principal,
+                  principal_digest, activation_digest, policy_revision_digest, outcome,
+                  denied_by, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    record.event_id,
+                    record.decision.namespace,
+                    record.decision.object_kind,
+                    record.decision.object_id,
+                    record.decision.operation,
+                    record.decision.principal,
+                    record.decision.principal_digest,
+                    record.decision.activation_digest,
+                    record.decision.policy_revision_digest,
+                    record.decision.outcome.as_str(),
+                    denied_by,
+                    record.created_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn query_policy_decisions(
+        &self,
+        query: &crate::sekai::policy_decision::PolicyDecisionQuery,
+    ) -> Result<Vec<crate::sekai::policy_decision::PolicyDecisionRecord>, String> {
+        let limit = if query.limit <= 0 {
+            100
+        } else {
+            query.limit.min(1000)
+        };
+        let offset = query.offset.max(0);
+        let connection = self.conn();
+        let mut statement = connection
+            .prepare(
+                "SELECT event_id, namespace, object_kind, object_id, operation, principal,
+                        principal_digest, activation_digest, policy_revision_digest, outcome,
+                        denied_by, created_at_ms
+                 FROM sekai_policy_decision_audit
+                 WHERE namespace=?1
+                   AND (?2 = '' OR principal=?2)
+                   AND (?3 = '' OR object_id=?3)
+                   AND (?4 <= 0 OR created_at_ms >= ?4)
+                   AND (?5 <= 0 OR created_at_ms <= ?5)
+                 ORDER BY created_at_ms ASC, event_id ASC
+                 LIMIT ?6 OFFSET ?7",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![
+                    query.namespace,
+                    query.principal,
+                    query.object_id,
+                    query.from_ms,
+                    query.to_ms,
+                    limit,
+                    offset
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                event_id,
+                namespace,
+                object_kind,
+                object_id,
+                operation,
+                principal,
+                principal_digest,
+                activation_digest,
+                policy_revision_digest,
+                outcome,
+                denied_by,
+                created_at_ms,
+            ) = row.map_err(|error| error.to_string())?;
+            records.push(crate::sekai::policy_decision::PolicyDecisionRecord {
+                event_id,
+                created_at_ms,
+                decision: crate::sekai::policy_decision::PolicyDecision {
+                    contract_version: crate::sekai::policy_decision::POLICY_DECISION_CONTRACT
+                        .into(),
+                    namespace,
+                    object_kind,
+                    object_id,
+                    operation,
+                    principal,
+                    principal_digest,
+                    activation_digest,
+                    policy_revision_digest,
+                    outcome: crate::sekai::policy_decision::PolicyOutcome::parse(&outcome)?,
+                    denied_by: if denied_by.is_empty() {
+                        None
+                    } else {
+                        Some(crate::sekai::policy_decision::PolicyLayer::parse(
+                            &denied_by,
+                        )?)
+                    },
+                },
+            });
+        }
+        Ok(records)
     }
 
     pub fn object_query_cursor_key(&self) -> Result<[u8; 32], String> {

@@ -358,6 +358,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "SimulateObjectPolicyChange",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "QueryObjectPolicyAudit",
+      "storage_path": "sekai.object-security",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "FindByExternalId",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
