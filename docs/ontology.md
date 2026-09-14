@@ -24,7 +24,11 @@ keeps the ADR 0001 evaluation profile; inverse and disjointness stay
 authoring and inspection metadata. Research
 [#659](research/659-derived-fact-admission.md) keeps governed functions
 read-only; computed properties and other derived views stay query-time
-overlays and are not persisted onto a type revision.
+overlays and are not persisted onto a type revision. The function product is
+that in-process host API (`CreateFunction` and its read-time pipeline).
+Customer guest code, if added, runs behind the same host; it is not an agent
+run and does not pick an engine here. See
+[ADR 0072](decisions/0072-in-process-function-host.md).
 
 ## First-run product loop (`sekaictl`)
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Record that ontology functions are an in-process host API: grow the
+  existing `CreateFunction` pipeline; never run them as an agent harness;
+  isolate guest code later behind that same host without picking an engine
+  (#881, [ADR 0072](docs/decisions/0072-in-process-function-host.md)).
 - Share one ontology definition design across portable `sekai` import and
   `sekaictl ontology apply`. Class, relation, property, cardinality, and
   mapped_kind fields mean the same thing on both I/O paths. Apply-only
