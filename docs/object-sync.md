@@ -7,8 +7,11 @@ Issue/PullRequest remains the catalog-advertised production profile under
 `source_control.object_sync`. A live registered descriptor may also apply
 batches with identity `{source}:{instance}#{record_kind}/{immutable_key}`.
 See [ADR 0022](decisions/0022-source-batch-transactions.md),
-[ADR 0021](decisions/0021-defer-second-object-sync-source.md), and
-[ADR 0060](decisions/0060-additive-source-type-descriptors.md). The ordered-feed
+[ADR 0021](decisions/0021-defer-second-object-sync-source.md),
+[ADR 0060](decisions/0060-additive-source-type-descriptors.md), and
+[ADR 0073](decisions/0073-source-and-action-objects.md). Inbound sync is one
+of the two product write paths for typed objects; versioned Actions are the
+other. The sync index is not object authority. The ordered-feed
 design rationale is in
 [ADR 0023](decisions/0023-generation-fenced-source-change-feeds.md).
 

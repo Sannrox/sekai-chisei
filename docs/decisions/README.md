@@ -93,3 +93,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0070: Publish a compatibility matrix as a projection of shipped metadata](0070-compatibility-matrix.md)
 - [ADR 0071: Classify public RPCs by backend and consumer evidence](0071-rpc-maturity.md)
 - [ADR 0072: Keep ontology functions on an in-process host API](0072-in-process-function-host.md)
+- [ADR 0073: Typed objects are source-backed and Action-written](0073-source-and-action-objects.md)
