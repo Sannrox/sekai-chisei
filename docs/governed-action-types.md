@@ -28,6 +28,8 @@ row for history.
 | --- | --- |
 | `parameter_schema_json` | Immutable closed parameter schema validated at `SubmitActionInstance` admission |
 | `allowed_effect_kinds` | Subset of `runtime_dispatch`, `notify`, `external_mutate` |
+| `declared_effect_kinds` | Subset of `allowed_effect_kinds` materialized on admit. Empty means all allowed kinds |
+| `submission_criteria` | Closed object-security v1 predicates over the bound object and invoker |
 | `policy_scope` / `budget_scope` | Empty = use namespace defaults |
 | `object_kind` | Admitted schema kind this type may create or update. Empty means admit-only |
 | `object_mutation` | `create` or `update` when `object_kind` is set. Empty means admit-only |
@@ -71,6 +73,21 @@ effect materialization. Unknown fields and values outside the declared subset
 fail closed with a bounded error. Parameter bodies remain untrusted data and
 are never copied into audit or receipt evidence.
 
+`submission_criteria` reuse the shipped object-security v1 predicate kinds
+(`allow_all`, `subject_equals_property`, `required_scope_equals`,
+`property_equals`). Object-property criteria require an update-bound type.
+Preview names the first failing visible criterion; submit rechecks live state
+and refuses with the same `criterion_id`. A criterion that names a hidden or
+ungranted property fails closed as `unavailable` and does not leak the
+property or criterion identity. Function-backed validation waits on #882.
+`declared_effect_kinds` that are not in `allowed_effect_kinds` are refused at
+type validation. Empty declared kinds keep the existing “materialize every
+allowed kind” behavior.
+
+`object_kind` and `object_mutation` live in the existing type body JSON, as do
+`submission_criteria` and `declared_effect_kinds`. No schema migration is
+required.
+
 There is no object-only compatibility path. A type whose stored schema does not
 satisfy this closed subset cannot admit a new `ActionInstance`; it fails closed
 at submission. Existing type rows and historical instances are not rewritten.
@@ -98,7 +115,6 @@ after policy and budget gates; `external_mutate` stays skipped. See
 ## Dual-backend
 
 SQLite and PostgreSQL both persist the registry through the existing
-`0020_governed_action_types` schema (SQLite migrates on first use). `object_kind`
-and `object_mutation` live in the existing type body JSON. No schema
-migration or data rewrite is required for admission enforcement; both backends
-validate the stored closed schema at the service boundary.
+`0020_governed_action_types` schema (SQLite migrates on first use). Additive
+type-body fields deserialize with empty defaults on older rows. Both backends
+validate the stored closed schema and criteria at the service boundary.

@@ -19,6 +19,10 @@ use crate::sekai::action_instance::{
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
 };
+use crate::sekai::action_type_criteria::{
+    CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
+};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::{action_effect, action_object_mutation, action_policy, audit};
 use std::collections::{BTreeMap, HashMap};
 
@@ -33,6 +37,7 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub request_id: String,
     pub ontology_digest: String,
     pub autonomous_envelope_id: String,
+    pub policy_context: PrincipalPolicyContext,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +156,27 @@ impl<'a> ActionInstanceAdmission<'a> {
             ))
         })?;
 
+        let criterion_object =
+            load_criterion_object(self.db, &namespace, &type_def, &request.parameters_json)?;
+        let criterion_policy = match &criterion_object {
+            Some(object) => self
+                .db
+                .active_object_policy(&object.namespace, &object.kind)
+                .map_err(|_| {
+                    ActionInstanceAdmissionError::FailedPrecondition(
+                        "object action unavailable".into(),
+                    )
+                })?,
+            None => None,
+        };
+        let invoker = invoker_context(actor, Some(&request.policy_context));
+        let criterion_decision = evaluate_submission_criteria(
+            &type_def.submission_criteria,
+            criterion_object.as_ref(),
+            criterion_policy.as_ref(),
+            &invoker,
+        );
+
         let policy_project = if type_def.policy_scope.trim().is_empty() {
             namespace.clone()
         } else {
@@ -188,14 +214,27 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             "not_configured".to_string()
         };
-        if policy_decision == action_policy::ActionDecision::Deny {
+        match criterion_decision {
+            CriterionDecision::Pass => {}
+            CriterionDecision::Fail { criterion_id } => {
+                status = STATUS_DENIED.into();
+                deny_reason = criterion_id;
+            }
+            CriterionDecision::Unavailable => {
+                status = STATUS_DENIED.into();
+                deny_reason = CRITERION_UNAVAILABLE.into();
+            }
+        }
+        if status == STATUS_ADMITTED && policy_decision == action_policy::ActionDecision::Deny {
             status = STATUS_DENIED.into();
             deny_reason = if policy_scope_label.is_empty() {
                 "action policy denied submit_action_instance".into()
             } else {
                 format!("action policy denied submit_action_instance ({policy_scope_label})")
             };
-        } else if policy_decision == action_policy::ActionDecision::RequireApproval {
+        } else if status == STATUS_ADMITTED
+            && policy_decision == action_policy::ActionDecision::RequireApproval
+        {
             status = STATUS_DENIED.into();
             deny_reason = "submit_action_instance requires approval (not yet supported)".into();
             policy_decision_text = "require_approval".into();
@@ -245,7 +284,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     &instance.instance_id,
                     &instance.namespace,
                     &instance.operation_id,
-                    &type_def.allowed_effect_kinds,
+                    type_def.effect_kinds_to_materialize(),
                     &instance.parameters_json,
                     now,
                     force_notify_fail,
@@ -540,6 +579,42 @@ impl<'a> ActionInstanceAdmission<'a> {
     }
 }
 
+fn load_criterion_object(
+    db: &RuntimeDb,
+    namespace: &str,
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    parameters_json: &str,
+) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
+    let needs_object = type_def
+        .submission_criteria
+        .iter()
+        .any(|criterion| criterion.requires_object().unwrap_or(true));
+    if !needs_object {
+        return Ok(None);
+    }
+    let object_id = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("object_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if object_id.trim().is_empty() {
+        return Ok(None);
+    }
+    match db
+        .get_object(&object_id)
+        .map_err(ActionInstanceAdmissionError::Internal)?
+    {
+        Some(object) if object.namespace == namespace && object.kind == type_def.object_kind => {
+            Ok(Some(object))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn map_object_mutation_error(error: ActionObjectMutationError) -> ActionInstanceAdmissionError {
     match error {
         ActionObjectMutationError::InvalidArgument(message) => {
@@ -657,6 +732,7 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
+                ..Default::default()
             },
             "operator",
             1,
@@ -679,6 +755,7 @@ mod tests {
             request_id: String::new(),
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
+            policy_context: PrincipalPolicyContext::default(),
         }
     }
 
@@ -767,6 +844,7 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
+                ..Default::default()
             },
             "operator",
             1,
@@ -872,6 +950,7 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 disabled_at_ms: 0,
+                ..Default::default()
             },
             "operator",
             1,
@@ -890,6 +969,7 @@ mod tests {
                     request_id: "operation-notify".into(),
                     ontology_digest: ONTOLOGY_DIGEST.into(),
                     autonomous_envelope_id: String::new(),
+                    policy_context: PrincipalPolicyContext::default(),
                 },
                 "alice",
                 10,
@@ -1042,6 +1122,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -1056,6 +1137,7 @@ mod tests {
             request_id: "operation-record".into(),
             ontology_digest: ONTOLOGY_DIGEST.into(),
             autonomous_envelope_id: String::new(),
+            policy_context: PrincipalPolicyContext::default(),
         }
     }
 
@@ -1310,5 +1392,56 @@ mod tests {
             ActionInstanceAdmissionError::FailedPrecondition(_)
         ));
         assert!(db.get_object("rec-7").unwrap().is_none());
+    }
+
+    #[test]
+    fn submit_refuses_a_failing_criterion_with_the_preview_code() {
+        let db = setup();
+        ensure_record_kind(&db);
+        let mut object = crate::domain::Object {
+            id: "rec-8".into(),
+            kind: "customer_record".into(),
+            name: "Draft".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("state".into(), "draft".into())]),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object(&object).unwrap();
+        let mut type_def = record_type("update");
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "ready_for_review".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                property: "state".into(),
+                value: "ready".into(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let denied = admission
+            .admit(
+                record_request(
+                    "customer.record.update",
+                    r#"{"object_id":"rec-8","title":"still draft"}"#,
+                ),
+                "alice",
+                10,
+            )
+            .unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_eq!(denied.instance.deny_reason, "ready_for_review");
+        object.properties.insert("state".into(), "ready".into());
+        db.update_object(&object).unwrap();
+        let mut admitted = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-8","title":"ready now"}"#,
+        );
+        admitted.idempotency_key = "record-8-ready".into();
+        admitted.request_id = "operation-record-8-ready".into();
+        let admitted = admission.admit(admitted, "alice", 20).unwrap();
+        assert_eq!(admitted.instance.status, STATUS_ADMITTED);
     }
 }

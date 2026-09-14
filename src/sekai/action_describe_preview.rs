@@ -13,7 +13,11 @@ use crate::sekai::action_instance::{
 };
 use crate::sekai::action_object_mutation;
 use crate::sekai::action_policy::ActionDecision;
+use crate::sekai::action_type_criteria::{
+    ActionSubmissionCriterion, CriterionDecision, evaluate_submission_criteria, invoker_context,
+};
 use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_UPDATE};
+use crate::sekai::object_security::PrincipalPolicyContext;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -39,6 +43,8 @@ pub struct ObjectActionDescription {
     pub enabled: bool,
     pub preview_supported: bool,
     pub compensation: String,
+    pub submission_criteria: Vec<ActionSubmissionCriterion>,
+    pub declared_effect_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +57,7 @@ pub struct ObjectActionPreviewRequest<'a> {
     pub expected_object_updated_ms: i64,
     pub expected_object_revision: &'a str,
     pub evidence_submission_ids: &'a [String],
+    pub policy_context: Option<&'a PrincipalPolicyContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +73,7 @@ pub struct ObjectActionPreview {
     pub budget_decision: String,
     pub approval_state: String,
     pub compensation: String,
+    pub failing_criterion: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +131,7 @@ pub fn preview_object_action(
         expected_object_updated_ms,
         expected_object_revision,
         evidence_submission_ids,
+        policy_context,
     } = request;
     let type_def = match load_object_bound_type(db, object, type_id, version) {
         Ok(type_def) => type_def,
@@ -148,6 +157,7 @@ pub fn preview_object_action(
             budget_decision: String::new(),
             approval_state: String::new(),
             compensation: COMPENSATION_UNSUPPORTED.into(),
+            failing_criterion: String::new(),
         });
     }
 
@@ -203,6 +213,33 @@ pub fn preview_object_action(
             &live_revision,
             error.to_string(),
         ));
+    }
+
+    let stored_object = db
+        .get_object(&object.id)
+        .map_err(|_| ObjectActionProjectionError::Unavailable)?;
+    let bound_object = stored_object.as_ref().unwrap_or(object);
+    let policy = match db.active_object_policy(&bound_object.namespace, &bound_object.kind) {
+        Ok(policy) => policy,
+        Err(_) => return Ok(unavailable_preview(object)),
+    };
+    let invoker = invoker_context(actor, policy_context);
+    match evaluate_submission_criteria(
+        &type_def.submission_criteria,
+        Some(bound_object),
+        policy.as_ref(),
+        &invoker,
+    ) {
+        CriterionDecision::Pass => {}
+        CriterionDecision::Fail { criterion_id } => {
+            return Ok(criterion_preview(
+                &type_def,
+                object,
+                &live_revision,
+                criterion_id,
+            ));
+        }
+        CriterionDecision::Unavailable => return Ok(unavailable_preview(object)),
     }
 
     let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -262,6 +299,7 @@ pub fn preview_object_action(
         budget_decision,
         approval_state,
         compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: String::new(),
     })
 }
 
@@ -308,6 +346,8 @@ fn description_from(object: &Object, type_def: &GovernedActionType) -> ObjectAct
         enabled: type_def.enabled,
         preview_supported: true,
         compensation: COMPENSATION_UNSUPPORTED.into(),
+        submission_criteria: type_def.submission_criteria.clone(),
+        declared_effect_kinds: type_def.declared_effect_kinds.clone(),
     }
 }
 
@@ -324,6 +364,7 @@ fn unavailable_preview(object: &Object) -> ObjectActionPreview {
         budget_decision: String::new(),
         approval_state: String::new(),
         compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: String::new(),
     }
 }
 
@@ -345,6 +386,29 @@ fn invalid_preview(
         budget_decision: String::new(),
         approval_state: String::new(),
         compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: String::new(),
+    }
+}
+
+fn criterion_preview(
+    type_def: &GovernedActionType,
+    object: &Object,
+    live_revision: &str,
+    criterion_id: String,
+) -> ObjectActionPreview {
+    ObjectActionPreview {
+        outcome: PREVIEW_INVALID.into(),
+        reason_code: criterion_id.clone(),
+        request_digest: String::new(),
+        object_revision: live_revision.to_string(),
+        object_updated_ms: object.updated,
+        type_id: type_def.type_id.clone(),
+        version: type_def.version.clone(),
+        policy_decision: String::new(),
+        budget_decision: String::new(),
+        approval_state: String::new(),
+        compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: criterion_id,
     }
 }
 
@@ -403,6 +467,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -464,6 +529,7 @@ mod tests {
                 expected_object_updated_ms: object.updated,
                 expected_object_revision: &object_revision(&object),
                 evidence_submission_ids: &[],
+                policy_context: None,
             },
         )
         .unwrap();
@@ -496,6 +562,7 @@ mod tests {
                 expected_object_updated_ms: object.updated + 1,
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
+                policy_context: None,
             },
         )
         .unwrap();
@@ -512,6 +579,7 @@ mod tests {
                 expected_object_updated_ms: object.updated,
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
+                policy_context: None,
             },
         )
         .unwrap();
@@ -528,9 +596,120 @@ mod tests {
                 expected_object_updated_ms: object.updated,
                 expected_object_revision: "",
                 evidence_submission_ids: &[],
+                policy_context: None,
             },
         )
         .unwrap();
         assert_eq!(unknown.outcome, PREVIEW_INVALID);
+    }
+
+    #[test]
+    fn preview_names_a_failing_visible_criterion() {
+        let (db, mut object) = setup();
+        object.properties.insert("state".into(), "draft".into());
+        db.update_object(&object).unwrap();
+        let mut type_def = update_type();
+        type_def.version = "2".into();
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "ready_for_review".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                property: "state".into(),
+                value: "ready".into(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 2)
+            .unwrap();
+        let preview = preview_object_action(
+            &db,
+            None,
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.update",
+                version: "2",
+                parameters_json: r#"{"object_id":"cust-1"}"#,
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: "",
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.outcome, PREVIEW_INVALID);
+        assert_eq!(preview.reason_code, "ready_for_review");
+        assert_eq!(preview.failing_criterion, "ready_for_review");
+    }
+
+    #[test]
+    fn preview_hides_ungranted_criterion_properties() {
+        use crate::sekai::object_security::{
+            OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+            ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+        };
+        use std::collections::BTreeMap;
+
+        let (db, mut object) = setup();
+        object.properties.insert("secret".into(), "yes".into());
+        db.update_object(&object).unwrap();
+        let policy = ObjectSecurityPolicy {
+            contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "acme".into(),
+            kind: "customer_record".into(),
+            rules: vec![ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Read,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![PropertyGrant {
+                property: "title".into(),
+                access: PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: None,
+            required_purpose: None,
+        };
+        let revision = db
+            .put_object_security_policy(&policy, "root", "put-hidden-criterion", 3)
+            .unwrap();
+        db.activate_object_security_policies(
+            "acme",
+            &BTreeMap::from([("customer_record".into(), revision.revision_digest)]),
+            "root",
+            "activate-hidden-criterion",
+            4,
+        )
+        .unwrap();
+        let mut type_def = update_type();
+        type_def.version = "3".into();
+        type_def.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "has_clearance".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                property: "secret".into(),
+                value: "yes".into(),
+            },
+        ];
+        db.put_governed_action_type(type_def, "operator", 5)
+            .unwrap();
+        let preview = preview_object_action(
+            &db,
+            None,
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.update",
+                version: "3",
+                parameters_json: r#"{"object_id":"cust-1"}"#,
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: "",
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.outcome, PREVIEW_UNAVAILABLE);
+        assert_eq!(preview.reason_code, "unavailable");
+        assert!(preview.failing_criterion.is_empty());
+        assert!(!preview.reason_code.contains("secret"));
+        assert!(!format!("{preview:?}").contains("has_clearance"));
     }
 }

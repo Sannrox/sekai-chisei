@@ -7,8 +7,10 @@ Research freeze: [research/395-action-effect-mapping.md](research/395-action-eff
 ## Purpose
 
 When an ActionInstance is **admitted**, the plane records durable **effect**
-children from the type's `allowed_effect_kinds`. Effects are not silent log
-lines; they have lifecycle status and bounded JSON payloads.
+children from the type's `declared_effect_kinds`, or from `allowed_effect_kinds`
+when the declared list is empty. Effects are not silent log
+lines; they have lifecycle status and bounded JSON payloads. An effect
+failure does not rewrite the Action instance outcome.
 
 ## Effect kinds (v1)
 

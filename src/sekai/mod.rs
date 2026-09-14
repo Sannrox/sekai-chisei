@@ -5,6 +5,7 @@ pub mod action_instance;
 pub mod action_instance_admission;
 pub(crate) mod action_object_mutation;
 pub mod action_policy;
+pub mod action_type_criteria;
 pub(crate) mod action_work_lifecycle;
 pub mod attestation;
 pub mod audit;

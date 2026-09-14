@@ -128,6 +128,7 @@ pub(super) async fn submit_action_instance(
     };
 
     let principals = caller_principals(&req);
+    let policy_context = principal_policy_context(&req);
     let tenant_context = request_tenant_context(&service.db, &req)?;
     let header_operation_id = SekaiServiceImpl::catalog_metadata_value(
         &req,
@@ -172,6 +173,7 @@ pub(super) async fn submit_action_instance(
                 request_id: inner.request_id,
                 ontology_digest: inner.ontology_digest,
                 autonomous_envelope_id: String::new(),
+                policy_context,
             },
             &actor,
             now_millis(),
@@ -249,6 +251,7 @@ pub(super) async fn preview_object_action(
             expected_object_updated_ms: inner.expected_object_updated_ms,
             expected_object_revision: &inner.expected_object_revision,
             evidence_submission_ids: &inner.evidence_submission_ids,
+            policy_context: Some(&policy_context),
         },
     )
     .map_err(map_object_action_projection_error)?;
