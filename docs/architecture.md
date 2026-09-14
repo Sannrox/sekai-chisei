@@ -43,7 +43,12 @@ external evidence, and governed memory candidates.
 Important mutations are explicit. Object RPC mutations and object-mutating
 built-in actions write audit rows in the same transaction as the object change.
 Creates and deletes use lifecycle summaries; updates record changed scalar and
-property fields.
+property fields. A typed object is a fact of a type revision produced by a
+registered source mapping or a versioned Action. Graph rows persist those
+facts. A derived index is a rebuildable projection, not a second object
+authority. Generic object and link RPCs remain the current escape hatch, not
+the destination write model. See
+[ADR 0073](decisions/0073-source-and-action-objects.md).
 
 Reusable PostgreSQL persistence also covers retention policies, scope-bound
 immutable content, legal and operational holds, transactional garbage

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Record that typed objects are facts of a type revision produced by
+  registered sources or versioned Actions. Graph rows are persistence. A
+  derived index is a rebuildable projection, never a second authority
+  (#876, [ADR 0073](docs/decisions/0073-source-and-action-objects.md)).
 - Record that ontology functions are an in-process host API: grow the
   existing `CreateFunction` pipeline; never run them as an agent harness;
   isolate guest code later behind that same host without picking an engine
