@@ -729,7 +729,7 @@ fn reject_unknown_keys(
 }
 
 impl ObjectSecurityPredicate {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::AllowAll => Ok(()),
             Self::SubjectEqualsProperty { property } => validate_property(property),
@@ -741,7 +741,7 @@ impl ObjectSecurityPredicate {
         }
     }
 
-    fn matches(&self, context: &PrincipalPolicyContext, object: &Object) -> bool {
+    pub(crate) fn matches(&self, context: &PrincipalPolicyContext, object: &Object) -> bool {
         match self {
             Self::AllowAll => true,
             Self::SubjectEqualsProperty { property } => object

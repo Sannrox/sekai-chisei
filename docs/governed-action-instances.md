@@ -36,10 +36,12 @@ Reconciliation stays `GetOperationReceipt`.
 
 Describe requires object-read authorization, not action-admin. Preview uses the
 same submit authorization as admission, then rechecks live object revision,
-Action version, closed parameter schema, policy, and budget. A preview digest
-is not a permit. Stale object or Action state fails closed. Hidden objects and
-types share one unavailable shape. Compensation is explicit `unsupported`
-unless a type already stores a supported contract.
+Action version, closed parameter schema, submission criteria, policy, and
+budget. A preview digest is not a permit. Stale object or Action state fails
+closed. Hidden objects, types, and hidden-property criteria share one
+unavailable shape. A visible failing criterion is named on preview and on
+submit `deny_reason`. Compensation is explicit `unsupported` unless a type
+already stores a supported contract.
 
 ## Admission flow
 

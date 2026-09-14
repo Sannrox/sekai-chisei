@@ -257,6 +257,7 @@ pub fn submit_step(
                 request_id: String::new(),
                 ontology_digest: String::new(),
                 autonomous_envelope_id: String::new(),
+                policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
             },
             actor,
             now_ms,
@@ -834,6 +835,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -854,6 +856,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         }
     }
 

@@ -4649,6 +4649,8 @@ async fn governed_action_type_registry_put_get_list_disable() {
         disabled_at_ms: 0,
         object_kind: String::new(),
         object_mutation: String::new(),
+        submission_criteria: vec![],
+        declared_effect_kinds: vec![],
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -4773,6 +4775,8 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         disabled_at_ms: 0,
         object_kind: String::new(),
         object_mutation: String::new(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -4966,6 +4970,8 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             disabled_at_ms: 0,
             object_kind: String::new(),
             object_mutation: String::new(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -5104,6 +5110,8 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
             disabled_at_ms: 0,
             object_kind: String::new(),
             object_mutation: String::new(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
         }),
         request_id: "put-nul".into(),
     }))
@@ -5325,6 +5333,8 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
             disabled_at_ms: 0,
             object_kind: "customer_record".into(),
             object_mutation: "create".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
         }),
         request_id: "put-record".into(),
     }))
@@ -5397,6 +5407,8 @@ async fn submit_action_instance_propagates_one_operation_identity() {
             disabled_at_ms: 0,
             object_kind: "customer_record".into(),
             object_mutation: "create".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -5525,6 +5537,8 @@ async fn describe_and_preview_object_action_are_observational() {
             disabled_at_ms: 0,
             object_kind: "customer_record".into(),
             object_mutation: "update".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
         }),
         request_id: "put-update".into(),
     }))

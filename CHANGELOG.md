@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Let a `GovernedActionType` declare closed submission criteria and a
+  declared effect-kind subset (#883,
+  [ADR 0077](docs/decisions/0077-action-type-criteria.md)). Preview names a
+  failing visible criterion; submit rechecks live state and refuses with the
+  same code. Hidden or ungranted properties fail closed as unavailable.
+  Function-backed rules and a webhook family stay out of this slice.
 - Serve stable unary RPCs as an in-process HTTP/JSON projection of the same
   gRPC handlers, auth interceptor, and maturity gate (#875,
   [ADR 0075](docs/decisions/0075-http-ontology-projection.md)). Routes are

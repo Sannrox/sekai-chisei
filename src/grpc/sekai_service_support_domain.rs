@@ -366,6 +366,12 @@ pub(super) fn from_proto_governed_action_type(
         budget_scope: proto.budget_scope,
         object_kind: proto.object_kind,
         object_mutation: proto.object_mutation,
+        submission_criteria: proto
+            .submission_criteria
+            .into_iter()
+            .map(from_proto_submission_criterion)
+            .collect(),
+        declared_effect_kinds: proto.declared_effect_kinds,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -388,11 +394,37 @@ pub(super) fn to_proto_governed_action_type(
         budget_scope: domain.budget_scope.clone(),
         object_kind: domain.object_kind.clone(),
         object_mutation: domain.object_mutation.clone(),
+        submission_criteria: domain
+            .submission_criteria
+            .iter()
+            .map(to_proto_submission_criterion)
+            .collect(),
+        declared_effect_kinds: domain.declared_effect_kinds.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
         updated_at_ms: domain.updated_at_ms,
         disabled_at_ms: domain.disabled_at_ms,
+    }
+}
+fn from_proto_submission_criterion(
+    proto: crate::grpc::pb::sekai::ActionSubmissionCriterion,
+) -> crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+    crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+        criterion_id: proto.criterion_id,
+        kind: proto.kind,
+        property: proto.property,
+        value: proto.value,
+    }
+}
+fn to_proto_submission_criterion(
+    domain: &crate::sekai::action_type_criteria::ActionSubmissionCriterion,
+) -> crate::grpc::pb::sekai::ActionSubmissionCriterion {
+    crate::grpc::pb::sekai::ActionSubmissionCriterion {
+        criterion_id: domain.criterion_id.clone(),
+        kind: domain.kind.clone(),
+        property: domain.property.clone(),
+        value: domain.value.clone(),
     }
 }
 pub(super) fn to_proto_action_instance(
@@ -1491,6 +1523,12 @@ pub(super) fn object_action_description_to_proto(
         enabled: description.enabled,
         preview_supported: description.preview_supported,
         compensation: description.compensation,
+        submission_criteria: description
+            .submission_criteria
+            .iter()
+            .map(to_proto_submission_criterion)
+            .collect(),
+        declared_effect_kinds: description.declared_effect_kinds,
     }
 }
 pub(super) fn object_action_preview_to_proto(
@@ -1508,6 +1546,7 @@ pub(super) fn object_action_preview_to_proto(
         budget_decision: preview.budget_decision,
         approval_state: preview.approval_state,
         compensation: preview.compensation,
+        failing_criterion: preview.failing_criterion,
     }
 }
 pub(super) fn authorize_action_instance_submit(

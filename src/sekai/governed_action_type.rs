@@ -5,6 +5,7 @@
 //! later Issues (#397–#399).
 
 use crate::db::sekai::SekaiDb;
+use crate::sekai::action_type_criteria::{ActionSubmissionCriterion, validate_submission_criteria};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,7 @@ const KNOWN_EFFECT_KINDS: &[&str] = &[
     EFFECT_KIND_EXTERNAL_MUTATE,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedActionType {
     pub namespace: String,
     pub type_id: String,
@@ -40,6 +41,12 @@ pub struct GovernedActionType {
     /// `create` or `update` when `object_kind` is set. Empty means admit-only.
     #[serde(default)]
     pub object_mutation: String,
+    /// Closed object-security v1 predicates over the bound object and invoker.
+    #[serde(default)]
+    pub submission_criteria: Vec<ActionSubmissionCriterion>,
+    /// Subset of `allowed_effect_kinds` materialized on admit. Empty means all allowed.
+    #[serde(default)]
+    pub declared_effect_kinds: Vec<String>,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -88,12 +95,40 @@ impl GovernedActionType {
                 return Err(format!("duplicate effect kind {kind:?}"));
             }
         }
+        let mut declared_seen = std::collections::BTreeSet::new();
+        for kind in &self.declared_effect_kinds {
+            if !self
+                .allowed_effect_kinds
+                .iter()
+                .any(|allowed| allowed == kind)
+            {
+                return Err(format!(
+                    "undeclared effect kind {kind:?}; must be a subset of allowed_effect_kinds"
+                ));
+            }
+            if !declared_seen.insert(kind.clone()) {
+                return Err(format!("duplicate declared effect kind {kind:?}"));
+            }
+        }
         validate_object_binding(
             &self.object_kind,
             &self.object_mutation,
             &self.parameter_schema_json,
         )?;
+        validate_submission_criteria(
+            &self.submission_criteria,
+            &self.object_kind,
+            &self.object_mutation,
+        )?;
         Ok(())
+    }
+
+    pub fn effect_kinds_to_materialize(&self) -> &[String] {
+        if self.declared_effect_kinds.is_empty() {
+            &self.allowed_effect_kinds
+        } else {
+            &self.declared_effect_kinds
+        }
     }
 }
 
@@ -160,6 +195,8 @@ fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "budget_scope": t.budget_scope,
         "object_kind": t.object_kind,
         "object_mutation": t.object_mutation,
+        "submission_criteria": t.submission_criteria,
+        "declared_effect_kinds": t.declared_effect_kinds,
     });
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
@@ -422,6 +459,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -519,5 +557,14 @@ mod tests {
         notify.object_mutation = OBJECT_MUTATION_CREATE.into();
         let error = db.put_governed_action_type(notify, "op", 1).unwrap_err();
         assert!(error.contains("notify_delivery"), "{error}");
+    }
+
+    #[test]
+    fn rejects_undeclared_effect_kind() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut bad = sample(true);
+        bad.declared_effect_kinds = vec![EFFECT_KIND_EXTERNAL_MUTATE.into()];
+        let error = db.put_governed_action_type(bad, "op", 1).unwrap_err();
+        assert!(error.contains("undeclared effect kind"), "{error}");
     }
 }

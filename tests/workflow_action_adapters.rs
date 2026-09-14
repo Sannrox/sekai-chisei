@@ -85,6 +85,7 @@ fn setup() -> RuntimeDb {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         },
         "operator",
         1,
@@ -107,6 +108,7 @@ fn setup() -> RuntimeDb {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         },
         "operator",
         1,

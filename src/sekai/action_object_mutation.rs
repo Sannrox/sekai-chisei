@@ -348,6 +348,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         };
         let error = plan(&db, &type_def, "acme", r#"{"object_id":" rec-1 "}"#).unwrap_err();
         assert!(matches!(
@@ -394,6 +395,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         };
         let error = plan(&db, &type_def, "acme", r#"{"object_id":"rec-schema"}"#).unwrap_err();
         assert!(matches!(
@@ -430,6 +432,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         };
         let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#)
             .unwrap()
@@ -473,6 +476,7 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             disabled_at_ms: 0,
+            ..Default::default()
         };
         let planned = plan(
             &db,

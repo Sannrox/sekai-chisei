@@ -91,6 +91,10 @@ struct TypeFile {
     object_kind: String,
     #[serde(default)]
     object_mutation: String,
+    #[serde(default)]
+    submission_criteria: Vec<crate::sekai::action_type_criteria::ActionSubmissionCriterion>,
+    #[serde(default)]
+    declared_effect_kinds: Vec<String>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -170,6 +174,19 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
             budget_scope: parsed.budget_scope,
             object_kind: parsed.object_kind,
             object_mutation: parsed.object_mutation,
+            submission_criteria: parsed
+                .submission_criteria
+                .into_iter()
+                .map(
+                    |criterion| crate::grpc::pb::sekai::ActionSubmissionCriterion {
+                        criterion_id: criterion.criterion_id,
+                        kind: criterion.kind,
+                        property: criterion.property,
+                        value: criterion.value,
+                    },
+                )
+                .collect(),
+            declared_effect_kinds: parsed.declared_effect_kinds,
             enabled: parsed.enabled,
             created_by: String::new(),
             created_at_ms: 0,
