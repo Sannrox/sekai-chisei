@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "Sekai",
+      "description": "Canonical operational memory: typed objects and relations for actors, operations, attempts, actions, artifacts, verification, and outcomes; graph traversal, lineage, schema validation, audit trails, and namespace-first access control. Domain concepts belong in schemas and adapters, not the core contract."
+    },
+    {
+      "name": "Chisei",
+      "description": "Governed decision layer that resolves how an operation may proceed: allowed runtimes and models from namespace policy; budgets, egress, action policy, and approval; memory and risk enrichment; evaluation and outcome attribution. Policy choices stay inspectable instead of buried in an agent runtime."
+    },
+    {
+      "name": "Portable Ontology Database",
+      "description": "A local SQLite ontology file selected with --db or SEKAI_DB, commonly .sekai/knowledge.db. It stores portable class, relation, and provenance documents for the sekai CLI. It is not the control-plane runtime database."
+    },
+    {
+      "name": "Control Plane Database",
+      "description": "The sekai-chisei runtime store, defaulting to data/sekai.db. It holds operational graph state for the gRPC control plane and must not be used as a portable ontology database."
+    },
+    {
+      "name": "Receipt",
+      "description": "The authoritative operation projection returned by GetOperationReceipt. Reconciliation uses the receipt; it records the bound operation identity, events, and outcome on the harvest spine."
+    },
+    {
+      "name": "Operation",
+      "description": "A governed run correlated by operation_id across plan, execute, events, and receipt. GetOperationReceipt is the stable read of that run."
+    },
+    {
+      "name": "Governed Action",
+      "description": "A submitted ActionInstance against a registered GovernedActionType. Admission persists the instance with a bound operation_id. Deliberate execution stays SubmitActionInstance; describe and preview are observational and are not submit authority."
+    },
+    {
+      "name": "Directory Fact",
+      "description": "A local filesystem entity or contains link recorded by directory init and directory index in a portable ontology database. Directory facts record workspace layout; they are not ontology classes."
+    },
+    {
+      "name": "Ontology Class",
+      "description": "An explicit portable definition of meaning: name, description, superclasses, properties, and provenance. Classes describe types above durable facts; they are not directory index rows and are not server builtins unless separately applied through the control plane."
+    }
+  ],
+  "relations": [
+    {
+      "name": "governs_through",
+      "description": "Chisei decisions constrain operations whose durable facts live in Sekai. The two layers are one control plane, not separate products.",
+      "domain": "Chisei",
+      "range": "Sekai"
+    },
+    {
+      "name": "distinct_from",
+      "description": "The portable ontology file selected with --db or SEKAI_DB is not the control-plane database at data/sekai.db.",
+      "domain": "Portable Ontology Database",
+      "range": "Control Plane Database"
+    },
+    {
+      "name": "records",
+      "description": "A receipt is the authoritative projection of one operation.",
+      "domain": "Receipt",
+      "range": "Operation"
+    },
+    {
+      "name": "submitted_as",
+      "description": "A governed Action binds an ActionInstance to the operation receipt spine. SubmitActionInstance admits; GetOperationReceipt reconciles.",
+      "domain": "Governed Action",
+      "range": "Receipt"
+    },
+    {
+      "name": "binds",
+      "description": "Admission persists a governed Action with a bound operation_id for the existing operation receipt and harvest spine.",
+      "domain": "Governed Action",
+      "range": "Operation"
+    },
+    {
+      "name": "is_not",
+      "description": "A directory fact records filesystem layout; an ontology class defines meaning. Do not treat directory index rows as ontology classes.",
+      "domain": "Directory Fact",
+      "range": "Ontology Class"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "Sekai",
+      "source": "VISION.md",
+      "locator": "Sekai: Durable Facts",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Sekai",
+      "source": "docs/architecture.md",
+      "locator": "Sekai: durable facts",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Chisei",
+      "source": "VISION.md",
+      "locator": "Chisei: Governed Decisions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Chisei",
+      "source": "docs/architecture.md",
+      "locator": "Chisei: governed decisions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "governs_through",
+      "source": "docs/architecture.md",
+      "locator": "Components",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Portable Ontology Database",
+      "source": "AGENTS.md",
+      "locator": "Ontology Policy",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Control Plane Database",
+      "source": "AGENTS.md",
+      "locator": "Ontology Policy",
+      "confidence": 1.0
+    },
+    {
+      "subject": "distinct_from",
+      "source": "AGENTS.md",
+      "locator": "Ontology Policy",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Receipt",
+      "source": "docs/architecture.md",
+      "locator": "Governed immutable subjects",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Receipt",
+      "source": "docs/rpc-maturity.md",
+      "locator": "ChiseiService.GetOperationReceipt",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Operation",
+      "source": "docs/rpc-maturity.md",
+      "locator": "ChiseiService.GetOperationReceipt",
+      "confidence": 1.0
+    },
+    {
+      "subject": "records",
+      "source": "docs/architecture.md",
+      "locator": "Governed immutable subjects",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Governed Action",
+      "source": "docs/rpc-maturity.md",
+      "locator": "SekaiService.SubmitActionInstance",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Governed Action",
+      "source": "docs/architecture.md",
+      "locator": "External host actions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "submitted_as",
+      "source": "docs/rpc-maturity.md",
+      "locator": "SekaiService.SubmitActionInstance",
+      "confidence": 1.0
+    },
+    {
+      "subject": "binds",
+      "source": "docs/rpc-maturity.md",
+      "locator": "ChiseiService.GetOperationReceipt",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Directory Fact",
+      "source": "AGENTS.md",
+      "locator": "Ontology Policy",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Ontology Class",
+      "source": "docs/ontology.md",
+      "locator": "Ontology definitions",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Ontology Class",
+      "source": "VISION.md",
+      "locator": "Semantic Ontology Layer",
+      "confidence": 1.0
+    },
+    {
+      "subject": "is_not",
+      "source": "AGENTS.md",
+      "locator": "Ontology Policy",
+      "confidence": 1.0
+    }
+  ]
+}

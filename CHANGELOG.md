@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Ship a versioned portable product vocabulary pack that agents can import
+  into a fresh `sekai` database and query with provenance (#895). The pack is
+  contributor vocabulary for this repository, not a built-in server ontology
+  and not `directory init` vocabulary.
 - Split the three largest service files into handler-family modules so each
   facade stays under 2,000 lines (#872). Shared helpers move with the family;
   each service keeps one trait impl that delegates. CI fails if any of the

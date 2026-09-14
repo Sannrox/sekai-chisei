@@ -33,6 +33,8 @@ For work involving portable ontology definitions, classes, relations, provenance
 
 Select the ontology database explicitly with `--db <path>` or `SEKAI_DB`, then run `sekai --db <path> --json validate` before relying on its contents. Treat successful ontology output as structured repository evidence, preserve its provenance in answers, and state when validation fails or the requested fact is absent rather than inferring it. Do not use the control-plane database at `data/sekai.db` as a portable ontology database.
 
+Ontology classes and relations describe meaning. Directory commands record local filesystem facts (`directory init` / `directory index`) in the same portable database; those facts are not ontology classes. This repository's contributor vocabulary pack is `crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`. Import it into a throwaway `--db` when answering product-term questions; do not treat it as a built-in server ontology or as `directory init` vocabulary.
+
 ## Coding Style & Naming Conventions
 
 Follow standard Rust formatting with `cargo fmt` and keep modules aligned with the existing domain boundaries. Use `snake_case` for files, modules, functions, and variables; use `PascalCase` for types and traits; use `SCREAMING_SNAKE_CASE` for constants. Keep provider-specific behavior behind `crates/sekai-provider/` abstractions (re-exported as `sekai_chisei::llm`). Prefer explicit policy, audit, and authorization behavior over hidden side effects.

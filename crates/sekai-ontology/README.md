@@ -203,3 +203,17 @@ Arm64 and x86-64. The supported Homebrew installation does not require Rust:
 ```bash
 brew install Sannrox/tap/sekai
 ```
+
+## Product vocabulary (this repository)
+
+`ontologies/sekai-chisei-product-v1.json` is contributor and agent vocabulary
+for the sekai-chisei repository. Import it into a fresh `--db` to answer
+product-term questions with provenance. It is not a built-in server ontology,
+not part of `init` or `directory init`, and not a customer domain.
+
+```bash
+sekai --db /tmp/product.db init
+sekai --db /tmp/product.db import ontologies/sekai-chisei-product-v1.json
+sekai --db /tmp/product.db --json validate
+sekai --db /tmp/product.db --json explain Sekai
+```
