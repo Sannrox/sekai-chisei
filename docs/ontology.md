@@ -6,6 +6,11 @@ and it does not persist inferred facts. The initial reasoning direction is a
 fixed, opt-in, query-time profile; see
 [ADR 0001](decisions/0001-query-time-ontology-entailment.md).
 
+Portable `sekai import` and `sekaictl ontology apply` share one definition
+design (class, relation, property, cardinality, provenance, mapped_kind).
+Their I/O differs: a local SQLite file versus authenticated gRPC apply.
+Apply-only hints such as `ensure_kind` are not ontology meaning.
+
 The native `SekaiService` API exposes ontology classes and relations. Classes
 can declare superclasses, equivalent classes, disjoint classes, and typed
 properties. Relations declare domain and range classes plus metadata that later
@@ -72,7 +77,10 @@ ontology-first authoring.
 
 Document versions:
 
-- Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`)
+- Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`).
+  `sekaictl ontology apply` also accepts portable `schema_version: 1` and
+  `sekai.ontology-definition/v1` documents with the same class and relation
+  fields.
 - Seed: `sekai.seed/v1` (`tests/fixtures/product_loop/seed-v1.json`)
 
 ### Reference lookup-first domain pack

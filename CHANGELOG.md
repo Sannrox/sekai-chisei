@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Share one ontology definition design across portable `sekai` import and
+  `sekaictl ontology apply`. Class, relation, property, cardinality, and
+  mapped_kind fields mean the same thing on both I/O paths. Apply-only
+  hints (`ensure_kind`, `kind_description`) stay off the portable meaning
+  model (#900).
+- Add `sekai setup` so a scoped portable ontology, directory vocabulary,
+  optional directory index, and agent skill can be created in one idempotent
+  command. Default setup writes `.sekai/knowledge.db` instead of a bare
+  `knowledge.db`. Existing `init`, `directory`, and `skill` commands stay
+  available for scripted steps.
 - Ship a versioned portable product vocabulary pack that agents can import
   into a fresh `sekai` database and query with provenance (#895). The pack is
   contributor vocabulary for this repository, not a built-in server ontology

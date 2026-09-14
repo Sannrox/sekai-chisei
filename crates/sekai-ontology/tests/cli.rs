@@ -47,6 +47,60 @@ fn fresh_file_workflow_has_stable_machine_output() {
 }
 
 #[test]
+fn product_definition_document_imports_as_the_same_design() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("knowledge.db");
+    let product = directory.path().join("domain.json");
+    fs::write(
+        &product,
+        r#"{
+          "version": "sekai.ontology-product/v1",
+          "classes": [
+            {
+              "name": "Receipt",
+              "description": "Inspectable operation outcome",
+              "mapped_kind": "receipt",
+              "ensure_kind": true,
+              "kind_description": "apply only",
+              "properties": [{"name": "request_id", "type": "string", "required": true}]
+            }
+          ],
+          "relations": []
+        }"#,
+    )
+    .unwrap();
+    let database = database.to_str().unwrap();
+    assert!(sekai(&["--db", database, "init"]).status.success());
+    assert!(
+        sekai(&["--db", database, "import", product.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let output = sekai(&["--db", database, "--json", "explain", "Receipt"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["class"]["name"], "Receipt");
+    assert_eq!(json["data"]["class"]["mapped_kind"], "receipt");
+    assert_eq!(json["data"]["class"]["properties"][0]["name"], "request_id");
+    let exported = sekai(&["--db", database, "--json", "export"]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let exported: Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let class = &exported["data"]["classes"][0];
+    assert_eq!(class["name"], "Receipt");
+    assert_eq!(class["mapped_kind"], "receipt");
+    assert!(class.get("ensure_kind").is_none());
+    assert!(class.get("kind_description").is_none());
+}
+
+#[test]
 fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
     let directory = tempfile::tempdir().unwrap();
     let database_path = directory.path().join("knowledge.db");
@@ -278,6 +332,7 @@ fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
     let help = String::from_utf8(help.stdout).unwrap();
     for command in [
+        "setup",
         "export",
         "explain",
         "query",
@@ -1180,4 +1235,251 @@ fn database_resolution_skips_user_default_when_file_missing() {
     );
     let json: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["data"]["valid"], true);
+}
+
+fn sekai_isolated(home: &std::path::Path, cwd: &std::path::Path, arguments: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    command
+        .args(arguments)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env_remove("SEKAI_DB")
+        .env_remove("SEKAI_SKILL_PATH");
+    #[cfg(not(target_os = "macos"))]
+    command.env("XDG_DATA_HOME", home.join("share"));
+    command.output().unwrap()
+}
+
+#[test]
+fn setup_creates_scoped_database_vocabulary_index_and_skill() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let project = temporary.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir(&home).unwrap();
+
+    let output = sekai_isolated(&home, &project, &["--json", "setup", "--max-depth", "1"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["command"], "setup");
+    assert_eq!(json["data"]["created_database"], true);
+    assert_eq!(json["data"]["scope"], "project");
+    assert_eq!(json["data"]["kind"], "ProjectDirectory");
+    assert_eq!(json["data"]["directory_vocabulary"], true);
+    assert_eq!(json["data"]["index"]["scanned_entities"], 2);
+    assert_eq!(json["data"]["skill"]["status"], "installed");
+    assert!(project.join(".sekai/knowledge.db").is_file());
+    assert!(!project.join("knowledge.db").exists());
+    assert_eq!(
+        fs::read_to_string(home.join(".agents/skills/sekai-ontology/SKILL.md")).unwrap(),
+        EMBEDDED_SKILL
+    );
+
+    let repeat = sekai_isolated(&home, &project, &["--json", "setup", "--max-depth", "1"]);
+    assert!(
+        repeat.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeat.stderr)
+    );
+    let repeat: Value = serde_json::from_slice(&repeat.stdout).unwrap();
+    assert_eq!(repeat["data"]["created_database"], false);
+    assert_eq!(repeat["data"]["kind"], "ProjectDirectory");
+    assert_eq!(repeat["data"]["skill"]["status"], "already_current");
+}
+
+#[test]
+fn setup_reuses_nearest_scoped_database_and_preserves_root_kind() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let workspace = temporary.path().join("Projects");
+    let nested = workspace.join("alpha/src");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir(&home).unwrap();
+
+    let first = sekai_isolated(
+        &home,
+        &workspace,
+        &[
+            "--json",
+            "setup",
+            "--scope",
+            "workspace",
+            "--max-depth",
+            "1",
+            "--no-skill",
+        ],
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["data"]["scope"], "workspace");
+    assert_eq!(first["data"]["kind"], "WorkspaceDirectory");
+
+    let reused = sekai_isolated(
+        &home,
+        &nested,
+        &["--json", "setup", "--max-depth", "1", "--no-skill"],
+    );
+    assert!(
+        reused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    let reused: Value = serde_json::from_slice(&reused.stdout).unwrap();
+    assert_eq!(reused["data"]["created_database"], false);
+    assert_eq!(reused["data"]["scope"], "project");
+    assert_eq!(reused["data"]["kind"], "WorkspaceDirectory");
+    assert_eq!(
+        std::path::Path::new(reused["data"]["database"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        workspace
+            .join(".sekai/knowledge.db")
+            .canonicalize()
+            .unwrap()
+    );
+    assert!(!nested.join(".sekai/knowledge.db").exists());
+}
+
+#[test]
+fn setup_scope_project_overrides_an_ancestor_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let workspace = temporary.path().join("Projects");
+    let project = workspace.join("alpha");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+
+    assert!(
+        sekai_isolated(
+            &home,
+            &workspace,
+            &["setup", "--scope", "workspace", "--no-index", "--no-skill"]
+        )
+        .status
+        .success()
+    );
+    let output = sekai_isolated(
+        &home,
+        &project,
+        &[
+            "--json",
+            "setup",
+            "--scope",
+            "project",
+            "--max-depth",
+            "0",
+            "--no-skill",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["created_database"], true);
+    assert_eq!(json["data"]["scope"], "project");
+    assert_eq!(
+        std::path::Path::new(json["data"]["database"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        project.join(".sekai/knowledge.db").canonicalize().unwrap()
+    );
+    assert!(workspace.join(".sekai/knowledge.db").is_file());
+}
+
+#[test]
+fn setup_user_scope_creates_the_user_database_without_indexing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let cwd = temporary.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir(&home).unwrap();
+
+    let output = sekai_isolated(&home, &cwd, &["--json", "setup", "--scope", "user"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["data"]["scope"], "user");
+    assert_eq!(json["data"]["created_database"], true);
+    assert!(json["data"]["index"].is_null());
+    assert_eq!(json["data"]["skill"]["status"], "installed");
+    #[cfg(target_os = "macos")]
+    let expected = home.join("Library/Application Support/sekai/knowledge.db");
+    #[cfg(not(target_os = "macos"))]
+    let expected = home.join("share/sekai/knowledge.db");
+    assert_eq!(
+        json["data"]["database"].as_str().unwrap(),
+        expected.to_str().unwrap()
+    );
+    assert!(expected.is_file());
+    assert!(!cwd.join(".sekai/knowledge.db").exists());
+}
+
+#[test]
+fn setup_rejects_index_flags_without_indexing_and_keeps_json_stdout_clean() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+
+    let invalid = sekai_isolated(
+        &home,
+        &project,
+        &["setup", "--no-index", "--prune", "--no-skill"],
+    );
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+
+    let unknown_scope = sekai_isolated(&home, &project, &["setup", "--scope", "org"]);
+    assert_eq!(unknown_scope.status.code(), Some(2));
+
+    let query_flag = sekai_isolated(
+        &home,
+        &project,
+        &["setup", "--direction", "both", "--no-skill"],
+    );
+    assert_eq!(query_flag.status.code(), Some(2));
+
+    let skill = project.join("skill");
+    fs::create_dir(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        format!("{EMBEDDED_SKILL}\n# edited\n"),
+    )
+    .unwrap();
+    let drift = sekai_isolated(
+        &home,
+        &project,
+        &[
+            "--json",
+            "setup",
+            "--no-index",
+            "--path",
+            skill.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(drift.status.code(), Some(11));
+    let drift_json: Value = serde_json::from_slice(&drift.stdout).unwrap();
+    assert_eq!(drift_json["command"], "setup");
+    assert_eq!(drift_json["data"]["directory_vocabulary"], true);
+    assert_eq!(drift_json["data"]["skill"]["status"], "drift");
+    assert!(project.join(".sekai/knowledge.db").is_file());
 }

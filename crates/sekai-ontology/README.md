@@ -6,23 +6,28 @@ runs one command and exits; the library offers the same operations in process.
 ## Quick start
 
 ```bash
-sekai --db knowledge.db init
-sekai --db knowledge.db import ontology.json
-sekai --db knowledge.db export
-sekai --db knowledge.db validate
-sekai --db knowledge.db --json explain Api
-sekai --db knowledge.db --json query Api --direction outbound --depth 2
-sekai --db knowledge.db --json find interface
-sekai --db knowledge.db --json ask "What does Api depend on?"
-sekai --db knowledge.db --json ask "find language"
-sekai --db knowledge.db --json ask "What does Api depend on to depth 2?"
+sekai setup --scope project --prune
+sekai import ontology.json
+sekai export
+sekai validate
+sekai --json explain Api
+sekai --json query Api --direction outbound --depth 2
+sekai --json find interface
+sekai --json ask "What does Api depend on?"
+sekai --json ask "find language"
+sekai --json ask "What does Api depend on to depth 2?"
 sekai --json diff before.json after.json
-sekai --db knowledge.db --json entity list
-sekai --db knowledge.db --json relation list
-sekai --db knowledge.db directory init
-sekai --db knowledge.db directory index ~/Projects --kind WorkspaceDirectory --prune
-sekai --db knowledge.db directory tree ~/Projects
+sekai --json entity list
+sekai --json relation list
+sekai directory tree .
 ```
+
+`setup` creates `.sekai/knowledge.db` in the current directory (or reuses the
+nearest existing scoped file), installs the directory vocabulary, indexes the
+scope root, and installs the agent skill. Use `--scope workspace` or
+`--scope user` for those layouts, `--no-index` / `--no-skill` to skip a step,
+and `--db` when a script must name the file explicitly. The older `init`,
+`directory init`, and `directory index` commands remain available.
 
 The database is resolved in this order (first match wins):
 
@@ -39,6 +44,13 @@ This lets `~/Projects/.sekai/knowledge.db` describe a workspace while
 `~/Projects/project-a/.sekai/knowledge.db` overrides it for one project.
 Explicit `--db` or `SEKAI_DB` remains the escape hatch for scripts and
 cross-scope inspection.
+
+Import accepts the shared definition design: the portable
+`schema_version: 1` document, a `sekai.ontology-product/v1` apply document,
+or an `export --json` envelope. Optional class fields include
+`equivalent_classes`, `disjoint_classes`, and `mapped_kind`. Optional
+relation fields include `inverse` and `mapped_relation`. Apply-only hints
+(`ensure_kind`, `kind_description`) are ignored on this path.
 
 Import accepts a versioned JSON document:
 
@@ -132,10 +144,10 @@ Mutations such as `import` remain explicit commands.
 
 ## Process contract
 
-`export --json`, `explain --json`, `query --json`, `find --json`, `diff --json`,
-`ask --json`, and `validate --json` return an envelope with `schema_version`,
-`command`, and `data`. Structured results are written to stdout and diagnostics
-to stderr.
+`setup --json`, `export --json`, `explain --json`, `query --json`, `find --json`,
+`diff --json`, `ask --json`, and `validate --json` return an envelope with
+`schema_version`, `command`, and `data`. Structured results are written to
+stdout and diagnostics to stderr.
 
 | Exit | Meaning |
 | --- | --- |
@@ -147,7 +159,9 @@ to stderr.
 
 `ask` also uses exit 2 for an ambiguous or unsupported question. A successful
 `find` with no matches and a `diff` with changes both exit 0; inspect their JSON
-data rather than using a failure exit code as a change indicator.
+data rather than using a failure exit code as a change indicator. `setup` treats
+an already-current skill as success. A modified or unrecognized skill is left
+untouched, reported as `drift`, and exits 11 after the ontology is ready.
 
 The JSON contract is version 1. New optional fields may be added within version
 1; incompatible changes require a new schema version.
@@ -155,21 +169,14 @@ The JSON contract is version 1. New optional fields may be added within version
 ## Directory facts
 
 The portable ontology keeps class/relation definitions separate from local
-filesystem facts. `directory init` installs the `Directory`,
-`WorkspaceDirectory`, `ProjectDirectory`, and transitive `contains` vocabulary.
-`directory index` then stores deterministic directory entities and direct
-parent-child links in the same SQLite file.
+filesystem facts. `setup` installs the `Directory`, `WorkspaceDirectory`,
+`ProjectDirectory`, and transitive `contains` vocabulary, then indexes the
+scope root. `directory init` and `directory index` remain available when those
+steps must run apart.
 
 ```bash
-sekai --db ~/Projects/.sekai/knowledge.db init
-sekai --db ~/Projects/.sekai/knowledge.db directory init
-sekai --db ~/Projects/.sekai/knowledge.db directory index ~/Projects \
-  --kind WorkspaceDirectory --prune
-
-sekai --db ~/Projects/project-a/.sekai/knowledge.db init
-sekai --db ~/Projects/project-a/.sekai/knowledge.db directory init
-sekai --db ~/Projects/project-a/.sekai/knowledge.db directory index . \
-  --kind ProjectDirectory --prune
+sekai setup --scope workspace --prune ~/Projects
+sekai setup --scope project --prune ~/Projects/project-a
 ```
 
 `directory tree` renders a bounded human hierarchy. `directory query` returns
@@ -181,7 +188,8 @@ stale facts when `--prune` is explicit.
 
 ## Agent skill
 
-The matching agent skill is embedded in the binary and installs offline:
+The matching agent skill is embedded in the binary. `sekai setup` installs it
+unless `--no-skill` is given. Offline install remains available:
 
 ```bash
 sekai skill install --path /chosen/skill/directory

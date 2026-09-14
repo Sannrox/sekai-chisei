@@ -3,6 +3,7 @@ use sekai_ontology::{
     DirectoryDocument, DirectoryScanOptions, EMBEDDED_SKILL, Error, ExportDocument,
     MAX_DIRECTORY_DEPTH, Ontology, QueryOptions, SCHEMA_VERSION, SqliteOntology,
     TraversalDirection, ValidationIssue, diff_documents, interpret_question,
+    parse_definition_document,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -51,8 +52,63 @@ struct AskResponse {
     answer: Option<AskAnswer>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupScope {
+    Project,
+    Workspace,
+    User,
+}
+
+impl SetupScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Workspace => "workspace",
+            Self::User => "user",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, Error> {
+        match value {
+            "project" => Ok(Self::Project),
+            "workspace" => Ok(Self::Workspace),
+            "user" => Ok(Self::User),
+            _ => Err(Error::Input(format!(
+                "unsupported scope '{value}'; expected project, workspace, or user"
+            ))),
+        }
+    }
+
+    fn default_kind(self) -> &'static str {
+        match self {
+            Self::Project => "ProjectDirectory",
+            Self::Workspace => "WorkspaceDirectory",
+            Self::User => DEFAULT_DIRECTORY_KIND,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SetupSkillResult {
+    path: Option<String>,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct SetupResult {
+    database: String,
+    created_database: bool,
+    scope: &'static str,
+    root: Option<String>,
+    kind: Option<String>,
+    directory_vocabulary: bool,
+    index: Option<sekai_ontology::DirectoryIndexReport>,
+    skill: SetupSkillResult,
+}
+
 struct Arguments {
     database: PathBuf,
+    database_explicit: bool,
     json: bool,
     command: String,
     operands: Vec<String>,
@@ -66,6 +122,9 @@ struct Arguments {
     skill_path: Option<PathBuf>,
     force: bool,
     uninstall: bool,
+    setup_scope: Option<SetupScope>,
+    no_index: bool,
+    no_skill: bool,
 }
 
 fn main() -> ExitCode {
@@ -103,22 +162,32 @@ fn run() -> Result<ExitCode, Error> {
             "--direction, --relation, and --depth are only valid with directory query".into(),
         ));
     }
-    if arguments.command != "directory"
+    if !matches!(arguments.command.as_str(), "directory" | "setup")
         && (arguments.directory_max_depth_set
             || arguments.directory_include_hidden
             || arguments.directory_prune
             || arguments.directory_kind.is_some())
     {
         return Err(Error::Input(
-            "--max-depth, --include-hidden, --prune, and --kind are only valid with directory"
+            "--max-depth, --include-hidden, --prune, and --kind are only valid with directory or setup"
                 .into(),
         ));
     }
-    if arguments.command != "skill"
-        && (arguments.skill_path.is_some() || arguments.force || arguments.uninstall)
+    if arguments.command != "skill" && arguments.uninstall {
+        return Err(Error::Input("--uninstall is only valid with skill".into()));
+    }
+    if !matches!(arguments.command.as_str(), "skill" | "setup")
+        && (arguments.skill_path.is_some() || arguments.force)
     {
         return Err(Error::Input(
-            "--path, --force, and --uninstall are only valid with skill".into(),
+            "--path and --force are only valid with skill or setup".into(),
+        ));
+    }
+    if arguments.command != "setup"
+        && (arguments.setup_scope.is_some() || arguments.no_index || arguments.no_skill)
+    {
+        return Err(Error::Input(
+            "--scope, --no-index, and --no-skill are only valid with setup".into(),
         ));
     }
     match arguments.command.as_str() {
@@ -233,6 +302,7 @@ fn run() -> Result<ExitCode, Error> {
         "diff" => run_diff(&arguments)?,
         "ask" => return run_ask(&arguments),
         "directory" => return run_directory(&arguments),
+        "setup" => return run_setup(&arguments),
         "entity" => run_entity(&arguments)?,
         "relation" => run_relation(&arguments)?,
         "skill" => return run_skill(&arguments),
@@ -331,6 +401,250 @@ fn run_ask(arguments: &Arguments) -> Result<ExitCode, Error> {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(EXIT_USAGE_OR_INPUT))
+    }
+}
+
+fn run_setup(arguments: &Arguments) -> Result<ExitCode, Error> {
+    if arguments.operands.len() > 1 {
+        return Err(setup_usage());
+    }
+    let index = !arguments.no_index;
+    if !index
+        && (arguments.directory_max_depth_set
+            || arguments.directory_include_hidden
+            || arguments.directory_prune
+            || arguments.directory_kind.is_some())
+    {
+        return Err(Error::Input(
+            "--max-depth, --include-hidden, --prune, and --kind require directory indexing; omit --no-index"
+                .into(),
+        ));
+    }
+    let cwd = env::current_dir()
+        .map_err(|error| Error::Input(format!("cannot resolve the current directory: {error}")))?;
+    let root_operand = arguments.operands.first().map(PathBuf::from);
+    let (database, resolved_scope) =
+        resolve_setup_database(arguments, &cwd, root_operand.as_deref())?;
+    let should_index = index && !(resolved_scope == SetupScope::User && root_operand.is_none());
+    if !should_index
+        && (arguments.directory_max_depth_set
+            || arguments.directory_include_hidden
+            || arguments.directory_prune
+            || arguments.directory_kind.is_some())
+    {
+        return Err(Error::Input(
+            "--max-depth, --include-hidden, --prune, and --kind require directory indexing; pass a root or omit --scope user"
+                .into(),
+        ));
+    }
+    let index_root = if should_index {
+        Some(match root_operand {
+            Some(path) => path,
+            None => scoped_root_from_database(&database).unwrap_or_else(|| cwd.clone()),
+        })
+    } else {
+        None
+    };
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            Error::Input(format!("cannot create '{}': {error}", parent.display()))
+        })?;
+    }
+    let created_database = !database.exists();
+    let mut ontology = SqliteOntology::initialize(&database)?;
+    ontology.initialize_directory_ontology()?;
+    let kind = resolve_setup_kind(arguments, resolved_scope, &ontology, index_root.as_deref())?;
+    let index_report = if let Some(root) = &index_root {
+        let options = DirectoryScanOptions {
+            max_depth: arguments.directory_max_depth,
+            include_hidden: arguments.directory_include_hidden,
+            root_kind: kind.clone(),
+        };
+        Some(ontology.index_directory(root, options, arguments.directory_prune)?)
+    } else {
+        None
+    };
+    let (skill, skill_code) = setup_skill(arguments)?;
+    let result = SetupResult {
+        database: database.display().to_string(),
+        created_database,
+        scope: resolved_scope.as_str(),
+        root: index_root.map(|path| path.display().to_string()),
+        kind: index_report.is_some().then_some(kind),
+        directory_vocabulary: true,
+        index: index_report,
+        skill,
+    };
+    if arguments.json {
+        print_json("setup", result)?;
+    } else {
+        print_setup_human(&result);
+    }
+    Ok(skill_code)
+}
+
+fn setup_usage() -> Error {
+    Error::Input(
+        "usage: sekai [--db <path>] setup [<root>] [--scope <project|workspace|user>] [--kind <class>] [--max-depth <0..64>] [--include-hidden] [--prune] [--no-index] [--no-skill] [--path <dir>] [--force]".into(),
+    )
+}
+
+fn resolve_setup_database(
+    arguments: &Arguments,
+    cwd: &Path,
+    root_operand: Option<&Path>,
+) -> Result<(PathBuf, SetupScope), Error> {
+    if arguments.database_explicit {
+        let scope = arguments.setup_scope.unwrap_or(SetupScope::Project);
+        return Ok((arguments.database.clone(), scope));
+    }
+    if arguments.setup_scope == Some(SetupScope::User) {
+        let database = user_default_database().ok_or_else(|| {
+            Error::Input(
+                "cannot resolve the user-level database; pass --db or set HOME / XDG_DATA_HOME"
+                    .into(),
+            )
+        })?;
+        return Ok((database, SetupScope::User));
+    }
+    if let Some(scope) = arguments.setup_scope {
+        let root = root_operand.unwrap_or(cwd);
+        return Ok((root.join(".sekai/knowledge.db"), scope));
+    }
+    if let Some(root) = root_operand {
+        return Ok((root.join(".sekai/knowledge.db"), SetupScope::Project));
+    }
+    if let Some(database) = nearest_scoped_database() {
+        return Ok((database, SetupScope::Project));
+    }
+    Ok((cwd.join(".sekai/knowledge.db"), SetupScope::Project))
+}
+
+fn scoped_root_from_database(database: &Path) -> Option<PathBuf> {
+    let file_name = database.file_name()?;
+    if file_name != "knowledge.db" {
+        return None;
+    }
+    let sekai_dir = database.parent()?;
+    if sekai_dir.file_name()? != ".sekai" {
+        return None;
+    }
+    Some(sekai_dir.parent()?.to_path_buf())
+}
+
+fn resolve_setup_kind(
+    arguments: &Arguments,
+    scope: SetupScope,
+    ontology: &SqliteOntology,
+    index_root: Option<&Path>,
+) -> Result<String, Error> {
+    if let Some(kind) = &arguments.directory_kind {
+        return Ok(kind.clone());
+    }
+    if arguments.setup_scope.is_some() {
+        return Ok(scope.default_kind().into());
+    }
+    if let Some(root) = index_root
+        && let Ok(document) = ontology.export_directory_with_depth(root, 0)
+        && let Some(entity) = document.entities.first()
+    {
+        return Ok(entity.kind.clone());
+    }
+    Ok(scope.default_kind().into())
+}
+
+fn setup_skill(arguments: &Arguments) -> Result<(SetupSkillResult, ExitCode), Error> {
+    if arguments.no_skill {
+        return Ok((
+            SetupSkillResult {
+                path: None,
+                status: "skipped",
+            },
+            ExitCode::SUCCESS,
+        ));
+    }
+    let directory = arguments
+        .skill_path
+        .clone()
+        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
+        .or_else(default_skill_path)
+        .ok_or_else(|| {
+            Error::Input(
+                "cannot resolve a user skill directory; pass --path, set SEKAI_SKILL_PATH, or use --no-skill"
+                    .into(),
+            )
+        })?;
+    let target = directory.join("SKILL.md");
+    let code = install_skill(&target, arguments.force, false)?;
+    let status = match code {
+        0 => "installed",
+        EXIT_ALREADY_CURRENT => "already_current",
+        EXIT_SKILL_DRIFT => "drift",
+        _ => {
+            return Err(Error::Input(format!(
+                "unexpected skill install status {code}"
+            )));
+        }
+    };
+    let exit = if code == EXIT_SKILL_DRIFT {
+        ExitCode::from(code)
+    } else {
+        ExitCode::SUCCESS
+    };
+    Ok((
+        SetupSkillResult {
+            path: Some(target.display().to_string()),
+            status,
+        },
+        exit,
+    ))
+}
+
+fn print_setup_human(result: &SetupResult) {
+    println!("database: {}", result.database);
+    println!(
+        "created: {}",
+        if result.created_database {
+            "true"
+        } else {
+            "false"
+        }
+    );
+    println!("scope: {}", result.scope);
+    println!("directory vocabulary: ready");
+    match (&result.index, &result.root, &result.kind) {
+        (Some(report), _, _) => {
+            println!(
+                "indexed {} directories and {} contains links under {}",
+                report.scanned_entities, report.scanned_links, report.root
+            );
+            if report.pruned {
+                println!(
+                    "pruned {} directories and {} links",
+                    report.removed_entities, report.removed_links
+                );
+            }
+        }
+        (None, Some(root), Some(kind)) => {
+            println!("index: skipped ({kind} at {root})");
+        }
+        _ => println!("index: skipped"),
+    }
+    match result.skill.status {
+        "skipped" => println!("skill: skipped"),
+        "installed" => println!(
+            "skill: installed {}",
+            result.skill.path.as_deref().unwrap_or("")
+        ),
+        "already_current" => println!(
+            "skill: already current at {}",
+            result.skill.path.as_deref().unwrap_or("")
+        ),
+        "drift" => println!(
+            "skill: unmodified at {}; rerun with --force",
+            result.skill.path.as_deref().unwrap_or("")
+        ),
+        status => println!("skill: {status}"),
     }
 }
 
@@ -575,24 +889,10 @@ fn load_document(path: &str) -> Result<ExportDocument, Error> {
         .copied();
     let is_json = first == Some(b'{') || first == Some(b'[') || path.ends_with(".json");
     if is_json {
-        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        let input = String::from_utf8(bytes).map_err(|error| {
             Error::Input(format!("invalid ontology document '{path}': {error}"))
         })?;
-        let value = if let Some(command) = value.get("command").and_then(Value::as_str) {
-            if command != "export" {
-                return Err(Error::Input(format!(
-                    "JSON input '{path}' has command '{command}', expected 'export'"
-                )));
-            }
-            value
-                .get("data")
-                .cloned()
-                .ok_or_else(|| Error::Input(format!("JSON export '{path}' has no data field")))?
-        } else {
-            value
-        };
-        return serde_json::from_value(value)
-            .map_err(|error| Error::Input(format!("invalid ontology document '{path}': {error}")));
+        return parse_definition_document(&input);
     }
     SqliteOntology::open_read_only(path)?.export()
 }
@@ -772,9 +1072,13 @@ fn run_skill(arguments: &Arguments) -> Result<ExitCode, Error> {
             )?;
             let target = directory.ok_or_else(|| Error::Input("cannot resolve a user skill directory; pass --path or set SEKAI_SKILL_PATH".into()))?.join("SKILL.md");
             if arguments.uninstall {
-                return uninstall_skill(&target);
+                return Ok(ExitCode::from(uninstall_skill(&target)?));
             }
-            install_skill(&target, arguments.force)
+            Ok(ExitCode::from(install_skill(
+                &target,
+                arguments.force,
+                true,
+            )?))
         }
         _ => Err(Error::Input(
             "usage: sekai skill <path|install> [--path <dir>] [--force|--uninstall]".into(),
@@ -788,10 +1092,10 @@ fn default_skill_path() -> Option<PathBuf> {
         .map(|home| home.join(".agents/skills/sekai-ontology"))
 }
 
-fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
+fn install_skill(target: &Path, force: bool, announce: bool) -> Result<u8, Error> {
     if target_is_symlink(target)? {
         eprintln!("refusing to follow skill symlink at {}", target.display());
-        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        return Ok(EXIT_SKILL_DRIFT);
     }
     if target.exists() {
         let metadata = fs::symlink_metadata(target).map_err(|error| {
@@ -802,30 +1106,32 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
                 "refusing to overwrite non-file skill target at {}",
                 target.display()
             );
-            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+            return Ok(EXIT_SKILL_DRIFT);
         }
         let current = read_skill_file(target)?;
         if current == EMBEDDED_SKILL {
             eprintln!("skill already current at {}", target.display());
-            return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
+            return Ok(EXIT_ALREADY_CURRENT);
         }
         if !is_sekai_skill(&current) {
             eprintln!(
                 "refusing to overwrite non-Sekai file at {}",
                 target.display()
             );
-            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+            return Ok(EXIT_SKILL_DRIFT);
         }
         if !force {
             eprintln!(
                 "refusing to overwrite modified or unrecognized skill at {}; rerun with --force",
                 target.display()
             );
-            return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+            return Ok(EXIT_SKILL_DRIFT);
         }
         replace_claimed_skill(target)?;
-        println!("installed {}", target.display());
-        return Ok(ExitCode::SUCCESS);
+        if announce {
+            println!("installed {}", target.display());
+        }
+        return Ok(0);
     }
     let parent = target
         .parent()
@@ -833,8 +1139,10 @@ fn install_skill(target: &Path, force: bool) -> Result<ExitCode, Error> {
     fs::create_dir_all(parent)
         .map_err(|error| Error::Input(format!("cannot create '{}': {error}", parent.display())))?;
     install_new_skill(target)?;
-    println!("installed {}", target.display());
-    Ok(ExitCode::SUCCESS)
+    if announce {
+        println!("installed {}", target.display());
+    }
+    Ok(0)
 }
 
 fn stage_skill(target: &Path) -> Result<PathBuf, Error> {
@@ -1062,14 +1370,14 @@ fn read_skill_file(target: &Path) -> Result<String, Error> {
     Ok(content)
 }
 
-fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
+fn uninstall_skill(target: &Path) -> Result<u8, Error> {
     if target_is_symlink(target)? {
         eprintln!("refusing to follow skill symlink at {}", target.display());
-        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        return Ok(EXIT_SKILL_DRIFT);
     }
     if !target.exists() {
         eprintln!("skill is not installed at {}", target.display());
-        return Ok(ExitCode::from(EXIT_ALREADY_CURRENT));
+        return Ok(EXIT_ALREADY_CURRENT);
     }
     let claimed = claim_skill_target(target)?;
     let current = read_skill_file(&claimed);
@@ -1079,12 +1387,12 @@ fn uninstall_skill(target: &Path) -> Result<ExitCode, Error> {
             "refusing to remove modified or unrecognized skill at {}",
             target.display()
         );
-        return Ok(ExitCode::from(EXIT_SKILL_DRIFT));
+        return Ok(EXIT_SKILL_DRIFT);
     }
     fs::remove_file(&claimed)
         .map_err(|error| Error::Input(format!("cannot remove '{}': {error}", claimed.display())))?;
     println!("removed {}", target.display());
-    Ok(ExitCode::SUCCESS)
+    Ok(0)
 }
 
 fn is_sekai_skill(content: &str) -> bool {
@@ -1169,6 +1477,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     let mut skill_path = None;
     let mut force = false;
     let mut uninstall = false;
+    let mut setup_scope = None;
+    let mut no_index = false;
+    let mut no_skill = false;
     let mut arguments = arguments.peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -1187,6 +1498,27 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
             }
             "--force" => force = true,
             "--uninstall" => uninstall = true,
+            "--scope" => {
+                if setup_scope.is_some() {
+                    return Err(Error::Input("--scope may only be specified once".into()));
+                }
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| Error::Input("--scope requires a value".into()))?;
+                setup_scope = Some(SetupScope::parse(&value)?);
+            }
+            "--no-index" => {
+                if no_index {
+                    return Err(Error::Input("--no-index may only be specified once".into()));
+                }
+                no_index = true;
+            }
+            "--no-skill" => {
+                if no_skill {
+                    return Err(Error::Input("--no-skill may only be specified once".into()));
+                }
+                no_skill = true;
+            }
             "--direction" => {
                 if direction_set {
                     return Err(Error::Input(
@@ -1289,7 +1621,8 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
     }
     let command = positional.first().cloned().unwrap_or_else(|| "help".into());
     Ok(Arguments {
-        database: database.unwrap_or_else(resolve_default_database),
+        database: database.clone().unwrap_or_else(resolve_default_database),
+        database_explicit: database.is_some(),
         json,
         command,
         operands: positional.into_iter().skip(1).collect(),
@@ -1303,6 +1636,9 @@ fn parse_arguments(arguments: impl Iterator<Item = String>) -> Result<Arguments,
         skill_path,
         force,
         uninstall,
+        setup_scope,
+        no_index,
+        no_skill,
     })
 }
 
@@ -1327,7 +1663,7 @@ fn print_json<T: Serialize>(command: &'static str, data: T) -> Result<(), Error>
 }
 
 fn usage() -> &'static str {
-    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  directory init\n  directory index <root> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]\n  directory export <root> [--max-depth <0..64>]\n  directory tree <root> [--max-depth <0..64>]\n  directory import <path|->\n  directory query <path> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..64>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. nearest existing .sekai/knowledge.db from the current directory upward\n  4. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  5. knowledge.db in the current directory\n\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain, query, find, and directory-query plans.\nDirectory indexing never follows symlinks; `--prune` removes stale indexed facts under the selected root.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
+    "Usage: sekai [--db <path>] [--json] <command>\n\nCommands:\n  setup [<root>] [--scope <project|workspace|user>] [--kind <class>] [--max-depth <0..64>] [--include-hidden] [--prune] [--no-index] [--no-skill] [--path <dir>] [--force]\n  init\n  import <path>\n  export\n  validate\n  explain <name>\n  query <name> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..32>]\n  find <text>\n  diff <before> <after>\n  ask <question>\n  directory init\n  directory index <root> [--max-depth <0..64>] [--include-hidden] [--prune] [--kind <class>]\n  directory export <root> [--max-depth <0..64>]\n  directory tree <root> [--max-depth <0..64>]\n  directory import <path|->\n  directory query <path> [--direction <outbound|inbound|both>] [--relation <name>] [--depth <0..64>]\n  entity list\n  entity show <name>\n  relation list\n  skill path [--path <dir>]\n  skill install [--path <dir>] [--force|--uninstall]\n\nDatabase resolution (first match wins):\n  1. --db <path>\n  2. SEKAI_DB environment variable\n  3. nearest existing .sekai/knowledge.db from the current directory upward\n  4. User-level default (if file exists):\n       macOS:  ~/Library/Application Support/sekai/knowledge.db\n       Linux:  ${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db\n  5. knowledge.db in the current directory\n\n`setup` creates a scoped `.sekai/knowledge.db` when no database is selected, installs the directory vocabulary, indexes the scope root unless `--no-index`, and installs the agent skill unless `--no-skill`. `--scope user` does not index unless a root is given. Re-running `setup` is idempotent and keeps an existing root kind unless `--scope` or `--kind` is explicit.\nQuery defaults to --direction both --depth 1. `ask` is read-only and only executes bounded explain, query, find, and directory-query plans.\nDirectory indexing never follows symlinks; `--prune` removes stale indexed facts under the selected root.\n`diff` accepts raw ontology JSON, `export --json` envelopes, or SQLite databases.\nSEKAI_SKILL_PATH selects the skill directory."
 }
 
 fn print_help() {
