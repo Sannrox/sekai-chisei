@@ -3,6 +3,7 @@
   "server_version": "1.0.1",
   "proto_revision": "sha256:aaabd393e69d103e4b1101c6b0903385d9c1ccea372b6912babfc379d119414a",
   "minimum_compatible_server": "1.0.1",
+  "identity_assertion_contract": "sekai.identity-assertion/v1",
   "packages": {
     "sekai-chisei": "1.0.1",
     "sekai-proto": "1.0.1",

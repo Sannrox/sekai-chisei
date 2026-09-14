@@ -107,6 +107,12 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             reject_unauthorized();
             return Err(Status::unauthenticated("missing authorization"));
         };
+        if crate::identity_assertion::is_assertion_token(&token)
+            && req.metadata().get(TENANT_CONTEXT_HEADER).is_some()
+        {
+            reject_unauthorized();
+            return Err(Status::failed_precondition("caller-selected tenant header"));
+        }
 
         let enterprise_result = self
             .db
@@ -827,6 +833,39 @@ mod tests {
 
         let request = Request::new(());
         assert!(interceptor.call(request).is_err());
+    }
+
+    #[test]
+    fn token_auth_interceptor_rejects_assertion_with_caller_tenant_header() {
+        let db = in_memory_db();
+        let store = Arc::new(PrincipalCredentialStore::new());
+        let mut interceptor = TokenAuthInterceptor::new(store, db);
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer sia1.payload.sig"),
+        );
+        request.metadata_mut().insert(
+            TENANT_CONTEXT_HEADER,
+            MetadataValue::from_static("tenant-evil"),
+        );
+        let error = interceptor.call(request).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "caller-selected tenant header");
+    }
+
+    #[test]
+    fn community_interceptor_treats_assertions_as_invalid_without_authority() {
+        let db = in_memory_db();
+        let store = Arc::new(PrincipalCredentialStore::new());
+        let mut interceptor = TokenAuthInterceptor::new(store, db);
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            "authorization",
+            MetadataValue::from_static("Bearer sia1.payload.sig"),
+        );
+        let error = interceptor.call(request).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]

@@ -295,6 +295,11 @@ contract documented in [Enterprise identity extension contract](enterprise-ident
 The default SQLite service remains tenant-free and exposes no OAuth/OIDC
 runtime endpoints. Validated human and machine credentials converge on one
 internal authenticated context; caller metadata never constructs that context.
+A configured authority may issue a short-lived, audience-bound, one-use
+assertion (`sekai.identity-assertion/v1`) that fills the same context;
+see [ADR 0078](decisions/0078-audience-bound-assertions.md). No authority
+configured stays community behavior. Caller-selected tenant headers fail
+closed.
 
 - Namespace and object access control apply when data is read or mutated.
 - Gateway virtual keys and control-plane credentials identify principals; raw
