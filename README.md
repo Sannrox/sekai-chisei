@@ -171,15 +171,17 @@ The database is resolved in this order (first match wins):
 
 1. `--db <path>` (explicit flag)
 2. `SEKAI_DB` environment variable
-3. User-level default (if the file exists):
+3. The nearest existing `.sekai/knowledge.db` while walking upward from the
+   current directory
+4. User-level default (if the file exists):
    - macOS: `~/Library/Application Support/sekai/knowledge.db`
    - Linux: `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
-4. `knowledge.db` in the current directory
+5. `knowledge.db` in the current directory
 
 Create and use an ontology:
 
 ```bash
-sekai init                          # creates knowledge.db (see resolution order)
+sekai setup --scope project --prune # scoped .sekai/knowledge.db, directory facts, skill
 sekai import definitions.json       # import classes and relations
 sekai validate                      # check structural integrity
 sekai --json explain SomeClass      # definition, closure, provenance

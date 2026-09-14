@@ -23,9 +23,9 @@ use crate::grpc::pb::chisei::{
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
-    CreateLinkRequest, CreateObjectRequest, CreateOntologyClassRequest,
-    CreateOntologyRelationRequest, CreateSchemaTypeRequest, Link, Object, ObjectType,
-    OntologyClass, OntologyRelation,
+    Cardinality as ProtoCardinality, CreateLinkRequest, CreateObjectRequest,
+    CreateOntologyClassRequest, CreateOntologyRelationRequest, CreateSchemaTypeRequest, Link,
+    Object, ObjectType, OntologyClass, OntologyProperty, OntologyRelation,
 };
 use crate::sekai::schema::is_builtin_schema_kind;
 use crate::sekai::semantic;
@@ -91,6 +91,23 @@ pub struct DomainClass {
     pub kind_description: String,
     #[serde(default)]
     pub superclasses: Vec<String>,
+    #[serde(default)]
+    pub equivalent_classes: Vec<String>,
+    #[serde(default)]
+    pub disjoint_classes: Vec<String>,
+    #[serde(default)]
+    pub properties: Vec<DomainProperty>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainProperty {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub value_type: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +119,20 @@ pub struct DomainRelation {
     pub range: String,
     #[serde(default)]
     pub mapped_relation: String,
+    #[serde(default)]
+    pub inverse: String,
+    #[serde(default)]
+    pub transitive: bool,
+    #[serde(default)]
+    pub cardinality: DomainCardinality,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DomainCardinality {
+    #[serde(default)]
+    pub min: u32,
+    #[serde(default)]
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,16 +195,139 @@ pub fn load_domain_document(path: &Path) -> Result<DomainDocument, String> {
 }
 
 pub fn parse_domain_document(raw: &str) -> Result<DomainDocument, String> {
-    let doc: DomainDocument =
+    let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("parse domain document: {e}"))?;
+    let apply_hints = apply_hints_from_value(&value);
+    let wire_version = definition_wire_version(&value);
+    let imported = sekai_ontology::parse_definition_document_value(value)
+        .map_err(|error| error.to_string())?;
+    let mut doc = domain_from_import(imported, wire_version);
+    for class in &mut doc.classes {
+        if let Some((ensure_kind, kind_description)) = apply_hints.get(&class.name) {
+            class.ensure_kind = *ensure_kind;
+            class.kind_description = kind_description.clone();
+        }
+    }
     validate_domain_document(&doc)?;
     Ok(doc)
 }
 
+fn definition_wire_version(value: &serde_json::Value) -> String {
+    if let Some(version) = value.get("version").and_then(|value| value.as_str()) {
+        return version.to_string();
+    }
+    if value.get("command").and_then(|value| value.as_str()) == Some("export") {
+        if let Some(version) = value
+            .pointer("/data/version")
+            .and_then(|value| value.as_str())
+        {
+            return version.to_string();
+        }
+        if value
+            .pointer("/data/schema_version")
+            .and_then(|value| value.as_u64())
+            == Some(1)
+        {
+            return "1".into();
+        }
+    }
+    if value.get("schema_version").and_then(|value| value.as_u64()) == Some(1) {
+        return "1".into();
+    }
+    String::new()
+}
+
+fn apply_hints_from_value(value: &serde_json::Value) -> HashMap<String, (bool, String)> {
+    let classes = value
+        .get("data")
+        .and_then(|data| data.get("classes"))
+        .or_else(|| value.get("classes"))
+        .and_then(|classes| classes.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut hints = HashMap::new();
+    for class in classes {
+        let name = class
+            .get("name")
+            .and_then(|name| name.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        hints.insert(
+            name,
+            (
+                class
+                    .get("ensure_kind")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                class
+                    .get("kind_description")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        );
+    }
+    hints
+}
+
+fn domain_from_import(imported: sekai_ontology::ImportDocument, version: String) -> DomainDocument {
+    DomainDocument {
+        version,
+        classes: imported
+            .classes
+            .into_iter()
+            .map(|class| DomainClass {
+                name: class.name,
+                description: class.description,
+                mapped_kind: class.mapped_kind,
+                ensure_kind: false,
+                kind_description: String::new(),
+                superclasses: class.superclasses,
+                equivalent_classes: class.equivalent_classes,
+                disjoint_classes: class.disjoint_classes,
+                properties: class
+                    .properties
+                    .into_iter()
+                    .map(|property| DomainProperty {
+                        name: property.name,
+                        value_type: property.value_type,
+                        required: property.required,
+                        description: property.description,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        relations: imported
+            .relations
+            .into_iter()
+            .map(|relation| DomainRelation {
+                name: relation.name,
+                description: relation.description,
+                domain: relation.domain,
+                range: relation.range,
+                mapped_relation: relation.mapped_relation,
+                inverse: relation.inverse,
+                transitive: relation.transitive,
+                cardinality: DomainCardinality {
+                    min: relation.cardinality.min,
+                    max: relation.cardinality.max,
+                },
+            })
+            .collect(),
+    }
+}
+
 pub fn validate_domain_document(doc: &DomainDocument) -> Result<(), String> {
-    if doc.version != DOMAIN_DOC_VERSION {
+    if !matches!(
+        doc.version.as_str(),
+        DOMAIN_DOC_VERSION | sekai_ontology::DEFINITION_DOC_VERSION | "1"
+    ) {
         return Err(format!(
-            "domain document version must be {DOMAIN_DOC_VERSION}, got {:?}",
+            "domain document version must be {DOMAIN_DOC_VERSION}, {}, or portable schema_version 1, got {:?}",
+            sekai_ontology::DEFINITION_DOC_VERSION,
             doc.version
         ));
     }
@@ -326,9 +480,18 @@ pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyRep
                     name: class.name.clone(),
                     description: class.description.clone(),
                     superclasses: class.superclasses.clone(),
-                    equivalent_classes: Vec::new(),
-                    disjoint_classes: Vec::new(),
-                    properties: Vec::new(),
+                    equivalent_classes: class.equivalent_classes.clone(),
+                    disjoint_classes: class.disjoint_classes.clone(),
+                    properties: class
+                        .properties
+                        .iter()
+                        .map(|property| OntologyProperty {
+                            name: property.name.clone(),
+                            r#type: property.value_type.clone(),
+                            required: property.required,
+                            description: property.description.clone(),
+                        })
+                        .collect(),
                     is_builtin: false,
                     mapped_kind: class.mapped_kind.clone(),
                 }),
@@ -359,9 +522,12 @@ pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyRep
                     description: rel.description.clone(),
                     domain: rel.domain.clone(),
                     range: rel.range.clone(),
-                    cardinality: None,
-                    inverse: String::new(),
-                    transitive: false,
+                    cardinality: Some(ProtoCardinality {
+                        min: rel.cardinality.min,
+                        max: rel.cardinality.max,
+                    }),
+                    inverse: rel.inverse.clone(),
+                    transitive: rel.transitive,
                     is_builtin: false,
                     mapped_relation: if rel.mapped_relation.is_empty() {
                         rel.name.clone()
@@ -818,6 +984,56 @@ mod tests {
         assert_eq!(doc.relations.len(), 1);
         assert!(!should_ensure_kind(&doc.classes[0])); // builtin component
         assert!(should_ensure_kind(&doc.classes[1])); // custom incident
+    }
+
+    #[test]
+    fn parses_portable_definition_document_as_the_same_design() {
+        let portable = r#"{
+          "schema_version": 1,
+          "classes": [
+            {
+              "name": "Receipt",
+              "description": "Inspectable operation outcome",
+              "mapped_kind": "receipt",
+              "properties": [{"name": "request_id", "type": "string", "required": true}]
+            }
+          ],
+          "relations": [
+            {
+              "name": "records",
+              "domain": "Receipt",
+              "range": "Receipt",
+              "cardinality": {"min": 0, "max": 1},
+              "mapped_relation": "records"
+            }
+          ],
+          "provenance": [
+            {
+              "subject": "Receipt",
+              "source": "VISION.md",
+              "locator": "Inspectable outcomes"
+            }
+          ]
+        }"#;
+        let doc = parse_domain_document(portable).unwrap();
+        assert_eq!(doc.version, "1");
+        assert_eq!(doc.classes[0].name, "Receipt");
+        assert_eq!(doc.classes[0].mapped_kind, "receipt");
+        assert_eq!(doc.classes[0].properties[0].name, "request_id");
+        assert_eq!(doc.relations[0].cardinality.max, Some(1));
+        assert!(!doc.classes[0].ensure_kind);
+        assert!(doc.classes[0].kind_description.is_empty());
+        assert!(should_ensure_kind(&doc.classes[0]));
+    }
+
+    #[test]
+    fn product_sample_preserves_apply_io_hints_outside_definition() {
+        let doc = parse_domain_document(SAMPLE_DOMAIN).unwrap();
+        assert_eq!(doc.version, DOMAIN_DOC_VERSION);
+        assert_eq!(doc.classes[1].name, "Incident");
+        assert!(doc.classes[1].ensure_kind);
+        assert_eq!(doc.classes[1].kind_description, "Incident object kind");
+        assert_eq!(doc.classes[1].mapped_kind, "incident");
     }
 
     #[test]

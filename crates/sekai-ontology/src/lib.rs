@@ -4,11 +4,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 mod directory;
+mod document;
 
 pub use directory::{
     DEFAULT_DIRECTORY_KIND, DIRECTORY_RELATION_CONTAINS, DIRECTORY_SCHEMA_VERSION,
     DirectoryDocument, DirectoryEntity, DirectoryImportReport, DirectoryIndexReport, DirectoryLink,
     DirectoryQueryResult, DirectoryScanOptions, MAX_DIRECTORY_DEPTH, directory_ontology_document,
+};
+pub use document::{
+    DEFINITION_DOC_VERSION, PRODUCT_DOC_VERSION, parse_definition_document,
+    parse_definition_document_value,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -60,7 +65,7 @@ pub struct ImportDocument {
 /// between databases without exposing the private SQLite schema.
 pub type ExportDocument = ImportDocument;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Class {
     pub name: String,
@@ -68,8 +73,14 @@ pub struct Class {
     pub description: String,
     #[serde(default)]
     pub superclasses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub equivalent_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disjoint_classes: Vec<String>,
     #[serde(default)]
     pub properties: Vec<Property>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mapped_kind: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -84,7 +95,7 @@ pub struct Property {
     pub description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Relation {
     pub name: String,
@@ -94,8 +105,12 @@ pub struct Relation {
     pub range: String,
     #[serde(default)]
     pub cardinality: Cardinality,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inverse: String,
     #[serde(default)]
     pub transitive: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mapped_relation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -348,9 +363,7 @@ impl SqliteOntology {
     }
 
     pub fn import_json(&mut self, input: &str) -> Result<(), Error> {
-        let document: ImportDocument = serde_json::from_str(input)
-            .map_err(|error| Error::Input(format!("invalid import document: {error}")))?;
-        self.import(document)
+        self.import(parse_definition_document(input)?)
     }
 
     pub fn import(&mut self, document: ImportDocument) -> Result<(), Error> {
@@ -2045,9 +2058,7 @@ mod tests {
                     .into_iter()
                     .map(|name| Class {
                         name: name.into(),
-                        description: String::new(),
-                        superclasses: vec![],
-                        properties: vec![],
+                        ..Class::default()
                     })
                     .collect(),
                 relations: [
@@ -2059,11 +2070,9 @@ mod tests {
                 .into_iter()
                 .map(|(name, domain, range)| Relation {
                     name: name.into(),
-                    description: String::new(),
                     domain: domain.into(),
                     range: range.into(),
-                    cardinality: Cardinality::default(),
-                    transitive: false,
+                    ..Relation::default()
                 })
                 .collect(),
                 provenance: vec![],
@@ -2249,9 +2258,8 @@ mod tests {
             let mut slash_document = document.clone();
             slash_document.classes.push(Class {
                 name: "Client/Server".into(),
-                description: String::new(),
                 superclasses: vec!["Component".into()],
-                properties: Vec::new(),
+                ..Class::default()
             });
             interpret_question(&slash_document, "What does Client/Server depend on?").unwrap()
         };
@@ -2349,23 +2357,21 @@ mod tests {
             "Child".into(),
             Class {
                 name: "Child".into(),
-                description: String::new(),
                 superclasses: vec!["Missing".into()],
-                properties: vec![],
+                ..Class::default()
             },
         )]);
         let relations = BTreeMap::from([(
             "bad".into(),
             Relation {
                 name: "bad".into(),
-                description: String::new(),
                 domain: "Child".into(),
                 range: "Missing".into(),
                 cardinality: Cardinality {
                     min: 2,
                     max: Some(1),
                 },
-                transitive: false,
+                ..Relation::default()
             },
         )]);
         let issues = validate_parts(&classes, &relations, &[]);
@@ -2389,11 +2395,9 @@ mod tests {
             "Child".into(),
             Relation {
                 name: "Child".into(),
-                description: String::new(),
                 domain: "Child".into(),
                 range: "Child".into(),
-                cardinality: Cardinality::default(),
-                transitive: false,
+                ..Relation::default()
             },
         )]);
         let issues = validate_parts(&classes, &colliding_relations, &[]);

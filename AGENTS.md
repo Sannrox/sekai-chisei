@@ -31,7 +31,14 @@ surfaces, and serialized Git mutations.
 
 For work involving portable ontology definitions, classes, relations, provenance, validation, import, export, or structural queries, always use the project-local `sekai-ontology` Skill in `.agents/skills/sekai-ontology/`.
 
-Select the ontology database explicitly with `--db <path>` or `SEKAI_DB`, then run `sekai --db <path> --json validate` before relying on its contents. Treat successful ontology output as structured repository evidence, preserve its provenance in answers, and state when validation fails or the requested fact is absent rather than inferring it. Do not use the control-plane database at `data/sekai.db` as a portable ontology database.
+Create or refresh a scoped portable database with `sekai setup` (or
+`sekai setup --scope workspace|project|user`). Select a database explicitly
+with `--db <path>` or `SEKAI_DB` when the resolved default is not the intended
+file, then run `sekai --json validate` before relying on its contents. Treat
+successful ontology output as structured repository evidence, preserve its
+provenance in answers, and state when validation fails or the requested fact is
+absent rather than inferring it. Do not use the control-plane database at
+`data/sekai.db` as a portable ontology database.
 
 Ontology classes and relations describe meaning. Directory commands record local filesystem facts (`directory init` / `directory index`) in the same portable database; those facts are not ontology classes. This repository's contributor vocabulary pack is `crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json`. Import it into a throwaway `--db` when answering product-term questions; do not treat it as a built-in server ontology or as `directory init` vocabulary.
 

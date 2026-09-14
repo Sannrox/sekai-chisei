@@ -1,5 +1,5 @@
 use super::{
-    Cardinality, Class, Error, ImportDocument, Property, QueryOptions, Relation, SqliteOntology,
+    Class, Error, ImportDocument, Property, QueryOptions, Relation, SqliteOntology,
     TraversalDirection, ValidationIssue, check_schema_version, database_error,
 };
 use rusqlite::{Connection, Transaction, params};
@@ -999,8 +999,8 @@ pub fn directory_ontology_document() -> ImportDocument {
             Class {
                 name: "Directory".into(),
                 description: "A filesystem directory represented as a durable local fact.".into(),
-                superclasses: vec![],
                 properties: directory_properties.clone(),
+                ..Class::default()
             },
             Class {
                 name: "WorkspaceDirectory".into(),
@@ -1008,12 +1008,14 @@ pub fn directory_ontology_document() -> ImportDocument {
                     "A directory that scopes multiple projects and their local ontologies.".into(),
                 superclasses: vec!["Directory".into()],
                 properties: directory_properties.clone(),
+                ..Class::default()
             },
             Class {
                 name: "ProjectDirectory".into(),
                 description: "A project root directory with its own local ontology scope.".into(),
                 superclasses: vec!["Directory".into()],
                 properties: directory_properties,
+                ..Class::default()
             },
         ],
         relations: vec![Relation {
@@ -1021,8 +1023,8 @@ pub fn directory_ontology_document() -> ImportDocument {
             description: "Direct filesystem parent-child containment between directories.".into(),
             domain: "Directory".into(),
             range: "Directory".into(),
-            cardinality: Cardinality::default(),
             transitive: true,
+            ..Relation::default()
         }],
         provenance: vec![
             super::Provenance {
