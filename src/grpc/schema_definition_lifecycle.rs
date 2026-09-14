@@ -15,7 +15,7 @@ pub(super) enum SchemaDefinitionLifecycleError {
 }
 
 #[derive(Clone)]
-pub(super) struct SchemaDefinitionLifecycle {
+pub(crate) struct SchemaDefinitionLifecycle {
     db: Arc<RuntimeDb>,
     registry: Arc<RwLock<SchemaRegistry>>,
     unavailable_error: Arc<RwLock<Option<String>>>,

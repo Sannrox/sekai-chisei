@@ -21,10 +21,10 @@
       "class": "positive",
       "summary": "A valid machine credential reaches PlanExecution, ExecutePlan, and ExecutePlanStream as the authenticated service principal.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#enterprise_execution_marker_without_context_fails_closed",
-        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
-        "src/grpc/chisei_service.rs#managed_unary_execution_accepts_machine_context_and_normalizes_receipt",
-        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+        "src/grpc/chisei_service_tests.rs#enterprise_execution_marker_without_context_fails_closed",
+        "src/grpc/chisei_service_tests.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service_tests.rs#managed_unary_execution_accepts_machine_context_and_normalizes_receipt",
+        "src/grpc/chisei_service_tests.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },
     {
@@ -32,8 +32,8 @@
       "class": "negative",
       "summary": "Caller-supplied principal or tenant metadata cannot replace the authenticated context.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
-        "src/grpc/chisei_service.rs#managed_cached_plan_is_bound_to_authenticated_tenant",
+        "src/grpc/chisei_service_tests.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service_tests.rs#managed_cached_plan_is_bound_to_authenticated_tenant",
         "src/grpc/mod.rs#token_auth_interceptor_overwrites_client_principal"
       ]
     },
@@ -42,8 +42,8 @@
       "class": "negative",
       "summary": "Missing, invalid, expired, wrong-resource, and insufficient-scope credentials are refused before provider contact.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
-        "src/grpc/chisei_service.rs#managed_context_without_enterprise_extension_fails_closed",
+        "src/grpc/chisei_service_tests.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",
+        "src/grpc/chisei_service_tests.rs#managed_context_without_enterprise_extension_fails_closed",
         "src/grpc/mod.rs#token_auth_interceptor_rejects_unsupported_or_expired_enterprise_context"
       ]
     },
@@ -52,7 +52,7 @@
       "class": "positive",
       "summary": "The request carries an operator-approved logical model with no route override; policy resolves the canonical provider and model.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_machine_context_owns_plan_identity_and_namespace_authority"
+        "src/grpc/chisei_service_tests.rs#managed_machine_context_owns_plan_identity_and_namespace_authority"
       ]
     },
     {
@@ -61,7 +61,7 @@
       "summary": "Provider credentials resolve from authenticated context and never appear in requests, events, errors, receipts, or diagnostics.",
       "evidence_tests": [
         "src/grpc/provider_execution.rs#execution_provider_credentials_are_selected_by_authenticated_tenant",
-        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+        "src/grpc/chisei_service_tests.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },
     {
@@ -71,7 +71,7 @@
       "evidence_tests": [
         "crates/sekai-provider/src/llm/openai.rs#preserves_fragmented_interleaved_tool_calls",
         "crates/sekai-provider/src/llm/anthropic.rs#preserves_fragmented_interleaved_tool_uses",
-        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+        "src/grpc/chisei_service_tests.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },
     {
@@ -79,7 +79,7 @@
       "class": "positive",
       "summary": "Terminal execution exposes normalized usage and a receipt reference without raw provider response or credential material.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
+        "src/grpc/chisei_service_tests.rs#managed_stream_preserves_tool_calls_usage_and_receipt_without_route_override"
       ]
     },
     {
@@ -87,8 +87,8 @@
       "class": "negative",
       "summary": "Provider failure records a bounded failed receipt and does not silently switch physical route.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_provider_failure_records_failed_receipt_without_route_switch",
-        "src/grpc/chisei_service.rs#managed_stream_read_failure_records_failed_receipt_without_route_switch"
+        "src/grpc/chisei_service_tests.rs#managed_provider_failure_records_failed_receipt_without_route_switch",
+        "src/grpc/chisei_service_tests.rs#managed_stream_read_failure_records_failed_receipt_without_route_switch"
       ]
     },
     {
@@ -96,7 +96,7 @@
       "class": "positive",
       "summary": "A host retry is a distinct attempt under the same logical operation; automatic ambiguous replay is forbidden.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#managed_explicit_retry_creates_distinct_correlated_attempts"
+        "src/grpc/chisei_service_tests.rs#managed_explicit_retry_creates_distinct_correlated_attempts"
       ]
     },
     {
@@ -104,7 +104,7 @@
       "class": "negative",
       "summary": "The community SQLite runtime accepts no caller-selected tenant and does not store tenant provider secrets. Tenant callers use the unscoped instance process key.",
       "evidence_tests": [
-        "src/grpc/chisei_service.rs#community_machine_context_keeps_legacy_execution_authorization",
+        "src/grpc/chisei_service_tests.rs#community_machine_context_keeps_legacy_execution_authorization",
         "src/provider_credentials.rs#community_env_resolver_uses_instance_key_for_tenant_callers"
       ]
     }

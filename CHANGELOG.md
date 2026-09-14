@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Split the three largest service files into handler-family modules so each
+  facade stays under 2,000 lines (#872). Shared helpers move with the family;
+  each service keeps one trait impl that delegates. CI fails if any of the
+  three files regrows past that ceiling.
 - Classify every public RPC as `stable`, `experimental`, or `remove` from
   backend and consumer evidence (#871). The default build invokes at most 60
   stable RPCs. Experimental and remove-classified RPCs keep their wire
