@@ -135,6 +135,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Create,
                 &format!("guarded_create_object_replay:{}", created.id),
+                purpose.as_ref(),
             )?;
             let created = self.resolve_computed_for_response(
                 created,
@@ -184,6 +185,7 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             crate::sekai::object_security::ObjectSecurityOperation::Create,
             &format!("guarded_create_object:{}", domain_object.id),
+            purpose.as_ref(),
         )?;
         let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -252,6 +254,7 @@ impl SekaiServiceImpl {
                 &principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
+                purpose.as_ref(),
             )? == Some(false)
         {
             return Err(Status::not_found("not found"));
@@ -304,6 +307,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object:{}", existing.id),
+                purpose.as_ref(),
             )?;
         }
         if let Some(precondition) = &precondition {
@@ -357,6 +361,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object_replay:{}", updated.id),
+                purpose.as_ref(),
             )?;
             let updated = self.resolve_computed_for_response(
                 updated,
@@ -427,6 +432,7 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             crate::sekai::object_security::ObjectSecurityOperation::Update,
             &format!("guarded_update_object_proposed:{}", domain_object.id),
+            purpose.as_ref(),
         )?;
         let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -471,6 +477,7 @@ impl SekaiServiceImpl {
                 &principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Delete,
+                None,
             )? == Some(false)
         {
             if precondition.is_none() {
@@ -527,6 +534,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Delete,
                 &format!("guarded_delete_object:{}", existing.id),
+                None,
             )?;
             if existing.kind == markings::PRINCIPAL_PROFILE_KIND {
                 require_credential_admin(&principals)?;

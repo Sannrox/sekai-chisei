@@ -710,6 +710,7 @@ mod policy_decision_rpc_tests {
             None,
             crate::sekai::object_security::ObjectSecurityOperation::Read,
             "read-alice",
+            None,
         )
         .unwrap();
         let bob_err = enforce_object_operation_access(
@@ -719,6 +720,7 @@ mod policy_decision_rpc_tests {
             None,
             crate::sekai::object_security::ObjectSecurityOperation::Read,
             "read-bob",
+            None,
         );
         assert!(bob_err.is_err());
 
@@ -811,6 +813,7 @@ mod policy_decision_rpc_tests {
             &["alice".into()],
             None,
             crate::sekai::object_security::ObjectSecurityOperation::Read,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -828,6 +831,7 @@ mod policy_decision_rpc_tests {
                 &["alice".into()],
                 None,
                 crate::sekai::object_security::ObjectSecurityOperation::Read,
+                None,
             )
             .unwrap(),
             Some(false)
@@ -839,6 +843,7 @@ mod policy_decision_rpc_tests {
             None,
             crate::sekai::object_security::ObjectSecurityOperation::Read,
             "read-purpose",
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);

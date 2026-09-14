@@ -39,6 +39,7 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &format!("get_object:{id}"),
+            purpose.as_ref(),
         );
         let (obj, marking) = match visibility {
             Ok(visible) => visible,
@@ -391,6 +392,7 @@ impl SekaiServiceImpl {
                 &principals,
                 tenant_context.as_ref(),
                 &format!("find_by_external_id:{}", candidate.id),
+                purpose.as_ref(),
             );
             let (obj, marking) = match visibility {
                 Ok(visible) => visible,
@@ -545,6 +547,7 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &format!("get_links:{}", r.object_id),
+            purpose.as_ref(),
         )?;
         enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let dir = if r.direction == "incoming" {
@@ -620,6 +623,7 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &format!("get_linked_objects:{}", r.object_id),
+            purpose.as_ref(),
         )?;
         enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let dir = if r.direction == "incoming" {
@@ -730,6 +734,7 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &start_operation,
+            purpose.as_ref(),
         )?;
         enforce_optional_ontology_revision_pin(
             &self.db,
@@ -884,6 +889,7 @@ impl SekaiServiceImpl {
             &principals,
             tenant_context.as_ref(),
             &format!("get_lineage:{}", r.object_id),
+            purpose.as_ref(),
         )?;
         enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
         let mut res = self

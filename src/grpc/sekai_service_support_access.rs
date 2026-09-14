@@ -388,7 +388,7 @@ pub(super) fn object_is_visible_for(
         && check_team_namespace(db, principals, &object.namespace, false).is_ok()
         && enforce_namespace_tenant_context(db, tenant_context, &object.namespace, false).is_ok()
         && check_read(security, &object.id, principals).is_ok()
-        && object_passes_security_policy(db, object, principals, tenant_context, operation)
+        && object_passes_security_policy(db, object, principals, tenant_context, operation, None)
             .unwrap_or(false)
 }
 pub(super) fn object_security_generation(
@@ -407,8 +407,10 @@ pub(super) fn evaluate_active_object_policy(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<Option<bool>, Status> {
-    let decision = decide_object_access(db, object, principals, tenant_context, operation)?;
+    let decision =
+        decide_object_access(db, object, principals, tenant_context, operation, purpose)?;
     Ok(match (decision.outcome, decision.denied_by) {
         (crate::sekai::policy_decision::PolicyOutcome::Allow, _) => Some(true),
         // Marking denials stay on the marking path so they remain
@@ -423,12 +425,13 @@ pub(super) fn object_passes_security_policy(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<bool, Status> {
     if is_reserved_governance_kind(&object.kind) {
         return object_passes_marking(db, object, principals);
     }
     Ok(
-        decide_object_access(db, object, principals, tenant_context, operation)?.outcome
+        decide_object_access(db, object, principals, tenant_context, operation, purpose)?.outcome
             == crate::sekai::policy_decision::PolicyOutcome::Allow,
     )
 }
@@ -439,8 +442,10 @@ pub(super) fn enforce_object_operation_access(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
     operation_id: &str,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<markings::MarkingCheckResult, Status> {
-    let decision = decide_object_access(db, object, principals, tenant_context, operation)?;
+    let decision =
+        decide_object_access(db, object, principals, tenant_context, operation, purpose)?;
     let record = crate::sekai::policy_decision::PolicyDecisionRecord {
         event_id: format!("{operation_id}:{}", uuid::Uuid::new_v4().as_simple()),
         decision: decision.clone(),
@@ -462,6 +467,7 @@ pub(super) fn decide_object_access(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<crate::sekai::policy_decision::PolicyDecision, Status> {
     let policy = match db.active_object_policy(&object.namespace, &object.kind) {
         Ok(policy) => policy,
@@ -495,6 +501,34 @@ pub(super) fn decide_object_access(
         }
         None => "legacy".into(),
     };
+    let purpose_authorization = match (
+        policy
+            .as_ref()
+            .and_then(|policy| policy.required_purpose.as_deref()),
+        purpose,
+    ) {
+        (Some(_), Some(presented))
+            if !crate::sekai::markings::is_trusted_service_principal(&presented.actor)
+                && !presented.purpose.is_empty() =>
+        {
+            db.find_purpose_authorization(
+                &presented.actor,
+                &presented.purpose,
+                &object.namespace,
+                &object.kind,
+                &activation_digest,
+                now_millis(),
+            )
+            .map_err(|error| {
+                if error.contains("unavailable") {
+                    Status::unavailable("purpose authorization unavailable")
+                } else {
+                    Status::internal(error)
+                }
+            })?
+        }
+        _ => None,
+    };
     let compiled = crate::sekai::policy_decision::compile_object_access(
         crate::sekai::policy_decision::PolicyCompileRequest {
             namespace: &object.namespace,
@@ -505,8 +539,8 @@ pub(super) fn decide_object_access(
             lattice: lattice.as_ref(),
             policy: policy.as_ref(),
             activation_digest: &activation_digest,
-            purpose: None,
-            purpose_authorization: None,
+            purpose,
+            purpose_authorization: purpose_authorization.as_ref(),
             now_ms: now_millis(),
             namespace_granted: true,
         },
@@ -590,6 +624,7 @@ pub(super) fn require_visible_read_root(
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
     operation_id: &str,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
     if is_reserved_governance_kind(&object.kind) {
         return Err(Status::not_found("not found"));
@@ -604,6 +639,7 @@ pub(super) fn require_visible_read_root(
         principals,
         tenant_context,
         crate::sekai::object_security::ObjectSecurityOperation::Read,
+        purpose,
     )
     .map_err(|_| Status::not_found("not found"))?
     {

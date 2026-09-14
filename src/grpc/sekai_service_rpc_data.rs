@@ -585,6 +585,7 @@ pub(super) async fn list_object_changes(
                 &principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Read,
+                None,
             )? == Some(false)
             {
                 return Err(Status::not_found("not found"));
