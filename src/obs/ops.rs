@@ -24,6 +24,7 @@ pub fn router(
     db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 ) -> Router {
     let ops = Router::new()
         .route("/metrics", get(metrics))
@@ -36,7 +37,11 @@ pub fn router(
 
     let console = console::router(ConsoleState {
         db: db.clone(),
-        auth: crate::grpc::TokenAuthInterceptor::new(credential_store, db),
+        auth: crate::grpc::TokenAuthInterceptor::from_runtime(
+            credential_store,
+            db,
+            assertion_authority,
+        ),
         sessions: Arc::new(SessionStore::new()),
         session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
     });
@@ -50,13 +55,19 @@ pub async fn bind_and_spawn(
     db: Arc<RuntimeDb>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::obs::metrics::handle();
     crate::obs::metrics::spawn_upkeep_task();
 
     let listener = TcpListener::bind((bind, port)).await?;
     let actual_addr = listener.local_addr()?;
-    let app = router(db, provider_registry_state_path, credential_store);
+    let app = router(
+        db,
+        provider_registry_state_path,
+        credential_store,
+        assertion_authority,
+    );
 
     info!(
         addr = %actual_addr,

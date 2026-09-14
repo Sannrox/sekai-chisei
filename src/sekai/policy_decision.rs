@@ -305,50 +305,59 @@ impl CompiledObjectAccess {
     }
 }
 
-/// Migration oracle: today's evaluators in ADR 0076 order. Not the product.
+/// Migration oracle: pre-PDP evaluators in ADR 0076 order. Not the product.
+///
+/// Calls today's evaluators (`evaluate_lattice_access`, `namespace_granted`,
+/// `policy.allows`, `evaluate_required_purpose`, and the property/value-instance
+/// projectors). Must not call [`compile_object_access`] or
+/// [`CompiledObjectAccess::decide`].
 pub fn evaluate_legacy_layers(
     request: PolicyCompileRequest<'_>,
     object: &Object,
 ) -> Result<(PolicyDecision, BTreeSet<String>), String> {
-    let compiled = compile_object_access(request)?;
+    let context = request.context.clone().normalized();
+    let principal_digest = context.digest()?;
+    let policy_revision_digest = match request.policy {
+        Some(policy) => policy.revision_digest()?,
+        None => "legacy".into(),
+    };
     let mut denied_by = None;
-    if object.namespace != compiled.namespace || object.kind != compiled.kind {
+    if object.namespace != request.namespace || object.kind != request.kind {
         denied_by = Some(PolicyLayer::ObjectRow);
     }
     if denied_by.is_none() {
         let marking = evaluate_lattice_access(
             "legacy-migration",
             object_marking_token(object),
-            &compiled.authority,
-            compiled.lattice.as_ref(),
+            request.authority,
+            request.lattice,
         );
         if marking.decision == MarkingDecision::Deny {
             denied_by = Some(PolicyLayer::Marking);
         }
     }
-    if denied_by.is_none() && !compiled.namespace_granted {
+    if denied_by.is_none() && !request.namespace_granted {
         denied_by = Some(PolicyLayer::NamespaceGrant);
     }
     if denied_by.is_none()
-        && let Some(policy) = &compiled.policy
-        && !policy.allows(&compiled.context, object, compiled.operation)
+        && let Some(policy) = request.policy
+        && !policy.allows(&context, object, request.operation)
     {
         denied_by = Some(PolicyLayer::ObjectRow);
     }
     if denied_by.is_none() {
-        let required_purpose = compiled
+        let required_purpose = request
             .policy
-            .as_ref()
             .and_then(|policy| policy.required_purpose.as_deref());
         let purpose = evaluate_required_purpose(PurposeEvaluation {
             operation_id: "legacy-migration",
             required_purpose,
-            presentation: compiled.purpose.as_ref(),
-            authorization: compiled.purpose_authorization.as_ref(),
-            namespace: &compiled.namespace,
-            kind: &compiled.kind,
-            activation_digest: &compiled.activation_digest,
-            now_ms: compiled.now_ms,
+            presentation: request.purpose,
+            authorization: request.purpose_authorization,
+            namespace: request.namespace,
+            kind: request.kind,
+            activation_digest: request.activation_digest,
+            now_ms: request.now_ms,
         });
         if purpose.decision == MarkingDecision::Deny {
             denied_by = Some(PolicyLayer::Purpose);
@@ -362,7 +371,10 @@ pub fn evaluate_legacy_layers(
     let mut visible = BTreeSet::new();
     if outcome == PolicyOutcome::Allow {
         let mut projected = object.clone();
-        compiled.project(&mut projected);
+        if let Some(policy) = request.policy {
+            policy.project_visible_properties(&mut projected);
+            policy.project_visible_value_instances(&mut projected);
+        }
         visible = projected.properties.keys().cloned().collect();
     }
     Ok((
@@ -371,11 +383,11 @@ pub fn evaluate_legacy_layers(
             namespace: object.namespace.clone(),
             object_kind: object.kind.clone(),
             object_id: object.id.clone(),
-            operation: compiled.operation.as_str().into(),
-            principal: compiled.authority.principal,
-            principal_digest: compiled.principal_digest,
-            activation_digest: compiled.activation_digest,
-            policy_revision_digest: compiled.policy_revision_digest,
+            operation: request.operation.as_str().into(),
+            principal: request.authority.principal.clone(),
+            principal_digest,
+            activation_digest: request.activation_digest.into(),
+            policy_revision_digest,
             outcome,
             denied_by,
         },
@@ -746,7 +758,38 @@ mod tests {
                 "decision export leaked a hidden value"
             );
         }
-        assert_eq!(diverged, 0, "compile diverged from the legacy oracle");
+        assert_eq!(diverged, 0, "compile diverged from the pre-PDP evaluators");
+    }
+
+    #[test]
+    fn legacy_oracle_uses_pre_pdp_purpose_and_row_evaluators() {
+        let ctx = context(&["alice"], &[]);
+        let auth = authority("alice", None);
+        let mut policy = policy_allow_all();
+        policy.required_purpose = Some("review".into());
+        let obj = object("doc-1", "alice", "open", None);
+        assert!(policy.allows(&ctx, &obj, ObjectSecurityOperation::Read));
+        let request = PolicyCompileRequest {
+            namespace: "acme",
+            kind: "document",
+            operation: ObjectSecurityOperation::Read,
+            context: &ctx,
+            authority: &auth,
+            lattice: None,
+            policy: Some(&policy),
+            activation_digest: "act",
+            purpose: None,
+            purpose_authorization: None,
+            now_ms: 50,
+            namespace_granted: true,
+        };
+        let compiled = compile_object_access(request.clone()).unwrap();
+        let product = compiled.decide(&obj);
+        let (legacy, _) = evaluate_legacy_layers(request, &obj).unwrap();
+        assert_eq!(product.outcome, PolicyOutcome::Deny);
+        assert_eq!(product.denied_by, Some(PolicyLayer::Purpose));
+        assert_eq!(legacy.outcome, product.outcome);
+        assert_eq!(legacy.denied_by, product.denied_by);
     }
 
     #[test]

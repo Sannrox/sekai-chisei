@@ -33,6 +33,7 @@ impl SekaiServiceImpl {
                 &principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Read,
+                None,
             )? == Some(false)
             {
                 return Err(Status::not_found("link endpoint not found"));
@@ -52,6 +53,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("create_link:{object_id}"),
+                None,
             )?;
             endpoints.push(object);
         }
@@ -114,6 +116,7 @@ impl SekaiServiceImpl {
                 &principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Read,
+                None,
             )? == Some(false)
             {
                 return Err(Status::not_found("link endpoint not found"));
@@ -133,6 +136,7 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("delete_link:{object_id}"),
+                None,
             )?;
             endpoints.push(object);
         }

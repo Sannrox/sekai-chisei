@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Verify configured `sia1.` identity assertions on the live
+  `TokenAuthInterceptor` path from `SEKAI_ASSERTION_ISSUER`,
+  `SEKAI_ASSERTION_AUDIENCE`, and `SEKAI_ASSERTION_HMAC_KEY`. Make
+  `CompiledObjectAccess::decide` the live object read/write/link
+  authority; the 10k differential compares that product to the pre-PDP
+  evaluators rather than a copy of `decide`.
 - Accept audience-bound, one-use signed identity assertions that fill the
   existing `AuthenticatedContext` (#888,
   [ADR 0078](docs/decisions/0078-audience-bound-assertions.md)). No configured

@@ -1490,6 +1490,7 @@ pub(super) fn visible_action_object(
         principals,
         tenant_context,
         &format!("object_action:{object_id}"),
+        None,
     )
     .map(|(object, _)| object)
     .map_err(|_| unavailable())

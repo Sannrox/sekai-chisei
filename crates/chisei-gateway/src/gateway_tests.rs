@@ -3261,6 +3261,9 @@ fn test_config() -> Config {
         governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
         site_id: "local".into(),
         budget_topology: Default::default(),
+        assertion_issuer: None,
+        assertion_audience: None,
+        assertion_hmac_key: None,
     }
 }
 
