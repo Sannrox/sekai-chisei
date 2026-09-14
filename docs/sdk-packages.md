@@ -59,7 +59,9 @@ pip registry installs, and it does not upload crates.io, npm, or PyPI bytes.
 Each release publishes [`compatibility.json`](../compatibility.json)
 (`sekai.compatibility-matrix/v1`) as a projection of the shipped server
 version, proto revision, `sekai-client`, `sekai-proto`, and TypeScript/Python
-package versions. See [ADR 0070](decisions/0070-compatibility-matrix.md).
+package versions. Generated HTTP/JSON clients (`sdk/typescript/http.ts`,
+`sdk/python/sekai_http.py`) ship in those same packages and are reproduced
+from the maturity table in CI. See [ADR 0070](decisions/0070-compatibility-matrix.md).
 The file is not a second authority: CI regenerates it from Cargo, proto, and
 SDK metadata and fails when it drifts.
 

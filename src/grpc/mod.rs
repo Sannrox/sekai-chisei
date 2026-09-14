@@ -379,6 +379,33 @@ pub fn run(
             .await?;
         }
 
+        if crate::http_projection::should_bind(&config, &tcp_mode) {
+            let http_port = config
+                .http_port
+                .expect("HTTP projection bind requires SEKAI_HTTP_PORT");
+            crate::http_projection::validate_bind(&config.http_bind, &config)
+                .map_err(std::io::Error::other)?;
+            if tcp_mode.token_auth_mode {
+                crate::http_projection::bind_and_spawn(
+                    &config.http_bind,
+                    http_port,
+                    sekai_svc.clone(),
+                    chisei_svc.clone(),
+                    TokenAuthInterceptor::new(credential_store.clone(), db.clone()),
+                )
+                .await?;
+            } else {
+                crate::http_projection::bind_and_spawn(
+                    &config.http_bind,
+                    http_port,
+                    sekai_svc.clone(),
+                    chisei_svc.clone(),
+                    LocalInterceptor::new(true),
+                )
+                .await?;
+            }
+        }
+
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
 

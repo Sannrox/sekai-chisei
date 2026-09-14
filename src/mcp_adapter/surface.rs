@@ -8,14 +8,19 @@ use tokio::time::timeout;
 use tonic::Request;
 
 use crate::capability_projection::{ProjectedError, ProjectionContext, SdkInvocation};
+use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::client::connect_sekai_with_token;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
+use crate::grpc::pb::chisei::chisei_service_server::ChiseiService;
 use crate::grpc::pb::chisei::{GetOperationReceiptRequest, GetOperationReceiptResponse};
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
+use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    DiscoverCapabilitiesRequest, GetObjectRequest, SubmitActionInstanceRequest,
+    DescribeObjectActionRequest, DiscoverCapabilitiesRequest, EvaluateObjectSetRequest,
+    GetObjectRequest, PreviewObjectActionRequest, SubmitActionInstanceRequest,
     SubmitActionInstanceResponse,
 };
+use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::capability::CONTRACT_VERSION;
 
 use super::AdapterConfig;
@@ -23,6 +28,9 @@ use super::AdapterConfig;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeRpc {
     GetObject,
+    EvaluateObjectSet,
+    DescribeObjectAction,
+    PreviewObjectAction,
     SubmitActionInstance,
     GetOperationReceipt,
 }
@@ -61,6 +69,126 @@ pub trait NativeSurface: Send + Sync {
         rpc: NativeRpc,
         invocation: SdkInvocation,
     ) -> Result<Value, AdapterError>;
+}
+
+pub async fn dispatch_native(
+    sekai: &SekaiServiceImpl,
+    chisei: &ChiseiServiceImpl,
+    rpc: NativeRpc,
+    invocation: SdkInvocation,
+) -> Result<Value, AdapterError> {
+    match rpc {
+        NativeRpc::GetObject => {
+            let request = invocation
+                .bind(GetObjectRequest {
+                    id: invocation
+                        .input
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = sekai
+                .get_object(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            let object = response
+                .object
+                .ok_or_else(|| AdapterError::Protocol("object missing from GetObject".into()))?;
+            Ok(json!({
+                "object": {
+                    "id": object.id,
+                    "kind": object.kind,
+                    "name": object.name,
+                    "namespace": object.namespace,
+                    "properties": object.properties,
+                }
+            }))
+        }
+        NativeRpc::EvaluateObjectSet => {
+            let payload =
+                serde_json::from_value::<EvaluateObjectSetRequest>(invocation.input.clone())
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = sekai
+                .evaluate_object_set(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
+        }
+        NativeRpc::DescribeObjectAction => {
+            let payload =
+                serde_json::from_value::<DescribeObjectActionRequest>(invocation.input.clone())
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = sekai
+                .describe_object_action(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
+        }
+        NativeRpc::PreviewObjectAction => {
+            let payload =
+                serde_json::from_value::<PreviewObjectActionRequest>(invocation.input.clone())
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = timeout(Duration::from_secs(5), sekai.preview_object_action(request))
+                .await
+                .map_err(|_| AdapterError::Deadline)?
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
+        }
+        NativeRpc::SubmitActionInstance => {
+            let request = invocation
+                .bind(submit_request(&invocation)?)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = timeout(
+                Duration::from_secs(5),
+                sekai.submit_action_instance(request),
+            )
+            .await
+            .map_err(|_| AdapterError::Deadline)?
+            .map_err(status_error)?
+            .into_inner();
+            Ok(submit_output(response))
+        }
+        NativeRpc::GetOperationReceipt => {
+            let request = invocation
+                .bind(GetOperationReceiptRequest {
+                    operation_id: invocation
+                        .input
+                        .get("operation_id")
+                        .or_else(|| invocation.input.get("operationId"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&invocation.operation_id)
+                        .to_string(),
+                    request_id: String::new(),
+                    caller_scope: String::new(),
+                    attempt: 0,
+                })
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = chisei
+                .get_operation_receipt(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            Ok(receipt_output(response))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +349,20 @@ impl NativeSurface for FixtureSurface {
                     "missing_surfaces": []
                 }))
             }
+            NativeRpc::EvaluateObjectSet => Ok(json!({
+                "members": [],
+                "total": 0,
+                "authority": false
+            })),
+            NativeRpc::DescribeObjectAction => Ok(json!({
+                "namespace": self.namespace,
+                "enabled": true,
+                "previewSupported": true
+            })),
+            NativeRpc::PreviewObjectAction => Ok(json!({
+                "outcome": "ready",
+                "reasonCode": "preview"
+            })),
         }
     }
 }
@@ -356,6 +498,50 @@ impl NativeSurface for SdkSurface {
                         .await?;
                 Ok(receipt_output(response))
             }
+            NativeRpc::EvaluateObjectSet => {
+                let payload =
+                    serde_json::from_value::<EvaluateObjectSetRequest>(invocation.input.clone())
+                        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.evaluate_object_set(request)).await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::DescribeObjectAction => {
+                let payload =
+                    serde_json::from_value::<DescribeObjectActionRequest>(invocation.input.clone())
+                        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.describe_object_action(request))
+                        .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::PreviewObjectAction => {
+                let payload =
+                    serde_json::from_value::<PreviewObjectActionRequest>(invocation.input.clone())
+                        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.preview_object_action(request))
+                        .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
         }
     }
 }
@@ -452,7 +638,7 @@ where
     }
 }
 
-pub(super) fn status_error(status: tonic::Status) -> AdapterError {
+pub fn status_error(status: tonic::Status) -> AdapterError {
     AdapterError::Projected(ProjectedError {
         code: grpc_code_name(status.code()).into(),
         message: status.message().into(),

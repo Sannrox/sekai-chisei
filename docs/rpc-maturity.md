@@ -35,6 +35,12 @@ experimental RPC.
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.
 
+HTTP/JSON is a generated projection of the same `stable` unary RPCs
+([ADR 0075](decisions/0075-http-ontology-projection.md)). Routes are
+`POST /sekai.SekaiService/{Method}` and `POST /chisei.ChiseiService/{Method}`
+on `SEKAI_HTTP_PORT`. Authorization, cursors, and hidden-row rules match gRPC.
+Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
+
 ## Table
 
 <!-- rpc-maturity-rows -->

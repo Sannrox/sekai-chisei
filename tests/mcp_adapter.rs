@@ -17,6 +17,9 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
         report.tools,
         vec![
             "sekai.objects.get",
+            "sekai.objects.evaluate_set",
+            "sekai.actions.describe",
+            "sekai.actions.preview",
             "sekai.actions.submit",
             "chisei.receipt.read"
         ]

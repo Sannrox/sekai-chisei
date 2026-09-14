@@ -256,17 +256,21 @@ explicit `operation_id` and are rebound to the native RPC rather than executed
 by an independent MCP policy path.
 
 `sekai-mcp` is the executable projection host for that contract. It speaks MCP
-stdio with newline-delimited JSON-RPC 2.0 and does not bind a network port.
-Credentials stay in the host environment (`SEKAI_MCP_PRINCIPAL`,
-`SEKAI_MCP_NAMESPACE`, `SEKAI_MCP_TARGET` or `SEKAI_SOCKET`, and optional
-`SEKAI_CREDENTIAL`). `tools/list` requires a live `DiscoverCapabilities`
-success, then returns only the v1 allowlist: `sekai.objects.get` →
-`GetObject`, `sekai.actions.submit` → `SubmitActionInstance`, and
-`chisei.receipt.read` → `GetOperationReceipt`. `SubmitActionInstance` uses the
-caller `operation_id` as `request_id`. Unknown mappings, forged reserved
-metadata, oversized frames, and revoked catalog access fail closed. The adapter
-never invents success; timeouts and unknown effects reconcile through
-`GetOperationReceipt`.
+stdio with newline-delimited JSON-RPC 2.0. The same JSON-RPC allowlist is also
+served as `POST /mcp` on `SEKAI_HTTP_PORT` with the HTTP/JSON bearer.
+Credentials for the stdio host stay in the process environment
+(`SEKAI_MCP_PRINCIPAL`, `SEKAI_MCP_NAMESPACE`, `SEKAI_MCP_TARGET` or
+`SEKAI_SOCKET`, and optional `SEKAI_CREDENTIAL`). HTTP MCP uses the request
+bearer and `x-sekai-namespace`. `tools/list` requires a live
+`DiscoverCapabilities` success, then returns only the v1 allowlist:
+`sekai.objects.get` → `GetObject`, `sekai.objects.evaluate_set` →
+`EvaluateObjectSet`, `sekai.actions.describe` → `DescribeObjectAction`,
+`sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
+`SubmitActionInstance`, and `chisei.receipt.read` → `GetOperationReceipt`.
+`SubmitActionInstance` uses the caller `operation_id` as `request_id`. Unknown
+mappings, forged reserved metadata, oversized frames, and revoked catalog
+access fail closed. The adapter never invents success; timeouts and unknown
+effects reconcile through `GetOperationReceipt`.
 
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and

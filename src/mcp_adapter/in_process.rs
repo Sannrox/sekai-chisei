@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::time::timeout;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 
@@ -14,23 +12,17 @@ use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::grpc::chisei_service::ChiseiServiceImpl;
-use crate::grpc::pb::chisei::GetOperationReceiptRequest;
-use crate::grpc::pb::chisei::chisei_service_server::ChiseiService;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest, GetObjectRequest,
-    GovernedActionType, Object, ObjectType, PropertyDef, PutGovernedActionTypeRequest,
-    SubmitActionInstanceRequest,
+    CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest, GovernedActionType,
+    Object, ObjectType, PropertyDef, PutGovernedActionTypeRequest,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::capability::CONTRACT_VERSION;
 use crate::sekai::security::{Grant, Role};
 
-use super::surface::{
-    AdapterError, CatalogSnapshot, NativeRpc, NativeSurface, receipt_output, status_error,
-    submit_output,
-};
+use super::surface::{AdapterError, CatalogSnapshot, NativeRpc, NativeSurface, status_error};
 
 const PRINCIPAL: &str = "tester";
 const NAMESPACE: &str = "acme";
@@ -196,105 +188,7 @@ impl NativeSurface for InProcessSurface {
         rpc: NativeRpc,
         invocation: SdkInvocation,
     ) -> Result<Value, AdapterError> {
-        match rpc {
-            NativeRpc::GetObject => {
-                let request = invocation
-                    .bind(GetObjectRequest {
-                        id: invocation
-                            .input
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    })
-                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-                let response = self
-                    .sekai
-                    .get_object(request)
-                    .await
-                    .map_err(status_error)?
-                    .into_inner();
-                let object = response.object.ok_or_else(|| {
-                    AdapterError::Protocol("object missing from GetObject".into())
-                })?;
-                Ok(json!({
-                    "object": {
-                        "id": object.id,
-                        "kind": object.kind,
-                        "name": object.name,
-                        "namespace": object.namespace,
-                        "properties": object.properties,
-                    }
-                }))
-            }
-            NativeRpc::SubmitActionInstance => {
-                let request = invocation
-                    .bind(SubmitActionInstanceRequest {
-                        namespace: invocation.namespace.clone(),
-                        type_id: invocation
-                            .input
-                            .get("type_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        version: invocation
-                            .input
-                            .get("version")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        parameters_json: invocation
-                            .input
-                            .get("parameters_json")
-                            .map(|value| match value {
-                                Value::String(raw) => raw.clone(),
-                                other => other.to_string(),
-                            })
-                            .unwrap_or_else(|| "{}".into()),
-                        idempotency_key: invocation
-                            .input
-                            .get("idempotency_key")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&invocation.operation_id)
-                            .to_string(),
-                        evidence_submission_ids: vec![],
-                        request_id: invocation.operation_id.clone(),
-                        ontology_digest: String::new(),
-                    })
-                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-                let response = timeout(
-                    Duration::from_secs(5),
-                    self.sekai.submit_action_instance(request),
-                )
-                .await
-                .map_err(|_| AdapterError::Deadline)?
-                .map_err(status_error)?
-                .into_inner();
-                Ok(submit_output(response))
-            }
-            NativeRpc::GetOperationReceipt => {
-                let request = invocation
-                    .bind(GetOperationReceiptRequest {
-                        operation_id: invocation
-                            .input
-                            .get("operation_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or(&invocation.operation_id)
-                            .to_string(),
-                        request_id: String::new(),
-                        caller_scope: String::new(),
-                        attempt: 0,
-                    })
-                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-                let response = self
-                    .chisei
-                    .get_operation_receipt(request)
-                    .await
-                    .map_err(status_error)?
-                    .into_inner();
-                Ok(receipt_output(response))
-            }
-        }
+        super::surface::dispatch_native(&self.sekai, &self.chisei, rpc, invocation).await
     }
 }
 
@@ -331,6 +225,8 @@ fn fixture_config() -> Config {
         sekai_bind: None,
         ops_port: None,
         ops_bind: "127.0.0.1".into(),
+        http_port: None,
+        http_bind: "127.0.0.1".into(),
         sekai_socket: None,
         db_path: ":memory:".into(),
         anthropic_api_key: None,

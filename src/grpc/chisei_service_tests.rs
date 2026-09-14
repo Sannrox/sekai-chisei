@@ -1084,6 +1084,8 @@ fn config(db_path: &str) -> Config {
         sekai_bind: None,
         ops_port: None,
         ops_bind: "127.0.0.1".into(),
+        http_port: None,
+        http_bind: "127.0.0.1".into(),
         sekai_socket: None,
         db_path: db_path.to_string(),
         anthropic_api_key: None,

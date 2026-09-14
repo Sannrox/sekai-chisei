@@ -8,6 +8,9 @@ use super::surface::{AdapterError, NativeRpc, NativeSurface};
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const GET_OBJECT_TOOL: &str = "sekai.objects.get";
+pub const EVALUATE_SET_TOOL: &str = "sekai.objects.evaluate_set";
+pub const DESCRIBE_ACTION_TOOL: &str = "sekai.actions.describe";
+pub const PREVIEW_ACTION_TOOL: &str = "sekai.actions.preview";
 pub const SUBMIT_ACTION_TOOL: &str = "sekai.actions.submit";
 pub const GET_RECEIPT_TOOL: &str = "chisei.receipt.read";
 
@@ -23,13 +26,23 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 3] {
-    [GET_OBJECT_TOOL, SUBMIT_ACTION_TOOL, GET_RECEIPT_TOOL]
+pub fn well_known_tools() -> [&'static str; 6] {
+    [
+        GET_OBJECT_TOOL,
+        EVALUATE_SET_TOOL,
+        DESCRIBE_ACTION_TOOL,
+        PREVIEW_ACTION_TOOL,
+        SUBMIT_ACTION_TOOL,
+        GET_RECEIPT_TOOL,
+    ]
 }
 
 pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
     match name {
         GET_OBJECT_TOOL => Some(NativeRpc::GetObject),
+        EVALUATE_SET_TOOL => Some(NativeRpc::EvaluateObjectSet),
+        DESCRIBE_ACTION_TOOL => Some(NativeRpc::DescribeObjectAction),
+        PREVIEW_ACTION_TOOL => Some(NativeRpc::PreviewObjectAction),
         SUBMIT_ACTION_TOOL => Some(NativeRpc::SubmitActionInstance),
         GET_RECEIPT_TOOL => Some(NativeRpc::GetOperationReceipt),
         _ => None,
@@ -83,7 +96,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, SubmitActionInstance, and GetOperationReceipt. Discovery is not a grant."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, and GetOperationReceipt. Discovery is not a grant."
     }))
 }
 
@@ -230,6 +243,28 @@ fn bind_session_input(
                 object.insert("operation_id".into(), json!(operation_id));
             }
         }
+        NativeRpc::EvaluateObjectSet => {
+            if let Some(descriptor) = object.get("descriptor").and_then(Value::as_object)
+                && let Some(namespace) = descriptor.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"object-set namespace must match the authenticated adapter session"
+                }));
+            }
+        }
+        NativeRpc::DescribeObjectAction | NativeRpc::PreviewObjectAction => {
+            if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"Action namespace must match the authenticated adapter session"
+                }));
+            }
+            object.insert("namespace".into(), json!(context.namespace));
+        }
     }
     Ok(input)
 }
@@ -253,6 +288,30 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "query",
             "sekai.GetObjectRequest",
             "sekai.GetObjectResponse",
+            "read",
+        ),
+        capability_entry(
+            EVALUATE_SET_TOOL,
+            "Evaluate one authorized object set.",
+            "query",
+            "sekai.EvaluateObjectSetRequest",
+            "sekai.EvaluateObjectSetResponse",
+            "read",
+        ),
+        capability_entry(
+            DESCRIBE_ACTION_TOOL,
+            "Describe one object-bound Action type.",
+            "query",
+            "sekai.DescribeObjectActionRequest",
+            "sekai.DescribeObjectActionResponse",
+            "read",
+        ),
+        capability_entry(
+            PREVIEW_ACTION_TOOL,
+            "Preview one object-bound Action without submitting it.",
+            "query",
+            "sekai.PreviewObjectActionRequest",
+            "sekai.PreviewObjectActionResponse",
             "read",
         ),
         capability_entry(
@@ -423,7 +482,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec![GET_OBJECT_TOOL, SUBMIT_ACTION_TOOL, GET_RECEIPT_TOOL]
+            vec![
+                GET_OBJECT_TOOL,
+                EVALUATE_SET_TOOL,
+                DESCRIBE_ACTION_TOOL,
+                PREVIEW_ACTION_TOOL,
+                SUBMIT_ACTION_TOOL,
+                GET_RECEIPT_TOOL,
+            ]
         );
         assert_eq!(
             listed["result"]["tools"][0]["inputSchema"]["additionalProperties"],

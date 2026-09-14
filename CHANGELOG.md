@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Serve stable unary RPCs as an in-process HTTP/JSON projection of the same
+  gRPC handlers, auth interceptor, and maturity gate (#875,
+  [ADR 0075](docs/decisions/0075-http-ontology-projection.md)). Routes are
+  `POST /sekai.SekaiService/{Method}` and `POST /chisei.ChiseiService/{Method}`
+  on `SEKAI_HTTP_PORT` (default 50080). Experimental RPCs stay refused.
+  Streaming stays on gRPC. `/mcp` reuses the same bearer. Generated
+  TypeScript, Python, and Rust HTTP clients are CI goldens, not a second
+  resource model.
 - Record accepted Design Discussions for transforms, the HTTP ontology
   projection, one compiling policy entry, Action-type criteria, audience-bound
   assertions, and evaluation-gated promotion (Discussions 908, 902, 903, 904,
