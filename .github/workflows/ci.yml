@@ -33,6 +33,9 @@ jobs:
       - name: Assert RPC maturity table
         run: cargo test --locked --test rpc_maturity
 
+      - name: Assert service file line ceilings
+        run: cargo test --locked --test service_file_ceilings
+
       - name: Verify standalone ontology dependencies
         shell: bash
         run: |

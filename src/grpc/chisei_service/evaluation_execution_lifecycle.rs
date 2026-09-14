@@ -13,7 +13,7 @@ use std::sync::{
 };
 use tokio::sync::Mutex as AsyncMutex;
 
-pub(super) struct EvaluationExecutionLifecycle {
+pub(crate) struct EvaluationExecutionLifecycle {
     db: Arc<RuntimeDb>,
     budget: Arc<BudgetTracker>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
