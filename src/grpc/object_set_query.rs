@@ -306,6 +306,78 @@ impl SekaiServiceImpl {
         }))
     }
 
+    fn require_hop_projection_ready(
+        &self,
+        bound: &BoundObjectSet,
+        hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    ) -> Result<(), Status> {
+        for hop in hops {
+            if !self
+                .db
+                .hop_projection_ready(&bound.descriptor.namespace, &hop.far_kind)
+                .map_err(Status::internal)?
+            {
+                return Err(Status::failed_precondition(
+                    "object index hop projection is stale",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn hop_projection_paths(
+        &self,
+        bound: &BoundObjectSet,
+        hops: &[crate::sekai::object_set::ObjectSetTraversal],
+        roots: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
+        meter: &mut crate::sekai::object_set::CostMeter,
+    ) -> Result<Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>>, Status> {
+        let mut current: Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>> =
+            roots.iter().cloned().map(|member| vec![member]).collect();
+        for hop in hops {
+            let mut parent_keys = std::collections::HashSet::new();
+            for path in &current {
+                let parent = path.last().expect("path");
+                parent_keys.insert(parent.source_key.clone());
+                parent_keys.insert(parent.object_id.clone());
+            }
+            let parent_keys: Vec<String> = parent_keys.into_iter().collect();
+            let pairs = self
+                .db
+                .list_index_join_children(
+                    &bound.descriptor.namespace,
+                    &hop.far_kind,
+                    &hop.join_property,
+                    &parent_keys,
+                )
+                .map_err(Status::internal)?;
+            let mut child_keys = std::collections::HashSet::new();
+            for (_, source_key) in pairs {
+                child_keys.insert(source_key);
+            }
+            let child_keys: Vec<String> = child_keys.into_iter().collect();
+            let children = self
+                .db
+                .list_index_members_by_keys(&bound.descriptor.namespace, &hop.far_kind, &child_keys)
+                .map_err(Status::internal)?;
+            meter
+                .charge(children.len() as i32)
+                .map_err(map_object_set_error)?;
+            current = crate::sekai::object_index_engine::join_paths_hash(
+                current.iter().map(|path| path.iter().collect()).collect(),
+                &children,
+                &hop.join_property,
+            )
+            .into_iter()
+            .map(|path| path.into_iter().cloned().collect())
+            .collect();
+            meter
+                .charge(current.len() as i32)
+                .map_err(map_object_set_error)?;
+        }
+        Ok(current)
+    }
+
     fn evaluate_aggregated_object_set(
         &self,
         bound: &BoundObjectSet,
@@ -347,6 +419,14 @@ impl SekaiServiceImpl {
             {
                 return Err(Status::failed_precondition("object type index is stale"));
             }
+            let load_members = index == 0
+                || self.object_index_engine
+                    == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+                || self.object_index_dual_read;
+            if !load_members {
+                layers.push(Vec::new());
+                continue;
+            }
             let query = if index == 0 {
                 crate::sekai::dataset::RowQuery {
                     filters: bound
@@ -373,60 +453,68 @@ impl SekaiServiceImpl {
                 .map_err(map_object_set_error)?;
             layers.push(members);
         }
+        if self.object_index_engine
+            == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
+        {
+            self.require_hop_projection_ready(bound, hops)?;
+        }
+        let projected = if self.object_index_engine
+            == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
+        {
+            Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter)?)
+        } else {
+            None
+        };
         let mut paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
             layers[0].iter().map(|member| vec![member]).collect();
-        for (hop_index, hop) in hops.iter().enumerate() {
-            let children = &layers[hop_index + 1];
-            let mut next = Vec::new();
-            for path in &paths {
-                let parent = path[path.len() - 1];
-                for child in children {
-                    let matched = if hop.join_property.is_empty() {
-                        false
-                    } else {
-                        child
-                            .properties
-                            .get(&hop.join_property)
-                            .is_some_and(|value| {
-                                value == &parent.source_key || value == &parent.object_id
-                            })
-                    };
-                    if matched {
-                        let mut joined = path.clone();
-                        joined.push(child);
-                        next.push(joined);
-                    }
+        if self.object_index_engine
+            == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+            || self.object_index_dual_read
+        {
+            for (hop_index, hop) in hops.iter().enumerate() {
+                paths = crate::sekai::object_index_engine::join_paths_nested(
+                    paths,
+                    &layers[hop_index + 1],
+                    &hop.join_property,
+                );
+                if self.object_index_engine
+                    == crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop
+                {
+                    meter
+                        .charge(paths.len() as i32)
+                        .map_err(map_object_set_error)?;
                 }
             }
-            meter
-                .charge(next.len() as i32)
-                .map_err(map_object_set_error)?;
-            paths = next;
+        }
+        if let Some(projected) = projected.as_ref()
+            && self.object_index_dual_read
+        {
+            let projected_sig = crate::sekai::object_index_engine::path_signature(
+                &projected
+                    .iter()
+                    .map(|path| path.iter().collect())
+                    .collect::<Vec<Vec<_>>>(),
+            );
+            if projected_sig != crate::sekai::object_index_engine::path_signature(&paths) {
+                return Err(Status::internal(
+                    "object index hop-projection dual-read mismatch",
+                ));
+            }
         }
         let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
             Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
         })?;
-        let rows: Vec<(String, Option<f64>)> = paths
-            .iter()
-            .map(|path| {
-                let root = path[0];
-                let leaf = path[path.len() - 1];
-                let group = root
-                    .properties
-                    .get(&aggregation.group_by)
-                    .cloned()
-                    .or_else(|| leaf.properties.get(&aggregation.group_by).cloned())
-                    .unwrap_or_else(|| root.source_key.clone());
-                let value = if aggregation.function.eq_ignore_ascii_case("count") {
-                    Some(1.0)
-                } else {
-                    leaf.properties
-                        .get(&aggregation.property)
-                        .and_then(|raw| raw.parse().ok())
-                };
-                (group, value)
-            })
-            .collect();
+        let rows: Vec<(String, Option<f64>)> = if let Some(projected) = projected.as_ref() {
+            projected
+                .iter()
+                .map(|path| aggregate_path_row(&path[0], path.last().expect("path"), &aggregation))
+                .collect()
+        } else {
+            paths
+                .iter()
+                .map(|path| aggregate_path_row(path[0], path[path.len() - 1], &aggregation))
+                .collect()
+        };
         let aggregates = crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
             .map_err(map_object_set_error)?;
         let _ = (principals, tenant_context);
@@ -448,6 +536,27 @@ impl SekaiServiceImpl {
                 .collect(),
         }))
     }
+}
+
+fn aggregate_path_row(
+    root: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+    leaf: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+    aggregation: &crate::sekai::object_set::ObjectSetAggregation,
+) -> (String, Option<f64>) {
+    let group = root
+        .properties
+        .get(&aggregation.group_by)
+        .cloned()
+        .or_else(|| leaf.properties.get(&aggregation.group_by).cloned())
+        .unwrap_or_else(|| root.source_key.clone());
+    let value = if aggregation.function.eq_ignore_ascii_case("count") {
+        Some(1.0)
+    } else {
+        leaf.properties
+            .get(&aggregation.property)
+            .and_then(|raw| raw.parse().ok())
+    };
+    (group, value)
 }
 
 fn parse_object_set_descriptor(
@@ -1208,6 +1317,59 @@ mod tests {
         assert_eq!(page.aggregates[0].count, 1);
         assert!(page.members.is_empty());
         assert!(!page.authority);
+
+        let mut projected = service();
+        grant_namespace(&projected, "sales", "alice");
+        grant_namespace(&projected, "sales", "local");
+        let digest = seed_sales_with_shipments(&projected);
+        seed_indexed_customer_order_shipment(&projected, &digest);
+        projected.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
+        projected.object_index_dual_read = true;
+        let hop_page = projected
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![
+                            ObjectSetTraversal {
+                                relation: "placed".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Order".into(),
+                                join_property: "customer_id".into(),
+                            },
+                            ObjectSetTraversal {
+                                relation: "ships".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Shipment".into(),
+                                join_property: "order_id".into(),
+                            },
+                        ],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "sum".into(),
+                            property: "amount".into(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(hop_page.aggregates, page.aggregates);
+        assert!(!hop_page.authority);
 
         let refused = svc
             .evaluate_object_set(with_named_principal(

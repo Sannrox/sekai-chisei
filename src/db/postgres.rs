@@ -62,6 +62,8 @@ const EVENT_STREAMS_SCHEMA: &str = include_str!("postgres/0039_event_streams.sql
 const WORKFLOW_ACTIONS_SCHEMA: &str = include_str!("postgres/0040_workflow_actions.sql");
 const POLICY_DECISION_AUDIT_SCHEMA: &str = include_str!("postgres/0041_policy_decision_audit.sql");
 const OBJECT_TYPE_INDEX_SCHEMA: &str = include_str!("postgres/0042_object_type_index.sql");
+const OBJECT_TYPE_INDEX_JOIN_SCHEMA: &str =
+    include_str!("postgres/0043_object_type_index_join.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -275,6 +277,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 41,
         name: "object_type_index",
         sql: OBJECT_TYPE_INDEX_SCHEMA,
+    },
+    Migration {
+        version: 42,
+        name: "object_type_index_join",
+        sql: OBJECT_TYPE_INDEX_JOIN_SCHEMA,
     },
 ];
 

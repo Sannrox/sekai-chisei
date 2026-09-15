@@ -258,6 +258,45 @@ impl RuntimeDb {
         }
     }
 
+    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.hop_projection_ready(namespace, kind),
+            Self::Postgres(db) => db.hop_projection_ready(namespace, kind),
+        }
+    }
+
+    pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.count_index_join_rows(namespace, kind),
+            Self::Postgres(db) => db.count_index_join_rows(namespace, kind),
+        }
+    }
+
+    pub fn list_index_join_children(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_index_join_children(namespace, kind, property, values),
+            Self::Postgres(db) => db.list_index_join_children(namespace, kind, property, values),
+        }
+    }
+
+    pub fn list_index_members_by_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_index_members_by_keys(namespace, kind, keys),
+            Self::Postgres(db) => db.list_index_members_by_keys(namespace, kind, keys),
+        }
+    }
+
     pub fn put_governed_transform(
         &self,
         transform: &crate::sekai::governed_transform::GovernedTransform,

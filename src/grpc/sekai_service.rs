@@ -157,6 +157,8 @@ pub struct SekaiServiceImpl {
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
     pub(super) site_id: String,
     pub(super) object_query_cursor_key: [u8; 32],
+    pub(super) object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind,
+    pub(super) object_index_dual_read: bool,
 }
 
 impl SekaiServiceImpl {
@@ -183,6 +185,10 @@ impl SekaiServiceImpl {
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
             object_query_cursor_key,
+            object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind::from_env(
+            ),
+            object_index_dual_read:
+                crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
         }
     }
 
