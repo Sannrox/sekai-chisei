@@ -6,12 +6,20 @@
 
 ## Build, Test, and Development Commands
 
-- `cargo fmt` formats Rust code before review.
-- `cargo test` runs the normal unit and integration test suite.
-- `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind.
-- `cargo build --release` builds an optimized binary. The compiler is pinned in `rust-toolchain.toml`.
-- `make release-images` compiles linux binaries in the pinned rust image and wraps `sekai-chisei:local`. `docker compose up --build` remains the checkout-build recovery path.
-- `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
+The Makefile is the workflow. Local and CI run the same targets:
+
+```sh
+make all && make test && make validate
+```
+
+- `make all` builds release binaries (`WHAT=sekaictl` narrows).
+- `make test` runs the workspace tests (`WHAT=` narrows).
+- `make validate` runs every `scripts/validate-*.sh` script.
+- `make update` runs every `scripts/update-*.sh` script.
+- `make check` is those three in order.
+- `make docker` and `make release-images` are image builds, not the gate.
+
+`SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind. The compiler is pinned in `rust-toolchain.toml`. `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
 Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 

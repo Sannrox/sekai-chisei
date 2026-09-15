@@ -1,36 +1,43 @@
 SHELL := /bin/sh
+.EXPORT_ALL_VARIABLES:
 
-CARGO ?= cargo
-PROTO_CONTRACTS := sekai.proto chisei.proto
-# Cargo's --tests also runs unit-test targets; select integration targets explicitly.
-INTEGRATION_TESTS := $(sort $(patsubst tests/%.rs,%,$(wildcard tests/*.rs)))
+WHAT ?=
 
-.PHONY: test validate test-integration update release-images
+.PHONY: all check docker gateway-smoke release-images test test-integration update validate
 
-test:
-	$(CARGO) test --workspace --lib --bins --locked
+# Build release binaries.
+# Example: make all
+#          make all WHAT=sekaictl
+all:
+	bash ./scripts/make-targets/build.sh $(WHAT)
 
+# Run every scripts/validate-*.sh script.
+# Example: make validate
 validate:
-	$(CARGO) fmt --all -- --check
-	$(CARGO) check --workspace --all-targets --locked
-	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+	bash ./scripts/make-targets/validate.sh
+
+# Run every scripts/update-*.sh script.
+# Example: make update
+update:
+	bash ./scripts/make-targets/update.sh
+
+# Example: make test
+#          make test WHAT=--lib
+#          make test WHAT='--test compatibility_matrix'
+test:
+	bash ./scripts/make-targets/test.sh $(WHAT)
 
 test-integration:
-	@if [ -z "$(INTEGRATION_TESTS)" ]; then \
-		echo "No integration test targets found under tests/" >&2; \
-		exit 1; \
-	fi
-	$(CARGO) test --workspace $(foreach test,$(INTEGRATION_TESTS),--test $(test)) --locked
+	bash ./scripts/make-targets/test.sh --tests
 
-update:
-	@for name in $(PROTO_CONTRACTS); do \
-		if ! cmp -s "proto/$$name" "crates/sekai-proto/proto/$$name"; then \
-			cp "proto/$$name" "crates/sekai-proto/proto/$$name"; \
-			echo "Updated crates/sekai-proto/proto/$$name"; \
-		fi; \
-	done
+# The local and CI gate.
+check: all test validate
 
-# Linux binaries in the pinned rust image, then one runtime image with
-# sekai-chisei, chisei-gateway, and sekaictl. Host development stays on cargo.
+docker:
+	bash ./scripts/make-targets/docker.sh
+
+gateway-smoke:
+	bash ./scripts/make-targets/gateway-smoke.sh
+
 release-images:
 	bash ./build/release-images.sh
