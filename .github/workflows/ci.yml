@@ -112,7 +112,7 @@ jobs:
             changed_files="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
           fi
 
-          if grep -Eq '^(Dockerfile|Cargo\.lock|Cargo\.toml|crates/|proto/|src/)' <<<"$changed_files"; then
+          if grep -Eq '^(Dockerfile|rust-toolchain.toml|build/|Cargo\.lock|Cargo\.toml|crates/|proto/|src/)' <<<"$changed_files"; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
@@ -120,7 +120,7 @@ jobs:
 
       - name: Build Docker image
         if: steps.docker-inputs.outputs.should_run == 'true'
-        run: docker build -t sekai-chisei-ci .
+        run: docker build --build-arg VCS_REF="${{ github.sha }}" -t sekai-chisei-ci .
 
       - name: Verify sekaictl is packaged
         if: steps.docker-inputs.outputs.should_run == 'true'
