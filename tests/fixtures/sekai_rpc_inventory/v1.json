@@ -940,7 +940,9 @@
       "evidence": [
         "src/sekai/function.rs"
       ],
-      "durable_dependencies": [],
+      "durable_dependencies": [
+        "sekai.function-definitions"
+      ],
       "product_tier": "experimental"
     },
     {
