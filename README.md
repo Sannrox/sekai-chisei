@@ -270,6 +270,21 @@ SEKAI_INSECURE=1 cargo run
 cargo run --example demo_client
 ```
 
+The native binary smoke starts `sekai-chisei` with a loopback fake LLM and
+drives the product palette (`sekaictl` plus public gRPC) over a temp Unix
+socket:
+
+```bash
+cargo test --test native_server_smoke --locked
+```
+
+The gateway HTTP smoke starts `chisei-gateway` against the same control plane
+and a loopback fake provider:
+
+```bash
+cargo test --test gateway_http_smoke --locked
+```
+
 The ignored Ollama test requires a local compatible endpoint and model:
 
 ```bash
