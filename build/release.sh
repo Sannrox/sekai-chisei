@@ -23,6 +23,10 @@ else
 fi
 
 VERSION="${LOCAL_TAG##*:}"
+if [[ "${VERSION}" == *dirty* ]]; then
+  echo "Refusing to push a dirty image tag: ${LOCAL_TAG}" >&2
+  exit 1
+fi
 REMOTE="${DOCKER_REGISTRY}:${VERSION}"
 docker tag "${LOCAL_TAG}" "${REMOTE}"
 echo "Push ${REMOTE}"

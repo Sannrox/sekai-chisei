@@ -12,7 +12,7 @@ docker compose --env-file _output/compose.env up
 ```
 
 Cargo is the gate. `./build/release-images.sh` is the only image build. The tag
-is git describe (no `:local`). `./build/release.sh` pushes that same tag to
+is git describe (no `:local`). A dirty tree is refused. `./build/release.sh` pushes that same tag to
 `DOCKER_REGISTRY`. Compose uses `sekai-chisei:${GIT_VERSION}`.
 
 ## Quickstart

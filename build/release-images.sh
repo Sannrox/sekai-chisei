@@ -14,9 +14,23 @@ if [[ "${RUST_IMAGE}" != *"${CHANNEL}"* ]]; then
   exit 1
 fi
 
-GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-GIT_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "release-images.sh requires a git checkout" >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "Working tree is dirty. Commit or stash before building images." >&2
+  git status --porcelain >&2
+  exit 1
+fi
+
+GIT_COMMIT="$(git rev-parse HEAD)"
+GIT_VERSION="$(git describe --tags --always --abbrev=14 HEAD)"
 GIT_VERSION="${GIT_VERSION/+/_}"
+if [[ -z "${GIT_VERSION}" || "${GIT_VERSION}" == *dirty* ]]; then
+  echo "Refusing to build a dirty image tag: ${GIT_VERSION:-<empty>}" >&2
+  exit 1
+fi
 IMAGE_NAME="${IMAGE_NAME:-sekai-chisei}"
 IMAGE_TAG="${IMAGE_NAME}:${GIT_VERSION}"
 
