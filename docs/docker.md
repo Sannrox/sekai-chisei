@@ -4,14 +4,15 @@ The runtime image is Debian bookworm with `sekai-chisei`, `chisei-gateway`,
 and `sekaictl`. The builder is pinned `rust:1.98.1-bookworm`.
 
 ```bash
-make all && make test && make validate
-make docker
-make release-images
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+./build/release-images.sh
 ```
 
-The first line is the gate locally and in CI. `make docker` builds the recovery
-image. `make release-images` compiles linux binaries in the pinned rust image
-and tags `sekai-chisei:local`. Compose `up --build` uses the root `Dockerfile`.
+Cargo is the gate locally and in CI (`rust-toolchain.toml`). `./build/release-images.sh`
+compiles linux binaries in that same channel and tags `sekai-chisei:local`.
+Compose `up --build` uses the root `Dockerfile`.
 
 ## Quickstart
 

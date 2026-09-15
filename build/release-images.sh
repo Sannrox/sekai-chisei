@@ -7,7 +7,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${ROOT}"
 
-RUST_IMAGE="${RUST_IMAGE:-rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa}"
+CHANNEL="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+RUST_IMAGE="${RUST_IMAGE:-rust:${CHANNEL}-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa}"
+if [[ "${RUST_IMAGE}" != *"${CHANNEL}"* ]]; then
+  echo "RUST_IMAGE=${RUST_IMAGE} does not match rust-toolchain.toml channel ${CHANNEL}" >&2
+  exit 1
+fi
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
 
