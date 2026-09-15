@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Publish the #876 object-index envelope: 10⁷ synthetic Customer → Order →
+  Shipment rows on a named Apple M2 Pro profile. Membership materialize,
+  1_000-key incremental, filter, aggregate, and rebuild-from-source hold;
+  two-hop p95 misses 500 ms. #877 is unblocked as a projection; #878 and
+  #889 stay measurement-gated. The harness is not the product indexer.
 - Verify configured `sia1.` identity assertions on the live
   `TokenAuthInterceptor` path from `SEKAI_ASSERTION_ISSUER`,
   `SEKAI_ASSERTION_AUDIENCE`, and `SEKAI_ASSERTION_HMAC_KEY`. Make
