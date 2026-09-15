@@ -1,5 +1,20 @@
 # Running with Docker
 
+The runtime image is Debian bookworm with `sekai-chisei`, `chisei-gateway`,
+and `sekaictl`. The builder is pinned `rust:1.98.1-bookworm`.
+
+```bash
+cargo fmt-check
+cargo clippy-all
+cargo test-all
+./build/release-images.sh
+docker compose --env-file _output/compose.env up
+```
+
+Cargo is the gate. `./build/release-images.sh` is the only image build. The tag
+is git describe (no `:local`). A dirty tree is refused. `./build/release.sh` pushes that same tag to
+`DOCKER_REGISTRY`. Compose uses `sekai-chisei:${GIT_VERSION}`.
+
 ## Quickstart
 
 ```bash
@@ -7,7 +22,8 @@ export CHISEI_GATEWAY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='<your-openai-key>'
 export GATEWAY_KEYS='sekai-docker-demo=demo:default'
 export GATEWAY_KEY='sekai-docker-demo'
-docker compose up --build
+./build/release-images.sh
+docker compose --env-file _output/compose.env up
 ```
 
 The exported `GATEWAY_KEYS` value must be a gateway allowlist map (`key=agent:project`).
@@ -30,7 +46,7 @@ Gateway traffic is served at `http://localhost:8080` by default and talks to the
 For an end-to-end container smoke check (requires provider credentials, e.g. `OPENAI_API_KEY`):
 
 ```bash
-docker compose up -d
+docker compose --env-file _output/compose.env up -d
 curl -sS -X POST "http://localhost:8080/v1/chat/completions" \
   -H "authorization: Bearer $GATEWAY_KEY" \
   -H "content-type: application/json" \
@@ -110,11 +126,11 @@ loopback `SEKAI_BIND`.
 - Seed setup data:
 
 ```bash
-docker compose run --rm gateway sekaictl admin gateway setup --help
+docker compose --env-file _output/compose.env run --rm gateway sekaictl admin gateway setup --help
 ```
 
 - Generate an attribution/report from shared state:
 
 ```bash
-docker compose run --rm gateway chisei-gateway report --by work-unit --since 24h
+docker compose --env-file _output/compose.env run --rm gateway chisei-gateway report --by work-unit --since 24h
 ```

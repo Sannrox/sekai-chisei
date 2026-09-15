@@ -1,7 +1,8 @@
 //! Typed ActionInstance effects (#398 / research #395).
 //!
 //! Durable children of an admitted ActionInstance. Not silent log lines.
-//! Claim for `runtime_dispatch` is #399; external_mutate stays on the permit path.
+//! Claim, heartbeat, and ack for `runtime_dispatch` live here;
+//! `external_mutate` stays on the permit path.
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::governed_action_type::{

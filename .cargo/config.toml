@@ -1,0 +1,7 @@
+# Builtin `cargo check` / `cargo test` cannot be overridden.
+# These aliases are the gated options locally and in CI.
+[alias]
+check-all = "check --workspace --all-targets --locked"
+clippy-all = "clippy --workspace --all-targets --locked -- -D warnings"
+test-all = "test --workspace --locked"
+fmt-check = "fmt --all -- --check"

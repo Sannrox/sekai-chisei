@@ -11,7 +11,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return run_gateway_report(&config);
     }
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "sekai-chisei starting");
+    tracing::info!(
+        version = sekai_chisei::build_info::PKG_VERSION,
+        git_version = sekai_chisei::build_info::GIT_VERSION,
+        git_commit = sekai_chisei::build_info::GIT_COMMIT,
+        "sekai-chisei starting"
+    );
 
     let provider_registry_state_path =
         sekai_chisei::provider_profile::provider_registry_state_path(&config.db_path);

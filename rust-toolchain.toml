@@ -1,0 +1,5 @@
+# rustfmt and clippy must be listed so rustup auto-install of this channel
+# includes `cargo fmt` and `cargo clippy` (CI uses those jobs).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

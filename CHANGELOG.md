@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Pin the Rust toolchain to 1.98.1 and digest-pin the Debian runtime image.
+  Cargo is the local and CI gate (`cargo fmt-check`, `cargo clippy-all`,
+  `cargo test-all`). `./build/release-images.sh` is the only image build
+  (git-describe tag; dirty trees are refused). `./build/release.sh` pushes
+  that same tag. Binaries record git describe identity at startup.
+- Honor a presented bearer on insecure TCP and HTTP the same way UDS
+  already does (#929). Missing bearer stays local; caller-selected tenant
+  headers still fail closed. Token-auth TCP is unchanged.
 - Coordinate definition-branch edits across object types, functions,
   transforms, and policies in one revision (#890). Merge refuses a
   breaking function, transform, or policy change, or any unknown kind,

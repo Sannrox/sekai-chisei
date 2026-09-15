@@ -1,8 +1,8 @@
 //! Namespace-scoped governed Action type registry (#396 / research #395).
 //!
 //! Defines host-executed governed operations and their evidence contract.
-//! Types define which decision kinds may be admitted; instances and effects are
-//! later Issues (#397–#399).
+//! Types define which decision kinds may be admitted; instances and effects
+//! live in `action_instance` and `action_effect`.
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::action_type_criteria::{ActionSubmissionCriterion, validate_submission_criteria};

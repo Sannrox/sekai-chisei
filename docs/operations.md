@@ -128,8 +128,11 @@ Also preserve state files configured for provider registry lifecycle, gateway
 usage recovery, and durable receipt, usage, and refusal recovery. Test
 restore procedures, not only backup creation.
 
-Audit history is not purged automatically. High-churn deployments should define
-a retention policy and invoke `purge_old_records` with an explicit cutoff.
+Audit history is not purged automatically. High-churn SQLite deployments should
+define a retention policy and invoke `purge_old_records` with an explicit
+cutoff. That helper is SQLite-only; on PostgreSQL use the lifecycle-archive
+path (`archive_lifecycle_records`) documented in
+[postgres-sekai-parity.md](postgres-sekai-parity.md).
 
 ## Gateway safeguards
 
