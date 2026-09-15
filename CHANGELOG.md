@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Run plane-owned incremental dataset transforms with lineage and
+  quality quarantine (#880). Definitions are content-addressed; secrets
+  are rejected; a failing rule keeps the previous output queryable and
+  names the rule on the run receipt. In-process `projection` execution,
+  not an engine pick. SQLite community path; PostgreSQL fails closed.
 - Evaluate revision-bound object sets with grouped aggregations and
   bounded multi-hop traversal (`sekai.object-set/v2`, #878). Plans use
   the #877 membership index and refuse named cost limits rather than

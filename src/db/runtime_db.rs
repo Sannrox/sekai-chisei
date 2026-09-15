@@ -258,6 +258,61 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_governed_transform(
+        &self,
+        transform: &crate::sekai::governed_transform::GovernedTransform,
+        created_at_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_transform(transform, created_at_ms),
+            Self::Postgres(_) => Err(
+                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn get_governed_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::GovernedTransform>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_transform(namespace, transform_id),
+            Self::Postgres(_) => Err(
+                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn run_governed_transform(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        incremental: bool,
+        now_ms: i64,
+    ) -> Result<crate::sekai::governed_transform::TransformRun, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.run_governed_transform(namespace, transform_id, incremental, now_ms)
+            }
+            Self::Postgres(_) => Err(
+                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn get_governed_transform_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_transform_run(run_id),
+            Self::Postgres(_) => Err(
+                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
     pub fn put_purpose_authorization(
         &self,
         authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,

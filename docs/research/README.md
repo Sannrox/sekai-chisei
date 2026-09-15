@@ -37,6 +37,7 @@ reference pages.
 | [Type-bound derived-fact admission](659-derived-fact-admission.md) | Functions stay read-only; derived views stay query-time; no derived-fact kind or digest |
 | [Additive source-type admission](817-source-type-admission.md) | Accepted in [ADR 0060](../decisions/0060-additive-source-type-descriptors.md); GitHub profile unchanged; #818 registers descriptors |
 | [Object-index envelope at 10⁷](876-object-index-envelope.md) | Membership and incremental hold; two-hop misses 500 ms; #877 unblocked as a projection, #878/#889 stay measurement-gated |
+| [Incremental governed-transform envelope](879-transform-envelope.md) | In-process projection; 1% append processes 2 of 200 rows; #880 landed without an engine pick |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).

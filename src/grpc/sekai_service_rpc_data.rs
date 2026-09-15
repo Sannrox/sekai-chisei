@@ -1100,3 +1100,130 @@ pub(super) async fn get_provenance_report(
         report: crate::provenance::render_text(&report),
     }))
 }
+pub(super) async fn put_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<PutGovernedTransformRequest>,
+) -> Result<Response<PutGovernedTransformResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let proto = req
+        .into_inner()
+        .transform
+        .ok_or_else(|| Status::invalid_argument("transform required"))?;
+    let transform = crate::sekai::governed_transform::GovernedTransform {
+        contract_version: proto.contract_version,
+        namespace: proto.namespace,
+        transform_id: proto.transform_id,
+        input_dataset_id: proto.input_dataset_id,
+        output_dataset_id: proto.output_dataset_id,
+        steps: proto
+            .steps
+            .into_iter()
+            .map(|step| crate::sekai::governed_transform::TransformStep {
+                kind: step.kind,
+                column: step.column,
+                op: step.op,
+                value: step.value,
+                columns: step.columns,
+            })
+            .collect(),
+        quality_rule: proto.quality_rule,
+        definition_digest: proto.definition_digest,
+    }
+    .prepare()
+    .map_err(|error| Status::invalid_argument(error.message()))?;
+    service
+        .db
+        .put_governed_transform(&transform, now_millis())
+        .map_err(Status::internal)?;
+    Ok(Response::new(PutGovernedTransformResponse {
+        transform: Some(to_proto_transform(&transform)),
+    }))
+}
+pub(super) async fn run_governed_transform(
+    service: &SekaiServiceImpl,
+    req: Request<RunGovernedTransformRequest>,
+) -> Result<Response<RunGovernedTransformResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let input = req.into_inner();
+    let run = service
+        .db
+        .run_governed_transform(
+            &input.namespace,
+            &input.transform_id,
+            input.incremental,
+            now_millis(),
+        )
+        .map_err(|error| {
+            if error.contains("not found") {
+                Status::not_found(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+    Ok(Response::new(RunGovernedTransformResponse {
+        run: Some(to_proto_transform_run(&run)),
+    }))
+}
+pub(super) async fn get_governed_transform_run(
+    service: &SekaiServiceImpl,
+    req: Request<GetGovernedTransformRunRequest>,
+) -> Result<Response<GetGovernedTransformRunResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let run = service
+        .db
+        .get_governed_transform_run(&req.into_inner().run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("not found"))?;
+    Ok(Response::new(GetGovernedTransformRunResponse {
+        run: Some(to_proto_transform_run(&run)),
+    }))
+}
+
+fn to_proto_transform(
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> GovernedTransform {
+    GovernedTransform {
+        contract_version: transform.contract_version.clone(),
+        namespace: transform.namespace.clone(),
+        transform_id: transform.transform_id.clone(),
+        input_dataset_id: transform.input_dataset_id.clone(),
+        output_dataset_id: transform.output_dataset_id.clone(),
+        steps: transform
+            .steps
+            .iter()
+            .map(|step| TransformStep {
+                kind: step.kind.clone(),
+                column: step.column.clone(),
+                op: step.op.clone(),
+                value: step.value.clone(),
+                columns: step.columns.clone(),
+            })
+            .collect(),
+        quality_rule: transform.quality_rule.clone(),
+        definition_digest: transform.definition_digest.clone(),
+    }
+}
+
+fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) -> TransformRun {
+    TransformRun {
+        run_id: run.run_id.clone(),
+        namespace: run.namespace.clone(),
+        transform_id: run.transform_id.clone(),
+        definition_digest: run.definition_digest.clone(),
+        input_digest: run.input_digest.clone(),
+        output_digest: run.output_digest.clone(),
+        last_input_row_id: run.last_input_row_id,
+        incremental: run.incremental,
+        quarantined: run.quarantined,
+        quality_rule: run.quality_rule.clone(),
+        rows_in: run.rows_in,
+        rows_out: run.rows_out,
+        lineage_parent: run.lineage_parent.clone(),
+        created_at_ms: run.created_at_ms,
+    }
+}

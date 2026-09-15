@@ -489,6 +489,59 @@ message PutObjectTypeIndexEditRequest {
   string idempotency_key = 6;
 }
 message PutObjectTypeIndexEditResponse {}
+message TransformStep {
+  string kind = 1;
+  string column = 2;
+  string op = 3;
+  string value = 4;
+  repeated string columns = 5;
+}
+message GovernedTransform {
+  string contract_version = 1;
+  string namespace = 2;
+  string transform_id = 3;
+  string input_dataset_id = 4;
+  string output_dataset_id = 5;
+  repeated TransformStep steps = 6;
+  string quality_rule = 7;
+  string definition_digest = 8;
+}
+message PutGovernedTransformRequest {
+  GovernedTransform transform = 1;
+}
+message PutGovernedTransformResponse {
+  GovernedTransform transform = 1;
+}
+message RunGovernedTransformRequest {
+  string namespace = 1;
+  string transform_id = 2;
+  bool incremental = 3;
+}
+message TransformRun {
+  string run_id = 1;
+  string namespace = 2;
+  string transform_id = 3;
+  string definition_digest = 4;
+  string input_digest = 5;
+  string output_digest = 6;
+  int64 last_input_row_id = 7;
+  bool incremental = 8;
+  bool quarantined = 9;
+  string quality_rule = 10;
+  int32 rows_in = 11;
+  int32 rows_out = 12;
+  string lineage_parent = 13;
+  int64 created_at_ms = 14;
+}
+message RunGovernedTransformResponse {
+  TransformRun run = 1;
+}
+message GetGovernedTransformRunRequest {
+  string run_id = 1;
+}
+message GetGovernedTransformRunResponse {
+  TransformRun run = 1;
+}
 message EvaluateObjectSetResponse {
   string contract_version = 1;
   string definition_digest = 2;
@@ -2198,6 +2251,9 @@ service SekaiService {
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
   rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
   rpc PutObjectTypeIndexEdit(PutObjectTypeIndexEditRequest) returns (PutObjectTypeIndexEditResponse);
+  rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
+  rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
+  rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
   rpc ReadObjectChangeSubscription(ReadObjectChangeSubscriptionRequest) returns (ReadObjectChangeSubscriptionResponse);
   rpc PutObjectSecurityPolicyRevision(PutObjectSecurityPolicyRevisionRequest) returns (PutObjectSecurityPolicyRevisionResponse);
   rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);

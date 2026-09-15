@@ -28,6 +28,11 @@ tokens.
 Schema drift (missing key or mapped column) quarantines the batch and leaves
 the last consistent index readable with `stale=true`.
 
+Governed transforms (`sekai.governed-transform/v1`) write datasets, not
+type-revision object ids. Incremental runs process only new input rows.
+A failing quality rule quarantines the batch and leaves the previous
+output queryable.
+
 `sekai.object-set/v2` can group count/sum/min/max/avg/distinct across bounded
 index hops (`join_property`). Cost limits (`max_rows_scanned`, `max_depth`,
 `max_time_ms`) fail closed with the limit named. Two-hop at 10⁷ is still
