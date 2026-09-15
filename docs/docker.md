@@ -8,12 +8,12 @@ cargo fmt-check
 cargo clippy-all
 cargo test-all
 ./build/release-images.sh
-docker compose up
+docker compose --env-file _output/compose.env up
 ```
 
-Cargo is the gate. `./build/release-images.sh` is the only image build (local, CI,
-and GHCR). `./build/release.sh` pushes that image when `DOCKER_REGISTRY` is set.
-Compose uses `sekai-chisei:local`.
+Cargo is the gate. `./build/release-images.sh` is the only image build. The tag
+is git describe (no `:local`). `./build/release.sh` pushes that same tag to
+`DOCKER_REGISTRY`. Compose uses `sekai-chisei:${GIT_VERSION}`.
 
 ## Quickstart
 
@@ -23,7 +23,7 @@ export OPENAI_API_KEY='<your-openai-key>'
 export GATEWAY_KEYS='sekai-docker-demo=demo:default'
 export GATEWAY_KEY='sekai-docker-demo'
 ./build/release-images.sh
-docker compose up
+docker compose --env-file _output/compose.env up
 ```
 
 The exported `GATEWAY_KEYS` value must be a gateway allowlist map (`key=agent:project`).
@@ -46,7 +46,7 @@ Gateway traffic is served at `http://localhost:8080` by default and talks to the
 For an end-to-end container smoke check (requires provider credentials, e.g. `OPENAI_API_KEY`):
 
 ```bash
-docker compose up -d
+docker compose --env-file _output/compose.env up -d
 curl -sS -X POST "http://localhost:8080/v1/chat/completions" \
   -H "authorization: Bearer $GATEWAY_KEY" \
   -H "content-type: application/json" \

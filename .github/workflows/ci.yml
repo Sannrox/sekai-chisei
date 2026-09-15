@@ -24,4 +24,4 @@ jobs:
       - run: cargo test-all
       - run: ./scripts/validate-ontology-deps.sh
       - run: ./build/release-images.sh
-      - run: docker run --rm sekai-chisei:local sekaictl --help
+      - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile linux binaries in the pinned rust image, then wrap them.
-# Host `cargo build --release` remains the developer build.
+# The image tag is git describe, never a separate "local" name.
 
 set -euo pipefail
 
@@ -13,8 +13,12 @@ if [[ "${RUST_IMAGE}" != *"${CHANNEL}"* ]]; then
   echo "RUST_IMAGE=${RUST_IMAGE} does not match rust-toolchain.toml channel ${CHANNEL}" >&2
   exit 1
 fi
+
 GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo unknown)"
+GIT_VERSION="${GIT_VERSION/+/_}"
+IMAGE_NAME="${IMAGE_NAME:-sekai-chisei}"
+IMAGE_TAG="${IMAGE_NAME}:${GIT_VERSION}"
 
 mkdir -p _output/cargo-target _output/linux-bins
 
@@ -31,14 +35,12 @@ docker run --rm \
   bash -lc 'cargo build --release --locked --workspace --bins &&
     cp /target/release/sekai-chisei /target/release/chisei-gateway /target/release/sekaictl /out/'
 
-IMAGE_TAG="${IMAGE_TAG:-sekai-chisei:local}"
-
 docker build \
   -f build/server-image/Dockerfile \
   --build-arg VCS_REF="${GIT_COMMIT}" \
   -t "${IMAGE_TAG}" \
   _output/linux-bins
 
-if [[ "${IMAGE_TAG}" != "sekai-chisei:local" ]]; then
-  docker tag "${IMAGE_TAG}" sekai-chisei:local
-fi
+printf '%s\n' "${IMAGE_TAG}" > _output/image-tag
+printf 'GIT_VERSION=%s\n' "${GIT_VERSION}" > _output/compose.env
+echo "Built ${IMAGE_TAG}"

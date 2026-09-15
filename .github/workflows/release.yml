@@ -86,4 +86,3 @@ jobs:
       - run: ./build/release.sh
         env:
           DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
-          IMAGE_VERSION: ${{ github.ref_name }}
