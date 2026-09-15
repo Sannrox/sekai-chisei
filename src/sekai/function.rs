@@ -2,7 +2,9 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Object};
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Instant;
 
 type PipelineRow = (
     String,
@@ -51,6 +53,66 @@ pub struct FunctionResult {
     pub aggregates: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FunctionBudget {
+    pub max_time_ms: u64,
+    pub max_output_bytes: usize,
+    pub max_steps: u32,
+}
+
+impl Default for FunctionBudget {
+    fn default() -> Self {
+        Self {
+            max_time_ms: 50,
+            max_output_bytes: 1_048_576,
+            max_steps: 32,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionHost {
+    pub now_ms: i64,
+    pub rng_seed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionReceipt {
+    pub function_name: String,
+    pub function_digest: String,
+    pub now_ms: i64,
+    pub rng_seed: u64,
+    pub elapsed_ms: u64,
+    pub steps: u32,
+    pub budget_exceeded: String,
+    pub output_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInvocation {
+    pub result: FunctionResult,
+    pub receipt: FunctionReceipt,
+}
+
+struct BudgetChecker {
+    started: Instant,
+    steps: u32,
+    budget: FunctionBudget,
+}
+
+impl BudgetChecker {
+    fn tick(&mut self) -> Result<(), String> {
+        self.steps = self.steps.saturating_add(1);
+        if self.steps > self.budget.max_steps {
+            return Err("function budget exceeded: max_steps".into());
+        }
+        if self.started.elapsed().as_millis() as u64 > self.budget.max_time_ms {
+            return Err("function budget exceeded: max_time_ms".into());
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_function(f: &Function) -> Result<(), String> {
     if f.name.is_empty() {
         return Err("function name required".into());
@@ -81,6 +143,7 @@ pub fn validate_function(f: &Function) -> Result<(), String> {
                     return Err(format!("step {}: transform requires field", i));
                 }
             }
+            "repeat" => {}
             other => {
                 return Err(format!("step {}: unknown op {:?}", i, other));
             }
@@ -131,7 +194,7 @@ pub fn execute_with_result_filter<F>(
 where
     F: Fn(&Object) -> Result<bool, String>,
 {
-    execute_with_source_and_result_filter(db, f, params, None, allow)
+    execute_with_source_and_result_filter(db, f, params, None, allow, None)
 }
 
 pub fn execute_for_object_with_result_filter<F>(
@@ -144,7 +207,128 @@ pub fn execute_for_object_with_result_filter<F>(
 where
     F: Fn(&Object) -> Result<bool, String>,
 {
-    execute_with_source_and_result_filter(db, f, params, Some(source), allow)
+    execute_with_source_and_result_filter(db, f, params, Some(source), allow, None)
+}
+
+pub fn function_digest(function: &Function) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(function.name.as_bytes());
+    hasher.update(
+        serde_json::to_vec(
+            &function
+                .pipeline
+                .iter()
+                .map(|step| {
+                    (
+                        step.op.as_str(),
+                        step.kind.as_str(),
+                        step.property.as_str(),
+                        step.value.as_str(),
+                        step.relation.as_str(),
+                        step.func.as_str(),
+                        step.field.as_str(),
+                        step.alias.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+    );
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+pub fn result_digest(result: &FunctionResult) -> String {
+    let mut hasher = Sha256::new();
+    let mut ids: Vec<_> = result
+        .objects
+        .iter()
+        .map(|object| object.id.as_str())
+        .collect();
+    ids.sort_unstable();
+    hasher.update(ids.join(",").as_bytes());
+    let mut aggregates: Vec<_> = result.aggregates.iter().collect();
+    aggregates.sort_by(|left, right| left.0.cmp(right.0));
+    hasher.update(serde_json::to_vec(&aggregates).unwrap_or_default());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Invoke a function on the in-process host (#882 / ADR 0072).
+///
+/// Clock and randomness are host-provided and recorded. The host API has no
+/// network or filesystem capability. Authorization is the `allow` filter.
+pub fn invoke<F>(
+    db: &RuntimeDb,
+    function: &Function,
+    params: &HashMap<String, String>,
+    allow: F,
+    host: FunctionHost,
+    budget: FunctionBudget,
+) -> Result<FunctionInvocation, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    invoke_with_source(db, function, params, None, allow, host, budget)
+}
+
+pub fn invoke_with_source<F>(
+    db: &RuntimeDb,
+    function: &Function,
+    params: &HashMap<String, String>,
+    source: Option<&Object>,
+    allow: F,
+    host: FunctionHost,
+    budget: FunctionBudget,
+) -> Result<FunctionInvocation, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    let mut checker = BudgetChecker {
+        started: Instant::now(),
+        steps: 0,
+        budget: budget.clone(),
+    };
+    let executed = execute_with_source_and_result_filter(
+        db,
+        function,
+        params,
+        source,
+        allow,
+        Some(&mut checker),
+    );
+    let elapsed_ms = checker.started.elapsed().as_millis() as u64;
+    let (result, budget_exceeded) = match executed {
+        Ok(result) => {
+            let encoded = serde_json::to_vec(&result.aggregates)
+                .unwrap_or_default()
+                .len()
+                + result.objects.len() * 64;
+            if encoded > budget.max_output_bytes {
+                (
+                    FunctionResult::default(),
+                    "function budget exceeded: max_output_bytes".into(),
+                )
+            } else {
+                (result, String::new())
+            }
+        }
+        Err(error) if error.starts_with("function budget exceeded:") => {
+            (FunctionResult::default(), error)
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(FunctionInvocation {
+        receipt: FunctionReceipt {
+            function_name: function.name.clone(),
+            function_digest: function_digest(function),
+            now_ms: host.now_ms,
+            rng_seed: host.rng_seed,
+            elapsed_ms,
+            steps: checker.steps,
+            budget_exceeded: budget_exceeded.clone(),
+            output_digest: result_digest(&result),
+        },
+        result,
+    })
 }
 
 fn execute_with_source_and_result_filter<F>(
@@ -153,6 +337,7 @@ fn execute_with_source_and_result_filter<F>(
     params: &HashMap<String, String>,
     source: Option<&Object>,
     allow: F,
+    mut budget: Option<&mut BudgetChecker>,
 ) -> Result<FunctionResult, String>
 where
     F: Fn(&Object) -> Result<bool, String>,
@@ -162,6 +347,9 @@ where
     let mut last_kind = source.map(|object| object.kind.clone());
 
     for step in &f.pipeline {
+        if let Some(checker) = budget.as_mut() {
+            checker.tick()?;
+        }
         match step.op.as_str() {
             "self" => {
                 objects = match source {
@@ -284,6 +472,14 @@ where
             "transform" => {
                 reject_pipeline_field(db, source, &objects, last_kind.as_deref(), &step.field)?;
                 objects.retain(|o| o.properties.contains_key(&step.field));
+            }
+            "repeat" => {
+                let extra = step.value.parse::<u32>().unwrap_or(0);
+                for _ in 0..extra {
+                    if let Some(checker) = budget.as_mut() {
+                        checker.tick()?;
+                    }
+                }
             }
             _ => {}
         }
@@ -922,5 +1118,142 @@ mod tests {
                 .contains("object_security_denied"),
             "naming a hidden property must deny even when no rows survive"
         );
+    }
+
+    #[test]
+    fn invoke_records_host_clock_and_replays() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_object(&Object {
+            id: "c1".into(),
+            kind: KIND_COMPONENT.into(),
+            name: "a".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties: HashMap::from([("language".into(), "rust".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let function = Function {
+            name: "count_rust".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                PipelineStep {
+                    property: "language".into(),
+                    value: "rust".into(),
+                    ..step("filter", KIND_COMPONENT, "", "", "")
+                },
+                step("aggregate", "", "", "count", ""),
+            ],
+        };
+        let host = FunctionHost {
+            now_ms: 1_700_000_000_000,
+            rng_seed: 42,
+        };
+        let first = invoke(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            host.clone(),
+            FunctionBudget::default(),
+        )
+        .unwrap();
+        assert!(first.receipt.elapsed_ms < 50);
+        assert_eq!(first.receipt.now_ms, host.now_ms);
+        assert_eq!(first.receipt.rng_seed, 42);
+        assert!(first.receipt.budget_exceeded.is_empty());
+        assert_eq!(first.result.aggregates["count"], "1");
+        let second = invoke(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            host,
+            FunctionBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(first.receipt.output_digest, second.receipt.output_digest);
+        assert_eq!(
+            first.receipt.function_digest,
+            second.receipt.function_digest
+        );
+    }
+
+    #[test]
+    fn invoke_terminates_repeat_at_step_budget() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let function = Function {
+            name: "loop".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![PipelineStep {
+                op: "repeat".into(),
+                value: "1000000".into(),
+                ..step("repeat", "", "", "", "")
+            }],
+        };
+        let invocation = invoke(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            FunctionHost {
+                now_ms: 1,
+                rng_seed: 1,
+            },
+            FunctionBudget {
+                max_time_ms: 50,
+                max_output_bytes: 1024,
+                max_steps: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.receipt.budget_exceeded,
+            "function budget exceeded: max_steps"
+        );
+    }
+
+    #[test]
+    fn invoke_cannot_read_unauthorized_objects() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_object(&Object {
+            id: "secret".into(),
+            kind: KIND_COMPONENT.into(),
+            name: "s".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties: HashMap::from([("language".into(), "rust".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+        let function = Function {
+            name: "all".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                step("filter", KIND_COMPONENT, "", "", ""),
+                step("aggregate", "", "", "count", ""),
+            ],
+        };
+        let invocation = invoke(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(false),
+            FunctionHost {
+                now_ms: 1,
+                rng_seed: 1,
+            },
+            FunctionBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(invocation.result.aggregates["count"], "0");
     }
 }

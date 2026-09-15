@@ -44,6 +44,81 @@ pub(super) async fn list_functions(
         .collect();
     Ok(Response::new(ListFunctionsResponse { functions }))
 }
+pub(super) async fn invoke_function(
+    service: &SekaiServiceImpl,
+    req: Request<InvokeFunctionRequest>,
+) -> Result<Response<InvokeFunctionResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    let function = service
+        .db
+        .get_function(&input.name)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("not found"))?;
+    crate::sekai::function::validate_function(&function).map_err(Status::invalid_argument)?;
+    let budget = input
+        .budget
+        .map(|budget| crate::sekai::function::FunctionBudget {
+            max_time_ms: if budget.max_time_ms == 0 {
+                50
+            } else {
+                budget.max_time_ms
+            },
+            max_output_bytes: if budget.max_output_bytes == 0 {
+                1_048_576
+            } else {
+                budget.max_output_bytes as usize
+            },
+            max_steps: if budget.max_steps == 0 {
+                32
+            } else {
+                budget.max_steps
+            },
+        })
+        .unwrap_or_default();
+    let host = crate::sekai::function::FunctionHost {
+        now_ms: if input.now_ms == 0 {
+            now_millis()
+        } else {
+            input.now_ms
+        },
+        rng_seed: input.rng_seed,
+    };
+    let invocation = crate::sekai::function::invoke(
+        &service.db,
+        &function,
+        &input.params,
+        |object| {
+            object_passes_security_policy(
+                &service.db,
+                object,
+                &principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Read,
+                None,
+            )
+            .map_err(|status| status.message().to_string())
+        },
+        host,
+        budget,
+    )
+    .map_err(Status::internal)?;
+    Ok(Response::new(InvokeFunctionResponse {
+        aggregates: invocation.result.aggregates,
+        receipt: Some(FunctionReceipt {
+            function_name: invocation.receipt.function_name,
+            function_digest: invocation.receipt.function_digest,
+            now_ms: invocation.receipt.now_ms,
+            rng_seed: invocation.receipt.rng_seed,
+            elapsed_ms: invocation.receipt.elapsed_ms,
+            steps: invocation.receipt.steps,
+            budget_exceeded: invocation.receipt.budget_exceeded,
+            output_digest: invocation.receipt.output_digest,
+        }),
+    }))
+}
 pub(super) async fn create_dataset(
     service: &SekaiServiceImpl,
     req: Request<CreateDatasetRequest>,
