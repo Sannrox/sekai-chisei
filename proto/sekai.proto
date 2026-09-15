@@ -413,7 +413,63 @@ message ObjectSetDescriptor {
 message EvaluateObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;
   string page_token = 2;
+  int64 required_freshness_ms = 3;
 }
+message ObjectTypeDatasource {
+  string contract_version = 1;
+  string namespace = 2;
+  string kind = 3;
+  string definition_digest = 4;
+  string dataset_id = 5;
+  string key_column = 6;
+  map<string, string> property_mapping = 7;
+  string hidden_column = 8;
+  bool edits_only = 9;
+}
+message RegisterObjectTypeDatasourceRequest {
+  ObjectTypeDatasource datasource = 1;
+  string idempotency_key = 2;
+}
+message RegisterObjectTypeDatasourceResponse {
+  ObjectTypeDatasource datasource = 1;
+}
+message ReindexObjectTypeRequest {
+  string namespace = 1;
+  string kind = 2;
+  bool full_rebuild = 3;
+}
+message ReindexObjectTypeResponse {
+  int32 rewritten_keys = 1;
+  int32 skipped_unchanged = 2;
+  bool quarantined = 3;
+  string quarantine_reason = 4;
+  ObjectTypeIndexStatus status = 5;
+}
+message GetObjectTypeIndexStatusRequest {
+  string namespace = 1;
+  string kind = 2;
+}
+message ObjectTypeIndexStatus {
+  string namespace = 1;
+  string kind = 2;
+  int64 indexed_at_ms = 3;
+  int32 member_count = 4;
+  bool stale = 5;
+  string quarantine_reason = 6;
+  int64 lag_ms = 7;
+}
+message GetObjectTypeIndexStatusResponse {
+  ObjectTypeIndexStatus status = 1;
+}
+message PutObjectTypeIndexEditRequest {
+  string namespace = 1;
+  string kind = 2;
+  string source_key = 3;
+  map<string, string> properties = 4;
+  bool hidden = 5;
+  string idempotency_key = 6;
+}
+message PutObjectTypeIndexEditResponse {}
 message EvaluateObjectSetResponse {
   string contract_version = 1;
   string definition_digest = 2;
@@ -2118,6 +2174,10 @@ service SekaiService {
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
   rpc EvaluateObjectSet(EvaluateObjectSetRequest) returns (EvaluateObjectSetResponse);
+  rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
+  rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
+  rpc GetObjectTypeIndexStatus(GetObjectTypeIndexStatusRequest) returns (GetObjectTypeIndexStatusResponse);
+  rpc PutObjectTypeIndexEdit(PutObjectTypeIndexEditRequest) returns (PutObjectTypeIndexEditResponse);
   rpc ReadObjectChangeSubscription(ReadObjectChangeSubscriptionRequest) returns (ReadObjectChangeSubscriptionResponse);
   rpc PutObjectSecurityPolicyRevision(PutObjectSecurityPolicyRevisionRequest) returns (PutObjectSecurityPolicyRevisionResponse);
   rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);

@@ -1071,6 +1071,7 @@ mod tests {
                 ..Default::default()
             }),
             page_token: String::new(),
+            required_freshness_ms: 0,
         };
         let grpc = sekai
             .evaluate_object_set(named_request(request.clone(), "alice"))

@@ -387,6 +387,62 @@
       "product_tier": "core"
     },
     {
+      "rpc": "RegisterObjectTypeDatasource",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/object_type_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReindexObjectType",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/object_type_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetObjectTypeIndexStatus",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/object_type_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PutObjectTypeIndexEdit",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/object_type_index.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ReadObjectChangeSubscription",
       "kind": "query",
       "surfaces": [],
@@ -404,64 +460,96 @@
     {
       "rpc": "PutObjectSecurityPolicyRevision",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "GetObjectSecurityPolicyRevision",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "ActivateObjectSecurityPolicies",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "GetObjectSecurityActivation",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "PutPurposeAuthorization",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "RevokePurposeAuthorization",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "PutClassificationLattice",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
     {
       "rpc": "GetClassificationLattice",
       "kind": "persistent",
-      "surfaces": ["sekai.object-security"],
-      "evidence": ["tests/object_security_backend_conformance.rs"],
+      "surfaces": [
+        "sekai.object-security"
+      ],
+      "evidence": [
+        "tests/object_security_backend_conformance.rs"
+      ],
       "durable_dependencies": [],
       "product_tier": "core"
     },
@@ -474,7 +562,9 @@
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],
-      "durable_dependencies": ["sekai.object-security"],
+      "durable_dependencies": [
+        "sekai.object-security"
+      ],
       "product_tier": "core"
     },
     {
@@ -486,7 +576,9 @@
         "src/grpc/sekai_service_rpc_objects.rs",
         "docs/object-security.md"
       ],
-      "durable_dependencies": ["sekai.object-security"],
+      "durable_dependencies": [
+        "sekai.object-security"
+      ],
       "product_tier": "core"
     },
     {

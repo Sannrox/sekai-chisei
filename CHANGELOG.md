@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Register a dataset as the membership source for an object type revision
+  and maintain a rebuildable incremental projection (#877). Schema drift
+  quarantines the batch and leaves the last index readable and stale.
+  Action deltas survive a full rebuild. Hidden rows are absent from
+  members and counts. `EvaluateObjectSet` may require freshness and fails
+  closed when the index is stale or lagging. The index is not authority.
 - Publish the #876 object-index envelope: 10⁷ synthetic Customer → Order →
   Shipment rows on a named Apple M2 Pro profile. Membership materialize,
   1_000-key incremental, filter, aggregate, and rebuild-from-source hold;

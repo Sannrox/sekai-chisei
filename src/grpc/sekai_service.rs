@@ -531,6 +531,30 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         rpc_objects::evaluate_object_set(self, req).await
     }
+    async fn register_object_type_datasource(
+        &self,
+        req: Request<RegisterObjectTypeDatasourceRequest>,
+    ) -> Result<Response<RegisterObjectTypeDatasourceResponse>, Status> {
+        rpc_objects::register_object_type_datasource(self, req).await
+    }
+    async fn reindex_object_type(
+        &self,
+        req: Request<ReindexObjectTypeRequest>,
+    ) -> Result<Response<ReindexObjectTypeResponse>, Status> {
+        rpc_objects::reindex_object_type(self, req).await
+    }
+    async fn get_object_type_index_status(
+        &self,
+        req: Request<GetObjectTypeIndexStatusRequest>,
+    ) -> Result<Response<GetObjectTypeIndexStatusResponse>, Status> {
+        rpc_objects::get_object_type_index_status(self, req).await
+    }
+    async fn put_object_type_index_edit(
+        &self,
+        req: Request<PutObjectTypeIndexEditRequest>,
+    ) -> Result<Response<PutObjectTypeIndexEditResponse>, Status> {
+        rpc_objects::put_object_type_index_edit(self, req).await
+    }
     async fn read_object_change_subscription(
         &self,
         req: Request<ReadObjectChangeSubscriptionRequest>,

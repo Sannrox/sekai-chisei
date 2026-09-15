@@ -83,6 +83,156 @@ pub(super) async fn evaluate_object_set(
 ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
     service.evaluate_visible_object_set(req).await
 }
+pub(super) async fn register_object_type_datasource(
+    service: &SekaiServiceImpl,
+    req: Request<RegisterObjectTypeDatasourceRequest>,
+) -> Result<Response<RegisterObjectTypeDatasourceResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    let proto = input
+        .datasource
+        .ok_or_else(|| Status::invalid_argument("datasource required"))?;
+    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &proto.namespace, true)?;
+    check_team_namespace(&service.db, &principals, &proto.namespace, true)?;
+    let binding = crate::sekai::object_type_index::ObjectTypeDatasource {
+        contract_version: proto.contract_version,
+        namespace: proto.namespace,
+        kind: proto.kind,
+        definition_digest: proto.definition_digest,
+        dataset_id: proto.dataset_id,
+        key_column: proto.key_column,
+        property_mapping: proto.property_mapping.into_iter().collect(),
+        hidden_column: proto.hidden_column,
+        edits_only: proto.edits_only,
+    }
+    .prepare()
+    .map_err(|error| Status::invalid_argument(error.message()))?;
+    service
+        .db
+        .register_object_type_datasource(&binding, now_millis())
+        .map_err(Status::internal)?;
+    Ok(Response::new(RegisterObjectTypeDatasourceResponse {
+        datasource: Some(to_proto_datasource(&binding)),
+    }))
+}
+pub(super) async fn reindex_object_type(
+    service: &SekaiServiceImpl,
+    req: Request<ReindexObjectTypeRequest>,
+) -> Result<Response<ReindexObjectTypeResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
+    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    let report = service
+        .db
+        .apply_object_type_index(
+            &input.namespace,
+            &input.kind,
+            input.full_rebuild,
+            now_millis(),
+        )
+        .map_err(|error| {
+            if error.contains("not found") {
+                Status::not_found(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+    let status = service
+        .db
+        .object_type_index_status(&input.namespace, &input.kind, now_millis())
+        .map_err(Status::internal)?;
+    Ok(Response::new(ReindexObjectTypeResponse {
+        rewritten_keys: report.rewritten_keys,
+        skipped_unchanged: report.skipped_unchanged,
+        quarantined: report.quarantined,
+        quarantine_reason: report.quarantine_reason,
+        status: status.as_ref().map(to_proto_index_status),
+    }))
+}
+pub(super) async fn get_object_type_index_status(
+    service: &SekaiServiceImpl,
+    req: Request<GetObjectTypeIndexStatusRequest>,
+) -> Result<Response<GetObjectTypeIndexStatusResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    enforce_namespace_tenant_context(
+        &service.db,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    let status = service
+        .db
+        .object_type_index_status(&input.namespace, &input.kind, now_millis())
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("not found"))?;
+    Ok(Response::new(GetObjectTypeIndexStatusResponse {
+        status: Some(to_proto_index_status(&status)),
+    }))
+}
+pub(super) async fn put_object_type_index_edit(
+    service: &SekaiServiceImpl,
+    req: Request<PutObjectTypeIndexEditRequest>,
+) -> Result<Response<PutObjectTypeIndexEditResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let input = req.into_inner();
+    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
+    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    service
+        .db
+        .put_object_type_index_edit(&crate::sekai::object_type_index::ObjectTypeIndexEdit {
+            namespace: input.namespace,
+            kind: input.kind,
+            source_key: input.source_key,
+            properties: input.properties.into_iter().collect(),
+            hidden: input.hidden,
+        })
+        .map_err(Status::internal)?;
+    Ok(Response::new(PutObjectTypeIndexEditResponse {}))
+}
+
+fn to_proto_datasource(
+    binding: &crate::sekai::object_type_index::ObjectTypeDatasource,
+) -> ObjectTypeDatasource {
+    ObjectTypeDatasource {
+        contract_version: binding.contract_version.clone(),
+        namespace: binding.namespace.clone(),
+        kind: binding.kind.clone(),
+        definition_digest: binding.definition_digest.clone(),
+        dataset_id: binding.dataset_id.clone(),
+        key_column: binding.key_column.clone(),
+        property_mapping: binding.property_mapping.clone().into_iter().collect(),
+        hidden_column: binding.hidden_column.clone(),
+        edits_only: binding.edits_only,
+    }
+}
+
+fn to_proto_index_status(
+    status: &crate::sekai::object_type_index::ObjectTypeIndexStatus,
+) -> ObjectTypeIndexStatus {
+    ObjectTypeIndexStatus {
+        namespace: status.namespace.clone(),
+        kind: status.kind.clone(),
+        indexed_at_ms: status.indexed_at_ms,
+        member_count: status.member_count,
+        stale: status.stale,
+        quarantine_reason: status.quarantine_reason.clone(),
+        lag_ms: status.lag_ms,
+    }
+}
 pub(super) async fn read_object_change_subscription(
     service: &SekaiServiceImpl,
     req: Request<ReadObjectChangeSubscriptionRequest>,
