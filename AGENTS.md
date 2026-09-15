@@ -9,10 +9,12 @@
 Cargo is the workflow. The compiler is pinned in `rust-toolchain.toml`. Local and CI run the same commands:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo fmt-check
+cargo clippy-all
+cargo test-all
 ```
+
+Aliases in `.cargo/config.toml` pin `--workspace --all-targets --locked` and clippy `-D warnings`. Plain `cargo check` / `cargo test` stay the short developer loop.
 
 `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind. `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
