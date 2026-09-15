@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Coordinate definition-branch edits across object types, functions,
+  transforms, and policies in one revision (#890). Merge refuses a
+  breaking function, transform, or policy change, or any unknown kind,
+  naming `compatibility_gate:{member_kind}` and leaving the published
+  head unchanged. Consumer impact lists registered dependents of all
+  four kinds. `GetDefinitionBranch` returns a content-addressed
+  `pin_digest` for delivery consumers. Breaking object-type publication
+  stays available for fact migration.
 - Invoke ontology functions on the in-process host with recorded clock
   and rng, step/time/output budgets, and principal-scoped reads (#882,
   [ADR 0072](docs/decisions/0072-in-process-function-host.md)). Guest

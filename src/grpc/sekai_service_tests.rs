@@ -468,6 +468,8 @@ async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
         .branch
         .unwrap();
     assert_eq!(created.head_revision_digest, parent.revision_digest);
+    assert!(created.pin_digest.starts_with("sha256:"));
+    assert_eq!(created.pin_digest.len(), 71);
 
     let edit = ApplyDefinitionBranchEditRequest {
         namespace: "definition-team".into(),
@@ -503,10 +505,13 @@ async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
         .into_inner()
         .branch
         .unwrap();
+    let applied_branch = applied.branch.clone().unwrap();
     assert_eq!(
         current.head_revision_digest,
-        applied.branch.unwrap().head_revision_digest
+        applied_branch.head_revision_digest
     );
+    assert_eq!(current.pin_digest, applied_branch.pin_digest);
+    assert_ne!(current.pin_digest, created.pin_digest);
 
     let mut stale = edit;
     stale.idempotency_key = "edit-2".into();

@@ -209,6 +209,30 @@ pub fn classify_definition_revision_compatibility(
     Ok(compatibility)
 }
 
+const MERGE_GATED_KINDS: &[&str] = &["function", "policy", "transform"];
+
+/// Refuse merge when a function, transform, or policy change is breaking,
+/// or when any kind is unknown. The error names `compatibility_gate:{member_kind}`.
+/// Breaking object-type and related kinds stay mergeable so checkpointed fact
+/// migration can target the published head.
+pub fn require_merge_compatibility(
+    from: &DefinitionRevision,
+    from_members: &[DefinitionMember],
+    to: &DefinitionRevision,
+    to_members: &[DefinitionMember],
+) -> Result<(), String> {
+    let report = classify_definition_revision_compatibility(from, from_members, to, to_members)?;
+    let gate = report.reasons.iter().find(|reason| {
+        reason.class == "unknown"
+            || (reason.class == "breaking"
+                && MERGE_GATED_KINDS.contains(&reason.member_kind.as_str()))
+    });
+    match gate {
+        Some(reason) => Err(format!("compatibility_gate:{}", reason.member_kind)),
+        None => Ok(()),
+    }
+}
+
 fn added_member_reason(change: &DefinitionMemberChange) -> DefinitionCompatibilityReason {
     match change.member_kind.as_str() {
         "action_type" => reason(
@@ -221,6 +245,18 @@ fn added_member_reason(change: &DefinitionMemberChange) -> DefinitionCompatibili
             DefinitionCompatibilityClass::Conditional,
             change,
             "added_function",
+            "",
+        ),
+        "transform" => reason(
+            DefinitionCompatibilityClass::Conditional,
+            change,
+            "added_transform",
+            "",
+        ),
+        "policy" => reason(
+            DefinitionCompatibilityClass::Conditional,
+            change,
+            "added_policy",
             "",
         ),
         "control" => reason(
@@ -994,5 +1030,94 @@ mod tests {
                 .iter()
                 .any(|reason| reason.code == "added_optional_property" && reason.property == "body")
         );
+    }
+
+    #[test]
+    fn added_function_transform_and_policy_are_conditional() {
+        let ticket = prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#);
+        let function = prepared("function", "CountOpen", r#"{"name":"CountOpen"}"#);
+        let transform = prepared(
+            "transform",
+            "ProjectTickets",
+            r#"{"name":"ProjectTickets"}"#,
+        );
+        let policy = prepared("policy", "TicketPolicy", r#"{"name":"TicketPolicy"}"#);
+        let from_members = vec![ticket.clone()];
+        let to_members = vec![ticket, function, transform, policy];
+        let from = revision(&from_members, "");
+        let to = revision(&to_members, "");
+        let report =
+            classify_definition_revision_compatibility(&from, &from_members, &to, &to_members)
+                .unwrap();
+        assert_eq!(report.class, "conditional");
+        assert_eq!(
+            report
+                .reasons
+                .iter()
+                .map(|reason| (reason.member_kind.as_str(), reason.code.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("function", "added_function"),
+                ("policy", "added_policy"),
+                ("transform", "added_transform"),
+            ]
+        );
+        require_merge_compatibility(&from, &from_members, &to, &to_members).unwrap();
+    }
+
+    #[test]
+    fn merge_names_function_gate_when_a_bound_function_is_removed() {
+        let ticket = prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#);
+        let function = prepared("function", "CountOpen", r#"{"name":"CountOpen"}"#);
+        let from_members = vec![ticket.clone(), function];
+        let to_members = vec![ticket];
+        let from = revision(&from_members, "");
+        let to = revision(&to_members, "");
+        let error =
+            require_merge_compatibility(&from, &from_members, &to, &to_members).unwrap_err();
+        assert_eq!(error, "compatibility_gate:function");
+    }
+
+    #[test]
+    fn merge_allows_breaking_object_type_so_fact_migration_can_follow() {
+        let from_ticket = prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title","secret"]}"#,
+        );
+        let to_ticket = prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title"]}"#,
+        );
+        let from = revision(std::slice::from_ref(&from_ticket), "");
+        let to = revision(std::slice::from_ref(&to_ticket), "");
+        require_merge_compatibility(
+            &from,
+            std::slice::from_ref(&from_ticket),
+            &to,
+            std::slice::from_ref(&to_ticket),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_refuses_unknown_field_on_policy() {
+        let from_policy = prepared("policy", "TicketPolicy", r#"{"name":"TicketPolicy"}"#);
+        let to_policy = prepared(
+            "policy",
+            "TicketPolicy",
+            r#"{"name":"TicketPolicy","shape":"wide"}"#,
+        );
+        let from = revision(std::slice::from_ref(&from_policy), "");
+        let to = revision(std::slice::from_ref(&to_policy), "");
+        let error = require_merge_compatibility(
+            &from,
+            std::slice::from_ref(&from_policy),
+            &to,
+            std::slice::from_ref(&to_policy),
+        )
+        .unwrap_err();
+        assert_eq!(error, "compatibility_gate:policy");
     }
 }

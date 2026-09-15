@@ -758,6 +758,7 @@ pub(super) fn to_proto_definition_branch(
         created_by: branch.created_by.clone(),
         created_at_ms: branch.created_at_ms,
         updated_at_ms: branch.updated_at_ms,
+        pin_digest: definition_branch_domain::branch_pin_digest(branch),
     }
 }
 pub(super) fn to_proto_definition_revision_diff(
@@ -916,6 +917,8 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("fact_migration_limit")
     {
         Status::failed_precondition("definition write is not current")
+    } else if let Some(gate) = error.strip_prefix("compatibility_gate:") {
+        Status::failed_precondition(format!("compatibility_gate:{gate}"))
     } else if error.starts_with("unknown_definition_construct") {
         Status::failed_precondition("definition compare encountered an unknown construct")
     } else if error.starts_with("definition_edit_no_change") {
@@ -1593,6 +1596,14 @@ mod definition_write_error_tests {
                 .into(),
         );
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_ne!(status.code(), tonic::Code::Internal);
+    }
+
+    #[test]
+    fn compatibility_gate_is_failed_precondition_and_names_the_kind() {
+        let status = map_definition_write_error("compatibility_gate:function".into());
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "compatibility_gate:function");
         assert_ne!(status.code(), tonic::Code::Internal);
     }
 }

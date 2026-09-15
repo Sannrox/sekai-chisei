@@ -507,6 +507,18 @@ impl PostgresDb {
         require_descendant_candidate(&candidate, &proposal.base_digest, |digest| {
             load_revision_postgres(&mut transaction, &proposal.namespace, digest)
         })?;
+        let published_revision =
+            load_revision_postgres(&mut transaction, &proposal.namespace, &published)?.ok_or_else(
+                || "definition_revision_not_found: published revision is unavailable".to_string(),
+            )?;
+        let published_members = load_members_postgres(&mut transaction, &published_revision)?;
+        let candidate_members = load_members_postgres(&mut transaction, &candidate)?;
+        crate::sekai::definition_diff::require_merge_compatibility(
+            &published_revision,
+            &published_members,
+            &candidate,
+            &candidate_members,
+        )?;
         let receipt_id = merge_receipt_id(
             &proposal.namespace,
             &proposal.proposal_id,

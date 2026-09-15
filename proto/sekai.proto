@@ -1911,6 +1911,7 @@ message DefinitionBranch {
   string created_by = 6;
   int64 created_at_ms = 7;
   int64 updated_at_ms = 8;
+  string pin_digest = 9;
 }
 
 message CreateDefinitionBranchRequest {

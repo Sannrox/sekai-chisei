@@ -19,8 +19,11 @@ authorized published revision. The request supplies:
 The new branch initially has the parent as both its base and head. Creation
 does not update the namespace's published head.
 
-`GetDefinitionBranch` returns the current authorized branch head. Use it after
-a stale-head result before preparing another edit. The read path reauthorizes
+`GetDefinitionBranch` returns the current authorized branch head and a
+content-addressed `pin_digest` bound to the branch contract, namespace,
+branch id, and head revision. A delivery consumer verifies the pin against
+that same identity; the pin is not a second authority. Use this read after
+a stale-head result before preparing another edit. The path reauthorizes
 the current revision and returns no member bodies.
 
 `ApplyDefinitionBranchEdit` advances an existing branch. The request supplies
@@ -52,11 +55,17 @@ published head.
 that the live published head equals both that digest and the pinned base, the
 branch head still equals the candidate, the candidate descends from the pinned
 base, at least one recorded approver still holds namespace write and
-changed-member admin, and named foreign digests are not members. It then
-compare-and-swaps the namespace published head, stores a durable `receipt_id`
-on the merged proposal, and writes the receipt, audit, and idempotency record
-in the same transaction. Exact replay of the same idempotency key returns that
-receipt without moving the published head again. A stale expected digest or a
+changed-member admin, and named foreign digests are not members. It classifies
+the candidate against the published head and refuses the whole merge when a
+`function`, `transform`, or `policy` change is breaking, or when any member
+kind is unknown, naming `compatibility_gate:{member_kind}`. Breaking
+object-type, interface, ontology, link, action, and control members still
+publish so checkpointed fact migration can follow the published head. A
+refused gate leaves the published head unchanged. It then compare-and-swaps
+the namespace published head, stores a durable `receipt_id` on the merged
+proposal, and writes the receipt, audit, and idempotency record in the same
+transaction. Exact replay of the same idempotency key returns that receipt
+without moving the published head again. A stale expected digest or a
 candidate that is not a descendant of the pinned base fails closed as not
 mergeable. Interrupted merges leave the published head unchanged and store no
 receipt.
@@ -86,10 +95,10 @@ Classification vocabulary:
   `interface_type`, `ontology_class`, `ontology_relation`, or `link_type`
   members. Removing a required constraint without removing the property is
   compatible.
-- `conditional`: new `action_type`, `function`, or `control` members,
-  `access_marking` changes, and known field changes such as `name` or `mode`.
-  These require live authorization or review before effect; they are not
-  silent success.
+- `conditional`: new `action_type`, `function`, `transform`, `policy`, or
+  `control` members, `access_marking` changes, and known field changes such
+  as `name` or `mode`. These require live authorization or review before
+  effect; they are not silent success.
 - `breaking`: removed members, removed properties, and newly required
   properties. Breaking changes need an approved migration path before facts
   can follow the candidate.
@@ -112,6 +121,8 @@ member kinds:
 - `link_type`
 - `action_type`
 - `function`
+- `transform`
+- `policy`
 - `control`
 
 Member identity binds the contract version, namespace, member kind, stable
