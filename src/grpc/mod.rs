@@ -371,6 +371,17 @@ impl tonic::service::Interceptor for LocalOrTokenAuthInterceptor {
     }
 }
 
+fn local_or_token_interceptor(
+    credential_store: Arc<PrincipalCredentialStore>,
+    db: Arc<RuntimeDb>,
+    assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
+) -> LocalOrTokenAuthInterceptor {
+    LocalOrTokenAuthInterceptor {
+        local: LocalInterceptor::new(true),
+        token: TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
+    }
+}
+
 impl tonic::service::Interceptor for LocalInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         while req.metadata_mut().remove(AUTH_SOURCE_HEADER).is_some() {}
@@ -505,7 +516,11 @@ pub fn run(
                     http_port,
                     sekai_svc.clone(),
                     chisei_svc.clone(),
-                    LocalInterceptor::new(true),
+                    local_or_token_interceptor(
+                        credential_store.clone(),
+                        db.clone(),
+                        assertion_authority.clone(),
+                    ),
                 )
                 .await?;
             }
@@ -519,16 +534,11 @@ pub fn run(
                 socket_path,
                 sekai_svc.clone(),
                 chisei_svc.clone(),
-                LocalOrTokenAuthInterceptor {
-                    // Force transport identity on UDS (same as TCP insecure):
-                    // never trust client-supplied x-principal without a bearer.
-                    local: LocalInterceptor::new(true),
-                    token: TokenAuthInterceptor::from_runtime(
-                        credential_store.clone(),
-                        db.clone(),
-                        assertion_authority.clone(),
-                    ),
-                },
+                local_or_token_interceptor(
+                    credential_store.clone(),
+                    db.clone(),
+                    assertion_authority.clone(),
+                ),
                 health_service.clone(),
             );
 
@@ -657,7 +667,7 @@ where
             config,
             sekai_svc,
             chisei_svc,
-            LocalInterceptor::new(true),
+            local_or_token_interceptor(credential_store, db, assertion_authority),
             health_service,
         )
         .await
@@ -1416,6 +1426,86 @@ mod tests {
             );
             assert_eq!(request.metadata().get(AUTH_SOURCE_HEADER).unwrap(), "local");
         }
+    }
+
+    #[test]
+    fn local_interceptor_does_not_attach_authenticated_context() {
+        let mut interceptor = LocalInterceptor::new(true);
+        let request = interceptor
+            .call(bearer_request("sia1.ignored.sig"))
+            .unwrap();
+        assert!(
+            request
+                .extensions()
+                .get::<crate::enterprise::AuthenticatedContext>()
+                .is_none()
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "local"
+        );
+    }
+
+    #[test]
+    fn insecure_tcp_interceptor_fills_context_from_assertion_bearer() {
+        let authority = test_assertion_authority();
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let token = authority
+            .sign(&test_assertion_claims("n-insecure-tcp", expires_at))
+            .unwrap();
+        let mut interceptor = local_or_token_interceptor(
+            Arc::new(PrincipalCredentialStore::new()),
+            in_memory_db(),
+            Some(Arc::new(authority)),
+        );
+        let mut request = bearer_request(&token);
+        request.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "ApplySourceBatch",
+        ));
+        let request = interceptor.call(request).unwrap();
+        let context = request
+            .extensions()
+            .get::<crate::enterprise::AuthenticatedContext>()
+            .expect("insecure TCP must honor a presented assertion bearer");
+        assert_eq!(context.principal.subject, "subject-a");
+        assert!(context.tenant.is_none());
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-principal")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "subject-a"
+        );
+    }
+
+    #[test]
+    fn insecure_tcp_interceptor_rejects_assertion_tenant_header() {
+        let authority = test_assertion_authority();
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let token = authority
+            .sign(&test_assertion_claims("n-insecure-header", expires_at))
+            .unwrap();
+        let mut interceptor = local_or_token_interceptor(
+            Arc::new(PrincipalCredentialStore::new()),
+            in_memory_db(),
+            Some(Arc::new(authority)),
+        );
+        let mut request = bearer_request(&token);
+        request.metadata_mut().insert(
+            TENANT_CONTEXT_HEADER,
+            MetadataValue::from_static("tenant-evil"),
+        );
+        let error = interceptor.call(request).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "caller-selected tenant header");
     }
 
     #[test]
