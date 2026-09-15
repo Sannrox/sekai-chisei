@@ -31,8 +31,10 @@ docker run --rm \
   bash -lc 'cargo build --release --locked --workspace --bins &&
     cp /target/release/sekai-chisei /target/release/chisei-gateway /target/release/sekaictl /out/'
 
+IMAGE_TAG="${IMAGE_TAG:-sekai-chisei:local}"
+
 docker build \
   -f build/server-image/Dockerfile \
   --build-arg VCS_REF="${GIT_COMMIT}" \
-  -t sekai-chisei:local \
+  -t "${IMAGE_TAG}" \
   _output/linux-bins

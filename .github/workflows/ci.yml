@@ -23,5 +23,5 @@ jobs:
       - run: cargo clippy-all
       - run: cargo test-all
       - run: ./scripts/validate-ontology-deps.sh
-      - run: docker build --build-arg VCS_REF="${{ github.sha }}" -t sekai-chisei-ci .
-      - run: docker run --rm sekai-chisei-ci sekaictl --help
+      - run: ./build/release-images.sh
+      - run: docker run --rm sekai-chisei:local sekaictl --help

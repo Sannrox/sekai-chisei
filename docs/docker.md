@@ -11,8 +11,8 @@ cargo test-all
 ```
 
 Cargo is the gate locally and in CI (`rust-toolchain.toml`). `./build/release-images.sh`
-compiles linux binaries in that same channel and tags `sekai-chisei:local`.
-Compose `up --build` uses the root `Dockerfile`.
+is the image build locally and in CI: linux binaries in that channel, tag
+`sekai-chisei:local`. Compose `up --build` uses the root `Dockerfile`.
 
 ## Quickstart
 
