@@ -398,6 +398,22 @@ message ObjectSetTraversal {
   string relation = 1;
   string direction = 2;
   string far_kind = 3;
+  string join_property = 4;
+}
+message ObjectSetAggregation {
+  string function = 1;
+  string property = 2;
+  string group_by = 3;
+}
+message ObjectSetCostLimit {
+  int32 max_rows_scanned = 1;
+  int32 max_depth = 2;
+  int64 max_time_ms = 3;
+}
+message ObjectSetAggregateRow {
+  string group_key = 1;
+  double value = 2;
+  int64 count = 3;
 }
 message ObjectSetDescriptor {
   string contract_version = 1;
@@ -409,6 +425,9 @@ message ObjectSetDescriptor {
   bool descending = 7;
   int32 limit = 8;
   ObjectSetTraversal traversal = 9;
+  repeated ObjectSetTraversal hops = 10;
+  ObjectSetAggregation aggregation = 11;
+  ObjectSetCostLimit cost_limit = 12;
 }
 message EvaluateObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;
@@ -478,6 +497,7 @@ message EvaluateObjectSetResponse {
   int32 total = 5;
   string next_page_token = 6;
   bool authority = 7;
+  repeated ObjectSetAggregateRow aggregates = 8;
 }
 message ObjectChangeSubscriptionScope {
   string namespace = 1;

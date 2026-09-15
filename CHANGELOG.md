@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Evaluate revision-bound object sets with grouped aggregations and
+  bounded multi-hop traversal (`sekai.object-set/v2`, #878). Plans use
+  the #877 membership index and refuse named cost limits rather than
+  truncating. Hidden rows stay out of aggregates. Two-hop at 10^7 remains
+  outside the 500 ms envelope recorded in the #876 note; an alternate
+  engine stays #889.
 - Register a dataset as the membership source for an object type revision
   and maintain a rebuildable incremental projection (#877). Schema drift
   quarantines the batch and leaves the last index readable and stale.
