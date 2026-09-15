@@ -6,11 +6,20 @@
 
 ## Build, Test, and Development Commands
 
-- `cargo fmt` formats Rust code before review.
-- `cargo test` runs the normal unit and integration test suite.
-- `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind.
-- `cargo build --release` builds an optimized binary.
-- `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
+Cargo is the workflow. The compiler is pinned in `rust-toolchain.toml`. Local and CI run the same commands:
+
+```sh
+cargo fmt-check
+cargo clippy-all
+cargo test-all
+```
+
+Aliases in `.cargo/config.toml` pin `--workspace --all-targets --locked` and clippy `-D warnings`. Plain `cargo check` / `cargo test` stay the short developer loop.
+
+`SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind. `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
+
+Linux images: `./build/release-images.sh`. Push: `./build/release.sh` with
+`DOCKER_REGISTRY` set. Proto copies: `./scripts/update-proto.sh`.
 
 Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 

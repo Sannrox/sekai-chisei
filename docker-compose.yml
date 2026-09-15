@@ -1,6 +1,6 @@
 services:
   server:
-    build: .
+    image: sekai-chisei:${GIT_VERSION}
     volumes:
       - sekai-data:/data
     environment:
@@ -18,7 +18,7 @@ services:
       retries: 30
 
   gateway:
-    build: .
+    image: sekai-chisei:${GIT_VERSION}
     command: ["chisei-gateway"]
     depends_on:
       server:

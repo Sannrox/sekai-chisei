@@ -1,4 +1,5 @@
 /target
+/_output/
 .agents/*
 !.agents/skills/
 .agents/skills/*

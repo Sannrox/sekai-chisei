@@ -36,6 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = GatewayConfig::from_env().map_err(|err| std::io::Error::other(err.to_string()))?;
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        git_version = env!("SEKAI_GIT_VERSION"),
+        git_commit = env!("SEKAI_GIT_COMMIT"),
         openai_upstream = %config.openai_base_url,
         anthropic_upstream = %config.anthropic_base_url,
         "chisei-gateway starting"

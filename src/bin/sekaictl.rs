@@ -21,6 +21,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         print_root_usage();
         return Ok(());
     }
+    if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+        println!(
+            "sekaictl {} ({})",
+            sekai_chisei::build_info::PKG_VERSION,
+            sekai_chisei::build_info::GIT_VERSION
+        );
+        return Ok(());
+    }
     if args[0] == "admin"
         && (args.len() == 1
             || args
@@ -619,7 +627,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl <ontology|launch|doctor|smoke|models|estimate|receipt|report|admin> ...\n"
+        "Usage: sekaictl [--version] <ontology|launch|doctor|smoke|models|estimate|receipt|report|admin> ...\n"
     );
     println!("Product loop (ontology-first):");
     println!("  {}", sekai_chisei::ontology_product_cli::usage());
