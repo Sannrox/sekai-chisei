@@ -79,6 +79,11 @@ impl SekaiServiceImpl {
             if let Some(order_property) = queried_order_property(&bound.filter.order_by) {
                 queried_properties.push(order_property);
             }
+            if let Some(aggregation) = &bound.descriptor.aggregation
+                && !aggregation.group_by.is_empty()
+            {
+                queried_properties.push(aggregation.group_by.clone());
+            }
             ensure_property_query_allowed(
                 &schema,
                 &principals,
@@ -129,6 +134,17 @@ impl SekaiServiceImpl {
                 ));
             }
             filter.offset = cursor.offset;
+        }
+        let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
+        if bound.descriptor.aggregation.is_some() || hops.len() > 1 {
+            return self.evaluate_aggregated_object_set(
+                &bound,
+                &hops,
+                &principals,
+                tenant_context.as_ref(),
+                inner.required_freshness_ms,
+                now_millis(),
+            );
         }
         if self
             .db
@@ -192,13 +208,14 @@ impl SekaiServiceImpl {
             String::new()
         };
         Ok(Response::new(EvaluateObjectSetResponse {
-            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            contract_version: bound.descriptor.contract_version.clone(),
             definition_digest: bound.descriptor.definition_digest,
             kind: bound.member_kind,
             members: members.iter().map(to_proto_obj).collect(),
             total,
             next_page_token,
             authority: false,
+            aggregates: Vec::new(),
         }))
     }
 }
@@ -285,6 +302,150 @@ impl SekaiServiceImpl {
             total,
             next_page_token,
             authority: false,
+            aggregates: Vec::new(),
+        }))
+    }
+
+    fn evaluate_aggregated_object_set(
+        &self,
+        bound: &BoundObjectSet,
+        hops: &[crate::sekai::object_set::ObjectSetTraversal],
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        required_freshness_ms: i64,
+        now_ms: i64,
+    ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        let mut meter =
+            crate::sekai::object_set::CostMeter::new(bound.descriptor.cost_limit.clone());
+        let mut layers = Vec::new();
+        let mut kind = bound.descriptor.kind.clone();
+        let empty = crate::sekai::dataset::RowQuery::default();
+        for (index, hop) in std::iter::once(None)
+            .chain(hops.iter().map(Some))
+            .enumerate()
+        {
+            if let Some(hop) = hop {
+                kind = hop.far_kind.clone();
+            }
+            if self
+                .db
+                .get_object_type_datasource(&bound.descriptor.namespace, &kind)
+                .map_err(Status::internal)?
+                .is_none()
+            {
+                return Err(Status::failed_precondition(
+                    "object-set aggregation requires an index on every hop kind",
+                ));
+            }
+            let status = self
+                .db
+                .object_type_index_status(&bound.descriptor.namespace, &kind, now_ms)
+                .map_err(Status::internal)?
+                .ok_or_else(|| Status::failed_precondition("object type index is stale"))?;
+            if index == 0
+                && !crate::sekai::object_type_index::freshness_holds(&status, required_freshness_ms)
+            {
+                return Err(Status::failed_precondition("object type index is stale"));
+            }
+            let query = if index == 0 {
+                crate::sekai::dataset::RowQuery {
+                    filters: bound
+                        .descriptor
+                        .property_filters
+                        .iter()
+                        .map(|filter| crate::sekai::dataset::RowFilter {
+                            column: filter.key.clone(),
+                            op: filter.op.clone(),
+                            value: filter.value.clone(),
+                        })
+                        .collect(),
+                    ..empty.clone()
+                }
+            } else {
+                empty.clone()
+            };
+            let members = self
+                .db
+                .list_visible_index_members(&bound.descriptor.namespace, &kind, &query)
+                .map_err(Status::internal)?;
+            meter
+                .charge(members.len() as i32)
+                .map_err(map_object_set_error)?;
+            layers.push(members);
+        }
+        let mut paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
+            layers[0].iter().map(|member| vec![member]).collect();
+        for (hop_index, hop) in hops.iter().enumerate() {
+            let children = &layers[hop_index + 1];
+            let mut next = Vec::new();
+            for path in &paths {
+                let parent = path[path.len() - 1];
+                for child in children {
+                    let matched = if hop.join_property.is_empty() {
+                        false
+                    } else {
+                        child
+                            .properties
+                            .get(&hop.join_property)
+                            .is_some_and(|value| {
+                                value == &parent.source_key || value == &parent.object_id
+                            })
+                    };
+                    if matched {
+                        let mut joined = path.clone();
+                        joined.push(child);
+                        next.push(joined);
+                    }
+                }
+            }
+            meter
+                .charge(next.len() as i32)
+                .map_err(map_object_set_error)?;
+            paths = next;
+        }
+        let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
+            Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
+        })?;
+        let rows: Vec<(String, Option<f64>)> = paths
+            .iter()
+            .map(|path| {
+                let root = path[0];
+                let leaf = path[path.len() - 1];
+                let group = root
+                    .properties
+                    .get(&aggregation.group_by)
+                    .cloned()
+                    .or_else(|| leaf.properties.get(&aggregation.group_by).cloned())
+                    .unwrap_or_else(|| root.source_key.clone());
+                let value = if aggregation.function.eq_ignore_ascii_case("count") {
+                    Some(1.0)
+                } else {
+                    leaf.properties
+                        .get(&aggregation.property)
+                        .and_then(|raw| raw.parse().ok())
+                };
+                (group, value)
+            })
+            .collect();
+        let aggregates = crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
+            .map_err(map_object_set_error)?;
+        let _ = (principals, tenant_context);
+        Ok(Response::new(EvaluateObjectSetResponse {
+            contract_version: bound.descriptor.contract_version.clone(),
+            definition_digest: bound.descriptor.definition_digest.clone(),
+            kind: bound.member_kind.clone(),
+            members: Vec::new(),
+            total: aggregates.len() as i32,
+            next_page_token: String::new(),
+            authority: false,
+            aggregates: aggregates
+                .into_iter()
+                .map(|row| ObjectSetAggregateRow {
+                    group_key: row.group_key,
+                    value: row.value,
+                    count: row.count,
+                })
+                .collect(),
         }))
     }
 }
@@ -315,7 +476,33 @@ fn parse_object_set_descriptor(
                 relation: traversal.relation,
                 direction: traversal.direction,
                 far_kind: traversal.far_kind,
+                join_property: traversal.join_property,
             }),
+        hops: descriptor
+            .hops
+            .into_iter()
+            .map(|traversal| DomainObjectSetTraversal {
+                relation: traversal.relation,
+                direction: traversal.direction,
+                far_kind: traversal.far_kind,
+                join_property: traversal.join_property,
+            })
+            .collect(),
+        aggregation: descriptor.aggregation.map(|aggregation| {
+            crate::sekai::object_set::ObjectSetAggregation {
+                function: aggregation.function,
+                property: aggregation.property,
+                group_by: aggregation.group_by,
+            }
+        }),
+        cost_limit: descriptor
+            .cost_limit
+            .map(|limit| crate::sekai::object_set::ObjectSetCostLimit {
+                max_rows_scanned: limit.max_rows_scanned,
+                max_depth: limit.max_depth,
+                max_time_ms: limit.max_time_ms,
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -407,6 +594,7 @@ fn map_object_set_error(error: ObjectSetError) -> Status {
         ObjectSetError::InvalidArgument(message) => Status::invalid_argument(message),
         ObjectSetError::Stale(message) => Status::failed_precondition(message),
         ObjectSetError::Unsupported(message) => Status::invalid_argument(message),
+        ObjectSetError::LimitExceeded(message) => Status::failed_precondition(message),
     }
 }
 
@@ -603,7 +791,11 @@ mod tests {
                 relation: "placed".into(),
                 direction: "outgoing".into(),
                 far_kind: "Order".into(),
+                join_property: String::new(),
             }),
+            hops: Vec::new(),
+            aggregation: None,
+            cost_limit: None,
         }
     }
 
@@ -959,5 +1151,267 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn evaluate_object_set_two_hop_aggregates_without_hidden_leakage() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        let page = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![
+                            ObjectSetTraversal {
+                                relation: "placed".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Order".into(),
+                                join_property: "customer_id".into(),
+                            },
+                            ObjectSetTraversal {
+                                relation: "ships".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Shipment".into(),
+                                join_property: "order_id".into(),
+                            },
+                        ],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "sum".into(),
+                            property: "amount".into(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.aggregates.len(), 1);
+        assert_eq!(page.aggregates[0].group_key, "eu");
+        assert_eq!(page.aggregates[0].value, 10.0);
+        assert_eq!(page.aggregates[0].count, 1);
+        assert!(page.members.is_empty());
+        assert!(!page.authority);
+
+        let refused = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: page.definition_digest.clone(),
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 1,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert!(refused.message().contains("max_rows_scanned"));
+    }
+
+    fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {
+        let members = vec![
+            member(
+                "sales",
+                "object_type",
+                "Customer",
+                r#"{"name":"Customer","properties":{"region":{"type":"string"}}}"#,
+            ),
+            member(
+                "sales",
+                "object_type",
+                "Order",
+                r#"{"name":"Order","properties":{"customer_id":{"type":"string"}}}"#,
+            ),
+            member(
+                "sales",
+                "object_type",
+                "Shipment",
+                r#"{"name":"Shipment","properties":{"order_id":{"type":"string"},"amount":{"type":"number"}}}"#,
+            ),
+            member(
+                "sales",
+                "link_type",
+                "placed",
+                r#"{"name":"placed","from":"Customer","to":"Order"}"#,
+            ),
+            member(
+                "sales",
+                "link_type",
+                "ships",
+                r#"{"name":"ships","from":"Order","to":"Shipment"}"#,
+            ),
+        ];
+        let revision = prepare_revision(
+            "sales",
+            "",
+            members.iter().map(|item| DefinitionRevisionMember {
+                member_kind: item.member_kind.clone(),
+                member_id: item.member_id.clone(),
+                member_digest: item.member_digest.clone(),
+            }),
+            true,
+            "author",
+            1,
+        )
+        .unwrap();
+        svc.db
+            .seed_published_definition_revision(&revision, &members)
+            .unwrap();
+        revision.revision_digest
+    }
+
+    fn seed_indexed_customer_order_shipment(svc: &SekaiServiceImpl, digest: &str) {
+        index_kind(
+            svc,
+            digest,
+            "Customer",
+            "ds-c",
+            "customer_id",
+            &[("region", "region")],
+            vec![
+                hashmap(&[("customer_id", "c1"), ("region", "eu"), ("hidden", "0")]),
+                hashmap(&[
+                    ("customer_id", "c-hidden"),
+                    ("region", "eu"),
+                    ("hidden", "true"),
+                ]),
+            ],
+        );
+        index_kind(
+            svc,
+            digest,
+            "Order",
+            "ds-o",
+            "order_id",
+            &[("customer_id", "customer_id")],
+            vec![hashmap(&[
+                ("order_id", "o1"),
+                ("customer_id", "c1"),
+                ("hidden", "0"),
+            ])],
+        );
+        index_kind(
+            svc,
+            digest,
+            "Shipment",
+            "ds-s",
+            "shipment_id",
+            &[("order_id", "order_id"), ("amount", "amount")],
+            vec![
+                hashmap(&[
+                    ("shipment_id", "s1"),
+                    ("order_id", "o1"),
+                    ("amount", "10"),
+                    ("hidden", "0"),
+                ]),
+                hashmap(&[
+                    ("shipment_id", "s-hidden"),
+                    ("order_id", "o1"),
+                    ("amount", "99"),
+                    ("hidden", "true"),
+                ]),
+            ],
+        );
+    }
+
+    fn hashmap(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect()
+    }
+
+    fn index_kind(
+        svc: &SekaiServiceImpl,
+        digest: &str,
+        kind: &str,
+        dataset_id: &str,
+        key: &str,
+        mapping: &[(&str, &str)],
+        rows: Vec<std::collections::HashMap<String, String>>,
+    ) {
+        let mut columns = vec![key, "hidden"];
+        for (_, column) in mapping {
+            columns.push(*column);
+        }
+        columns.sort();
+        columns.dedup();
+        svc.db
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: columns
+                    .iter()
+                    .map(|name| crate::sekai::dataset::ColumnDef {
+                        name: (*name).into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .collect(),
+                object_id: String::new(),
+                created: 1,
+            })
+            .unwrap();
+        svc.db.append_rows(dataset_id, &rows).unwrap();
+        let binding = crate::sekai::object_type_index::ObjectTypeDatasource {
+            contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: kind.into(),
+            definition_digest: digest.into(),
+            dataset_id: dataset_id.into(),
+            key_column: key.into(),
+            property_mapping: mapping
+                .iter()
+                .map(|(property, column)| ((*property).into(), (*column).into()))
+                .collect(),
+            hidden_column: "hidden".into(),
+            edits_only: false,
+        }
+        .prepare()
+        .unwrap();
+        svc.db
+            .register_object_type_datasource(&binding, 10)
+            .unwrap();
+        svc.db
+            .apply_object_type_index("sales", kind, true, 20)
+            .unwrap();
     }
 }

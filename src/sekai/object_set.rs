@@ -9,11 +9,16 @@ use crate::sekai::object_security::object_query_digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 pub const CONTRACT_VERSION: &str = "sekai.object-set/v1";
+pub const CONTRACT_VERSION_V2: &str = "sekai.object-set/v2";
 pub const MAX_PROPERTY_FILTERS: usize = 4;
 pub const MAX_EVALUATE_LIMIT: i32 = domain::MAX_LIST_LIMIT;
 pub const DEFAULT_EVALUATE_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
+pub const MAX_HOPS: usize = 3;
+pub const DEFAULT_MAX_ROWS_SCANNED: i32 = 10_000;
+pub const DEFAULT_MAX_DEPTH: i32 = 3;
 
 const ALLOWED_OPERATORS: &[&str] = &["eq", "gt", "gte", "lt", "lte"];
 
@@ -22,12 +27,13 @@ pub enum ObjectSetError {
     InvalidArgument(String),
     Stale(&'static str),
     Unsupported(&'static str),
+    LimitExceeded(String),
 }
 
 impl ObjectSetError {
     pub fn message(&self) -> String {
         match self {
-            Self::InvalidArgument(message) => message.clone(),
+            Self::InvalidArgument(message) | Self::LimitExceeded(message) => message.clone(),
             Self::Stale(message) | Self::Unsupported(message) => (*message).into(),
         }
     }
@@ -38,6 +44,46 @@ pub struct ObjectSetTraversal {
     pub relation: String,
     pub direction: String,
     pub far_kind: String,
+    pub join_property: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSetAggregation {
+    pub function: String,
+    pub property: String,
+    pub group_by: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSetCostLimit {
+    pub max_rows_scanned: i32,
+    pub max_depth: i32,
+    pub max_time_ms: i64,
+}
+
+impl ObjectSetCostLimit {
+    pub fn resolved(&self) -> Self {
+        Self {
+            max_rows_scanned: if self.max_rows_scanned <= 0 {
+                DEFAULT_MAX_ROWS_SCANNED
+            } else {
+                self.max_rows_scanned
+            },
+            max_depth: if self.max_depth <= 0 {
+                DEFAULT_MAX_DEPTH
+            } else {
+                self.max_depth
+            },
+            max_time_ms: self.max_time_ms.max(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObjectSetAggregateRow {
+    pub group_key: String,
+    pub value: f64,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -51,6 +97,9 @@ pub struct ObjectSetDescriptor {
     pub descending: bool,
     pub limit: i32,
     pub traversal: Option<ObjectSetTraversal>,
+    pub hops: Vec<ObjectSetTraversal>,
+    pub aggregation: Option<ObjectSetAggregation>,
+    pub cost_limit: ObjectSetCostLimit,
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +116,21 @@ impl ObjectSetDescriptor {
         published_digest: &str,
         members: &[DefinitionMember],
     ) -> Result<BoundObjectSet, ObjectSetError> {
-        if self.contract_version != CONTRACT_VERSION {
+        let v2 = self.contract_version == CONTRACT_VERSION_V2;
+        if self.contract_version != CONTRACT_VERSION && !v2 {
             return Err(ObjectSetError::Unsupported(
                 "unsupported object-set contract version",
+            ));
+        }
+        if !v2
+            && (self.aggregation.is_some()
+                || !self.hops.is_empty()
+                || self.cost_limit.max_rows_scanned > 0
+                || self.cost_limit.max_depth > 0
+                || self.cost_limit.max_time_ms > 0)
+        {
+            return Err(ObjectSetError::Unsupported(
+                "object-set aggregation and extra hops require sekai.object-set/v2",
             ));
         }
         if self.namespace.trim().is_empty() {
@@ -109,11 +170,26 @@ impl ObjectSetDescriptor {
             filters.push(prepare_property_filter(object_type, filter)?);
         }
         let order_by = prepare_order_by(object_type, &self.order_by)?;
-        let member_kind = if let Some(traversal) = &self.traversal {
-            prepare_traversal(members, &self.kind, traversal)?
-        } else {
-            self.kind.clone()
-        };
+        let hops = resolved_hops(&self);
+        if hops.len() > MAX_HOPS {
+            return Err(ObjectSetError::Unsupported(
+                "object-set hop count exceeds the documented bound",
+            ));
+        }
+        let cost = self.cost_limit.resolved();
+        if hops.len() as i32 > cost.max_depth {
+            return Err(ObjectSetError::LimitExceeded(
+                "cost limit: max_depth".into(),
+            ));
+        }
+        let mut near = self.kind.clone();
+        for hop in &hops {
+            near = prepare_traversal(members, &near, hop)?;
+        }
+        if let Some(aggregation) = &self.aggregation {
+            prepare_aggregation(aggregation)?;
+        }
+        let member_kind = near;
         let filter = ListFilter {
             kind: Some(self.kind.clone()),
             name: None,
@@ -148,12 +224,135 @@ pub fn descriptor_query_digest(
     hasher.update(CONTRACT_VERSION.as_bytes());
     hasher.update(descriptor.definition_digest.as_bytes());
     hasher.update(list_digest.as_bytes());
-    if let Some(traversal) = &descriptor.traversal {
-        hasher.update(traversal.relation.as_bytes());
-        hasher.update(traversal.direction.as_bytes());
-        hasher.update(traversal.far_kind.as_bytes());
+    for hop in resolved_hops(descriptor) {
+        hasher.update(hop.relation.as_bytes());
+        hasher.update(hop.direction.as_bytes());
+        hasher.update(hop.far_kind.as_bytes());
+        hasher.update(hop.join_property.as_bytes());
+    }
+    if let Some(aggregation) = &descriptor.aggregation {
+        hasher.update(aggregation.function.as_bytes());
+        hasher.update(aggregation.property.as_bytes());
+        hasher.update(aggregation.group_by.as_bytes());
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn resolved_hops(descriptor: &ObjectSetDescriptor) -> Vec<ObjectSetTraversal> {
+    if !descriptor.hops.is_empty() {
+        return descriptor.hops.clone();
+    }
+    descriptor.traversal.clone().into_iter().collect()
+}
+
+fn prepare_aggregation(aggregation: &ObjectSetAggregation) -> Result<(), ObjectSetError> {
+    let function = aggregation.function.trim().to_ascii_lowercase();
+    if !matches!(
+        function.as_str(),
+        "count" | "sum" | "min" | "max" | "avg" | "distinct"
+    ) {
+        return Err(ObjectSetError::Unsupported(
+            "unsupported object-set aggregation function",
+        ));
+    }
+    if function != "count" && aggregation.property.trim().is_empty() {
+        return Err(ObjectSetError::InvalidArgument(
+            "aggregation property required".into(),
+        ));
+    }
+    if aggregation.group_by.trim().is_empty() {
+        return Err(ObjectSetError::InvalidArgument(
+            "aggregation group_by required".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct CostMeter {
+    pub rows: i32,
+    pub started: std::time::Instant,
+    pub limit: ObjectSetCostLimit,
+}
+
+impl CostMeter {
+    pub fn new(limit: ObjectSetCostLimit) -> Self {
+        Self {
+            rows: 0,
+            started: std::time::Instant::now(),
+            limit: limit.resolved(),
+        }
+    }
+
+    pub fn charge(&mut self, rows: i32) -> Result<(), ObjectSetError> {
+        self.rows = self.rows.saturating_add(rows.max(0));
+        if self.rows > self.limit.max_rows_scanned {
+            return Err(ObjectSetError::LimitExceeded(
+                "cost limit: max_rows_scanned".into(),
+            ));
+        }
+        if self.limit.max_time_ms > 0
+            && self.started.elapsed().as_millis() as i64 > self.limit.max_time_ms
+        {
+            return Err(ObjectSetError::LimitExceeded(
+                "cost limit: max_time_ms".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Group leaf numeric values. Hidden or non-numeric properties are omitted
+/// from the value list and are indistinguishable from absence.
+pub fn aggregate_groups(
+    rows: &[(String, Option<f64>)],
+    function: &str,
+) -> Result<Vec<ObjectSetAggregateRow>, ObjectSetError> {
+    let function = function.trim().to_ascii_lowercase();
+    let mut grouped: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for (group, value) in rows {
+        if let Some(number) = value {
+            grouped.entry(group.clone()).or_default().push(*number);
+        } else if function == "count" {
+            grouped.entry(group.clone()).or_default();
+        }
+    }
+    let mut out = Vec::new();
+    for (group_key, values) in grouped {
+        let count = values.len() as i64;
+        let value = match function.as_str() {
+            "count" => count as f64,
+            "sum" => values.iter().sum(),
+            "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+            "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "avg" => {
+                if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                }
+            }
+            "distinct" => {
+                let mut unique = values;
+                unique.sort_by(|left, right| {
+                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                unique.dedup();
+                unique.len() as f64
+            }
+            _ => {
+                return Err(ObjectSetError::Unsupported(
+                    "unsupported object-set aggregation function",
+                ));
+            }
+        };
+        out.push(ObjectSetAggregateRow {
+            group_key,
+            value,
+            count,
+        });
+    }
+    Ok(out)
 }
 
 fn prepare_property_filter(
@@ -400,8 +599,40 @@ mod tests {
                 relation: "placed".into(),
                 direction: "outgoing".into(),
                 far_kind: "Order".into(),
+                join_property: String::new(),
             }),
+            hops: Vec::new(),
+            aggregation: None,
+            cost_limit: ObjectSetCostLimit::default(),
         }
+    }
+
+    #[test]
+    fn aggregate_groups_omit_missing_values_like_hidden_properties() {
+        let rows = vec![
+            ("c1".into(), Some(10.0)),
+            ("c1".into(), None),
+            ("c2".into(), Some(5.0)),
+        ];
+        let sums = aggregate_groups(&rows, "sum").unwrap();
+        assert_eq!(sums.len(), 2);
+        let c1 = sums.iter().find(|row| row.group_key == "c1").unwrap();
+        assert_eq!(c1.value, 10.0);
+        assert_eq!(c1.count, 1);
+    }
+
+    #[test]
+    fn cost_meter_names_the_exceeded_limit() {
+        let mut meter = CostMeter::new(ObjectSetCostLimit {
+            max_rows_scanned: 2,
+            max_depth: 3,
+            max_time_ms: 0,
+        });
+        meter.charge(2).unwrap();
+        let error = meter.charge(1).unwrap_err();
+        assert!(
+            matches!(error, ObjectSetError::LimitExceeded(message) if message == "cost limit: max_rows_scanned")
+        );
     }
 
     #[test]
