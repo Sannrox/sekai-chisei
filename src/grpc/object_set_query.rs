@@ -515,8 +515,48 @@ impl SekaiServiceImpl {
                 .map(|path| aggregate_path_row(path[0], path[path.len() - 1], &aggregation))
                 .collect()
         };
-        let aggregates = crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
-            .map_err(map_object_set_error)?;
+        let mut aggregates =
+            crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
+                .map_err(map_object_set_error)?;
+        if self.object_store_mode.reads_kura() {
+            let mut members = Vec::new();
+            for layer in &layers {
+                members.extend(layer.iter().cloned());
+            }
+            if let Some(projected) = projected.as_ref() {
+                for path in projected {
+                    members.extend(path.iter().cloned());
+                }
+            }
+            let leaf_kind = hops
+                .last()
+                .map(|hop| hop.far_kind.as_str())
+                .unwrap_or(bound.descriptor.kind.as_str());
+            let (kura_count, kura_sum) = crate::grpc::kura_object_store::evaluate_members(
+                &members,
+                &bound.descriptor.kind,
+                hops,
+                leaf_kind,
+                &aggregation.property,
+            )
+            .map_err(Status::internal)?;
+            let sql_sum: f64 = aggregates.iter().map(|row| row.value).sum();
+            let sql_count: i64 = aggregates.iter().map(|row| row.count).sum();
+            if self.object_store_mode == crate::grpc::kura_object_store::ObjectStoreMode::Dual
+                && aggregation.function.eq_ignore_ascii_case("sum")
+                && (sql_sum.round() as i64) != kura_sum
+            {
+                return Err(Status::internal("kura object-store dual-read mismatch"));
+            }
+            if self.object_store_mode == crate::grpc::kura_object_store::ObjectStoreMode::Kura {
+                aggregates = vec![crate::sekai::object_set::ObjectSetAggregateRow {
+                    group_key: String::new(),
+                    value: kura_sum as f64,
+                    count: kura_count as i64,
+                }];
+                let _ = sql_count;
+            }
+        }
         let _ = (principals, tenant_context);
         Ok(Response::new(EvaluateObjectSetResponse {
             contract_version: bound.descriptor.contract_version.clone(),
@@ -1370,6 +1410,56 @@ mod tests {
             .into_inner();
         assert_eq!(hop_page.aggregates, page.aggregates);
         assert!(!hop_page.authority);
+
+        let mut kura_dual = service();
+        grant_namespace(&kura_dual, "sales", "alice");
+        grant_namespace(&kura_dual, "sales", "local");
+        let digest = seed_sales_with_shipments(&kura_dual);
+        seed_indexed_customer_order_shipment(&kura_dual, &digest);
+        kura_dual.object_store_mode = crate::grpc::kura_object_store::ObjectStoreMode::Dual;
+        let kura_page = kura_dual
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![
+                            ObjectSetTraversal {
+                                relation: "placed".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Order".into(),
+                                join_property: "customer_id".into(),
+                            },
+                            ObjectSetTraversal {
+                                relation: "ships".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Shipment".into(),
+                                join_property: "order_id".into(),
+                            },
+                        ],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "sum".into(),
+                            property: "amount".into(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(kura_page.aggregates, page.aggregates);
 
         let refused = svc
             .evaluate_object_set(with_named_principal(

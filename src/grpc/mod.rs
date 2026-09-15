@@ -1,5 +1,6 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
+pub(crate) mod kura_object_store;
 mod provider_execution;
 pub mod sekai_service;
 mod visible_page;

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Dual-write/dual-read object instances through kura without removing the
+  SQL object-type index ([ADR 0081](docs/decisions/0081-kura-object-store-adapter.md)).
+  `SEKAI_OBJECT_STORE=sql|kura|dual` (default sql). Control-plane SQLite and
+  PostgreSQL are unchanged (ADR 0080).
 - Keep SQLite and PostgreSQL as the community control-plane pair
   ([ADR 0080](docs/decisions/0080-dual-community-runtime-storage.md), #870).
   SQLite stays the local default. PostgreSQL stays optional. The embedded

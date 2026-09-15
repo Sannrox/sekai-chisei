@@ -1222,6 +1222,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kura"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2492,6 +2500,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "hyper-util",
+ "kura",
  "metrics",
  "metrics-exporter-prometheus",
  "native-tls",

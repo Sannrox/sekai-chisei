@@ -144,6 +144,10 @@ pub(super) async fn reindex_object_type(
                 Status::internal(error)
             }
         })?;
+    if service.object_store_mode.writes_kura() {
+        crate::grpc::kura_object_store::persist_kind(service, &input.namespace, &input.kind)
+            .map_err(Status::internal)?;
+    }
     let status = service
         .db
         .object_type_index_status(&input.namespace, &input.kind, now_millis())
