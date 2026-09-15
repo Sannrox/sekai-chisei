@@ -6,6 +6,7 @@
 //! from source must restore visible membership and aggregates.
 
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const REGIONS: [&str; 3] = ["eu", "us", "ap"];
@@ -107,6 +108,9 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         );
         CREATE INDEX idx_order_customer ON idx_order(customer_id);
         CREATE INDEX idx_shipment_order ON idx_shipment(order_id);
+        CREATE TABLE idx_two_hop (
+            id INTEGER PRIMARY KEY
+        );
         ",
     )?;
     Ok(())
@@ -171,6 +175,7 @@ pub fn drop_projection(conn: &Connection) -> Result<(), rusqlite::Error> {
         DELETE FROM idx_customer;
         DELETE FROM idx_order;
         DELETE FROM idx_shipment;
+        DELETE FROM idx_two_hop;
         ",
     )?;
     Ok(())
@@ -253,6 +258,116 @@ pub fn two_hop_customer_count(conn: &Connection) -> Result<i64, rusqlite::Error>
         [],
         |row| row.get(0),
     )
+}
+
+/// In-process hash-join two-hop over the same membership projection.
+/// Throwaway candidate for #889; not a shipped engine pick.
+pub fn two_hop_hash_join(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    let mut orders_by_customer: HashMap<i64, Vec<i64>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, customer_id FROM idx_order WHERE hidden = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let order_id: i64 = row.get(0)?;
+            let customer_id: i64 = row.get(1)?;
+            orders_by_customer
+                .entry(customer_id)
+                .or_default()
+                .push(order_id);
+        }
+    }
+    let mut orders_with_shipment = HashSet::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT order_id FROM idx_shipment WHERE hidden = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            orders_with_shipment.insert(row.get::<_, i64>(0)?);
+        }
+    }
+    let mut count = 0i64;
+    let mut stmt = conn.prepare("SELECT id FROM idx_customer WHERE hidden = 0")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let customer_id: i64 = row.get(0)?;
+        if let Some(orders) = orders_by_customer.get(&customer_id)
+            && orders
+                .iter()
+                .any(|order_id| orders_with_shipment.contains(order_id))
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Nested-loop two-hop matching the #878 EvaluateObjectSet hop path.
+/// Unusable at 10⁷; measure only at bounded scale.
+pub fn two_hop_nested_loop(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    let mut customers = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id FROM idx_customer WHERE hidden = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            customers.push(row.get::<_, i64>(0)?);
+        }
+    }
+    let mut orders = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id, customer_id FROM idx_order WHERE hidden = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            orders.push((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?));
+        }
+    }
+    let mut shipments = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT order_id FROM idx_shipment WHERE hidden = 0")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            shipments.push(row.get::<_, i64>(0)?);
+        }
+    }
+    let mut paths: Vec<(i64, i64)> = Vec::new();
+    for customer_id in &customers {
+        for (order_id, order_customer) in &orders {
+            if order_customer == customer_id {
+                paths.push((*customer_id, *order_id));
+            }
+        }
+    }
+    let mut counted = HashSet::new();
+    for (customer_id, order_id) in &paths {
+        for shipment_order in &shipments {
+            if shipment_order == order_id {
+                counted.insert(*customer_id);
+                break;
+            }
+        }
+    }
+    Ok(counted.len() as i64)
+}
+
+/// Rebuildable two-hop reachability projection. Query is a table count;
+/// materialize pays the join once. Throwaway #889 candidate, not a pick.
+pub fn materialize_two_hop_projection(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        DELETE FROM idx_two_hop;
+        INSERT INTO idx_two_hop(id)
+        SELECT c.id
+        FROM idx_customer c
+        JOIN idx_order o ON o.customer_id = c.id
+        JOIN idx_shipment s ON s.order_id = o.id
+        WHERE c.hidden = 0 AND o.hidden = 0 AND s.hidden = 0
+        GROUP BY c.id;
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn two_hop_projection_count(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row("SELECT COUNT(*) FROM idx_two_hop", [], |row| row.get(0))
 }
 
 pub fn source_matches_projection(conn: &Connection) -> Result<bool, rusqlite::Error> {
@@ -393,5 +508,18 @@ mod tests {
         materialize(&conn).unwrap();
         assert!(source_matches_projection(&conn).unwrap());
         assert!(two_hop_customer_count(&conn).unwrap() > 0);
+        assert_eq!(
+            two_hop_customer_count(&conn).unwrap(),
+            two_hop_hash_join(&conn).unwrap()
+        );
+        assert_eq!(
+            two_hop_customer_count(&conn).unwrap(),
+            two_hop_nested_loop(&conn).unwrap()
+        );
+        materialize_two_hop_projection(&conn).unwrap();
+        assert_eq!(
+            two_hop_customer_count(&conn).unwrap(),
+            two_hop_projection_count(&conn).unwrap()
+        );
     }
 }
