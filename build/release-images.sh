@@ -46,7 +46,7 @@ docker run --rm \
   --env SEKAI_GIT_COMMIT="${GIT_COMMIT}" \
   --env SEKAI_GIT_VERSION="${GIT_VERSION}" \
   "${RUST_IMAGE}" \
-  bash -lc 'cargo build --release --locked --workspace --bins &&
+  bash -c 'cargo build --release --locked --workspace --bins &&
     cp /target/release/sekai-chisei /target/release/chisei-gateway /target/release/sekaictl /out/'
 
 docker build \

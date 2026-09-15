@@ -8,6 +8,8 @@ pub fn emit() {
     if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
         println!("cargo:rerun-if-changed={root}/.git/HEAD");
         println!("cargo:rerun-if-changed={root}/.git/index");
+        println!("cargo:rerun-if-changed={root}/.git/packed-refs");
+        println!("cargo:rerun-if-changed={root}/.git/refs/tags");
     }
 
     let pkg = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
