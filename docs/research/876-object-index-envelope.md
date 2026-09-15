@@ -67,8 +67,8 @@ Captured run: 2026-09-15T, same machine as the profile above.
 | Rebuild | 4_925 ms | 216_205 ms |
 
 Membership incremental still holds. Two-hop and aggregate miss the 10⁷
-envelope at 10⁸. #889 stays a contingency: do not pick an alternate engine
-here; re-measure a candidate against this table first.
+envelope at 10⁸ on the on-the-fly SQL plan. The hop-projection candidate
+is recorded in [889-hop-projection-envelope.md](889-hop-projection-envelope.md).
 
 ## Meaning of the miss
 
@@ -89,13 +89,13 @@ to pick an external engine in this note.
   **projection**: register a dataset, materialize members, re-index changed
   keys, fail closed on hidden rows, rebuild from source and Action deltas.
   Two-hop SLA is a non-goal of that Issue.
-- **#878** stays blocked until a query plan meets two-hop ≤ 500 ms on this
-  fixture (or a published successor profile). Do not freeze graph-row scans
-  into the object-set descriptor.
-- **#889** stays a contingency. Re-measure two-hop on the #877 product
-  projection before selecting an alternate engine.
-- **#870** is independent. This envelope used SQLite as a measurement vehicle,
-  not as the runtime storage decision.
+- **#878** landed without claiming the 500 ms two-hop SLA.
+- **#889** is unblocked by the hop-projection envelope in
+  [889-hop-projection-envelope.md](889-hop-projection-envelope.md). Product
+  nested-loop misses at 10⁵; a rebuildable hop-projection query holds at 10⁷.
+- **#870** is unblocked by the embedded-PostgreSQL envelope in
+  [870-embedded-postgres-envelope.md](870-embedded-postgres-envelope.md). This
+  SQLite fixture is still not the runtime storage decision.
 
 ## Alternatives rejected here
 
