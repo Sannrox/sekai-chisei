@@ -1,8 +1,7 @@
-//! Control-plane operability signals.
+//! Shared operability-signal vocabulary copied into the gateway crate.
 //!
-//! Covers the signal families Issue #98 requires: control-plane overhead,
-//! saturation, database waits, queue depth, cache behavior, receipt and audit
-//! lag, fallback, and rejected work.
+//! Gateway production callers emit provider-circuit, fallback, and cache
+//! events. Other helpers stay so label enums match the control-plane copy.
 //!
 //! Every label position takes a closed enum from [`crate::obs::labels`], so no
 //! call site can attach an object id, namespace, or content digest to a time

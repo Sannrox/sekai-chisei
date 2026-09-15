@@ -63,9 +63,11 @@ governance, and operations health—with shared SQLite/PostgreSQL conformance fo
 the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts the
 public control plane against PostgreSQL when `DATABASE_URL` is set and
 migrations/capabilities validate. Some public paths remain SQLite-only and fail
-closed on community Postgres (audited ontology mutations, online permit
-redeem/reconcile, Gunshi allocation state, FTS text search, federation peer
-tables). See [postgres-sekai-parity.md](postgres-sekai-parity.md) and
+closed on community Postgres (audited ontology mutations, query-time ontology
+entailment, dataset row append/query through `RuntimeDb`, online permit
+redeem/reconcile, Gunshi allocation state, federation peer tables, and
+`GetEffectivePolicySummary` budget-limit projection). See
+[postgres-sekai-parity.md](postgres-sekai-parity.md) and
 [postgres-chisei-parity.md](postgres-chisei-parity.md). Backend selection does
 not enable tenant, OIDC, OAuth, or identity endpoints.
 
@@ -118,7 +120,8 @@ value to stdout.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
+| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Preferred over `GATEWAY_PORT`. Non-loopback binds require non-empty `GATEWAY_KEYS` and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
+| `GATEWAY_PORT` | unset | Loopback-only fallback: when `GATEWAY_BIND` is unset, binds `127.0.0.1:{port}` |
 | `CHISEI_GRPC_URL` | unset | Required control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
 | `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |

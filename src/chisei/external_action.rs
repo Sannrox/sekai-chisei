@@ -1,8 +1,7 @@
 //! Versioned contracts and durable authorization state for host-executed actions.
 //!
 //! Chisei decides whether bounded external authority may be granted. It never
-//! executes the action and this module deliberately does not issue permits;
-//! permit signing and redemption are owned by the follow-on permit work.
+//! executes the action. Permit signing and redemption live in `external_permit`.
 
 use crate::db::sekai::SekaiDb;
 use rusqlite::OptionalExtension;

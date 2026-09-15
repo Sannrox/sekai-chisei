@@ -137,6 +137,10 @@ If you want to deploy or operate the control plane:
 - [Epistemic metadata conformance](epistemic-metadata-conformance.md) —
   black-box non-disclosure evidence across graph, receipt, and
   descriptor projections.
+- [Epistemic context operations](epistemic-context-operations.md) — aggregate
+  operator-console projection of context use.
+- [Epistemic replication example](epistemic-replication-example.md) — local
+  fixture walkthrough.
 - [Context admission policy](context-admission-policy.md) — versioned rules
   for using or holding out epistemically qualified context. Gateway fat-decide
   requires a policy and fails closed when it is missing or unavailable.

@@ -1,9 +1,10 @@
 //! Closed-loop self-improvement, promote/rollback stage: turn a `gate_passed` candidate into a
 //! live, governed override of the default routing heuristic, and auto-revert it if the namespace
-//! it applies to later regresses. This generalizes the previously audit-only `eval_regressed`
-//! observation (`gateway.rs`'s `gateway.eval_regression` hook, which only logs) into an active
-//! decision: promotion and rollback are both first-class, audited actions here, and a promoted
-//! candidate has a real effect on live routing (see `ActivePromotions`).
+//! it applies to later regresses. This generalizes the previously observation-only
+//! `eval_regressed` signal (`crates/chisei-gateway` `gateway.eval_regression`, which records a
+//! gateway decision audit) into an active decision: promotion and rollback are both first-class,
+//! audited actions here, and a promoted candidate has a real effect on live routing (see
+//! `ActivePromotions`).
 //!
 //! Every promotion and rollback is recorded as a `chisei.promotion` audit decision — the same
 //! durable, queryable log every other stage of this loop writes to.

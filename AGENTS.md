@@ -2,17 +2,17 @@
 
 ## Project Structure & Module Organization
 
-`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Provider adapters live in `crates/sekai-provider/` (re-exported as `sekai_chisei::llm` from `src/lib.rs`). Protocol definitions are in `proto/`. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state.
+`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Workspace crates include `chisei-gateway`, `sekai-proto`, `sekai-provider` (re-exported as `sekai_chisei::llm`), `sekai-admin-client`, `sekai-client`, and `sekai-ontology`. Canonical protocol files are in `proto/`; keep `crates/sekai-proto/proto/` in byte-for-byte sync. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state. `CLAUDE.md` is a symlink to this file. Domain lifecycle maps live in `CONTEXT.md`.
 
 ## Build, Test, and Development Commands
 
 - `cargo fmt` formats Rust code before review.
 - `cargo test` runs the normal unit and integration test suite.
-- `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default; never combine insecure mode with a non-loopback bind.
+- `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default. Do not combine insecure mode with a non-loopback bind; the server does not reject that combination.
 - `cargo build --release` builds an optimized binary.
 - `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
-Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `DB_PATH`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
+Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `SEKAI_BIND`, `SEKAI_SOCKET`, `DB_PATH`, `SEKAI_DB_BACKEND`, `DATABASE_URL`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 
 GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
 
@@ -52,7 +52,7 @@ Add focused tests for changes touching provider routing, LLM calls, authenticati
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: remove .agents from git tracking`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications.
+Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: sync proto copies`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications. `.agents/skills/` is tracked; do not treat it as gitignored.
 
 ### Verified commits on GitHub
 
