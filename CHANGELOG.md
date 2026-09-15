@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Invoke ontology functions on the in-process host with recorded clock
+  and rng, step/time/output budgets, and principal-scoped reads (#882,
+  [ADR 0072](docs/decisions/0072-in-process-function-host.md)). Guest
+  isolation remains later. `InvokeFunction` is experimental.
 - Run plane-owned incremental dataset transforms with lineage and
   quality quarantine (#880). Definitions are content-addressed; secrets
   are rejected; a failing rule keeps the previous output queryable and

@@ -119,6 +119,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.CreateOntologyRelation` | `sekai.ontology-definitions` | yes | none | `stable` |
 | `SekaiService.DeleteOntologyRelation` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateFunction` | `sekai.function-definitions` | yes | none | `experimental` |
+| `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.ListFunctions` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |

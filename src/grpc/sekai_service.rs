@@ -1023,6 +1023,12 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<ListFunctionsResponse>, Status> {
         rpc_data::list_functions(self, req).await
     }
+    async fn invoke_function(
+        &self,
+        req: Request<InvokeFunctionRequest>,
+    ) -> Result<Response<InvokeFunctionResponse>, Status> {
+        rpc_data::invoke_function(self, req).await
+    }
     async fn create_dataset(
         &self,
         req: Request<CreateDatasetRequest>,

@@ -55,6 +55,21 @@ Invariants at small scale: `sekai::object_index_envelope` unit tests.
 
 Captured run: 2026-09-15T, same machine as the profile above.
 
+### 10⁸ follow-up (same profile, same harness)
+
+| Metric | 10⁷ | 10⁸ |
+| --- | ---: | ---: |
+| Initial materialize | 4_942 ms | 92_401 ms |
+| 1_000-key incremental | 1 ms | 2 ms |
+| p95 filter | 3 ms | 33 ms |
+| p95 aggregate | 32 ms | 357 ms |
+| p95 two-hop | 2_140 ms | 35_356 ms |
+| Rebuild | 4_925 ms | 216_205 ms |
+
+Membership incremental still holds. Two-hop and aggregate miss the 10⁷
+envelope at 10⁸. #889 stays a contingency: do not pick an alternate engine
+here; re-measure a candidate against this table first.
+
 ## Meaning of the miss
 
 Filter + aggregate at 10⁷ is inside 300 ms. Incremental membership update is

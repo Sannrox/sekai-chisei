@@ -934,6 +934,16 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "InvokeFunction",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/sekai/function.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "CreateDataset",
       "kind": "persistent",
       "surfaces": [

@@ -50,10 +50,10 @@ process was not measured.
 
 ## Consequences
 
-Host-API growth is not blocked on a guest engine. #882 remains the guest-code
-runtime and stays implementation-blocked on measurements. Function-backed
-Action validation (#883) still waits on that runtime. A later isolated-process
-profile, if measured, is additive and uses the same host API.
+Host-API growth is not blocked on a guest engine. #882 lands `InvokeFunction`
+on this in-process host: recorded clock/rng, step and time budgets, and
+principal-scoped reads. Guest isolation remains a later additive profile
+after cold start, memory, replay, and CI toolchain are measured.
 
 ## Validation
 

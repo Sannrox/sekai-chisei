@@ -664,6 +664,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "InvokeFunction",
+      "storage_path": "sekai.function-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "CreateDataset",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
