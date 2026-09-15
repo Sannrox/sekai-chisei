@@ -174,13 +174,12 @@ fn linked_library_bytes(postgres: &Path) -> Result<u64, String> {
             paths.insert(real);
             if let Some(name) = path.file_name().and_then(|name| name.to_str())
                 && name.contains("icuuc")
+                && let Some(parent) = path.parent()
             {
-                if let Some(parent) = path.parent() {
-                    for candidate in ["libicudata.78.3.dylib", "libicudata.78.dylib"] {
-                        let data = parent.join(candidate);
-                        if let Ok(real) = data.canonicalize() {
-                            paths.insert(real);
-                        }
+                for candidate in ["libicudata.78.3.dylib", "libicudata.78.dylib"] {
+                    let data = parent.join(candidate);
+                    if let Ok(real) = data.canonicalize() {
+                        paths.insert(real);
                     }
                 }
             }
