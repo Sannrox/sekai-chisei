@@ -3,9 +3,9 @@
 //! Sits above the typed object graph and lets objects be understood by their
 //! meaning and relationships, not only their kind. This module owns the durable
 //! ontology primitives — classes (with inheritance, equivalence, disjointness),
-//! properties, and relations (with domain/range and cardinality) — plus their
-//! SQLite storage, definition validation, and a projection from the existing
-//! `SchemaRegistry`.
+//! properties, and relations (with domain/range and cardinality) — plus
+//! definition validation, a projection from the existing `SchemaRegistry`, and
+//! SQLite storage. PostgreSQL persistence is in `src/db/postgres_ontology.rs`.
 //!
 //! Inference/entailment (#143), endpoint enforcement (#142), and query surfaces
 //! (#144/#145) are intentionally out of scope here; this layer only represents

@@ -51,11 +51,12 @@ the destination write model. See
 [ADR 0073](decisions/0073-source-and-action-objects.md).
 
 Reusable PostgreSQL persistence also covers retention policies, scope-bound
-immutable content, legal and operational holds, transactional garbage
-collection, integrity-checked lifecycle archives, and reversible object
-reconciliation. PostgreSQL collectors serialize per namespace so concurrent
-release, hold, reconciliation, and collection attempts cannot double-delete a
-payload or lose a retaining obligation. Selecting `SEKAI_DB_BACKEND=postgres`
+immutable content, legal and operational holds, integrity-checked lifecycle
+archives (`archive_lifecycle_records`), and reversible object reconciliation.
+PostgreSQL collectors serialize per namespace so concurrent release, hold,
+reconciliation, and archive attempts cannot double-delete a payload or lose a
+retaining obligation. The SQLite `run_retention` / `purge_old_records` /
+`archive_retained_records` helpers remain SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres`
 with a validated `DATABASE_URL` activates these reusable surfaces as the
 community runtime backend; it still does not add tenant, OIDC, OAuth, or
 identity capabilities.
@@ -120,9 +121,10 @@ routing, evaluation gates, outcome attribution, and learning rules.
 
 The LLM provider adapters execute calls but do not own these decisions.
 Provider-specific behavior stays behind the `sekai-provider` crate. The
-`chisei-gateway` crate depends only on `sekai-proto` and `sekai-provider` among
-workspace packages; governed decisions and durable mutations cross the gRPC
-contract instead of reaching into control-plane implementation modules.
+`chisei-gateway` crate depends on `sekai-proto`, `sekai-provider`, and
+`sekai-admin-client` among workspace packages; governed decisions and durable
+mutations cross the gRPC contract instead of reaching into control-plane
+implementation modules.
 
 Provider registry persistence and lifecycle records are owned by
 `provider_profile`; `provider_resolution` is the single orchestration boundary
@@ -382,15 +384,16 @@ mutations, team-namespace bootstrap, principal credentials, coordination and
 work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Known community Postgres fail-closed exceptions include public
-audited ontology mutation RPCs (`upsert_*_with_audit`), FTS text search,
-federation peer tables, registered Iceberg/Parquet snapshot projections,
+audited ontology mutation RPCs (`upsert_*_with_audit`), query-time ontology
+entailment, federation peer tables, registered Iceberg/Parquet snapshot projections,
 governed documents and renditions,
 governed images, renditions, and annotations,
 capability-package certifications,
 federation network contracts,
 versioned client packages,
 and (on the Chisei side)
-online permit redeem and Gunshi allocation state — see the parity guides.
+online permit redeem, Gunshi allocation state, and
+`GetEffectivePolicySummary` budget-limit projection — see the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

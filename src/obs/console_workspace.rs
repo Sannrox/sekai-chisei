@@ -22,7 +22,7 @@ use std::time::Instant;
 /// (receipt projection + HTML/JSON render). Larger historical lists are capped.
 pub const WORKSPACE_INITIAL_LOAD_BUDGET_MS: u128 = 2_000;
 
-/// Max operations returned on the namespace operations home (S1 list stub).
+/// Max operations returned on the namespace operations home.
 pub const OPERATIONS_LIST_LIMIT: usize = 50;
 
 /// Look-back window for the operations list (7 days).

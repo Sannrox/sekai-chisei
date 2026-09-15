@@ -1,8 +1,7 @@
 //! Governed ActionInstance admission (#397 / research #395).
 //!
 //! Thin durable decision envelope: type + parameters + idempotency →
-//! admit/deny with a bound `operation_id`.
-//! Effects materialization is #398.
+//! admit/deny with a bound `operation_id`. Effects live in `action_effect`.
 
 use crate::db::sekai::SekaiDb;
 use rusqlite::{OptionalExtension, params};

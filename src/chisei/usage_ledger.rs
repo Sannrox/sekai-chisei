@@ -408,14 +408,9 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageEvent> {
     })
 }
 
-// Keep hex without adding a dependency if hex crate missing - check
-// use simple format instead
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
-
-// Fix stable_event_id if hex crate unavailable - use local encoder
-// Patch after compile if needed
 
 #[cfg(test)]
 mod tests {

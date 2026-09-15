@@ -149,6 +149,8 @@ lives in the separate [research index](research/README.md).
   observations and missing-evidence reconciliation.
 - [Governed subject evaluation](governed-subjects.md) — payload-free,
   content-bound evaluation through registered profiles.
+- [Evaluation plans and evaluator definitions](evaluation-plans.md) —
+  situation-specific deterministic and bounded stochastic contracts.
 - [Resolved evaluation manifests](evaluation-manifests.md) — authorized,
   content-bound evaluation-plan resolution without evaluator execution.
 - [Evaluation execution](evaluation-execution.md) — exact-digest compiled or
@@ -165,6 +167,19 @@ lives in the separate [research index](research/README.md).
 - [Generation-fenced leases](leases.md) — object-bound coordination.
 - [Gunshi auto-allocation](gunshi-auto-allocation.md) — evaluation-gated
   promotion and bounded automatic dispatch.
+- [Epistemic Kioku context evaluation](epistemic-context-evaluation.md) —
+  matched claim-only/framed comparison with digest-bound metrics and gates.
+- [Kioku evidence reassessment](kioku-evidence-reassessment.md) — explicit,
+  review-gated successor candidates when admitted evidence changes.
+- [Epistemic descriptor](epistemic-descriptor.md) — additive origin, evidence,
+  and lifecycle metadata on existing context references.
+- [Epistemic metadata conformance](epistemic-metadata-conformance.md) —
+  black-box non-disclosure evidence across graph, receipt, and descriptor
+  projections.
+- [Epistemic context operations](epistemic-context-operations.md) — aggregate
+  operator-console projection of context use.
+- [Epistemic replication example](epistemic-replication-example.md) —
+  local fixture walkthrough for the replication example.
 
 ## Security, classification, and federation
 

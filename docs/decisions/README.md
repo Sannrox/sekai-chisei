@@ -16,6 +16,7 @@ Routine implementation detail stays in its Issue and pull request.
    solo-maintained repository, the accountable maintainer may instead resolve
    them in the source Issue and proposed ADR pull request.
 2. Copy `0000-template.md` to the next zero-padded number and a short slug.
+   Numbers `0006` and `0014` were skipped and remain unused.
 3. Open the ADR and implementation in the same PR when practical.
 4. Set the status to `accepted` when merged.
 5. Never rewrite the history of a superseded decision. Add a new ADR and link

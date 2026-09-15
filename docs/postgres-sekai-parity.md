@@ -62,6 +62,11 @@ treat inventory “complete” as dual-backend for these RPCs):
   lookup-first expansion in `entailment` mode; see
   [ADR 0001](decisions/0001-query-time-ontology-entailment.md) and
   [capability catalog](capability-catalog.md));
+- dataset row `append_rows` / `query_rows` through the community `RuntimeDb`
+  dispatcher;
+- execution-evidence reject and record helpers used by evidence admission;
+- SQLite-named retention run/purge/`archive_retained_records` (Postgres uses
+  `archive_lifecycle_records` instead);
 - multi-control-plane federation site/peer tables (see
   [federation-profile.md](federation-profile.md));
 - purpose authorizations for `required_purpose` reads (`sekai.purpose-authorization/v1`;

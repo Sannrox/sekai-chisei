@@ -11,7 +11,7 @@ explicit computed/query paths with named durable dependencies.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| `chisei.budget` | Proven | `tests/chisei_budget_backend_conformance.rs` |
+| `chisei.budget` | Proven for reserve/usage; **`budget_limits_for_scope` / `GetEffectivePolicySummary` limit projection SQLite-only** | `tests/chisei_budget_backend_conformance.rs`; `RuntimeDb::budget_limits_for_scope` fails closed on Postgres |
 | `chisei.execution` | Proven | `tests/chisei_execution_backend_conformance.rs` |
 | `chisei.evaluation` / samples | Proven | `tests/chisei_eval_backend_conformance.rs` |
 | `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
@@ -52,12 +52,14 @@ CAS (see table above).
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
 - Control-plane **online redeem**, offline reconcile, delegation-chain
-  validation, and Gunshi allocation state (SQLite-only community runtime)
+  validation, Gunshi allocation state, and `GetEffectivePolicySummary`
+  budget-limit projection (SQLite-only community runtime)
 
 ## Operator posture
 
 SQLite remains the default community backend. Select PostgreSQL with
-`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for dual-backend budgets, policy,
-execution, Kioku, and gateway governance. Prefer SQLite when hosts must redeem
-online permits or use Gunshi auto-allocation durability (see
+`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for dual-backend budget
+reserve/usage, policy, execution, Kioku, and gateway governance. Prefer SQLite
+when hosts must redeem online permits, read `GetEffectivePolicySummary` budget
+limits, or use Gunshi auto-allocation durability (see
 [configuration.md](configuration.md) and #238).
