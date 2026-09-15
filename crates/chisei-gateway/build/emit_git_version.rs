@@ -1,7 +1,16 @@
 use std::process::Command;
 
 pub fn emit() {
-    // No rerun-if-changed: git describe --dirty depends on the whole worktree.
+    // Image wrap refuses dirty trees. Host identity follows git metadata and
+    // SEKAI_GIT_* overrides, not every unstaged file in the repository.
+    println!("cargo:rerun-if-env-changed=SEKAI_GIT_VERSION");
+    println!("cargo:rerun-if-env-changed=SEKAI_GIT_COMMIT");
+    if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
+        println!("cargo:rerun-if-changed={root}/.git/HEAD");
+        println!("cargo:rerun-if-changed={root}/.git/index");
+        println!("cargo:rerun-if-changed={root}/.git/packed-refs");
+        println!("cargo:rerun-if-changed={root}/.git/refs/tags");
+    }
     let pkg = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
     let version = first_nonempty(&[
         env_nonempty("SEKAI_GIT_VERSION"),
