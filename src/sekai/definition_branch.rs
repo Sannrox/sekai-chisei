@@ -30,6 +30,8 @@ const KNOWN_MEMBER_KINDS: &[&str] = &[
     "object_type",
     "ontology_class",
     "ontology_relation",
+    "policy",
+    "transform",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +88,18 @@ pub struct DefinitionBranch {
     pub created_by: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+pub fn branch_pin_digest(branch: &DefinitionBranch) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(BRANCH_CONTRACT_VERSION.as_bytes());
+    hasher.update(b"\nbranch_pin\n");
+    hasher.update(branch.namespace.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(branch.branch_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(branch.head_revision_digest.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,5 +660,43 @@ mod tests {
             idempotency_key: "request-1".into(),
         };
         assert!(request.prepare().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn branch_pin_is_content_addressed_to_contract_identity_and_head() {
+        let branch = DefinitionBranch {
+            contract_version: BRANCH_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            base_revision_digest: digest('a'),
+            head_revision_digest: digest('b'),
+            created_by: "author".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let pin = branch_pin_digest(&branch);
+        assert!(pin.starts_with("sha256:"));
+        assert_eq!(pin.len(), 71);
+        assert_eq!(pin, branch_pin_digest(&branch));
+        let mut advanced = branch.clone();
+        advanced.head_revision_digest = digest('c');
+        assert_ne!(pin, branch_pin_digest(&advanced));
+        let mut renamed = branch;
+        renamed.branch_id = "other".into();
+        assert_ne!(pin, branch_pin_digest(&renamed));
+    }
+
+    #[test]
+    fn policy_and_transform_are_known_member_kinds() {
+        for kind in ["policy", "transform", "function"] {
+            DefinitionMemberInput {
+                member_kind: kind.into(),
+                member_id: "Artifact".into(),
+                definition_json: r#"{"name":"Artifact"}"#.into(),
+                member_digest: String::new(),
+            }
+            .prepare("team-a")
+            .unwrap();
+        }
     }
 }

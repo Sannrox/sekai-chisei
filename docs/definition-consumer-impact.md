@@ -1,8 +1,10 @@
 # Authorized consumer impact
 
 `ReportDefinitionConsumerImpact` joins `CompareDefinitionRevisions` to
-explicit `sekai.definition-consumer-binding/v1` objects. The plane does
-not scan repositories or infer undeclared dependents.
+explicit `sekai.definition-consumer-binding/v1` objects. Bindings may name
+`object_type`, `function`, `transform`, and `policy` members, and the
+report lists every visible hit across those kinds. The plane does not
+scan repositories or infer undeclared dependents.
 
 Registration, refresh, and revocation are ordinary authorized object
 writes of kind `definition_consumer_binding`. Foreign owners cannot

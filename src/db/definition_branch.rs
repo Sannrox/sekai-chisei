@@ -832,6 +832,18 @@ impl SekaiDb {
         require_descendant_candidate(&candidate, &proposal.base_digest, |digest| {
             load_revision_sqlite(&transaction, &proposal.namespace, digest)
         })?;
+        let published_revision =
+            load_revision_sqlite(&transaction, &proposal.namespace, &published)?.ok_or_else(
+                || "definition_revision_not_found: published revision is unavailable".to_string(),
+            )?;
+        let published_members = load_members_sqlite(&transaction, &published_revision)?;
+        let candidate_members = load_members_sqlite(&transaction, &candidate)?;
+        crate::sekai::definition_diff::require_merge_compatibility(
+            &published_revision,
+            &published_members,
+            &candidate,
+            &candidate_members,
+        )?;
         let receipt_id = merge_receipt_id(
             &proposal.namespace,
             &proposal.proposal_id,

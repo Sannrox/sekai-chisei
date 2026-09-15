@@ -232,13 +232,33 @@ mod tests {
         locator: &str,
         digest: Option<&str>,
     ) -> Object {
+        kind_binding_object(
+            id,
+            owner,
+            "object_type",
+            "Customer",
+            property,
+            locator,
+            digest,
+        )
+    }
+
+    fn kind_binding_object(
+        id: &str,
+        owner: &str,
+        member_kind: &str,
+        member_id: &str,
+        property: &str,
+        locator: &str,
+        digest: Option<&str>,
+    ) -> Object {
         let mut binding = DefinitionConsumerBinding {
             contract_version: BINDING_CONTRACT.into(),
             owner: owner.into(),
             resource_identity: format!("app:{id}"),
             namespace: "sales".into(),
-            member_kind: "object_type".into(),
-            member_id: "Customer".into(),
+            member_kind: member_kind.into(),
+            member_id: member_id.into(),
             property: property.into(),
             declaration_digest: String::new(),
             source_locator: locator.into(),
@@ -328,5 +348,108 @@ mod tests {
         );
         assert_eq!(report.completeness, COMPLETENESS_STALE);
         assert!(report.impacts.is_empty());
+    }
+
+    #[test]
+    fn impact_lists_consumers_across_type_function_transform_and_policy() {
+        let diff = DefinitionRevisionDiff {
+            from_revision_digest: "sha256:from".into(),
+            to_revision_digest: "sha256:to".into(),
+            diff_digest: "sha256:diff".into(),
+            added: Vec::new(),
+            removed: vec![
+                DefinitionMemberChange {
+                    member_kind: "function".into(),
+                    member_id: "CountOpen".into(),
+                    from_member_digest: "sha256:fn".into(),
+                    to_member_digest: String::new(),
+                    added_properties: Vec::new(),
+                    removed_properties: Vec::new(),
+                    changed_properties: Vec::new(),
+                },
+                DefinitionMemberChange {
+                    member_kind: "transform".into(),
+                    member_id: "ProjectTickets".into(),
+                    from_member_digest: "sha256:tf".into(),
+                    to_member_digest: String::new(),
+                    added_properties: Vec::new(),
+                    removed_properties: Vec::new(),
+                    changed_properties: Vec::new(),
+                },
+                DefinitionMemberChange {
+                    member_kind: "policy".into(),
+                    member_id: "TicketPolicy".into(),
+                    from_member_digest: "sha256:pol".into(),
+                    to_member_digest: String::new(),
+                    added_properties: Vec::new(),
+                    removed_properties: Vec::new(),
+                    changed_properties: Vec::new(),
+                },
+            ],
+            changed: vec![DefinitionMemberChange {
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                from_member_digest: "sha256:a".into(),
+                to_member_digest: "sha256:b".into(),
+                added_properties: Vec::new(),
+                removed_properties: vec!["owner".into()],
+                changed_properties: Vec::new(),
+            }],
+        };
+        let report = report_consumer_impact(
+            &diff,
+            &[
+                kind_binding_object(
+                    "crm",
+                    "alice",
+                    "object_type",
+                    "Ticket",
+                    "owner",
+                    "app://crm#owner",
+                    None,
+                ),
+                kind_binding_object(
+                    "count",
+                    "bob",
+                    "function",
+                    "CountOpen",
+                    "",
+                    "app://count#fn",
+                    None,
+                ),
+                kind_binding_object(
+                    "proj",
+                    "cara",
+                    "transform",
+                    "ProjectTickets",
+                    "",
+                    "app://proj#tf",
+                    None,
+                ),
+                kind_binding_object(
+                    "acl",
+                    "drew",
+                    "policy",
+                    "TicketPolicy",
+                    "",
+                    "app://acl#policy",
+                    None,
+                ),
+            ],
+        );
+        assert_eq!(report.completeness, COMPLETENESS_COMPLETE);
+        assert_eq!(
+            report
+                .impacts
+                .iter()
+                .map(|impact| (impact.member_kind.as_str(), impact.member_id.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("object_type", "Ticket"),
+                ("function", "CountOpen"),
+                ("transform", "ProjectTickets"),
+                ("policy", "TicketPolicy"),
+            ]
+        );
     }
 }

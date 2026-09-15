@@ -4,7 +4,7 @@ use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
-    DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
+    DefinitionRevisionMember, DefinitionWriteResult, branch_pin_digest, prepare_revision,
 };
 use sekai_chisei::sekai::definition_diff::{
     classify_definition_revision_compatibility, compare_definition_revisions,
@@ -77,6 +77,9 @@ fn exercise_backend(db: &dyn DefinitionBranchBackend, namespace: &str) {
     };
     assert_eq!(branch.base_revision_digest, parent_digest);
     assert_eq!(branch.head_revision_digest, parent_digest);
+    let created_pin = branch_pin_digest(&branch);
+    assert!(created_pin.starts_with("sha256:"));
+    assert_eq!(created_pin.len(), 71);
 
     let edit = ApplyDefinitionBranchEdit {
         namespace: namespace.into(),
@@ -114,6 +117,15 @@ fn exercise_backend(db: &dyn DefinitionBranchBackend, namespace: &str) {
             .unwrap()
             .unwrap(),
         result.branch
+    );
+    assert_ne!(created_pin, branch_pin_digest(&result.branch));
+    assert_eq!(
+        branch_pin_digest(&result.branch),
+        branch_pin_digest(
+            &db.get_definition_branch(namespace, "feature")
+                .unwrap()
+                .unwrap()
+        )
     );
 
     let parent = db
@@ -723,12 +735,241 @@ fn exercise_revision_compatibility(db: &dyn DefinitionBranchBackend, namespace: 
     );
 }
 
+fn seed_four_kinds(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+) -> (String, CreateDefinitionBranch) {
+    let inputs = [
+        typed_member(
+            namespace,
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title"]}"#,
+        ),
+        typed_member(
+            namespace,
+            "function",
+            "CountOpen",
+            r#"{"name":"CountOpen"}"#,
+        ),
+        typed_member(
+            namespace,
+            "transform",
+            "ProjectTickets",
+            r#"{"name":"ProjectTickets"}"#,
+        ),
+        typed_member(
+            namespace,
+            "policy",
+            "TicketPolicy",
+            r#"{"name":"TicketPolicy"}"#,
+        ),
+    ];
+    let prepared = inputs
+        .iter()
+        .map(|input| input.prepare(namespace).unwrap())
+        .collect::<Vec<_>>();
+    let revision = prepare_revision(
+        namespace,
+        "",
+        prepared.iter().map(|member| DefinitionRevisionMember {
+            member_kind: member.member_kind.clone(),
+            member_id: member.member_id.clone(),
+            member_digest: member.member_digest.clone(),
+        }),
+        true,
+        "root",
+        1,
+    )
+    .unwrap();
+    db.seed_published_definition_revision(&revision, &prepared)
+        .unwrap();
+    let request = CreateDefinitionBranch {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        parent_revision_digest: revision.revision_digest.clone(),
+        idempotency_key: "create-four".into(),
+    };
+    (revision.revision_digest, request)
+}
+
+fn exercise_coordinated_artifact_merge(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent_digest, create) = seed_four_kinds(db, namespace);
+    db.create_definition_branch(&create, "author", 2).unwrap();
+    let compatible_edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: parent_digest.clone(),
+        upserts: vec![
+            typed_member(
+                namespace,
+                "object_type",
+                "Ticket",
+                r#"{"name":"Ticket","properties":["title","body"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "function",
+                "CountOpen",
+                r#"{"name":"CountOpen","properties":["query"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "transform",
+                "ProjectTickets",
+                r#"{"name":"ProjectTickets","properties":["output"]}"#,
+            ),
+            typed_member(
+                namespace,
+                "policy",
+                "TicketPolicy",
+                r#"{"name":"TicketPolicy","properties":["marking"]}"#,
+            ),
+        ],
+        removals: Vec::new(),
+        idempotency_key: "edit-four".into(),
+    };
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(&compatible_edit, "author", 3)
+        .unwrap()
+    else {
+        panic!("expected four-kind edit");
+    };
+    let candidate = result.revision.revision_digest.clone();
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-four".into(),
+            base_digest: parent_digest.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "propose-four".into(),
+        },
+        "author",
+        4,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "cs-four".into(),
+            idempotency_key: "approve-four".into(),
+        },
+        "author",
+        5,
+    )
+    .unwrap();
+    let DefinitionWriteResult::MergeProposal { result: merged } = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "cs-four".into(),
+                expected_published_digest: parent_digest.clone(),
+                idempotency_key: "merge-four".into(),
+            },
+            "author",
+            6,
+        )
+        .unwrap()
+    else {
+        panic!("expected four-kind merge");
+    };
+    assert_eq!(merged.proposal.status, STATUS_MERGED);
+    let published = db
+        .get_published_definition_revision(namespace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.revision_digest, candidate);
+    let kinds = published
+        .members
+        .iter()
+        .map(|member| member.member_kind.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["function", "object_type", "policy", "transform"]);
+}
+
+fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent_digest, create) = seed_four_kinds(db, namespace);
+    db.create_definition_branch(&create, "author", 2).unwrap();
+    let breaking_edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: parent_digest.clone(),
+        upserts: vec![typed_member(
+            namespace,
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title","body"]}"#,
+        )],
+        removals: vec![DefinitionMemberRef {
+            member_kind: "function".into(),
+            member_id: "CountOpen".into(),
+        }],
+        idempotency_key: "edit-gate".into(),
+    };
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(&breaking_edit, "author", 3)
+        .unwrap()
+    else {
+        panic!("expected gate edit");
+    };
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-gate".into(),
+            base_digest: parent_digest.clone(),
+            candidate_digest: result.revision.revision_digest.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "propose-gate".into(),
+        },
+        "author",
+        4,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "cs-gate".into(),
+            idempotency_key: "approve-gate".into(),
+        },
+        "author",
+        5,
+    )
+    .unwrap();
+    let error = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "cs-gate".into(),
+                expected_published_digest: parent_digest.clone(),
+                idempotency_key: "merge-gate".into(),
+            },
+            "author",
+            6,
+        )
+        .unwrap_err();
+    assert_eq!(error, "compatibility_gate:function");
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent_digest
+    );
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
     exercise_backend(&SekaiDb::new(":memory:").unwrap(), "sqlite-definition");
     exercise_proposal_publish(&SekaiDb::new(":memory:").unwrap(), "sqlite-proposal");
     exercise_revision_diff(&SekaiDb::new(":memory:").unwrap(), "sqlite-diff");
     exercise_revision_compatibility(&SekaiDb::new(":memory:").unwrap(), "sqlite-compat");
+    exercise_coordinated_artifact_merge(&SekaiDb::new(":memory:").unwrap(), "sqlite-four-kind");
+    exercise_named_compatibility_gate_refusal(&SekaiDb::new(":memory:").unwrap(), "sqlite-gate");
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -754,5 +995,7 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_proposal_publish(db.as_ref(), &format!("{prefix}-proposal"));
     exercise_revision_diff(db.as_ref(), &format!("{prefix}-diff"));
     exercise_revision_compatibility(db.as_ref(), &format!("{prefix}-compat"));
+    exercise_coordinated_artifact_merge(db.as_ref(), &format!("{prefix}-four-kind"));
+    exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
     exercise_concurrent_stale_head(db, &format!("{prefix}-concurrent"));
 }
