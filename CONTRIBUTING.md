@@ -58,6 +58,16 @@ The build vendors `protoc`; a system installation is not required.
   `tests/ollama_e2e.rs`, and document their prerequisites.
 - Run `scripts/chisei_gateway_smoke.sh` for gateway changes. It uses fake
   upstreams and does not require provider credentials.
+- Run `cargo test --test native_server_smoke --locked` for native control-plane
+  process smoke. It spawns the compiled `sekai-chisei` binary, a loopback
+  OpenAI-compatible fake for Ollama, and drives `sekaictl` plus public gRPC
+  over a temp Unix socket. It does not require live provider credentials.
+- Run `cargo test --test gateway_http_smoke --locked` for gateway HTTP process
+  smoke. It spawns `sekai-chisei`, `chisei-gateway`, and a loopback OpenAI/
+  Anthropic fake, then hits health/readiness, missing and wrong keys,
+  disallowed models, `/v1/responses`, `/v1/chat/completions`, `/v1/messages`
+  (including streams), `/v1/models`, and fail-closed when the control plane is
+  down. It does not require live provider credentials.
 
 Changes to provider routing, LLM calls, authentication, authorization,
 persistence, migrations, evidence, retention, or coordination require focused
