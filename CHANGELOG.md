@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Honor a presented bearer on insecure TCP and HTTP the same way UDS
+  already does (#929). Missing bearer stays local; caller-selected tenant
+  headers still fail closed. Token-auth TCP is unchanged.
 - Coordinate definition-branch edits across object types, functions,
   transforms, and policies in one revision (#890). Merge refuses a
   breaking function, transform, or policy change, or any unknown kind,
