@@ -4,9 +4,9 @@ A registered dataset plus key mapping is the **source of members** for a type
 revision. The index is a rebuildable **projection**. It is not object
 authority: delete it and rematerialize from dataset rows and Action deltas.
 
-See [ADR 0073](decisions/0073-source-and-action-objects.md) and the published
-[10⁷ envelope](research/876-object-index-envelope.md). Aggregations and
-multi-hop (#878) and an alternate engine (#889) are out of scope.
+See [ADR 0073](decisions/0073-source-and-action-objects.md), the published
+[10⁷ envelope](research/876-object-index-envelope.md), and the
+[hop-projection envelope](research/889-hop-projection-envelope.md).
 
 ## Operator path
 
@@ -35,6 +35,9 @@ output queryable.
 
 `sekai.object-set/v2` can group count/sum/min/max/avg/distinct across bounded
 index hops (`join_property`). Cost limits (`max_rows_scanned`, `max_depth`,
-`max_time_ms`) fail closed with the limit named. Two-hop at 10⁷ is still
-outside the 500 ms envelope; do not treat a miss as a second object
-authority.
+`max_time_ms`) fail closed with the limit named. `SEKAI_OBJECT_INDEX_ENGINE`
+selects `nested-loop` (default) or `hop-projection`. Hop-projection is a
+rebuildable join-key projection, not object authority; switching engines
+requires `ReindexObjectType`. `SEKAI_OBJECT_INDEX_DUAL_READ=1` compares both
+plans and fails closed on mismatch. Hidden rows stay out of members,
+aggregates, and hop edges.

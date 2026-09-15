@@ -130,6 +130,12 @@ impl PostgresDb {
                     &[&namespace, &kind],
                 )
                 .map_err(|error| error.to_string())?;
+            self.connection()?
+                .execute(
+                    "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?;
         }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
@@ -156,6 +162,7 @@ impl PostgresDb {
             rewritten += 1;
         }
         let member_count = self.count_visible_index_members(namespace, kind)?;
+        self.rebuild_kind_join(namespace, kind, now_ms)?;
         self.connection()?
             .execute(
                 "INSERT INTO sekai_object_type_index_status
@@ -337,8 +344,190 @@ impl PostgresDb {
                     &member.from_edit,
                 ],
             )
+            .map_err(|error| error.to_string())?;
+        self.replace_index_join(member)
+    }
+
+    fn replace_index_join(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM sekai_object_type_index_join
+                 WHERE namespace=$1 AND kind=$2 AND source_key=$3",
+                &[&member.namespace, &member.kind, &member.source_key],
+            )
+            .map_err(|error| error.to_string())?;
+        if member.hidden {
+            return Ok(());
+        }
+        for (property, value) in &member.properties {
+            let digest = crate::sekai::object_type_index::join_value_digest(value);
+            self.connection()?
+                .execute(
+                    "INSERT INTO sekai_object_type_index_join
+                     (namespace, kind, property, value_digest, source_key, value)
+                     VALUES ($1,$2,$3,$4,$5,$6)
+                     ON CONFLICT (namespace, kind, property, value_digest, source_key) DO NOTHING",
+                    &[
+                        &member.namespace,
+                        &member.kind,
+                        property,
+                        &digest,
+                        &member.source_key,
+                        value,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            )
+            .map_err(|error| error.to_string())?;
+        let members = self.list_visible_index_members(
+            namespace,
+            kind,
+            &crate::sekai::dataset::RowQuery::default(),
+        )?;
+        for member in members {
+            self.replace_index_join(&member)?;
+        }
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_object_type_index_join_status
+                 (namespace, kind, ready, rebuilt_at_ms)
+                 VALUES ($1,$2,TRUE,$3)
+                 ON CONFLICT (namespace, kind) DO UPDATE SET
+                   ready = TRUE,
+                   rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
+                &[&namespace, &kind, &now_ms],
+            )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                "SELECT ready FROM sekai_object_type_index_join_status
+                 WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            )
+            .map_err(|error| error.to_string())?
+            .is_some_and(|row| row.get(0)))
+    }
+
+    pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
+        self.connection()?
+            .query_one(
+                "SELECT COUNT(*) FROM sekai_object_type_index_join
+                 WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            )
+            .map(|row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_index_join_children(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if values.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in values.chunks(400) {
+                out.extend(self.list_index_join_children(namespace, kind, property, chunk)?);
+            }
+            return Ok(out);
+        }
+        let digests: Vec<String> = values
+            .iter()
+            .map(|value| crate::sekai::object_type_index::join_value_digest(value))
+            .collect();
+        let placeholders = (0..digests.len())
+            .map(|index| format!("${}", index + 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT value, source_key FROM sekai_object_type_index_join
+             WHERE namespace=$1 AND kind=$2 AND property=$3 AND value_digest IN ({placeholders})"
+        );
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+            vec![&namespace, &kind, &property];
+        for digest in &digests {
+            params.push(digest);
+        }
+        let wanted: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
+        self.connection()?
+            .query(&sql, params.as_slice())
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|row| {
+                let value: String = row.get(0);
+                wanted
+                    .contains(value.as_str())
+                    .then(|| Ok((value, row.get(1))))
+            })
+            .collect()
+    }
+
+    pub fn list_index_members_by_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in keys.chunks(400) {
+                out.extend(self.list_index_members_by_keys(namespace, kind, chunk)?);
+            }
+            return Ok(out);
+        }
+        let placeholders = (0..keys.len())
+            .map(|index| format!("${}", index + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_key, object_id, properties, content_hash, hidden, from_edit
+             FROM sekai_object_type_index_member
+             WHERE namespace=$1 AND kind=$2 AND hidden=FALSE AND source_key IN ({placeholders})"
+        );
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&namespace, &kind];
+        for key in keys {
+            params.push(key);
+        }
+        self.connection()?
+            .query(&sql, params.as_slice())
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let properties: String = row.get(2);
+                Ok(ObjectTypeIndexMember {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key: row.get(0),
+                    object_id: row.get(1),
+                    properties: serde_json::from_str(&properties).map_err(|e| e.to_string())?,
+                    content_hash: row.get(3),
+                    hidden: false,
+                    from_edit: row.get(5),
+                })
+            })
+            .collect()
     }
 
     fn mark_index_quarantined(

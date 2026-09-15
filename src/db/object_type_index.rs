@@ -53,6 +53,26 @@ impl SekaiDb {
                     hidden INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (namespace, kind, source_key)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_object_type_index_join (
+                    namespace TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    property TEXT NOT NULL,
+                    value_digest TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    PRIMARY KEY (namespace, kind, property, value_digest, source_key)
+                );
+                CREATE INDEX IF NOT EXISTS sekai_object_type_index_join_lookup
+                    ON sekai_object_type_index_join (namespace, kind, property, value_digest);
+                CREATE INDEX IF NOT EXISTS sekai_object_type_index_join_member
+                    ON sekai_object_type_index_join (namespace, kind, source_key);
+                CREATE TABLE IF NOT EXISTS sekai_object_type_index_join_status (
+                    namespace TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    ready INTEGER NOT NULL DEFAULT 0,
+                    rebuilt_at_ms INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (namespace, kind)
+                );
                 ",
             )
             .map_err(|error| error.to_string())
@@ -187,6 +207,12 @@ impl SekaiDb {
                     params![namespace, kind],
                 )
                 .map_err(|error| error.to_string())?;
+            self.conn()
+                .execute(
+                    "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
         }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
@@ -215,6 +241,7 @@ impl SekaiDb {
             rewritten += 1;
         }
         let member_count = self.count_visible_index_members(namespace, kind)?;
+        self.rebuild_kind_join(namespace, kind, now_ms)?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_object_type_index_status
@@ -389,8 +416,183 @@ impl SekaiDb {
                     i64::from(member.from_edit)
                 ],
             )
+            .map_err(|error| error.to_string())?;
+        self.replace_index_join(member)
+    }
+
+    fn replace_index_join(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_join
+                 WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
+                params![member.namespace, member.kind, member.source_key],
+            )
+            .map_err(|error| error.to_string())?;
+        if member.hidden {
+            return Ok(());
+        }
+        for (property, value) in &member.properties {
+            let digest = crate::sekai::object_type_index::join_value_digest(value);
+            self.conn()
+                .execute(
+                    "INSERT OR REPLACE INTO sekai_object_type_index_join
+                     (namespace, kind, property, value_digest, source_key, value)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        member.namespace,
+                        member.kind,
+                        property,
+                        digest,
+                        member.source_key,
+                        value
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
+                params![namespace, kind],
+            )
+            .map_err(|error| error.to_string())?;
+        let members = self.list_visible_index_members(
+            namespace,
+            kind,
+            &crate::sekai::dataset::RowQuery::default(),
+        )?;
+        for member in members {
+            self.replace_index_join(&member)?;
+        }
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO sekai_object_type_index_join_status
+                 (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,1,?3)",
+                params![namespace, kind, now_ms],
+            )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        self.conn()
+            .query_row(
+                "SELECT ready FROM sekai_object_type_index_join_status
+                 WHERE namespace = ?1 AND kind = ?2",
+                params![namespace, kind],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .optional_row()
+            .map(|value| value.unwrap_or(false))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_object_type_index_join
+                 WHERE namespace = ?1 AND kind = ?2",
+                params![namespace, kind],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_index_join_children(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        values: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if values.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in values.chunks(400) {
+                out.extend(self.list_index_join_children(namespace, kind, property, chunk)?);
+            }
+            return Ok(out);
+        }
+        let conn = self.conn();
+        let digests: Vec<String> = values
+            .iter()
+            .map(|value| crate::sekai::object_type_index::join_value_digest(value))
+            .collect();
+        let placeholders = vec!["?"; digests.len()].join(",");
+        let sql = format!(
+            "SELECT value, source_key FROM sekai_object_type_index_join
+             WHERE namespace = ?1 AND kind = ?2 AND property = ?3 AND value_digest IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind, &property];
+        for digest in &digests {
+            params.push(digest);
+        }
+        let wanted: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let value: String = row.get(0).map_err(|error| error.to_string())?;
+            if wanted.contains(value.as_str()) {
+                out.push((value, row.get(1).map_err(|error| error.to_string())?));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_index_members_by_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in keys.chunks(400) {
+                out.extend(self.list_index_members_by_keys(namespace, kind, chunk)?);
+            }
+            return Ok(out);
+        }
+        let conn = self.conn();
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT source_key, object_id, properties, content_hash, hidden, from_edit
+             FROM sekai_object_type_index_member
+             WHERE namespace = ?1 AND kind = ?2 AND hidden = 0 AND source_key IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind];
+        for key in keys {
+            params.push(key);
+        }
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|error| error.to_string())?;
+        let mut members = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let properties: String = row.get(2).map_err(|error| error.to_string())?;
+            members.push(ObjectTypeIndexMember {
+                namespace: namespace.into(),
+                kind: kind.into(),
+                source_key: row.get(0).map_err(|error| error.to_string())?,
+                object_id: row.get(1).map_err(|error| error.to_string())?,
+                properties: serde_json::from_str(&properties).map_err(|error| error.to_string())?,
+                content_hash: row.get(3).map_err(|error| error.to_string())?,
+                hidden: false,
+                from_edit: row.get::<_, i64>(5).map_err(|error| error.to_string())? != 0,
+            });
+        }
+        Ok(members)
     }
 
     fn mark_index_quarantined(

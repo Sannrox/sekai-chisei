@@ -58,6 +58,7 @@ pub mod markings;
 pub mod model_platform;
 pub mod namespace_snapshot;
 pub mod object_change_subscription;
+pub mod object_index_engine;
 pub mod object_index_envelope;
 pub mod object_lineage;
 pub mod object_mutation;

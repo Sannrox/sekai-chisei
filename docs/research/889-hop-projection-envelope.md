@@ -67,9 +67,9 @@ projection, not object authority.
 
 ## Consequences
 
-- **#889** is unblocked to implement a pluggable hop/aggregate engine whose
-  first alternate is this in-process hop projection, with conformance against
-  the #876 fixture. Do not adopt a vendor engine from this note.
+- **#889** ships `SEKAI_OBJECT_INDEX_ENGINE=hop-projection` as this in-process
+  join-key projection, with nested-loop remaining the default. Do not adopt a
+  vendor engine from this note.
 - On-the-fly SQL and hash-join remain measurement baselines, not product
   query plans.
 - 10⁸ hop-projection **query** holds; 10⁸ on-the-fly joins still miss.

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+pub fn join_value_digest(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
 pub const CONTRACT_VERSION: &str = "sekai.object-type-index/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

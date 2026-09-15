@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Evaluate object-set hops on a pluggable index engine (#889). Default
+  `nested-loop` keeps the original scan. `SEKAI_OBJECT_INDEX_ENGINE=hop-projection`
+  uses the rebuildable join-key projection from the #889 envelope; switch
+  is a reindex, receipts and authorization are unchanged. Dual-read
+  (`SEKAI_OBJECT_INDEX_DUAL_READ=1`) fails closed on a path mismatch.
+  Hidden rows stay out of both engines. Not a vendor engine pick.
 - Publish the #889 hop-projection envelope: the #877 product nested-loop
   two-hop misses 500 ms at 10⁵ (distinct 963 ms; all-paths 65 s); on-the-fly
   SQL and hash-join miss at 10⁷ and 10⁸; a rebuildable reachability
