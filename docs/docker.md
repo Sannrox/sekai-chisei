@@ -126,11 +126,11 @@ loopback `SEKAI_BIND`.
 - Seed setup data:
 
 ```bash
-docker compose run --rm gateway sekaictl admin gateway setup --help
+docker compose --env-file _output/compose.env run --rm gateway sekaictl admin gateway setup --help
 ```
 
 - Generate an attribution/report from shared state:
 
 ```bash
-docker compose run --rm gateway chisei-gateway report --by work-unit --since 24h
+docker compose --env-file _output/compose.env run --rm gateway chisei-gateway report --by work-unit --since 24h
 ```
