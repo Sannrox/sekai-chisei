@@ -93,9 +93,10 @@ to pick an external engine in this note.
 - **#889** is unblocked by the hop-projection envelope in
   [889-hop-projection-envelope.md](889-hop-projection-envelope.md). Product
   nested-loop misses at 10⁵; a rebuildable hop-projection query holds at 10⁷.
-- **#870** is unblocked by the embedded-PostgreSQL envelope in
-  [870-embedded-postgres-envelope.md](870-embedded-postgres-envelope.md). This
-  SQLite fixture is still not the runtime storage decision.
+- **#870** closed as keep dual
+  ([ADR 0080](../decisions/0080-dual-community-runtime-storage.md)). The
+  embedded-PostgreSQL envelope remains feasibility evidence, not a pick.
+  This SQLite fixture is still not the runtime storage decision.
 
 ## Alternatives rejected here
 

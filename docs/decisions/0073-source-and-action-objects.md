@@ -59,8 +59,9 @@ second object authority. It does not forbid a rebuildable derived index.
 
 The product write paths are sync and `SubmitActionInstance`. Source-owned
 objects already reject generic mutation. A later indexer, if measured, is a
-projection rebuild. #870 remains a storage-engine question and is independent
-of this meaning rule.
+projection rebuild. Control-plane SQLite and PostgreSQL stay dual
+([ADR 0080](0080-dual-community-runtime-storage.md)); that pair is
+independent of this meaning rule.
 
 ## Validation
 

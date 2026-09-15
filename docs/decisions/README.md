@@ -101,3 +101,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0077: Action types declare closed criteria and receipt-bound effects](0077-action-type-criteria.md)
 - [ADR 0078: Audience-bound assertions fill existing AuthenticatedContext](0078-audience-bound-assertions.md)
 - [ADR 0079: Bound evaluation suites gate promotion on existing certification](0079-evaluation-promotion-gate.md)
+- [ADR 0080: Keep dual community control-plane storage](0080-dual-community-runtime-storage.md)

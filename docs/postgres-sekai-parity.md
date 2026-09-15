@@ -2,6 +2,8 @@
 
 This note closes the parent reusable-Sekai PostgreSQL parity track. Community
 PostgreSQL runtime selection is activated by #238.
+[ADR 0080](decisions/0080-dual-community-runtime-storage.md) keeps SQLite as
+the local default and PostgreSQL as the optional community backend.
 
 ## Outcome
 
