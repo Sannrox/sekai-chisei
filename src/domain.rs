@@ -8,8 +8,8 @@ pub type ObjectKind = String;
 // Kinds the chisei routing logic matches on. Not a closed taxonomy — objects
 // may use any kind; these just name the strings the code uses, in one
 // place. `model`/`component` drive model selection in chisei::affinity (live
-// as an internal routing affinity signal). `learning` is matched only in the learning/pipeline
-// graph helpers, which are not yet wired to an RPC.
+// as an internal routing affinity signal). `learning` is matched by Gunshi
+// allocation, pipeline context selection, and the learning graph helpers.
 pub const KIND_MODEL: &str = "model";
 pub const KIND_COMPONENT: &str = "component";
 pub const KIND_LEARNING: &str = "learning";

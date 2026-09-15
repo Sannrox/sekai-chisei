@@ -340,7 +340,7 @@ impl ChiseiServiceImpl {
         }
     }
 
-    /// Build a background scoring job sharing this service's DB, in-memory eval store, budget,
+    /// Build a background scoring job sharing this service's DB, eval store, budget,
     /// and config — so emitted runs are visible to live regression checks immediately.
     pub fn scoring_job(&self) -> crate::chisei::scoring::ScoringJob {
         crate::chisei::scoring::ScoringJob::new(
@@ -352,7 +352,7 @@ impl ChiseiServiceImpl {
     }
 
     /// This service's live candidate store, for propose/gate/promote workflows that need to share
-    /// its DB and in-memory `EvalStore` (e.g. a periodic promotion-controller driver, or direct
+    /// its DB and `EvalStore` (e.g. a periodic promotion-controller driver, or direct
     /// RPC-triggered promotion).
     pub fn candidate_store(&self) -> Arc<CandidateStore> {
         self.candidates.clone()

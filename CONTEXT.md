@@ -287,8 +287,6 @@ protocol projection. It supplies an authorization hook for creation candidates
 and idempotency replays; the lifecycle decides when that hook runs so request
 replay ordering remains transport-independent.
 
-## Action execution
-
 ## Reported Operation Receipt events
 
 The **reported Operation Receipt event lifecycle** admits one authenticated

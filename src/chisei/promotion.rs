@@ -78,9 +78,8 @@ pub struct Candidate {
     pub created: i64,
 }
 
-/// In-memory store for proposed candidates, mirroring `EvalStore`'s shape (see that module for the
-/// persistence pattern this follows: a durable SQLite mirror is added alongside, hydrated at
-/// startup by the owning service).
+/// Process-local store for proposed candidates. Unlike `EvalStore`, there is no
+/// durable mirror or startup hydrate.
 pub struct CandidateStore {
     candidates: Mutex<HashMap<String, Candidate>>,
 }

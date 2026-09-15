@@ -155,8 +155,8 @@ const MAX_JUDGE_ATTEMPTS: i64 = 3;
 /// context-overflow failure class (an oversized input would otherwise fail the provider forever).
 const JUDGE_INPUT_LEN: usize = 12000;
 /// How many runs/iterations to retain per synthetic sampling suite. The scoring job emits one of
-/// each per namespace per cycle; without a cap they grow unbounded (and are hydrated into memory at
-/// startup). Keeping the most recent N preserves the regression baseline while bounding growth.
+/// each per namespace per cycle; without a cap they grow unbounded. Keeping the most recent N
+/// preserves the regression baseline while bounding growth.
 const SAMPLING_RETENTION: i64 = 20;
 /// Minimum observations in a batch before it may drive the (execution-gating) regression signal.
 /// Consecutive sampled batches contain *different* tasks, so a tiny batch's mean is dominated by
@@ -192,7 +192,7 @@ const DEFAULT_RUBRIC: &str = "Evaluate the output as a response to the task spec
 - Clarity: is the result understandable and self-consistent?\n\
 A truncated or refused output should score low.";
 
-/// The background scoring job. Holds shared handles to the same DB and in-memory [`EvalStore`]
+/// The background scoring job. Holds shared handles to the same DB and [`EvalStore`]
 /// the gRPC service uses, so emitted runs are visible to live regression checks immediately.
 pub struct ScoringJob {
     db: Arc<RuntimeDb>,
@@ -670,11 +670,10 @@ impl ScoringJob {
             });
         }
 
-        // Bound the continuously-produced runs/iterations for this synthetic suite, in both the DB
-        // and the in-memory store (the latter is hydrated wholesale at startup). Retention keeps
-        // enough history for the regression baseline; pruning is scoped to this sampling suite, so
-        // user-authored eval data is never affected. Best-effort: a prune failure must not drop the
-        // scored run.
+        // Bound the continuously-produced runs/iterations for this synthetic suite in the durable
+        // eval store. Retention keeps enough history for the regression baseline; pruning is scoped
+        // to this sampling suite, so user-authored eval data is never affected. Best-effort: a prune
+        // failure must not drop the scored run.
         let _ = self
             .db
             .prune_eval_runs_for_suite(&suite_id, SAMPLING_RETENTION);
