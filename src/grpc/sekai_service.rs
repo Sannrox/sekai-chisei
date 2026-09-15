@@ -1029,6 +1029,24 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<CreateDatasetResponse>, Status> {
         rpc_data::create_dataset(self, req).await
     }
+    async fn put_governed_transform(
+        &self,
+        req: Request<PutGovernedTransformRequest>,
+    ) -> Result<Response<PutGovernedTransformResponse>, Status> {
+        rpc_data::put_governed_transform(self, req).await
+    }
+    async fn run_governed_transform(
+        &self,
+        req: Request<RunGovernedTransformRequest>,
+    ) -> Result<Response<RunGovernedTransformResponse>, Status> {
+        rpc_data::run_governed_transform(self, req).await
+    }
+    async fn get_governed_transform_run(
+        &self,
+        req: Request<GetGovernedTransformRunRequest>,
+    ) -> Result<Response<GetGovernedTransformRunResponse>, Status> {
+        rpc_data::get_governed_transform_run(self, req).await
+    }
     async fn update_dataset(
         &self,
         req: Request<UpdateDatasetRequest>,

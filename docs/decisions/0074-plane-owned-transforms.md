@@ -29,9 +29,10 @@ and table format should do that.
    ([ADR 0073](0073-source-and-action-objects.md)).
 3. Lineage and a receipt are required on every run. Secrets do not live in
    transform documents.
-4. This ADR does not pick an engine, table format, or cluster. #880 stays
-   implementation-blocked until incremental rebuild time and memory on the
-   published fixture are measured.
+4. This ADR does not pick an engine, table format, or cluster. Incremental
+   rebuild is an in-process `projection` class of
+   `sekai.governed-transform-execution/v1` (#880). SQLite is a measurement
+   vehicle, not a format pick.
 
 ## Alternatives considered
 

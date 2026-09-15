@@ -203,6 +203,7 @@ impl SekaiDb {
         self.migrate_leases()?;
         self.migrate_datasets()?;
         self.migrate_object_type_index()?;
+        self.migrate_governed_transforms()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
         self.migrate_chisei()?;

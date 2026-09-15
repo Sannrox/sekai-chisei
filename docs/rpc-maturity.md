@@ -81,6 +81,9 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |

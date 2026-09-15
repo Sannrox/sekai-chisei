@@ -38,6 +38,7 @@ mod federation_store;
 pub mod function;
 mod governed_facts;
 mod governed_subject_provenance;
+pub mod governed_transform;
 pub mod graph;
 pub mod guarded_mutation;
 pub mod handoff;

@@ -313,6 +313,33 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "PutGovernedTransform",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RunGovernedTransform",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetGovernedTransformRun",
+      "storage_path": "sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ReadObjectChangeSubscription",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",

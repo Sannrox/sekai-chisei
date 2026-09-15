@@ -443,6 +443,48 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RunGovernedTransform",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetGovernedTransformRun",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "src/db/governed_transform.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ReadObjectChangeSubscription",
       "kind": "query",
       "surfaces": [],
