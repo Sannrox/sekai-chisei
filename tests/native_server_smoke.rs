@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -178,6 +178,11 @@ impl NativeServer {
     }
 
     fn spawn_with_ollama(ollama_url: Option<&str>) -> Self {
+        static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _start = START_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("native server start lock");
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("sekai.sock");
         let db_path = dir.path().join("sekai.db");
@@ -290,24 +295,47 @@ impl NativeServer {
         let socket = self.socket_str();
         let domain = self.fixture("tests/fixtures/product_loop/domain-v1.json");
         let seed = self.fixture("tests/fixtures/product_loop/seed-v1.json");
-        let apply = self.sekaictl(&[
-            "ontology",
-            "apply",
-            "--file",
-            domain.to_str().unwrap(),
-            "--target",
-            &socket,
-        ]);
+        let apply = self.sekaictl_retry(
+            &[
+                "ontology",
+                "apply",
+                "--file",
+                domain.to_str().unwrap(),
+                "--target",
+                &socket,
+            ],
+            "ontology apply",
+        );
         assert_success(&apply, "ontology apply", &self.logs());
-        let seeded = self.sekaictl(&[
-            "ontology",
-            "seed",
-            "--file",
-            seed.to_str().unwrap(),
-            "--target",
-            &socket,
-        ]);
+        let seeded = self.sekaictl_retry(
+            &[
+                "ontology",
+                "seed",
+                "--file",
+                seed.to_str().unwrap(),
+                "--target",
+                &socket,
+            ],
+            "ontology seed",
+        );
         assert_success(&seeded, "ontology seed", &self.logs());
+    }
+
+    fn sekaictl_retry(&mut self, args: &[&str], label: &str) -> Output {
+        let mut last = self.sekaictl(args);
+        for attempt in 1..6 {
+            if last.status.success() {
+                return last;
+            }
+            let stderr = String::from_utf8_lossy(&last.stderr);
+            if !stderr.contains("database is locked") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50 * attempt));
+            last = self.sekaictl(args);
+        }
+        let _ = label;
+        last
     }
 
     async fn sekai(&self) -> SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient> {
