@@ -32,6 +32,8 @@ pub fn llm_call_column_classification(name: &str) -> &'static str {
     }
 }
 
+pub type DatasetRowRecord = (i64, HashMap<String, String>);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dataset {
     pub id: String,
@@ -295,6 +297,26 @@ impl SekaiDb {
             count += 1;
         }
         Ok(count)
+    }
+
+    pub fn list_dataset_row_records(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<DatasetRowRecord>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = ?1 ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let mut rows_iter = stmt.query(params![dataset_id]).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
+            let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let data: String = row.get(1).map_err(|e| e.to_string())?;
+            let map: HashMap<String, String> = serde_json::from_str(&data)
+                .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))?;
+            results.push((id, map));
+        }
+        Ok(results)
     }
 
     pub fn query_rows(

@@ -61,6 +61,7 @@ const FACT_MIGRATION_AUDIT_SCHEMA: &str = include_str!("postgres/0038_fact_migra
 const EVENT_STREAMS_SCHEMA: &str = include_str!("postgres/0039_event_streams.sql");
 const WORKFLOW_ACTIONS_SCHEMA: &str = include_str!("postgres/0040_workflow_actions.sql");
 const POLICY_DECISION_AUDIT_SCHEMA: &str = include_str!("postgres/0041_policy_decision_audit.sql");
+const OBJECT_TYPE_INDEX_SCHEMA: &str = include_str!("postgres/0042_object_type_index.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -269,6 +270,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 40,
         name: "policy_decision_audit",
         sql: POLICY_DECISION_AUDIT_SCHEMA,
+    },
+    Migration {
+        version: 41,
+        name: "object_type_index",
+        sql: OBJECT_TYPE_INDEX_SCHEMA,
     },
 ];
 

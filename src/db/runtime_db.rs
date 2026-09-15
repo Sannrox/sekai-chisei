@@ -182,6 +182,82 @@ impl RuntimeDb {
         }
     }
 
+    pub fn register_object_type_datasource(
+        &self,
+        binding: &crate::sekai::object_type_index::ObjectTypeDatasource,
+        created_at_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.register_object_type_datasource(binding, created_at_ms),
+            Self::Postgres(db) => db.register_object_type_datasource(binding, created_at_ms),
+        }
+    }
+
+    pub fn get_object_type_datasource(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Option<crate::sekai::object_type_index::ObjectTypeDatasource>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_type_datasource(namespace, kind),
+            Self::Postgres(db) => db.get_object_type_datasource(namespace, kind),
+        }
+    }
+
+    pub fn apply_object_type_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        full_rebuild: bool,
+        now_ms: i64,
+    ) -> Result<crate::sekai::object_type_index::ReindexReport, String> {
+        match self {
+            Self::Sqlite(db) => db.apply_object_type_index(namespace, kind, full_rebuild, now_ms),
+            Self::Postgres(db) => db.apply_object_type_index(namespace, kind, full_rebuild, now_ms),
+        }
+    }
+
+    pub fn put_object_type_index_edit(
+        &self,
+        edit: &crate::sekai::object_type_index::ObjectTypeIndexEdit,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_object_type_index_edit(edit),
+            Self::Postgres(db) => db.put_object_type_index_edit(edit),
+        }
+    }
+
+    pub fn object_type_index_status(
+        &self,
+        namespace: &str,
+        kind: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::object_type_index::ObjectTypeIndexStatus>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_type_index_status(namespace, kind, now_ms),
+            Self::Postgres(db) => db.object_type_index_status(namespace, kind, now_ms),
+        }
+    }
+
+    pub fn list_visible_index_members(
+        &self,
+        namespace: &str,
+        kind: &str,
+        query: &RowQuery,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_visible_index_members(namespace, kind, query),
+            Self::Postgres(db) => db.list_visible_index_members(namespace, kind, query),
+        }
+    }
+
+    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+        match self {
+            Self::Sqlite(db) => db.count_visible_index_members(namespace, kind),
+            Self::Postgres(db) => db.count_visible_index_members(namespace, kind),
+        }
+    }
+
     pub fn put_purpose_authorization(
         &self,
         authorization: &crate::sekai::purpose_authorization::PurposeAuthorization,

@@ -63,6 +63,7 @@ pub mod object_mutation;
 pub mod object_security;
 pub mod object_set;
 pub mod object_sync;
+pub mod object_type_index;
 pub mod observation;
 pub mod ontology;
 pub mod open_table;

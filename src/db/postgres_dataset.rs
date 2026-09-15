@@ -91,6 +91,27 @@ impl PostgresDb {
         i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
     }
 
+    pub fn list_dataset_row_records(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<crate::sekai::dataset::DatasetRowRecord>, String> {
+        self.connection()?
+            .query(
+                "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id=$1 ORDER BY id",
+                &[&dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let id: i64 = row.get(0);
+                let data: String = row.get(1);
+                let values: HashMap<String, String> = serde_json::from_str(&data)
+                    .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))?;
+                Ok((id, values))
+            })
+            .collect()
+    }
+
     pub fn query_dataset_rows(
         &self,
         dataset_id: &str,

@@ -130,6 +130,21 @@ impl SekaiServiceImpl {
             }
             filter.offset = cursor.offset;
         }
+        if self
+            .db
+            .get_object_type_datasource(&bound.descriptor.namespace, &bound.descriptor.kind)
+            .map_err(Status::internal)?
+            .is_some()
+        {
+            return self.evaluate_indexed_object_set(
+                &bound,
+                inner.required_freshness_ms,
+                filter.offset,
+                &principal_context_digest,
+                &policy_activation_digest,
+                now_millis(),
+            );
+        }
         let (near, total) = list_objects_with_marking(
             &self.db,
             &filter,
@@ -181,6 +196,92 @@ impl SekaiServiceImpl {
             definition_digest: bound.descriptor.definition_digest,
             kind: bound.member_kind,
             members: members.iter().map(to_proto_obj).collect(),
+            total,
+            next_page_token,
+            authority: false,
+        }))
+    }
+}
+
+impl SekaiServiceImpl {
+    fn evaluate_indexed_object_set(
+        &self,
+        bound: &BoundObjectSet,
+        required_freshness_ms: i64,
+        offset: i32,
+        principal_context_digest: &str,
+        policy_activation_digest: &str,
+        now_ms: i64,
+    ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        let status = self
+            .db
+            .object_type_index_status(&bound.descriptor.namespace, &bound.descriptor.kind, now_ms)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::failed_precondition("object type index is stale"))?;
+        if !crate::sekai::object_type_index::freshness_holds(&status, required_freshness_ms) {
+            return Err(Status::failed_precondition("object type index is stale"));
+        }
+        let query = crate::sekai::dataset::RowQuery {
+            filters: bound
+                .descriptor
+                .property_filters
+                .iter()
+                .map(|filter| crate::sekai::dataset::RowFilter {
+                    column: filter.key.clone(),
+                    op: filter.op.clone(),
+                    value: filter.value.clone(),
+                })
+                .collect(),
+            columns: Vec::new(),
+            limit: if bound.descriptor.limit > 0 {
+                bound.descriptor.limit
+            } else {
+                crate::sekai::object_set::DEFAULT_EVALUATE_LIMIT
+            },
+            offset,
+        };
+        let members = self
+            .db
+            .list_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind, &query)
+            .map_err(Status::internal)?;
+        let total = self
+            .db
+            .count_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind)
+            .map_err(Status::internal)?;
+        let objects: Vec<domain::Object> = members
+            .iter()
+            .map(|member| domain::Object {
+                id: member.object_id.clone(),
+                kind: member.kind.clone(),
+                name: member.source_key.clone(),
+                namespace: member.namespace.clone(),
+                external_id: member.source_key.clone(),
+                properties: member.properties.clone().into_iter().collect(),
+                created: status.indexed_at_ms,
+                updated: status.indexed_at_ms,
+            })
+            .collect();
+        let returned = objects.len() as i32;
+        let next_offset = offset.saturating_add(returned);
+        let next_page_token = if next_offset < total && returned > 0 {
+            crate::sekai::object_security::ObjectQueryCursor::issue(
+                next_offset,
+                principal_context_digest.to_string(),
+                bound.descriptor.namespace.clone(),
+                policy_activation_digest.to_string(),
+                bound.query_digest.clone(),
+                now_ms,
+            )
+            .and_then(|cursor| cursor.encode(&self.object_query_cursor_key))
+            .map_err(Status::internal)?
+        } else {
+            String::new()
+        };
+        Ok(Response::new(EvaluateObjectSetResponse {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            definition_digest: bound.descriptor.definition_digest.clone(),
+            kind: bound.member_kind.clone(),
+            members: objects.iter().map(to_proto_obj).collect(),
             total,
             next_page_token,
             authority: false,
@@ -518,6 +619,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(descriptor(&digest, 1)),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -541,6 +643,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(descriptor(&digest, 1)),
                     page_token: first.next_page_token,
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -565,6 +668,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(descriptor("sha256:deadbeef", 2)),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -579,6 +683,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(wrong),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -593,6 +698,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(contains),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -682,6 +788,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(descriptor(&digest, 10)),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -698,6 +805,7 @@ mod tests {
                 EvaluateObjectSetRequest {
                     descriptor: Some(region_only),
                     page_token: String::new(),
+                    required_freshness_ms: 0,
                 },
                 "alice",
             ))
@@ -707,5 +815,149 @@ mod tests {
         assert_eq!(visible.total, 3);
         assert!(!visible.members.iter().any(|object| object.id == "c-us-2"));
         assert!(!visible.authority);
+    }
+
+    #[tokio::test]
+    async fn evaluate_object_set_reads_index_and_fails_closed_on_freshness() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_definition(&svc);
+        svc.db
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: "ds-customers".into(),
+                name: "customers".into(),
+                columns: vec![
+                    crate::sekai::dataset::ColumnDef {
+                        name: "customer_id".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                    crate::sekai::dataset::ColumnDef {
+                        name: "region".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                    crate::sekai::dataset::ColumnDef {
+                        name: "hidden".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                ],
+                object_id: String::new(),
+                created: 1,
+            })
+            .unwrap();
+        svc.db
+            .append_rows(
+                "ds-customers",
+                &[
+                    std::collections::HashMap::from([
+                        ("customer_id".into(), "c1".into()),
+                        ("region".into(), "eu".into()),
+                        ("hidden".into(), "0".into()),
+                    ]),
+                    std::collections::HashMap::from([
+                        ("customer_id".into(), "c-hidden".into()),
+                        ("region".into(), "eu".into()),
+                        ("hidden".into(), "true".into()),
+                    ]),
+                ],
+            )
+            .unwrap();
+        svc.register_object_type_datasource(with_named_principal(
+            RegisterObjectTypeDatasourceRequest {
+                datasource: Some(ObjectTypeDatasource {
+                    contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    definition_digest: digest.clone(),
+                    dataset_id: "ds-customers".into(),
+                    key_column: "customer_id".into(),
+                    property_mapping: std::collections::HashMap::from([(
+                        "region".into(),
+                        "region".into(),
+                    )]),
+                    hidden_column: "hidden".into(),
+                    edits_only: false,
+                }),
+                idempotency_key: "reg-1".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.reindex_object_type(with_named_principal(
+            ReindexObjectTypeRequest {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                full_rebuild: true,
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut descriptor = descriptor(&digest, 10);
+        descriptor.property_filters.clear();
+        descriptor.order_by.clear();
+        descriptor.traversal = None;
+        let page = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor.clone()),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.members[0].id, "Customer:c1");
+        assert!(
+            !page
+                .members
+                .iter()
+                .any(|object| object.id.contains("hidden"))
+        );
+        svc.db
+            .update_dataset(&crate::sekai::dataset::Dataset {
+                id: "ds-customers".into(),
+                name: "customers".into(),
+                columns: vec![crate::sekai::dataset::ColumnDef {
+                    name: "customer_id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: String::new(),
+                created: 1,
+            })
+            .unwrap();
+        let quarantined = svc
+            .reindex_object_type(with_named_principal(
+                ReindexObjectTypeRequest {
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    full_rebuild: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(quarantined.quarantined);
+        let stale = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor),
+                    page_token: String::new(),
+                    required_freshness_ms: 60_000,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
     }
 }
