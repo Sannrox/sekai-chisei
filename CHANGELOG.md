@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Publish the #889 hop-projection envelope: the #877 product nested-loop
+  two-hop misses 500 ms at 10⁵ (distinct 963 ms; all-paths 65 s); on-the-fly
+  SQL and hash-join miss at 10⁷ and 10⁸; a rebuildable reachability
+  projection query holds (0 ms p95) with matching counts. Not a vendor
+  engine pick.
+- Publish the #870 embedded-PostgreSQL envelope: cold start 136 ms and
+  ~161 MiB complete footprint (prefix + data + linked dylibs including ICU)
+  on macOS PostgreSQL 17.10; Docker `postgres:17-alpine` 110 MiB / 1.09 s to
+  TCP readiness. Discussion 906 kill signals hold. Not a runtime pick.
 - Coordinate definition-branch edits across object types, functions,
   transforms, and policies in one revision (#890). Merge refuses a
   breaking function, transform, or policy change, or any unknown kind,
