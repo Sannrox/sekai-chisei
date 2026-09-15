@@ -4,7 +4,8 @@ Issue: [#870](https://github.com/Sannrox/sekai-chisei/issues/870)
 Discussion: [#906](https://github.com/Sannrox/sekai-chisei/discussions/906)
 Predecessor: [#869](https://github.com/Sannrox/sekai-chisei/issues/869)
 Date: 2026-09-15
-Status: **envelope published**
+Status: **envelope published**; #870 closed as keep dual
+  ([ADR 0080](../decisions/0080-dual-community-runtime-storage.md))
 Hardware: Apple M2 Pro, 32 GiB, Darwin 25.5.0 arm64
 
 Discussion 906 keeps both community runtime backends until an
@@ -64,18 +65,19 @@ from the control-plane database.
 
 ## Consequences
 
-- **#870** is unblocked to retire duplicated runtime storage **after** a
-  follow-up implementation chooses the measured profile, ships the migration
-  Discussion 906 noted is absent, and keeps ontology SQLite separate.
-- Dual SQLite/PostgreSQL remains the shipped community pair until that
-  implementation lands. This note does not delete `postgres_*.rs`.
-- No vendor name is adopted as the product engine.
+- **#870** closed as keep dual
+  ([ADR 0080](../decisions/0080-dual-community-runtime-storage.md)). This
+  envelope is feasibility evidence for a local PostgreSQL process, not a
+  pick to delete SQLite or to adopt a custom object store.
+- Dual SQLite/PostgreSQL remains the shipped community pair. This note
+  does not delete `postgres_*.rs`.
+- A later single-binary packaging ADR needs its own envelope and a
+  retained-data migration before retiring a backend.
 
 ## Alternatives rejected here
 
 - Treat the Homebrew prefix or the Alpine image as the one true runtime.
-  Rejected: measurement only; #870 still has to pick, migrate, and collapse
-  conformance suites.
+  Rejected: measurement only. ADR 0080 keeps both community backends.
 - Hosted multi-service mesh. Rejected: Discussion 906, not local-first.
 - Skip the envelope because SQLite already starts in 24 ms. Rejected: the
   hold was specifically the unmeasured embed profile.

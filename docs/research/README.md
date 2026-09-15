@@ -38,7 +38,7 @@ reference pages.
 | [Additive source-type admission](817-source-type-admission.md) | Accepted in [ADR 0060](../decisions/0060-additive-source-type-descriptors.md); GitHub profile unchanged; #818 registers descriptors |
 | [Object-index envelope at 10⁷](876-object-index-envelope.md) | Membership and incremental hold; two-hop misses 500 ms; #877 unblocked as a projection |
 | [Two-hop hop-projection envelope](889-hop-projection-envelope.md) | Product nested-loop misses at 10⁵; on-the-fly join misses at 10⁷; rebuildable hop-projection query holds; #889 unblocked without a vendor pick |
-| [Embedded-PostgreSQL envelope](870-embedded-postgres-envelope.md) | Cold start and ≤200 MB footprint hold on macOS and Linux-container packaging; #870 unblocked to implement retirement |
+| [Embedded-PostgreSQL envelope](870-embedded-postgres-envelope.md) | Cold start and ≤200 MB footprint hold; #870 closed as keep dual ([ADR 0080](../decisions/0080-dual-community-runtime-storage.md)) |
 | [Incremental governed-transform envelope](879-transform-envelope.md) | In-process projection; 1% append processes 2 of 200 rows; #880 landed without an engine pick |
 
 For current usage and operations, return to the [documentation guide](../README.md)

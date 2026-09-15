@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep SQLite and PostgreSQL as the community control-plane pair
+  ([ADR 0080](docs/decisions/0080-dual-community-runtime-storage.md), #870).
+  SQLite stays the local default. PostgreSQL stays optional. The embedded
+  PostgreSQL envelope remains a feasibility measurement, not a runtime pick.
+  Ontology CLI SQLite stays a different database.
 - Evaluate object-set hops on a pluggable index engine (#889). Default
   `nested-loop` keeps the original scan. `SEKAI_OBJECT_INDEX_ENGINE=hop-projection`
   uses the rebuildable join-key projection from the #889 envelope; switch
