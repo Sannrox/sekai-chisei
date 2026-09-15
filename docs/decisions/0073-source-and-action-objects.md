@@ -41,8 +41,9 @@ second object authority. It does not forbid a rebuildable derived index.
 5. This ADR does not pick an indexer, per-type table layout, or query engine.
    The envelope is published in
    [docs/research/876-object-index-envelope.md](../research/876-object-index-envelope.md).
-   #877 implements a rebuildable membership projection. #878 and #889 stay
-   blocked on the two-hop miss recorded there.
+   #877 implements a rebuildable membership projection. #878 landed without
+   claiming the 500 ms two-hop SLA. The hop-projection envelope for #889 is
+   [docs/research/889-hop-projection-envelope.md](../research/889-hop-projection-envelope.md).
 
 ## Alternatives considered
 
