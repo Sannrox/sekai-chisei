@@ -38,3 +38,7 @@ docker build \
   --build-arg VCS_REF="${GIT_COMMIT}" \
   -t "${IMAGE_TAG}" \
   _output/linux-bins
+
+if [[ "${IMAGE_TAG}" != "sekai-chisei:local" ]]; then
+  docker tag "${IMAGE_TAG}" sekai-chisei:local
+fi

@@ -8,11 +8,12 @@ cargo fmt-check
 cargo clippy-all
 cargo test-all
 ./build/release-images.sh
+docker compose up
 ```
 
-Cargo is the gate locally and in CI (`rust-toolchain.toml`). `./build/release-images.sh`
-is the image build locally and in CI: linux binaries in that channel, tag
-`sekai-chisei:local`. Compose `up --build` uses the root `Dockerfile`.
+Cargo is the gate. `./build/release-images.sh` is the only image build (local, CI,
+and GHCR). `./build/release.sh` pushes that image when `DOCKER_REGISTRY` is set.
+Compose uses `sekai-chisei:local`.
 
 ## Quickstart
 
@@ -21,7 +22,8 @@ export CHISEI_GATEWAY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='<your-openai-key>'
 export GATEWAY_KEYS='sekai-docker-demo=demo:default'
 export GATEWAY_KEY='sekai-docker-demo'
-docker compose up --build
+./build/release-images.sh
+docker compose up
 ```
 
 The exported `GATEWAY_KEYS` value must be a gateway allowlist map (`key=agent:project`).
