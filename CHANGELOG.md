@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Pin the Rust toolchain to 1.98.1 and digest-pin the Debian runtime image.
+  `make release-images` wraps linux binaries; Compose remains a checkout-build
+  recovery path. Binaries record git describe identity at startup.
 - Evaluate revision-bound object sets with grouped aggregations and
   bounded multi-hop traversal (`sekai.object-set/v2`, #878). Plans use
   the #877 membership index and refuse named cost limits rather than

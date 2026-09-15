@@ -1,5 +1,19 @@
 # Running with Docker
 
+The runtime image is Debian bookworm with `sekai-chisei`, `chisei-gateway`,
+and `sekaictl`. The builder is pinned `rust:1.98.1-bookworm`. Host development
+stays on `cargo`; do not treat Make as a Cargo replacement.
+
+```bash
+cargo build --release --locked --workspace --bins
+make release-images   # linux compile in the pinned rust image, then wrap
+docker compose up --build   # checkout-build recovery path
+```
+
+`make release-images` tags `sekai-chisei:local`. Compose still builds from the
+root `Dockerfile`. GHCR release builds that recovery Dockerfile with
+`VCS_REF` set to the git commit.
+
 ## Quickstart
 
 ```bash

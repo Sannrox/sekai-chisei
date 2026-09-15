@@ -5,7 +5,7 @@ PROTO_CONTRACTS := sekai.proto chisei.proto
 # Cargo's --tests also runs unit-test targets; select integration targets explicitly.
 INTEGRATION_TESTS := $(sort $(patsubst tests/%.rs,%,$(wildcard tests/*.rs)))
 
-.PHONY: test validate test-integration update
+.PHONY: test validate test-integration update release-images
 
 test:
 	$(CARGO) test --workspace --lib --bins --locked
@@ -29,3 +29,8 @@ update:
 			echo "Updated crates/sekai-proto/proto/$$name"; \
 		fi; \
 	done
+
+# Linux binaries in the pinned rust image, then one runtime image with
+# sekai-chisei, chisei-gateway, and sekaictl. Host development stays on cargo.
+release-images:
+	bash ./build/release-images.sh

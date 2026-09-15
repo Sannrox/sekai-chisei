@@ -23,7 +23,13 @@ pub fn handle() -> &'static PrometheusHandle {
             "Database connection mutex poison recoveries"
         );
         crate::obs::signals::describe_all();
-        gauge!("sekai_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+        gauge!(
+            "sekai_build_info",
+            "version" => env!("CARGO_PKG_VERSION"),
+            "git_version" => env!("SEKAI_GIT_VERSION"),
+            "git_commit" => env!("SEKAI_GIT_COMMIT")
+        )
+        .set(1.0);
         handle
     })
 }

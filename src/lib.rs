@@ -1,6 +1,7 @@
 pub mod action_cli;
 pub mod attest_cli;
 pub mod autonomous_envelope_cli;
+pub mod build_info;
 pub mod capability_codegen;
 pub mod capability_projection;
 pub mod chisei;
