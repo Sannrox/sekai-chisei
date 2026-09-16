@@ -34,6 +34,8 @@ template.
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
 | `SEKAI_OBJECT_INDEX_ENGINE` | `nested-loop` | Object-set hop engine (`nested-loop` or `hop-projection`). Switching engines requires `ReindexObjectType` |
 | `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Set `1` to compare both engines and fail closed on mismatch |
+| `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Set `1` to compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
+| `SEKAI_OBJECT_LOG` | unset | Path to the mikura object log required when `SEKAI_OBJECT_LOG_DUAL_READ=1` |
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
 | `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
 | `CHISEI_PERMIT_KEY_ID` | `permit-key-1` | Key id embedded in signed permits for rotation |
