@@ -159,6 +159,7 @@ pub struct SekaiServiceImpl {
     pub(super) object_query_cursor_key: [u8; 32],
     pub(super) object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind,
     pub(super) object_index_dual_read: bool,
+    pub(super) object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead,
 }
 
 impl SekaiServiceImpl {
@@ -189,6 +190,7 @@ impl SekaiServiceImpl {
             ),
             object_index_dual_read:
                 crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
+            object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
         }
     }
 

@@ -23,9 +23,15 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 `EvaluateObjectSet` reads the index when a datasource is registered. Set
 `required_freshness_ms` to fail closed when the index is stale or lagging.
 Hidden rows never appear in members, counts, order, errors, or continuation
-tokens. The SQL index remains the current evaluate backend. A later
-fail-closed comparison against the tagged object-log library is
-[ADR 0081](decisions/0081-evaluate-reads-mikura-library.md); it does not
+tokens. The SQL index remains the current evaluate backend.
+`SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` compares hop/count/sum
+answers to a tagged in-process object-log library and fails closed on
+mismatch, missing log, or a descriptor that library cannot express (property
+filters). First soak uses that library's allow-all property deny-list; clerk
+grants stay compiled on the SQL path, so a grant-narrowed SQL answer fails
+closed instead of being rewritten to match. This is not
+`SEKAI_OBJECT_INDEX_DUAL_READ`. See
+[ADR 0081](decisions/0081-evaluate-reads-mikura-library.md). It does not
 retire these writes.
 
 Schema drift (missing key or mapped column) quarantines the batch and leaves

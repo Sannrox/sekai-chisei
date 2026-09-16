@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Dual-read `EvaluateObjectSet` against a tagged mikura object log when
+  `SEKAI_OBJECT_LOG_DUAL_READ=1` (#942). Hop count and sum must match; a
+  missing log, mismatch, or unmappable descriptor (filters, non-sum/count)
+  fails closed. SQL index writes continue.
 - Share the gateway git-version emitter and provider SSE `data:` parser instead
   of keeping byte-identical copies, and hoist adapter timestamp/required-field
   helpers onto the evidence SDK.

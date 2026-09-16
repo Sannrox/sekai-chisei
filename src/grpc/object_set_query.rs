@@ -504,6 +504,25 @@ impl SekaiServiceImpl {
         let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
             Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
         })?;
+        if self.object_log_dual_read.enabled {
+            let sql_paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
+                if let Some(projected) = projected.as_ref() {
+                    projected.iter().map(|path| path.iter().collect()).collect()
+                } else {
+                    paths.clone()
+                };
+            crate::sekai::object_log::compare_sql_to_log(
+                &self.object_log_dual_read,
+                &bound.descriptor,
+                hops,
+                &aggregation,
+                &sql_paths,
+                // Tagged evaluate is not principal-aware. Clerk grants stay on
+                // SQL; a later mapper can project a deny-list after soak.
+                mikura::PropertyAcl::allow_all(),
+            )
+            .map_err(|error| Status::failed_precondition(error.message()))?;
+        }
         let rows: Vec<(String, Option<f64>)> = if let Some(projected) = projected.as_ref() {
             projected
                 .iter()
@@ -1458,6 +1477,87 @@ mod tests {
         assert!(err.message().contains("hop projection is stale"));
     }
 
+    #[tokio::test]
+    async fn evaluate_object_set_object_log_dual_read_matches_and_fails_closed() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        seed_mikura_customer_order_shipment(&log);
+        svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
+            enabled: true,
+            log_path: Some(log.clone()),
+        };
+        let request = EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                definition_digest: digest.clone(),
+                hops: vec![
+                    ObjectSetTraversal {
+                        relation: "placed".into(),
+                        direction: "outgoing".into(),
+                        far_kind: "Order".into(),
+                        join_property: "customer_id".into(),
+                    },
+                    ObjectSetTraversal {
+                        relation: "ships".into(),
+                        direction: "outgoing".into(),
+                        far_kind: "Shipment".into(),
+                        join_property: "order_id".into(),
+                    },
+                ],
+                aggregation: Some(ObjectSetAggregation {
+                    function: "sum".into(),
+                    property: "amount".into(),
+                    group_by: "region".into(),
+                }),
+                cost_limit: Some(ObjectSetCostLimit {
+                    max_rows_scanned: 100,
+                    max_depth: 3,
+                    max_time_ms: 0,
+                }),
+                ..Default::default()
+            }),
+            page_token: String::new(),
+            required_freshness_ms: 0,
+        };
+        let page = svc
+            .evaluate_object_set(with_named_principal(request.clone(), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.aggregates.len(), 1);
+        assert_eq!(page.aggregates[0].value, 10.0);
+        assert!(!page.authority);
+
+        let mut store = mikura::Store::open(&log).unwrap();
+        mikura::BatchIngest::run(
+            &mut store,
+            vec![mikura::ObjectRecord {
+                r#gen: 1,
+                kind: "Shipment".into(),
+                key: "s2".into(),
+                hidden: false,
+                props: std::collections::HashMap::from([
+                    ("order_id".into(), "o1".into()),
+                    ("amount".into(), "5".into()),
+                ]),
+            }],
+        )
+        .unwrap();
+        let mismatch = svc
+            .evaluate_object_set(with_named_principal(request, "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
+        assert!(mismatch.message().contains("object-log dual-read mismatch"));
+    }
+
     fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {
         let members = vec![
             member(
@@ -1625,5 +1725,56 @@ mod tests {
         svc.db
             .apply_object_type_index("sales", kind, true, 20)
             .unwrap();
+    }
+
+    fn seed_mikura_customer_order_shipment(path: &std::path::Path) {
+        let mut store = mikura::Store::create(path).unwrap();
+        mikura::BatchIngest::run(
+            &mut store,
+            vec![
+                mikura::ObjectRecord {
+                    r#gen: 1,
+                    kind: "Customer".into(),
+                    key: "c1".into(),
+                    hidden: false,
+                    props: std::collections::HashMap::from([("region".into(), "eu".into())]),
+                },
+                mikura::ObjectRecord {
+                    r#gen: 1,
+                    kind: "Customer".into(),
+                    key: "c-hidden".into(),
+                    hidden: true,
+                    props: std::collections::HashMap::from([("region".into(), "eu".into())]),
+                },
+                mikura::ObjectRecord {
+                    r#gen: 1,
+                    kind: "Order".into(),
+                    key: "o1".into(),
+                    hidden: false,
+                    props: std::collections::HashMap::from([("customer_id".into(), "c1".into())]),
+                },
+                mikura::ObjectRecord {
+                    r#gen: 1,
+                    kind: "Shipment".into(),
+                    key: "s1".into(),
+                    hidden: false,
+                    props: std::collections::HashMap::from([
+                        ("order_id".into(), "o1".into()),
+                        ("amount".into(), "10".into()),
+                    ]),
+                },
+                mikura::ObjectRecord {
+                    r#gen: 1,
+                    kind: "Shipment".into(),
+                    key: "s-hidden".into(),
+                    hidden: true,
+                    props: std::collections::HashMap::from([
+                        ("order_id".into(), "o1".into()),
+                        ("amount".into(), "99".into()),
+                    ]),
+                },
+            ],
+        )
+        .unwrap();
     }
 }

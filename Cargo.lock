@@ -368,6 +368,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1381,6 +1390,16 @@ dependencies = [
  "rand_xoshiro",
  "rapidhash",
  "sketches-ddsketch",
+]
+
+[[package]]
+name = "mikura"
+version = "0.1.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.1.0#4620f8e3fe669f170cf113768195ef3808b739d8"
+dependencies = [
+ "crc32fast",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2494,6 +2513,7 @@ dependencies = [
  "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
+ "mikura",
  "native-tls",
  "opentelemetry",
  "opentelemetry-otlp",
