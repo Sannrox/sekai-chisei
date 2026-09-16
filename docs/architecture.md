@@ -48,7 +48,10 @@ registered source mapping or a versioned Action. Graph rows persist those
 facts. A derived index is a rebuildable projection, not a second object
 authority. Generic object and link RPCs remain the current escape hatch, not
 the destination write model. See
-[ADR 0073](decisions/0073-source-and-action-objects.md).
+[ADR 0073](decisions/0073-source-and-action-objects.md). Evaluate is intended
+to fail-closed dual-read a tagged in-process object-log library before any
+later cutover; see
+[ADR 0081](decisions/0081-evaluate-reads-mikura-library.md).
 
 Reusable PostgreSQL persistence also covers retention policies, scope-bound
 immutable content, legal and operational holds, integrity-checked lifecycle
