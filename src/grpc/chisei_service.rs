@@ -737,6 +737,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::get_operation_receipt(self, req).await
     }
 
+    async fn invoke_action_instance(
+        &self,
+        req: Request<InvokeActionInstanceRequest>,
+    ) -> Result<Response<InvokeActionInstanceResponse>, Status> {
+        rpc_execution::invoke_action_instance(self, req).await
+    }
+
     async fn get_quality_trend(
         &self,
         req: Request<GetQualityTrendRequest>,

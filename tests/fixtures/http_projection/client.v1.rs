@@ -35,7 +35,10 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("sekai.SekaiService", "ListGrants"),
         ("sekai.SekaiService", "CheckAccess"),
         ("sekai.SekaiService", "PutGovernedActionType"),
+        ("sekai.SekaiService", "GetGovernedActionType"),
         ("sekai.SekaiService", "SubmitActionInstance"),
+        ("sekai.SekaiService", "PersistAdmittedAction"),
+        ("sekai.SekaiService", "GetPersistedOperationReceipt"),
         ("sekai.SekaiService", "DescribeObjectAction"),
         ("sekai.SekaiService", "PreviewObjectAction"),
         ("sekai.SekaiService", "GetActionInstance"),
@@ -58,6 +61,7 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("chisei.ChiseiService", "PlanContentExecution"),
         ("chisei.ChiseiService", "ReportOperationEvent"),
         ("chisei.ChiseiService", "GetOperationReceipt"),
+        ("chisei.ChiseiService", "InvokeActionInstance"),
         ("chisei.ChiseiService", "GetQualityTrend"),
         ("chisei.ChiseiService", "ClaimGatewayDispatch"),
 ];

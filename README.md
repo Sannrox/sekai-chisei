@@ -43,9 +43,13 @@ define ontology
 - **Sekai** stores durable facts: typed objects and links, lineage, access
   control, audit history, coordination, and operational memory.
 - **Chisei** makes governed decisions about context, policy, budgets,
-  approvals, routing, evaluation, and learning.
+  approvals, routing, evaluation, and learning. It is a gRPC client of
+  Sekai when the planes run as two processes.
 - **Product interfaces** expose the same core loop to operators through
   `sekaictl` and to agents through gRPC and the capability catalog.
+
+See [docs/two-local-servers.md](docs/two-local-servers.md) for the two-process
+operator path.
 
 Provider adapters, the OpenAI- and Anthropic-compatible gateway, evaluation
 plans, advanced retrieval, federation administration, and automated allocation

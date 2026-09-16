@@ -4,6 +4,9 @@
 //! Doc: `docs/host-executor-permit-conformance.md`
 
 use ed25519_dalek::SigningKey;
+use sekai_chisei::chisei::execution_evidence::{
+    EXECUTION_EVIDENCE_SCHEMA, ExecutionEvidence, ExecutionLifecycleState, verify_for_executor,
+};
 use sekai_chisei::chisei::external_action::AuthorizationClaim;
 use sekai_chisei::chisei::external_action::{
     ASSURANCE_VERSION, AssuranceDeclaration, AuthorizationRecord, ExternalActionDecision,
@@ -14,9 +17,6 @@ use sekai_chisei::chisei::external_permit::{
 };
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::sekai::execution_evidence::{
-    EXECUTION_EVIDENCE_SCHEMA, ExecutionEvidence, ExecutionLifecycleState, verify_for_executor,
-};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;

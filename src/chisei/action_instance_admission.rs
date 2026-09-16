@@ -1,29 +1,24 @@
-//! Governed `ActionInstance` admission behind one transport-neutral interface.
-//!
-//! Transport adapters authenticate the caller and enforce tenant context. This
-//! module owns request validation, idempotent replay, type/policy/budget
-//! decisions, receipt and audit creation, effect planning, and post-admission
-//! metering so their ordering is exercised through the same interface callers
-//! use.
+//! Chisei-owned `ActionInstance` admission. Transport adapters authenticate the
+//! caller; this module decides, then persists facts through Sekai.
 
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
 };
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::action::RiskClass;
-use crate::sekai::action_instance::{
+use crate::sekai::facts::action::RiskClass;
+use crate::sekai::facts::action_instance::{
     ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION,
     compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
 };
-use crate::sekai::action_object_mutation::{
+use crate::sekai::facts::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
 };
-use crate::sekai::action_type_criteria::{
+use crate::sekai::facts::action_type_criteria::{
     CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
-use crate::sekai::object_security::PrincipalPolicyContext;
-use crate::sekai::{action_effect, action_object_mutation, action_policy, audit};
+use crate::sekai::facts::object_security::PrincipalPolicyContext;
+use crate::sekai::facts::{action_effect, action_object_mutation, action_policy, audit};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone)]
@@ -121,7 +116,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         // admitted request stays idempotent after stop, rollback, lease loss,
         // or receipt invalidation. The envelope is not a runtime grant.
         if request.type_id.starts_with("autonomous.") || !envelope_id.is_empty() {
-            crate::sekai::autonomous_envelope::require_live_envelope(
+            crate::sekai::facts::autonomous_envelope::require_live_envelope(
                 self.db,
                 actor,
                 &namespace,
@@ -371,6 +366,126 @@ impl<'a> ActionInstanceAdmission<'a> {
         })
     }
 
+    /// Persist a Chisei-decided instance (ADR 0082). One clerk transaction:
+    /// instance row, object effect, audit, and receipt.
+    pub(crate) fn persist_decided(
+        &self,
+        instance: ActionInstance,
+        actor: &str,
+        ontology_digest: Option<String>,
+        policy_scope: &str,
+        budget_subject: &str,
+        now: i64,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        instance
+            .validate_fields()
+            .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let type_def = self
+            .db
+            .get_governed_action_type(&instance.namespace, &instance.type_id, &instance.version)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(|| {
+                ActionInstanceAdmissionError::FailedPrecondition(format!(
+                    "governed action type {}@{} not found",
+                    instance.type_id, instance.version
+                ))
+            })?;
+        let evidence_ids = instance.evidence_submission_ids.clone();
+        let planned_effects = if instance.status == STATUS_ADMITTED {
+            let force_notify_fail =
+                serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("notify_delivery")
+                            .and_then(|delivery| delivery.as_str())
+                            .map(|delivery| delivery == "fail")
+                    })
+                    .unwrap_or(false);
+            Some(
+                action_effect::plan_effects_for_admit(
+                    &instance.instance_id,
+                    &instance.namespace,
+                    &instance.operation_id,
+                    type_def.effect_kinds_to_materialize(),
+                    &instance.parameters_json,
+                    now,
+                    force_notify_fail,
+                )
+                .map_err(ActionInstanceAdmissionError::InvalidArgument)?,
+            )
+        } else {
+            None
+        };
+        let stored = self.db.put_action_instance(&instance).map_err(|error| {
+            if error.contains("conflict") {
+                ActionInstanceAdmissionError::AlreadyExists(error)
+            } else if error.contains("required") || error.contains("must") {
+                ActionInstanceAdmissionError::InvalidArgument(error)
+            } else {
+                ActionInstanceAdmissionError::Internal(error)
+            }
+        })?;
+        let replay = stored.instance_id != instance.instance_id;
+        if replay {
+            return self.completed_replay(stored);
+        }
+        let applied_object = if instance.status == STATUS_ADMITTED {
+            match plan_object_mutation(
+                self.db,
+                &type_def,
+                &stored.namespace,
+                &stored.parameters_json,
+            ) {
+                Ok(None) => None,
+                Ok(Some(planned)) => {
+                    match action_object_mutation::apply(self.db, planned, actor, now) {
+                        Ok(applied) => Some(applied),
+                        Err(error) => {
+                            let _ = self.db.delete_action_instance(&stored.instance_id);
+                            return Err(map_object_mutation_error(error));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = self.db.delete_action_instance(&stored.instance_id);
+                    return Err(map_object_mutation_error(error));
+                }
+            }
+        } else {
+            None
+        };
+        if let Err(error) = self.record_admission(
+            &stored,
+            actor,
+            policy_scope,
+            budget_subject,
+            &evidence_ids,
+            planned_effects.as_deref(),
+            applied_object.as_ref(),
+            ontology_digest,
+            now,
+        ) {
+            let receipt_exists = self
+                .db
+                .get_operation_receipt(&stored.operation_id)
+                .ok()
+                .flatten()
+                .is_some();
+            if !receipt_exists {
+                if let Some(applied) = &applied_object {
+                    action_object_mutation::compensate(self.db, applied, actor);
+                }
+                let _ = self.db.delete_action_instance(&stored.instance_id);
+            }
+            return Err(error);
+        }
+        Ok(ActionInstanceAdmissionOutcome {
+            instance: stored,
+            replay,
+        })
+    }
+
     fn completed_replay(
         &self,
         existing: ActionInstance,
@@ -582,7 +697,7 @@ impl<'a> ActionInstanceAdmission<'a> {
 fn load_criterion_object(
     db: &RuntimeDb,
     namespace: &str,
-    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    type_def: &crate::sekai::facts::governed_action_type::GovernedActionType,
     parameters_json: &str,
 ) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
     let needs_object = type_def
@@ -654,7 +769,7 @@ fn resolve_operation_id(request_id: &str) -> Result<String, ActionInstanceAdmiss
 
 fn has_pending_runtime_dispatch(effects: Option<&[action_effect::ActionEffect]>) -> bool {
     effects.unwrap_or(&[]).iter().any(|effect| {
-        effect.kind == crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH
+        effect.kind == crate::sekai::facts::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH
             && effect.status == action_effect::EFFECT_STATUS_PENDING
     })
 }
@@ -709,7 +824,7 @@ fn parse_ontology_digest(raw: &str) -> Result<Option<String>, ActionInstanceAdmi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::governed_action_type::{
+    use crate::sekai::facts::governed_action_type::{
         EFFECT_KIND_NOTIFY, EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType,
     };
 
@@ -818,7 +933,7 @@ mod tests {
 
     #[test]
     fn autonomous_action_requires_a_live_envelope() {
-        use crate::sekai::autonomous_envelope::{
+        use crate::sekai::facts::autonomous_envelope::{
             AutonomousEnvelope, AutonomousPins, ENVELOPE_CONTRACT, PROFILE_SIMULATE,
             PROFILE_VERSION, RECEIPT_CURRENT, STATUS_LIVE, admit_envelope, envelope_digest_for,
             stop_envelope,
@@ -996,8 +1111,8 @@ mod tests {
     #[test]
     fn denied_dispatch_admission_completes_the_receipt() {
         let db = setup();
-        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
-        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        let mut policy = crate::sekai::facts::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::facts::action_policy::ActionDecision::Deny;
         db.upsert_action_policy(&policy).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
         let mut denied = request(r#"{"runtime":"shikigami"}"#);
@@ -1095,7 +1210,7 @@ mod tests {
     }
 
     fn ensure_record_kind(db: &RuntimeDb) {
-        db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        db.upsert_object_type(&crate::sekai::facts::schema::ObjectType {
             kind: "customer_record".into(),
             description: "Fixture customer record kind".into(),
             properties: vec![],
@@ -1302,8 +1417,8 @@ mod tests {
         ensure_record_kind(&db);
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
-        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
-        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        let mut policy = crate::sekai::facts::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::facts::action_policy::ActionDecision::Deny;
         db.upsert_action_policy(&policy).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
         let outcome = admission
@@ -1336,8 +1451,8 @@ mod tests {
                 10,
             )
             .unwrap();
-        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
-        policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+        let mut policy = crate::sekai::facts::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::facts::action_policy::ActionDecision::Deny;
         db.upsert_action_policy(&policy).unwrap();
         let mut denied = record_request("customer.record.create", r#"{"object_id":"rec-6"}"#);
         denied.idempotency_key = "record-6-deny".into();
@@ -1356,14 +1471,14 @@ mod tests {
         ensure_record_kind(&db);
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
-        let reserved = crate::sekai::action_instance::ActionInstance {
+        let reserved = crate::sekai::facts::action_instance::ActionInstance {
             instance_id: "gai-incomplete".into(),
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),
             version: "1".into(),
             principal: "alice".into(),
             parameters_json: r#"{"object_id":"rec-7"}"#.into(),
-            request_digest: crate::sekai::action_instance::compute_request_digest(
+            request_digest: crate::sekai::facts::action_instance::compute_request_digest(
                 "acme",
                 "customer.record.create",
                 "1",
@@ -1411,9 +1526,10 @@ mod tests {
         db.create_object(&object).unwrap();
         let mut type_def = record_type("update");
         type_def.submission_criteria = vec![
-            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+            crate::sekai::facts::action_type_criteria::ActionSubmissionCriterion {
                 criterion_id: "ready_for_review".into(),
-                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                kind: crate::sekai::facts::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS
+                    .into(),
                 property: "state".into(),
                 value: "ready".into(),
             },

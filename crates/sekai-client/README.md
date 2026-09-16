@@ -2,11 +2,13 @@
 
 This crate is licensed under [Apache-2.0](../../LICENSE).
 
-`sekai-client` is the separately versioned Rust facade for the native Sekai
-and Chisei core loop. It is intentionally a leaf client crate: the canonical
-generated protocol remains in [`sekai-proto`](../sekai-proto), and the control
-plane remains authoritative for authentication, authorization, policy, budget,
-provider routing, persistence, and receipts.
+`sekai-client` is the separately versioned Rust facade for the native
+`ChiseiService` core loop (plan/execute/receipt). After ADR 0082 the clerk
+client of `SekaiService` is [`sekai-clerk-client`](../sekai-clerk-client).
+This crate stays a leaf: the generated protocol remains in
+[`sekai-proto`](../sekai-proto), and the control plane remains authoritative
+for authentication, authorization, policy, budget, provider routing,
+persistence, and receipts.
 
 ## Supported surface
 

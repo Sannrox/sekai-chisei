@@ -15,6 +15,7 @@ categories = ["development-tools", "web-programming"]
 members = [
     "crates/chisei-gateway",
     "crates/sekai-admin-client",
+    "crates/sekai-clerk-client",
     "crates/sekai-client",
     "crates/sekai-ontology",
     "crates/sekai-proto",
@@ -98,6 +99,14 @@ tempfile = "3"
 [[bin]]
 name = "sekai-mcp"
 path = "src/bin/sekai_mcp.rs"
+
+[[bin]]
+name = "sekai"
+path = "src/bin/sekai.rs"
+
+[[bin]]
+name = "chisei"
+path = "src/bin/chisei.rs"
 
 [[bench]]
 name = "control_plane"

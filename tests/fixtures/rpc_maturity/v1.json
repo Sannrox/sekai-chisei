@@ -1,7 +1,7 @@
 {
   "version": "sekai.rpc-maturity/v1",
   "issue": 871,
-  "stable_limit": 60,
+  "stable_limit": 64,
   "experimental_env": "SEKAI_EXPERIMENTAL_RPCS",
   "experimental_feature": "experimental-rpcs",
   "entries": [
@@ -847,8 +847,8 @@
       "rpc": "GetGovernedActionType",
       "storage_path": "sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -875,6 +875,24 @@
       "storage_path": "sekai.audit",
       "real_backend": "yes",
       "consumer": "host, example",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PersistAdmittedAction",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetPersistedOperationReceipt",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "host",
       "classification": "stable",
       "product_tier": "advanced"
     },
@@ -1426,6 +1444,15 @@
       "consumer": "sdk, host",
       "classification": "stable",
       "product_tier": "core"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "InvokeActionInstance",
+      "storage_path": "sekai.audit, chisei.execution",
+      "real_backend": "yes",
+      "consumer": "host",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",

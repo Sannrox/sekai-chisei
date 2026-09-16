@@ -102,3 +102,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0078: Audience-bound assertions fill existing AuthenticatedContext](0078-audience-bound-assertions.md)
 - [ADR 0079: Bound evaluation suites gate promotion on existing certification](0079-evaluation-promotion-gate.md)
 - [ADR 0080: Keep dual community control-plane storage](0080-dual-community-runtime-storage.md)
+- [ADR 0081: Keep Chisei depending on Sekai in one process](0081-chisei-depends-on-sekai.md)
+- [ADR 0082: Two local servers, one Sekai database](0082-two-local-servers.md)

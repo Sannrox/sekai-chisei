@@ -1,0 +1,47 @@
+# Local two-server proof (ADR 0082). One Sekai database. Chisei has none.
+# From the repo root:
+#   docker compose -f compose/two-planes.yaml up --build
+# Or without Docker:
+#   SEKAI_INSECURE=1 cargo run --locked --bin sekai
+#   SEKAI_INSECURE=1 CHISEI_SEKAI_ENDPOINT=http://127.0.0.1:50051 GRPC_PORT=50052 cargo run --locked --bin chisei
+#
+# Builds the in-tree `sekai` and `chisei` binaries.
+
+services:
+  sekai:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile.sekai
+    image: sekai:local
+    environment:
+      SEKAI_INSECURE: "1"
+      SEKAI_PLANE: sekai
+      SEKAI_BIND: 0.0.0.0
+      GRPC_PORT: "50051"
+      SEKAI_SOCKET: ""
+      SEKAI_HTTP_PORT: ""
+      OPS_PORT: ""
+      DB_PATH: /data/sekai.db
+    volumes:
+      - sekai-data:/data
+    ports:
+      - "127.0.0.1:50051:50051"
+  chisei:
+    build:
+      context: ..
+      dockerfile: compose/Dockerfile.chisei
+    image: chisei:local
+    environment:
+      SEKAI_INSECURE: "1"
+      SEKAI_PLANE: chisei
+      SEKAI_BIND: 0.0.0.0
+      GRPC_PORT: "50052"
+      SEKAI_SOCKET: ""
+      CHISEI_SEKAI_ENDPOINT: http://sekai:50051
+    ports:
+      - "127.0.0.1:50052:50052"
+    depends_on:
+      - sekai
+
+volumes:
+  sekai-data:

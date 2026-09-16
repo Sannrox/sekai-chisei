@@ -1,23 +1,24 @@
 //! Observational object-bound Action describe and preview (#836).
 //!
-//! These projections never persist an ActionInstance, write an object, redeem a
+//! Chisei owns these projections so budget and policy stay on the decision
+//! side. They never persist an ActionInstance, write an object, redeem a
 //! permit, or become submit authority. `SubmitActionInstance` still owns
 //! admission.
 
 use crate::chisei::budget::BudgetTracker;
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
-use crate::sekai::action::RiskClass;
-use crate::sekai::action_instance::{
+use crate::sekai::facts::action::RiskClass;
+use crate::sekai::facts::action_instance::{
     SUBMIT_POLICY_ACTION, compute_request_digest, submit_budget_subject, validate_parameters_json,
 };
-use crate::sekai::action_object_mutation;
-use crate::sekai::action_policy::ActionDecision;
-use crate::sekai::action_type_criteria::{
+use crate::sekai::facts::action_object_mutation;
+use crate::sekai::facts::action_policy::ActionDecision;
+use crate::sekai::facts::action_type_criteria::{
     ActionSubmissionCriterion, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
-use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_UPDATE};
-use crate::sekai::object_security::PrincipalPolicyContext;
+use crate::sekai::facts::governed_action_type::{GovernedActionType, OBJECT_MUTATION_UPDATE};
+use crate::sekai::facts::object_security::PrincipalPolicyContext;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
@@ -434,7 +435,7 @@ impl std::fmt::Display for action_object_mutation::ActionObjectMutationError {
 mod tests {
     use super::*;
     use crate::domain::Object;
-    use crate::sekai::governed_action_type::GovernedActionType;
+    use crate::sekai::facts::governed_action_type::GovernedActionType;
     use std::collections::HashMap;
 
     fn object() -> Object {
@@ -473,7 +474,7 @@ mod tests {
 
     fn setup() -> (RuntimeDb, Object) {
         let db = RuntimeDb::memory();
-        db.upsert_object_type(&crate::sekai::schema::ObjectType {
+        db.upsert_object_type(&crate::sekai::facts::schema::ObjectType {
             kind: "customer_record".into(),
             description: "fixture".into(),
             properties: vec![],
@@ -611,9 +612,10 @@ mod tests {
         let mut type_def = update_type();
         type_def.version = "2".into();
         type_def.submission_criteria = vec![
-            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+            crate::sekai::facts::action_type_criteria::ActionSubmissionCriterion {
                 criterion_id: "ready_for_review".into(),
-                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                kind: crate::sekai::facts::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS
+                    .into(),
                 property: "state".into(),
                 value: "ready".into(),
             },
@@ -643,7 +645,7 @@ mod tests {
 
     #[test]
     fn preview_hides_ungranted_criterion_properties() {
-        use crate::sekai::object_security::{
+        use crate::sekai::facts::object_security::{
             OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
             ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
         };
@@ -681,9 +683,10 @@ mod tests {
         let mut type_def = update_type();
         type_def.version = "3".into();
         type_def.submission_criteria = vec![
-            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+            crate::sekai::facts::action_type_criteria::ActionSubmissionCriterion {
                 criterion_id: "has_clearance".into(),
-                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                kind: crate::sekai::facts::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS
+                    .into(),
                 property: "secret".into(),
                 value: "yes".into(),
             },

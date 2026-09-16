@@ -199,7 +199,7 @@ fn record(db: &RuntimeDb, outcome: &str, candidate: &Candidate, reason: &str) {
     evidence.insert("namespace".to_string(), candidate.namespace.clone());
     evidence.insert("task_class".to_string(), candidate.task_class.clone());
     evidence.insert("payload".to_string(), candidate.payload.clone());
-    let _ = db.record_decision(&crate::sekai::audit::Decision {
+    let _ = db.record_decision(&crate::sekai::facts::audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: "chisei.promotion".into(),

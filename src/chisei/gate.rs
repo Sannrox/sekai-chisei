@@ -80,7 +80,7 @@ pub fn gate_candidate(
         "candidate_score".to_string(),
         format!("{:.2}", decision.candidate_score),
     );
-    let _ = db.record_decision(&crate::sekai::audit::Decision {
+    let _ = db.record_decision(&crate::sekai::facts::audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: "chisei.gate".into(),

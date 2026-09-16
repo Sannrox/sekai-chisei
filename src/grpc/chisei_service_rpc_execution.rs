@@ -1013,3 +1013,56 @@ pub(super) async fn cancel_evaluation_execution(
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
     }))
 }
+
+pub(super) async fn invoke_action_instance(
+    service: &ChiseiServiceImpl,
+    req: Request<InvokeActionInstanceRequest>,
+) -> Result<Response<InvokeActionInstanceResponse>, Status> {
+    use crate::chisei::action_instance_admission::{
+        ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
+    };
+    use crate::sekai::object_security::PrincipalPolicyContext;
+
+    let actor = authenticated_actor(&req);
+    let inner = req.into_inner();
+    let outcome = ActionInstanceAdmission::new(&service.db, Some(service.budget.as_ref()))
+        .admit(
+            ActionInstanceAdmissionRequest {
+                namespace: inner.namespace,
+                type_id: inner.type_id,
+                version: inner.version,
+                parameters_json: inner.parameters_json,
+                idempotency_key: inner.idempotency_key,
+                evidence_submission_ids: inner.evidence_submission_ids,
+                request_id: inner.request_id,
+                ontology_digest: inner.ontology_digest,
+                autonomous_envelope_id: String::new(),
+                policy_context: PrincipalPolicyContext::default(),
+            },
+            &actor,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| match error {
+            ActionInstanceAdmissionError::InvalidArgument(message) => {
+                Status::invalid_argument(message)
+            }
+            ActionInstanceAdmissionError::FailedPrecondition(message) => {
+                Status::failed_precondition(message)
+            }
+            ActionInstanceAdmissionError::AlreadyExists(message) => Status::already_exists(message),
+            ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
+        })?;
+    let receipt_json = service
+        .db
+        .get_operation_receipt(&outcome.instance.operation_id)
+        .map_err(Status::internal)?
+        .map(|receipt| serde_json::to_string(&receipt).unwrap_or_default())
+        .unwrap_or_default();
+    let instance_json = serde_json::to_string(&outcome.instance)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    Ok(Response::new(InvokeActionInstanceResponse {
+        instance_json,
+        replay: outcome.replay,
+        receipt_json,
+    }))
+}

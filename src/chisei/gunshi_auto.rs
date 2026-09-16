@@ -19,7 +19,7 @@ use crate::chisei::gunshi_policy::{
     PolicyTransition, PolicyTransitionDecision, apply_promotion, monitor_and_rollback,
 };
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::audit::Decision;
+use crate::sekai::facts::audit::Decision;
 
 pub const STATE_CONTRACT_VERSION: &str = "gunshi.allocation-control/v1";
 pub const AUDIT_PROMOTE: &str = "gunshi.allocation_policy.promote";

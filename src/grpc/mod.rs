@@ -1,3 +1,4 @@
+pub mod chisei_remote;
 pub mod chisei_service;
 pub use sekai_admin_client::client;
 mod provider_execution;
@@ -429,15 +430,50 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServicePlane {
+    Combined,
+    Sekai,
+    Chisei,
+}
+
+impl ServicePlane {
+    pub fn from_env() -> Self {
+        match std::env::var("SEKAI_PLANE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "sekai" => Self::Sekai,
+            "chisei" => Self::Chisei,
+            _ => Self::Combined,
+        }
+    }
+}
+
+pub fn chisei_sekai_endpoint() -> Option<String> {
+    std::env::var("CHISEI_SEKAI_ENDPOINT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub fn run(
     config: Config,
     backend: Arc<RuntimeBackend>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
+    plane: ServicePlane,
 ) -> Result<
     impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
     Box<dyn std::error::Error>,
 > {
+    if plane == ServicePlane::Chisei {
+        return Err(std::io::Error::other(
+            "SEKAI_PLANE=chisei requires grpc::run_chisei_plane (no local database)",
+        )
+        .into());
+    }
     // This setup deliberately executes when `run` is called, before the
     // returned future is polled. The PostgreSQL backend uses synchronous
     // clients, so service construction must not acquire or release them from
@@ -548,6 +584,7 @@ pub fn run(
                     &config,
                     sekai_svc,
                     chisei_svc,
+                    plane,
                     &tcp_mode,
                     credential_store,
                     db,
@@ -575,6 +612,7 @@ pub fn run(
             &config,
             sekai_svc,
             chisei_svc,
+            plane,
             &tcp_mode,
             credential_store,
             db,
@@ -582,6 +620,47 @@ pub fn run(
             health_service,
         )
         .await
+    })
+}
+
+pub fn run_chisei_plane(
+    config: Config,
+    tcp_mode: GrpcTcpMode,
+) -> Result<
+    impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Box<dyn std::error::Error>,
+> {
+    let endpoint = chisei_sekai_endpoint().ok_or_else(|| {
+        std::io::Error::other("CHISEI_SEKAI_ENDPOINT is required for the Chisei plane")
+    })?;
+    if !tcp_mode.token_auth_mode && !config.insecure {
+        return Err(std::io::Error::other(
+            "create a principal credential before enabling TCP, or set SEKAI_INSECURE=1 for local development",
+        )
+        .into());
+    }
+    let chisei_svc = std::sync::Arc::new(chisei_remote::ChiseiRemoteImpl::new(endpoint));
+    let port = config.grpc_port;
+    let bind_addr = tcp_mode.bind_addr.clone();
+    Ok(async move {
+        let addr = format!("{bind_addr}:{port}").parse()?;
+        tracing::info!(addr = %addr, plane = "chisei", "gRPC server listening");
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        health_reporter
+            .set_service_status("", ServingStatus::Serving)
+            .await;
+        Server::builder()
+            .layer(MetricsLayer)
+            .add_service(health_service)
+            .add_service(InterceptedService::new(
+                RpcMaturityLayer::from_env().layer(
+                    pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(chisei_svc),
+                ),
+                LocalInterceptor::new(false),
+            ))
+            .serve(addr)
+            .await
+            .map_err(Into::into)
     })
 }
 
@@ -631,6 +710,7 @@ async fn run_tcp<H>(
     config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
+    plane: ServicePlane,
     tcp_mode: &GrpcTcpMode,
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
@@ -656,6 +736,7 @@ where
             config,
             sekai_svc,
             chisei_svc,
+            plane,
             TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
             health_service,
         )
@@ -667,6 +748,7 @@ where
             config,
             sekai_svc,
             chisei_svc,
+            plane,
             local_or_token_interceptor(credential_store, db, assertion_authority),
             health_service,
         )
@@ -674,13 +756,14 @@ where
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments, clippy::future_not_send)]
 async fn serve_tcp_listener<I, H>(
     bind_addr: &str,
     port: u16,
     config: &Config,
     sekai_svc: Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
+    plane: ServicePlane,
     interceptor: I,
     health_service: H,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -705,25 +788,26 @@ where
         server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
     }
 
-    server
-        .add_service(health_service)
-        .add_service(InterceptedService::new(
+    let mut router = server.add_service(health_service);
+    if plane != ServicePlane::Chisei {
+        router = router.add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
                 pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             ),
             interceptor.clone(),
-        ))
-        .add_service(InterceptedService::new(
+        ));
+    }
+    if plane != ServicePlane::Sekai {
+        router = router.add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
                 pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
                     chisei_svc.clone(),
                 ),
             ),
             interceptor,
-        ))
-        .serve(addr)
-        .await
-        .map_err(Into::into)
+        ));
+    }
+    router.serve(addr).await.map_err(Into::into)
 }
 
 async fn serve_uds<I, H>(
@@ -936,7 +1020,13 @@ mod tests {
             bind_inferred_from_active_credentials: false,
         };
 
-        let result = run(config, backend, Vec::new(), tcp_mode);
+        let result = run(
+            config,
+            backend,
+            Vec::new(),
+            tcp_mode,
+            ServicePlane::Combined,
+        );
 
         assert!(result.is_err());
     }

@@ -10,8 +10,8 @@ use crate::chisei::external_action::{
 };
 use crate::db::chisei_budget::METRIC_TOKENS;
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::action::RiskClass;
-use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
+use crate::sekai::facts::action::RiskClass;
+use crate::sekai::facts::action_policy::{ActionDecision, ActionPolicy};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug)]
@@ -178,7 +178,7 @@ pub fn ensure_audit(db: &RuntimeDb, record: &AuthorizationRecord) -> Result<(), 
     } else {
         record.approval_status.as_str()
     };
-    db.record_decisions_idempotently(&[crate::sekai::audit::Decision {
+    db.record_decisions_idempotently(&[crate::sekai::facts::audit::Decision {
         id: format!("{}:audit:{lifecycle}", record.decision.authorization_id),
         timestamp: record.decision_updated_at_ms,
         actor: record.decision_actor.clone(),

@@ -13,7 +13,7 @@ Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures
 
 | Class | Meaning | Default build |
 | --- | --- | --- |
-| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 60 RPCs. | Invokable. |
+| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 64 RPCs. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
 | `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
 
@@ -140,10 +140,12 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.ListAttestations` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.VerifyAttestation` | `sekai.attestations, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.PutGovernedActionType` | `sekai.audit` | yes | example | `stable` |
-| `SekaiService.GetGovernedActionType` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetGovernedActionType` | `sekai.audit` | yes | host | `stable` |
 | `SekaiService.ListGovernedActionTypes` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
+| `SekaiService.PersistAdmittedAction` | `sekai.audit` | yes | host | `stable` |
+| `SekaiService.GetPersistedOperationReceipt` | `chisei.execution` | yes | host | `stable` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
@@ -205,6 +207,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `ChiseiService.ExecuteContentPlanStream` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ReportOperationEvent` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host | `stable` |
+| `ChiseiService.InvokeActionInstance` | `sekai.audit, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ListKiokuCandidates` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ReviewKiokuMemory` | `chisei.learning` | yes | none | `remove` |

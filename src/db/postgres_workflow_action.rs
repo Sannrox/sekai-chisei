@@ -2,10 +2,10 @@
 
 use postgres::{GenericClient, Transaction};
 
-use crate::db::postgres::PostgresDb;
-use crate::sekai::workflow_action::{
+use crate::chisei::workflow_action::{
     WORKFLOW_UNAVAILABLE, WorkflowActionBinding, WorkflowCallback, WorkflowCommandRecord,
 };
+use crate::db::postgres::PostgresDb;
 
 const BINDING_LOCK_SEED: i64 = 8_231;
 
@@ -223,13 +223,13 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use crate::db::postgres::PostgresDb;
-    use crate::db::runtime_db::RuntimeDb;
-    use crate::sekai::workflow_action::{
+    use crate::chisei::workflow_action::{
         BRIDGE_CONTRACT, COMMAND_CALLBACK, COMMAND_CANCEL, COMMAND_PARK, COMMAND_SUBMIT,
         PROFILE_JOB_STEP, PROFILE_VERSION, STATUS_CANCELLED, STATUS_PARKED, STATUS_RESUMED,
         STATUS_SUBMITTED,
     };
+    use crate::db::postgres::PostgresDb;
+    use crate::db::runtime_db::RuntimeDb;
 
     fn binding(scope: &str, cursor: u64, status: &str) -> WorkflowActionBinding {
         WorkflowActionBinding {

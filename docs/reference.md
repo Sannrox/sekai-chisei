@@ -229,6 +229,8 @@ enabled in the default build.
 ## Project internals
 
 - [Architecture](architecture.md) — component and trust boundaries.
+- [Two local servers](two-local-servers.md) — Sekai clerk and Chisei platform
+  as two loopback processes (ADR 0082).
 - [Architecture decisions](decisions/README.md) — accepted decisions and ADR
   template.
 - [Project operating system](project-operating-system.md) — contribution and

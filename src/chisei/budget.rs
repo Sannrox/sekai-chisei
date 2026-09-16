@@ -5,7 +5,7 @@ use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::sekai::audit::Decision;
+use crate::sekai::facts::audit::Decision;
 
 pub use crate::db::chisei_budget::BudgetTransferRecord;
 
@@ -796,7 +796,7 @@ mod tests {
 
         // Audit decision recorded.
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::sekai::facts::audit::DecisionFilter {
                 action: Some("budget.transfer".into()),
                 target_id: Some("region:us".into()),
                 ..Default::default()

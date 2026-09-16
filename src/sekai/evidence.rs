@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const EVIDENCE_ENVELOPE_VERSION: &str = "sekai.evidence/v1";
+pub const EXECUTION_EVIDENCE_TYPE: &str = "external_action_execution";
 pub const DEFAULT_MAX_EVIDENCE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_RELATIONSHIPS: usize = 128;

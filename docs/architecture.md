@@ -7,32 +7,23 @@ owns durable facts and the decisions that constrain an operation.
 ## Components
 
 ```text
-OpenAI / Anthropic clients        Native integrations
-            |                            |
-            v                            v
-     chisei-gateway              Gunshi fleet allocation
-            |                            |
-            |                            v
-            |                   PlanExecution
-            |                   (Kioku enrichment)
-            |                            |
-            |                            v
-            |                   ExecutePlanStream
-            |                            |
-            +-------------+--------------+
-                          v
-                    Chisei decisions
-              policy | budget | routing
-              approval | eval | learning
-                          |
-                          v
-                     Sekai facts
-              graph | ACL | audit | lineage
-              evidence | outcomes | memory
-                          |
-                          v
-                  SQLite / PostgreSQL
+OpenAI / Anthropic clients     PlanExecution / InvokeActionInstance
+         |                            |
+         v                            v
+              Chisei server (AIP)
+         route: policy, model, budget,
+         egress, admit or deny Action
+         |                    |
+         | LLM provider       | clerk RPCs after a decision
+         v                    v
+                    Sekai server (Foundry)
+                    objects, ACL, persist Action+audit, DB
 ```
+
+Combined `sekai-chisei` still hosts both services in one process. The Chisei
+plane requires `CHISEI_SEKAI_ENDPOINT` and does not open a database. See
+[ADR 0082](decisions/0082-two-local-servers.md) and
+[two-local-servers.md](two-local-servers.md).
 
 ### Sekai: durable facts
 
@@ -131,6 +122,12 @@ Provider registry persistence and lifecycle records are owned by
 that loads an execution snapshot and resolves canonical provider/model records.
 Gateway and native gRPC transports consume that boundary, while provider
 adapters receive an already resolved record and do not infer policy or routing.
+
+Chisei sits **on** Sekai: decision modules import `sekai::facts` only;
+`src/sekai` must not import `crate::chisei`. Action admission, Action Work,
+workflow bridging, describe/preview, and host execution-evidence helpers live
+in `src/chisei`. gRPC, persistence, and CLI wire both layers in one process.
+See [ADR 0081](decisions/0081-chisei-depends-on-sekai.md).
 
 ### Gateway and native execution
 

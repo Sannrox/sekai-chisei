@@ -70,7 +70,10 @@ Coverage:
 | ObjectSet query (#835) | supported | Sekai | `SekaiService.EvaluateObjectSet` | [object-set.md](object-set.md) | `src/grpc/object_set_query.rs` |
 | Application Action describe | supported | Sekai | `SekaiService.DescribeObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
 | Application Action preview | supported | Sekai | `SekaiService.PreviewObjectAction` | [governed-action-instances.md](governed-action-instances.md) | `src/grpc/sekai_service.rs` |
-| Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
+| Action approval RPC | unavailable | Chisei | — | [governed-action-instances.md](governed-action-instances.md) | `src/chisei/action_instance_admission.rs` |
+| Action invoke (ADR 0082) | supported | Chisei | `ChiseiService.InvokeActionInstance` | [architecture.md](architecture.md) | `tests/two_process_planes.rs` |
+| Persist admitted Action | supported | Sekai | `SekaiService.PersistAdmittedAction` | [architecture.md](architecture.md) | `tests/two_process_planes.rs` |
+| Persisted operation receipt | supported | Sekai | `SekaiService.GetPersistedOperationReceipt` | [architecture.md](architecture.md) | `tests/two_process_planes.rs` |
 | Object-change subscription (#838) | supported | Sekai | `SekaiService.ReadObjectChangeSubscription` | [object-change-subscriptions.md](object-change-subscriptions.md) | `src/grpc/object_change_subscription.rs` |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
 | HTTP/JSON ontology projection (#875) | supported | Interface | `POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |

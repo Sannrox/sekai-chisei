@@ -16,7 +16,7 @@ fn classification_table_matches_proto_services() {
         table.entries.len(),
         "docs table must list every classified RPC"
     );
-    assert_eq!(table.stable_rpcs().len(), 60);
+    assert_eq!(table.stable_rpcs().len(), 64);
     assert!(
         table
             .entries

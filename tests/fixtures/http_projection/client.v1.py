@@ -42,7 +42,10 @@ HTTP_UNARY_METHODS = (
     ("sekai.SekaiService", "ListGrants"),
     ("sekai.SekaiService", "CheckAccess"),
     ("sekai.SekaiService", "PutGovernedActionType"),
+    ("sekai.SekaiService", "GetGovernedActionType"),
     ("sekai.SekaiService", "SubmitActionInstance"),
+    ("sekai.SekaiService", "PersistAdmittedAction"),
+    ("sekai.SekaiService", "GetPersistedOperationReceipt"),
     ("sekai.SekaiService", "DescribeObjectAction"),
     ("sekai.SekaiService", "PreviewObjectAction"),
     ("sekai.SekaiService", "GetActionInstance"),
@@ -65,6 +68,7 @@ HTTP_UNARY_METHODS = (
     ("chisei.ChiseiService", "PlanContentExecution"),
     ("chisei.ChiseiService", "ReportOperationEvent"),
     ("chisei.ChiseiService", "GetOperationReceipt"),
+    ("chisei.ChiseiService", "InvokeActionInstance"),
     ("chisei.ChiseiService", "GetQualityTrend"),
     ("chisei.ChiseiService", "ClaimGatewayDispatch"),
 )

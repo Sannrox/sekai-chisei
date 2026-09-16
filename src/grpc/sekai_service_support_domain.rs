@@ -427,6 +427,29 @@ fn to_proto_submission_criterion(
         value: domain.value.clone(),
     }
 }
+pub(super) fn from_proto_action_instance(
+    proto: crate::grpc::pb::sekai::ActionInstance,
+) -> crate::sekai::action_instance::ActionInstance {
+    crate::sekai::action_instance::ActionInstance {
+        instance_id: proto.instance_id,
+        namespace: proto.namespace,
+        type_id: proto.type_id,
+        version: proto.version,
+        principal: proto.principal,
+        parameters_json: proto.parameters_json,
+        request_digest: proto.request_digest,
+        idempotency_key: proto.idempotency_key,
+        operation_id: proto.operation_id,
+        status: proto.status,
+        deny_reason: proto.deny_reason,
+        evidence_submission_ids: proto.evidence_submission_ids,
+        policy_decision: proto.policy_decision,
+        budget_decision: proto.budget_decision,
+        created_at_ms: proto.created_at_ms,
+        decided_at_ms: proto.decided_at_ms,
+    }
+}
+
 pub(super) fn to_proto_action_instance(
     domain: &crate::sekai::action_instance::ActionInstance,
 ) -> crate::grpc::pb::sekai::ActionInstance {
@@ -1499,19 +1522,19 @@ pub(super) fn visible_action_object(
     .map_err(|_| unavailable())
 }
 pub(super) fn map_object_action_projection_error(
-    error: crate::sekai::action_describe_preview::ObjectActionProjectionError,
+    error: crate::chisei::action_describe_preview::ObjectActionProjectionError,
 ) -> Status {
     match error {
-        crate::sekai::action_describe_preview::ObjectActionProjectionError::Unavailable => {
+        crate::chisei::action_describe_preview::ObjectActionProjectionError::Unavailable => {
             Status::permission_denied("object action unavailable")
         }
-        crate::sekai::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
+        crate::chisei::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
             message,
         ) => Status::invalid_argument(message),
     }
 }
 pub(super) fn object_action_description_to_proto(
-    description: crate::sekai::action_describe_preview::ObjectActionDescription,
+    description: crate::chisei::action_describe_preview::ObjectActionDescription,
 ) -> DescribeObjectActionResponse {
     DescribeObjectActionResponse {
         namespace: description.namespace,
@@ -1536,7 +1559,7 @@ pub(super) fn object_action_description_to_proto(
     }
 }
 pub(super) fn object_action_preview_to_proto(
-    preview: crate::sekai::action_describe_preview::ObjectActionPreview,
+    preview: crate::chisei::action_describe_preview::ObjectActionPreview,
 ) -> PreviewObjectActionResponse {
     PreviewObjectActionResponse {
         outcome: preview.outcome,

@@ -6,7 +6,7 @@ use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::sekai::audit::Decision;
+use crate::sekai::facts::audit::Decision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};

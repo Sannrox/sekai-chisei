@@ -5,13 +5,13 @@ mod workflow_approval_step;
 #[path = "../adapters/workflow_job_step.rs"]
 mod workflow_job_step;
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
-use sekai_chisei::sekai::workflow_action::{
+use sekai_chisei::chisei::workflow_action::{
     PROFILE_APPROVAL_STEP, PROFILE_JOB_STEP, STATUS_CANCELLED, STATUS_PARKED, STATUS_RESUMED,
     STATUS_SUBMITTED, WORKFLOW_UNAVAILABLE, WorkflowActionBinding, WorkflowReceiptReconciliation,
     WorkflowStepEnvelope, cancel_step, park_step, reconcile_receipt, resume_step, submit_step,
 };
+use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
 use sekai_chisei::workflow_action_catalog::built_in_workflow_adapters;
 use std::path::{Path, PathBuf};
 use workflow_action_sdk::{WorkflowCommand, WorkflowTransport, command, enqueue, flush};
@@ -44,7 +44,7 @@ impl WorkflowTransport for PlaneTransport {
         envelope: &WorkflowStepEnvelope,
         payload_digest: &str,
     ) -> Result<WorkflowActionBinding, String> {
-        sekai_chisei::sekai::workflow_action::callback_step(
+        sekai_chisei::chisei::workflow_action::callback_step(
             &self.db,
             &self.actor,
             envelope,

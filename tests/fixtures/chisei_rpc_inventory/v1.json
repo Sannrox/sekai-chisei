@@ -206,6 +206,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "InvokeActionInstance",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.execution"
+      ],
+      "evidence": [
+        "src/chisei/action_instance_admission.rs",
+        "src/grpc/chisei_remote.rs",
+        "tests/two_process_planes.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetQualityTrend",
       "kind": "query",
       "surfaces": [],

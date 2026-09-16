@@ -2532,6 +2532,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sekai-clerk-client"
+version = "0.1.0"
+dependencies = [
+ "sekai-proto",
+ "tonic",
+]
+
+[[package]]
 name = "sekai-client"
 version = "0.1.2"
 dependencies = [

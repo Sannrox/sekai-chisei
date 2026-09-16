@@ -9,8 +9,8 @@
 use crate::chisei::kioku::{
     KIOKU_EVIDENCE_REASSESSMENT_METHOD, KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance,
 };
-use crate::sekai::evidence::EvidenceLifecycleState;
-use crate::sekai::evidence_store::EvidenceSubmissionRecord;
+use crate::sekai::facts::evidence::EvidenceLifecycleState;
+use crate::sekai::facts::evidence_store::EvidenceSubmissionRecord;
 use serde::{Deserialize, Serialize};
 
 pub const EPISTEMIC_DESCRIPTOR_VERSION: &str = "chisei.epistemic-descriptor/v1";
@@ -132,7 +132,7 @@ impl EpistemicDescriptor {
     /// asserted or entailed; this constructor does not infer evidence
     /// polarity from graph shape or object properties.
     pub fn from_graph_explanation(
-        explanation: &crate::sekai::retrieval::Explanation,
+        explanation: &crate::sekai::facts::retrieval::Explanation,
         source_rows_truncated: bool,
     ) -> Self {
         Self::from_graph_projection(
@@ -551,7 +551,9 @@ mod tests {
     use crate::chisei::kioku::{
         KiokuEvidenceBasis, KiokuEvidenceLink, KiokuMemory, MemoryKind, MemoryLifecycleState,
     };
-    use crate::sekai::evidence::{EvidenceClassification, EvidenceIntent, EvidenceLifecycleState};
+    use crate::sekai::facts::evidence::{
+        EvidenceClassification, EvidenceIntent, EvidenceLifecycleState,
+    };
 
     fn memory(state: MemoryLifecycleState) -> KiokuMemory {
         KiokuMemory {

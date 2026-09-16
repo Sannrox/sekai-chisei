@@ -1,0 +1,11 @@
+[package]
+name = "sekai-clerk-client"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Generated SekaiService clerk client. Chisei depends on this crate, not Sekai internals."
+repository = "https://github.com/Sannrox/sekai-chisei"
+
+[dependencies]
+sekai-proto = { version = "1.0.1", path = "../sekai-proto" }
+tonic = { version = "0.14", features = ["tls-ring"] }

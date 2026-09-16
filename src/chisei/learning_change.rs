@@ -7,7 +7,7 @@
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::KIND_LEARNING;
-use crate::sekai::audit::Decision;
+use crate::sekai::facts::audit::Decision;
 use crate::shomei;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -460,8 +460,8 @@ fn required(name: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::domain::Object;
-    use crate::sekai::learning::record_learning;
-    use crate::sekai::schema::SchemaRegistry;
+    use crate::sekai::facts::learning::record_learning;
+    use crate::sekai::facts::schema::SchemaRegistry;
     use std::collections::HashMap;
 
     fn db() -> RuntimeDb {

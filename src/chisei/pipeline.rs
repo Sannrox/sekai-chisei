@@ -8,9 +8,9 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
-use crate::sekai::capacity;
-use crate::sekai::evidence::EvidenceClassification;
-use crate::sekai::schema::ObjectType;
+use crate::sekai::facts::capacity;
+use crate::sekai::facts::evidence::EvidenceClassification;
+use crate::sekai::facts::schema::ObjectType;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
@@ -2085,15 +2085,15 @@ mod tests {
         MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
     };
     use crate::domain::{Link, Object};
-    use crate::sekai::evidence::{
+    use crate::sekai::facts::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
         EvidenceTarget, SchemaCompatibility,
     };
-    use crate::sekai::evidence_store::{
+    use crate::sekai::facts::evidence_store::{
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
     };
-    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
-    use crate::sekai::security::{Grant, Role};
+    use crate::sekai::facts::schema::{ObjectType, PropertyDef, PropertyType};
+    use crate::sekai::facts::security::{Grant, Role};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 
@@ -2106,7 +2106,7 @@ mod tests {
             enum_values: vec![],
             link_kind: String::new(),
             compute_expr: String::new(),
-            classification: crate::sekai::schema::default_property_classification(),
+            classification: crate::sekai::facts::schema::default_property_classification(),
             struct_fields: vec![],
         }
     }
@@ -2408,7 +2408,7 @@ mod tests {
             evidence_digest: "sha256:authoritative".into(),
             source_submission_id: "submission:authoritative".into(),
             stance: MemoryEvidenceStance::Supporting,
-            lifecycle_state: crate::sekai::evidence::EvidenceLifecycleState::Available,
+            lifecycle_state: crate::sekai::facts::evidence::EvidenceLifecycleState::Available,
             observed_at_ms: 100,
         }];
         let reassessed_rendered = render_memory_context(&crate::chisei::kioku::RetrievedMemory {

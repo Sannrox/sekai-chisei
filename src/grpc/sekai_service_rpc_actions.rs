@@ -123,7 +123,7 @@ pub(super) async fn submit_action_instance(
     service: &SekaiServiceImpl,
     req: Request<SubmitActionInstanceRequest>,
 ) -> Result<Response<SubmitActionInstanceResponse>, Status> {
-    use crate::sekai::action_instance_admission::{
+    use crate::chisei::action_instance_admission::{
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
     };
 
@@ -194,6 +194,109 @@ pub(super) async fn submit_action_instance(
         replay: outcome.replay,
     }))
 }
+
+fn map_admission_error(
+    error: crate::chisei::action_instance_admission::ActionInstanceAdmissionError,
+) -> Status {
+    use crate::chisei::action_instance_admission::ActionInstanceAdmissionError;
+    match error {
+        ActionInstanceAdmissionError::InvalidArgument(message) => Status::invalid_argument(message),
+        ActionInstanceAdmissionError::FailedPrecondition(message) => {
+            Status::failed_precondition(message)
+        }
+        ActionInstanceAdmissionError::AlreadyExists(message) => Status::already_exists(message),
+        ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
+    }
+}
+
+pub(super) async fn persist_admitted_action(
+    service: &SekaiServiceImpl,
+    req: Request<PersistAdmittedActionRequest>,
+) -> Result<Response<PersistAdmittedActionResponse>, Status> {
+    use crate::chisei::action_instance_admission::ActionInstanceAdmission;
+
+    let principals = caller_principals(&req);
+    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let inner = req.into_inner();
+    let proto = inner
+        .instance
+        .ok_or_else(|| Status::invalid_argument("instance required"))?;
+    let instance = from_proto_action_instance(proto);
+    let actor = authorize_action_instance_submit(service, &principals, &instance.namespace)?;
+    if !instance.principal.is_empty() && instance.principal != actor {
+        return Err(Status::permission_denied(
+            "persist principal must match the authenticated actor",
+        ));
+    }
+    enforce_namespace_tenant_context(
+        &service.db,
+        tenant_context.as_ref(),
+        &instance.namespace,
+        true,
+    )?;
+    let mut instance = instance;
+    if instance.principal.is_empty() {
+        instance.principal = actor.clone();
+    }
+    let outcome = ActionInstanceAdmission::new(
+        &service.db,
+        service.budget.as_ref().map(std::convert::AsRef::as_ref),
+    )
+    .persist_decided(
+        instance,
+        &actor,
+        {
+            let digest = inner.ontology_digest.trim();
+            (!digest.is_empty()).then(|| digest.to_string())
+        },
+        inner.policy_scope.trim(),
+        inner.budget_subject.trim(),
+        now_millis(),
+    )
+    .map_err(map_admission_error)?;
+    let receipt_json = service
+        .db
+        .get_operation_receipt(&outcome.instance.operation_id)
+        .map_err(Status::internal)?
+        .map(|receipt| {
+            serde_json::to_string(&receipt).map_err(|error| Status::internal(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Response::new(PersistAdmittedActionResponse {
+        instance: Some(to_proto_action_instance(&outcome.instance)),
+        replay: outcome.replay,
+        receipt_json,
+    }))
+}
+
+pub(super) async fn get_persisted_operation_receipt(
+    service: &SekaiServiceImpl,
+    req: Request<GetPersistedOperationReceiptRequest>,
+) -> Result<Response<GetPersistedOperationReceiptResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let operation_id = req.into_inner().operation_id.trim().to_string();
+    if operation_id.is_empty() {
+        return Err(Status::invalid_argument("operation_id required"));
+    }
+    let receipt = service
+        .db
+        .get_operation_receipt(&operation_id)
+        .map_err(Status::internal)?;
+    match receipt {
+        Some(receipt) => {
+            let complete = receipt.completed_at_ms.is_some();
+            Ok(Response::new(GetPersistedOperationReceiptResponse {
+                receipt_json: serde_json::to_string(&receipt)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+                complete,
+            }))
+        }
+        None => Err(Status::not_found("operation receipt not found")),
+    }
+}
+
 pub(super) async fn describe_object_action(
     service: &SekaiServiceImpl,
     req: Request<DescribeObjectActionRequest>,
@@ -211,7 +314,7 @@ pub(super) async fn describe_object_action(
         &inner.namespace,
         &inner.object_id,
     )?;
-    let description = crate::sekai::action_describe_preview::describe_object_action(
+    let description = crate::chisei::action_describe_preview::describe_object_action(
         &service.db,
         &object,
         &inner.type_id,
@@ -239,10 +342,10 @@ pub(super) async fn preview_object_action(
         &inner.namespace,
         &inner.object_id,
     )?;
-    let preview = crate::sekai::action_describe_preview::preview_object_action(
+    let preview = crate::chisei::action_describe_preview::preview_object_action(
         &service.db,
         service.budget.as_ref().map(std::convert::AsRef::as_ref),
-        crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
+        crate::chisei::action_describe_preview::ObjectActionPreviewRequest {
             actor: &actor,
             object: &object,
             type_id: &inner.type_id,
@@ -255,7 +358,7 @@ pub(super) async fn preview_object_action(
         },
     )
     .map_err(map_object_action_projection_error)?;
-    if preview.outcome == crate::sekai::action_describe_preview::PREVIEW_UNAVAILABLE {
+    if preview.outcome == crate::chisei::action_describe_preview::PREVIEW_UNAVAILABLE {
         return Err(Status::permission_denied("object action unavailable"));
     }
     Ok(Response::new(object_action_preview_to_proto(preview)))

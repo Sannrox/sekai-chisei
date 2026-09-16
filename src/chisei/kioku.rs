@@ -4,8 +4,8 @@ use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 #[cfg(test)]
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
-use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
-use crate::sekai::security::Role;
+use crate::sekai::facts::evidence::{EvidenceClassification, EvidenceLifecycleState};
+use crate::sekai::facts::security::Role;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2703,7 +2703,7 @@ mod tests {
         GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceiptEvent, ReceiptEventKind,
     };
     use crate::domain::Object;
-    use crate::sekai::security::Grant;
+    use crate::sekai::facts::security::Grant;
     use std::collections::{BTreeMap, HashMap};
 
     fn candidate() -> KiokuMemory {

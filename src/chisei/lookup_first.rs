@@ -17,17 +17,17 @@ use crate::chisei::epistemic_descriptor::{
 };
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
-use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
-use crate::sekai::compute;
-use crate::sekai::governed_facts::{FACT_KIND, PROFILE_KIND, WAIVER_KIND};
-use crate::sekai::markings;
-use crate::sekai::ontology::OntologyRegistry;
-use crate::sekai::retrieval::{
+use crate::sekai::facts::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
+use crate::sekai::facts::compute;
+use crate::sekai::facts::governed_facts::{FACT_KIND, PROFILE_KIND, WAIVER_KIND};
+use crate::sekai::facts::markings;
+use crate::sekai::facts::ontology::OntologyRegistry;
+use crate::sekai::facts::retrieval::{
     self, ReasoningMode, RetrievalDirection, RetrievalQuery, RetrievalRoot,
 };
-use crate::sekai::schema::{self, SchemaRegistry};
-use crate::sekai::security::Role;
-use crate::sekai::semantic;
+use crate::sekai::facts::schema::{self, SchemaRegistry};
+use crate::sekai::facts::security::Role;
+use crate::sekai::facts::semantic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -476,7 +476,7 @@ pub fn record_lookup_promotion_gate(
     evidence.insert("passed".into(), report.passed.to_string());
     evidence.insert("failed".into(), report.failed.to_string());
     let verdict = report.verdict.as_str();
-    db.record_decision(&crate::sekai::audit::Decision {
+    db.record_decision(&crate::sekai::facts::audit::Decision {
         id: decision_id.clone(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: actor.into(),
@@ -1470,7 +1470,7 @@ fn lookup_object_readable(
     let authority = lookup_principal_authority(primary, db)?;
     let lattice = db.get_classification_lattice(&object.namespace)?;
     Ok(
-        crate::sekai::classification_lattice::evaluate_lattice_access(
+        crate::sekai::facts::classification_lattice::evaluate_lattice_access(
             "lookup-first",
             markings::object_marking_token(object),
             &authority,
@@ -2077,7 +2077,7 @@ fn s2_explain_negative_golden_answer() -> Value {
 /// Seed the graph state required by [`s1_fixture_cases`].
 pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
     use crate::domain::{Link, Object};
-    use crate::sekai::security::{Grant, Role};
+    use crate::sekai::facts::security::{Grant, Role};
     use std::collections::HashMap;
 
     let now = 1_700_000_000_000i64;

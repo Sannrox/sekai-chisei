@@ -96,7 +96,7 @@ pub struct Permit {
 }
 
 fn default_permit_site_id() -> String {
-    crate::sekai::lease::DEFAULT_SITE_ID.into()
+    crate::sekai::facts::lease::DEFAULT_SITE_ID.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -640,9 +640,9 @@ impl SekaiDb {
         let stored: Permit =
             serde_json::from_str(&stored_json).map_err(|error| error.to_string())?;
         if inserted == 1 {
-            crate::sekai::ledger::insert_chained_decision(
+            crate::sekai::facts::ledger::insert_chained_decision(
                 &tx,
-                &crate::sekai::audit::Decision {
+                &crate::sekai::facts::audit::Decision {
                     id: format!("{}:audit:issued", stored.permit_id),
                     timestamp: stored.issued_at_ms,
                     actor: issued_by.into(),
@@ -688,9 +688,9 @@ impl SekaiDb {
             "INSERT INTO chisei_external_action_delegated_permits(permit_id,parent_permit_id,permit_json,issued_at_ms) VALUES(?1,?2,?3,?4)",
             rusqlite::params![permit.permit_id, permit.parent_permit_id, json, permit.issued_at_ms],
         ).map_err(|error| error.to_string())?;
-        crate::sekai::ledger::insert_chained_decision(
+        crate::sekai::facts::ledger::insert_chained_decision(
             &tx,
-            &crate::sekai::audit::Decision {
+            &crate::sekai::facts::audit::Decision {
                 id: format!("{}:audit:delegated", permit.permit_id),
                 timestamp: permit.issued_at_ms,
                 actor: issued_by.into(),
@@ -792,9 +792,9 @@ impl SekaiDb {
             rusqlite::params![handle, reason, now_ms]
         ).map_err(|error| error.to_string())? == 1;
         if changed {
-            crate::sekai::ledger::insert_chained_decision(
+            crate::sekai::facts::ledger::insert_chained_decision(
                 &tx,
-                &crate::sekai::audit::Decision {
+                &crate::sekai::facts::audit::Decision {
                     id: format!("{handle}:audit:revoked"),
                     timestamp: now_ms,
                     actor: actor.into(),
@@ -876,7 +876,7 @@ impl SekaiDb {
         let host_site_id = crate::config::validate_site_id(host_site_id)?;
         // Fail closed: online (and offline reconcile) authority is pin-home only.
         let permit_site = if permit.site_id.trim().is_empty() {
-            crate::sekai::lease::DEFAULT_SITE_ID
+            crate::sekai::facts::lease::DEFAULT_SITE_ID
         } else {
             permit.site_id.as_str()
         };
@@ -1008,9 +1008,9 @@ impl SekaiDb {
         };
         let json = serde_json::to_string(&redemption).map_err(|error| error.to_string())?;
         tx.execute("INSERT INTO chisei_external_action_redemptions(permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![permit.permit_id,idempotency_key,execution_id,json,redemption.redeemed_at_ms,redemption.invocation_ordinal,redemption.redemption_id,redemption.evidence_due_at_ms]).map_err(|error| error.to_string())?;
-        crate::sekai::ledger::insert_chained_decision(
+        crate::sekai::facts::ledger::insert_chained_decision(
             &tx,
-            &crate::sekai::audit::Decision {
+            &crate::sekai::facts::audit::Decision {
                 id: format!("{}:audit:redeemed", redemption.redemption_id),
                 timestamp: redemption.redeemed_at_ms,
                 actor: context.executor.clone(),

@@ -1,128 +1,15 @@
 use sekai_chisei::config::Config;
+use sekai_chisei::grpc::ServicePlane;
 use sekai_chisei::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
-use std::sync::Arc;
-use tokio::signal;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut telemetry = sekai_chisei::obs::logging::init();
     let config = Config::from_env();
     if let Some(mode) = std::env::args().nth(1)
         && mode == "gateway-report"
     {
         return run_gateway_report(&config);
     }
-    tracing::info!(
-        version = sekai_chisei::build_info::PKG_VERSION,
-        git_version = sekai_chisei::build_info::GIT_VERSION,
-        git_commit = sekai_chisei::build_info::GIT_COMMIT,
-        "sekai-chisei starting"
-    );
-
-    let provider_registry_state_path =
-        sekai_chisei::provider_profile::provider_registry_state_path(&config.db_path);
-    sekai_chisei::provider_profile::validate_provider_registry_storage(
-        &provider_registry_state_path,
-    )
-    .map_err(std::io::Error::other)?;
-    sekai_chisei::provider_profile::refresh_provider_registry(&provider_registry_state_path)
-        .map_err(std::io::Error::other)?;
-
-    let backend_config =
-        RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
-    let backend =
-        Arc::new(RuntimeBackend::initialize(backend_config).map_err(std::io::Error::other)?);
-    let db = backend.database();
-    let active_credentials = db.list_active_credentials()?;
-    let external_credentials_active = active_credentials.iter().any(|credential| {
-        !matches!(
-            credential.principal.as_str(),
-            "chisei-gateway" | "local-onboarding"
-        )
-    });
-    let grpc_tcp_mode = config.grpc_tcp_mode(external_credentials_active);
-
-    if config.insecure && grpc_tcp_mode.auth_configured {
-        tracing::warn!("SEKAI_INSECURE=1 disables token-auth mode for local development");
-    }
-    if grpc_tcp_mode.bind_inferred_from_active_credentials {
-        tracing::warn!(
-            "binding 0.0.0.0 because active credentials exist; set SEKAI_BIND to make this explicit"
-        );
-    }
-
-    if grpc_tcp_mode.token_auth_mode {
-        tracing::info!(
-            bind = %grpc_tcp_mode.bind_addr,
-            port = config.grpc_port,
-            "gRPC TCP listener enabled"
-        );
-    } else if config.insecure {
-        tracing::info!(
-            bind = %grpc_tcp_mode.bind_addr,
-            port = config.grpc_port,
-            "gRPC TCP listener enabled"
-        );
-    } else {
-        tracing::info!("gRPC TCP listener disabled");
-    }
-
-    if let Some(socket_path) = &config.sekai_socket {
-        tracing::info!(
-            socket_path,
-            "gRPC UDS listener enabled (socket mode 0600; protect the socket directory; unauthenticated identity is forced to local)"
-        );
-    }
-    tracing::info!(
-        db_path = %config.db_path,
-        backend = ?backend.capabilities().backend,
-        backend_contract = %backend.capabilities().contract_version,
-        db_lock_poisoned_total = db.db_lock_poisoned_total(),
-        "database configured"
-    );
-    tracing::info!(
-        anthropic = config.anthropic_api_key.is_some(),
-        openai = config.openai_api_key.is_some(),
-        ollama_url = %config.ollama_url,
-        "LLM providers configured"
-    );
-
-    // PostgreSQL uses the synchronous `postgres` client internally. Keep its
-    // pool construction and final owner outside Tokio so client setup and
-    // teardown never try to block an already-running async runtime.
-    let async_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let server = sekai_chisei::grpc::run(
-        config,
-        Arc::clone(&backend),
-        active_credentials,
-        grpc_tcp_mode,
-    )?;
-    let result = {
-        let _runtime_guard = async_runtime.enter();
-        async_runtime.block_on(run_server(server))
-    };
-    telemetry.shutdown();
-    drop(async_runtime);
-    drop(backend);
-    result
-}
-
-async fn run_server(
-    server: impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let shutdown = async {
-        signal::ctrl_c().await.ok();
-        tracing::info!("shutting down");
-    };
-
-    tokio::select! {
-        result = server => {
-            result?;
-        }
-        _ = shutdown => {}
-    }
-    Ok(())
+    sekai_chisei::server::boot(ServicePlane::from_env())
 }
 
 fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Error>> {

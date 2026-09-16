@@ -1,4 +1,4 @@
-//! Runtime Action Work claim and acknowledgement lifecycle.
+//! Chisei-owned Action Work claim and acknowledgement lifecycle.
 //!
 //! Transport adapters authenticate callers and enforce namespace access before
 //! crossing this seam. This module owns persistence calls, retry/park event
@@ -9,12 +9,12 @@ use crate::chisei::receipt::{
     OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
 };
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::action_effect::{
+use crate::sekai::facts::action_effect::{
     ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect, EFFECT_STATUS_COMPLETED,
     EFFECT_STATUS_FAILED,
 };
-use crate::sekai::audit;
-use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
+use crate::sekai::facts::audit;
+use crate::sekai::facts::parked_work::{ActionWorkContinuation, ActionWorkPark};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,10 +724,10 @@ mod tests {
         ReceiptSurface, UncoveredSurface,
     };
     use crate::db::runtime_db::RuntimeDb;
-    use crate::sekai::action_effect::{
+    use crate::sekai::facts::action_effect::{
         ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, plan_effects_for_admit,
     };
-    use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+    use crate::sekai::facts::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
 
     fn seed_effect(db: &RuntimeDb) -> ActionEffect {
         let effect = plan_effects_for_admit(

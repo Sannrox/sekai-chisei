@@ -2,7 +2,7 @@
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
-use crate::sekai::audit::Decision;
+use crate::sekai::facts::audit::Decision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};

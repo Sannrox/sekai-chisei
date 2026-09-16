@@ -33,7 +33,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::llm;
-use crate::sekai::audit::DecisionFilter;
+use crate::sekai::facts::audit::DecisionFilter;
 
 /// A sampled execution captured at execute time, carrying enough context to be scored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,16 +472,18 @@ impl ScoringJob {
             evidence.insert("attempts".to_string(), attempts.to_string());
             evidence.insert("error".to_string(), message.clone());
             evidence.insert("request_id".to_string(), obs.request_id.clone());
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: "chisei.scoring".into(),
-                action: "judge_failed".into(),
-                reason: format!("retired after {attempts} judge failures"),
-                evidence,
-                target_id: obs.request_id.clone(),
-                outcome: "retired".into(),
-            });
+            let _ = self
+                .db
+                .record_decision(&crate::sekai::facts::audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    actor: "chisei.scoring".into(),
+                    action: "judge_failed".into(),
+                    reason: format!("retired after {attempts} judge failures"),
+                    evidence,
+                    target_id: obs.request_id.clone(),
+                    outcome: "retired".into(),
+                });
             let _ = self.db.delete_observation(&obs.request_id);
         } else {
             warn!(
@@ -606,23 +608,25 @@ impl ScoringJob {
         // Capture audit time after iteration tracking so a class-scoped signal
         // from this batch is never considered older than its namespace signal.
         let decision_timestamp = chrono::Utc::now().timestamp_millis();
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: decision_timestamp,
-            actor: "chisei.scoring".into(),
-            action: "scored".into(),
-            reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
-            evidence,
-            target_id: namespace.to_string(),
-            outcome: if regressed {
-                "regressed".into()
-            } else {
-                "stable".into()
-            },
-        });
+        let _ = self
+            .db
+            .record_decision(&crate::sekai::facts::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: decision_timestamp,
+                actor: "chisei.scoring".into(),
+                action: "scored".into(),
+                reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
+                evidence,
+                target_id: namespace.to_string(),
+                outcome: if regressed {
+                    "regressed".into()
+                } else {
+                    "stable".into()
+                },
+            });
         for (task_class, delta) in &class_deltas {
             let regressed = *delta < -TASK_CLASS_REGRESSION_THRESHOLD;
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            let _ = self.db.record_decision(&crate::sekai::facts::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: decision_timestamp,
                 actor: "chisei.scoring".into(),
@@ -651,7 +655,7 @@ impl ScoringJob {
             });
         }
         for (task_class, delta) in class_regressions {
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            let _ = self.db.record_decision(&crate::sekai::facts::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: decision_timestamp,
                 actor: "chisei.scoring".into(),
@@ -945,7 +949,7 @@ fn task_class_breakdown_json(group: &[&SampleObservation], results: &[eval::Case
     serde_json::to_string(&counts).unwrap_or_default()
 }
 
-fn scored_decisions(db: &RuntimeDb, namespace: &str) -> Vec<crate::sekai::audit::Decision> {
+fn scored_decisions(db: &RuntimeDb, namespace: &str) -> Vec<crate::sekai::facts::audit::Decision> {
     db.list_decisions(&DecisionFilter {
         actor: Some("chisei.scoring".to_string()),
         action: Some("scored".to_string()),
@@ -1429,7 +1433,7 @@ mod tests {
         assert!(class_signal.regressed);
         assert_eq!(class_signal.delta, -85.0);
         let notifications = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::sekai::facts::audit::DecisionFilter {
                 action: Some("cheap_tier_regressed".into()),
                 ..Default::default()
             })
@@ -1457,7 +1461,7 @@ mod tests {
             "an under-sampled batch must not clear a statistically meaningful regression"
         );
         for index in 0..25 {
-            db.record_decision(&crate::sekai::audit::Decision {
+            db.record_decision(&crate::sekai::facts::audit::Decision {
                 id: format!("unrelated-{index}"),
                 timestamp: 1_000 + index,
                 actor: "chisei.scoring".into(),
@@ -1618,7 +1622,7 @@ mod tests {
 
         // Retirement is auditable.
         let retired = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::sekai::facts::audit::DecisionFilter {
                 action: Some("judge_failed".into()),
                 ..Default::default()
             })
@@ -1647,7 +1651,7 @@ mod tests {
         }
         assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
         let retired = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::sekai::facts::audit::DecisionFilter {
                 action: Some("judge_failed".into()),
                 ..Default::default()
             })
@@ -1775,7 +1779,7 @@ mod tests {
 
         // ...but the audit decision still carries a per-task-class breakdown.
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::sekai::facts::audit::DecisionFilter {
                 action: Some("scored".into()),
                 ..Default::default()
             })

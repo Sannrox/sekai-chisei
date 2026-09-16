@@ -1,12 +1,9 @@
 pub mod action;
-pub mod action_describe_preview;
 pub mod action_effect;
 pub mod action_instance;
-pub mod action_instance_admission;
 pub(crate) mod action_object_mutation;
 pub mod action_policy;
 pub mod action_type_criteria;
-pub(crate) mod action_work_lifecycle;
 pub mod attestation;
 pub mod audit;
 pub mod autonomous_envelope;
@@ -34,7 +31,7 @@ pub mod evidence;
 pub(crate) mod evidence_admission_lifecycle;
 pub mod evidence_projection;
 pub mod evidence_store;
-pub mod execution_evidence;
+pub mod facts;
 pub mod federation_conflict;
 pub mod federation_network;
 pub mod federation_profile;
@@ -70,6 +67,7 @@ pub mod observation;
 pub mod ontology;
 pub mod open_table;
 pub mod operation_correlation;
+pub mod parameter_schema;
 pub mod parked_work;
 pub mod peer_import;
 pub mod policy_decision;
@@ -91,4 +89,40 @@ pub mod source_webhook;
 pub mod virtual_pushdown;
 pub mod warehouse_projection;
 pub(crate) mod work_unit_lifecycle;
-pub mod workflow_action;
+
+#[cfg(test)]
+mod layering {
+    use std::fs;
+    use std::path::Path;
+
+    fn rust_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("src/sekai") {
+            let path = entry.expect("dirent").path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn sekai_modules_do_not_import_chisei() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sekai");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        let mut offenders = Vec::new();
+        for path in files {
+            let source = fs::read_to_string(&path).expect("read sekai module");
+            let import = format!("{}{}", "crate::", "chisei::");
+            let use_import = format!("{}{}", "use crate::", "chisei");
+            if source.contains(&use_import) || source.contains(&import) {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Sekai facts must not import Chisei; one-way Chisei → Sekai only: {offenders:?}"
+        );
+    }
+}

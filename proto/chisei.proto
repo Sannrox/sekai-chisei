@@ -1016,6 +1016,23 @@ message GetOperationReceiptRequest {
   uint32 attempt = 4;
 }
 
+// Client-facing Action invoke (#956 / ADR 0082). Chisei decides; Sekai persists.
+message InvokeActionInstanceRequest {
+  string namespace = 1;
+  string type_id = 2;
+  string version = 3;
+  string parameters_json = 4;
+  string idempotency_key = 5;
+  repeated string evidence_submission_ids = 6;
+  string request_id = 7;
+  string ontology_digest = 8;
+}
+message InvokeActionInstanceResponse {
+  string instance_json = 1;
+  bool replay = 2;
+  string receipt_json = 3;
+}
+
 message ClaimGatewayDispatchRequest {
   string caller_scope = 1;
   string request_alias = 2;
@@ -1538,6 +1555,7 @@ service ChiseiService {
   rpc ExecuteContentPlanStream(ExecuteContentPlanRequest) returns (stream ExecuteContentPlanStreamEvent);
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
+  rpc InvokeActionInstance(InvokeActionInstanceRequest) returns (InvokeActionInstanceResponse);
   rpc GetQualityTrend(GetQualityTrendRequest) returns (GetQualityTrendResponse);
   rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
   rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);

@@ -36,7 +36,10 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "ListGrants" },
   { service: "sekai.SekaiService", rpc: "CheckAccess" },
   { service: "sekai.SekaiService", rpc: "PutGovernedActionType" },
+  { service: "sekai.SekaiService", rpc: "GetGovernedActionType" },
   { service: "sekai.SekaiService", rpc: "SubmitActionInstance" },
+  { service: "sekai.SekaiService", rpc: "PersistAdmittedAction" },
+  { service: "sekai.SekaiService", rpc: "GetPersistedOperationReceipt" },
   { service: "sekai.SekaiService", rpc: "DescribeObjectAction" },
   { service: "sekai.SekaiService", rpc: "PreviewObjectAction" },
   { service: "sekai.SekaiService", rpc: "GetActionInstance" },
@@ -59,6 +62,7 @@ export const HTTP_UNARY_METHODS = [
   { service: "chisei.ChiseiService", rpc: "PlanContentExecution" },
   { service: "chisei.ChiseiService", rpc: "ReportOperationEvent" },
   { service: "chisei.ChiseiService", rpc: "GetOperationReceipt" },
+  { service: "chisei.ChiseiService", rpc: "InvokeActionInstance" },
   { service: "chisei.ChiseiService", rpc: "GetQualityTrend" },
   { service: "chisei.ChiseiService", rpc: "ClaimGatewayDispatch" },
 ] as const;

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sekai::workflow_action::{
+use crate::chisei::workflow_action::{
     APPROVAL_TYPE_ID, BRIDGE_CONTRACT, JOB_TYPE_ID, PROFILE_APPROVAL_STEP, PROFILE_JOB_STEP,
     PROFILE_VERSION, USAGE_APPROVAL, USAGE_STEP,
 };

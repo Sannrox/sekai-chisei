@@ -37,6 +37,8 @@ If you want to deploy or operate the control plane:
 2. Apply the safeguards in [Operations and security](operations.md).
 3. Use the [Docker guide](docker.md) if you want the supported container
    topology.
+4. Run the two local servers with [Two local servers](two-local-servers.md)
+   (`sekai` then `chisei`, or `compose/two-planes.yaml`).
 
 ## Core concepts
 

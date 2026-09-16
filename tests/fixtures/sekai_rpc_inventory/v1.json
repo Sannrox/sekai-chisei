@@ -1229,11 +1229,36 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PersistAdmittedAction",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/chisei/action_instance_admission.rs",
+        "src/grpc/sekai_service_rpc_actions.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetPersistedOperationReceipt",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/grpc/sekai_service_rpc_actions.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DescribeObjectAction",
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/action_describe_preview.rs",
+        "src/chisei/action_describe_preview.rs",
         "src/grpc/sekai_service.rs",
         "docs/governed-action-instances.md"
       ],
@@ -1247,7 +1272,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/sekai/action_describe_preview.rs",
+        "src/chisei/action_describe_preview.rs",
         "src/grpc/sekai_service.rs",
         "docs/governed-action-instances.md"
       ],

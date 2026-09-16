@@ -3,7 +3,7 @@
 //! Translates a sequential job/step document into a workflow-action envelope.
 //! Admission, policy, budget, and receipts stay in the control plane.
 
-use sekai_chisei::sekai::workflow_action::{
+use sekai_chisei::chisei::workflow_action::{
     ACTION_TYPE_VERSION, BRIDGE_CONTRACT, JOB_TYPE_ID, PROFILE_JOB_STEP, PROFILE_VERSION,
     USAGE_STEP, WorkflowStepEnvelope,
 };

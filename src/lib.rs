@@ -73,6 +73,7 @@ pub mod rpc_maturity;
 pub mod runtime_backend;
 pub mod secrets;
 pub mod sekai;
+pub mod server;
 pub mod shomei;
 pub mod source_adapter_catalog;
 pub mod source_webhook_cli;

@@ -17,7 +17,7 @@ use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
 use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
-use crate::sekai::audit::{Decision, insert_object_changes, object_diff_changes};
+use crate::sekai::facts::audit::{Decision, insert_object_changes, object_diff_changes};
 
 pub const MIN_RECURRING_TASKS: usize = 3;
 pub const MIN_SUCCESSFUL_TASKS: usize = 2;
@@ -745,7 +745,7 @@ pub fn register_capability(
             relation: REL_DEPENDS_ON.to_string(),
             created: now,
         };
-        crate::sekai::ontology::validate_link_constraint(
+        crate::sekai::facts::ontology::validate_link_constraint(
             &tx,
             &link.from_id,
             &link.to_id,
@@ -1021,7 +1021,7 @@ fn insert_registry_decision(
     evidence: BTreeMap<String, String>,
     now: i64,
 ) -> Result<(), CapabilityRegistryError> {
-    let decision = crate::sekai::audit::Decision {
+    let decision = crate::sekai::facts::audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: now,
         actor: actor.into(),
@@ -1031,7 +1031,8 @@ fn insert_registry_decision(
         target_id: target_id.into(),
         outcome: outcome.into(),
     };
-    crate::sekai::ledger::insert_chained_decision(conn, &decision).map_err(registry_storage)?;
+    crate::sekai::facts::ledger::insert_chained_decision(conn, &decision)
+        .map_err(registry_storage)?;
     Ok(())
 }
 
@@ -1129,7 +1130,7 @@ fn is_terminal(status: &str) -> bool {
 mod tests {
     use super::*;
     use crate::chisei::eval::{CaseResult, Run};
-    use crate::sekai::audit::DecisionFilter;
+    use crate::sekai::facts::audit::DecisionFilter;
 
     fn observation(
         id: &str,

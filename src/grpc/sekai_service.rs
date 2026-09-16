@@ -67,6 +67,11 @@ use tonic::{Request, Response, Status};
 use super::pb::sekai::sekai_service_server::SekaiService;
 use super::pb::sekai::*;
 use super::visible_page::{VisiblePageError, scan_visible_page};
+use crate::chisei::action_work_lifecycle::{
+    AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
+    ClaimActionWork as ClaimActionWorkCommand, HeartbeatActionClaim as HeartbeatActionClaimCommand,
+    ReportActionClaimEvent as ReportActionClaimEventCommand,
+};
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
@@ -78,11 +83,6 @@ use crate::domain;
 use crate::gateway_keys::hash_gateway_key;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{self, ActionDecision};
-use crate::sekai::action_work_lifecycle::{
-    AckActionWork as AckActionWorkCommand, ActionWorkLifecycle, ActionWorkLifecycleError,
-    ClaimActionWork as ClaimActionWorkCommand, HeartbeatActionClaim as HeartbeatActionClaimCommand,
-    ReportActionClaimEvent as ReportActionClaimEventCommand,
-};
 use crate::sekai::attestation;
 use crate::sekai::capability;
 use crate::sekai::definition_branch as definition_branch_domain;
@@ -821,6 +821,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<SubmitActionInstanceRequest>,
     ) -> Result<Response<SubmitActionInstanceResponse>, Status> {
         rpc_actions::submit_action_instance(self, req).await
+    }
+
+    async fn persist_admitted_action(
+        &self,
+        req: Request<PersistAdmittedActionRequest>,
+    ) -> Result<Response<PersistAdmittedActionResponse>, Status> {
+        rpc_actions::persist_admitted_action(self, req).await
+    }
+
+    async fn get_persisted_operation_receipt(
+        &self,
+        req: Request<GetPersistedOperationReceiptRequest>,
+    ) -> Result<Response<GetPersistedOperationReceiptResponse>, Status> {
+        rpc_actions::get_persisted_operation_receipt(self, req).await
     }
 
     async fn describe_object_action(

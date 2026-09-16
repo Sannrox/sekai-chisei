@@ -1,0 +1,20 @@
+# Chisei plane (ADR 0082). No database. Requires CHISEI_SEKAI_ENDPOINT.
+ARG RUST_IMAGE=rust:1.98.1-bookworm
+FROM ${RUST_IMAGE} AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release --bin chisei
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home chisei
+COPY --from=build /src/target/release/chisei /usr/local/bin/chisei
+ENV SEKAI_SOCKET= \
+    SEKAI_BIND=0.0.0.0 \
+    GRPC_PORT=50052 \
+    SEKAI_PLANE=chisei
+EXPOSE 50052
+USER chisei
+CMD ["chisei"]

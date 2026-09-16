@@ -13,7 +13,7 @@ use crate::chisei::scoring::normalize_task_class;
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::sekai::audit::DecisionFilter;
+use crate::sekai::facts::audit::DecisionFilter;
 
 /// What a candidate would change if promoted.
 pub const KIND_ROUTING_BIAS: &str = "routing_bias";

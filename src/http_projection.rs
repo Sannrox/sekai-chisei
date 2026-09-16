@@ -407,9 +407,27 @@ where
             })
             .await
         }
+        ("sekai.SekaiService", "GetGovernedActionType") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::get_governed_action_type(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "SubmitActionInstance") => {
             invoke_sekai(state, headers, body, |svc, req| async move {
                 SekaiService::submit_action_instance(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "PersistAdmittedAction") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::persist_admitted_action(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetPersistedOperationReceipt") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::get_persisted_operation_receipt(&*svc, req).await
             })
             .await
         }
@@ -542,6 +560,12 @@ where
         ("chisei.ChiseiService", "GetOperationReceipt") => {
             invoke_chisei(state, headers, body, |svc, req| async move {
                 ChiseiService::get_operation_receipt(&*svc, req).await
+            })
+            .await
+        }
+        ("chisei.ChiseiService", "InvokeActionInstance") => {
+            invoke_chisei(state, headers, body, |svc, req| async move {
+                ChiseiService::invoke_action_instance(&*svc, req).await
             })
             .await
         }

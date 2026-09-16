@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
-pub const EXECUTION_EVIDENCE_TYPE: &str = "external_action_execution";
+pub use crate::sekai::facts::evidence::EXECUTION_EVIDENCE_TYPE;
 pub const EXECUTION_EVIDENCE_SCHEMA: &str = "external-action.execution-evidence/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,7 +342,7 @@ impl SekaiDb {
 
     pub fn validate_execution_evidence_envelope(
         &self,
-        envelope: &crate::sekai::evidence::EvidenceEnvelope,
+        envelope: &crate::sekai::facts::evidence::EvidenceEnvelope,
         authenticated_producer: &str,
     ) -> Result<Option<ExecutionEvidence>, String> {
         if envelope.evidence_type != EXECUTION_EVIDENCE_TYPE {
@@ -556,9 +556,9 @@ fn insert_alert_and_audit(
         )
         .map_err(|error| error.to_string())?;
     if inserted == 1 {
-        crate::sekai::ledger::insert_chained_decision(
+        crate::sekai::facts::ledger::insert_chained_decision(
             conn,
-            &crate::sekai::audit::Decision {
+            &crate::sekai::facts::audit::Decision {
                 id: format!("{}:audit", alert.alert_id),
                 timestamp: alert.observed_at_ms,
                 actor: "sekai:execution-reconciliation".into(),
@@ -672,11 +672,11 @@ mod tests {
     use crate::chisei::external_permit::{REDEMPTION_MODE, SIGNATURE_ALGORITHM};
     use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, UncoveredSurface};
     use crate::domain::Object;
-    use crate::sekai::evidence::{
+    use crate::sekai::facts::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
         EvidenceSignal, EvidenceTarget, SchemaCompatibility,
     };
-    use crate::sekai::evidence_store::{
+    use crate::sekai::facts::evidence_store::{
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
     };
     use ed25519_dalek::SigningKey;
@@ -728,7 +728,7 @@ mod tests {
             issued_at_ms: 1_000,
             revocation_latency_ms: 0,
             offline_revocation_unavailable: false,
-            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            site_id: crate::sekai::facts::lease::DEFAULT_SITE_ID.into(),
             signed_digest: String::new(),
             signature: vec![],
         };
@@ -879,7 +879,7 @@ mod tests {
             redeemed_at_ms: 1_000,
             invocation_ordinal: 1,
             evidence_due_at_ms: 2_000,
-            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            site_id: crate::sekai::facts::lease::DEFAULT_SITE_ID.into(),
         };
         db.conn()
             .execute(
@@ -993,7 +993,7 @@ mod tests {
             redeemed_at_ms: 1_000,
             invocation_ordinal: 1,
             evidence_due_at_ms: 2_000,
-            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            site_id: crate::sekai::facts::lease::DEFAULT_SITE_ID.into(),
         };
         db.conn().execute(
             "INSERT INTO chisei_external_action_redemptions

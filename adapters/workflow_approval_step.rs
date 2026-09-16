@@ -3,7 +3,7 @@
 //! Translates an approval-gate document into a workflow-action envelope.
 //! Admission, policy, budget, and receipts stay in the control plane.
 
-use sekai_chisei::sekai::workflow_action::{
+use sekai_chisei::chisei::workflow_action::{
     ACTION_TYPE_VERSION, APPROVAL_TYPE_ID, BRIDGE_CONTRACT, PROFILE_APPROVAL_STEP, PROFILE_VERSION,
     USAGE_APPROVAL, WorkflowStepEnvelope,
 };

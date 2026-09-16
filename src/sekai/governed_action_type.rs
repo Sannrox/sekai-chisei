@@ -76,7 +76,7 @@ impl GovernedActionType {
         if !schema.is_object() {
             return Err("parameter_schema_json must be a JSON object".into());
         }
-        crate::chisei::evaluation_plan::validate_parameter_schema(&self.parameter_schema_json)
+        crate::sekai::parameter_schema::validate_parameter_schema(&self.parameter_schema_json)
             .map_err(|error| {
                 format!("parameter_schema_json must use the closed v1 subset: {error}")
             })?;

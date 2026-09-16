@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chisei::action_instance_admission::{
+    ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
+};
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::receipt::OperationReceipt;
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::action_instance::STATUS_ADMITTED;
-use crate::sekai::action_instance_admission::{
-    ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
-};
+use crate::sekai::facts::action_instance::STATUS_ADMITTED;
 use crate::shomei;
 
 pub const BRIDGE_CONTRACT: &str = "sekai.workflow-action-bridge/v1";
@@ -33,7 +33,7 @@ pub const STATUS_SUBMITTED: &str = "submitted";
 pub const STATUS_PARKED: &str = "parked";
 pub const STATUS_RESUMED: &str = "resumed";
 pub const STATUS_CANCELLED: &str = "cancelled";
-pub use crate::sekai::action_instance::STATUS_DENIED;
+pub use crate::sekai::facts::action_instance::STATUS_DENIED;
 pub const USAGE_STEP: &str = "step";
 pub const USAGE_APPROVAL: &str = "approval";
 pub const WORKFLOW_UNAVAILABLE: &str = "workflow action is unavailable";
@@ -199,7 +199,7 @@ pub fn binding_id_for(
 }
 
 pub fn parameters_digest_for(parameters_json: &str) -> Result<String, String> {
-    crate::sekai::action_instance::validate_parameters_json(parameters_json)?;
+    crate::sekai::facts::action_instance::validate_parameters_json(parameters_json)?;
     let params: serde_json::Value = serde_json::from_str(parameters_json)
         .map_err(|error| format!("parameters_json must be JSON: {error}"))?;
     Ok(format!("sha256:{}", shomei::digest_serializable(&params)?))
@@ -257,7 +257,8 @@ pub fn submit_step(
                 request_id: String::new(),
                 ontology_digest: String::new(),
                 autonomous_envelope_id: String::new(),
-                policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
+                policy_context:
+                    crate::sekai::facts::object_security::PrincipalPolicyContext::default(),
             },
             actor,
             now_ms,
@@ -573,7 +574,7 @@ fn prepare_envelope(
     if envelope.parameters_json.len() > MAX_JSON_BYTES {
         return Err(WORKFLOW_UNAVAILABLE.into());
     }
-    crate::sekai::action_instance::validate_parameters_json(&envelope.parameters_json)
+    crate::sekai::facts::action_instance::validate_parameters_json(&envelope.parameters_json)
         .map_err(|_| WORKFLOW_UNAVAILABLE.to_string())?;
     if envelope.usage_kind != expected_usage || envelope.usage_units != 1 {
         return Err(WORKFLOW_UNAVAILABLE.into());
@@ -803,7 +804,7 @@ fn required(label: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
+    use crate::sekai::facts::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
 
     fn digest(tag: u8) -> String {
         format!("sha256:{tag:02x}{}", "ab".repeat(31))

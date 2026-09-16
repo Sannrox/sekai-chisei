@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Split Sekai and Chisei into two local gRPC planes
+  ([ADR 0082](docs/decisions/0082-two-local-servers.md), #956). `sekai` owns the
+  database. `chisei` routes and calls `CHISEI_SEKAI_ENDPOINT`. Combined
+  `sekai-chisei` stays the compatibility process. Action invoke is
+  `ChiseiService.InvokeActionInstance`; persist is one
+  `SekaiService.PersistAdmittedAction` transaction. Operator map:
+  `compose/two-planes.yaml` and
+  [docs/two-local-servers.md](docs/two-local-servers.md).
+- Keep Chisei depending on Sekai in one process ([ADR 0081](docs/decisions/0081-chisei-depends-on-sekai.md)).
+  Action admission, Action Work, workflow bridging, describe/preview, and
+  host execution-evidence helpers move under `src/chisei`. `src/sekai` must
+  not import Chisei. Chisei imports Sekai only through `sekai::facts`.
+  In-crate paths such as `sekai::workflow_action` become
+  `chisei::workflow_action`. gRPC and receipts are unchanged.
 - Share the gateway git-version emitter and provider SSE `data:` parser instead
   of keeping byte-identical copies, and hoist adapter timestamp/required-field
   helpers onto the evidence SDK.

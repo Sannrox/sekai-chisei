@@ -6,10 +6,9 @@
 //! resolution behind one domain-shaped interface.
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::evidence::EvidenceEnvelope;
+use crate::sekai::evidence::{EXECUTION_EVIDENCE_TYPE, EvidenceEnvelope};
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::EvidenceSubmissionRecord;
-use crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EvidenceAdmissionLifecycleError {

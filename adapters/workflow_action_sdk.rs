@@ -4,7 +4,7 @@
 //! writes ActionInstance, policy, budget, or receipt state.
 
 use fs2::FileExt;
-use sekai_chisei::sekai::workflow_action::{
+use sekai_chisei::chisei::workflow_action::{
     WorkflowActionBinding, WorkflowReceiptReconciliation, WorkflowStepEnvelope,
 };
 use serde::{Deserialize, Serialize};
