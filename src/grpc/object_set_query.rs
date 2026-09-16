@@ -1282,6 +1282,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluate_object_set_index_honors_numeric_filter_ops() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_definition(&svc);
+        svc.db
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: "ds-customers".into(),
+                name: "customers".into(),
+                columns: vec![
+                    crate::sekai::dataset::ColumnDef {
+                        name: "customer_id".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                    crate::sekai::dataset::ColumnDef {
+                        name: "region".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                    crate::sekai::dataset::ColumnDef {
+                        name: "tier".into(),
+                        col_type: "integer".into(),
+                        classification: "public".into(),
+                    },
+                    crate::sekai::dataset::ColumnDef {
+                        name: "hidden".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    },
+                ],
+                object_id: String::new(),
+                created: 1,
+            })
+            .unwrap();
+        svc.db
+            .append_rows(
+                "ds-customers",
+                &[
+                    std::collections::HashMap::from([
+                        ("customer_id".into(), "c-low".into()),
+                        ("region".into(), "eu".into()),
+                        ("tier".into(), "1".into()),
+                        ("hidden".into(), "0".into()),
+                    ]),
+                    std::collections::HashMap::from([
+                        ("customer_id".into(), "c-high".into()),
+                        ("region".into(), "eu".into()),
+                        ("tier".into(), "3".into()),
+                        ("hidden".into(), "0".into()),
+                    ]),
+                ],
+            )
+            .unwrap();
+        svc.register_object_type_datasource(with_named_principal(
+            RegisterObjectTypeDatasourceRequest {
+                datasource: Some(ObjectTypeDatasource {
+                    contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    definition_digest: digest.clone(),
+                    dataset_id: "ds-customers".into(),
+                    key_column: "customer_id".into(),
+                    property_mapping: std::collections::HashMap::from([
+                        ("region".into(), "region".into()),
+                        ("tier".into(), "tier".into()),
+                    ]),
+                    hidden_column: "hidden".into(),
+                    edits_only: false,
+                }),
+                idempotency_key: "reg-filter".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        svc.reindex_object_type(with_named_principal(
+            ReindexObjectTypeRequest {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                full_rebuild: true,
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let mut request = descriptor(&digest, 10);
+        request.property_filters = vec![PropertyFilter {
+            key: "tier".into(),
+            op: "gte".into(),
+            value: "2".into(),
+        }];
+        request.order_by.clear();
+        request.traversal = None;
+        let page = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(request),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(page.members.len(), 1);
+        assert_eq!(page.members[0].id, "Customer:c-high");
+    }
+
+    #[tokio::test]
     async fn evaluate_object_set_two_hop_aggregates_without_hidden_leakage() {
         let svc = service();
         grant_namespace(&svc, "sales", "alice");

@@ -105,6 +105,17 @@ fn compare_numeric(left: &str, right: &str, op: &str) -> bool {
     }
 }
 
+/// Shared property compare for dataset rows and object-type index reads.
+/// Unknown operators and non-numeric inequalities fail closed (no match).
+pub(crate) fn row_value_matches(actual: &str, op: &str, expected: &str) -> bool {
+    match op {
+        "eq" | "" => actual == expected,
+        "neq" => actual != expected,
+        "gt" | "lt" | "gte" | "lte" => compare_numeric(actual, expected, op),
+        _ => false,
+    }
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_datasets(&self) -> Result<(), String> {
         let conn = self.conn();
@@ -511,12 +522,7 @@ fn matches_row_filters(row: &HashMap<String, String>, filters: &[RowFilter]) -> 
             Some(v) => v,
             None => return false,
         };
-        let ok = match f.op.as_str() {
-            "eq" => val == &f.value,
-            "neq" => val != &f.value,
-            "gt" | "lt" | "gte" | "lte" => compare_numeric(val, &f.value, f.op.as_str()),
-            _ => false,
-        };
+        let ok = row_value_matches(val, &f.op, &f.value);
         if !ok {
             return false;
         }
@@ -900,5 +906,14 @@ mod tests {
 
         let rows = db.query_virtual_table(&vts[0]).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn row_value_matches_eq_and_numeric_ops() {
+        assert!(row_value_matches("3", "gte", "2"));
+        assert!(!row_value_matches("1", "gte", "2"));
+        assert!(row_value_matches("eu", "eq", "eu"));
+        assert!(!row_value_matches("eu", "gt", "ap"));
+        assert!(!row_value_matches("3", "contains", "3"));
     }
 }
