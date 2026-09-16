@@ -433,10 +433,11 @@ export class SekaiChiseiClient {
         return responseField(response, "plan", "PlanExecution");
     }
     async executePlan(plan, options = {}) {
-        return this.callUnary("chisei", "ExecutePlan", { plan }, {
-            ...options,
-            capability: options.capability ?? "chisei.plan.execute",
-        });
+        let last = {};
+        for await (const event of this.executePlanStream(plan, options)) {
+            last = event;
+        }
+        return last;
     }
     executePlanStream(plan, options = {}) {
         return this.callStream("chisei", "ExecutePlanStream", { plan }, {
@@ -506,14 +507,8 @@ export class SekaiChiseiClient {
         }, baseOptions);
         const events = [];
         if (plan.executable !== false) {
-            if (input.stream !== false) {
-                for await (const event of this.executePlanStream(plan, { ...baseOptions, requestId })) {
-                    events.push(event);
-                }
-            }
-            else {
-                const response = await this.executePlan(plan, { ...baseOptions, requestId });
-                events.push({ response });
+            for await (const event of this.executePlanStream(plan, { ...baseOptions, requestId })) {
+                events.push(event);
             }
         }
         const receipt = await this.getOperationReceipt({

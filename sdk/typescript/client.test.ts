@@ -110,6 +110,15 @@ test("TypeScript completes the ontology → facts → plan/stream → receipt lo
   assert.equal(receiptCall.request.request_id, "");
 });
 
+test("TypeScript executePlan drains ExecutePlanStream", async () => {
+  const transport = new FixtureTransport();
+  const result = await client(transport).executePlan(fixture.plan);
+  assert.deepEqual(result, fixture.stream_events.at(-1));
+  assert.deepEqual(transport.calls.map((call) => `${call.service}.${call.method}`), [
+    "chisei.ExecutePlanStream",
+  ]);
+});
+
 test("TypeScript retries only when the caller opts into retryable unary work", async () => {
   const transport = new FixtureTransport();
   transport.failNext = true;

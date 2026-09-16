@@ -101,7 +101,7 @@ lives in the separate [research index](research/README.md).
 - [ActionInstance admission](governed-action-instances.md) — idempotent submit
   and admit lifecycle.
 - [Typed ActionInstance effects](governed-action-effects.md) —
-  `runtime_dispatch` and `notify` effects.
+  `runtime_dispatch`, `notify`, and `external_mutate` effects.
 - [Runtime claim API](runtime-claim.md) — claim, heartbeat, and terminal
   acknowledgement.
 - [Action harvest binding](action-harvest-binding.md) — instance, effect, and

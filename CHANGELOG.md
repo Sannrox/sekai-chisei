@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Point TypeScript and Python `executePlan` helpers at `ExecutePlanStream`.
+  The public unary `ExecutePlan` RPC is gone; `runCoreLoop` no longer calls it.
 - Keep SQLite and PostgreSQL as the community control-plane pair
   ([ADR 0080](docs/decisions/0080-dual-community-runtime-storage.md), #870).
   SQLite stays the local default. PostgreSQL stays optional. The embedded

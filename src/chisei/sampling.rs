@@ -13,7 +13,7 @@
 //!
 //! The eval-driven adaptive trigger (oversample when the namespace eval signal is
 //! regressed) lives in the service layer, which holds the eval store; see
-//! `plan_from_input` in `grpc/chisei_service.rs`.
+//! `plan_from_input` in `grpc/chisei_service/execution_planning.rs`.
 
 use super::budget::PressureLevel;
 use super::pipeline::{PipelineRequest, Step, StepDecision, complexity_class};

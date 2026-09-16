@@ -181,11 +181,12 @@ fn now_ms() -> i64 {
 /// Token-budget enforcement over the hierarchical scope chain persisted in
 /// `chisei_budget_limits`/`chisei_budget_usage` (see `db::chisei_budget`).
 ///
-/// `user_id`/`subject` arguments here are scope ids: either a flat legacy
+/// `scope_id` arguments here are scope ids: either a flat legacy
 /// subject (e.g. an explicit `subject` field, chaining only through the
 /// unset `global` root) or a `/`-joined hierarchical id such as
 /// `project:p/agent:a/work_unit:w`, whose ancestors (`global`, `project:p`,
 /// `project:p/agent:a`) are all checked and deducted together atomically.
+/// `Usage.user_id` still names the leftover field on the usage row.
 ///
 /// Gateway preflight, fat-decide budget admission, and
 /// auto-allocation paths that share this tracker all hit the **same** store

@@ -607,7 +607,10 @@ class SekaiChiseiClient:
         return _response_field(response, "plan", "PlanExecution")
 
     def execute_plan(self, plan: ExecutionPlan, options: CallOptions = CallOptions()) -> Any:
-        return self.call_unary("chisei", "ExecutePlan", {"plan": plan}, _with_capability(options, "chisei.plan.execute"))
+        last: dict[str, Any] = {}
+        for event in self.execute_plan_stream(plan, options):
+            last = event
+        return last
 
     def execute_plan_stream(self, plan: ExecutionPlan, options: CallOptions = CallOptions()) -> CancellableStream:
         return self.call_stream("chisei", "ExecutePlanStream", {"plan": plan}, _with_capability(options, "chisei.plan.execute"))
@@ -706,18 +709,11 @@ class SekaiChiseiClient:
         plan = self.plan_execution(normalized_execution, base)
         events: list[Any] = []
         if plan.get("executable", True):
-            if stream:
-                events.extend(self.execute_plan_stream(plan, CallOptions(
-                    context=base.context,
-                    timeout_seconds=base.timeout_seconds,
-                    request_id=request_id,
-                )))
-            else:
-                events.append(self.execute_plan(plan, CallOptions(
-                    context=base.context,
-                    timeout_seconds=base.timeout_seconds,
-                    request_id=request_id,
-                )))
+            events.extend(self.execute_plan_stream(plan, CallOptions(
+                context=base.context,
+                timeout_seconds=base.timeout_seconds,
+                request_id=request_id,
+            )))
         receipt = self.get_operation_receipt(
             operation_id=_required_text("plan.plan_id", plan.get("plan_id"), 200),
             caller_scope=caller_scope,

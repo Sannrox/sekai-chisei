@@ -695,10 +695,11 @@ export class SekaiChiseiClient {
   }
 
   async executePlan(plan: ExecutionPlan, options: CallOptions = {}): Promise<Record<string, unknown>> {
-    return this.callUnary("chisei", "ExecutePlan", { plan }, {
-      ...options,
-      capability: options.capability ?? "chisei.plan.execute",
-    });
+    let last: Record<string, unknown> = {};
+    for await (const event of this.executePlanStream(plan, options)) {
+      last = event as Record<string, unknown>;
+    }
+    return last;
   }
 
   executePlanStream(plan: ExecutionPlan, options: CallOptions = {}): AsyncIterable<ExecutePlanStreamEvent> {
@@ -777,13 +778,8 @@ export class SekaiChiseiClient {
     }, baseOptions);
     const events: ExecutePlanStreamEvent[] = [];
     if (plan.executable !== false) {
-      if (input.stream !== false) {
-        for await (const event of this.executePlanStream(plan, { ...baseOptions, requestId })) {
-          events.push(event);
-        }
-      } else {
-        const response = await this.executePlan(plan, { ...baseOptions, requestId });
-        events.push({ response });
+      for await (const event of this.executePlanStream(plan, { ...baseOptions, requestId })) {
+        events.push(event);
       }
     }
     const receipt = await this.getOperationReceipt({

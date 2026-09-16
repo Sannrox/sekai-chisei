@@ -63,8 +63,8 @@ empty, and contains no provider secret or private deployment configuration.
 - `proto/chisei.proto` already defines `ExecutionInput.tools`,
   `ExecutionInput.route_override`, `PlannedChatResponse.tool_calls`, normalized
   usage, and `ExecutePlanStream`.
-- `proto/llm.proto` already defines streamed `tool_calls`; no additive wire
-  field is needed.
+- Streamed `tool_calls` live on `proto/chisei.proto`; no additive wire field
+  is needed. `proto/llm.proto` was removed with the unserved `LlmService`.
 - `src/grpc/mod.rs` authenticates bearer credentials, overwrites forged
   principal and tenant metadata, and installs `AuthenticatedContext`.
 - `src/enterprise.rs` binds principal, credential kind, scopes, issuer,

@@ -25,7 +25,7 @@ reference pages.
 | [External-action permit lifecycle surface](420-external-permit-lifecycle-surface.md) | Retain explicit lifecycle RPCs; consolidation would widen trust boundaries without removing implementation paths |
 | [Gateway administration single-source boundary](421-gateway-administration-single-source.md) | Extract shared setup and reporting into a leaf administration-client crate after façade cleanup |
 | [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Superseded by the 1.0 clean break: server bootstrap removed; clients use `SEKAI_CREDENTIAL` with durable principal credentials |
-| [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Recommend core commands at the root and grouped expert operations under `admin`; implementation requires a Design Discussion |
+| [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Accepted in ADR 0009/0010; root commands plus grouped expert operations under `admin` |
 | [Kernel and extension boundary](443-kernel-extension-boundary.md) | Keep one published governance product, narrow its public facade, and extract only acyclic leaf libraries with a measured independent-consumer dividend |
 | [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |
 | [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
