@@ -32,6 +32,8 @@ template.
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
+| `SEKAI_OBJECT_INDEX_ENGINE` | `nested-loop` | Object-set hop engine (`nested-loop` or `hop-projection`). Switching engines requires `ReindexObjectType` |
+| `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Set `1` to compare both engines and fail closed on mismatch |
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
 | `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
 | `CHISEI_PERMIT_KEY_ID` | `permit-key-1` | Key id embedded in signed permits for rotation |
@@ -101,6 +103,8 @@ Operator runbook and data model: [budget-topology.md](budget-topology.md). Desig
 | `LLM_HTTP_REQUEST_TIMEOUT_SECS` | `120` | Total timeout for unary provider calls |
 | `CHISEI_DEFAULT_DATA_CLASS` | `unclassified` | Default classification for egress decisions |
 | `CHISEI_SAFE_EGRESS_PROVIDERS` | empty | Comma-separated providers allowed by egress policy |
+| `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | empty | Providers whose upstream auth is supplied by the gateway; model routing treats them as available without a local key |
+| `CHISEI_GATEWAY_RECEIPT_PRINCIPALS` | empty | Token-authenticated service principals allowed to write gateway receipts |
 | `LEAK_REVIEW_MODEL` | unset | Optional local model used for leak review |
 | `CHISEI_EVALUATOR_ADAPTER_SHARED_SECRET` | unset | Shared secret for authenticated operator-deployed `external_adapter/v1` evaluator calls; unset keeps those implementations unavailable |
 

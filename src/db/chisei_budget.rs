@@ -3,8 +3,8 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::db::sekai::SekaiDb;
 
-/// Default metric for token-based budgets (the only metric before Phase C's
-/// request-rate quotas reused this table with a `requests` metric).
+/// Default metric for token-based budgets. Request-rate quotas reuse this
+/// table with `METRIC_REQUESTS`.
 pub const METRIC_TOKENS: &str = "tokens";
 pub const METRIC_REQUESTS: &str = "requests";
 

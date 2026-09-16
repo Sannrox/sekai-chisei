@@ -193,7 +193,7 @@ impl SekaiServiceImpl {
     }
 
     /// Construct sharing a chisei budget tracker so governed actions can be
-    /// metered against action-class budgets (Plan 9, Phase C).
+    /// metered against action-class budgets.
     pub fn with_budget(
         db: Arc<RuntimeDb>,
         budget: Arc<crate::chisei::budget::BudgetTracker>,

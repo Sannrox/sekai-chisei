@@ -18,6 +18,17 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+pub(super) fn event_data_values(event: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for line in event.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(value) = line.strip_prefix("data:") {
+            values.push(value.trim_start().to_string());
+        }
+    }
+    values
+}
+
 pub(super) fn ensure_declared_response_size(
     content_length: Option<u64>,
     context: &str,
@@ -54,7 +65,7 @@ pub(super) async fn read_bounded_response(
 
 #[cfg(test)]
 mod response_limit_tests {
-    use super::{MAX_PROVIDER_RESPONSE_BYTES, ensure_declared_response_size};
+    use super::{MAX_PROVIDER_RESPONSE_BYTES, ensure_declared_response_size, event_data_values};
 
     #[test]
     fn rejects_declared_provider_responses_above_the_limit() {
@@ -69,6 +80,14 @@ mod response_limit_tests {
             "provider response",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn event_data_values_keeps_data_lines_and_strips_cr() {
+        assert_eq!(
+            event_data_values("event: message\r\ndata: {\"ok\":true}\r\ndata: [DONE]\r\n"),
+            vec!["{\"ok\":true}".to_string(), "[DONE]".to_string()]
+        );
     }
 }
 

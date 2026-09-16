@@ -4,8 +4,7 @@
 //! fan-in, or an external CLI). This adapter only maps a bounded JSON document
 //! into a `sekai.evidence/v1` draft for `social.post_snapshot`.
 
-use crate::sdk::{ConformanceProfile, EvidenceDraft};
-use chrono::DateTime;
+use crate::sdk::{self, ConformanceProfile, EvidenceDraft};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -43,9 +42,9 @@ pub fn parse(input: &[u8]) -> Result<PostSnapshotDocument, String> {
 }
 
 pub fn translate(document: PostSnapshotDocument) -> Result<EvidenceDraft, String> {
-    let post_id = require_nonempty(&document.post_id, "post_id")?;
+    let post_id = sdk::require_nonempty(&document.post_id, "post_id")?;
     let window = normalize_window(&document.window)?;
-    let observed_at_ms = parse_timestamp(&document.observed_at, "observed_at")?;
+    let observed_at_ms = sdk::parse_rfc3339_millis(&document.observed_at, "observed_at")?;
     let metrics = require_metrics(&document.metrics)?;
     let source_system = document
         .source_system
@@ -135,18 +134,4 @@ fn require_metrics(metrics: &HashMap<String, i64>) -> Result<Value, String> {
         }
     }
     Ok(Value::Object(normalized))
-}
-
-fn require_nonempty(value: &str, field: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{field} is required"));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn parse_timestamp(value: &str, field: &str) -> Result<i64, String> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.timestamp_millis())
-        .map_err(|error| format!("invalid {field} timestamp: {error}"))
 }

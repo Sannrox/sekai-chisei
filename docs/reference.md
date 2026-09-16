@@ -106,6 +106,13 @@ lives in the separate [research index](research/README.md).
   acknowledgement.
 - [Action harvest binding](action-harvest-binding.md) — instance, effect, and
   operation correlation.
+- [Operation correlation](operation-correlation.md) — one caller-chosen
+  operation identity on the inbound span, receipt, and object-change event.
+- [Authorized consumer impact](definition-consumer-impact.md) — registered
+  definition-consumer bindings joined to revision comparison.
+- [Revision-bound ObjectSet evaluation](object-set.md) — typed
+  `sekai.object-set/v1` descriptors evaluated through authorized list and
+  one-hop traverse.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
 - [Inbound object sync](object-sync.md) — authenticated source batches,

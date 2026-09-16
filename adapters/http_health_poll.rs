@@ -1,5 +1,4 @@
-use crate::sdk::{ConformanceProfile, EvidenceDraft};
-use chrono::DateTime;
+use crate::sdk::{self, ConformanceProfile, EvidenceDraft};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -33,18 +32,12 @@ pub fn translate(
     response_version: Option<&str>,
     ttl_ms: i64,
 ) -> Result<EvidenceDraft, String> {
-    if source_record_id.trim().is_empty() {
-        return Err("health source record id is required".into());
-    }
-    if payload.status.trim().is_empty() {
-        return Err("health status is required".into());
-    }
+    sdk::require_nonempty(source_record_id, "health source record id")?;
+    sdk::require_nonempty(&payload.status, "health status")?;
     if ttl_ms <= 0 {
         return Err("health evidence TTL must be positive".into());
     }
-    let observed_at_ms = DateTime::parse_from_rfc3339(&payload.observed_at)
-        .map(|value| value.timestamp_millis())
-        .map_err(|_| "health observed_at is invalid".to_string())?;
+    let observed_at_ms = sdk::parse_rfc3339_millis(&payload.observed_at, "health observed_at")?;
     let source_version = response_version
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)

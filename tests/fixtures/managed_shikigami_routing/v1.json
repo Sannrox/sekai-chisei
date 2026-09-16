@@ -19,7 +19,7 @@
     {
       "id": "service_principal_authenticates",
       "class": "positive",
-      "summary": "A valid machine credential reaches PlanExecution, ExecutePlan, and ExecutePlanStream as the authenticated service principal.",
+      "summary": "A valid machine credential reaches PlanExecution and ExecutePlanStream as the authenticated service principal.",
       "evidence_tests": [
         "src/grpc/chisei_service_tests.rs#enterprise_execution_marker_without_context_fails_closed",
         "src/grpc/chisei_service_tests.rs#managed_machine_context_owns_plan_identity_and_namespace_authority",

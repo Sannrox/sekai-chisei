@@ -1,5 +1,4 @@
-use crate::sdk::{ConformanceProfile, EvidenceDraft};
-use chrono::DateTime;
+use crate::sdk::{self, ConformanceProfile, EvidenceDraft};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -43,14 +42,16 @@ pub struct Repository {
 }
 
 pub fn translate(payload: CheckRunWebhook) -> Result<EvidenceDraft, String> {
-    let observed_at_ms = parse_timestamp(
+    let observed_at_ms = sdk::parse_rfc3339_millis(
         payload
             .check_run
             .completed_at
             .as_deref()
             .unwrap_or(&payload.check_run.updated_at),
+        "GitHub check_run",
     )?;
-    let updated_at_ms = parse_timestamp(&payload.check_run.updated_at)?;
+    let updated_at_ms =
+        sdk::parse_rfc3339_millis(&payload.check_run.updated_at, "GitHub check_run")?;
     let outcome = payload
         .check_run
         .conclusion
@@ -107,10 +108,4 @@ pub fn parse(input: &[u8]) -> Result<CheckRunWebhook, String> {
     serde_json::from_slice::<Value>(input)
         .and_then(serde_json::from_value)
         .map_err(|error| format!("invalid GitHub check_run payload: {error}"))
-}
-
-fn parse_timestamp(value: &str) -> Result<i64, String> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|value| value.timestamp_millis())
-        .map_err(|_| "GitHub check_run timestamp is invalid".into())
 }

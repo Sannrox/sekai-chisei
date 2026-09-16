@@ -51,8 +51,8 @@ pub struct SampleObservation {
     pub scored: bool,
     /// Routing/cost-tier task class (e.g. `background`, `primary`, `bulk`) resolved at execute
     /// time. Empty for observations recorded before this field existed or where no class was
-    /// resolved. Lets Phase A verdicts be sliced by task-class alongside namespace + model,
-    /// matching how Plan 8B routing bias decisions are keyed.
+    /// resolved. Lets scoring verdicts be sliced by task-class alongside namespace + model,
+    /// matching how routing bias decisions are keyed.
     #[serde(default)]
     pub task_class: String,
     /// Metered call cost paired with the quality verdict. Zero means pricing
