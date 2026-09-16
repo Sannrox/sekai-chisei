@@ -1,3 +1,4 @@
+use chrono::DateTime;
 use prost::Message;
 use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
@@ -401,6 +402,23 @@ pub async fn submit(
     response
         .result
         .ok_or_else(|| "Sekai returned no evidence submission result".into())
+}
+
+#[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+pub fn require_nonempty(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("{field} is required"))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+#[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+pub fn parse_rfc3339_millis(value: &str, field: &str) -> Result<i64, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp_millis())
+        .map_err(|error| format!("invalid {field} timestamp: {error}"))
 }
 
 fn required_env(name: &str) -> Result<String, String> {

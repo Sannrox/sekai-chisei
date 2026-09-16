@@ -1,7 +1,7 @@
 use super::{
     ChatRequest, ChatResponse, ChatStream, ChatStreamChunk, HttpTimeouts,
     MAX_PROVIDER_RESPONSE_BYTES, Provider, SamplingOptions, ToolCall, classify_reqwest_error,
-    ensure_declared_response_size, read_bounded_response,
+    ensure_declared_response_size, event_data_values, read_bounded_response,
 };
 use crate::content::{ContentChatRequest, ContentKind, ResolvedPayload};
 use base64::Engine as _;
@@ -674,17 +674,6 @@ fn completed_anthropic_tool_calls(
             })
         })
         .collect()
-}
-
-fn event_data_values(event: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    for line in event.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(value) = line.strip_prefix("data:") {
-            values.push(value.trim_start().to_string());
-        }
-    }
-    values
 }
 
 #[cfg(test)]

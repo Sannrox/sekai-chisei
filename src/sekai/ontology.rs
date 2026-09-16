@@ -72,7 +72,7 @@ pub struct OntologyClass {
 
 /// A typed, directed relation between two classes. `inverse` names the relation
 /// that holds in the opposite direction (empty when none); `transitive` is
-/// durable metadata consumed by later reasoning work (#143).
+/// durable metadata consumed by query-time entailment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyRelation {
     pub name: String,

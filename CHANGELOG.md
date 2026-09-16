@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Share the gateway git-version emitter and provider SSE `data:` parser instead
+  of keeping byte-identical copies, and hoist adapter timestamp/required-field
+  helpers onto the evidence SDK.
 - Point TypeScript and Python `executePlan` helpers at `ExecutePlanStream`.
   The public unary `ExecutePlan` RPC is gone; `runCoreLoop` no longer calls it.
 - Keep SQLite and PostgreSQL as the community control-plane pair

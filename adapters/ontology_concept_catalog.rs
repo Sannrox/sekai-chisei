@@ -6,8 +6,7 @@
 //! This adapter only maps a bounded JSON document into a `sekai.evidence/v1`
 //! draft. It never writes ontology definitions or proposal state.
 
-use crate::sdk::{ConformanceProfile, EvidenceDraft};
-use chrono::DateTime;
+use crate::sdk::{self, ConformanceProfile, EvidenceDraft};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -45,13 +44,11 @@ pub fn parse(input: &[u8]) -> Result<ConceptCatalogDocument, String> {
 }
 
 pub fn translate(document: ConceptCatalogDocument) -> Result<EvidenceDraft, String> {
-    if document.catalog_id.trim().is_empty() {
-        return Err("catalog_id is required".into());
-    }
+    sdk::require_nonempty(&document.catalog_id, "catalog_id")?;
     if document.classes.is_empty() && document.relations.is_empty() {
         return Err("concept catalog must declare at least one class or relation".into());
     }
-    let observed_at_ms = parse_timestamp(&document.revised_at)?;
+    let observed_at_ms = sdk::parse_rfc3339_millis(&document.revised_at, "revised_at")?;
     let source_sequence = document.revision.unwrap_or(observed_at_ms);
     let content = json!({
         "classes": document.classes,
@@ -82,10 +79,4 @@ pub fn translate(document: ConceptCatalogDocument) -> Result<EvidenceDraft, Stri
         ]),
         causality: None,
     })
-}
-
-fn parse_timestamp(value: &str) -> Result<i64, String> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.timestamp_millis())
-        .map_err(|error| format!("invalid revised_at timestamp: {error}"))
 }
