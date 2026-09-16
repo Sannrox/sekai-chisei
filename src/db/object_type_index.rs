@@ -647,12 +647,9 @@ impl SekaiDb {
 
 fn index_member_matches(properties: &BTreeMap<String, String>, query: &RowQuery) -> bool {
     query.filters.iter().all(|filter| {
-        properties
-            .get(&filter.column)
-            .is_some_and(|value| match filter.op.as_str() {
-                "eq" | "" => value == &filter.value,
-                _ => false,
-            })
+        properties.get(&filter.column).is_some_and(|value| {
+            crate::sekai::dataset::row_value_matches(value, &filter.op, &filter.value)
+        })
     })
 }
 
@@ -679,7 +676,7 @@ impl From<ObjectTypeIndexError> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::dataset::{ColumnDef, Dataset, RowFilter, RowQuery};
     use crate::sekai::object_type_index::CONTRACT_VERSION;
     use std::collections::HashMap;
 
@@ -898,5 +895,77 @@ mod tests {
         db.apply_object_type_index("sales", "Customer", true, 40)
             .unwrap();
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    #[test]
+    fn index_member_filters_honor_numeric_ops_and_fail_closed() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "tier", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[
+                HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("tier".into(), "1".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+                HashMap::from([
+                    ("customer_id".into(), "c2".into()),
+                    ("region".into(), "eu".into()),
+                    ("tier".into(), "3".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("tier".into(), "tier".into());
+        db.register_object_type_datasource(&binding, 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+
+        let gte = db
+            .list_visible_index_members(
+                "sales",
+                "Customer",
+                &RowQuery {
+                    filters: vec![RowFilter {
+                        column: "tier".into(),
+                        op: "gte".into(),
+                        value: "2".into(),
+                    }],
+                    ..RowQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            gte.iter()
+                .map(|m| m.source_key.as_str())
+                .collect::<Vec<_>>(),
+            ["c2"]
+        );
+
+        let non_numeric = db
+            .list_visible_index_members(
+                "sales",
+                "Customer",
+                &RowQuery {
+                    filters: vec![RowFilter {
+                        column: "region".into(),
+                        op: "gt".into(),
+                        value: "eu".into(),
+                    }],
+                    ..RowQuery::default()
+                },
+            )
+            .unwrap();
+        assert!(non_numeric.is_empty());
     }
 }

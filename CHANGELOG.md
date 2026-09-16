@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Indexed `EvaluateObjectSet` property filters use the same eq/gt/gte/lt/lte
+  matcher as dataset rows (#946). Non-eq ops no longer empty the SQLite index
+  path or collapse to string equality on PostgreSQL; non-numeric inequalities
+  fail closed.
 - Dual-read `EvaluateObjectSet` against a tagged mikura object log when
   `SEKAI_OBJECT_LOG_DUAL_READ=1` (#942). Hop count and sum must match; a
   missing log, mismatch, or unmappable descriptor (filters, non-sum/count)

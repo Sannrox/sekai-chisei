@@ -238,9 +238,9 @@ impl PostgresDb {
             let properties: BTreeMap<String, String> =
                 serde_json::from_str(&properties).map_err(|error| error.to_string())?;
             if !query.filters.iter().all(|filter| {
-                properties
-                    .get(&filter.column)
-                    .is_some_and(|value| value == &filter.value)
+                properties.get(&filter.column).is_some_and(|value| {
+                    crate::sekai::dataset::row_value_matches(value, &filter.op, &filter.value)
+                })
             }) {
                 continue;
             }
