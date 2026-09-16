@@ -201,6 +201,7 @@ impl SekaiDb {
                 .unwrap_or(0)
         };
         if full_rebuild {
+            self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
             self.conn()
                 .execute(
                     "DELETE FROM sekai_object_type_index_member WHERE namespace = ?1 AND kind = ?2 AND from_edit = 0",
@@ -452,7 +453,25 @@ impl SekaiDb {
         Ok(())
     }
 
+    pub(crate) fn set_hop_projection_ready(
+        &self,
+        namespace: &str,
+        kind: &str,
+        ready: bool,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT OR REPLACE INTO sekai_object_type_index_join_status
+                 (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
+                params![namespace, kind, i64::from(ready), now_ms],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         self.conn()
             .execute(
                 "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
@@ -467,18 +486,12 @@ impl SekaiDb {
         for member in members {
             self.replace_index_join(&member)?;
         }
-        self.conn()
-            .execute(
-                "INSERT OR REPLACE INTO sekai_object_type_index_join_status
-                 (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,1,?3)",
-                params![namespace, kind, now_ms],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.set_hop_projection_ready(namespace, kind, true, now_ms)
     }
 
     pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
-        self.conn()
+        let ready = self
+            .conn()
             .query_row(
                 "SELECT ready FROM sekai_object_type_index_join_status
                  WHERE namespace = ?1 AND kind = ?2",
@@ -487,7 +500,15 @@ impl SekaiDb {
             )
             .optional_row()
             .map(|value| value.unwrap_or(false))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if !ready {
+            return Ok(false);
+        }
+        let joins = self.count_index_join_rows(namespace, kind)?;
+        if joins > 0 {
+            return Ok(true);
+        }
+        Ok(self.count_visible_index_members(namespace, kind)? == 0)
     }
 
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
@@ -837,5 +858,45 @@ mod tests {
             .unwrap();
         assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
         assert!(visible[0].from_edit);
+    }
+
+    #[test]
+    fn hop_projection_ready_fails_closed_while_joins_wiped() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+        assert!(db.count_index_join_rows("sales", "Customer").unwrap() > 0);
+
+        db.conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_join WHERE namespace = 'sales' AND kind = 'Customer'",
+                [],
+            )
+            .unwrap();
+        assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.set_hop_projection_ready("sales", "Customer", false, 30)
+            .unwrap();
+        assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.apply_object_type_index("sales", "Customer", true, 40)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
     }
 }

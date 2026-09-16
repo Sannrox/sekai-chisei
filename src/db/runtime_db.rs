@@ -265,6 +265,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn set_hop_projection_ready(
+        &self,
+        namespace: &str,
+        kind: &str,
+        ready: bool,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.set_hop_projection_ready(namespace, kind, ready, now_ms),
+            Self::Postgres(db) => db.set_hop_projection_ready(namespace, kind, ready, now_ms),
+        }
+    }
+
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
         match self {
             Self::Sqlite(db) => db.count_index_join_rows(namespace, kind),
