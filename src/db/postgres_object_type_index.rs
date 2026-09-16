@@ -124,6 +124,7 @@ impl PostgresDb {
                 .unwrap_or(0)
         };
         if full_rebuild {
+            self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
             self.connection()?
                 .execute(
                     "DELETE FROM sekai_object_type_index_member WHERE namespace=$1 AND kind=$2 AND from_edit=FALSE",
@@ -381,7 +382,29 @@ impl PostgresDb {
         Ok(())
     }
 
+    pub(crate) fn set_hop_projection_ready(
+        &self,
+        namespace: &str,
+        kind: &str,
+        ready: bool,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_object_type_index_join_status
+                 (namespace, kind, ready, rebuilt_at_ms)
+                 VALUES ($1,$2,$3,$4)
+                 ON CONFLICT (namespace, kind) DO UPDATE SET
+                   ready = EXCLUDED.ready,
+                   rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
+                &[&namespace, &kind, &ready, &now_ms],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         self.connection()?
             .execute(
                 "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
@@ -396,22 +419,11 @@ impl PostgresDb {
         for member in members {
             self.replace_index_join(&member)?;
         }
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_object_type_index_join_status
-                 (namespace, kind, ready, rebuilt_at_ms)
-                 VALUES ($1,$2,TRUE,$3)
-                 ON CONFLICT (namespace, kind) DO UPDATE SET
-                   ready = TRUE,
-                   rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
-                &[&namespace, &kind, &now_ms],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.set_hop_projection_ready(namespace, kind, true, now_ms)
     }
 
     pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
-        Ok(self
+        let ready = self
             .connection()?
             .query_opt(
                 "SELECT ready FROM sekai_object_type_index_join_status
@@ -419,7 +431,15 @@ impl PostgresDb {
                 &[&namespace, &kind],
             )
             .map_err(|error| error.to_string())?
-            .is_some_and(|row| row.get(0)))
+            .is_some_and(|row| row.get(0));
+        if !ready {
+            return Ok(false);
+        }
+        let joins = self.count_index_join_rows(namespace, kind)?;
+        if joins > 0 {
+            return Ok(true);
+        }
+        Ok(self.count_visible_index_members(namespace, kind)? == 0)
     }
 
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
