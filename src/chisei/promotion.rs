@@ -183,7 +183,7 @@ pub fn propose_routing_bias_candidate(
     task_class: &str,
 ) -> Option<Candidate> {
     let normalized_class = normalize_task_class(task_class);
-    // Only classes `cheap_route_bias` (grpc/chisei_service.rs) actually routes to the cheaper
+    // Only classes `cheap_route_bias` (grpc/chisei_service/policy_resolution.rs) actually routes to the cheaper
     // tier are worth a routing-bias proposal in either direction: a "cheap" proposal for e.g.
     // "primary" would never take effect if promoted, and a "capable" revert is meaningless for a
     // class that was never biased cheap to begin with.

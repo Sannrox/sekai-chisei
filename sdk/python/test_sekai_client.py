@@ -132,6 +132,15 @@ class CoreLoopSdkTest(unittest.TestCase):
         self.assertEqual(receipt_request["operation_id"], FIXTURE["plan"]["plan_id"])
         self.assertEqual(receipt_request["request_id"], "")
 
+    def test_python_execute_plan_drains_execute_plan_stream(self):
+        transport = FixtureTransport()
+        result = sdk(transport).execute_plan(FIXTURE["plan"])
+        self.assertEqual(result, FIXTURE["stream_events"][-1])
+        self.assertEqual(
+            [f"{service}.{method}" for service, method, _, _ in transport.calls],
+            ["chisei.ExecutePlanStream"],
+        )
+
     def test_python_retries_opted_in_unary_work(self):
         transport = FixtureTransport()
         transport.fail_next = True

@@ -22,7 +22,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 
 /// Live, governed routing-bias overrides keyed by (namespace, task_class), consulted by
-/// `resolve_policy` (`grpc/chisei_service.rs`) alongside the static `cheap_route_bias` heuristic.
+/// `resolve_policy` (`grpc/chisei_service/policy_resolution.rs`) alongside the static `cheap_route_bias` heuristic.
 ///
 /// Only a `"capable"` override has an active effect today: it forces capable-tier routing for its
 /// (namespace, task_class) even when the class would otherwise default to cheap, closing a gap the

@@ -18,7 +18,7 @@ The product has two layers:
 
 Provider adapters remain internal execution machinery, not a public policy
 boundary. Existing OpenAI- and Anthropic-compatible clients enter through the
-gateway; native integrations use `PlanExecution` and `ExecutePlan`. Both paths
+gateway; native integrations use `PlanExecution` and `ExecutePlanStream`. Both paths
 are governed by the same control plane.
 
 ## Problem
@@ -107,7 +107,7 @@ an agent runtime or provider adapter.
 
 The gateway accepts existing OpenAI- and Anthropic-compatible clients. The
 native execution API plans and executes an operation through `PlanExecution`
-and `ExecutePlan`. These are two entry paths into the same control plane, not
+and `ExecutePlanStream`. These are two entry paths into the same control plane, not
 separate products.
 
 Agent runtimes and domain executors remain replaceable integrations. Bugyo and

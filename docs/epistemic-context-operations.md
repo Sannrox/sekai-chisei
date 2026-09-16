@@ -1,9 +1,10 @@
 # Epistemic context operations report
 
-The operator console can include a bounded `epistemic` projection for
+Operation statistics include a bounded `epistemic` projection for
 understanding context use and measured outcome impact. It is an internal
-projection, not a separate public Chisei RPC; the canonical public surface
-keeps operation receipts and Sekai decisions as the query authority.
+aggregate on `OperationStatistics`, not a console tile and not a separate
+public Chisei RPC; the canonical public surface keeps operation receipts and
+Sekai decisions as the query authority.
 
 The report is deliberately aggregate-only. It never returns prompts, claims,
 evidence references or digests, actors, credentials, or labels derived from

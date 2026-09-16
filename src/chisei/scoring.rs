@@ -896,7 +896,7 @@ fn verdict_from_args(args: &serde_json::Value) -> Option<JudgeVerdict> {
 }
 
 /// Trim + lowercase, matching the normalization `gateway::resolve_task_class` and
-/// `chisei_service::cheap_route_bias` already apply when reading this field, so case/whitespace
+/// `policy_resolution::cheap_route_bias` already apply when reading this field, so case/whitespace
 /// variants of the same class (e.g. `"Primary"` vs `"primary"`) roll up together instead of
 /// fragmenting the breakdown.
 pub(crate) fn normalize_task_class(task_class: &str) -> String {

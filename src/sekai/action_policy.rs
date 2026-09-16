@@ -1,4 +1,4 @@
-//! Governed-action policy (Plan 9, Phase A).
+//! Governed-action policy.
 //!
 //! A per-scope policy over action types and ops: allow / deny / require-approval.
 //! Policies are stored Sekai-natively as objects of kind `action_policy` with
@@ -58,7 +58,7 @@ pub struct ActionPolicy {
     pub action_overrides: HashMap<String, ActionDecision>,
     /// Per-risk-class overrides.
     pub risk_overrides: HashMap<RiskClass, ActionDecision>,
-    /// Phase C blast-radius caps per work unit (0/None == unlimited).
+    /// Blast-radius caps per work unit (0/None == unlimited).
     pub max_mutations_per_work_unit: Option<u32>,
     pub max_deletes_per_work_unit: Option<u32>,
 }

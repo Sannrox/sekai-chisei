@@ -7,9 +7,9 @@
 //! definition validation, a projection from the existing `SchemaRegistry`, and
 //! SQLite storage. PostgreSQL persistence is in `src/db/postgres_ontology.rs`.
 //!
-//! Inference/entailment (#143), endpoint enforcement (#142), and query surfaces
-//! (#144/#145) are intentionally out of scope here; this layer only represents
-//! and persists the ontology.
+//! Class inheritance and equivalence live here (`kind_satisfies_class`,
+//! `kind_entailment_path`). Endpoint enforcement (#142) and query surfaces
+//! (#144/#145) stay out of this module.
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;

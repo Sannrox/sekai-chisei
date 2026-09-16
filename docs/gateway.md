@@ -7,7 +7,7 @@ control plane.
 
 It exposes:
 
-- OpenAI-compatible `/v1/responses` and `/v1/chat/completions`;
+- OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models`;
 - Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens`;
 - `GET /v1/chisei/models` (`chisei.available-models/v1`);
 - `GET /v1/chisei/capabilities` (`chisei.provider-capabilities/v1`, no grant

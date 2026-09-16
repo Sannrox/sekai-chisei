@@ -56,7 +56,7 @@ import { SekaiChiseiClient } from "@sannrox/sekai-chisei-sdk";
 
 const client = await SekaiChiseiClient.connect({
   target: process.env.SEKAI_CHISEI_TARGET ?? "http://127.0.0.1:50051",
-  token: process.env.SEKAI_AUTH_TOKEN,
+  token: process.env.SEKAI_CREDENTIAL,
   principal: "aldunis-code",
   namespace: "demo",
   catalogVersion: "catalog-v1",
@@ -120,7 +120,7 @@ import chisei_pb2, chisei_pb2_grpc, sekai_pb2, sekai_pb2_grpc
 client = SekaiChiseiClient.connect(
     ClientConfig(
         target="http://127.0.0.1:50051",
-        token=os.environ.get("SEKAI_AUTH_TOKEN"),
+        token=os.environ.get("SEKAI_CREDENTIAL"),
         principal="aldunis-code",
         namespace="demo",
     ),

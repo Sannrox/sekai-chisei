@@ -18,11 +18,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
+    let proto_root = if std::path::Path::new("../../proto/sekai.proto").exists() {
+        "../../proto".to_string()
+    } else {
+        "proto".to_string()
+    };
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
-        .compile_protos(&["proto/sekai.proto", "proto/chisei.proto"], &["proto/"])?;
+        .compile_protos(
+            &[
+                format!("{proto_root}/sekai.proto"),
+                format!("{proto_root}/chisei.proto"),
+            ],
+            &[proto_root],
+        )?;
     Ok(())
 }
