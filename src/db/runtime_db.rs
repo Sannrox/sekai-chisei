@@ -278,6 +278,17 @@ impl RuntimeDb {
         }
     }
 
+    pub fn invalidate_namespace_hop_projection(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.invalidate_namespace_hop_projection(namespace, now_ms),
+            Self::Postgres(db) => db.invalidate_namespace_hop_projection(namespace, now_ms),
+        }
+    }
+
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
         match self {
             Self::Sqlite(db) => db.count_index_join_rows(namespace, kind),
@@ -903,7 +914,7 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
-        match self {
+        let result = match self {
             Self::Sqlite(db) => DefinitionBranchBackend::merge_definition_proposal(
                 db.as_ref(),
                 request,
@@ -916,7 +927,11 @@ impl RuntimeDb {
                 actor,
                 now_ms,
             ),
+        }?;
+        if matches!(result, DefinitionWriteResult::MergeProposal { .. }) {
+            self.invalidate_namespace_hop_projection(&request.namespace, now_ms)?;
         }
+        Ok(result)
     }
 
     pub fn close_definition_proposal(

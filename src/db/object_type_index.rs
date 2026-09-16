@@ -243,6 +243,7 @@ impl SekaiDb {
         }
         let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
+        self.stamp_datasource_to_published(namespace, kind)?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_object_type_index_status
@@ -465,6 +466,35 @@ impl SekaiDb {
                 "INSERT OR REPLACE INTO sekai_object_type_index_join_status
                  (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
                 params![namespace, kind, i64::from(ready), now_ms],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn invalidate_namespace_hop_projection(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "UPDATE sekai_object_type_index_join_status
+                 SET ready = 0, rebuilt_at_ms = ?1 WHERE namespace = ?2",
+                params![now_ms, namespace],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn stamp_datasource_to_published(&self, namespace: &str, kind: &str) -> Result<(), String> {
+        let Some(published) = self.get_published_definition_revision(namespace)? else {
+            return Ok(());
+        };
+        self.conn()
+            .execute(
+                "UPDATE sekai_object_type_datasource
+                 SET definition_digest = ?1 WHERE namespace = ?2 AND kind = ?3",
+                params![published.revision_digest, namespace, kind],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -895,6 +925,43 @@ mod tests {
         db.apply_object_type_index("sales", "Customer", true, 40)
             .unwrap();
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    #[test]
+    fn hop_projection_clears_ready_until_reindex_stamps_published_digest() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.invalidate_namespace_hop_projection("sales", 30).unwrap();
+        assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.apply_object_type_index("sales", "Customer", true, 40)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+        assert_eq!(
+            db.get_object_type_datasource("sales", "Customer")
+                .unwrap()
+                .unwrap()
+                .definition_digest,
+            "rev-1"
+        );
     }
 
     #[test]

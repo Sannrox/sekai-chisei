@@ -164,6 +164,7 @@ impl PostgresDb {
         }
         let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
+        self.stamp_datasource_to_published(namespace, kind)?;
         self.connection()?
             .execute(
                 "INSERT INTO sekai_object_type_index_status
@@ -398,6 +399,35 @@ impl PostgresDb {
                    ready = EXCLUDED.ready,
                    rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
                 &[&namespace, &kind, &ready, &now_ms],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn invalidate_namespace_hop_projection(
+        &self,
+        namespace: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE sekai_object_type_index_join_status
+                 SET ready = FALSE, rebuilt_at_ms = $1 WHERE namespace = $2",
+                &[&now_ms, &namespace],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn stamp_datasource_to_published(&self, namespace: &str, kind: &str) -> Result<(), String> {
+        let Some(published) = self.get_published_definition_revision(namespace)? else {
+            return Ok(());
+        };
+        self.connection()?
+            .execute(
+                "UPDATE sekai_object_type_datasource
+                 SET definition_digest = $1 WHERE namespace = $2 AND kind = $3",
+                &[&published.revision_digest, &namespace, &kind],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
