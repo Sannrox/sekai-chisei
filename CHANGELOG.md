@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Definition-branch publish clears hop-projection ready until `ReindexObjectType`
+  restamps the datasource digest (#947). Hop-projection evaluate fails closed
+  when join status is unready or the datasource revision is not the published
+  head.
 - Indexed `EvaluateObjectSet` property filters use the same eq/gt/gte/lt/lte
   matcher as dataset rows (#946). Non-eq ops no longer empty the SQLite index
   path or collapse to string equality on PostgreSQL; non-numeric inequalities

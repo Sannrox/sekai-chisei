@@ -311,11 +311,24 @@ impl SekaiServiceImpl {
         bound: &BoundObjectSet,
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
     ) -> Result<(), Status> {
-        for hop in hops {
+        let published = bound.descriptor.definition_digest.as_str();
+        let mut kinds = vec![bound.descriptor.kind.as_str()];
+        kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
+        for kind in kinds {
             if !self
                 .db
-                .hop_projection_ready(&bound.descriptor.namespace, &hop.far_kind)
+                .hop_projection_ready(&bound.descriptor.namespace, kind)
                 .map_err(Status::internal)?
+            {
+                return Err(Status::failed_precondition(
+                    "object index hop projection is stale",
+                ));
+            }
+            if let Some(datasource) = self
+                .db
+                .get_object_type_datasource(&bound.descriptor.namespace, kind)
+                .map_err(Status::internal)?
+                && datasource.definition_digest != published
             {
                 return Err(Status::failed_precondition(
                     "object index hop projection is stale",
@@ -1551,6 +1564,60 @@ mod tests {
         svc.db
             .set_hop_projection_ready("sales", "Order", false, 99)
             .unwrap();
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
+    async fn hop_projection_evaluate_fails_closed_when_datasource_revision_is_stale() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
+        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let mut stale = svc
+            .db
+            .get_object_type_datasource("sales", "Order")
+            .unwrap()
+            .unwrap();
+        stale.definition_digest = format!("sha256:{}", "ab".repeat(32));
+        svc.db.register_object_type_datasource(&stale, 99).unwrap();
         let err = svc
             .evaluate_object_set(with_named_principal(
                 EvaluateObjectSetRequest {
