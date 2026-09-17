@@ -2,9 +2,14 @@
 
 ## Unreleased
 
+- Combined mode opens two physical stores when `SEKAI_DB_PATH` and
+  `CHISEI_DB_PATH` (or two PostgreSQL destination URLs) are set, and refuses
+  a pair that resolves to the same file or database (#1005). Gateway stays a
+  translator. A single `DB_PATH` / `DATABASE_URL` remains one-file
+  compatibility until relocation.
 - Introduce typed `SekaiStore` / `ChiseiStore` handles so Chisei constructors
-  no longer take `RuntimeDb` (#1004). Combined mode still wraps one physical
-  store behind `split_shared_runtime` until #1005 opens two files.
+  no longer take `RuntimeDb` (#1004). Combined destination mode now opens two
+  files (#1005); a single `DB_PATH` still uses `split_shared_runtime`.
 - Record two-store implementation contracts (#999): ADR 0083 (offline
   relocation, lifecycle ownership, reservation recovery, one-sided restore
   fence), ADR 0082 corrections (`SubmitActionInstance`, per-plane

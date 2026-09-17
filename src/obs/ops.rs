@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 struct OpsState {
     db: Arc<RuntimeDb>,
+    chisei_db: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
 }
 
@@ -22,6 +23,7 @@ struct OpsState {
 /// authenticated operator console under `/console`.
 pub fn router(
     db: Arc<RuntimeDb>,
+    chisei_db: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
@@ -32,6 +34,7 @@ pub fn router(
         .route("/readyz", get(readyz))
         .with_state(OpsState {
             db: db.clone(),
+            chisei_db,
             provider_registry_state_path,
         });
 
@@ -53,6 +56,7 @@ pub async fn bind_and_spawn(
     bind: &str,
     port: u16,
     db: Arc<RuntimeDb>,
+    chisei_db: Option<Arc<RuntimeDb>>,
     provider_registry_state_path: PathBuf,
     credential_store: Arc<PrincipalCredentialStore>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
@@ -64,6 +68,7 @@ pub async fn bind_and_spawn(
     let actual_addr = listener.local_addr()?;
     let app = router(
         db,
+        chisei_db,
         provider_registry_state_path,
         credential_store,
         assertion_authority,
@@ -96,6 +101,9 @@ async fn healthz() -> impl IntoResponse {
 async fn readyz(State(state): State<OpsState>) -> impl IntoResponse {
     match tokio::task::spawn_blocking(move || {
         state.db.ping().map_err(std::io::Error::other)?;
+        if let Some(chisei) = state.chisei_db.as_ref() {
+            chisei.ping().map_err(std::io::Error::other)?;
+        }
         crate::provider_profile::refresh_provider_registry(&state.provider_registry_state_path)
             .map_err(std::io::Error::other)
     })

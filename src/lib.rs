@@ -57,6 +57,7 @@ pub use sekai_provider::provider_profile;
 pub use sekai_provider::provider_resolution;
 pub mod capability_package_cli;
 pub mod client_package_cli;
+pub mod combined_stores;
 pub mod compatibility_cli;
 pub mod compatibility_matrix;
 pub mod connector_certification_cli;

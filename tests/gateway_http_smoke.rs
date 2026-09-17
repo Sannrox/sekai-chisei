@@ -221,6 +221,10 @@ impl GatewayStack {
             .env_remove("SEKAI_BIND")
             .env_remove("SEKAI_DB_BACKEND")
             .env_remove("DATABASE_URL")
+            .env_remove("SEKAI_DB_PATH")
+            .env_remove("CHISEI_DB_PATH")
+            .env_remove("SEKAI_DATABASE_URL")
+            .env_remove("CHISEI_DATABASE_URL")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
         let control_plane = KillOnDrop::new(control_plane.spawn().expect("spawn sekai-chisei"));
