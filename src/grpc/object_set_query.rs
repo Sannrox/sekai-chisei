@@ -96,6 +96,27 @@ impl SekaiServiceImpl {
                 bound.filter.kind.as_deref(),
                 queried_properties,
             )?;
+            if let Some(aggregation) = &bound.descriptor.aggregation
+                && !aggregation.property.is_empty()
+            {
+                let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
+                let leaf_kind = hops
+                    .last()
+                    .map(|hop| hop.far_kind.as_str())
+                    .unwrap_or(bound.descriptor.kind.as_str());
+                ensure_property_query_allowed(
+                    &schema,
+                    &principals,
+                    leaf_kind,
+                    [aggregation.property.clone()],
+                )?;
+                ensure_property_grant_query_allowed(
+                    &self.db,
+                    Some(bound.descriptor.namespace.as_str()),
+                    Some(leaf_kind),
+                    [aggregation.property.as_str()],
+                )?;
+            }
         }
         let principal_context_digest =
             crate::sekai::purpose_authorization::purpose_bound_context_digest(
@@ -2099,6 +2120,133 @@ mod tests {
             err.message()
                 .contains("object-log dual-read requires max_rows_scanned")
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_property_fails_closed_when_leaf_grant_denies() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.db
+            .create_object(&object(
+                "s-gate",
+                "Shipment",
+                "S1",
+                &[("order_id", "o1"), ("amount", "10")],
+                30,
+            ))
+            .unwrap();
+        let shipment = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Shipment".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+                property: "order_id".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: None,
+            required_purpose: None,
+        };
+        let shipment_revision = svc
+            .db
+            .put_object_security_policy(&shipment, "root", "put-shipment", 1)
+            .unwrap();
+        let instantiated = svc
+            .db
+            .list_objects(&domain::ListFilter {
+                namespace: Some("sales".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut activation = std::collections::BTreeMap::from([(
+            "Shipment".into(),
+            shipment_revision.revision_digest,
+        )]);
+        for (index, kind) in instantiated
+            .iter()
+            .map(|object| object.kind.as_str())
+            .filter(|kind| *kind != "Shipment")
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            let extra = crate::sekai::object_security::ObjectSecurityPolicy {
+                contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION
+                    .into(),
+                namespace: "sales".into(),
+                kind: kind.into(),
+                rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                    operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                    predicates: vec![
+                        crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
+                    ],
+                }],
+                property_grants: None,
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = svc
+                .db
+                .put_object_security_policy(
+                    &extra,
+                    "root",
+                    &format!("put-{kind}"),
+                    10 + index as i64,
+                )
+                .unwrap();
+            activation.insert(kind.to_string(), revision.revision_digest);
+        }
+        svc.db
+            .activate_object_security_policies("sales", &activation, "root", "activate", 40)
+            .unwrap();
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![
+                            ObjectSetTraversal {
+                                relation: "placed".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Order".into(),
+                                join_property: "customer_id".into(),
+                            },
+                            ObjectSetTraversal {
+                                relation: "ships".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Shipment".into(),
+                                join_property: "order_id".into(),
+                            },
+                        ],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "sum".into(),
+                            property: "amount".into(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {
