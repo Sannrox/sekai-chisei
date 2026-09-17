@@ -59,6 +59,13 @@ explicit operator decision.
 Malformed governed-subject provenance key-window or TTL values disable new
 provenance issuance; they never fall back to a wider activation window.
 
+`DB_PATH` and `DATABASE_URL` remain the shipped single-store variables.
+[ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
+[ADR 0083](decisions/0083-two-store-cutover-and-recovery.md) accept two
+physical stores; the destination names (`SEKAI_DB_PATH` / `CHISEI_DB_PATH`,
+or two PostgreSQL URLs) land with the relocation Issues. Until then a single
+store is migration compatibility, not the target architecture.
+
 Backend configuration is validated before any listener binds. `DB_PATH` and
 `DATABASE_URL` are mutually exclusive. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend, its

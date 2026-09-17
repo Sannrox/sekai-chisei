@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Record two-store implementation contracts (#999): ADR 0083 (offline
+  relocation, lifecycle ownership, reservation recovery, one-sided restore
+  fence), ADR 0082 corrections (`SubmitActionInstance`, per-plane
+  `operation_id` collision scope, no cross-plane store handles), and
+  implementation Issues #1004–#1009 (first slice #1004 ready).
 - Document the #963 hop-projection default ops contract (#970): unset or
   empty `SEKAI_OBJECT_INDEX_ENGINE` is hop-projection, including `parse("")`.
   Operators must `ReindexObjectType` for hop kinds. Pinning nested-loop

@@ -31,8 +31,14 @@ OpenAI / Anthropic clients        Native integrations
               evidence | outcomes | memory
                           |
                           v
-                  SQLite / PostgreSQL
+          Sekai store          Chisei store
+          (facts, commits)     (decisions)
+          SQLite / PostgreSQL  SQLite / PostgreSQL
 ```
+
+Combined mode still opens both stores. See
+[ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
+[ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
 
 ### Sekai: durable facts
 

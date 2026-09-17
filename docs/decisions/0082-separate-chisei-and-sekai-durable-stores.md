@@ -4,13 +4,16 @@
 - Date: 2026-09-17
 - Owners: @Sannrox
 - Discussion: [Reference platform boundary research](../research/957-reference-platform-boundary.md)
-- Issue: none; accepted in the architecture discussion for this change
+- Issue: https://github.com/Sannrox/sekai-chisei/issues/999 (#999); accepted in the architecture discussion for this change
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0065](0065-workflow-action-postgres-parity.md),
   [ADR 0069](0069-operation-correlation.md),
   [ADR 0079](0079-evaluation-promotion-gate.md),
-  [ADR 0080](0080-dual-community-runtime-storage.md)
+  [ADR 0080](0080-dual-community-runtime-storage.md),
+  [ADR 0083](0083-two-store-cutover-and-recovery.md)
+- Research: [957-reference-platform-boundary](../research/957-reference-platform-boundary.md),
+  [999-two-store-implementation-contracts](../research/999-two-store-implementation-contracts.md)
 
 ## Context
 
@@ -86,8 +89,11 @@ and observable. A timeout cannot be interpreted as rejection, and a local
 Chisei reservation cannot be released until Sekai confirms that the operation
 was not committed.
 
-Existing `InvokeActionInstance` behavior remains compatible at the public
-façade while its implementation is decomposed into:
+Public admission stays `SubmitActionInstance`. Collision scope for the
+caller identity (`request_id` / `x-sekai-operation-id`) is
+`(namespace, operation_id)` on each plane, not a globally unique string;
+payload digest binds separately ([ADR 0069](0069-operation-correlation.md)).
+The implementation decomposes into:
 
 ```text
 read authorized Sekai context
@@ -99,7 +105,8 @@ read authorized Sekai context
 ```
 
 Chisei code must not receive a `RuntimeDb`, SQL handle, Sekai database
-credential, or arbitrary mutation endpoint. Sekai must not accept a Chisei
+credential, or arbitrary mutation endpoint. Sekai constructors must not take
+a Chisei store handle or credentials. Sekai must not accept a Chisei
 decision as a substitute for current authorization or action constraints.
 
 ## Validation
