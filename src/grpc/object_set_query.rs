@@ -478,6 +478,11 @@ impl SekaiServiceImpl {
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         let mut meter =
             crate::sekai::object_set::CostMeter::new(bound.descriptor.cost_limit.clone());
+        if self.object_index_dual_read && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
+            return Err(Status::failed_precondition(
+                "object index dual-read requires max_rows_scanned",
+            ));
+        }
         let mut layers = Vec::new();
         let mut kind = bound.descriptor.kind.clone();
         let empty = crate::sekai::dataset::RowQuery::default();
@@ -1683,6 +1688,49 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
+    async fn dual_read_evaluate_fails_closed_without_row_cost_limit() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_dual_read = true;
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("dual-read requires max_rows_scanned")
+        );
     }
 
     #[tokio::test]
