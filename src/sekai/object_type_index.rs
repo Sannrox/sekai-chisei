@@ -33,6 +33,69 @@ pub fn project_member_properties(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexSqlDialect {
+    Sqlite,
+    Postgres,
+}
+
+/// Push eq/gt/gte/lt/lte onto stored member JSON so evaluate does not
+/// decode every kind row. Unknown ops fail closed (no rows).
+pub fn member_filter_sql(
+    dialect: IndexSqlDialect,
+    filters: &[crate::sekai::dataset::RowFilter],
+) -> Result<(String, Vec<String>), String> {
+    let mut clause = String::new();
+    let mut values = Vec::new();
+    let mut param = 3usize;
+    for filter in filters {
+        if filter.column.is_empty() || filter.column.contains('\'') || filter.column.contains('"') {
+            return Err(format!("invalid index filter key {}", filter.column));
+        }
+        let extract = match dialect {
+            IndexSqlDialect::Sqlite => {
+                format!("json_extract(properties, '$.{}')", filter.column)
+            }
+            IndexSqlDialect::Postgres => {
+                format!("(properties::json ->> '{}')", filter.column)
+            }
+        };
+        let placeholder = match dialect {
+            IndexSqlDialect::Sqlite => format!("?{param}"),
+            IndexSqlDialect::Postgres => format!("${param}"),
+        };
+        let pred = match filter.op.as_str() {
+            "eq" | "" => {
+                values.push(filter.value.clone());
+                param += 1;
+                format!("{extract} = {placeholder}")
+            }
+            "gt" | "lt" | "gte" | "lte" => {
+                let cmp = match filter.op.as_str() {
+                    "gt" => ">",
+                    "lt" => "<",
+                    "gte" => ">=",
+                    _ => "<=",
+                };
+                values.push(filter.value.clone());
+                param += 1;
+                match dialect {
+                    IndexSqlDialect::Sqlite => format!(
+                        "({extract} IS NOT NULL AND {extract} GLOB '*[0-9]*' AND {extract} NOT GLOB '*[A-Za-z]*' AND CAST({extract} AS REAL) {cmp} CAST({placeholder} AS REAL))"
+                    ),
+                    IndexSqlDialect::Postgres => format!(
+                        "({extract} IS NOT NULL AND {extract} ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::float8 {cmp} ({placeholder})::float8)"
+                    ),
+                }
+            }
+            _ => "0".into(),
+        };
+        clause.push_str(" AND ");
+        clause.push_str(&pred);
+    }
+    Ok((clause, values))
+}
+
 pub const CONTRACT_VERSION: &str = "sekai.object-type-index/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,5 +415,29 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(project_member_properties(raw, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn member_filter_sql_pushes_eq_and_numeric_predicates() {
+        let filters = [
+            crate::sekai::dataset::RowFilter {
+                column: "tier".into(),
+                op: "gte".into(),
+                value: "2".into(),
+            },
+            crate::sekai::dataset::RowFilter {
+                column: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            },
+        ];
+        let (sqlite, values) = member_filter_sql(IndexSqlDialect::Sqlite, &filters).unwrap();
+        assert!(sqlite.contains("json_extract(properties, '$.tier')"));
+        assert!(sqlite.contains("CAST("));
+        assert!(sqlite.contains("json_extract(properties, '$.region') = ?4"));
+        assert_eq!(values, ["2".to_string(), "eu".into()]);
+        let (postgres, _) = member_filter_sql(IndexSqlDialect::Postgres, &filters).unwrap();
+        assert!(postgres.contains("properties::json ->> 'tier'"));
+        assert!(postgres.contains("::float8"));
     }
 }

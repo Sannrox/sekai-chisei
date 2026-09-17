@@ -319,17 +319,24 @@ impl SekaiDb {
         query: &RowQuery,
         needed: Option<&[String]>,
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        let (filter_sql, filter_values) = crate::sekai::object_type_index::member_filter_sql(
+            crate::sekai::object_type_index::IndexSqlDialect::Sqlite,
+            &query.filters,
+        )?;
+        let sql = format!(
+            "SELECT source_key, object_id, properties, content_hash, hidden, from_edit
+             FROM sekai_object_type_index_member
+             WHERE namespace = ?1 AND kind = ?2 AND hidden = 0{filter_sql}
+             ORDER BY source_key"
+        );
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT source_key, object_id, properties, content_hash, hidden, from_edit
-                 FROM sekai_object_type_index_member
-                 WHERE namespace = ?1 AND kind = ?2 AND hidden = 0
-                 ORDER BY source_key",
-            )
-            .map_err(|error| error.to_string())?;
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind];
+        for value in &filter_values {
+            params.push(value);
+        }
         let mut rows = stmt
-            .query(params![namespace, kind])
+            .query(params.as_slice())
             .map_err(|error| error.to_string())?;
         let mut members = Vec::new();
         let mut skipped = 0i32;
