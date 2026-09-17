@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Object-index dual-read stays off by default and fails closed without
+  `max_rows_scanned` (#951). Both nested-loop and hop-projection share that
+  meter so a canary cannot run as an unbounded production path.
 - Kind reindex writes join rows once, in one transaction, after member upserts
   (#950). Per-member join DELETE/INSERT during upsert is gone; PostgreSQL
   rebuild uses a single pooled connection.
