@@ -347,39 +347,6 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        self.replace_index_join(member)
-    }
-
-    fn replace_index_join(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
-        self.connection()?
-            .execute(
-                "DELETE FROM sekai_object_type_index_join
-                 WHERE namespace=$1 AND kind=$2 AND source_key=$3",
-                &[&member.namespace, &member.kind, &member.source_key],
-            )
-            .map_err(|error| error.to_string())?;
-        if member.hidden {
-            return Ok(());
-        }
-        for (property, value) in &member.properties {
-            let digest = crate::sekai::object_type_index::join_value_digest(value);
-            self.connection()?
-                .execute(
-                    "INSERT INTO sekai_object_type_index_join
-                     (namespace, kind, property, value_digest, source_key, value)
-                     VALUES ($1,$2,$3,$4,$5,$6)
-                     ON CONFLICT (namespace, kind, property, value_digest, source_key) DO NOTHING",
-                    &[
-                        &member.namespace,
-                        &member.kind,
-                        property,
-                        &digest,
-                        &member.source_key,
-                        value,
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-        }
         Ok(())
     }
 
@@ -434,22 +401,59 @@ impl PostgresDb {
     }
 
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
-        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
-        self.connection()?
-            .execute(
-                "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
-                &[&namespace, &kind],
-            )
-            .map_err(|error| error.to_string())?;
         let members = self.list_visible_index_members(
             namespace,
             kind,
             &crate::sekai::dataset::RowQuery::default(),
         )?;
-        for member in members {
-            self.replace_index_join(&member)?;
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_object_type_index_join_status
+             (namespace, kind, ready, rebuilt_at_ms)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (namespace, kind) DO UPDATE SET
+               ready = EXCLUDED.ready,
+               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
+            &[&namespace, &kind, &false, &now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
+            &[&namespace, &kind],
+        )
+        .map_err(|error| error.to_string())?;
+        for member in &members {
+            for (property, value) in &member.properties {
+                let digest = crate::sekai::object_type_index::join_value_digest(value);
+                tx.execute(
+                    "INSERT INTO sekai_object_type_index_join
+                     (namespace, kind, property, value_digest, source_key, value)
+                     VALUES ($1,$2,$3,$4,$5,$6)
+                     ON CONFLICT (namespace, kind, property, value_digest, source_key) DO NOTHING",
+                    &[
+                        &member.namespace,
+                        &member.kind,
+                        property,
+                        &digest,
+                        &member.source_key,
+                        value,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
         }
-        self.set_hop_projection_ready(namespace, kind, true, now_ms)
+        tx.execute(
+            "INSERT INTO sekai_object_type_index_join_status
+             (namespace, kind, ready, rebuilt_at_ms)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (namespace, kind) DO UPDATE SET
+               ready = EXCLUDED.ready,
+               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
+            &[&namespace, &kind, &true, &now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {

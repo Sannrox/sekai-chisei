@@ -419,38 +419,6 @@ impl SekaiDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        self.replace_index_join(member)
-    }
-
-    fn replace_index_join(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
-        self.conn()
-            .execute(
-                "DELETE FROM sekai_object_type_index_join
-                 WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
-                params![member.namespace, member.kind, member.source_key],
-            )
-            .map_err(|error| error.to_string())?;
-        if member.hidden {
-            return Ok(());
-        }
-        for (property, value) in &member.properties {
-            let digest = crate::sekai::object_type_index::join_value_digest(value);
-            self.conn()
-                .execute(
-                    "INSERT OR REPLACE INTO sekai_object_type_index_join
-                     (namespace, kind, property, value_digest, source_key, value)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![
-                        member.namespace,
-                        member.kind,
-                        property,
-                        digest,
-                        member.source_key,
-                        value
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-        }
         Ok(())
     }
 
@@ -501,22 +469,50 @@ impl SekaiDb {
     }
 
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
-        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
-        self.conn()
-            .execute(
-                "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
-                params![namespace, kind],
-            )
-            .map_err(|error| error.to_string())?;
         let members = self.list_visible_index_members(
             namespace,
             kind,
             &crate::sekai::dataset::RowQuery::default(),
         )?;
-        for member in members {
-            self.replace_index_join(&member)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sekai_object_type_index_join_status
+             (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
+            params![namespace, kind, 0i64, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
+            params![namespace, kind],
+        )
+        .map_err(|error| error.to_string())?;
+        for member in &members {
+            for (property, value) in &member.properties {
+                let digest = crate::sekai::object_type_index::join_value_digest(value);
+                tx.execute(
+                    "INSERT OR REPLACE INTO sekai_object_type_index_join
+                     (namespace, kind, property, value_digest, source_key, value)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        member.namespace,
+                        member.kind,
+                        property,
+                        digest,
+                        member.source_key,
+                        value
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            }
         }
-        self.set_hop_projection_ready(namespace, kind, true, now_ms)
+        tx.execute(
+            "INSERT OR REPLACE INTO sekai_object_type_index_join_status
+             (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
+            params![namespace, kind, 1i64, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
@@ -1075,5 +1071,47 @@ mod tests {
             )
             .unwrap();
         assert!(non_numeric.is_empty());
+    }
+
+    #[test]
+    fn reindex_rebuilds_joins_once_from_visible_members() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[
+                HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+                HashMap::from([
+                    ("customer_id".into(), "c2".into()),
+                    ("region".into(), "us".into()),
+                    ("hidden".into(), "true".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        let expected = visible
+            .iter()
+            .map(|member| member.properties.len() as i64)
+            .sum::<i64>();
+        assert_eq!(expected, 1);
+        assert_eq!(
+            db.count_index_join_rows("sales", "Customer").unwrap(),
+            expected
+        );
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
     }
 }

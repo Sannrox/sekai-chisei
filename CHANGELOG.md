@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Kind reindex writes join rows once, in one transaction, after member upserts
+  (#950). Per-member join DELETE/INSERT during upsert is gone; PostgreSQL
+  rebuild uses a single pooled connection.
 - Hop-projection evaluate walks join-table edges instead of rematerializing
   every hop and re-hashing child properties (#949). Intermediate hops load
   source_key/object_id only; full member JSON is fetched at the leaf.
