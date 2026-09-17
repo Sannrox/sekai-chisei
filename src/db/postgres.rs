@@ -64,6 +64,8 @@ const POLICY_DECISION_AUDIT_SCHEMA: &str = include_str!("postgres/0041_policy_de
 const OBJECT_TYPE_INDEX_SCHEMA: &str = include_str!("postgres/0042_object_type_index.sql");
 const OBJECT_TYPE_INDEX_JOIN_SCHEMA: &str =
     include_str!("postgres/0043_object_type_index_join.sql");
+const OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA: &str =
+    include_str!("postgres/0044_object_type_index_join_value.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -282,6 +284,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 42,
         name: "object_type_index_join",
         sql: OBJECT_TYPE_INDEX_JOIN_SCHEMA,
+    },
+    Migration {
+        version: 43,
+        name: "object_type_index_join_value",
+        sql: OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA,
     },
 ];
 

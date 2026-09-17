@@ -497,41 +497,15 @@ impl PostgresDb {
         if values.is_empty() {
             return Ok(Vec::new());
         }
-        if values.len() > 400 {
-            let mut out = Vec::new();
-            for chunk in values.chunks(400) {
-                out.extend(self.list_index_join_children(namespace, kind, property, chunk)?);
-            }
-            return Ok(out);
-        }
-        let digests: Vec<String> = values
-            .iter()
-            .map(|value| crate::sekai::object_type_index::join_value_digest(value))
-            .collect();
-        let placeholders = (0..digests.len())
-            .map(|index| format!("${}", index + 4))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT value, source_key FROM sekai_object_type_index_join
-             WHERE namespace=$1 AND kind=$2 AND property=$3 AND value_digest IN ({placeholders})"
-        );
-        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
-            vec![&namespace, &kind, &property];
-        for digest in &digests {
-            params.push(digest);
-        }
-        let wanted: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
         self.connection()?
-            .query(&sql, params.as_slice())
+            .query(
+                "SELECT value, source_key FROM sekai_object_type_index_join
+                 WHERE namespace=$1 AND kind=$2 AND property=$3 AND value = ANY($4)",
+                &[&namespace, &kind, &property, &values],
+            )
             .map_err(|error| error.to_string())?
             .into_iter()
-            .filter_map(|row| {
-                let value: String = row.get(0);
-                wanted
-                    .contains(value.as_str())
-                    .then(|| Ok((value, row.get(1))))
-            })
+            .map(|row| Ok((row.get(0), row.get(1))))
             .collect()
     }
 
