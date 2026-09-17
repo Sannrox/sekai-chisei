@@ -66,7 +66,11 @@ fence for the root and hop kinds; a matching generation skips recounting
 join and member rows. `nested-loop` is the original in-process
 scan, kept as an explicit debug engine. It still honors the same
 ready+generation+digest fence: a debug scan cannot read a revoked
-membership generation. Switching engines requires
+membership generation. After hop-projection became the default,
+operators must `ReindexObjectType` for hop kinds; pinning
+`SEKAI_OBJECT_INDEX_ENGINE=nested-loop` only selects the debug scan
+and does not restore evaluate while the generation is unready.
+Switching engines requires
 `ReindexObjectType`. A definition-branch publish clears hop-projection
 ready until `ReindexObjectType` restamps the datasource to the published
 revision; evaluate fails closed while that generation is stale.
