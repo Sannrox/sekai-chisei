@@ -11,32 +11,54 @@ use mikura::{
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DUAL_READ_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ";
 pub const LOG_PATH_ENV: &str = "SEKAI_OBJECT_LOG";
+pub const SAMPLE_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE";
+const DEFAULT_SAMPLE_N: u32 = 32;
+
+static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectLogDualRead {
     pub enabled: bool,
     pub log_path: Option<PathBuf>,
+    /// Compare one of `sample_n` armed requests. `1` is CI. Unset soak
+    /// defaults to 32 so enabling the flag is not a per-request Store open.
+    pub sample_n: u32,
 }
 
 impl ObjectLogDualRead {
     pub fn from_env() -> Self {
+        let enabled = env::var(DUAL_READ_ENV).unwrap_or_default() == "1";
+        let sample_n = env::var(SAMPLE_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(if enabled { DEFAULT_SAMPLE_N } else { 1 });
         Self {
-            enabled: env::var(DUAL_READ_ENV).unwrap_or_default() == "1",
+            enabled,
             log_path: env::var(LOG_PATH_ENV)
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            sample_n: sample_n.max(1),
         }
+    }
+
+    fn take_sample(&self) -> bool {
+        let n = u64::from(self.sample_n.max(1));
+        SAMPLE_TICK
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(n)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectLogCompareError {
     Disabled,
+    Unbounded,
     MissingLog,
     Unsupported(&'static str),
     Evaluate(String),
@@ -51,6 +73,7 @@ impl ObjectLogCompareError {
     pub fn message(&self) -> String {
         match self {
             Self::Disabled => "object-log dual-read is off".into(),
+            Self::Unbounded => "object-log dual-read requires max_rows_scanned".into(),
             Self::MissingLog => {
                 "object-log dual-read requires SEKAI_OBJECT_LOG to an existing mikura log".into()
             }
@@ -186,9 +209,16 @@ pub fn compare_sql_to_log(
     aggregation: &ObjectSetAggregation,
     sql_paths: &[Vec<&ObjectTypeIndexMember>],
     acl: PropertyAcl,
+    max_rows_scanned: i32,
 ) -> Result<(), ObjectLogCompareError> {
     if !config.enabled {
         return Err(ObjectLogCompareError::Disabled);
+    }
+    if max_rows_scanned <= 0 {
+        return Err(ObjectLogCompareError::Unbounded);
+    }
+    if !config.take_sample() {
+        return Ok(());
     }
     let path = config
         .log_path
@@ -414,5 +444,51 @@ mod tests {
         assert!(
             matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("i64"))
         );
+    }
+
+    #[test]
+    fn dual_read_refuses_unbounded_and_skips_unsampled_without_opening() {
+        SAMPLE_TICK.store(0, Ordering::Relaxed);
+        let config = ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 2,
+        };
+        let descriptor = ObjectSetDescriptor {
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let hops = [crate::sekai::object_set::ObjectSetTraversal {
+            far_kind: "Order".into(),
+            join_property: "customer_id".into(),
+            ..Default::default()
+        }];
+        let aggregation = ObjectSetAggregation {
+            function: "count".into(),
+            ..Default::default()
+        };
+        let err = compare_sql_to_log(
+            &config,
+            &descriptor,
+            &hops,
+            &aggregation,
+            &[],
+            PropertyAcl::allow_all(),
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ObjectLogCompareError::Unbounded));
+
+        SAMPLE_TICK.store(1, Ordering::Relaxed);
+        compare_sql_to_log(
+            &config,
+            &descriptor,
+            &hops,
+            &aggregation,
+            &[],
+            PropertyAcl::allow_all(),
+            10,
+        )
+        .unwrap();
     }
 }

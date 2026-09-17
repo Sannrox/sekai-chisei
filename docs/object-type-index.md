@@ -24,10 +24,13 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 `required_freshness_ms` to fail closed when the index is stale or lagging.
 Hidden rows never appear in members, counts, order, errors, or continuation
 tokens. The SQL index remains the current evaluate backend.
-`SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` compares hop/count/sum
-answers to a tagged in-process object-log library and fails closed on
-mismatch, missing log, or a descriptor that library cannot express (property
-filters, `group_by` buckets, path multiplicity, or a non-i64 sum). First soak
+`SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` is a canary: it
+compares hop/count/sum answers to a tagged in-process object-log library on
+a sample of requests (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1`
+for CI) and fails closed on mismatch, missing log, a missing
+`max_rows_scanned`, or a descriptor that library cannot express (property
+filters, `group_by` buckets, path multiplicity, or a non-i64 sum). Unsampled
+requests keep the SQL answer and do not open the log. First soak
 uses that library's allow-all property deny-list; clerk
 grants stay compiled on the SQL path, so a grant-narrowed SQL answer fails
 closed instead of being rewritten to match. This is not
