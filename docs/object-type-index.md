@@ -47,7 +47,8 @@ index hops (`join_property`). Cost limits (`max_rows_scanned`, `max_depth`,
 `max_time_ms`) fail closed with the limit named. `SEKAI_OBJECT_INDEX_ENGINE`
 selects `hop-projection` (default) or `nested-loop`. Hop-projection is a
 rebuildable join-key projection, not object authority. Evaluate walks those
-join edges as the reachability plan and fails closed
+join edges as the reachability plan and looks up children by the stored
+raw join value, not a per-hop digest of every parent key. It fails closed
 while that generation is unready. `nested-loop` is the original in-process
 scan, kept as an explicit debug engine. Switching engines requires
 `ReindexObjectType`. A definition-branch publish clears hop-projection

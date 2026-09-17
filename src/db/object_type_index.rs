@@ -64,6 +64,8 @@ impl SekaiDb {
                 );
                 CREATE INDEX IF NOT EXISTS sekai_object_type_index_join_lookup
                     ON sekai_object_type_index_join (namespace, kind, property, value_digest);
+                CREATE INDEX IF NOT EXISTS sekai_object_type_index_join_value
+                    ON sekai_object_type_index_join (namespace, kind, property, value);
                 CREATE INDEX IF NOT EXISTS sekai_object_type_index_join_member
                     ON sekai_object_type_index_join (namespace, kind, source_key);
                 CREATE TABLE IF NOT EXISTS sekai_object_type_index_join_status (
@@ -566,30 +568,25 @@ impl SekaiDb {
             return Ok(out);
         }
         let conn = self.conn();
-        let digests: Vec<String> = values
-            .iter()
-            .map(|value| crate::sekai::object_type_index::join_value_digest(value))
-            .collect();
-        let placeholders = vec!["?"; digests.len()].join(",");
+        let placeholders = vec!["?"; values.len()].join(",");
         let sql = format!(
             "SELECT value, source_key FROM sekai_object_type_index_join
-             WHERE namespace = ?1 AND kind = ?2 AND property = ?3 AND value_digest IN ({placeholders})"
+             WHERE namespace = ?1 AND kind = ?2 AND property = ?3 AND value IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind, &property];
-        for digest in &digests {
-            params.push(digest);
+        for value in values {
+            params.push(value);
         }
-        let wanted: std::collections::HashSet<&str> = values.iter().map(String::as_str).collect();
         let mut rows = stmt
             .query(params.as_slice())
             .map_err(|error| error.to_string())?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-            let value: String = row.get(0).map_err(|error| error.to_string())?;
-            if wanted.contains(value.as_str()) {
-                out.push((value, row.get(1).map_err(|error| error.to_string())?));
-            }
+            out.push((
+                row.get(0).map_err(|error| error.to_string())?,
+                row.get(1).map_err(|error| error.to_string())?,
+            ));
         }
         Ok(out)
     }
@@ -1113,5 +1110,37 @@ mod tests {
             expected
         );
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    #[test]
+    fn join_children_lookup_uses_raw_value_not_digest() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let pairs = db
+            .list_index_join_children("sales", "Customer", "region", &["eu".into()])
+            .unwrap();
+        assert_eq!(pairs, vec![("eu".into(), "c1".into())]);
+        let digest = crate::sekai::object_type_index::join_value_digest("eu");
+        assert!(
+            db.list_index_join_children("sales", "Customer", "region", &[digest])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

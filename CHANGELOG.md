@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Hop-projection join lookup uses the stored raw join value instead of
+  SHA-256 hashing every parent key on each hop (#952). PostgreSQL binds
+  `ANY($::text[])`; SQLite keeps a bounded `IN` list. Digest remains the
+  write-time uniqueness key.
 - Object-index dual-read stays off by default and fails closed without
   `max_rows_scanned` (#951). Both nested-loop and hop-projection share that
   meter so a canary cannot run as an unbounded production path.
