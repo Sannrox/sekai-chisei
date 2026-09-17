@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Incremental `ReindexObjectType` clears hop-projection ready before member
+  upserts and keeps it false until join rewrite commits (#985). Concurrent
+  evaluate cannot pair updated member JSON with stale hop edges.
 - Nested-loop multi-hop EvaluateObjectSet honors the hop-projection ready
   fence (#984). After a same-digest datasource rebind or an unready join
   generation, the debug engine fails closed until `ReindexObjectType`.

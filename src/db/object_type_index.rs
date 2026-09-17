@@ -192,6 +192,28 @@ impl SekaiDb {
         full_rebuild: bool,
         now_ms: i64,
     ) -> Result<ReindexReport, String> {
+        self.apply_object_type_index_staged(namespace, kind, full_rebuild, now_ms, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_object_type_index_without_join_rebuild(
+        &self,
+        namespace: &str,
+        kind: &str,
+        full_rebuild: bool,
+        now_ms: i64,
+    ) -> Result<ReindexReport, String> {
+        self.apply_object_type_index_staged(namespace, kind, full_rebuild, now_ms, false)
+    }
+
+    fn apply_object_type_index_staged(
+        &self,
+        namespace: &str,
+        kind: &str,
+        full_rebuild: bool,
+        now_ms: i64,
+        commit_joins: bool,
+    ) -> Result<ReindexReport, String> {
         let binding = self
             .get_object_type_datasource(namespace, kind)?
             .ok_or("object type datasource not found")?;
@@ -217,8 +239,8 @@ impl SekaiDb {
                 .map(|status| status.last_dataset_row_id)
                 .unwrap_or(0)
         };
+        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         if full_rebuild {
-            self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
             self.conn()
                 .execute(
                     "DELETE FROM sekai_object_type_index_member WHERE namespace = ?1 AND kind = ?2 AND from_edit = 0",
@@ -257,6 +279,14 @@ impl SekaiDb {
             let member = member_from_edit(&binding, &edit);
             self.force_upsert_index_member(&member)?;
             rewritten += 1;
+        }
+        if !commit_joins {
+            return Ok(ReindexReport {
+                rewritten_keys: rewritten,
+                skipped_unchanged: skipped,
+                quarantined: false,
+                quarantine_reason: String::new(),
+            });
         }
         let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
@@ -1101,6 +1131,59 @@ mod tests {
         db.apply_object_type_index("sales", "Customer", true, 40)
             .unwrap();
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    #[test]
+    fn incremental_reindex_clears_hop_ready_before_member_upsert() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+        let joins_before = db.count_index_join_rows("sales", "Customer").unwrap();
+        assert!(joins_before > 0);
+
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c3".into()),
+                ("region".into(), "ap".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        let report = db
+            .apply_object_type_index_without_join_rebuild("sales", "Customer", false, 30)
+            .unwrap();
+        assert_eq!(report.rewritten_keys, 1);
+        assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
+        assert_eq!(
+            db.count_visible_index_members("sales", "Customer").unwrap(),
+            2
+        );
+        assert_eq!(
+            db.count_index_join_rows("sales", "Customer").unwrap(),
+            joins_before
+        );
+
+        db.apply_object_type_index("sales", "Customer", false, 40)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+        assert!(db.count_index_join_rows("sales", "Customer").unwrap() > joins_before);
     }
 
     #[test]
