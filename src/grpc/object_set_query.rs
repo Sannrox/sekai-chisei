@@ -646,7 +646,7 @@ impl SekaiServiceImpl {
                     } else {
                         paths.clone()
                     };
-                    crate::sekai::object_log::compare_sql_to_log(
+                    match crate::sekai::object_log::compare_sql_to_log(
                         &self.object_log_dual_read,
                         &bound.descriptor,
                         hops,
@@ -654,10 +654,16 @@ impl SekaiServiceImpl {
                         &sql_paths,
                         acl,
                         bound.descriptor.cost_limit.max_rows_scanned,
-                    )
-                    .map_err(|error| Status::failed_precondition(error.message()))?;
+                    ) {
+                        Ok(())
+                        | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
+                        Err(error) => {
+                            return Err(Status::failed_precondition(error.message()));
+                        }
+                    }
                 }
-                Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed) => {}
+                Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed)
+                | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
                 Err(error) => {
                     return Err(Status::failed_precondition(error.message()));
                 }
@@ -2160,22 +2166,22 @@ mod tests {
             page_token: String::new(),
             required_freshness_ms: 0,
         };
-        let grouped_err = svc
-            .evaluate_object_set(with_named_principal(request.clone(), "alice"))
-            .await
-            .unwrap_err();
-        assert_eq!(grouped_err.code(), tonic::Code::FailedPrecondition);
-        assert!(grouped_err.message().contains("group_by"));
-
-        svc.object_log_dual_read.enabled = false;
         let page = svc
-            .evaluate_object_set(with_named_principal(request, "alice"))
+            .evaluate_object_set(with_named_principal(request.clone(), "alice"))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(page.aggregates.len(), 1);
         assert_eq!(page.aggregates[0].value, 10.0);
         assert!(!page.authority);
+
+        svc.object_log_dual_read.enabled = false;
+        let off = svc
+            .evaluate_object_set(with_named_principal(request, "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(off.aggregates, page.aggregates);
     }
 
     #[tokio::test]

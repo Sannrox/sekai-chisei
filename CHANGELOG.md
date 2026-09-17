@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Object-log dual-read skips unexpressible grammar (`group_by`, filters,
+  incoming hops, path multiplicity, non-i64 sum) and keeps the SQL answer
+  (#990). After #980 every production multi-hop has `group_by`; the canary
+  is no longer a kill switch. Mismatch, missing log, and missing
+  `max_rows_scanned` still fail closed.
 - Object-log dual-read refuses incoming (and other non-outgoing) hop
   directions instead of comparing them as outbound (#989). Tagged mikura
   `v0.1.0` has no incoming hop; mapping waits on a later published tag.

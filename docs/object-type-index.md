@@ -30,11 +30,13 @@ tokens. The SQL index remains the current evaluate backend.
 `SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` is a canary: it
 compares hop/count/sum answers to a tagged in-process object-log library on
 a sample of requests (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1`
-for CI) and fails closed on mismatch, missing log, a missing
-`max_rows_scanned`, or a descriptor that library cannot express (property
+for CI) and fails closed on mismatch, missing log, or a missing
+`max_rows_scanned`. A descriptor that library cannot express (property
 filters, `group_by` buckets, path multiplicity, a non-i64 sum, or incoming
-hop direction). Tagged `v0.1.0` is outbound-only; incoming hops refuse
-instead of comparing as outbound. Unsampled
+hop direction) keeps the SQL answer and skips the canary. After #980
+every production multi-hop has `group_by`, so those evaluates skip rather
+than turning the flag into a kill switch. Tagged `v0.1.0` is outbound-only;
+incoming hops skip instead of comparing as outbound. Unsampled
 requests keep the SQL answer and do not open the log. First soak
 uses that library's allow-all property deny-list. Clerk
 grants stay compiled on the SQL path; when a kind's property-grant
