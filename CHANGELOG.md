@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `.env.example` object-log dual-read comments match configuration.md after
+  #980: refuse `group_by`, path multiplicity, and non-i64 sum, and note that
+  production multi-hop always refuses the canary (#986).
 - Incremental `ReindexObjectType` clears hop-projection ready before member
   upserts and keeps it false until join rewrite commits (#985). Concurrent
   evaluate cannot pair updated member JSON with stale hop edges.
