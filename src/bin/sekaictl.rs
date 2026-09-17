@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "quality" => {
             sekai_chisei::quality_cli::run_quality_command(args.into_iter().skip(1).collect()).await
         }
+        "store" => {
+            sekai_chisei::store_relocate::run_store_command(args.into_iter().skip(1).collect())
+        }
         "sync" => {
             sekai_chisei::source_webhook_cli::run_sync_command(args.into_iter().skip(1).collect())
                 .await
@@ -503,6 +506,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("lakehouse"), _) => ("lakehouse", 2),
         (Some("providers"), _) => ("providers", 2),
         (Some("autonomy"), _) => ("autonomy", 2),
+        (Some("store"), _) => ("store", 2),
         _ => return Err("unknown admin command".to_string()),
     };
 
@@ -726,7 +730,10 @@ fn print_admin_usage() {
            sekaictl admin providers ...\n\
          \n\
          Autonomy:\n\
-           sekaictl admin autonomy ..."
+           sekaictl admin autonomy ...\n\
+         \n\
+         Store:\n\
+           sekaictl admin store relocate ..."
     );
 }
 
@@ -768,6 +775,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "lakehouse" => Some(sekai_chisei::lakehouse_snapshot_cli::usage().to_string()),
         "providers" => Some(sekai_chisei::model_platform_cli::usage().to_string()),
         "autonomy" => Some(sekai_chisei::autonomous_envelope_cli::usage().to_string()),
+        "store" => Some(sekai_chisei::store_relocate::usage().to_string()),
         _ => None,
     }
 }
@@ -865,6 +873,7 @@ mod tests {
             (vec!["lakehouse"], "lakehouse"),
             (vec!["providers"], "providers"),
             (vec!["autonomy"], "autonomy"),
+            (vec!["store"], "store"),
         ] {
             let mut args = vec!["admin".to_string()];
             args.extend(canonical.into_iter().map(str::to_string));
@@ -923,6 +932,7 @@ mod tests {
             "lakehouse",
             "providers",
             "autonomy",
+            "store",
         ] {
             let usage = expert_usage(command).unwrap();
             assert!(usage.contains("sekaictl admin "));
