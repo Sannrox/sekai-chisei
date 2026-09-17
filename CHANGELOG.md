@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Nested-loop multi-hop EvaluateObjectSet honors the hop-projection ready
+  fence (#984). After a same-digest datasource rebind or an unready join
+  generation, the debug engine fails closed until `ReindexObjectType`.
 - Aggregate EvaluateObjectSet checks `aggregation.property` against property
   grants on the leaf hop kind (#983). Denied numeric properties fail closed
   instead of contributing to sum/min/max.
