@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `RegisterObjectTypeDatasource` that changes join-relevant binding fields
+  clears hop-projection ready even when `definition_digest` is unchanged
+  (#964). Identical re-register does not. Evaluate stays fail-closed until
+  `ReindexObjectType`.
 - Aggregate `EvaluateObjectSet` loads only group_by, numeric, filter, and
   nested-loop join properties on hop members (#953). Unused JSON keys are
   dropped; count-only leaf fetches skip property maps.

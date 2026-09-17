@@ -11,6 +11,7 @@ impl PostgresDb {
         binding: &ObjectTypeDatasource,
         created_at_ms: i64,
     ) -> Result<(), String> {
+        let existing = self.get_object_type_datasource(&binding.namespace, &binding.kind)?;
         let mapping =
             serde_json::to_string(&binding.property_mapping).map_err(|e| e.to_string())?;
         self.connection()?
@@ -37,8 +38,14 @@ impl PostgresDb {
                     &created_at_ms,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if existing
+            .as_ref()
+            .is_none_or(|previous| previous.changes_hop_generation(binding))
+        {
+            self.set_hop_projection_ready(&binding.namespace, &binding.kind, false, created_at_ms)?;
+        }
+        Ok(())
     }
 
     pub fn get_object_type_datasource(
