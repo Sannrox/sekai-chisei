@@ -32,7 +32,7 @@ template.
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
-| `SEKAI_OBJECT_INDEX_ENGINE` | `nested-loop` | Object-set hop engine (`nested-loop` or `hop-projection`). Switching engines requires `ReindexObjectType` |
+| `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Switching engines requires `ReindexObjectType` |
 | `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Set `1` to compare both engines and fail closed on mismatch |
 | `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Set `1` to compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
 | `SEKAI_OBJECT_LOG` | unset | Path to the mikura object log required when `SEKAI_OBJECT_LOG_DUAL_READ=1` |

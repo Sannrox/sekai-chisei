@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Multi-hop `EvaluateObjectSet` defaults to hop-projection (#948). Nested-loop
+  remains an explicit debug engine (`SEKAI_OBJECT_INDEX_ENGINE=nested-loop`).
+  Unready or stale join generations still fail closed.
 - Definition-branch publish clears hop-projection ready until `ReindexObjectType`
   restamps the datasource digest (#947). Hop-projection evaluate fails closed
   when join status is unready or the datasource revision is not the published
