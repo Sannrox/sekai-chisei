@@ -54,6 +54,9 @@ scan, kept as an explicit debug engine. Switching engines requires
 `ReindexObjectType`. A definition-branch publish clears hop-projection
 ready until `ReindexObjectType` restamps the datasource to the published
 revision; evaluate fails closed while that generation is stale.
+`RegisterObjectTypeDatasource` that changes dataset, key, mapping, hidden,
+edits-only, or digest also clears ready for that kind, even when the catalog
+digest is unchanged; identical re-register leaves the generation in place.
 `SEKAI_OBJECT_INDEX_DUAL_READ=1` compares both
 plans and fails closed on mismatch. Hidden rows stay out of members,
 aggregates, and hop edges. Aggregate evaluates project only the group_by,

@@ -107,6 +107,18 @@ pub struct ReindexReport {
 }
 
 impl ObjectTypeDatasource {
+    /// Physical join generation, distinct from catalog `definition_digest`.
+    /// Changing dataset, key, mapping, hidden, edits-only, or digest is a new
+    /// hop-projection generation and must fail closed until reindex.
+    pub fn changes_hop_generation(&self, next: &Self) -> bool {
+        self.definition_digest != next.definition_digest
+            || self.dataset_id != next.dataset_id
+            || self.key_column != next.key_column
+            || self.property_mapping != next.property_mapping
+            || self.hidden_column != next.hidden_column
+            || self.edits_only != next.edits_only
+    }
+
     pub fn prepare(self) -> Result<Self, ObjectTypeIndexError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(ObjectTypeIndexError::InvalidArgument(

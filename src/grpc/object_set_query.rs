@@ -1917,6 +1917,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hop_projection_evaluate_fails_closed_when_same_digest_binding_changes() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
+        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let mut rebound = svc
+            .db
+            .get_object_type_datasource("sales", "Order")
+            .unwrap()
+            .unwrap();
+        rebound.dataset_id = "ds-orders-v2".into();
+        svc.db
+            .register_object_type_datasource(&rebound, 99)
+            .unwrap();
+        assert!(!svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
     async fn evaluate_object_set_object_log_dual_read_matches_and_fails_closed() {
         let mut svc = service();
         grant_namespace(&svc, "sales", "alice");

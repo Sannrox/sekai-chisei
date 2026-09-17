@@ -85,6 +85,7 @@ impl SekaiDb {
         binding: &ObjectTypeDatasource,
         created_at_ms: i64,
     ) -> Result<(), String> {
+        let existing = self.get_object_type_datasource(&binding.namespace, &binding.kind)?;
         let mapping =
             serde_json::to_string(&binding.property_mapping).map_err(|e| e.to_string())?;
         self.conn()
@@ -104,8 +105,14 @@ impl SekaiDb {
                     created_at_ms
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if existing
+            .as_ref()
+            .is_none_or(|previous| previous.changes_hop_generation(binding))
+        {
+            self.set_hop_projection_ready(&binding.namespace, &binding.kind, false, created_at_ms)?;
+        }
+        Ok(())
     }
 
     pub fn get_object_type_datasource(
@@ -1033,6 +1040,49 @@ mod tests {
                 .unwrap()
                 .definition_digest,
             "rev-1"
+        );
+    }
+
+    #[test]
+    fn register_same_digest_join_change_clears_hop_projection_ready() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.create_dataset(&dataset(
+            "ds-customers-v2",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.register_object_type_datasource(&binding(), 30).unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+
+        let mut rebound = binding();
+        rebound.dataset_id = "ds-customers-v2".into();
+        db.register_object_type_datasource(&rebound, 40).unwrap();
+        assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
+        assert_eq!(
+            db.get_object_type_datasource("sales", "Customer")
+                .unwrap()
+                .unwrap()
+                .dataset_id,
+            "ds-customers-v2"
         );
     }
 
