@@ -57,7 +57,9 @@ raw join value, not a per-hop digest of every parent key. It fails closed
 while that generation is unready. Evaluate reads one ready+generation+digest
 fence for the root and hop kinds; a matching generation skips recounting
 join and member rows. `nested-loop` is the original in-process
-scan, kept as an explicit debug engine. Switching engines requires
+scan, kept as an explicit debug engine. It still honors the same
+ready+generation+digest fence: a debug scan cannot read a revoked
+membership generation. Switching engines requires
 `ReindexObjectType`. A definition-branch publish clears hop-projection
 ready until `ReindexObjectType` restamps the datasource to the published
 revision; evaluate fails closed while that generation is stale.
