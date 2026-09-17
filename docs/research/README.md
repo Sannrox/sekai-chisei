@@ -27,6 +27,7 @@ reference pages.
 | [`SEKAI_AUTH_TOKEN` root-bootstrap retirement](423-auth-token-root-bootstrap.md) | Superseded by the 1.0 clean break: server bootstrap removed; clients use `SEKAI_CREDENTIAL` with durable principal credentials |
 | [`sekaictl` command-surface reduction](442-sekaictl-command-surface.md) | Accepted in ADR 0009/0010; root commands plus grouped expert operations under `admin` |
 | [Kernel and extension boundary](443-kernel-extension-boundary.md) | Keep one published governance product, narrow its public facade, and extract only acyclic leaf libraries with a measured independent-consumer dividend |
+| [Reference platform boundary research](957-reference-platform-boundary.md) | Implementation guidance: split decision governance from durable semantic and transaction authority behind a narrow authenticated clerk contract |
 | [Managed Shikigami routing compatibility](471-managed-shikigami-routing.md) | Existing contract shape retained; #484 completed context-bound provider credentials, streamed tool calls, and situation-specific conformance evidence |
 | [Epistemic profiles across federation contracts](500-epistemic-federation.md) | Existing signed receipts, provenance, peer-import, and handoff contracts compose without a new federation adapter; see the conformance fixture |
 | [Epistemic RDF/OWL/PROV-O boundary](501-epistemic-rdf-owl-prov-o.md) | Small edge projection with explicit loss metadata; no RDF parser or reasoner in core; see the conformance fixture |
