@@ -36,7 +36,7 @@ pub enum BackendIdentity {
 }
 
 impl BackendIdentity {
-    fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "sqlite" => Ok(Self::Sqlite),
             "postgres" | "postgresql" => Ok(Self::Postgres),

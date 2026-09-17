@@ -1,9 +1,10 @@
 //! Typed durable-store handles for the accepted two-store split.
 //!
-//! Combined mode may still wrap one [`RuntimeDb`] behind both handles. That
-//! facade is explicit and lives here so Chisei constructors never take
+//! Combined mode opens two physical stores when destination variables are
+//! set. One [`RuntimeDb`] behind both handles remains an explicit
+//! compatibility facade (`split_shared_runtime`) for a single `DB_PATH` /
+//! `DATABASE_URL` until relocation. Chisei constructors never take
 //! `RuntimeDb` and Sekai constructors never take a Chisei handle.
-//! Physical separation lands in later Issues (#1005+).
 
 use std::sync::Arc;
 

@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::chisei::budget::BudgetTracker;
+use crate::combined_stores::CombinedStoreLayout;
 use crate::config::{Config, GrpcTcpMode};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::PrincipalCredential;
@@ -21,7 +22,6 @@ use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::rpc_maturity::RpcMaturityLayer;
-use crate::runtime_backend::RuntimeBackend;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
 use std::convert::Infallible;
@@ -434,7 +434,7 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 
 pub fn run(
     config: Config,
-    backend: Arc<RuntimeBackend>,
+    stores: Arc<CombinedStoreLayout>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
 ) -> Result<
@@ -447,18 +447,22 @@ pub fn run(
     // inside Tokio.
     let (
         db,
+        chisei_db,
         provider_registry_state_path,
         credential_store,
         assertion_authority,
         (sekai_svc, chisei_svc),
     ) = (|| -> Result<_, std::io::Error> {
-        backend
-            .capabilities()
-            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+        stores
+            .validate_required_surfaces()
             .map_err(std::io::Error::other)?;
-        let db = backend.database();
+        let db = stores.sekai_runtime();
+        let chisei_db = stores.chisei_runtime();
+        let registry_anchor = stores
+            .registry_anchor_path()
+            .unwrap_or(config.db_path.as_str());
         let provider_registry_state_path =
-            crate::provider_profile::provider_registry_state_path(&config.db_path);
+            crate::provider_profile::provider_registry_state_path(registry_anchor);
         let credential_store = Arc::new(PrincipalCredentialStore::new());
         credential_store.load(&active_credentials);
 
@@ -469,9 +473,10 @@ pub fn run(
             .assertion_authority()
             .map_err(std::io::Error::other)?
             .map(Arc::new);
-        let services = build_services(&config, db.clone());
+        let services = build_services(&config, &stores);
         Ok((
             db,
+            chisei_db,
             provider_registry_state_path,
             credential_store,
             assertion_authority,
@@ -480,13 +485,14 @@ pub fn run(
     })()?;
 
     Ok(async move {
-        spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
+        spawn_service_background_tasks(&config, chisei_db.clone(), &sekai_svc, &chisei_svc);
 
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
                 &config.ops_bind,
                 ops_port,
                 db.clone(),
+                Some(chisei_db.clone()),
                 provider_registry_state_path.clone(),
                 credential_store.clone(),
                 assertion_authority.clone(),
@@ -787,14 +793,14 @@ where
         .await?)
 }
 
-fn build_services(
+pub fn build_services(
     config: &Config,
-    db: Arc<RuntimeDb>,
+    stores: &CombinedStoreLayout,
 ) -> (
     Arc<sekai_service::SekaiServiceImpl>,
     Arc<chisei_service::ChiseiServiceImpl>,
 ) {
-    let (sekai_store, chisei_store) = crate::db::store::split_shared_runtime(db);
+    let (sekai_store, chisei_store) = stores.handles();
     let budget = Arc::new(BudgetTracker::with_topology(
         chisei_store.clone(),
         config.budget_topology.clone(),
@@ -930,9 +936,12 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let backend = Arc::new(
-            RuntimeBackend::from_sqlite_with_enterprise_extension(":memory:", None).unwrap(),
-        );
+        let stores = Arc::new(CombinedStoreLayout::from_backend(
+            crate::runtime_backend::RuntimeBackend::from_sqlite_with_enterprise_extension(
+                ":memory:", None,
+            )
+            .unwrap(),
+        ));
         let tcp_mode = GrpcTcpMode {
             bind_addr: "127.0.0.1".into(),
             token_auth_mode: false,
@@ -940,7 +949,7 @@ mod tests {
             bind_inferred_from_active_credentials: false,
         };
 
-        let result = run(config, backend, Vec::new(), tcp_mode);
+        let result = run(config, stores, Vec::new(), tcp_mode);
 
         assert!(result.is_err());
     }

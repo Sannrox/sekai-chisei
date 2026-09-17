@@ -100,7 +100,7 @@ snapshot, not a mixed pair.
 | Invariant | Evidence | State |
 | --- | --- | --- |
 | Typed Chisei handle cannot see Sekai SQL | Unit + compile boundary | proposed |
-| Two physical stores in combined mode | Integration + config | proposed |
+| Two physical stores in combined mode | Integration + config | implemented (#1005) |
 | Same public API on combined and split | Public-API integration, gateway smoke | proposed |
 | SQLite and PostgreSQL conformance per store | Shared conformance | proposed |
 | Fresh install + upgraded retained data | Migration tests | proposed |
@@ -115,7 +115,7 @@ snapshot, not a mixed pair.
 Published from this preparatory Issue. Readiness is on each Issue.
 
 1. [#1004](https://github.com/Sannrox/sekai-chisei/issues/1004) — typed `SekaiStore` / `ChiseiStore` handles; Chisei loses `RuntimeDb`. **Ready.**
-2. [#1005](https://github.com/Sannrox/sekai-chisei/issues/1005) — combined mode opens two physical stores. Blocked on #1004.
+2. [#1005](https://github.com/Sannrox/sekai-chisei/issues/1005) — combined mode opens two physical stores. Ready after #1004.
 3. [#1006](https://github.com/Sannrox/sekai-chisei/issues/1006) — offline table relocation + writer fence. Blocked on #1005.
 4. [#1007](https://github.com/Sannrox/sekai-chisei/issues/1007) — reserve / commit / finalize / reconcile across the typed hop. Blocked on #1006.
 5. [#1008](https://github.com/Sannrox/sekai-chisei/issues/1008) — subprocess isolation and wrong-plane rejection. Blocked on #1007.

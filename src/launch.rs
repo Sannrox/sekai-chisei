@@ -266,7 +266,11 @@ pub async fn run_launch(
     config: LaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".into());
+    let db_path = std::env::var("SEKAI_DB_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("DB_PATH").ok())
+        .unwrap_or_else(|| "./data/sekai.db".into());
     if config.kind().is_some() {
         let contract = validate_launch_contract(&config, &db_path)?;
         println!(

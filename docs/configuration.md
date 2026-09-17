@@ -10,8 +10,12 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | `./data/sekai.db` | SQLite database path |
-| `DATABASE_URL` | unset | PostgreSQL connection URL; required when `SEKAI_DB_BACKEND=postgres` |
+| `DB_PATH` | `./data/sekai.db` | SQLite compatibility path when destination variables are unset |
+| `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
+| `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
+| `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; required when `SEKAI_DB_BACKEND=postgres` without destination URLs |
+| `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
+| `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
 | `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | PostgreSQL pool size |
 | `SEKAI_POSTGRES_CA_CERT` | unset | Optional PEM CA certificate path for TLS trust |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
@@ -59,15 +63,21 @@ explicit operator decision.
 Malformed governed-subject provenance key-window or TTL values disable new
 provenance issuance; they never fall back to a wider activation window.
 
-`DB_PATH` and `DATABASE_URL` remain the shipped single-store variables.
-[ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
-[ADR 0083](decisions/0083-two-store-cutover-and-recovery.md) accept two
-physical stores; the destination names (`SEKAI_DB_PATH` / `CHISEI_DB_PATH`,
-or two PostgreSQL URLs) land with the relocation Issues. Until then a single
-store is migration compatibility, not the target architecture.
+`SEKAI_DB_PATH` + `CHISEI_DB_PATH` (SQLite) or `SEKAI_DATABASE_URL` +
+`CHISEI_DATABASE_URL` (PostgreSQL) open two physical stores. Combined mode
+refuses a pair that resolves to the same file or database. Partial destination
+configuration is refused; a second file is never invented from one path.
+`DB_PATH` and `DATABASE_URL` remain migration compatibility: they keep one
+physical store behind both typed handles until relocation copies families.
+The gateway is a translator and does not own a third store.
+See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
+[ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
 
 Backend configuration is validated before any listener binds. `DB_PATH` and
-`DATABASE_URL` are mutually exclusive. The public
+`DATABASE_URL` are mutually exclusive. Destination pairs win over the matching
+legacy variable when both are present for SQLite; a leftover `DATABASE_URL`
+cannot be mixed with SQLite destination paths, and a leftover `DB_PATH`
+cannot be mixed with PostgreSQL destination URLs. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend, its
 supported reusable surfaces, and (for PostgreSQL) the applied migration version.
 PostgreSQL implements the reusable community surface set—Sekai, Chisei, gateway
