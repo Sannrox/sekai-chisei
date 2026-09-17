@@ -32,7 +32,9 @@ compares hop/count/sum answers to a tagged in-process object-log library on
 a sample of requests (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1`
 for CI) and fails closed on mismatch, missing log, a missing
 `max_rows_scanned`, or a descriptor that library cannot express (property
-filters, `group_by` buckets, path multiplicity, or a non-i64 sum). Unsampled
+filters, `group_by` buckets, path multiplicity, a non-i64 sum, or incoming
+hop direction). Tagged `v0.1.0` is outbound-only; incoming hops refuse
+instead of comparing as outbound. Unsampled
 requests keep the SQL answer and do not open the log. First soak
 uses that library's allow-all property deny-list. Clerk
 grants stay compiled on the SQL path; when a kind's property-grant

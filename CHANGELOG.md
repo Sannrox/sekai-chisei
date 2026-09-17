@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Object-log dual-read refuses incoming (and other non-outgoing) hop
+  directions instead of comparing them as outbound (#989). Tagged mikura
+  `v0.1.0` has no incoming hop; mapping waits on a later published tag.
 - `.env.example` object-log dual-read comments match configuration.md after
   #980: refuse `group_by`, path multiplicity, and non-i64 sum, and note that
   production multi-hop always refuses the canary (#986).
