@@ -10,9 +10,7 @@ use std::sync::Mutex;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::evolve::{self, TaskRecord};
 use crate::chisei::scoring::normalize_task_class;
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::audit::DecisionFilter;
 
 /// What a candidate would change if promoted.
@@ -177,7 +175,7 @@ pub struct RoutingBiasPayload {
 /// gated by Phase C.
 pub fn propose_routing_bias_candidate(
     store: &CandidateStore,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     eval: &EvalStore,
     namespace: &str,
     task_class: &str,
@@ -393,14 +391,12 @@ mod tests {
         }
     }
 
-    fn setup() -> (Arc<RuntimeDb>, Arc<EvalStore>, CandidateStore) {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+    fn setup() -> (ChiseiStore, Arc<EvalStore>, CandidateStore) {
+        let db = ChiseiStore::memory();
         (db, Arc::new(EvalStore::new()), CandidateStore::new())
     }
 
-    fn observe(db: &RuntimeDb, request_id: &str, namespace: &str, task_class: &str, ts: i64) {
+    fn observe(db: &ChiseiStore, request_id: &str, namespace: &str, task_class: &str, ts: i64) {
         db.put_sample_observation(&SampleObservation {
             request_id: request_id.into(),
             namespace: namespace.into(),
@@ -420,7 +416,7 @@ mod tests {
     }
 
     fn observe_batch(
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         namespace: &str,
         task_class: &str,
         base: &str,
@@ -438,7 +434,7 @@ mod tests {
         }
     }
 
-    async fn run_cycle(db: &Arc<RuntimeDb>, eval: &Arc<EvalStore>, score: i32, passed: bool) {
+    async fn run_cycle(db: &ChiseiStore, eval: &Arc<EvalStore>, score: i32, passed: bool) {
         let job = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),

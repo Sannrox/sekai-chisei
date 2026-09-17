@@ -14,7 +14,7 @@ use std::sync::{
 use tokio::sync::Mutex as AsyncMutex;
 
 pub(crate) struct EvaluationExecutionLifecycle {
-    db: Arc<RuntimeDb>,
+    db: crate::db::store::ChiseiStore,
     budget: Arc<BudgetTracker>,
     evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     stochastic_evaluator_registry: Arc<evaluation_execution_domain::StochasticEvaluatorRegistry>,
@@ -25,7 +25,7 @@ pub(crate) struct EvaluationExecutionLifecycle {
 
 impl EvaluationExecutionLifecycle {
     pub(super) fn new(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::ChiseiStore>,
         budget: Arc<BudgetTracker>,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
@@ -34,7 +34,7 @@ impl EvaluationExecutionLifecycle {
         safe_providers: HashSet<String>,
     ) -> Self {
         Self {
-            db,
+            db: db.into(),
             budget,
             evaluator_registry,
             stochastic_evaluator_registry,

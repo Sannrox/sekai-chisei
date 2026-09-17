@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use crate::chisei::eval::{Assertion, Case, Suite};
 use crate::chisei::gunshi::{OperatorResponse, ResourceSelection};
 use crate::chisei::gunshi_feedback::{FEEDBACK_RECORD_VERSION, GunshiFeedbackRecord};
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::audit::Decision;
 
 pub const FEEDBACK_SUITE_PREFIX: &str = "feedback-";
@@ -163,7 +163,7 @@ pub fn case_from_feedback(record: &GunshiFeedbackRecord) -> Result<Case, String>
 
 /// Load feedback by decision id components and promote into a feedback- suite.
 pub fn promote_feedback_to_eval(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     suite_id: &str,
     issuance_id: &str,
@@ -243,7 +243,7 @@ pub fn promote_feedback_to_eval(
 }
 
 fn load_feedback_record(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     allocation_id: &str,
     issuance_id: &str,
@@ -252,7 +252,7 @@ fn load_feedback_record(
 }
 
 fn audit_promotion(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     suite: &Suite,
     case: &Case,
@@ -310,7 +310,7 @@ mod tests {
         VerificationStrategy,
     };
     use crate::chisei::gunshi_feedback::record_issued_recommendations;
-    use crate::db::runtime_db::RuntimeDb;
+    use crate::db::store::ChiseiStore;
 
     fn plan() -> AllocationPlan {
         AllocationPlan {
@@ -367,7 +367,7 @@ mod tests {
         }
     }
 
-    fn seed_feedback(db: &RuntimeDb) -> GunshiFeedbackRecord {
+    fn seed_feedback(db: &ChiseiStore) -> GunshiFeedbackRecord {
         let plan = plan();
         record_issued_recommendations(
             db,
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn promotes_feedback_idempotently_into_feedback_suite() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         let record = seed_feedback(&db);
         let suite_id = default_feedback_suite_id("support", "triage");
         let first = promote_feedback_to_eval(
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn generated_feedback_case_requires_exact_content_identity_and_labels() {
-        let record = seed_feedback(&RuntimeDb::memory());
+        let record = seed_feedback(&ChiseiStore::memory());
         let case = case_from_feedback(&record).unwrap();
         assert!(is_generated_feedback_case(&case));
 
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn rejects_non_feedback_suite_ids() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         let record = seed_feedback(&db);
         assert!(
             promote_feedback_to_eval(
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn rejects_cross_namespace_promotion() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         let record = seed_feedback(&db);
         let suite_id = default_feedback_suite_id("other", "triage");
         // Lookup is namespaced; foreign namespace cannot see the feedback row.

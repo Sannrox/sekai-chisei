@@ -45,15 +45,18 @@ pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
-    db: Arc<RuntimeDb>,
+    db: crate::db::store::SekaiStore,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 }
 
 impl TokenAuthInterceptor {
-    pub fn new(store: Arc<PrincipalCredentialStore>, db: Arc<RuntimeDb>) -> Self {
+    pub fn new(
+        store: Arc<PrincipalCredentialStore>,
+        db: impl Into<crate::db::store::SekaiStore>,
+    ) -> Self {
         Self {
             store,
-            db,
+            db: db.into(),
             assertion_authority: None,
         }
     }
@@ -68,7 +71,7 @@ impl TokenAuthInterceptor {
 
     pub fn from_runtime(
         store: Arc<PrincipalCredentialStore>,
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::SekaiStore>,
         assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         Self::new(store, db).with_assertion_authority(assertion_authority)
@@ -791,20 +794,21 @@ fn build_services(
     Arc<sekai_service::SekaiServiceImpl>,
     Arc<chisei_service::ChiseiServiceImpl>,
 ) {
+    let (sekai_store, chisei_store) = crate::db::store::split_shared_runtime(db);
     let budget = Arc::new(BudgetTracker::with_topology(
-        db.clone(),
+        chisei_store.clone(),
         config.budget_topology.clone(),
     ));
     let sekai_svc = Arc::new(
         sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
-            db.clone(),
+            sekai_store,
             budget.clone(),
             config.gateway_receipt_principals.clone(),
         )
         .with_site_id(config.site_id.clone()),
     );
     let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        db.clone(),
+        chisei_store,
         config.clone(),
         budget,
     ));

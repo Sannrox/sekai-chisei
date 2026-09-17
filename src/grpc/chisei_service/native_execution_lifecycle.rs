@@ -886,7 +886,7 @@ pub(super) fn evaluate_execute_lookup_first(
         &input.namespace,
         actor,
         &input.spec,
-        db,
+        &crate::db::store::ChiseiStore::from(db),
     ) {
         Ok(crate::chisei::lookup_first::LookupDecision::Hit {
             answer_json,

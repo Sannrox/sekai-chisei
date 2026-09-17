@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Introduce typed `SekaiStore` / `ChiseiStore` handles so Chisei constructors
+  no longer take `RuntimeDb` (#1004). Combined mode still wraps one physical
+  store behind `split_shared_runtime` until #1005 opens two files.
 - Record two-store implementation contracts (#999): ADR 0083 (offline
   relocation, lifecycle ownership, reservation recovery, one-sided restore
   fence), ADR 0082 corrections (`SubmitActionInstance`, per-plane

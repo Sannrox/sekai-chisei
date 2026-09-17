@@ -1,12 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::db::chisei_eval_backend::{EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS};
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 
 const SUPPORTED_ASSERTION_TYPES: [&str; 4] = ["status", "contains", "not_contains", "min_score"];
 const MAX_REPORTED_ASSERTION_TYPE_CHARS: usize = 64;
@@ -125,7 +123,7 @@ pub struct ContextExpansionGate {
 }
 
 pub struct EvalStore {
-    db: Option<Arc<RuntimeDb>>,
+    db: Option<ChiseiStore>,
     suites: Mutex<HashMap<String, Suite>>,
     runs: Mutex<HashMap<String, Run>>,
     iterations: Mutex<HashMap<String, Iteration>>,
@@ -159,10 +157,10 @@ impl EvalStore {
         }
     }
 
-    /// Database-backed eval store shared across replicas via `RuntimeDb`.
-    pub fn with_db(db: Arc<RuntimeDb>) -> Self {
+    /// Database-backed eval store shared across replicas via `ChiseiStore`.
+    pub fn with_db(db: impl Into<ChiseiStore>) -> Self {
         Self {
-            db: Some(db),
+            db: Some(db.into()),
             suites: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             iterations: Mutex::new(HashMap::new()),
@@ -869,12 +867,8 @@ mod tests {
     #[test]
     fn database_backed_store_observes_writes_from_another_replica() {
         let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
-        let writer = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        )));
-        let reader = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        )));
+        let writer = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        let reader = ChiseiStore::open_sqlite(path.to_str().unwrap());
         let store = EvalStore::with_db(reader);
         let suite = Suite {
             id: "shared-suite".into(),
@@ -905,12 +899,8 @@ mod tests {
     #[test]
     fn database_eval_evidence_is_append_only_across_connections() {
         let path = std::env::temp_dir().join(format!("sekai-eval-{}.db", uuid::Uuid::new_v4()));
-        let first = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        )));
-        let second = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        )));
+        let first = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        let second = ChiseiStore::open_sqlite(path.to_str().unwrap());
         let mut promotion = Suite {
             id: "promotion-suite".into(),
             name: "a".into(),
@@ -1189,9 +1179,7 @@ mod tests {
     fn legacy_persisted_unknown_assertions_fail_closed_when_evaluated() {
         let path =
             std::env::temp_dir().join(format!("sekai-legacy-eval-{}.db", uuid::Uuid::new_v4()));
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        )));
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
         let cases = vec![Case {
             id: "legacy-case".into(),
             name: "legacy".into(),

@@ -1200,7 +1200,7 @@ mod tests {
                 &case.namespace,
                 &case.actor,
                 &case.input.to_string(),
-                &db,
+                &crate::db::store::ChiseiStore::from(&db),
             )
             .expect("lookup-first case");
             match case.expected_path.as_str() {

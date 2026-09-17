@@ -8,13 +8,16 @@ pub(super) struct ProvenanceExportOutcome {
 }
 
 pub(super) struct GovernedSubjectLifecycle {
-    db: Arc<RuntimeDb>,
+    db: crate::db::store::ChiseiStore,
     config: Config,
 }
 
 impl GovernedSubjectLifecycle {
-    pub(super) fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
-        Self { db, config }
+    pub(super) fn new(db: impl Into<crate::db::store::ChiseiStore>, config: Config) -> Self {
+        Self {
+            db: db.into(),
+            config,
+        }
     }
 
     pub(super) fn evaluate(

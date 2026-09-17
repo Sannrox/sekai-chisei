@@ -1,9 +1,9 @@
 //! Signed, short-lived authority for host-executed external actions.
 
 use crate::chisei::external_action::{AuthorizationRecord, PERMIT_VERSION, REDEMPTION_VERSION};
-#[cfg(test)]
-use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+#[cfg(test)]
+use crate::db::store::ChiseiStore;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -1287,7 +1287,7 @@ mod tests {
         }
     }
 
-    fn persist_authorization(db: &RuntimeDb, record: &AuthorizationRecord) {
+    fn persist_authorization(db: &ChiseiStore, record: &AuthorizationRecord) {
         assert!(matches!(
             db.claim_external_action_authorization(
                 &record.request,
@@ -1405,9 +1405,7 @@ mod tests {
         let record = authorization(10_000, 1);
         let (permit, key) = signed(&record);
         {
-            let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(path.to_str().unwrap()).unwrap(),
-            ));
+            let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
             persist_authorization(&db, &record);
             db.put_permit(&permit, "issue-1", "agent:test").unwrap();
             let first = db
@@ -1434,9 +1432,7 @@ mod tests {
                 .unwrap();
             assert_eq!(first, retry);
         }
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        ));
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
         db.revoke_permit(
             &permit.revocation_handle,
             "operator:test",
@@ -1476,9 +1472,7 @@ mod tests {
         let path = dir.path().join("replica.db");
         let record = authorization(10_000, 1);
         let (permit, key) = signed(&record);
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(path.to_str().unwrap()).unwrap(),
-        ));
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         drop(db);
@@ -1490,9 +1484,7 @@ mod tests {
             let permit = permit.clone();
             let key = key.clone();
             joins.push(std::thread::spawn(move || {
-                let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-                    SekaiDb::new(path.to_str().unwrap()).unwrap(),
-                ));
+                let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
                 barrier.wait();
                 db.redeem_permit(
                     &permit,
@@ -1517,7 +1509,7 @@ mod tests {
     fn toctou_revocation_and_kill_switch_stop_future_redemption() {
         let record = authorization(10_000, 3);
         let (permit, key) = signed(&record);
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         let mut changed = context(&permit);
@@ -1645,7 +1637,7 @@ mod tests {
             .verify_host_context(&context(&permit), 3_999)
             .unwrap();
 
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.put_permit(&permit, "offline-issue", "agent:test")
             .unwrap();
@@ -1761,7 +1753,7 @@ mod tests {
     fn delegation_is_narrow_policy_named_and_parent_chain_is_live() {
         let record = authorization(10_000, 3);
         let (root, key) = signed(&record);
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.set_external_permit_policy(&permit_policy(), 2_500)
             .unwrap();
@@ -1963,7 +1955,7 @@ mod tests {
         let record = authorization(10_000, 1);
         let (permit, key) = signed(&record);
         assert_eq!(permit.site_id, "local");
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         let redemption = db
@@ -1999,7 +1991,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(permit.site_id, "us-east");
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-us", "agent:test").unwrap();
         let foreign = db.redeem_permit(
@@ -2053,7 +2045,7 @@ mod tests {
         // by clearing and re-signing with explicit local.
         permit.site_id = "local".into();
         permit.sign(&key).unwrap();
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
         db.put_permit(&permit, "issue-legacy", "agent:test")
             .unwrap();

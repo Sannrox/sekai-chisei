@@ -149,7 +149,7 @@ fn map_schema_definition_lifecycle_error(error: SchemaDefinitionLifecycleError) 
 }
 
 pub struct SekaiServiceImpl {
-    pub(super) db: Arc<RuntimeDb>,
+    pub(super) db: crate::db::store::SekaiStore,
     pub(super) security: Arc<SecurityChecker>,
     pub(super) schema_definitions: SchemaDefinitionLifecycle,
     pub(super) budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
@@ -163,18 +163,19 @@ pub struct SekaiServiceImpl {
 }
 
 impl SekaiServiceImpl {
-    pub fn new(db: Arc<RuntimeDb>) -> Self {
+    pub fn new(db: impl Into<crate::db::store::SekaiStore>) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
 
     pub fn new_with_gateway_schema_principals(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::SekaiStore>,
         gateway_schema_principals: Vec<String>,
     ) -> Self {
+        let db = db.into();
         let security = Arc::new(SecurityChecker::new());
         let grants = db.list_all_grants().unwrap_or_default();
         security.load(&grants);
-        let schema_definitions = SchemaDefinitionLifecycle::load(db.clone());
+        let schema_definitions = SchemaDefinitionLifecycle::load(db.runtime_arc());
         let object_query_cursor_key = db
             .object_query_cursor_key()
             .expect("initialize durable object query cursor key");
@@ -197,7 +198,7 @@ impl SekaiServiceImpl {
     /// Construct sharing a chisei budget tracker so governed actions can be
     /// metered against action-class budgets.
     pub fn with_budget(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::SekaiStore>,
         budget: Arc<crate::chisei::budget::BudgetTracker>,
     ) -> Self {
         let mut svc = Self::new(db);
@@ -206,7 +207,7 @@ impl SekaiServiceImpl {
     }
 
     pub fn with_budget_and_gateway_schema_principals(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::SekaiStore>,
         budget: Arc<crate::chisei::budget::BudgetTracker>,
         gateway_schema_principals: Vec<String>,
     ) -> Self {

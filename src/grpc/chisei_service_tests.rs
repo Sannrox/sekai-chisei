@@ -9046,7 +9046,7 @@ async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path(
     // Only evaluate the decision path here — full model execute needs a live
     // provider. The fail-closed refusal is unit-tested below via evaluate.
     let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&db).unwrap();
+    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from(&db)).unwrap();
     let input = ExecutionInput {
         request_id: "incomplete".into(),
         namespace: "acme".into(),
@@ -9082,7 +9082,8 @@ fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
     use crate::sekai::semantic;
 
     let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&db).expect("seed lookup fixtures");
+    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from(&db))
+        .expect("seed lookup fixtures");
     for (capability, spec) in [
         (
             semantic::CAPABILITY_EXPAND_RELATIONS,

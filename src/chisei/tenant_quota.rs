@@ -9,13 +9,11 @@
 //! Quotas never override stricter project/namespace budgets (those remain on
 //! the hierarchical chain). Tenant admission is an additional gate.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 use crate::chisei::budget::{BudgetTracker, PeriodType};
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::enterprise::AuthenticatedContext;
 
 /// In-flight concurrency units reserved while a tenant operation is active.
@@ -109,7 +107,7 @@ pub struct TenantQuotaGate {
 }
 
 impl TenantQuotaGate {
-    pub fn new(db: Arc<RuntimeDb>) -> Self {
+    pub fn new(db: impl Into<ChiseiStore>) -> Self {
         Self {
             tracker: BudgetTracker::new(db),
         }
@@ -323,7 +321,7 @@ mod tests {
     use crate::provider_credentials::tenant_context;
 
     fn gate() -> TenantQuotaGate {
-        TenantQuotaGate::new(Arc::new(RuntimeDb::memory()))
+        TenantQuotaGate::new(ChiseiStore::memory())
     }
 
     fn limits(version: u64) -> TenantQuotaLimits {
