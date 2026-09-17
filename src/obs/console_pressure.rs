@@ -5,6 +5,7 @@
 
 use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus};
 use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::operation_statistics::{self, OperationStatistics};
 use crate::sekai::security::Role;
@@ -159,7 +160,7 @@ pub fn load_pressure_snapshot(
             }
         },
     };
-    let gunshi = match gunshi_auto::get_status(db, namespace) {
+    let gunshi = match gunshi_auto::get_status(&ChiseiStore::from(db), namespace) {
         Ok(Some(status)) => GunshiTiles::from(&status),
         Ok(None) => empty_gunshi(),
         Err(error) => GunshiTiles {
@@ -191,7 +192,7 @@ pub fn apply_kill_switch(
         return Err("namespace write access denied".into());
     }
     gunshi_auto::set_kill_switch(
-        db,
+        &ChiseiStore::from(db),
         principal,
         namespace,
         enabled,
@@ -471,7 +472,15 @@ mod tests {
             maximum_p95_latency_ms: 1_000_000.0,
             maximum_latency_increase_ms: 1_000_000.0,
         };
-        gunshi_auto::install_baseline(db, "root", namespace, snapshot, gate, 1_000).unwrap();
+        gunshi_auto::install_baseline(
+            &ChiseiStore::from(db),
+            "root",
+            namespace,
+            snapshot,
+            gate,
+            1_000,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -3,8 +3,6 @@
 //! External workflow adapters project steps onto ActionInstance admission.
 //! They never evaluate policy, budget, or receipts.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 
 use crate::chisei::budget::BudgetTracker;
@@ -244,7 +242,7 @@ pub fn submit_step(
     if prepared.envelope.cursor != 0 {
         return Err(WORKFLOW_UNAVAILABLE.into());
     }
-    let budget = BudgetTracker::new(Arc::new(db.clone()));
+    let budget = BudgetTracker::new(db.clone());
     let admitted = ActionInstanceAdmission::new(db, Some(&budget))
         .admit(
             ActionInstanceAdmissionRequest {

@@ -9,7 +9,7 @@ use crate::chisei::external_action::{
     self, AuthorizationRecord, ExternalActionDecision, ExternalActionRequest,
 };
 use crate::db::chisei_budget::METRIC_TOKENS;
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
 use std::collections::{BTreeMap, HashMap};
@@ -172,7 +172,7 @@ pub fn budget_scope(request: &ExternalActionRequest) -> String {
     )
 }
 
-pub fn ensure_audit(db: &RuntimeDb, record: &AuthorizationRecord) -> Result<(), String> {
+pub fn ensure_audit(db: &ChiseiStore, record: &AuthorizationRecord) -> Result<(), String> {
     let lifecycle = if record.approval_status.is_empty() {
         record.decision.decision.as_str()
     } else {
@@ -209,7 +209,7 @@ pub fn ensure_audit(db: &RuntimeDb, record: &AuthorizationRecord) -> Result<(), 
 }
 
 pub fn release_reservations(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     budget: &BudgetTracker,
     record: &mut AuthorizationRecord,
 ) -> Result<(), String> {
@@ -237,7 +237,7 @@ pub fn release_reservations(
 }
 
 pub fn persist_released_flags(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     reserved: &AuthorizationRecord,
     released: &AuthorizationRecord,
 ) -> Result<(), String> {
@@ -247,7 +247,11 @@ pub fn persist_released_flags(
     Ok(())
 }
 
-pub fn reclaim_expired(db: &RuntimeDb, budget: &BudgetTracker, now_ms: i64) -> Result<(), String> {
+pub fn reclaim_expired(
+    db: &ChiseiStore,
+    budget: &BudgetTracker,
+    now_ms: i64,
+) -> Result<(), String> {
     for expected in db
         .list_external_action_authorizations()?
         .into_iter()

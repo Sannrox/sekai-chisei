@@ -8,9 +8,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::{KIND_LEARNING, ListFilter};
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
@@ -623,7 +621,7 @@ pub fn recommend_advisory(
 /// Load governed learning objects without bypassing their namespace/status
 /// metadata. Invalid legacy rows are ignored rather than trusted implicitly.
 pub fn load_kioku_evidence(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     operation_class: &str,
 ) -> Result<Vec<KiokuEvidence>, String> {
@@ -1473,7 +1471,7 @@ mod tests {
         use crate::domain::Object;
         use std::collections::HashMap;
 
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "learning-1".into(),
             kind: KIND_LEARNING.into(),

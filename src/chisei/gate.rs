@@ -14,9 +14,7 @@ use crate::chisei::promotion::{
     STATUS_GATE_FAILED, STATUS_GATE_PASSED, STATUS_PROPOSED,
 };
 use crate::chisei::scoring::sampling_suite_id;
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 
 /// Minimum aggregate success rate a template candidate's namespace task history must show to pass
 /// the gate.
@@ -42,7 +40,7 @@ const TEMPLATE_GATE_MIN_TASKS: i32 = 2;
 /// time would leave a window for a concurrent supersede to be silently overwritten.
 pub fn gate_candidate(
     store: &CandidateStore,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     eval: &EvalStore,
     candidate_id: &str,
     tasks: &[TaskRecord],
@@ -116,7 +114,7 @@ pub fn gate_candidate(
 /// itself on a later retry, so treating it as "not enough evidence yet" would leave the candidate
 /// stuck in `proposed` forever, silently re-gated on every tick with no audit trail.
 fn gate_routing_bias(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     eval: &EvalStore,
     candidate: &Candidate,
 ) -> Option<GateDecision> {
@@ -266,15 +264,13 @@ mod tests {
         }
     }
 
-    fn setup() -> (Arc<RuntimeDb>, Arc<EvalStore>, CandidateStore) {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+    fn setup() -> (ChiseiStore, Arc<EvalStore>, CandidateStore) {
+        let db = ChiseiStore::memory();
         (db, Arc::new(EvalStore::new()), CandidateStore::new())
     }
 
     fn observe_batch(
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         namespace: &str,
         task_class: &str,
         base: &str,
@@ -301,7 +297,7 @@ mod tests {
         }
     }
 
-    async fn run_cycle(db: &Arc<RuntimeDb>, eval: &Arc<EvalStore>, score: i32, passed: bool) {
+    async fn run_cycle(db: &ChiseiStore, eval: &Arc<EvalStore>, score: i32, passed: bool) {
         let job = ScoringJob::with_judge(
             db.clone(),
             eval.clone(),
@@ -421,9 +417,7 @@ mod tests {
 
         let decision = gate_candidate(
             &store,
-            &Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(":memory:").unwrap(),
-            ))),
+            &ChiseiStore::memory(),
             &eval,
             &candidates[0].id,
             &tasks,
@@ -464,9 +458,7 @@ mod tests {
 
         let decision = gate_candidate(
             &store,
-            &Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(":memory:").unwrap(),
-            ))),
+            &ChiseiStore::memory(),
             &eval,
             &candidates[0].id,
             &tasks,
@@ -497,9 +489,7 @@ mod tests {
         store.upsert(candidate.clone());
         candidate.status = STATUS_GATE_PASSED.to_string();
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         assert!(gate_candidate(&store, &db, &eval, &candidate.id, &[]).is_none());
     }
 
@@ -525,9 +515,7 @@ mod tests {
         // as gate_passed/gate_failed.
         store.transition(&candidate.id, STATUS_PROPOSED, STATUS_SUPERSEDED);
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         assert!(
             gate_candidate(
                 &store,
@@ -577,9 +565,7 @@ mod tests {
         };
         store.upsert(candidate.clone());
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         assert!(gate_candidate(&store, &db, &eval, &candidate.id, &[]).is_none());
         assert_eq!(store.get(&candidate.id).unwrap().status, STATUS_PROPOSED);
     }
@@ -601,9 +587,7 @@ mod tests {
         };
         store.upsert(candidate.clone());
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         let decision = gate_candidate(&store, &db, &eval, &candidate.id, &[])
             .expect("a corrupt payload must be decided, not left indefinitely proposed");
         assert_eq!(decision.verdict, "fail");
@@ -627,9 +611,7 @@ mod tests {
         };
         store.upsert(candidate.clone());
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         let decision = gate_candidate(&store, &db, &eval, &candidate.id, &[])
             .expect("an unrecognized bias must be rejected, not silently treated as cheap");
         assert_eq!(decision.verdict, "fail");

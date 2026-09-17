@@ -4,9 +4,7 @@ use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
 use crate::chisei::policy::{
     ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
 };
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
 use crate::sekai::evidence::EvidenceClassification;
@@ -368,7 +366,7 @@ fn normalize_identifier(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn resolve_context_objects(req: &PipelineRequest, db: &RuntimeDb) -> Vec<crate::domain::Object> {
+fn resolve_context_objects(req: &PipelineRequest, db: &ChiseiStore) -> Vec<crate::domain::Object> {
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
     for (kind, value) in extract_object_context_refs(&req.namespace, &req.spec) {
@@ -386,7 +384,7 @@ fn resolve_context_objects(req: &PipelineRequest, db: &RuntimeDb) -> Vec<crate::
     objects
 }
 
-fn context_object_authorized(req: &PipelineRequest, db: &RuntimeDb, object: &Object) -> bool {
+fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &Object) -> bool {
     // Direct in-process pipeline users are trusted and historically omit an
     // actor. Network entry points always populate this from authenticated metadata.
     if req.memory_actor.is_empty() || matches!(req.memory_actor.as_str(), "root" | "local") {
@@ -450,7 +448,7 @@ fn safe_evidence_scalar(value: &serde_json::Value) -> Option<String> {
 
 fn collect_external_evidence_context(
     req: &mut PipelineRequest,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     target_object_ids: &[String],
 ) -> Vec<String> {
     const DISCLOSABLE_FIELDS: [&str; 5] = ["status", "result", "outcome", "state", "value"];
@@ -533,7 +531,7 @@ fn collect_external_evidence_context(
 
 pub fn applicable_evidence_classes(
     req: &PipelineRequest,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<Vec<EvidenceContextClass>, String> {
     let target_object_ids = resolve_context_objects(req, db)
         .into_iter()
@@ -554,7 +552,7 @@ pub fn applicable_evidence_classes(
     })
 }
 
-fn object_implements(db: &RuntimeDb, obj: &Object, interface_name: &str) -> bool {
+fn object_implements(db: &ChiseiStore, obj: &Object, interface_name: &str) -> bool {
     db.get_object_type(&obj.kind)
         .ok()
         .flatten()
@@ -566,13 +564,13 @@ fn object_implements(db: &RuntimeDb, obj: &Object, interface_name: &str) -> bool
         })
 }
 
-fn is_evaluable_context(db: &RuntimeDb, obj: &Object) -> bool {
+fn is_evaluable_context(db: &ChiseiStore, obj: &Object) -> bool {
     obj.kind == KIND_COMPONENT
         || object_implements(db, obj, INTERFACE_EVALUABLE)
         || object_implements(db, obj, INTERFACE_RISK_SCORED)
 }
 
-fn is_degraded_evaluable(db: &RuntimeDb, obj: &Object, max_success_rate: i32) -> bool {
+fn is_degraded_evaluable(db: &ChiseiStore, obj: &Object, max_success_rate: i32) -> bool {
     is_evaluable_context(db, obj)
         && obj
             .properties
@@ -596,7 +594,7 @@ fn risk_score_value(obj: &Object) -> Option<f64> {
 }
 
 fn filter_context_property(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     type_cache: &mut HashMap<String, Option<ObjectType>>,
     obj: &Object,
     field: &str,
@@ -612,7 +610,7 @@ fn filter_context_property(
 fn collect_related_verdict_context(
     req: &mut PipelineRequest,
     obj: &Object,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     external_egress: bool,
 ) -> (Vec<String>, Vec<egress::ContextEgressRecord>) {
     let mut lines = Vec::new();
@@ -695,14 +693,14 @@ impl Step for ObjectContextEnrichStep {
         "object_context_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         run_object_context_enrich(req, db, false)
     }
 
     fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         context_expansion_allowed: bool,
     ) -> StepDecision {
         run_object_context_enrich(req, db, context_expansion_allowed)
@@ -711,7 +709,7 @@ impl Step for ObjectContextEnrichStep {
 
 fn run_object_context_enrich(
     req: &mut PipelineRequest,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     context_expansion_allowed: bool,
 ) -> StepDecision {
     if req.template_only {
@@ -1018,12 +1016,12 @@ mod object_context_tests {
 
 pub trait Step: Send + Sync {
     fn name(&self) -> &str;
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision;
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision;
 
     fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         _context_expansion_allowed: bool,
     ) -> StepDecision {
         self.run(req, db)
@@ -1039,7 +1037,7 @@ impl Pipeline {
         Self { steps }
     }
 
-    pub fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> RunResult {
+    pub fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> RunResult {
         self.run_with_context_expansion(req, db, false)
     }
 
@@ -1048,7 +1046,7 @@ impl Pipeline {
     pub fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         context_expansion_allowed: bool,
     ) -> RunResult {
         self.run_with_context_admission(req, db, context_expansion_allowed, HashSet::new())
@@ -1057,7 +1055,7 @@ impl Pipeline {
     pub fn run_with_context_admission(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         context_expansion_allowed: bool,
         allowed_evidence_classes: HashSet<EvidenceContextClass>,
     ) -> RunResult {
@@ -1110,14 +1108,14 @@ impl Step for KiokuEnrichStep {
         "kioku_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         run_kioku_enrich(req, db, false)
     }
 
     fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         context_expansion_allowed: bool,
     ) -> StepDecision {
         run_kioku_enrich(req, db, context_expansion_allowed)
@@ -1126,7 +1124,7 @@ impl Step for KiokuEnrichStep {
 
 fn run_kioku_enrich(
     req: &mut PipelineRequest,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     context_expansion_allowed: bool,
 ) -> StepDecision {
     if req.template_only {
@@ -1425,14 +1423,14 @@ impl Step for LearningsEnrichStep {
         "learnings_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         run_learnings_enrich(req, db, false)
     }
 
     fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         context_expansion_allowed: bool,
     ) -> StepDecision {
         run_learnings_enrich(req, db, context_expansion_allowed)
@@ -1441,7 +1439,7 @@ impl Step for LearningsEnrichStep {
 
 fn run_learnings_enrich(
     req: &mut PipelineRequest,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     context_expansion_allowed: bool,
 ) -> StepDecision {
     if req.template_only {
@@ -1570,7 +1568,7 @@ impl Step for SpecEnrichStep {
         "spec_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         if req.template_only {
             return StepDecision {
                 step: String::new(),
@@ -1700,7 +1698,7 @@ impl Step for RiskStep {
         "risk_gate"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         if req.risk_score_ready {
             return risk_step_decision(&req.risk_signals, req.risk_score);
         }
@@ -1820,7 +1818,7 @@ impl Step for RiskStep {
     }
 }
 
-fn raw_risk_score(req: &PipelineRequest, db: &RuntimeDb) -> f64 {
+fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
     let mut risk = 0.0f64;
     let snapshots = capacity::latest_snapshots(db, 24).unwrap_or_default();
     if snapshots.len() >= 3 {
@@ -1909,7 +1907,7 @@ impl Step for ComplexityRouteStep {
         "complexity_route"
     }
 
-    fn run(&self, req: &mut PipelineRequest, _db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
         let action = match complexity_class(req) {
             Some("cheap") => Some((
                 "cheap",
@@ -1948,7 +1946,7 @@ impl Step for ModelSelectStep {
         "model_select"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
         if !req.model.is_empty() {
             return StepDecision {
                 step: String::new(),
@@ -1988,7 +1986,7 @@ impl Step for ReviewPolicyStep {
         "review_policy"
     }
 
-    fn run(&self, req: &mut PipelineRequest, _db: &RuntimeDb) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
         let mut max_cycles = if req.risk_score >= 0.5 { 4 } else { 2 };
         max_cycles += if req.spec.split_whitespace().count() > 80 {
             1
@@ -2122,7 +2120,7 @@ mod tests {
     }
 
     fn register_object_type(
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         kind: &str,
         implements: Vec<&str>,
         properties: Vec<PropertyDef>,
@@ -2170,7 +2168,7 @@ mod tests {
 
     #[test]
     fn kioku_enrichment_is_eval_gated_scoped_and_side_effect_free() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         for object in [
             Object {
                 id: "namespace-payments".into(),
@@ -2424,7 +2422,7 @@ mod tests {
         assert!(reassessed_rendered.contains("evidence: supporting=1 contradicting=0"));
     }
 
-    fn configure_evidence(db: &RuntimeDb) {
+    fn configure_evidence(db: &ChiseiStore) {
         db.upsert_evidence_producer(
             &EvidenceProducerCapability {
                 producer_identity: "producer:checks".into(),
@@ -2475,7 +2473,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn project_evidence(
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         record: &str,
         evidence_type: &str,
         source_version: &str,
@@ -2526,7 +2524,7 @@ mod tests {
 
     #[test]
     fn governed_evidence_is_gated_filtered_and_version_pinned() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         configure_evidence(&db);
         db.create_object(&Object {
             id: "service-payments".into(),
@@ -2663,7 +2661,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_runs_all_steps() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let p = default_pipeline();
         let mut req = make_req();
         let result = p.run(&mut req, &db);
@@ -2675,7 +2673,7 @@ mod tests {
 
     #[test]
     fn test_context_expansion_allows_linked_learnings() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "r1".into(),
             kind: "component".into(),
@@ -2736,7 +2734,7 @@ mod tests {
 
     #[test]
     fn test_direct_context_survives_default_denied_expansion() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let created = chrono::Utc::now().timestamp_millis();
         db.create_object(&Object {
             id: "ticker-aapl".into(),
@@ -2857,7 +2855,7 @@ mod tests {
 
     #[test]
     fn test_object_context_uses_risk_scored_interface() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -2902,7 +2900,7 @@ mod tests {
 
     #[test]
     fn test_object_context_prefers_schema_classification_over_legacy_allowlist() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -2950,7 +2948,7 @@ mod tests {
 
     #[test]
     fn test_object_context_denies_unlabelled_properties() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -2981,7 +2979,7 @@ mod tests {
 
     #[test]
     fn context_admission_holds_unknown_and_explicitly_qualifies_it() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "asset-admission".into(),
             kind: "asset".into(),
@@ -3043,7 +3041,7 @@ mod tests {
 
     #[test]
     fn context_admission_holdout_excludes_risk_from_routing_inputs() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3080,7 +3078,7 @@ mod tests {
 
     #[test]
     fn context_admission_operation_risk_sees_the_prepass_score() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3127,7 +3125,7 @@ mod tests {
 
     #[test]
     fn test_local_object_context_allows_unlabelled_properties() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "asset-local".into(),
             kind: "asset".into(),
@@ -3160,7 +3158,7 @@ mod tests {
 
     #[test]
     fn test_object_context_includes_identity_only_when_allowed() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -3186,7 +3184,7 @@ mod tests {
 
     #[test]
     fn test_learning_context_requires_explicit_allowed_fields() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "component-service".into(),
             kind: "component".into(),
@@ -3230,7 +3228,7 @@ mod tests {
 
     #[test]
     fn test_degraded_component_hint_requires_allowed_task_total() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "namespace-alpha".into(),
             kind: "namespace".into(),
@@ -3284,7 +3282,7 @@ mod tests {
 
     #[test]
     fn test_interface_backed_object_participates_in_degraded_routing() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3345,7 +3343,7 @@ mod tests {
 
     #[test]
     fn test_redacted_interface_degradation_hint_uses_generic_label() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3412,7 +3410,7 @@ mod tests {
 
     #[test]
     fn test_risk_scored_routing_respects_egress_policy() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3495,7 +3493,7 @@ mod tests {
 
     #[test]
     fn test_direct_risk_scored_context_raises_pipeline_risk() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         register_object_type(
             &db,
             "service",
@@ -3533,7 +3531,7 @@ mod tests {
 
     #[test]
     fn test_context_expansion_allows_related_verdict_context() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "asset-local".into(),
             kind: "asset".into(),
@@ -3579,7 +3577,7 @@ mod tests {
 
     #[test]
     fn authenticated_context_never_crosses_namespace_or_object_acl() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let mut object = Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -3645,7 +3643,7 @@ mod tests {
 
     #[test]
     fn test_review_policy_extracted() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let p = default_pipeline();
         let mut req = make_req();
         req.risk_score = 0.6;

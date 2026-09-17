@@ -3,9 +3,7 @@ use crate::chisei::gunshi::{
     compare_advisory, score_advisory_comparisons,
 };
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::audit::Decision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,7 +28,7 @@ pub struct GunshiFeedbackRecord {
 }
 
 pub fn record_issued_recommendations(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     issuance_id: &str,
     request_digest: &str,
@@ -114,7 +112,7 @@ pub fn record_issued_recommendations(
 }
 
 pub fn record_feedback(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     issuance_id: &str,
     plan: &AllocationPlan,
@@ -217,7 +215,7 @@ fn feedback_decisions_equivalent(existing: &Decision, requested: &Decision) -> b
 }
 
 pub fn require_issued_plan(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     issuance_id: &str,
     plan: &AllocationPlan,
 ) -> Result<Decision, String> {
@@ -334,7 +332,7 @@ fn receipted_metric(
     Ok((total, found))
 }
 
-pub fn advisory_scorecard(db: &RuntimeDb, namespace: &str) -> Result<AdvisoryScorecard, String> {
+pub fn advisory_scorecard(db: &ChiseiStore, namespace: &str) -> Result<AdvisoryScorecard, String> {
     required("scorecard namespace", namespace)?;
     let choices = feedback_decisions(db, CHOICE_ACTION, namespace)?;
     let outcomes = feedback_decisions(db, OUTCOME_ACTION, namespace)?
@@ -368,7 +366,7 @@ pub fn advisory_scorecard(db: &RuntimeDb, namespace: &str) -> Result<AdvisorySco
 }
 
 fn feedback_decisions(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     action: &str,
     namespace: &str,
 ) -> Result<Vec<Decision>, String> {
@@ -446,7 +444,7 @@ fn record_id(kind: &str, namespace: &str, allocation_id: &str, issuance_id: &str
 
 /// Load a stored operator-choice feedback record by issuance and allocation.
 pub fn load_choice_feedback(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     allocation_id: &str,
     issuance_id: &str,
@@ -556,12 +554,12 @@ mod tests {
         );
     }
 
-    fn persist_receipt(db: &RuntimeDb, plan: &AllocationPlan) {
+    fn persist_receipt(db: &ChiseiStore, plan: &AllocationPlan) {
         persist_receipt_as(db, plan, &plan.operation_id, false);
     }
 
     fn persist_receipt_as(
-        db: &RuntimeDb,
+        db: &ChiseiStore,
         plan: &AllocationPlan,
         receipt_operation_id: &str,
         include_logical_operation_id: bool,
@@ -626,7 +624,7 @@ mod tests {
 
     #[test]
     fn outcome_feedback_accepts_a_native_receipt_bound_by_logical_operation_id() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let plan = plan();
         let choice = choice(&plan);
         record_issued_recommendations(
@@ -669,7 +667,7 @@ mod tests {
 
     #[test]
     fn choices_and_outcomes_are_idempotent_and_scoreable() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let plan = plan();
         let choice = choice(&plan);
         record_issued_recommendations(
@@ -774,7 +772,7 @@ mod tests {
 
     #[test]
     fn conflicting_feedback_and_predecision_outcomes_are_rejected() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = ChiseiStore::memory();
         let plan = plan();
         let choice = choice(&plan);
         record_issued_recommendations(

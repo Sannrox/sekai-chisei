@@ -9,6 +9,7 @@ use sekai_chisei::chisei::eval::{CaseResult, EvalStore, Run};
 use sekai_chisei::chisei::evolve::TaskRecord;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
+use sekai_chisei::db::store::ChiseiStore;
 
 fn observation(
     id: &str,
@@ -61,6 +62,7 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
     let db = RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").expect("open in-memory database"),
     ));
+    let store = ChiseiStore::from(&db);
     let observations = vec![
         observation("task-1", "done", &["comment", "invented"], 1),
         observation("task-2", "done", &["comment"], 2),
@@ -79,14 +81,14 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
 
     assert_eq!(proposal.allowed_action_types, ["comment"]);
     assert!(
-        list_capability_versions(&db, "acme", "code review")
+        list_capability_versions(&store, "acme", "code review")
             .expect("list capability versions")
             .is_empty(),
         "authoring must not persist or launch a capability"
     );
 
     review_capability_proposal(
-        &db,
+        &store,
         &mut proposal,
         "human:reviewer",
         true,
@@ -101,7 +103,7 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
     changed_eval.create_run(passing_run(&changed_after_review));
     assert_eq!(
         gate_capability_proposal(
-            &db,
+            &store,
             &changed_eval,
             &mut changed_after_review,
             "capability-integration-run",
@@ -115,7 +117,7 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
     let eval = EvalStore::new();
     eval.create_run(passing_run(&proposal));
     let authorization = gate_capability_proposal(
-        &db,
+        &store,
         &eval,
         &mut proposal,
         "capability-integration-run",
@@ -126,7 +128,7 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
     .expect("passing seed suite should authorize launch");
 
     let launch_error = register_capability(
-        &db,
+        &store,
         &approved_but_ungated,
         &authorization,
         "human:registrar",
@@ -140,13 +142,13 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
         )
     );
     assert!(
-        list_capability_versions(&db, "acme", "code review")
+        list_capability_versions(&store, "acme", "code review")
             .expect("list capability versions")
             .is_empty(),
         "an ungated launch attempt must not persist a capability"
     );
 
-    let registered = register_capability(&db, &proposal, &authorization, "human:registrar", 40)
+    let registered = register_capability(&store, &proposal, &authorization, "human:registrar", 40)
         .expect("register reviewed and gated capability");
     assert_eq!(registered.version, 1);
     assert_eq!(registered.proposal.id, proposal.id);

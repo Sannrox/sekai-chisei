@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use base64::Engine as _;
 use tonic::Status;
@@ -8,7 +7,7 @@ use crate::chisei::kioku::{
     HumanMemoryReview, HumanReviewAction, KiokuCandidateCursor, KiokuEvidenceBasis,
     KiokuEvidenceLink, KiokuEvidenceReassessmentRequest, KiokuMemory, MemoryLifecycleEvent,
 };
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 
 const CANDIDATE_PAGE_SIZE: usize = 100;
 const MAX_CANDIDATE_PAGES: usize = 4;
@@ -55,12 +54,12 @@ pub(super) struct CandidateReviewOutcome {
 }
 
 pub(super) struct KiokuCandidateGovernance {
-    db: Arc<RuntimeDb>,
+    db: ChiseiStore,
 }
 
 impl KiokuCandidateGovernance {
-    pub fn new(db: Arc<RuntimeDb>) -> Self {
-        Self { db }
+    pub fn new(db: impl Into<ChiseiStore>) -> Self {
+        Self { db: db.into() }
     }
 
     pub fn decode_cursor(

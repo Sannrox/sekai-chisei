@@ -15,7 +15,7 @@
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::Object;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::compute;
@@ -404,7 +404,7 @@ fn validate_gate_namespace(namespace: &str) -> Result<(), String> {
 /// Execute the v1 gate without contacting a provider or mutating policy.
 pub fn run_lookup_promotion_gate(
     suite: &LookupPromotionGateSuite,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupPromotionGateReport, String> {
     validate_lookup_promotion_gate_suite(suite)?;
     let cases = suite
@@ -452,7 +452,7 @@ pub fn lookup_promotion_suite_digest(suite: &LookupPromotionGateSuite) -> Result
 /// Persist only bounded, secret-free gate evidence. The suite and golden answers
 /// remain operator-owned artifacts; the audit stores their digest and case-result digest.
 pub fn record_lookup_promotion_gate(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     report: &LookupPromotionGateReport,
 ) -> Result<String, String> {
@@ -515,7 +515,7 @@ pub fn try_lookup_first(
     namespace: &str,
     actor: &str,
     structured_input_json: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let capability = capability.trim();
     if !is_lookup_first_capability(capability) {
@@ -674,7 +674,7 @@ fn try_expand_relations(
     namespace: &str,
     actor: &str,
     structured_input_json: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let capability = semantic::CAPABILITY_EXPAND_RELATIONS;
     let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
@@ -714,7 +714,7 @@ fn try_retrieve_context(
     namespace: &str,
     actor: &str,
     structured_input_json: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let capability = semantic::CAPABILITY_RETRIEVE_CONTEXT;
     let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
@@ -760,7 +760,7 @@ fn try_explain_derivation(
     namespace: &str,
     actor: &str,
     structured_input_json: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let capability = semantic::CAPABILITY_EXPLAIN_DERIVATION;
     let input = match parse_retrieval_input(capability, namespace, structured_input_json) {
@@ -836,7 +836,7 @@ fn is_reserved_governance_kind(kind: &str) -> bool {
 fn run_lookup_retrieval(
     namespace: &str,
     actor: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     mut query: RetrievalQuery,
 ) -> Result<retrieval::RetrievalResult, RetrievalLookupError> {
     let started = Instant::now();
@@ -905,7 +905,7 @@ fn preflight_root_access(
     roots: &[RetrievalRoot],
     namespace: &str,
     principals: &[String],
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<Option<&'static str>, String> {
     for root in roots {
         let objects = match root {
@@ -942,7 +942,7 @@ fn explain_target_is_authorized(
     target: &RetrievalRoot,
     namespace: &str,
     principals: &[String],
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<bool, String> {
     let objects = match target {
         RetrievalRoot::Object(id) => db.get_object(id)?.into_iter().collect::<Vec<_>>(),
@@ -971,7 +971,7 @@ fn explain_target_is_authorized(
 }
 
 fn lookup_ontology_snapshot(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     principals: &[String],
     query: &RetrievalQuery,
     started: Instant,
@@ -1234,7 +1234,7 @@ fn try_resolve_ref(
     namespace: &str,
     actor: &str,
     structured_input_json: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let input: ResolveRefInput = match serde_json::from_str(structured_input_json) {
         Ok(value) => value,
@@ -1272,7 +1272,7 @@ fn resolve_object_ref(
     namespace: &str,
     actor: &str,
     input: &ResolveRefInput,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let object = if !input.object_id.trim().is_empty() {
         db.get_object(input.object_id.trim())?
@@ -1331,7 +1331,7 @@ fn resolve_ontology_class(
     namespace: &str,
     actor: &str,
     class_name: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let Some(class) = db.get_ontology_class(class_name)? else {
         return Ok(LookupDecision::Refusal {
@@ -1373,7 +1373,7 @@ fn resolve_ontology_relation(
     namespace: &str,
     actor: &str,
     relation_name: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let Some(relation) = db.get_ontology_relation(relation_name)? else {
         return Ok(LookupDecision::Refusal {
@@ -1415,14 +1415,14 @@ fn resolve_ontology_relation(
 
 /// Object is readable when unrestricted (no grants) or the actor holds a grant.
 /// Privileged local/root actors always pass, matching control-plane conventions.
-fn object_readable(object: &Object, actor: &str, db: &RuntimeDb) -> Result<bool, String> {
+fn object_readable(object: &Object, actor: &str, db: &ChiseiStore) -> Result<bool, String> {
     if matches!(actor, "root" | "local") {
         return Ok(true);
     }
     id_readable(&object.id, actor, db)
 }
 
-fn id_readable(object_id: &str, actor: &str, db: &RuntimeDb) -> Result<bool, String> {
+fn id_readable(object_id: &str, actor: &str, db: &ChiseiStore) -> Result<bool, String> {
     if matches!(actor, "root" | "local") {
         return Ok(true);
     }
@@ -1436,7 +1436,7 @@ fn id_readable(object_id: &str, actor: &str, db: &RuntimeDb) -> Result<bool, Str
 fn id_readable_for_principals(
     object_id: &str,
     principals: &[String],
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<bool, String> {
     if principals
         .iter()
@@ -1456,7 +1456,7 @@ fn id_readable_for_principals(
 fn lookup_object_readable(
     object: &Object,
     principals: &[String],
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<bool, String> {
     if !id_readable_for_principals(&object.id, principals, db)?
         || is_reserved_governance_kind(&object.kind)
@@ -1483,7 +1483,7 @@ fn lookup_object_readable(
 
 fn lookup_principal_authority(
     actor: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<markings::PrincipalAuthority, String> {
     if let Some(trusted) = markings::trusted_service_authority(actor) {
         return Ok(trusted);
@@ -1514,7 +1514,7 @@ fn redact_lookup_object(
     object: &Object,
     principals: &[String],
     namespace: &str,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<Object, String> {
     let mut schema_registry = SchemaRegistry::new();
     if let Some(object_type) = db.get_object_type(&object.kind)? {
@@ -1566,7 +1566,7 @@ fn redact_lookup_object(
 pub fn run_fixture_suite(
     suite_name: &str,
     cases: &[LookupFixtureCase],
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> LookupFixtureSuiteReport {
     let mut report = LookupFixtureSuiteReport {
         suite: suite_name.into(),
@@ -2075,7 +2075,7 @@ fn s2_explain_negative_golden_answer() -> Value {
 }
 
 /// Seed the graph state required by [`s1_fixture_cases`].
-pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
+pub fn seed_s1_fixture_graph(db: &ChiseiStore) -> Result<(), String> {
     use crate::domain::{Link, Object};
     use crate::sekai::security::{Grant, Role};
     use std::collections::HashMap;
@@ -2152,7 +2152,7 @@ pub fn seed_s1_fixture_graph(db: &RuntimeDb) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::runtime_db::RuntimeDb;
+    use crate::db::store::ChiseiStore;
 
     #[test]
     fn allowlist_matches_151_surfaces_only() {
@@ -2172,7 +2172,7 @@ mod tests {
 
     #[test]
     fn s1_fixture_suite_hit_incomplete_and_cross_namespace() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let report = run_fixture_suite("s1-lookup-first", &s1_fixture_cases(), &db);
         assert_eq!(report.failed, 0, "{report:?}");
@@ -2208,7 +2208,7 @@ mod tests {
 
     #[test]
     fn s2_fixture_suite_covers_hits_and_fail_closed_paths() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let report = run_fixture_suite("s2-lookup-first", &s2_fixture_cases(), &db);
         assert_eq!(report.failed, 0, "{report:?}");
@@ -2220,7 +2220,7 @@ mod tests {
 
     #[test]
     fn s2_answers_match_native_retrieval_shapes_and_zero_provider_fields() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
 
         let expand = try_lookup_first(
@@ -2287,7 +2287,7 @@ mod tests {
 
     #[test]
     fn explain_complete_negative_is_a_structured_lookup_hit() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let decision = try_lookup_first(
             semantic::CAPABILITY_EXPLAIN_DERIVATION,
@@ -2309,7 +2309,7 @@ mod tests {
 
     #[test]
     fn s2_rejects_unknown_and_capability_crossed_fields() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         for (capability, spec) in [
             (
@@ -2334,7 +2334,7 @@ mod tests {
 
     #[test]
     fn full_hit_has_zero_provider_token_fields_in_answer_envelope() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let decision = try_lookup_first(
             semantic::CAPABILITY_RESOLVE_REF,
@@ -2357,7 +2357,7 @@ mod tests {
 
     #[test]
     fn dual_run_shadow_flags_structural_mismatch() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let mut cases = s1_fixture_cases();
         cases[0].shadow_model_answer = Some(json!({"resolved": false, "wrong": true}));
@@ -2435,7 +2435,7 @@ mod tests {
 
     #[test]
     fn lookup_promotion_gate_passes_and_records_bounded_audit() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let suite = promotion_suite_from_fixture_cases(s1_fixture_cases());
         let report = run_lookup_promotion_gate(&suite, &db).expect("gate");
@@ -2455,7 +2455,7 @@ mod tests {
     fn checked_in_lookup_promotion_suite_executes_offline() {
         let raw = include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json");
         let suite = parse_lookup_promotion_gate_suite(raw).expect("promotion gate fixture");
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let report = run_lookup_promotion_gate(&suite, &db).expect("offline gate");
         assert_eq!(report.verdict, "allow", "{report:?}");
@@ -2465,7 +2465,7 @@ mod tests {
 
     #[test]
     fn lookup_promotion_gate_denies_on_golden_mismatch_without_policy_effect() {
-        let db = RuntimeDb::memory();
+        let db = ChiseiStore::memory();
         seed_s1_fixture_graph(&db).expect("seed");
         let mut cases = s1_fixture_cases();
         cases[0].expected_answer = Some(json!({"resolved": false}));
