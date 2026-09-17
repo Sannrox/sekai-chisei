@@ -62,3 +62,6 @@ digest is unchanged; identical re-register leaves the generation in place.
 plans and fails closed on mismatch. Hidden rows stay out of members,
 aggregates, and hop edges. Aggregate evaluates project only the group_by,
 numeric, filter, and nested-loop join properties needed for the plan.
+Indexed property filters (`eq`/`gt`/`gte`/`lt`/`lte`) are applied in SQL
+against the stored member JSON so evaluate does not deserialize every
+kind row before matching.

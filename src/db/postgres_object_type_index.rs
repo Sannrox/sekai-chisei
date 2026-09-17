@@ -238,15 +238,23 @@ impl PostgresDb {
         query: &RowQuery,
         needed: Option<&[String]>,
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        let (filter_sql, filter_values) = crate::sekai::object_type_index::member_filter_sql(
+            crate::sekai::object_type_index::IndexSqlDialect::Postgres,
+            &query.filters,
+        )?;
+        let sql = format!(
+            "SELECT source_key, object_id, properties, content_hash, from_edit
+             FROM sekai_object_type_index_member
+             WHERE namespace=$1 AND kind=$2 AND hidden=FALSE{filter_sql}
+             ORDER BY source_key"
+        );
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&namespace, &kind];
+        for value in &filter_values {
+            params.push(value);
+        }
         let rows = self
             .connection()?
-            .query(
-                "SELECT source_key, object_id, properties, content_hash, from_edit
-                 FROM sekai_object_type_index_member
-                 WHERE namespace=$1 AND kind=$2 AND hidden=FALSE
-                 ORDER BY source_key",
-                &[&namespace, &kind],
-            )
+            .query(&sql, params.as_slice())
             .map_err(|error| error.to_string())?;
         let mut members = Vec::new();
         let mut skipped = 0i32;

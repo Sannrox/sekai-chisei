@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Indexed EvaluateObjectSet filters push eq/gt/gte/lt/lte onto stored member
+  JSON in SQL (#966). Non-matching kind rows are excluded before the full
+  property map is decoded. Unknown operators fail closed.
 - Object-log dual-read fails closed when the tagged evaluate API cannot
   witness the SQL answer: `group_by` buckets, path multiplicity, or a
   non-i64/missing sum (#965). Vacuous root-count/sum matches no longer
