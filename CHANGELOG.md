@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hop-projection evaluate walks join-table edges instead of rematerializing
+  every hop and re-hashing child properties (#949). Intermediate hops load
+  source_key/object_id only; full member JSON is fetched at the leaf.
 - Multi-hop `EvaluateObjectSet` defaults to hop-projection (#948). Nested-loop
   remains an explicit debug engine (`SEKAI_OBJECT_INDEX_ENGINE=nested-loop`).
   Unready or stale join generations still fail closed.

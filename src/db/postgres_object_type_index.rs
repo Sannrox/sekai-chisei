@@ -580,6 +580,43 @@ impl PostgresDb {
             .collect()
     }
 
+    pub fn list_index_member_idents(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in keys.chunks(400) {
+                out.extend(self.list_index_member_idents(namespace, kind, chunk)?);
+            }
+            return Ok(out);
+        }
+        let placeholders = (0..keys.len())
+            .map(|index| format!("${}", index + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT source_key, object_id
+             FROM sekai_object_type_index_member
+             WHERE namespace=$1 AND kind=$2 AND hidden=FALSE AND source_key IN ({placeholders})"
+        );
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&namespace, &kind];
+        for key in keys {
+            params.push(key);
+        }
+        self.connection()?
+            .query(&sql, params.as_slice())
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| Ok((row.get(0), row.get(1))))
+            .collect()
+    }
+
     fn mark_index_quarantined(
         &self,
         namespace: &str,

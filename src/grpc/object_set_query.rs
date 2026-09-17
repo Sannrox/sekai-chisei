@@ -345,11 +345,21 @@ impl SekaiServiceImpl {
         roots: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
         meter: &mut crate::sekai::object_set::CostMeter,
     ) -> Result<Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>>, Status> {
-        let mut current: Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>> =
-            roots.iter().cloned().map(|member| vec![member]).collect();
-        for hop in hops {
+        let mut key_paths: Vec<Vec<crate::sekai::object_index_engine::HopKey>> = roots
+            .iter()
+            .map(|member| {
+                vec![crate::sekai::object_index_engine::HopKey::from_member(
+                    member,
+                )]
+            })
+            .collect();
+        let mut leaf_members: std::collections::HashMap<
+            String,
+            crate::sekai::object_type_index::ObjectTypeIndexMember,
+        > = std::collections::HashMap::new();
+        for (hop_index, hop) in hops.iter().enumerate() {
             let mut parent_keys = std::collections::HashSet::new();
-            for path in &current {
+            for path in &key_paths {
                 let parent = path.last().expect("path");
                 parent_keys.insert(parent.source_key.clone());
                 parent_keys.insert(parent.object_id.clone());
@@ -365,30 +375,96 @@ impl SekaiServiceImpl {
                 )
                 .map_err(Status::internal)?;
             let mut child_keys = std::collections::HashSet::new();
-            for (_, source_key) in pairs {
-                child_keys.insert(source_key);
+            for (_, source_key) in &pairs {
+                child_keys.insert(source_key.clone());
             }
             let child_keys: Vec<String> = child_keys.into_iter().collect();
-            let children = self
-                .db
-                .list_index_members_by_keys(&bound.descriptor.namespace, &hop.far_kind, &child_keys)
-                .map_err(Status::internal)?;
+            let last = hop_index + 1 == hops.len();
+            let child_by_key = if last {
+                let children = self
+                    .db
+                    .list_index_members_by_keys(
+                        &bound.descriptor.namespace,
+                        &hop.far_kind,
+                        &child_keys,
+                    )
+                    .map_err(Status::internal)?;
+                meter
+                    .charge(children.len() as i32)
+                    .map_err(map_object_set_error)?;
+                let mut by_key = std::collections::HashMap::new();
+                for member in children {
+                    by_key.insert(
+                        member.source_key.clone(),
+                        crate::sekai::object_index_engine::HopKey::from_member(&member),
+                    );
+                    leaf_members.insert(member.source_key.clone(), member);
+                }
+                by_key
+            } else {
+                let idents = self
+                    .db
+                    .list_index_member_idents(
+                        &bound.descriptor.namespace,
+                        &hop.far_kind,
+                        &child_keys,
+                    )
+                    .map_err(Status::internal)?;
+                meter
+                    .charge(idents.len() as i32)
+                    .map_err(map_object_set_error)?;
+                idents
+                    .into_iter()
+                    .map(|(source_key, object_id)| {
+                        (
+                            source_key.clone(),
+                            crate::sekai::object_index_engine::HopKey {
+                                kind: hop.far_kind.clone(),
+                                source_key,
+                                object_id,
+                            },
+                        )
+                    })
+                    .collect()
+            };
+            key_paths =
+                crate::sekai::object_index_engine::join_key_paths(key_paths, &pairs, &child_by_key);
             meter
-                .charge(children.len() as i32)
-                .map_err(map_object_set_error)?;
-            current = crate::sekai::object_index_engine::join_paths_hash(
-                current.iter().map(|path| path.iter().collect()).collect(),
-                &children,
-                &hop.join_property,
-            )
-            .into_iter()
-            .map(|path| path.into_iter().cloned().collect())
-            .collect();
-            meter
-                .charge(current.len() as i32)
+                .charge(key_paths.len() as i32)
                 .map_err(map_object_set_error)?;
         }
-        Ok(current)
+        let roots_by_key: std::collections::HashMap<
+            &str,
+            &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        > = roots
+            .iter()
+            .map(|member| (member.source_key.as_str(), member))
+            .collect();
+        Ok(key_paths
+            .into_iter()
+            .map(|path| {
+                let last = path.len().saturating_sub(1);
+                path.into_iter()
+                    .enumerate()
+                    .map(|(index, key)| {
+                        if index == 0 {
+                            roots_by_key
+                                .get(key.source_key.as_str())
+                                .copied()
+                                .cloned()
+                                .unwrap_or_else(|| key.stub_member())
+                        } else if index == last {
+                            leaf_members
+                                .get(&key.source_key)
+                                .cloned()
+                                .unwrap_or_else(|| key.stub_member())
+                        } else {
+                            key.stub_member()
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     fn evaluate_aggregated_object_set(

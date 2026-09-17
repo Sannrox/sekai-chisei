@@ -114,6 +114,73 @@ pub fn join_paths_hash<'a>(
     next
 }
 
+/// Parent/child identity used to walk the join-key projection without
+/// inspecting child property maps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopKey {
+    pub kind: String,
+    pub source_key: String,
+    pub object_id: String,
+}
+
+impl HopKey {
+    pub fn from_member(member: &ObjectTypeIndexMember) -> Self {
+        Self {
+            kind: member.kind.clone(),
+            source_key: member.source_key.clone(),
+            object_id: member.object_id.clone(),
+        }
+    }
+
+    pub fn stub_member(&self) -> ObjectTypeIndexMember {
+        ObjectTypeIndexMember {
+            kind: self.kind.clone(),
+            source_key: self.source_key.clone(),
+            object_id: self.object_id.clone(),
+            ..ObjectTypeIndexMember::default()
+        }
+    }
+}
+
+/// Extend key paths from join-table edges `(parent_value, child_source_key)`.
+/// Child identity comes from `child_by_key`; child properties are not read.
+pub fn join_key_paths(
+    paths: Vec<Vec<HopKey>>,
+    edges: &[(String, String)],
+    child_by_key: &HashMap<String, HopKey>,
+) -> Vec<Vec<HopKey>> {
+    if edges.is_empty() || child_by_key.is_empty() {
+        return Vec::new();
+    }
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (parent, child) in edges {
+        children_by_parent
+            .entry(parent.as_str())
+            .or_default()
+            .push(child.as_str());
+    }
+    let mut next = Vec::new();
+    for path in paths {
+        let parent = path.last().expect("path");
+        let mut seen_keys = HashSet::new();
+        for key in [&parent.source_key, &parent.object_id] {
+            if !seen_keys.insert(key.as_str()) {
+                continue;
+            }
+            if let Some(child_keys) = children_by_parent.get(key.as_str()) {
+                for child_key in child_keys {
+                    if let Some(child) = child_by_key.get(*child_key) {
+                        let mut joined = path.clone();
+                        joined.push(child.clone());
+                        next.push(joined);
+                    }
+                }
+            }
+        }
+    }
+    next
+}
+
 pub fn path_signature(paths: &[Vec<&ObjectTypeIndexMember>]) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = paths
         .iter()
@@ -156,6 +223,35 @@ mod tests {
         assert_eq!(path_signature(&nested), path_signature(&hashed));
         assert_eq!(nested.len(), 1);
         assert!(join_paths_hash(vec![vec![&customers[0]]], &orders, "").is_empty());
+    }
+
+    #[test]
+    fn join_key_paths_follows_edges_without_child_properties() {
+        let customers = [member("Customer", "c1", "region", "eu")];
+        let orders = [
+            member("Order", "o1", "customer_id", "c1"),
+            member("Order", "o-other", "customer_id", "c2"),
+        ];
+        let roots = vec![vec![HopKey::from_member(&customers[0])]];
+        let edges = vec![("c1".into(), "o1".into())];
+        let child_by_key = HashMap::from([(
+            "o1".into(),
+            HopKey {
+                kind: "Order".into(),
+                source_key: "o1".into(),
+                object_id: "Order:o1".into(),
+            },
+        )]);
+        let joined = join_key_paths(roots, &edges, &child_by_key);
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0][1].source_key, "o1");
+        let hashed = join_paths_hash(
+            customers.iter().map(|member| vec![member]).collect(),
+            &orders,
+            "customer_id",
+        );
+        assert_eq!(joined[0][1].source_key, hashed[0][1].source_key);
+        assert!(orders[0].properties.contains_key("customer_id"));
     }
 
     #[test]
