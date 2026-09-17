@@ -3,6 +3,7 @@
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
 
+use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use mikura::{
@@ -59,6 +60,7 @@ impl ObjectLogDualRead {
 pub enum ObjectLogCompareError {
     Disabled,
     Unbounded,
+    GrantNarrowed,
     MissingLog,
     Unsupported(&'static str),
     Evaluate(String),
@@ -74,6 +76,10 @@ impl ObjectLogCompareError {
         match self {
             Self::Disabled => "object-log dual-read is off".into(),
             Self::Unbounded => "object-log dual-read requires max_rows_scanned".into(),
+            Self::GrantNarrowed => {
+                "object-log dual-read soak is allow-all-only; property grants narrow visibility"
+                    .into()
+            }
             Self::MissingLog => {
                 "object-log dual-read requires SEKAI_OBJECT_LOG to an existing mikura log".into()
             }
@@ -200,6 +206,26 @@ pub fn sql_compare_signature(
         ));
     }
     Ok((roots.len(), sum))
+}
+
+/// Project clerk property grants into the tagged deny-list.
+///
+/// The tagged `PropertyAcl` public API is allow-all or a single deny. A
+/// non-empty grant allow-list therefore cannot be witnessed without a false
+/// allow-all compare. Callers skip the canary and keep the SQL answer.
+pub fn project_object_log_acl<'a>(
+    policies: impl IntoIterator<Item = Option<&'a ObjectSecurityPolicy>>,
+) -> Result<PropertyAcl, ObjectLogCompareError> {
+    for policy in policies.into_iter().flatten() {
+        if policy
+            .property_grants
+            .as_ref()
+            .is_some_and(|grants| !grants.is_empty())
+        {
+            return Err(ObjectLogCompareError::GrantNarrowed);
+        }
+    }
+    Ok(PropertyAcl::allow_all())
 }
 
 pub fn compare_sql_to_log(
@@ -490,5 +516,27 @@ mod tests {
             10,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn project_object_log_acl_skips_when_grants_narrow() {
+        project_object_log_acl([None]).unwrap();
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+                property: "region".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: None,
+            required_purpose: None,
+        };
+        let err = project_object_log_acl([Some(&policy)]).unwrap_err();
+        assert!(matches!(err, ObjectLogCompareError::GrantNarrowed));
     }
 }

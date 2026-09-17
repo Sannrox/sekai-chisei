@@ -608,24 +608,43 @@ impl SekaiServiceImpl {
             }
         }
         if self.object_log_dual_read.enabled {
-            let sql_paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
-                if let Some(projected) = projected.as_ref() {
-                    projected.iter().map(|path| path.iter().collect()).collect()
-                } else {
-                    paths.clone()
-                };
-            crate::sekai::object_log::compare_sql_to_log(
-                &self.object_log_dual_read,
-                &bound.descriptor,
-                hops,
-                &aggregation,
-                &sql_paths,
-                // Tagged evaluate is not principal-aware. Clerk grants stay on
-                // SQL; a later mapper can project a deny-list after soak.
-                mikura::PropertyAcl::allow_all(),
-                bound.descriptor.cost_limit.max_rows_scanned,
-            )
-            .map_err(|error| Status::failed_precondition(error.message()))?;
+            let mut kinds = vec![bound.descriptor.kind.as_str()];
+            kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
+            let mut policies = Vec::new();
+            for kind in &kinds {
+                policies.push(
+                    self.db
+                        .active_object_policy(&bound.descriptor.namespace, kind)
+                        .map_err(Status::internal)?,
+                );
+            }
+            match crate::sekai::object_log::project_object_log_acl(
+                policies.iter().map(|policy| policy.as_ref()),
+            ) {
+                Ok(acl) => {
+                    let sql_paths: Vec<
+                        Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>,
+                    > = if let Some(projected) = projected.as_ref() {
+                        projected.iter().map(|path| path.iter().collect()).collect()
+                    } else {
+                        paths.clone()
+                    };
+                    crate::sekai::object_log::compare_sql_to_log(
+                        &self.object_log_dual_read,
+                        &bound.descriptor,
+                        hops,
+                        &aggregation,
+                        &sql_paths,
+                        acl,
+                        bound.descriptor.cost_limit.max_rows_scanned,
+                    )
+                    .map_err(|error| Status::failed_precondition(error.message()))?;
+                }
+                Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed) => {}
+                Err(error) => {
+                    return Err(Status::failed_precondition(error.message()));
+                }
+            }
         }
         let rows: Vec<(String, Option<f64>)> = if let Some(projected) = projected.as_ref() {
             projected

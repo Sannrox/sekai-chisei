@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Object-log dual-read projects clerk property grants into the tagged deny-list
+  (#969). A non-empty grant allow-list cannot be witnessed by the tagged
+  single-deny API, so the canary stays off and evaluate keeps the SQL answer.
+  Soak remains allow-all-only.
 - Object-log dual-read is a canary: it requires `max_rows_scanned` and samples
   one of `SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE` requests (default 32) so enabling
   the flag does not open the object store on every evaluate (#968). Set

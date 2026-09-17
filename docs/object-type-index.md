@@ -31,9 +31,10 @@ for CI) and fails closed on mismatch, missing log, a missing
 `max_rows_scanned`, or a descriptor that library cannot express (property
 filters, `group_by` buckets, path multiplicity, or a non-i64 sum). Unsampled
 requests keep the SQL answer and do not open the log. First soak
-uses that library's allow-all property deny-list; clerk
-grants stay compiled on the SQL path, so a grant-narrowed SQL answer fails
-closed instead of being rewritten to match. This is not
+uses that library's allow-all property deny-list. Clerk
+grants stay compiled on the SQL path; when a kind's property-grant
+allow-list is non-empty the canary stays off instead of comparing
+grant-narrowed SQL to allow-all. This is not
 `SEKAI_OBJECT_INDEX_DUAL_READ`. See
 [ADR 0081](decisions/0081-evaluate-reads-mikura-library.md). It does not
 retire these writes.
