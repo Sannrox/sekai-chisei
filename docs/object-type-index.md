@@ -56,4 +56,5 @@ ready until `ReindexObjectType` restamps the datasource to the published
 revision; evaluate fails closed while that generation is stale.
 `SEKAI_OBJECT_INDEX_DUAL_READ=1` compares both
 plans and fails closed on mismatch. Hidden rows stay out of members,
-aggregates, and hop edges.
+aggregates, and hop edges. Aggregate evaluates project only the group_by,
+numeric, filter, and nested-loop join properties needed for the plan.

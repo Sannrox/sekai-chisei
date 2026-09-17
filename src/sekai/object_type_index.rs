@@ -13,6 +13,26 @@ pub fn join_value_digest(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Keep only plan-needed properties from a stored member JSON map.
+/// `None` keeps the full map. An empty slice skips deserialize of unused keys
+/// by returning an empty map when `raw` is ignored by callers; when `raw` is
+/// present this still parses once and retains named keys.
+pub fn project_member_properties(
+    raw: &str,
+    needed: Option<&[String]>,
+) -> Result<BTreeMap<String, String>, String> {
+    match needed {
+        None => serde_json::from_str(raw).map_err(|error| error.to_string()),
+        Some([]) => Ok(BTreeMap::new()),
+        Some(keys) => {
+            let mut properties: BTreeMap<String, String> =
+                serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            properties.retain(|key, _| keys.iter().any(|needed| needed == key));
+            Ok(properties)
+        }
+    }
+}
+
 pub const CONTRACT_VERSION: &str = "sekai.object-type-index/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,5 +320,25 @@ mod tests {
         status.lag_ms = 1;
         status.stale = true;
         assert!(!freshness_holds(&status, 10_000));
+    }
+
+    #[test]
+    fn project_member_properties_keeps_only_needed_keys() {
+        let raw = r#"{"region":"eu","amount":"10","extra":"drop"}"#;
+        let needed = ["region".into(), "amount".into()];
+        let projected = project_member_properties(raw, Some(&needed)).unwrap();
+        assert_eq!(
+            projected,
+            BTreeMap::from([
+                ("region".into(), "eu".into()),
+                ("amount".into(), "10".into())
+            ])
+        );
+        assert!(
+            project_member_properties(raw, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(project_member_properties(raw, None).unwrap().len(), 3);
     }
 }

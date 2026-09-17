@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Aggregate `EvaluateObjectSet` loads only group_by, numeric, filter, and
+  nested-loop join properties on hop members (#953). Unused JSON keys are
+  dropped; count-only leaf fetches skip property maps.
 - Hop-projection join lookup uses the stored raw join value instead of
   SHA-256 hashing every parent key on each hop (#952). PostgreSQL binds
   `ANY($::text[])`; SQLite keeps a bounded `IN` list. Digest remains the
