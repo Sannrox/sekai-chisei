@@ -4,7 +4,6 @@ use crate::sekai::object_type_index::{
     ObjectTypeDatasource, ObjectTypeIndexEdit, ObjectTypeIndexMember, ObjectTypeIndexStatus,
     ReindexReport, member_from_edit, member_from_row, schema_drift,
 };
-use std::collections::BTreeMap;
 
 impl PostgresDb {
     pub fn register_object_type_datasource(
@@ -222,6 +221,16 @@ impl PostgresDb {
         kind: &str,
         query: &RowQuery,
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        self.list_visible_index_members_projected(namespace, kind, query, None)
+    }
+
+    pub fn list_visible_index_members_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        query: &RowQuery,
+        needed: Option<&[String]>,
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
         let rows = self
             .connection()?
             .query(
@@ -236,8 +245,8 @@ impl PostgresDb {
         let mut skipped = 0i32;
         for row in rows {
             let properties: String = row.get(2);
-            let properties: BTreeMap<String, String> =
-                serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+            let properties =
+                crate::sekai::object_type_index::project_member_properties(&properties, needed)?;
             if !query.filters.iter().all(|filter| {
                 properties.get(&filter.column).is_some_and(|value| {
                     crate::sekai::dataset::row_value_matches(value, &filter.op, &filter.value)
@@ -515,15 +524,40 @@ impl PostgresDb {
         kind: &str,
         keys: &[String],
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        self.list_index_members_by_keys_projected(namespace, kind, keys, None)
+    }
+
+    pub fn list_index_members_by_keys_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+        needed: Option<&[String]>,
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         if keys.len() > 400 {
             let mut out = Vec::new();
             for chunk in keys.chunks(400) {
-                out.extend(self.list_index_members_by_keys(namespace, kind, chunk)?);
+                out.extend(
+                    self.list_index_members_by_keys_projected(namespace, kind, chunk, needed)?,
+                );
             }
             return Ok(out);
+        }
+        if needed.is_some_and(|keys| keys.is_empty()) {
+            return Ok(self
+                .list_index_member_idents(namespace, kind, keys)?
+                .into_iter()
+                .map(|(source_key, object_id)| ObjectTypeIndexMember {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key,
+                    object_id,
+                    ..ObjectTypeIndexMember::default()
+                })
+                .collect());
         }
         let placeholders = (0..keys.len())
             .map(|index| format!("${}", index + 3))
@@ -549,7 +583,10 @@ impl PostgresDb {
                     kind: kind.into(),
                     source_key: row.get(0),
                     object_id: row.get(1),
-                    properties: serde_json::from_str(&properties).map_err(|e| e.to_string())?,
+                    properties: crate::sekai::object_type_index::project_member_properties(
+                        &properties,
+                        needed,
+                    )?,
                     content_hash: row.get(3),
                     hidden: false,
                     from_edit: row.get(5),

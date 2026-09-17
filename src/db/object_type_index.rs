@@ -302,6 +302,16 @@ impl SekaiDb {
         kind: &str,
         query: &RowQuery,
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        self.list_visible_index_members_projected(namespace, kind, query, None)
+    }
+
+    pub fn list_visible_index_members_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        query: &RowQuery,
+        needed: Option<&[String]>,
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
@@ -318,8 +328,8 @@ impl SekaiDb {
         let mut skipped = 0i32;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let properties: String = row.get(2).map_err(|error| error.to_string())?;
-            let properties: BTreeMap<String, String> =
-                serde_json::from_str(&properties).map_err(|error| error.to_string())?;
+            let properties =
+                crate::sekai::object_type_index::project_member_properties(&properties, needed)?;
             if !index_member_matches(&properties, query) {
                 continue;
             }
@@ -597,15 +607,40 @@ impl SekaiDb {
         kind: &str,
         keys: &[String],
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        self.list_index_members_by_keys_projected(namespace, kind, keys, None)
+    }
+
+    pub fn list_index_members_by_keys_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+        needed: Option<&[String]>,
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         if keys.len() > 400 {
             let mut out = Vec::new();
             for chunk in keys.chunks(400) {
-                out.extend(self.list_index_members_by_keys(namespace, kind, chunk)?);
+                out.extend(
+                    self.list_index_members_by_keys_projected(namespace, kind, chunk, needed)?,
+                );
             }
             return Ok(out);
+        }
+        if needed.is_some_and(|keys| keys.is_empty()) {
+            return Ok(self
+                .list_index_member_idents(namespace, kind, keys)?
+                .into_iter()
+                .map(|(source_key, object_id)| ObjectTypeIndexMember {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key,
+                    object_id,
+                    ..ObjectTypeIndexMember::default()
+                })
+                .collect());
         }
         let conn = self.conn();
         let placeholders = vec!["?"; keys.len()].join(",");
@@ -630,7 +665,10 @@ impl SekaiDb {
                 kind: kind.into(),
                 source_key: row.get(0).map_err(|error| error.to_string())?,
                 object_id: row.get(1).map_err(|error| error.to_string())?,
-                properties: serde_json::from_str(&properties).map_err(|error| error.to_string())?,
+                properties: crate::sekai::object_type_index::project_member_properties(
+                    &properties,
+                    needed,
+                )?,
                 content_hash: row.get(3).map_err(|error| error.to_string())?,
                 hidden: false,
                 from_edit: row.get::<_, i64>(5).map_err(|error| error.to_string())? != 0,
@@ -1141,6 +1179,48 @@ mod tests {
             db.list_index_join_children("sales", "Customer", "region", &[digest])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_index_members_by_keys_projects_only_needed_properties() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let full = db
+            .list_index_members_by_keys("sales", "Customer", &["c1".into()])
+            .unwrap();
+        assert!(full[0].properties.contains_key("region"));
+        let projected = db
+            .list_index_members_by_keys_projected("sales", "Customer", &["c1".into()], Some(&[]))
+            .unwrap();
+        assert!(projected[0].properties.is_empty());
+        let region_only = db
+            .list_index_members_by_keys_projected(
+                "sales",
+                "Customer",
+                &["c1".into()],
+                Some(&["region".into()]),
+            )
+            .unwrap();
+        assert_eq!(
+            region_only[0].properties,
+            BTreeMap::from([("region".into(), "eu".into())])
         );
     }
 }

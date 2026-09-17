@@ -245,9 +245,23 @@ impl RuntimeDb {
         kind: &str,
         query: &RowQuery,
     ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        self.list_visible_index_members_projected(namespace, kind, query, None)
+    }
+
+    pub fn list_visible_index_members_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        query: &RowQuery,
+        needed: Option<&[String]>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
         match self {
-            Self::Sqlite(db) => db.list_visible_index_members(namespace, kind, query),
-            Self::Postgres(db) => db.list_visible_index_members(namespace, kind, query),
+            Self::Sqlite(db) => {
+                db.list_visible_index_members_projected(namespace, kind, query, needed)
+            }
+            Self::Postgres(db) => {
+                db.list_visible_index_members_projected(namespace, kind, query, needed)
+            }
         }
     }
 
@@ -315,9 +329,23 @@ impl RuntimeDb {
         kind: &str,
         keys: &[String],
     ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        self.list_index_members_by_keys_projected(namespace, kind, keys, None)
+    }
+
+    pub fn list_index_members_by_keys_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+        needed: Option<&[String]>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
         match self {
-            Self::Sqlite(db) => db.list_index_members_by_keys(namespace, kind, keys),
-            Self::Postgres(db) => db.list_index_members_by_keys(namespace, kind, keys),
+            Self::Sqlite(db) => {
+                db.list_index_members_by_keys_projected(namespace, kind, keys, needed)
+            }
+            Self::Postgres(db) => {
+                db.list_index_members_by_keys_projected(namespace, kind, keys, needed)
+            }
         }
     }
 

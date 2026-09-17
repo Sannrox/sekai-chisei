@@ -344,6 +344,7 @@ impl SekaiServiceImpl {
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
         roots: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
         meter: &mut crate::sekai::object_set::CostMeter,
+        needed_leaf: &[String],
     ) -> Result<Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>>, Status> {
         let mut key_paths: Vec<Vec<crate::sekai::object_index_engine::HopKey>> = roots
             .iter()
@@ -383,10 +384,11 @@ impl SekaiServiceImpl {
             let child_by_key = if last {
                 let children = self
                     .db
-                    .list_index_members_by_keys(
+                    .list_index_members_by_keys_projected(
                         &bound.descriptor.namespace,
                         &hop.far_kind,
                         &child_keys,
+                        Some(needed_leaf),
                     )
                     .map_err(Status::internal)?;
                 meter
@@ -483,6 +485,13 @@ impl SekaiServiceImpl {
                 "object index dual-read requires max_rows_scanned",
             ));
         }
+        let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
+            Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
+        })?;
+        let needed_root =
+            aggregate_plan_properties(&aggregation, &bound.descriptor.property_filters, &[]);
+        let needed_leaf = aggregate_plan_properties(&aggregation, &[], &[]);
+        let needed_nested = aggregate_plan_properties(&aggregation, &[], hops);
         let mut layers = Vec::new();
         let mut kind = bound.descriptor.kind.clone();
         let empty = crate::sekai::dataset::RowQuery::default();
@@ -538,9 +547,19 @@ impl SekaiServiceImpl {
             } else {
                 empty.clone()
             };
+            let needed = if index == 0 {
+                needed_root.as_slice()
+            } else {
+                needed_nested.as_slice()
+            };
             let members = self
                 .db
-                .list_visible_index_members(&bound.descriptor.namespace, &kind, &query)
+                .list_visible_index_members_projected(
+                    &bound.descriptor.namespace,
+                    &kind,
+                    &query,
+                    Some(needed),
+                )
                 .map_err(Status::internal)?;
             meter
                 .charge(members.len() as i32)
@@ -555,7 +574,7 @@ impl SekaiServiceImpl {
         let projected = if self.object_index_engine
             == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
         {
-            Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter)?)
+            Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter, &needed_leaf)?)
         } else {
             None
         };
@@ -595,9 +614,6 @@ impl SekaiServiceImpl {
                 ));
             }
         }
-        let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
-            Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
-        })?;
         if self.object_log_dual_read.enabled {
             let sql_paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
                 if let Some(projected) = projected.as_ref() {
@@ -649,6 +665,33 @@ impl SekaiServiceImpl {
                 .collect(),
         }))
     }
+}
+
+fn aggregate_plan_properties(
+    aggregation: &crate::sekai::object_set::ObjectSetAggregation,
+    filters: &[crate::domain::PropertyFilter],
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !aggregation.group_by.is_empty() {
+        keys.push(aggregation.group_by.clone());
+    }
+    if !aggregation.function.eq_ignore_ascii_case("count") && !aggregation.property.is_empty() {
+        keys.push(aggregation.property.clone());
+    }
+    for filter in filters {
+        if !filter.key.is_empty() {
+            keys.push(filter.key.clone());
+        }
+    }
+    for hop in hops {
+        if !hop.join_property.is_empty() {
+            keys.push(hop.join_property.clone());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn aggregate_path_row(
@@ -831,6 +874,42 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn aggregate_plan_properties_keeps_group_numeric_filter_and_join_keys() {
+        let aggregation = crate::sekai::object_set::ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: "region".into(),
+        };
+        let filters = [crate::domain::PropertyFilter {
+            key: "tier".into(),
+            op: "eq".into(),
+            value: "1".into(),
+        }];
+        let hops = [crate::sekai::object_set::ObjectSetTraversal {
+            join_property: "customer_id".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &filters, &[]),
+            vec!["amount".to_string(), "region".into(), "tier".into()]
+        );
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &[], &[]),
+            vec!["amount".to_string(), "region".into()]
+        );
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &[], &hops),
+            vec!["amount".to_string(), "customer_id".into(), "region".into()]
+        );
+        let count = crate::sekai::object_set::ObjectSetAggregation {
+            function: "count".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        assert!(aggregate_plan_properties(&count, &[], &[]).is_empty());
+    }
 
     fn service() -> SekaiServiceImpl {
         let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
