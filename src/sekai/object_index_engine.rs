@@ -1,8 +1,9 @@
 //! Pluggable object-index engines for EvaluateObjectSet hops (#889).
 //!
-//! `nested-loop` is the original in-process scan. `hop-projection` is the
-//! measured rebuildable join-key projection from the #889 envelope. Neither
-//! is object authority. Switching engines is a rebuild of the join projection.
+//! `hop-projection` is the shipping default: a rebuildable join-key
+//! projection from the #889 envelope. `nested-loop` is the original
+//! in-process scan, kept as an explicit debug engine. Neither is object
+//! authority. Switching engines is a rebuild of the join projection.
 
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use std::collections::{HashMap, HashSet};
@@ -31,10 +32,13 @@ impl ObjectIndexEngineKind {
     pub fn from_env() -> Self {
         match env::var("SEKAI_OBJECT_INDEX_ENGINE") {
             Ok(value) if !value.trim().is_empty() => Self::parse(&value).unwrap_or_else(|error| {
-                tracing::warn!(error = %error, "invalid object index engine; using nested-loop");
-                Self::NestedLoop
+                tracing::warn!(
+                    error = %error,
+                    "invalid object index engine; using hop-projection"
+                );
+                Self::HopProjection
             }),
-            _ => Self::NestedLoop,
+            _ => Self::HopProjection,
         }
     }
 
@@ -165,5 +169,18 @@ mod tests {
             ObjectIndexEngineKind::HopProjection
         );
         assert!(ObjectIndexEngineKind::parse("lucene").is_err());
+    }
+
+    #[test]
+    fn unset_engine_defaults_to_hop_projection() {
+        if env::var("SEKAI_OBJECT_INDEX_ENGINE")
+            .ok()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            assert_eq!(
+                ObjectIndexEngineKind::from_env(),
+                ObjectIndexEngineKind::HopProjection
+            );
+        }
     }
 }
