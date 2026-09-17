@@ -1,9 +1,11 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
-    ObjectTypeDatasource, ObjectTypeIndexEdit, ObjectTypeIndexMember, ObjectTypeIndexStatus,
-    ReindexReport, member_from_edit, member_from_row, schema_drift,
+    HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
+    ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
+    member_from_edit, member_from_row, schema_drift,
 };
+use std::collections::HashMap;
 
 impl PostgresDb {
     pub fn register_object_type_datasource(
@@ -384,12 +386,13 @@ impl PostgresDb {
         self.connection()?
             .execute(
                 "INSERT INTO sekai_object_type_index_join_status
-                 (namespace, kind, ready, rebuilt_at_ms)
-                 VALUES ($1,$2,$3,$4)
+                 (namespace, kind, ready, rebuilt_at_ms, generation)
+                 VALUES ($1,$2,$3,$4,$5)
                  ON CONFLICT (namespace, kind) DO UPDATE SET
                    ready = EXCLUDED.ready,
-                   rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
-                &[&namespace, &kind, &ready, &now_ms],
+                   rebuilt_at_ms = EXCLUDED.rebuilt_at_ms,
+                   generation = EXCLUDED.generation",
+                &[&namespace, &kind, &ready, &now_ms, &""],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -403,7 +406,7 @@ impl PostgresDb {
         self.connection()?
             .execute(
                 "UPDATE sekai_object_type_index_join_status
-                 SET ready = FALSE, rebuilt_at_ms = $1 WHERE namespace = $2",
+                 SET ready = FALSE, generation = '', rebuilt_at_ms = $1 WHERE namespace = $2",
                 &[&now_ms, &namespace],
             )
             .map(|_| ())
@@ -424,7 +427,18 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    fn hop_rebuild_generation(&self, namespace: &str, kind: &str) -> Result<String, String> {
+        if let Some(published) = self.get_published_definition_revision(namespace)? {
+            return Ok(published.revision_digest);
+        }
+        Ok(self
+            .get_object_type_datasource(namespace, kind)?
+            .map(|binding| binding.definition_digest)
+            .unwrap_or_default())
+    }
+
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        let generation = self.hop_rebuild_generation(namespace, kind)?;
         let members = self.list_visible_index_members(
             namespace,
             kind,
@@ -434,12 +448,13 @@ impl PostgresDb {
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO sekai_object_type_index_join_status
-             (namespace, kind, ready, rebuilt_at_ms)
-             VALUES ($1,$2,$3,$4)
+             (namespace, kind, ready, rebuilt_at_ms, generation)
+             VALUES ($1,$2,$3,$4,$5)
              ON CONFLICT (namespace, kind) DO UPDATE SET
                ready = EXCLUDED.ready,
-               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
-            &[&namespace, &kind, &false, &now_ms],
+               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms,
+               generation = EXCLUDED.generation",
+            &[&namespace, &kind, &false, &now_ms, &""],
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -469,35 +484,89 @@ impl PostgresDb {
         }
         tx.execute(
             "INSERT INTO sekai_object_type_index_join_status
-             (namespace, kind, ready, rebuilt_at_ms)
-             VALUES ($1,$2,$3,$4)
+             (namespace, kind, ready, rebuilt_at_ms, generation)
+             VALUES ($1,$2,$3,$4,$5)
              ON CONFLICT (namespace, kind) DO UPDATE SET
                ready = EXCLUDED.ready,
-               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms",
-            &[&namespace, &kind, &true, &now_ms],
+               rebuilt_at_ms = EXCLUDED.rebuilt_at_ms,
+               generation = EXCLUDED.generation",
+            &[&namespace, &kind, &true, &now_ms, &generation],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
-        let ready = self
-            .connection()?
-            .query_opt(
-                "SELECT ready FROM sekai_object_type_index_join_status
-                 WHERE namespace=$1 AND kind=$2",
-                &[&namespace, &kind],
-            )
-            .map_err(|error| error.to_string())?
-            .is_some_and(|row| row.get(0));
-        if !ready {
-            return Ok(false);
-        }
-        let joins = self.count_index_join_rows(namespace, kind)?;
-        if joins > 0 {
+    fn hop_projection_count_witness(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        if self.count_index_join_rows(namespace, kind)? > 0 {
             return Ok(true);
         }
         Ok(self.count_visible_index_members(namespace, kind)? == 0)
+    }
+
+    fn list_hop_projection_fences(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+    ) -> Result<HashMap<String, HopProjectionFence>, String> {
+        if kinds.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let kind_list: Vec<String> = kinds.iter().map(|kind| (*kind).to_string()).collect();
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT s.kind, s.ready, COALESCE(s.generation, ''), COALESCE(d.definition_digest, '')
+                 FROM sekai_object_type_index_join_status s
+                 LEFT JOIN sekai_object_type_datasource d
+                   ON d.namespace = s.namespace AND d.kind = s.kind
+                 WHERE s.namespace = $1 AND s.kind = ANY($2)",
+                &[&namespace, &kind_list],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut fences = HashMap::new();
+        for row in rows {
+            fences.insert(
+                row.get(0),
+                HopProjectionFence {
+                    ready: row.get(1),
+                    generation: row.get(2),
+                    definition_digest: row.get(3),
+                },
+            );
+        }
+        Ok(fences)
+    }
+
+    pub fn hop_projection_kinds_ready(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+        published: &str,
+    ) -> Result<bool, String> {
+        if kinds.is_empty() {
+            return Ok(true);
+        }
+        let fences = self.list_hop_projection_fences(namespace, kinds)?;
+        for kind in kinds {
+            let Some(fence) = fences.get(*kind) else {
+                return Ok(false);
+            };
+            match admit_hop_projection_fence(fence, published) {
+                HopProjectionAdmit::Admit => {}
+                HopProjectionAdmit::Reject => return Ok(false),
+                HopProjectionAdmit::CountFallback => {
+                    if !self.hop_projection_count_witness(namespace, kind)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        let published = self.hop_rebuild_generation(namespace, kind)?;
+        self.hop_projection_kinds_ready(namespace, &[kind], &published)
     }
 
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {

@@ -314,26 +314,14 @@ impl SekaiServiceImpl {
         let published = bound.descriptor.definition_digest.as_str();
         let mut kinds = vec![bound.descriptor.kind.as_str()];
         kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
-        for kind in kinds {
-            if !self
-                .db
-                .hop_projection_ready(&bound.descriptor.namespace, kind)
-                .map_err(Status::internal)?
-            {
-                return Err(Status::failed_precondition(
-                    "object index hop projection is stale",
-                ));
-            }
-            if let Some(datasource) = self
-                .db
-                .get_object_type_datasource(&bound.descriptor.namespace, kind)
-                .map_err(Status::internal)?
-                && datasource.definition_digest != published
-            {
-                return Err(Status::failed_precondition(
-                    "object index hop projection is stale",
-                ));
-            }
+        if !self
+            .db
+            .hop_projection_kinds_ready(&bound.descriptor.namespace, &kinds, published)
+            .map_err(Status::internal)?
+        {
+            return Err(Status::failed_precondition(
+                "object index hop projection is stale",
+            ));
         }
         Ok(())
     }

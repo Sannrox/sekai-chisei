@@ -50,7 +50,9 @@ selects `hop-projection` (default) or `nested-loop`. Hop-projection is a
 rebuildable join-key projection, not object authority. Evaluate walks those
 join edges as the reachability plan and looks up children by the stored
 raw join value, not a per-hop digest of every parent key. It fails closed
-while that generation is unready. `nested-loop` is the original in-process
+while that generation is unready. Evaluate reads one ready+generation+digest
+fence for the root and hop kinds; a matching generation skips recounting
+join and member rows. `nested-loop` is the original in-process
 scan, kept as an explicit debug engine. Switching engines requires
 `ReindexObjectType`. A definition-branch publish clears hop-projection
 ready until `ReindexObjectType` restamps the datasource to the published

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hop-projection evaluate reads one ready+generation+digest fence per query
+  (#967). Matching generation skips join/member COUNT; empty generation keeps
+  the wipe-detector COUNT path. Publish and invalidate clear the stamp.
 - Indexed EvaluateObjectSet filters push eq/gt/gte/lt/lte onto stored member
   JSON in SQL (#966). Non-matching kind rows are excluded before the full
   property map is decoded. Unknown operators fail closed.
