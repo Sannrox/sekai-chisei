@@ -103,3 +103,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0079: Bound evaluation suites gate promotion on existing certification](0079-evaluation-promotion-gate.md)
 - [ADR 0080: Keep dual community control-plane storage](0080-dual-community-runtime-storage.md)
 - [ADR 0081: EvaluateObjectSet dual-reads an in-process object-log library](0081-evaluate-reads-mikura-library.md)
+- [ADR 0082: Separate Chisei and Sekai durable stores](0082-separate-chisei-and-sekai-durable-stores.md)
