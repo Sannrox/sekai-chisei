@@ -146,6 +146,14 @@ pub fn map_evaluate_request(
         .last()
         .map(|hop| hop.far_kind.clone())
         .unwrap_or_else(|| descriptor.kind.clone());
+    for hop in hops {
+        let direction = hop.direction.trim();
+        if !direction.is_empty() && !direction.eq_ignore_ascii_case("outgoing") {
+            return Err(ObjectLogCompareError::Unsupported(
+                "hop direction is not expressible on the tagged object-log evaluate API",
+            ));
+        }
+    }
     Ok(EvaluateRequest {
         root_kind: descriptor.kind.clone(),
         hops: hops
@@ -429,6 +437,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ObjectLogCompareError::Unsupported(_)));
+    }
+
+    #[test]
+    fn incoming_hop_fails_closed_instead_of_outbound() {
+        let descriptor = ObjectSetDescriptor {
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let err = map_evaluate_request(
+            &descriptor,
+            &[crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+                direction: "incoming".into(),
+                ..Default::default()
+            }],
+            &ObjectSetAggregation {
+                function: "count".into(),
+                ..Default::default()
+            },
+            PropertyAcl::allow_all(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("direction"))
+        );
+
+        map_evaluate_request(
+            &descriptor,
+            &[crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+                direction: "outgoing".into(),
+                ..Default::default()
+            }],
+            &ObjectSetAggregation {
+                function: "count".into(),
+                ..Default::default()
+            },
+            PropertyAcl::allow_all(),
+        )
+        .unwrap();
     }
 
     #[test]
