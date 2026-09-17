@@ -2164,8 +2164,10 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        let mut activation =
-            std::collections::BTreeMap::from([("Shipment".into(), shipment_revision.revision_digest)]);
+        let mut activation = std::collections::BTreeMap::from([(
+            "Shipment".into(),
+            shipment_revision.revision_digest,
+        )]);
         for (index, kind) in instantiated
             .iter()
             .map(|object| object.kind.as_str())
