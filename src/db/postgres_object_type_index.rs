@@ -131,8 +131,8 @@ impl PostgresDb {
                 .map(|status| status.last_dataset_row_id)
                 .unwrap_or(0)
         };
+        self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         if full_rebuild {
-            self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
             self.connection()?
                 .execute(
                     "DELETE FROM sekai_object_type_index_member WHERE namespace=$1 AND kind=$2 AND from_edit=FALSE",

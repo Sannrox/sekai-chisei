@@ -15,7 +15,10 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 1. `RegisterObjectTypeDatasource` — namespace, kind, type-revision digest,
    dataset id, key column, property mapping, optional hidden column.
 2. `ReindexObjectType` — incremental by default; `full_rebuild` rematerializes
-   from source then reapplies Action deltas.
+   from source then reapplies Action deltas. Incremental apply clears
+   hop-projection ready before member upserts and keeps it false until the
+   join rewrite commits, so evaluate cannot pair new member keys with old
+   hop edges.
 3. `GetObjectTypeIndexStatus` — `stale`, `lag_ms`, `quarantine_reason`,
    visible `member_count`.
 4. `PutObjectTypeIndexEdit` — Action delta that survives a full rebuild.
