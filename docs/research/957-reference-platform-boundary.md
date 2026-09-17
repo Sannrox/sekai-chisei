@@ -332,7 +332,7 @@ The first remote contract should be small and authority-oriented:
    reads and action operations. Discovery must never be treated as an
    authorization token; commit must re-check live authority.
 
-The public InvokeActionInstance façade may remain for compatibility, but its
+The public `SubmitActionInstance` façade remains the admission RPC; its
 implementation should make the sequence explicit:
 
     read context -> decide in chisei -> submit admission -> commit in sekai -> read receipt
