@@ -321,6 +321,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_index_member_idents(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_index_member_idents(namespace, kind, keys),
+            Self::Postgres(db) => db.list_index_member_idents(namespace, kind, keys),
+        }
+    }
+
     pub fn put_governed_transform(
         &self,
         transform: &crate::sekai::governed_transform::GovernedTransform,

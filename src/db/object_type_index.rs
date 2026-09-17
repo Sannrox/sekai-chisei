@@ -646,6 +646,47 @@ impl SekaiDb {
         Ok(members)
     }
 
+    pub fn list_index_member_idents(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if keys.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in keys.chunks(400) {
+                out.extend(self.list_index_member_idents(namespace, kind, chunk)?);
+            }
+            return Ok(out);
+        }
+        let conn = self.conn();
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "SELECT source_key, object_id
+             FROM sekai_object_type_index_member
+             WHERE namespace = ?1 AND kind = ?2 AND hidden = 0 AND source_key IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind];
+        for key in keys {
+            params.push(key);
+        }
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            out.push((
+                row.get(0).map_err(|error| error.to_string())?,
+                row.get(1).map_err(|error| error.to_string())?,
+            ));
+        }
+        Ok(out)
+    }
+
     fn mark_index_quarantined(
         &self,
         namespace: &str,
