@@ -27,7 +27,8 @@ tokens. The SQL index remains the current evaluate backend.
 `SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` compares hop/count/sum
 answers to a tagged in-process object-log library and fails closed on
 mismatch, missing log, or a descriptor that library cannot express (property
-filters). First soak uses that library's allow-all property deny-list; clerk
+filters, `group_by` buckets, path multiplicity, or a non-i64 sum). First soak
+uses that library's allow-all property deny-list; clerk
 grants stay compiled on the SQL path, so a grant-narrowed SQL answer fails
 closed instead of being rewritten to match. This is not
 `SEKAI_OBJECT_INDEX_DUAL_READ`. See

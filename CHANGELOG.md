@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Object-log dual-read fails closed when the tagged evaluate API cannot
+  witness the SQL answer: `group_by` buckets, path multiplicity, or a
+  non-i64/missing sum (#965). Vacuous root-count/sum matches no longer
+  stamp Ok.
 - `RegisterObjectTypeDatasource` that changes join-relevant binding fields
   clears hop-projection ready even when `definition_digest` is unchanged
   (#964). Identical re-register does not. Evaluate stays fail-closed until

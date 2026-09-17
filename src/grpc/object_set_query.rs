@@ -2022,36 +2022,22 @@ mod tests {
             page_token: String::new(),
             required_freshness_ms: 0,
         };
-        let page = svc
+        let grouped_err = svc
             .evaluate_object_set(with_named_principal(request.clone(), "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(grouped_err.code(), tonic::Code::FailedPrecondition);
+        assert!(grouped_err.message().contains("group_by"));
+
+        svc.object_log_dual_read.enabled = false;
+        let page = svc
+            .evaluate_object_set(with_named_principal(request, "alice"))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(page.aggregates.len(), 1);
         assert_eq!(page.aggregates[0].value, 10.0);
         assert!(!page.authority);
-
-        let mut store = mikura::Store::open(&log).unwrap();
-        mikura::BatchIngest::run(
-            &mut store,
-            vec![mikura::ObjectRecord {
-                r#gen: 1,
-                kind: "Shipment".into(),
-                key: "s2".into(),
-                hidden: false,
-                props: std::collections::HashMap::from([
-                    ("order_id".into(), "o1".into()),
-                    ("amount".into(), "5".into()),
-                ]),
-            }],
-        )
-        .unwrap();
-        let mismatch = svc
-            .evaluate_object_set(with_named_principal(request, "alice"))
-            .await
-            .unwrap_err();
-        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
-        assert!(mismatch.message().contains("object-log dual-read mismatch"));
     }
 
     fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {

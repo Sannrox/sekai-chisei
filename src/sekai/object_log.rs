@@ -86,6 +86,11 @@ pub fn map_evaluate_request(
             "object-log evaluate requires at least one hop",
         ));
     }
+    if !aggregation.group_by.is_empty() {
+        return Err(ObjectLogCompareError::Unsupported(
+            "group_by buckets are not expressible on the tagged object-log evaluate API",
+        ));
+    }
     let function = aggregation.function.to_ascii_lowercase();
     if function != "sum" && function != "count" {
         return Err(ObjectLogCompareError::Unsupported(
@@ -131,24 +136,47 @@ pub fn map_evaluate_request(
 pub fn sql_compare_signature(
     paths: &[Vec<&ObjectTypeIndexMember>],
     aggregation: &ObjectSetAggregation,
-) -> (usize, i64) {
+) -> Result<(usize, i64), ObjectLogCompareError> {
+    if !aggregation.group_by.is_empty() {
+        return Err(ObjectLogCompareError::Unsupported(
+            "group_by buckets are not expressible on the tagged object-log evaluate API",
+        ));
+    }
     let mut roots = HashSet::new();
     let mut sum = 0i64;
+    let summing = aggregation.function.eq_ignore_ascii_case("sum");
     for path in paths {
         if let Some(root) = path.first() {
             roots.insert(root.source_key.as_str());
         }
-        if let Some(leaf) = path.last()
-            && !aggregation.property.is_empty()
-            && let Some(amount) = leaf
-                .properties
-                .get(&aggregation.property)
-                .and_then(|raw| raw.parse::<i64>().ok())
-        {
+        if summing {
+            if aggregation.property.is_empty() {
+                return Err(ObjectLogCompareError::Unsupported(
+                    "sum compare requires aggregation.property",
+                ));
+            }
+            let leaf = path.last().ok_or(ObjectLogCompareError::Unsupported(
+                "sum compare requires a leaf on every path",
+            ))?;
+            let raw = leaf.properties.get(&aggregation.property).ok_or(
+                ObjectLogCompareError::Unsupported(
+                    "sum property missing on a hop leaf; refusing vacuous compare",
+                ),
+            )?;
+            let amount = raw.parse::<i64>().map_err(|_| {
+                ObjectLogCompareError::Unsupported(
+                    "sum property is not an i64; refusing vacuous compare",
+                )
+            })?;
             sum += amount;
         }
     }
-    (roots.len(), sum)
+    if paths.len() != roots.len() {
+        return Err(ObjectLogCompareError::Unsupported(
+            "path multiplicity is not expressible on the tagged object-log evaluate API",
+        ));
+    }
+    Ok((roots.len(), sum))
 }
 
 pub fn compare_sql_to_log(
@@ -185,7 +213,7 @@ pub fn compare_sql_to_log_path(
     let log = ObjectSet::new(LocalCompute)
         .evaluate(&store, &request)
         .map_err(|error| ObjectLogCompareError::Evaluate(format!("{error:?}")))?;
-    let (sql_roots, sql_sum) = sql_compare_signature(sql_paths, aggregation);
+    let (sql_roots, sql_sum) = sql_compare_signature(sql_paths, aggregation)?;
     let sum_matches = request.sum_property.is_empty() || sql_sum == log.sum_amount;
     if sql_roots == log.two_hop_count && sum_matches {
         return Ok(());
@@ -277,7 +305,7 @@ mod tests {
         let aggregation = ObjectSetAggregation {
             function: "sum".into(),
             property: "amount".into(),
-            group_by: "region".into(),
+            group_by: String::new(),
         };
         let customer = member("Customer", "c1", "region", "eu");
         let order = member("Order", "o1", "customer_id", "c1");
@@ -345,5 +373,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ObjectLogCompareError::Unsupported(_)));
+    }
+
+    #[test]
+    fn group_by_path_multiplicity_and_non_i64_sum_fail_closed() {
+        let aggregation = ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: "region".into(),
+        };
+        let customer = member("Customer", "c1", "region", "eu");
+        let order = member("Order", "o1", "customer_id", "c1");
+        let shipment = member("Shipment", "s1", "amount", "10");
+        let err =
+            sql_compare_signature(&[vec![&customer, &order, &shipment]], &aggregation).unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("group_by"))
+        );
+
+        let no_group = ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        let extra = member("Shipment", "s2", "amount", "5");
+        let err = sql_compare_signature(
+            &[
+                vec![&customer, &order, &shipment],
+                vec![&customer, &order, &extra],
+            ],
+            &no_group,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("multiplicity"))
+        );
+
+        let bad = member("Shipment", "s1", "amount", "10.5");
+        let err = sql_compare_signature(&[vec![&customer, &order, &bad]], &no_group).unwrap_err();
+        assert!(
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("i64"))
+        );
     }
 }
