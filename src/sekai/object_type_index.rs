@@ -96,6 +96,43 @@ pub fn member_filter_sql(
     Ok((clause, values))
 }
 
+/// One evaluate fence row: ready bit, join generation, and catalog digest.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HopProjectionFence {
+    pub ready: bool,
+    pub generation: String,
+    pub definition_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopProjectionAdmit {
+    Admit,
+    Reject,
+    CountFallback,
+}
+
+/// Admit from the stamped receipt. Skip COUNT when generation matches the
+/// published catalog. Digest mismatch fails closed. Empty generation keeps
+/// the wipe-detector COUNT path for rows that have not been restamped.
+pub fn admit_hop_projection_fence(
+    fence: &HopProjectionFence,
+    published: &str,
+) -> HopProjectionAdmit {
+    if !fence.ready {
+        return HopProjectionAdmit::Reject;
+    }
+    if !published.is_empty()
+        && !fence.definition_digest.is_empty()
+        && fence.definition_digest != published
+    {
+        return HopProjectionAdmit::Reject;
+    }
+    if !fence.generation.is_empty() && (published.is_empty() || fence.generation == published) {
+        return HopProjectionAdmit::Admit;
+    }
+    HopProjectionAdmit::CountFallback
+}
+
 pub const CONTRACT_VERSION: &str = "sekai.object-type-index/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,5 +476,37 @@ mod tests {
         let (postgres, _) = member_filter_sql(IndexSqlDialect::Postgres, &filters).unwrap();
         assert!(postgres.contains("properties::json ->> 'tier'"));
         assert!(postgres.contains("::float8"));
+    }
+
+    #[test]
+    fn admit_hop_projection_fence_skips_count_when_generation_matches() {
+        let fence = HopProjectionFence {
+            ready: true,
+            generation: "rev-1".into(),
+            definition_digest: "rev-1".into(),
+        };
+        assert_eq!(
+            admit_hop_projection_fence(&fence, "rev-1"),
+            HopProjectionAdmit::Admit
+        );
+        assert_eq!(
+            admit_hop_projection_fence(&fence, "rev-2"),
+            HopProjectionAdmit::Reject
+        );
+        assert_eq!(
+            admit_hop_projection_fence(
+                &HopProjectionFence {
+                    ready: true,
+                    generation: String::new(),
+                    definition_digest: "rev-1".into(),
+                },
+                "rev-1"
+            ),
+            HopProjectionAdmit::CountFallback
+        );
+        assert_eq!(
+            admit_hop_projection_fence(&HopProjectionFence::default(), "rev-1"),
+            HopProjectionAdmit::Reject
+        );
     }
 }

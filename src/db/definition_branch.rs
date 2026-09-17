@@ -863,7 +863,7 @@ impl SekaiDb {
         transaction
             .execute(
                 "UPDATE sekai_object_type_index_join_status
-                 SET ready = 0, rebuilt_at_ms = ?1 WHERE namespace = ?2",
+                 SET ready = 0, generation = '', rebuilt_at_ms = ?1 WHERE namespace = ?2",
                 params![now_ms, proposal.namespace],
             )
             .map_err(|error| error.to_string())?;

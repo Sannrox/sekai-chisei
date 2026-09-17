@@ -279,6 +279,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn hop_projection_kinds_ready(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+        published: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.hop_projection_kinds_ready(namespace, kinds, published),
+            Self::Postgres(db) => db.hop_projection_kinds_ready(namespace, kinds, published),
+        }
+    }
+
     pub fn set_hop_projection_ready(
         &self,
         namespace: &str,

@@ -66,6 +66,8 @@ const OBJECT_TYPE_INDEX_JOIN_SCHEMA: &str =
     include_str!("postgres/0043_object_type_index_join.sql");
 const OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA: &str =
     include_str!("postgres/0044_object_type_index_join_value.sql");
+const OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA: &str =
+    include_str!("postgres/0045_object_type_index_join_generation.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -289,6 +291,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 43,
         name: "object_type_index_join_value",
         sql: OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA,
+    },
+    Migration {
+        version: 44,
+        name: "object_type_index_join_generation",
+        sql: OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA,
     },
 ];
 

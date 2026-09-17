@@ -1,11 +1,12 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
-    ObjectTypeDatasource, ObjectTypeIndexEdit, ObjectTypeIndexError, ObjectTypeIndexMember,
-    ObjectTypeIndexStatus, ReindexReport, member_from_edit, member_from_row, schema_drift,
+    HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
+    ObjectTypeIndexError, ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport,
+    admit_hop_projection_fence, member_from_edit, member_from_row, schema_drift,
 };
 use rusqlite::params;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 impl SekaiDb {
     pub(crate) fn migrate_object_type_index(&self) -> Result<(), String> {
@@ -73,11 +74,18 @@ impl SekaiDb {
                     kind TEXT NOT NULL,
                     ready INTEGER NOT NULL DEFAULT 0,
                     rebuilt_at_ms INTEGER NOT NULL DEFAULT 0,
+                    generation TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (namespace, kind)
                 );
                 ",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_index_join_status
+             ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        Ok(())
     }
 
     pub fn register_object_type_datasource(
@@ -458,8 +466,8 @@ impl SekaiDb {
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_object_type_index_join_status
-                 (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
-                params![namespace, kind, i64::from(ready), now_ms],
+                 (namespace, kind, ready, rebuilt_at_ms, generation) VALUES (?1,?2,?3,?4,?5)",
+                params![namespace, kind, i64::from(ready), now_ms, ""],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -473,7 +481,7 @@ impl SekaiDb {
         self.conn()
             .execute(
                 "UPDATE sekai_object_type_index_join_status
-                 SET ready = 0, rebuilt_at_ms = ?1 WHERE namespace = ?2",
+                 SET ready = 0, generation = '', rebuilt_at_ms = ?1 WHERE namespace = ?2",
                 params![now_ms, namespace],
             )
             .map(|_| ())
@@ -494,7 +502,18 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    fn hop_rebuild_generation(&self, namespace: &str, kind: &str) -> Result<String, String> {
+        if let Some(published) = self.get_published_definition_revision(namespace)? {
+            return Ok(published.revision_digest);
+        }
+        Ok(self
+            .get_object_type_datasource(namespace, kind)?
+            .map(|binding| binding.definition_digest)
+            .unwrap_or_default())
+    }
+
     fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+        let generation = self.hop_rebuild_generation(namespace, kind)?;
         let members = self.list_visible_index_members(
             namespace,
             kind,
@@ -504,8 +523,8 @@ impl SekaiDb {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT OR REPLACE INTO sekai_object_type_index_join_status
-             (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
-            params![namespace, kind, 0i64, now_ms],
+             (namespace, kind, ready, rebuilt_at_ms, generation) VALUES (?1,?2,?3,?4,?5)",
+            params![namespace, kind, 0i64, now_ms, ""],
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -534,33 +553,95 @@ impl SekaiDb {
         }
         tx.execute(
             "INSERT OR REPLACE INTO sekai_object_type_index_join_status
-             (namespace, kind, ready, rebuilt_at_ms) VALUES (?1,?2,?3,?4)",
-            params![namespace, kind, 1i64, now_ms],
+             (namespace, kind, ready, rebuilt_at_ms, generation) VALUES (?1,?2,?3,?4,?5)",
+            params![namespace, kind, 1i64, now_ms, generation],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
-    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
-        let ready = self
-            .conn()
-            .query_row(
-                "SELECT ready FROM sekai_object_type_index_join_status
-                 WHERE namespace = ?1 AND kind = ?2",
-                params![namespace, kind],
-                |row| Ok(row.get::<_, i64>(0)? != 0),
-            )
-            .optional_row()
-            .map(|value| value.unwrap_or(false))
-            .map_err(|error| error.to_string())?;
-        if !ready {
-            return Ok(false);
-        }
-        let joins = self.count_index_join_rows(namespace, kind)?;
-        if joins > 0 {
+    fn hop_projection_count_witness(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        if self.count_index_join_rows(namespace, kind)? > 0 {
             return Ok(true);
         }
         Ok(self.count_visible_index_members(namespace, kind)? == 0)
+    }
+
+    fn list_hop_projection_fences(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+    ) -> Result<HashMap<String, HopProjectionFence>, String> {
+        if kinds.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = (0..kinds.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT s.kind, s.ready, COALESCE(s.generation, ''), COALESCE(d.definition_digest, '')
+             FROM sekai_object_type_index_join_status s
+             LEFT JOIN sekai_object_type_datasource d
+               ON d.namespace = s.namespace AND d.kind = s.kind
+             WHERE s.namespace = ?1 AND s.kind IN ({placeholders})"
+        );
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::types::ToSql> = vec![&namespace];
+        for kind in kinds {
+            params.push(kind);
+        }
+        let rows = statement
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    HopProjectionFence {
+                        ready: row.get::<_, i64>(1)? != 0,
+                        generation: row.get(2)?,
+                        definition_digest: row.get(3)?,
+                    },
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut fences = HashMap::new();
+        for row in rows {
+            let (kind, fence) = row.map_err(|error| error.to_string())?;
+            fences.insert(kind, fence);
+        }
+        Ok(fences)
+    }
+
+    pub fn hop_projection_kinds_ready(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+        published: &str,
+    ) -> Result<bool, String> {
+        if kinds.is_empty() {
+            return Ok(true);
+        }
+        let fences = self.list_hop_projection_fences(namespace, kinds)?;
+        for kind in kinds {
+            let Some(fence) = fences.get(*kind) else {
+                return Ok(false);
+            };
+            match admit_hop_projection_fence(fence, published) {
+                HopProjectionAdmit::Admit => {}
+                HopProjectionAdmit::Reject => return Ok(false),
+                HopProjectionAdmit::CountFallback => {
+                    if !self.hop_projection_count_witness(namespace, kind)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn hop_projection_ready(&self, namespace: &str, kind: &str) -> Result<bool, String> {
+        let published = self.hop_rebuild_generation(namespace, kind)?;
+        self.hop_projection_kinds_ready(namespace, &[kind], &published)
     }
 
     pub fn count_index_join_rows(&self, namespace: &str, kind: &str) -> Result<i64, String> {
@@ -1002,6 +1083,15 @@ mod tests {
                 [],
             )
             .unwrap();
+        assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+
+        db.conn()
+            .execute(
+                "UPDATE sekai_object_type_index_join_status SET generation = ''
+                 WHERE namespace = 'sales' AND kind = 'Customer'",
+                [],
+            )
+            .unwrap();
         assert!(!db.hop_projection_ready("sales", "Customer").unwrap());
 
         db.set_hop_projection_ready("sales", "Customer", false, 30)
@@ -1011,6 +1101,46 @@ mod tests {
         db.apply_object_type_index("sales", "Customer", true, 40)
             .unwrap();
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    #[test]
+    fn hop_projection_fence_skips_count_when_generation_matches() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(
+            db.hop_projection_kinds_ready("sales", &["Customer"], "rev-1")
+                .unwrap()
+        );
+        db.conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_join WHERE namespace = 'sales' AND kind = 'Customer'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.hop_projection_kinds_ready("sales", &["Customer"], "rev-1")
+                .unwrap()
+        );
+        assert!(
+            !db.hop_projection_kinds_ready("sales", &["Customer"], "rev-2")
+                .unwrap()
+        );
     }
 
     #[test]
