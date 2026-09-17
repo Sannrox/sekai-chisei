@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Aggregate EvaluateObjectSet checks `aggregation.property` against property
+  grants on the leaf hop kind (#983). Denied numeric properties fail closed
+  instead of contributing to sum/min/max.
 - Object-log dual-read projects clerk property grants into the tagged deny-list
   (#969). A non-empty grant allow-list cannot be witnessed by the tagged
   single-deny API, so the canary stays off and evaluate keeps the SQL answer.

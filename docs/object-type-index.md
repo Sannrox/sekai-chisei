@@ -70,4 +70,5 @@ aggregates, and hop edges. Aggregate evaluates project only the group_by,
 numeric, filter, and nested-loop join properties needed for the plan.
 Indexed property filters (`eq`/`gt`/`gte`/`lt`/`lte`) are applied in SQL
 against the stored member JSON so evaluate does not deserialize every
-kind row before matching.
+kind row before matching. Aggregate `sum`/`min`/`max` fail closed when
+`aggregation.property` is not granted on the leaf hop kind.
