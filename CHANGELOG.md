@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Bind TypeSafe Jev as an Action-filling Function, not a write path
+  ([ADR 0082](docs/decisions/0082-system-one-action-function.md), #975). A
+  registered Action type may declare a pinned System One bind. Preview with
+  empty parameters returns `proposed_parameters_json` from an authorized
+  object projection. `SubmitActionInstance` remains the only write.
 - Hop-projection join lookup uses the stored raw join value instead of
   SHA-256 hashing every parent key on each hop (#952). PostgreSQL binds
   `ANY($::text[])`; SQLite keeps a bounded `IN` list. Digest remains the

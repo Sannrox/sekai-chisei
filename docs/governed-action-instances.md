@@ -37,7 +37,9 @@ Reconciliation stays `GetOperationReceipt`.
 Describe requires object-read authorization, not action-admin. Preview uses the
 same submit authorization as admission, then rechecks live object revision,
 Action version, closed parameter schema, submission criteria, policy, and
-budget. A preview digest is not a permit. Stale object or Action state fails
+budget. When `parameters_json` is empty and the type has a System One bind,
+preview fills `proposed_parameters_json` from an authorized object projection
+and does not persist. A preview digest is not a permit. Stale object or Action state fails
 closed. Hidden objects, types, and hidden-property criteria share one
 unavailable shape. A visible failing criterion is named on preview and on
 submit `deny_reason`. Compensation is explicit `unsupported` unless a type

@@ -141,6 +141,7 @@ impl InProcessSurface {
                         object_mutation: String::new(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+                        system_one_json: String::new(),
                     }),
                     request_id: "put-mcp-action".into(),
                 },

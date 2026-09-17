@@ -14,7 +14,10 @@ pub struct ContextEgressRecord {
 }
 
 pub fn is_external_provider(provider: &str) -> bool {
-    matches!(provider, "openai" | "anthropic" | "xai" | "meta" | "native")
+    matches!(
+        provider,
+        "openai" | "anthropic" | "xai" | "meta" | "native" | "typesafe"
+    )
 }
 
 pub fn object_ref(obj: &Object) -> String {
@@ -131,6 +134,7 @@ mod tests {
         assert!(is_external_provider("openai"));
         assert!(is_external_provider("anthropic"));
         assert!(is_external_provider("native"));
+        assert!(is_external_provider("typesafe"));
         assert!(!is_external_provider("ollama"));
     }
 

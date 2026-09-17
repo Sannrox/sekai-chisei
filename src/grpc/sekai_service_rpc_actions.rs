@@ -33,6 +33,7 @@ pub(super) async fn put_governed_action_type(
                 || e.contains("object_mutation")
                 || e.contains("object binding")
                 || e.contains("object_id")
+                || e.contains("system_one")
             {
                 Status::invalid_argument(e)
             } else {
@@ -239,6 +240,44 @@ pub(super) async fn preview_object_action(
         &inner.namespace,
         &inner.object_id,
     )?;
+    let type_def = match crate::sekai::action_describe_preview::load_object_bound_type(
+        &service.db,
+        &object,
+        &inner.type_id,
+        &inner.version,
+    ) {
+        Ok(type_def) => type_def,
+        Err(crate::sekai::action_describe_preview::ObjectActionProjectionError::Unavailable) => {
+            return Err(Status::permission_denied("object action unavailable"));
+        }
+        Err(
+            crate::sekai::action_describe_preview::ObjectActionProjectionError::InvalidArgument(
+                error,
+            ),
+        ) => return Err(Status::invalid_argument(error)),
+    };
+    let mut parameters_json = inner.parameters_json;
+    let mut proposed_parameters_json = String::new();
+    if crate::chisei::system_one_action::should_fill(&type_def, &parameters_json) {
+        let object_type = service.db.get_object_type(&object.kind).ok().flatten();
+        let client = sekai_provider::system_one::TypeSafeClient::from_env()
+            .map_err(Status::failed_precondition)?;
+        parameters_json = crate::chisei::system_one_action::fill_proposed_parameters(
+            &type_def,
+            &object,
+            object_type.as_ref(),
+            &client,
+        )
+        .await
+        .map_err(|error| {
+            if error.contains("system_one") || error.contains("action type has no") {
+                Status::failed_precondition(error)
+            } else {
+                Status::unavailable(error)
+            }
+        })?;
+        proposed_parameters_json.clone_from(&parameters_json);
+    }
     let preview = crate::sekai::action_describe_preview::preview_object_action(
         &service.db,
         service.budget.as_ref().map(std::convert::AsRef::as_ref),
@@ -247,7 +286,7 @@ pub(super) async fn preview_object_action(
             object: &object,
             type_id: &inner.type_id,
             version: &inner.version,
-            parameters_json: &inner.parameters_json,
+            parameters_json: &parameters_json,
             expected_object_updated_ms: inner.expected_object_updated_ms,
             expected_object_revision: &inner.expected_object_revision,
             evidence_submission_ids: &inner.evidence_submission_ids,
@@ -258,7 +297,9 @@ pub(super) async fn preview_object_action(
     if preview.outcome == crate::sekai::action_describe_preview::PREVIEW_UNAVAILABLE {
         return Err(Status::permission_denied("object action unavailable"));
     }
-    Ok(Response::new(object_action_preview_to_proto(preview)))
+    let mut proto = object_action_preview_to_proto(preview);
+    proto.proposed_parameters_json = proposed_parameters_json;
+    Ok(Response::new(proto))
 }
 pub(super) async fn get_action_instance(
     service: &SekaiServiceImpl,
