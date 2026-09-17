@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Object-log dual-read is a canary: it requires `max_rows_scanned` and samples
+  one of `SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE` requests (default 32) so enabling
+  the flag does not open the object store on every evaluate (#968). Set
+  sample to `1` for CI. Unsampled requests keep the SQL answer.
 - Hop-projection evaluate reads one ready+generation+digest fence per query
   (#967). Matching generation skips join/member COUNT; empty generation keeps
   the wipe-detector COUNT path. Publish and invalidate clear the stamp.

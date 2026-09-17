@@ -473,6 +473,11 @@ impl SekaiServiceImpl {
                 "object index dual-read requires max_rows_scanned",
             ));
         }
+        if self.object_log_dual_read.enabled && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
+            return Err(Status::failed_precondition(
+                "object-log dual-read requires max_rows_scanned",
+            ));
+        }
         let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
             Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
         })?;
@@ -618,6 +623,7 @@ impl SekaiServiceImpl {
                 // Tagged evaluate is not principal-aware. Clerk grants stay on
                 // SQL; a later mapper can project a deny-list after soak.
                 mikura::PropertyAcl::allow_all(),
+                bound.descriptor.cost_limit.max_rows_scanned,
             )
             .map_err(|error| Status::failed_precondition(error.message()))?;
         }
@@ -1974,6 +1980,7 @@ mod tests {
         svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
             enabled: true,
             log_path: Some(log.clone()),
+            sample_n: 1,
         };
         let request = EvaluateObjectSetRequest {
             descriptor: Some(ObjectSetDescriptor {
@@ -2026,6 +2033,53 @@ mod tests {
         assert_eq!(page.aggregates.len(), 1);
         assert_eq!(page.aggregates[0].value, 10.0);
         assert!(!page.authority);
+    }
+
+    #[tokio::test]
+    async fn object_log_dual_read_fails_closed_without_row_cost_limit() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 1,
+        };
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("object-log dual-read requires max_rows_scanned")
+        );
     }
 
     fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {
