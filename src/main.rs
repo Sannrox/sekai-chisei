@@ -1,5 +1,6 @@
 use sekai_chisei::combined_stores::{CombinedStoreLayout, registry_db_anchor};
 use sekai_chisei::config::Config;
+use sekai_chisei::store_relocate::open_layout_or_fence;
 use std::sync::Arc;
 use tokio::signal;
 
@@ -28,8 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sekai_chisei::provider_profile::refresh_provider_registry(&provider_registry_state_path)
         .map_err(std::io::Error::other)?;
 
-    let stores =
-        Arc::new(CombinedStoreLayout::from_env(&config.db_path).map_err(std::io::Error::other)?);
+    let stores = Arc::new(open_layout_or_fence(&config.db_path).map_err(std::io::Error::other)?);
     let db = stores.sekai_runtime();
     let active_credentials = db.list_active_credentials()?;
     let external_credentials_active = active_credentials.iter().any(|credential| {

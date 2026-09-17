@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Offline Chisei-family relocation copies destination tables family by
+  family, validates counts, and raises a writer fence so a single `DB_PATH`
+  writer refuses to start (`sekaictl admin store relocate`, #1006).
 - Combined mode opens two physical stores when `SEKAI_DB_PATH` and
   `CHISEI_DB_PATH` (or two PostgreSQL destination URLs) are set, and refuses
   a pair that resolves to the same file or database (#1005). Gateway stays a

@@ -35,7 +35,8 @@ If you want to deploy or operate the control plane:
 
 1. Review all settings in [Configuration](configuration.md).
 2. Apply the safeguards in [Operations and security](operations.md).
-3. Use the [Docker guide](docker.md) if you want the supported container
+3. Use [two-store relocation](store-relocation.md) when moving Chisei families off a historical single file.
+4. Use the [Docker guide](docker.md) if you want the supported container
    topology.
 
 ## Core concepts

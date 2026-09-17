@@ -103,7 +103,7 @@ snapshot, not a mixed pair.
 | Two physical stores in combined mode | Integration + config | implemented (#1005) |
 | Same public API on combined and split | Public-API integration, gateway smoke | proposed |
 | SQLite and PostgreSQL conformance per store | Shared conformance | proposed |
-| Fresh install + upgraded retained data | Migration tests | proposed |
+| Fresh install + upgraded retained data | Migration tests | implemented (#1006) |
 | Crash after reserve / after commit | Fault-injection | proposed |
 | Duplicate admission | Integration | proposed |
 | One-sided restore fence | Restore test | proposed |

@@ -77,6 +77,7 @@ pub mod sekai;
 pub mod shomei;
 pub mod source_adapter_catalog;
 pub mod source_webhook_cli;
+pub mod store_relocate;
 pub mod substitution_report;
 pub mod team_cli;
 pub mod warehouse_projection_cli;

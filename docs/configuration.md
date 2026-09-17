@@ -67,8 +67,11 @@ provenance issuance; they never fall back to a wider activation window.
 `CHISEI_DATABASE_URL` (PostgreSQL) open two physical stores. Combined mode
 refuses a pair that resolves to the same file or database. Partial destination
 configuration is refused; a second file is never invented from one path.
-`DB_PATH` and `DATABASE_URL` remain migration compatibility: they keep one
-physical store behind both typed handles until relocation copies families.
+`DB_PATH` and `DATABASE_URL` remain migration compatibility until
+[store relocation](store-relocation.md) copies Chisei families and raises
+the writer fence. After the fence a single-store writer refuses to start;
+set the destination pair instead.
+
 The gateway is a translator and does not own a third store.
 See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
 [ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
