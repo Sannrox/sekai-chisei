@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Document the #963 hop-projection default ops contract (#970): unset or
+  empty `SEKAI_OBJECT_INDEX_ENGINE` is hop-projection, including `parse("")`.
+  Operators must `ReindexObjectType` for hop kinds. Pinning nested-loop
+  does not bypass an unready generation.
 - Object-log dual-read skips unexpressible grammar (`group_by`, filters,
   incoming hops, path multiplicity, non-i64 sum) and keeps the SQL answer
   (#990). After #980 every production multi-hop has `group_by`; the canary
