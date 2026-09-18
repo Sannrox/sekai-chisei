@@ -5,6 +5,9 @@
 - Preview records TypeSafe egress audit only when the post-fill preview
   stays `valid`. A filled body that fails the second preview clears
   proposed parameters and does not persist a typesafe Decision (#1044).
+- MCP Preview that may fill uses the Function host request timeout
+  (`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) instead of a hard 5s
+  deadline. Submit stays at 5s (#987).
 - Shared and owned-plane opens of a stamped store compare `SEKAI_STORE_PEER`
   or refuse mutating RPCs until an operator restamp. An unstamped single
   file stays Shared compatibility (#1049).

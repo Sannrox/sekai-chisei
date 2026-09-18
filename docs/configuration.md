@@ -32,7 +32,7 @@ template.
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
-| `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. |
+| `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. MCP Preview that may fill uses `LLM_HTTP_REQUEST_TIMEOUT_SECS` (default 120s), not a hard 5s deadline; Submit stays at 5s. |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
@@ -129,7 +129,7 @@ Operator runbook and data model: [budget-topology.md](budget-topology.md). Desig
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound connection timeout |
 | `LLM_HTTP_READ_TIMEOUT_SECS` | `60` | Idle-read timeout |
 | `LLM_HTTP_POOL_IDLE_TIMEOUT_SECS` | `90` | Connection-pool idle timeout |
-| `LLM_HTTP_REQUEST_TIMEOUT_SECS` | `120` | Total timeout for unary provider calls |
+| `LLM_HTTP_REQUEST_TIMEOUT_SECS` | `120` | Total timeout for unary Function host calls. MCP Preview that may fill shares this budget so the adapter cannot deadline a fill that native Preview would complete |
 | `CHISEI_DEFAULT_DATA_CLASS` | `unclassified` | Default classification for egress decisions |
 | `CHISEI_SAFE_EGRESS_PROVIDERS` | empty | Comma-separated providers allowed by egress policy |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | empty | Providers whose upstream auth is supplied by the gateway; model routing treats them as available without a local key |
