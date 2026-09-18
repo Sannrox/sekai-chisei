@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Project object-type index member properties and page bounds in SQL so
+  EvaluateObjectSet does not decode the wide JSON row and apply
+  `LIMIT`/`OFFSET` after the stream (#1023).
 - `sekai` and `chisei` run as separate processes. Each opens only its own
   store and credentials, stamps that ownership, and rejects wrong-plane
   RPCs. Chisei hops to Sekai with `SEKAI_ENDPOINT` / `SEKAI_CREDENTIAL`;
