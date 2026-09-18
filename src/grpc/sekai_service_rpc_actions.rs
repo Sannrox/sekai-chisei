@@ -321,9 +321,15 @@ pub(super) async fn get_action_instance(
             .get_action_instance_by_idempotency(&inner.namespace, &inner.idempotency_key)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action instance not found"))?
+    } else if !inner.operation_id.trim().is_empty() {
+        service
+            .db
+            .get_action_instance_by_operation_id(&inner.operation_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("action instance not found"))?
     } else {
         return Err(Status::invalid_argument(
-            "instance_id or (namespace, idempotency_key) required",
+            "instance_id, operation_id, or (namespace, idempotency_key) required",
         ));
     };
     authorize_action_instance_read(service, &principals, &stored.namespace)?;

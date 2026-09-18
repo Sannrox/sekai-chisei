@@ -33,6 +33,7 @@ pub mod gunshi_policy;
 pub mod kioku;
 pub mod learning_change;
 pub mod lookup_first;
+pub mod remote_sekai;
 pub use sekai_provider::model_availability;
 pub mod model_routing;
 pub mod pipeline;

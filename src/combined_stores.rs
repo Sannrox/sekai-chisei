@@ -444,7 +444,7 @@ pub(crate) fn postgres_identity(url: &str) -> Result<StoreIdentity, String> {
     })
 }
 
-fn optional_trimmed_env(name: &str) -> Option<String> {
+pub(crate) fn optional_trimmed_env(name: &str) -> Option<String> {
     std::env::var(name).ok().and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {

@@ -1119,6 +1119,7 @@ fn config(db_path: &str) -> Config {
         assertion_issuer: None,
         assertion_audience: None,
         assertion_hmac_key: None,
+        sekai_endpoint: None,
     }
 }
 

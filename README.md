@@ -75,6 +75,9 @@ Start the control plane in one terminal:
 SEKAI_INSECURE=1 cargo run
 ```
 
+Combined mode is the default. To run the planes as separate processes, see
+[two-plane processes](docs/two-plane-processes.md).
+
 In another terminal, define a small service domain, seed facts, run a governed
 lookup, and receive a receipt hint:
 

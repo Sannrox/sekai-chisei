@@ -1152,6 +1152,8 @@ message GetActionInstanceRequest {
   // Optional alternate lookup when instance_id empty.
   string namespace = 2;
   string idempotency_key = 3;
+  // Optional hop lookup when instance_id and idempotency_key are empty.
+  string operation_id = 4;
 }
 message GetActionInstanceResponse { ActionInstance instance = 1; }
 message ListActionInstancesRequest {

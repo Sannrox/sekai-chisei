@@ -238,6 +238,7 @@ mod tests {
             assertion_issuer: None,
             assertion_audience: None,
             assertion_hmac_key: None,
+            sekai_endpoint: None,
         };
         let safe = safe_providers(&config);
         assert!(provider_safe_to_send("ollama", &safe));

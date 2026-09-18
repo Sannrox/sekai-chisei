@@ -300,6 +300,7 @@ fn fixture_config() -> Config {
         assertion_issuer: None,
         assertion_audience: None,
         assertion_hmac_key: None,
+        sekai_endpoint: None,
     }
 }
 
@@ -1236,6 +1237,7 @@ async fn run_async() -> Result<Report, String> {
                 instance_id: instance.instance_id.clone(),
                 namespace: String::new(),
                 idempotency_key: String::new(),
+                operation_id: String::new(),
             },
             OPERATOR,
         ))
