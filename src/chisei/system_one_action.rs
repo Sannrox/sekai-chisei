@@ -17,8 +17,24 @@ pub fn bind_of(type_def: &GovernedActionType) -> Option<&SystemOneBind> {
     type_def.system_one.as_ref().filter(|bind| !bind.is_empty())
 }
 
+/// Empty caller parameters: a blank string, JSON `null`, or `{}`.
+///
+/// Any other JSON, including a partial object, is caller-supplied and is
+/// not filled. Invalid JSON is not empty.
+pub fn parameters_are_empty(parameters_json: &str) -> bool {
+    let trimmed = parameters_json.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Null) => true,
+        Ok(Value::Object(map)) => map.is_empty(),
+        _ => false,
+    }
+}
+
 pub fn should_fill(type_def: &GovernedActionType, parameters_json: &str) -> bool {
-    parameters_json.trim().is_empty() && bind_of(type_def).is_some()
+    parameters_are_empty(parameters_json) && bind_of(type_def).is_some()
 }
 
 pub fn project_object_state(
@@ -149,6 +165,11 @@ mod tests {
     fn empty_parameters_select_the_bind() {
         assert!(should_fill(&type_def(), ""));
         assert!(should_fill(&type_def(), "   "));
+        assert!(should_fill(&type_def(), "{}"));
+        assert!(should_fill(&type_def(), "  {}  "));
+        assert!(should_fill(&type_def(), "null"));
+        assert!(!should_fill(&type_def(), "{"));
+        assert!(!should_fill(&type_def(), r#"{"object_id":"ticket-1"}"#));
         assert!(!should_fill(
             &type_def(),
             r#"{"object_id":"ticket-1","department":"technical"}"#
@@ -156,6 +177,7 @@ mod tests {
         let mut unbound = type_def();
         unbound.system_one = None;
         assert!(!should_fill(&unbound, ""));
+        assert!(!should_fill(&unbound, "{}"));
     }
 
     #[test]
