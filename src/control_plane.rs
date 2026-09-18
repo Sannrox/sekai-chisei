@@ -145,7 +145,7 @@ pub fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Err
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(500);
 
-    let stores = CombinedStoreLayout::from_env(&config.db_path).map_err(std::io::Error::other)?;
+    let stores = open_gateway_report_layout(&config.db_path).map_err(std::io::Error::other)?;
     let db = stores.sekai_runtime();
     let rows = crate::gateway_report::egress_rows(&db, after, limit)?;
 
@@ -161,4 +161,80 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].as_str())
+}
+
+fn open_gateway_report_layout(db_path: &str) -> Result<CombinedStoreLayout, String> {
+    crate::store_relocate::open_layout_or_fence(db_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chisei::budget::{BudgetTracker, PeriodType};
+    use crate::db::store::ChiseiStore;
+    use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
+    use crate::store_relocate::relocate_sqlite;
+
+    #[test]
+    fn gateway_report_refuses_fenced_shared_source() {
+        static STORE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = STORE_ENV.lock().unwrap();
+        let keys = [
+            "DB_PATH",
+            "DATABASE_URL",
+            "SEKAI_DB_PATH",
+            "CHISEI_DB_PATH",
+            "SEKAI_DATABASE_URL",
+            "CHISEI_DATABASE_URL",
+            "SEKAI_DB_BACKEND",
+        ];
+        struct RestoreEnv(Vec<(String, Option<String>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(&key, value) },
+                        None => unsafe { std::env::remove_var(&key) },
+                    }
+                }
+            }
+        }
+        let saved = RestoreEnv(
+            keys.iter()
+                .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+                .collect(),
+        );
+        for key in keys {
+            unsafe { std::env::remove_var(key) };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(source_s),
+                source_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            .set_limit("report-user", 3_000, PeriodType::Daily)
+            .unwrap();
+
+        let report = relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
+        assert!(report.fence_raised);
+
+        let err = open_gateway_report_layout(source_s).unwrap_err();
+        drop(saved);
+        assert!(err.contains("writer fence"), "{err}");
+    }
 }

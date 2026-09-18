@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Gateway-report opens Combined stores through `open_layout_or_fence`, so a
+  fenced Shared `DB_PATH` cannot still boot a writer for egress rows (#1029).
 - Shared-compatibility Combined open refuses when the writer fence is
   raised, so `from_env` cannot boot a single-file writer after relocate
   (#1019).
