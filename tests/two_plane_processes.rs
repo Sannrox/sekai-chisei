@@ -4,7 +4,7 @@ use std::future::Future;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::db::store::SekaiStore;
@@ -17,6 +17,21 @@ use sekai_chisei::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, Go
 use tempfile::tempdir;
 
 const TOKEN: &str = "plane-hop-token";
+
+#[derive(Clone, Default)]
+struct ProcessKiller(Arc<Mutex<Vec<u32>>>);
+
+impl ProcessKiller {
+    fn register(&self, pid: u32) {
+        self.0.lock().expect("process killer").push(pid);
+    }
+
+    fn kill_all(&self) {
+        for pid in self.0.lock().expect("process killer").iter().copied() {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+    }
+}
 
 struct ChildGuard(Child);
 
@@ -58,7 +73,12 @@ fn seed_sekai(path: &Path) {
         .unwrap();
 }
 
-fn spawn_plane(bin: &str, port: u16, extras: &[(&str, &str)]) -> ChildGuard {
+fn spawn_plane(
+    bin: &str,
+    port: u16,
+    extras: &[(&str, &str)],
+    killer: &ProcessKiller,
+) -> ChildGuard {
     let mut command = Command::new(bin);
     command
         .env("SEKAI_INSECURE", "1")
@@ -77,7 +97,9 @@ fn spawn_plane(bin: &str, port: u16, extras: &[(&str, &str)]) -> ChildGuard {
     for (key, value) in extras {
         command.env(key, value);
     }
-    ChildGuard(command.spawn().unwrap())
+    let child = command.spawn().unwrap();
+    killer.register(child.id());
+    ChildGuard(child)
 }
 
 fn wait_ready(port: u16) {
@@ -126,7 +148,7 @@ async fn chisei_client(port: u16) -> ChiseiServiceClient<tonic::transport::Chann
     ChiseiServiceClient::new(plane_endpoint(port).await)
 }
 
-fn run_async_with_deadline<F>(timeout: Duration, future: F)
+fn run_async_with_deadline<F>(timeout: Duration, killer: ProcessKiller, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
@@ -146,8 +168,17 @@ where
         .unwrap();
     match rx.recv_timeout(timeout) {
         Ok(Ok(())) => {}
-        Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_) => panic!("two-plane process test exceeded {timeout:?}"),
+        Ok(Err(panic)) => {
+            killer.kill_all();
+            std::panic::resume_unwind(panic)
+        }
+        Err(_) => {
+            killer.kill_all();
+            eprintln!("two-plane process test exceeded {timeout:?}");
+            // A leftover worker thread would keep this test binary alive and
+            // stall `cargo test-all`. Exit the process after killing children.
+            std::process::exit(101);
+        }
     }
 }
 
@@ -160,13 +191,15 @@ fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request
 
 #[test]
 fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
+    let killer = ProcessKiller::default();
     run_async_with_deadline(
         Duration::from_secs(45),
-        two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(),
+        killer.clone(),
+        two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer),
     );
 }
 
-async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
+async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer: ProcessKiller) {
     let dir = tempdir().unwrap();
     let sekai_db = dir.path().join("sekai.db");
     let chisei_db = dir.path().join("chisei.db");
@@ -181,6 +214,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
         sekai_bin,
         sekai_port,
         &[("SEKAI_DB_PATH", sekai_db.to_str().unwrap())],
+        &killer,
     );
     let _chisei = spawn_plane(
         chisei_bin,
@@ -190,6 +224,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
             ("SEKAI_ENDPOINT", &format!("http://127.0.0.1:{sekai_port}")),
             ("SEKAI_CREDENTIAL", TOKEN),
         ],
+        &killer,
     );
     wait_ready(sekai_port);
     wait_ready(chisei_port);
