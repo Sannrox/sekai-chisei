@@ -267,7 +267,10 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 `EvaluateObjectSet`, `sekai.actions.describe` → `DescribeObjectAction`,
 `sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
 `SubmitActionInstance`, and `chisei.receipt.read` → `GetOperationReceipt`.
-`SubmitActionInstance` uses the caller `operation_id` as `request_id`. Unknown
+`SubmitActionInstance` uses the caller `operation_id` as `request_id`.
+Preview that may fill uses the Function host request timeout
+(`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) instead of a hard 5s
+deadline; Submit stays at 5s. Unknown
 mappings, forged reserved metadata, oversized frames, and revoked catalog
 access fail closed. The adapter never invents success; timeouts and unknown
 effects reconcile through `GetOperationReceipt`.
