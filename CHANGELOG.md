@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Combined destination pairs stamp a split generation on each store and
+  refuse mutating RPCs when the pair disagrees after a one-sided restore
+  until `sekaictl admin store restamp` (#1009).
 - Concurrent governed-fact profile creates take an Immediate writer lock
   and treat SQLite lock errors as converge-if-identical, so two pools on
   one file no longer unwrap `database is locked` (#1030).

@@ -22,6 +22,7 @@ use tonic::service::Interceptor;
 use tonic::{Request, Status};
 use tracing::{error, info};
 
+use crate::combined_stores::CombinedStoreLayout;
 use crate::config::{Config, GrpcTcpMode};
 use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::pb::chisei::chisei_service_server::ChiseiService;
@@ -52,6 +53,7 @@ pub struct HttpProjectionState<I> {
     sekai: Arc<SekaiServiceImpl>,
     chisei: Arc<ChiseiServiceImpl>,
     interceptor: I,
+    stores: Option<Arc<CombinedStoreLayout>>,
 }
 
 pub fn should_bind(config: &Config, tcp_mode: &GrpcTcpMode) -> bool {
@@ -95,6 +97,7 @@ pub async fn bind_and_spawn<I>(
     sekai: Arc<SekaiServiceImpl>,
     chisei: Arc<ChiseiServiceImpl>,
     interceptor: I,
+    stores: Arc<CombinedStoreLayout>,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>>
 where
     I: Interceptor + Clone + Send + Sync + 'static,
@@ -105,6 +108,7 @@ where
         sekai,
         chisei,
         interceptor,
+        stores: Some(stores),
     });
     info!(
         addr = %addr,
@@ -131,6 +135,12 @@ where
     let path = format!("/{service}/{method}");
     if let Err(status) = authenticate(&state.interceptor, &headers) {
         return status_response(status);
+    }
+    if crate::store_relocate::is_mutating_rpc(&method)
+        && let Some(stores) = &state.stores
+        && let Err(message) = crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)
+    {
+        return status_response(Status::failed_precondition(message));
     }
     if let Err(status) = rpc_maturity::require_path(&path, experimental_rpcs_enabled()) {
         return status_response(status);
@@ -891,6 +901,7 @@ mod tests {
             sekai,
             chisei,
             interceptor,
+            stores: None,
         })
     }
 

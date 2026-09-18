@@ -3,6 +3,10 @@
 //! Quiesce writers, copy each Chisei-owned family into the destination store,
 //! validate counts, then raise a fence so a single `DB_PATH` / `DATABASE_URL`
 //! writer refuses to start. Rollback before the fence keeps the pre-copy files.
+//!
+//! Destination pairs also carry a split generation. Combined or split open
+//! compares the pair; a mismatch refuses mutating RPCs until an operator
+//! restamp. Independent backups are not a paired restore set.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,6 +14,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::combined_stores::{CombinedStoreLayout, CombinedStoreSources};
+use crate::db::postgres::PostgresDb;
+use crate::db::runtime_db::RuntimeDb;
 use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
 
 const CUTOVER_TABLE: &str = "sekai_store_cutover";
@@ -32,7 +38,8 @@ pub struct FamilyReport {
 }
 
 pub fn usage() -> &'static str {
-    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Restartable per family. Raises a writer fence so DB_PATH-only writers refuse to start. Quiesce writers first. Rollback before the fence keeps the pre-copy files."
+    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Restartable per family. Raises a writer fence so DB_PATH-only writers refuse to start. Quiesce writers first. Rollback before the fence keeps the pre-copy files.\n\
+sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
 }
 
 pub fn run_store_command(
@@ -43,6 +50,12 @@ pub fn run_store_command(
             let config = parse_relocate(&args[1..])?;
             let report = relocate_sqlite(&config.source, &config.sekai, &config.chisei)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Some("restamp") => {
+            let config = parse_restamp(&args[1..])?;
+            let generation = restamp_destinations(&config.sekai, &config.chisei)?;
+            println!("{{\"generation\":{generation}}}");
             Ok(())
         }
         _ => Err(std::io::Error::other(usage()).into()),
@@ -79,6 +92,34 @@ fn parse_relocate(args: &[String]) -> Result<RelocateArgs, String> {
     }
     Ok(RelocateArgs {
         source: source.ok_or("--source is required")?,
+        sekai: sekai.ok_or("--sekai is required")?,
+        chisei: chisei.ok_or("--chisei is required")?,
+    })
+}
+
+struct RestampArgs {
+    sekai: String,
+    chisei: String,
+}
+
+fn parse_restamp(args: &[String]) -> Result<RestampArgs, String> {
+    let mut sekai = None;
+    let mut chisei = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sekai" => {
+                sekai = Some(require_value(args, i, "--sekai")?);
+                i += 2;
+            }
+            "--chisei" => {
+                chisei = Some(require_value(args, i, "--chisei")?);
+                i += 2;
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    Ok(RestampArgs {
         sekai: sekai.ok_or("--sekai is required")?,
         chisei: chisei.ok_or("--chisei is required")?,
     })
@@ -270,6 +311,259 @@ pub fn shared_writer_guidance() -> String {
     "this database has a two-store writer fence; set SEKAI_DB_PATH and CHISEI_DB_PATH (or two PostgreSQL URLs) and keep writers quiesced on the historical single file. Rollback is restore-both from the pre-fence snapshot, not a mixed pair".into()
 }
 
+/// Compared split-generation state for a combined destination pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SplitGenerationState {
+    Shared,
+    Matched {
+        generation: i64,
+    },
+    Unstamped,
+    Mismatched {
+        sekai: Option<i64>,
+        chisei: Option<i64>,
+    },
+}
+
+impl SplitGenerationState {
+    pub fn refuses_mutations(&self) -> bool {
+        matches!(self, Self::Mismatched { .. })
+    }
+}
+
+pub fn compare_split_generations(sekai: Option<i64>, chisei: Option<i64>) -> SplitGenerationState {
+    match (sekai, chisei) {
+        (None, None) => SplitGenerationState::Unstamped,
+        (Some(left), Some(right)) if left == right => {
+            SplitGenerationState::Matched { generation: left }
+        }
+        (sekai, chisei) => SplitGenerationState::Mismatched { sekai, chisei },
+    }
+}
+
+pub fn split_generation_state(
+    layout: &CombinedStoreLayout,
+) -> Result<SplitGenerationState, String> {
+    if !layout.is_split() {
+        return Ok(SplitGenerationState::Shared);
+    }
+    Ok(compare_split_generations(
+        read_runtime_generation(&layout.sekai_runtime())?,
+        read_runtime_generation(&layout.chisei_runtime())?,
+    ))
+}
+
+/// Stamp a matching generation when both destinations are empty; leave a
+/// mismatch in place so mutating RPCs stay refused.
+pub fn align_split_generations(
+    layout: &CombinedStoreLayout,
+) -> Result<SplitGenerationState, String> {
+    match split_generation_state(layout)? {
+        SplitGenerationState::Unstamped => {
+            let generation = restamp_split_generation(layout)?;
+            Ok(SplitGenerationState::Matched { generation })
+        }
+        other => Ok(other),
+    }
+}
+
+pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> Result<(), String> {
+    match split_generation_state(layout)? {
+        SplitGenerationState::Mismatched { sekai, chisei } => {
+            Err(generation_mismatch_guidance(sekai, chisei))
+        }
+        _ => Ok(()),
+    }
+}
+
+pub fn generation_mismatch_guidance(sekai: Option<i64>, chisei: Option<i64>) -> String {
+    format!(
+        "split generations disagree (sekai={sekai:?}, chisei={chisei:?}); mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Independent backups are not a paired restore set"
+    )
+}
+
+pub fn restamp_split_generation(layout: &CombinedStoreLayout) -> Result<i64, String> {
+    if !layout.is_split() {
+        return Err("restamp requires a destination pair".into());
+    }
+    let generation = chrono::Utc::now().timestamp_millis();
+    write_runtime_generation(&layout.sekai_runtime(), generation)?;
+    write_runtime_generation(&layout.chisei_runtime(), generation)?;
+    Ok(generation)
+}
+
+pub fn restamp_destinations(sekai: &str, chisei: &str) -> Result<i64, String> {
+    let layout = open_restamp_layout(sekai, chisei)?;
+    restamp_split_generation(&layout)
+}
+
+fn open_restamp_layout(sekai: &str, chisei: &str) -> Result<CombinedStoreLayout, String> {
+    let sekai_pg = looks_like_postgres_url(sekai);
+    let chisei_pg = looks_like_postgres_url(chisei);
+    if sekai_pg != chisei_pg {
+        return Err("restamp requires two SQLite paths or two PostgreSQL URLs".into());
+    }
+    if sekai_pg {
+        CombinedStoreSources {
+            backend: Some(BackendIdentity::Postgres),
+            default_sqlite_path: "unused.db".into(),
+            sekai_postgres_url: Some(sekai.to_string()),
+            chisei_postgres_url: Some(chisei.to_string()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+    } else {
+        CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: sekai.to_string(),
+            sekai_sqlite_path: Some(sekai.to_string()),
+            chisei_sqlite_path: Some(chisei.to_string()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+    }
+}
+
+fn looks_like_postgres_url(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("postgres://") || trimmed.starts_with("postgresql://")
+}
+
+pub fn is_mutating_rpc(method: &str) -> bool {
+    let name = method.rsplit('/').next().unwrap_or(method);
+    !(name.starts_with("Get")
+        || name.starts_with("List")
+        || name.starts_with("Evaluate")
+        || name.starts_with("Describe")
+        || name.starts_with("Preview")
+        || name.starts_with("Search")
+        || name.starts_with("Lookup")
+        || name.starts_with("Watch")
+        || name == "Check"
+        || name == "CheckAccess"
+        || name == "CheckReady"
+        || name == "HealthCheck")
+}
+
+pub fn read_runtime_generation(db: &RuntimeDb) -> Result<Option<i64>, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(read_sqlite_generation)?,
+        RuntimeDb::Postgres(db) => read_postgres_generation(db),
+    }
+}
+
+pub fn write_runtime_generation(db: &RuntimeDb, generation: i64) -> Result<(), String> {
+    match db {
+        RuntimeDb::Sqlite(_) => {
+            db.with_sqlite_conn(|conn| write_sqlite_generation(conn, generation))?
+        }
+        RuntimeDb::Postgres(db) => write_postgres_generation(db, generation),
+    }
+}
+
+fn read_sqlite_generation(conn: &Connection) -> Result<Option<i64>, String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![CUTOVER_TABLE],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+    conn.query_row(
+        &format!("SELECT generation FROM {CUTOVER_TABLE} WHERE id=1"),
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn write_sqlite_generation(conn: &Connection, generation: i64) -> Result<(), String> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {CUTOVER_TABLE} (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation INTEGER NOT NULL,
+            fence_raised INTEGER NOT NULL,
+            raised_at_ms INTEGER NOT NULL
+        );"
+    ))
+    .map_err(|error| error.to_string())?;
+    let fence_raised: i64 = conn
+        .query_row(
+            &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {CUTOVER_TABLE}
+             (id, generation, fence_raised, raised_at_ms)
+             VALUES (1, ?1, ?2, ?3)"
+        ),
+        params![
+            generation,
+            fence_raised,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn read_postgres_generation(db: &PostgresDb) -> Result<Option<i64>, String> {
+    let mut conn = db.connection()?;
+    match conn.query_opt(
+        "SELECT generation FROM sekai_store_cutover WHERE id = 1",
+        &[],
+    ) {
+        Ok(Some(row)) => Ok(Some(row.get(0))),
+        Ok(None) => Ok(None),
+        Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_postgres_generation(db: &PostgresDb, generation: i64) -> Result<(), String> {
+    let mut conn = db.connection()?;
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS sekai_store_cutover (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation BIGINT NOT NULL,
+            fence_raised INTEGER NOT NULL,
+            raised_at_ms BIGINT NOT NULL
+        );",
+    )
+    .map_err(|error| error.to_string())?;
+    let fence_raised: i64 = match conn.query_opt(
+        "SELECT fence_raised FROM sekai_store_cutover WHERE id = 1",
+        &[],
+    ) {
+        Ok(Some(row)) => row.get(0),
+        Ok(None) => 0,
+        Err(error) => return Err(error.to_string()),
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
+         VALUES (1, $1, $2, $3)
+         ON CONFLICT (id) DO UPDATE SET
+            generation = EXCLUDED.generation,
+            raised_at_ms = EXCLUDED.raised_at_ms",
+        &[&generation, &fence_raised, &now_ms],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn list_chisei_tables(conn: &Connection, schema: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
         .prepare(&format!(
@@ -429,6 +723,7 @@ pub fn enforce_layout_writer_fence(layout: &CombinedStoreLayout) -> Result<(), S
 pub fn open_layout_or_fence(default_sqlite_path: &str) -> Result<CombinedStoreLayout, String> {
     let layout = CombinedStoreSources::from_env(default_sqlite_path)?.open()?;
     enforce_layout_writer_fence(&layout)?;
+    align_split_generations(&layout)?;
     Ok(layout)
 }
 
@@ -540,5 +835,220 @@ mod tests {
     fn same_source_and_destination_is_refused() {
         let err = relocate_sqlite("shared.db", "sekai.db", "shared.db").unwrap_err();
         assert!(err.contains("shared source"), "{err}");
+    }
+
+    fn open_dest_pair(sekai: &str, chisei: &str) -> CombinedStoreLayout {
+        CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: sekai.into(),
+            sekai_sqlite_path: Some(sekai.into()),
+            chisei_sqlite_path: Some(chisei.into()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap()
+    }
+
+    #[test]
+    fn compare_split_generations_classifies_pairs() {
+        assert_eq!(
+            compare_split_generations(None, None),
+            SplitGenerationState::Unstamped
+        );
+        assert_eq!(
+            compare_split_generations(Some(7), Some(7)),
+            SplitGenerationState::Matched { generation: 7 }
+        );
+        assert_eq!(
+            compare_split_generations(Some(7), Some(8)),
+            SplitGenerationState::Mismatched {
+                sekai: Some(7),
+                chisei: Some(8)
+            }
+        );
+        assert_eq!(
+            compare_split_generations(Some(7), None),
+            SplitGenerationState::Mismatched {
+                sekai: Some(7),
+                chisei: None
+            }
+        );
+        assert!(compare_split_generations(Some(1), Some(2)).refuses_mutations());
+        assert!(!compare_split_generations(Some(1), Some(1)).refuses_mutations());
+    }
+
+    #[test]
+    fn mutating_rpc_names_are_classified() {
+        assert!(is_mutating_rpc("SubmitActionInstance"));
+        assert!(is_mutating_rpc("/sekai.SekaiService/SubmitActionInstance"));
+        assert!(is_mutating_rpc("PutGovernedActionType"));
+        assert!(is_mutating_rpc("RecordDecision"));
+        assert!(!is_mutating_rpc("GetActionInstance"));
+        assert!(!is_mutating_rpc("ListGrants"));
+        assert!(!is_mutating_rpc("EvaluateObjectSet"));
+        assert!(!is_mutating_rpc("PreviewObjectAction"));
+        assert!(!is_mutating_rpc("DescribeObjectAction"));
+        assert!(!is_mutating_rpc("CheckAccess"));
+    }
+
+    #[test]
+    fn dest_pair_aligns_empty_generations_and_allows_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        let aligned = align_split_generations(&layout).unwrap();
+        assert!(matches!(aligned, SplitGenerationState::Matched { .. }));
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_generation(&layout.sekai_runtime()).unwrap(),
+            read_runtime_generation(&layout.chisei_runtime()).unwrap()
+        );
+    }
+
+    #[test]
+    fn one_sided_restore_refuses_mutations_until_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        write_runtime_generation(&layout.sekai_runtime(), 11).unwrap();
+        write_runtime_generation(&layout.chisei_runtime(), 22).unwrap();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("split generations disagree"), "{err}");
+        assert!(err.contains("restamp"), "{err}");
+        restamp_split_generation(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_generation(&layout.sekai_runtime()).unwrap(),
+            read_runtime_generation(&layout.chisei_runtime()).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_generation_on_one_store_is_a_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        write_runtime_generation(&layout.sekai_runtime(), 9).unwrap();
+        let state = split_generation_state(&layout).unwrap();
+        assert_eq!(
+            state,
+            SplitGenerationState::Mismatched {
+                sekai: Some(9),
+                chisei: None
+            }
+        );
+        assert!(
+            refuse_mutating_if_generation_mismatch(&layout)
+                .unwrap_err()
+                .contains("restamp")
+        );
+    }
+
+    #[test]
+    fn shared_layout_does_not_compare_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let path_s = path.to_str().unwrap();
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(path_s),
+                path_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let layout = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: path_s.into(),
+            legacy_sqlite_path: Some(path_s.into()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        assert_eq!(
+            split_generation_state(&layout).unwrap(),
+            SplitGenerationState::Shared
+        );
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn relocate_stamps_the_same_generation_on_both_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(source_s),
+                source_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let report =
+            relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei.to_str().unwrap()).unwrap();
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        assert_eq!(
+            split_generation_state(&layout).unwrap(),
+            SplitGenerationState::Matched {
+                generation: report.generation
+            }
+        );
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn restamp_cli_rewrites_a_mismatched_sqlite_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let sekai_s = sekai.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        let layout = open_dest_pair(sekai_s, chisei_s);
+        write_runtime_generation(&layout.sekai_runtime(), 1).unwrap();
+        write_runtime_generation(&layout.chisei_runtime(), 2).unwrap();
+        drop(layout);
+        let generation = restamp_destinations(sekai_s, chisei_s).unwrap();
+        let reopened = open_dest_pair(sekai_s, chisei_s);
+        assert_eq!(
+            split_generation_state(&reopened).unwrap(),
+            SplitGenerationState::Matched { generation }
+        );
+    }
+
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    #[test]
+    fn postgres_generation_roundtrip_covers_the_fence() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let pem = std::fs::read(&path).expect("read PostgreSQL test CA certificate");
+            PostgresDb::connect_with_ca_certificate(&url, 4, &pem).unwrap()
+        } else {
+            PostgresDb::connect(&url, 4).unwrap()
+        };
+        let runtime = RuntimeDb::Postgres(std::sync::Arc::new(db));
+        write_runtime_generation(&runtime, 41).unwrap();
+        assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(41));
+        write_runtime_generation(&runtime, 42).unwrap();
+        assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(42));
+        assert!(compare_split_generations(Some(42), Some(41)).refuses_mutations());
+        assert!(!compare_split_generations(Some(42), Some(42)).refuses_mutations());
     }
 }
