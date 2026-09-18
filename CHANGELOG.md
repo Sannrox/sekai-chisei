@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Combined two-store startup reconciles Sekai execution evidence against
+  the Sekai runtime, not the Chisei destination (#1013).
 - Offline Chisei-family relocation copies destination tables family by
   family, validates counts, and raises a writer fence so a single `DB_PATH`
   writer refuses to start (`sekaictl admin store relocate`, #1006).
