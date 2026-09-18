@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Relocate refuses `--sekai` and `--chisei` that resolve to the same SQLite
+  file or inode, so Split cutover cannot land both planes on one identity
+  (#1027).
 - Restore fence treats `PreviewObjectAction` as mutating so TypeSafe fill,
   egress, and Decision audit stay refused while split generations disagree
   (#1048).
