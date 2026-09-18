@@ -624,7 +624,15 @@ impl SekaiServiceImpl {
                 ));
             }
         }
-        if self.object_log_dual_read.enabled {
+        if self.object_log_dual_read.enabled
+            && crate::sekai::object_log::should_fetch_canary_policies(
+                &self.object_log_dual_read,
+                &bound.descriptor,
+                hops,
+                &aggregation,
+                bound.descriptor.cost_limit.max_rows_scanned,
+            )
+        {
             let mut kinds = vec![bound.descriptor.kind.as_str()];
             kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
             let mut policies = Vec::new();
@@ -646,14 +654,23 @@ impl SekaiServiceImpl {
                     } else {
                         paths.clone()
                     };
-                    match crate::sekai::object_log::compare_sql_to_log(
-                        &self.object_log_dual_read,
+                    let log_path =
+                        self.object_log_dual_read
+                            .log_path
+                            .as_deref()
+                            .ok_or_else(|| {
+                                Status::failed_precondition(
+                                    crate::sekai::object_log::ObjectLogCompareError::MissingLog
+                                        .message(),
+                                )
+                            })?;
+                    match crate::sekai::object_log::compare_sql_to_log_path(
+                        log_path,
                         &bound.descriptor,
                         hops,
                         &aggregation,
                         &sql_paths,
                         acl,
-                        bound.descriptor.cost_limit.max_rows_scanned,
                     ) {
                         Ok(())
                         | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}

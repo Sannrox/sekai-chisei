@@ -4,6 +4,9 @@
 
 - Preview fills System One proposals only after revision, criteria, policy,
   and budget would allow, and records a TypeSafe egress audit (#982).
+- Object-log dual-read samples and skips unexpressible compares before
+  loading `active_object_policy`, so unsampled evaluates do not pay
+  per-kind policy fetches (#1024).
 - Bind TypeSafe Jev as an Action-filling Function, not a write path
   ([ADR 0084](docs/decisions/0084-system-one-action-function.md), #975). A
   registered Action type may declare a pinned System One bind. Preview with
