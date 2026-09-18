@@ -1,8 +1,10 @@
 //! Black-box process isolation for the Sekai and Chisei binaries.
 
+use std::future::Future;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use sekai_chisei::db::store::SekaiStore;
@@ -106,16 +108,47 @@ fn run_until_exit(mut command: Command, timeout: Duration) -> std::process::Exit
     }
 }
 
-async fn sekai_client(port: u16) -> SekaiServiceClient<tonic::transport::Channel> {
-    SekaiServiceClient::connect(format!("http://127.0.0.1:{port}"))
+async fn plane_endpoint(port: u16) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .connect()
         .await
         .unwrap()
 }
 
+async fn sekai_client(port: u16) -> SekaiServiceClient<tonic::transport::Channel> {
+    SekaiServiceClient::new(plane_endpoint(port).await)
+}
+
 async fn chisei_client(port: u16) -> ChiseiServiceClient<tonic::transport::Channel> {
-    ChiseiServiceClient::connect(format!("http://127.0.0.1:{port}"))
-        .await
-        .unwrap()
+    ChiseiServiceClient::new(plane_endpoint(port).await)
+}
+
+fn run_async_with_deadline<F>(timeout: Duration, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("two-plane-deadline".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(future)
+            }));
+            let _ = tx.send(result);
+        })
+        .unwrap();
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("two-plane process test exceeded {timeout:?}"),
+    }
 }
 
 fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request<T> {
@@ -125,14 +158,12 @@ fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request
     request
 }
 
-#[tokio::test]
-async fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
-    tokio::time::timeout(
-        Duration::from_secs(60),
+#[test]
+fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
+    run_async_with_deadline(
+        Duration::from_secs(45),
         two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(),
-    )
-    .await
-    .expect("two-plane process test timed out")
+    );
 }
 
 async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
@@ -233,13 +264,9 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
         receipt.receipt_json
     );
 
-    let wrong_receipt = SekaiServiceClient::connect(format!("http://127.0.0.1:{sekai_port}"))
-        .await
-        .unwrap();
+    let wrong_receipt = SekaiServiceClient::new(plane_endpoint(sekai_port).await);
     // Reuse the Chisei client type against the Sekai listener.
-    let wrong = ChiseiServiceClient::connect(format!("http://127.0.0.1:{sekai_port}"))
-        .await
-        .unwrap()
+    let wrong = ChiseiServiceClient::new(plane_endpoint(sekai_port).await)
         .get_operation_receipt(tonic::Request::new(GetOperationReceiptRequest {
             operation_id: "op-plane-ok".into(),
             request_id: String::new(),
@@ -251,9 +278,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
     assert_eq!(wrong.code(), tonic::Code::FailedPrecondition);
     assert!(wrong.message().contains("wrong-plane"), "{wrong}");
 
-    let wrong_submit = SekaiServiceClient::connect(format!("http://127.0.0.1:{chisei_port}"))
-        .await
-        .unwrap()
+    let wrong_submit = SekaiServiceClient::new(plane_endpoint(chisei_port).await)
         .submit_action_instance(tonic::Request::new(SubmitActionInstanceRequest {
             namespace: "acme".into(),
             type_id: "dispatch".into(),
