@@ -144,11 +144,14 @@ pub async fn dispatch_native(
             let request = invocation
                 .bind(payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let response = timeout(Duration::from_secs(5), sekai.preview_object_action(request))
-                .await
-                .map_err(|_| AdapterError::Deadline)?
-                .map_err(status_error)?
-                .into_inner();
+            let response = timeout(
+                preview_fill_deadline(),
+                sekai.preview_object_action(request),
+            )
+            .await
+            .map_err(|_| AdapterError::Deadline)?
+            .map_err(status_error)?
+            .into_inner();
             serde_json::to_value(response)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))
         }
@@ -536,9 +539,11 @@ impl NativeSurface for SdkSurface {
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
                 let channel = self.channel().await?;
                 let mut client = SekaiServiceClient::new(channel);
-                let response =
-                    with_timeout(self.config.timeout, client.preview_object_action(request))
-                        .await?;
+                let response = with_timeout(
+                    preview_deadline(self.config.timeout),
+                    client.preview_object_action(request),
+                )
+                .await?;
                 serde_json::to_value(response)
                     .map_err(|error| AdapterError::Protocol(error.to_string()))
             }
@@ -626,6 +631,17 @@ fn bind_session<T>(
         request.metadata_mut().insert(key, metadata);
     }
     Ok(())
+}
+
+/// MCP Preview may invoke System One fill. Use the Function host request
+/// timeout (`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) so the adapter
+/// cannot deadline a fill that native Preview would complete.
+pub(crate) fn preview_fill_deadline() -> Duration {
+    crate::llm::HttpTimeouts::from_env().request_timeout
+}
+
+fn preview_deadline(configured: Duration) -> Duration {
+    preview_fill_deadline().max(configured)
 }
 
 async fn with_timeout<F, T>(limit: Duration, future: F) -> Result<T, AdapterError>
@@ -726,5 +742,19 @@ mod tests {
             json_string(&input, "parameters_json", "parametersJson").unwrap(),
             "{}"
         );
+    }
+
+    #[test]
+    fn preview_fill_deadline_matches_function_host_request_timeout() {
+        assert_eq!(
+            preview_fill_deadline(),
+            crate::llm::HttpTimeouts::from_env().request_timeout
+        );
+        assert_eq!(
+            preview_deadline(Duration::from_secs(5)),
+            preview_fill_deadline()
+        );
+        let longer = preview_fill_deadline() + Duration::from_secs(30);
+        assert_eq!(preview_deadline(longer), longer);
     }
 }
