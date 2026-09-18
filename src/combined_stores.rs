@@ -182,7 +182,9 @@ impl CombinedStoreSources {
                     )?,
                 };
                 let backend = RuntimeBackend::initialize(config)?;
-                Ok(CombinedStoreLayout::Shared { backend, identity })
+                let layout = CombinedStoreLayout::Shared { backend, identity };
+                crate::store_relocate::refuse_shared_writer_if_fenced(&layout)?;
+                Ok(layout)
             }
         }
     }

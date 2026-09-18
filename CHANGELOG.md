@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Shared-compatibility Combined open refuses when the writer fence is
+  raised, so `from_env` cannot boot a single-file writer after relocate
+  (#1019).
 - Combined SQLite destinations that resolve to the same inode are refused
   even when the path strings differ (hardlinks). Canonical-equal paths
   still refuse (#1017).
