@@ -50,8 +50,8 @@ lives in the separate [research index](research/README.md).
   observability, backups, and deployment checks.
 - [Two-store relocation](store-relocation.md) — offline Chisei-family copy,
   resume, rollback point, and writer fence.
-- [Two-plane processes](two-plane-processes.md) — separate `sekai` and
-  `chisei` processes, wrong-plane rejection, and the authenticated hop.
+- [Two-plane processes](two-plane-processes.md) — separate `sekai-plane` and
+  `chisei-plane` processes, wrong-plane rejection, and the authenticated hop.
 - [Docker](docker.md) — container quick start and transport choices.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.

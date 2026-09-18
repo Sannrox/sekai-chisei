@@ -70,7 +70,7 @@ does not copy the Sekai receipt body.
 
 ## Separate processes
 
-`sekai` and `chisei` binaries each open only their own store and credentials.
+`sekai-plane` and `chisei-plane` binaries each open only their own store and credentials.
 Combined `sekai-chisei` still uses the typed two-store contract. Wrong-plane
 RPCs return `FAILED_PRECONDITION`. A Chisei process hops to Sekai with
 `SEKAI_ENDPOINT` and `SEKAI_CREDENTIAL`; Sekai rechecks current caller

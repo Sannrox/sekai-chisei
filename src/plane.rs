@@ -1,7 +1,7 @@
 //! Process-plane isolation for independently runnable Sekai and Chisei servers.
 //!
 //! Combined `sekai-chisei` still opens the typed two-store contract. The
-//! `sekai` and `chisei` binaries each open only their own store and
+//! `sekai-plane` and `chisei-plane` binaries each open only their own store and
 //! credentials, stamp that ownership, and refuse the other plane's
 //! destination variables or a store already stamped for the other plane.
 

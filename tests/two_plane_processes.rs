@@ -207,8 +207,8 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
 
     let sekai_port = free_port();
     let chisei_port = free_port();
-    let sekai_bin = env!("CARGO_BIN_EXE_sekai");
-    let chisei_bin = env!("CARGO_BIN_EXE_chisei");
+    let sekai_bin = env!("CARGO_BIN_EXE_sekai-plane");
+    let chisei_bin = env!("CARGO_BIN_EXE_chisei-plane");
 
     let _sekai = spawn_plane(
         sekai_bin,
@@ -357,7 +357,7 @@ fn sekai_binary_refuses_chisei_destination_variables() {
     let dir = tempdir().unwrap();
     let sekai_db = dir.path().join("sekai.db");
     let chisei_db = dir.path().join("chisei.db");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-plane"));
     command
         .env("SEKAI_INSECURE", "1")
         .env("SEKAI_BIND", "127.0.0.1")

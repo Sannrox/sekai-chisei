@@ -73,7 +73,7 @@ configuration is refused; a second file is never invented from one path.
 the writer fence. After the fence a single-store writer refuses to start;
 set the destination pair instead.
 
-The `sekai` and `chisei` binaries each open only their own store. See
+The `sekai-plane` and `chisei-plane` binaries each open only their own store. See
 [two-plane processes](two-plane-processes.md). Combined mode still uses the
 typed dest-pair. The gateway is a translator and does not own a third store.
 See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and

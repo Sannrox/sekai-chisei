@@ -97,11 +97,11 @@ chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 tempfile = "3"
 
 [[bin]]
-name = "sekai"
+name = "sekai-plane"
 path = "src/bin/sekai.rs"
 
 [[bin]]
-name = "chisei"
+name = "chisei-plane"
 path = "src/bin/chisei.rs"
 
 [[bin]]
