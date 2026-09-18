@@ -5,6 +5,9 @@
 - Remote Sekai commit lookup reuses one gRPC channel and the current Tokio
   runtime (or one parked fallback runtime) instead of spawning a thread,
   runtime, and connect on every hop (#1046). Combined stays in-process.
+- Shared-compatibility Combined open refuses when the writer fence is
+  raised, so `from_env` cannot boot a single-file writer after relocate
+  (#1019).
 - Preview records TypeSafe egress audit only when the post-fill preview
   stays `valid`. A filled body that fails the second preview clears
   proposed parameters and does not persist a typesafe Decision (#1044).
