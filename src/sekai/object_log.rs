@@ -48,12 +48,37 @@ impl ObjectLogDualRead {
         }
     }
 
-    fn take_sample(&self) -> bool {
+    pub(crate) fn take_sample(&self) -> bool {
         let n = u64::from(self.sample_n.max(1));
         SAMPLE_TICK
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(n)
     }
+}
+
+/// Whether this evaluate should load `active_object_policy` and open the
+/// object-log Store.
+///
+/// Sample first so unsampled requests pay neither cost. After a hit, skip
+/// unexpressible grammar before any policy fetch. Store open stays inside
+/// [`compare_sql_to_log_path`] on the canary only.
+pub fn should_fetch_canary_policies(
+    config: &ObjectLogDualRead,
+    descriptor: &ObjectSetDescriptor,
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    aggregation: &ObjectSetAggregation,
+    max_rows_scanned: i32,
+) -> bool {
+    if !config.enabled || max_rows_scanned <= 0 {
+        return false;
+    }
+    if !config.take_sample() {
+        return false;
+    }
+    !matches!(
+        map_evaluate_request(descriptor, hops, aggregation, PropertyAcl::allow_all()),
+        Err(ObjectLogCompareError::Unsupported(_))
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -566,6 +591,93 @@ mod tests {
             10,
         )
         .unwrap();
+    }
+
+    fn canary_descriptor() -> ObjectSetDescriptor {
+        ObjectSetDescriptor {
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        }
+    }
+
+    fn canary_hops() -> [crate::sekai::object_set::ObjectSetTraversal; 1] {
+        [crate::sekai::object_set::ObjectSetTraversal {
+            far_kind: "Order".into(),
+            join_property: "customer_id".into(),
+            ..Default::default()
+        }]
+    }
+
+    fn canary_count() -> ObjectSetAggregation {
+        ObjectSetAggregation {
+            function: "count".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unsampled_canary_does_not_load_active_object_policy() {
+        SAMPLE_TICK.store(1, Ordering::Relaxed);
+        let config = ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 2,
+        };
+        let mut policy_loads = 0u32;
+        if should_fetch_canary_policies(
+            &config,
+            &canary_descriptor(),
+            &canary_hops(),
+            &canary_count(),
+            10,
+        ) {
+            policy_loads += 1;
+        }
+        assert_eq!(
+            policy_loads, 0,
+            "unsampled dual-read must not load active_object_policy"
+        );
+    }
+
+    #[test]
+    fn unexpressible_canary_skips_policy_after_sample() {
+        SAMPLE_TICK.store(0, Ordering::Relaxed);
+        let config = ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 1,
+        };
+        let mut descriptor = canary_descriptor();
+        descriptor.property_filters = vec![crate::domain::PropertyFilter {
+            key: "region".into(),
+            op: "eq".into(),
+            value: "eu".into(),
+        }];
+        let mut policy_loads = 0u32;
+        if should_fetch_canary_policies(&config, &descriptor, &canary_hops(), &canary_count(), 10) {
+            policy_loads += 1;
+        }
+        assert_eq!(
+            policy_loads, 0,
+            "unexpressible grammar must skip active_object_policy after the sample tick"
+        );
+    }
+
+    #[test]
+    fn sampled_expressible_canary_loads_policy() {
+        SAMPLE_TICK.store(0, Ordering::Relaxed);
+        let config = ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 1,
+        };
+        assert!(should_fetch_canary_policies(
+            &config,
+            &canary_descriptor(),
+            &canary_hops(),
+            &canary_count(),
+            10,
+        ));
     }
 
     #[test]
