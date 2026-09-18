@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Combined SQLite destinations that resolve to the same inode are refused
+  even when the path strings differ (hardlinks). Canonical-equal paths
+  still refuse (#1017).
 - MCP Preview that may fill uses the Function host request timeout
   (`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) instead of a hard 5s
   deadline. Submit stays at 5s (#987).
