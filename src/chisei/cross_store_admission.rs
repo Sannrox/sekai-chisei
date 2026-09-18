@@ -375,7 +375,6 @@ pub fn project_commit_handles(receipt: &mut OperationReceipt, commit: &SekaiComm
 mod tests {
     use super::*;
     use crate::chisei::budget::PeriodType;
-    use crate::db::runtime_db::RuntimeDb;
     use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
     use crate::sekai::object_security::PrincipalPolicyContext;
     use tempfile::tempdir;
@@ -548,8 +547,8 @@ mod tests {
 
     #[test]
     fn shared_runtime_admit_reuses_one_receipt_authority() {
-        let db = Arc::new(RuntimeDb::memory());
-        let (sekai, chisei) = crate::db::store::split_shared_runtime(db);
+        let sekai = SekaiStore::memory();
+        let chisei = ChiseiStore::from_shared_runtime(sekai.runtime_arc());
         seed_type(&sekai);
         let clerk = CrossStoreAdmission::new(chisei, sekai, None);
         assert!(!clerk.distinct_stores());
