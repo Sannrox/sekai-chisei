@@ -691,6 +691,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preview.outcome, PREVIEW_VALID);
+        let empty_digest = crate::sekai::action_instance::compute_request_digest(
+            "acme",
+            "customer.record.triage",
+            "1",
+            "{}",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            preview.request_digest,
+            crate::sekai::action_instance::compute_request_digest(
+                "acme",
+                "customer.record.triage",
+                "1",
+                &filled,
+                &[],
+            )
+            .unwrap()
+        );
+        assert_ne!(preview.request_digest, empty_digest);
         assert_eq!(
             db.list_action_instances("acme", None, None, 10)
                 .unwrap()

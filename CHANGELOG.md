@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preview treats a blank string, JSON `null`, or `{}` as empty parameters
+  for System One fill. After a fill, `request_digest` binds to the filled
+  body (#988).
 - Concurrent governed-fact profile creates take an Immediate writer lock
   and treat SQLite lock errors as converge-if-identical, so two pools on
   one file no longer unwrap `database is locked` (#1030).
