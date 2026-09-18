@@ -40,6 +40,11 @@ versioned Action. Function results are not type-revision facts
 6. The bind pins an exact model id. `jev-latest` is refused.
 7. Hosted TypeSafe is opt-in. Missing `TYPESAFE_API_KEY` fails closed.
    Ontology guest functions stay out of scope ([ADR 0072](0072-in-process-function-host.md)).
+8. Admit stamps `system_one_fill_json` from the type version's pinned bind
+   and the admitted parameter body. A valid preview of a bound type returns
+   the same document. Submit does not re-invoke the Function. Types without
+   a bind leave the field empty. Client-copied proposals are attributed to
+   the type version they are submitted against.
 
 ## Alternatives considered
 

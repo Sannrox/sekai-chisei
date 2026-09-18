@@ -75,6 +75,7 @@ pub struct ObjectActionPreview {
     pub compensation: String,
     pub failing_criterion: String,
     pub proposed_parameters_json: String,
+    pub system_one_fill_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +211,9 @@ pub fn preview_object_action(
         ));
     }
 
+    let system_one_fill_json =
+        crate::chisei::system_one_action::fill_provenance_json(&type_def, parameters_json)
+            .map_err(ObjectActionProjectionError::InvalidArgument)?;
     Ok(ObjectActionPreview {
         outcome: PREVIEW_VALID.into(),
         reason_code: "valid".into(),
@@ -224,6 +228,7 @@ pub fn preview_object_action(
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
         proposed_parameters_json: String::new(),
+        system_one_fill_json,
     })
 }
 
@@ -255,6 +260,7 @@ fn valid_admission_preview(allowed: &AdmissionAllowed, object: &Object) -> Objec
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
         proposed_parameters_json: String::new(),
+        system_one_fill_json: String::new(),
     }
 }
 
@@ -299,6 +305,7 @@ fn admit_object_action(
             compensation: COMPENSATION_UNSUPPORTED.into(),
             failing_criterion: String::new(),
             proposed_parameters_json: String::new(),
+            system_one_fill_json: String::new(),
         }));
     }
 
@@ -383,6 +390,7 @@ fn admit_object_action(
             compensation: COMPENSATION_UNSUPPORTED.into(),
             failing_criterion: String::new(),
             proposed_parameters_json: String::new(),
+            system_one_fill_json: String::new(),
         }));
     }
 
@@ -458,6 +466,7 @@ fn unavailable_preview(object: &Object) -> ObjectActionPreview {
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
         proposed_parameters_json: String::new(),
+        system_one_fill_json: String::new(),
     }
 }
 
@@ -481,6 +490,7 @@ fn invalid_preview(
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
         proposed_parameters_json: String::new(),
+        system_one_fill_json: String::new(),
     }
 }
 
@@ -504,6 +514,7 @@ fn criterion_preview(
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: criterion_id,
         proposed_parameters_json: String::new(),
+        system_one_fill_json: String::new(),
     }
 }
 
@@ -672,7 +683,7 @@ mod tests {
             },
         )
         .unwrap();
-        db.put_governed_action_type(type_def, "operator", 2)
+        db.put_governed_action_type(type_def.clone(), "operator", 2)
             .unwrap();
         let preview = preview_object_action(
             &db,
@@ -711,6 +722,11 @@ mod tests {
             .unwrap()
         );
         assert_ne!(preview.request_digest, empty_digest);
+        assert_eq!(
+            preview.system_one_fill_json,
+            crate::chisei::system_one_action::fill_provenance_json(&type_def, &filled).unwrap()
+        );
+        assert!(!preview.system_one_fill_json.is_empty());
         assert_eq!(
             db.list_action_instances("acme", None, None, 10)
                 .unwrap()

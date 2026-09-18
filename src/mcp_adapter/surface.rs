@@ -594,6 +594,7 @@ pub(super) fn submit_output(response: SubmitActionInstanceResponse) -> Value {
             "operation_id": instance.operation_id,
             "request_digest": instance.request_digest,
             "idempotency_key": instance.idempotency_key,
+            "system_one_fill_json": instance.system_one_fill_json,
         })),
         "replay": response.replay
     })

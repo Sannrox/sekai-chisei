@@ -12,6 +12,7 @@ use sekai_provider::system_one::{
     request_from_bind,
 };
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 pub fn bind_of(type_def: &GovernedActionType) -> Option<&SystemOneBind> {
     type_def.system_one.as_ref().filter(|bind| !bind.is_empty())
@@ -35,6 +36,41 @@ pub fn parameters_are_empty(parameters_json: &str) -> bool {
 
 pub fn should_fill(type_def: &GovernedActionType, parameters_json: &str) -> bool {
     parameters_are_empty(parameters_json) && bind_of(type_def).is_some()
+}
+
+/// Bind + parameter-body provenance for a filled or client-copied proposal.
+///
+/// Empty when the type has no bind. Submit does not re-invoke the Function;
+/// admit attributes the type version's pinned bind to the admitted body.
+pub fn fill_provenance_json(
+    type_def: &GovernedActionType,
+    parameters_json: &str,
+) -> Result<String, String> {
+    let Some(bind) = bind_of(type_def) else {
+        return Ok(String::new());
+    };
+    let bind_canonical =
+        serde_json::to_string(bind).map_err(|error| format!("system_one bind encode: {error}"))?;
+    let bind_digest = format!("sha256:{:x}", Sha256::digest(bind_canonical.as_bytes()));
+    let parameters: Value = serde_json::from_str(parameters_json)
+        .map_err(|error| format!("parameters_json must be JSON: {error}"))?;
+    if !parameters.is_object() {
+        return Err("parameters_json must be a JSON object".into());
+    }
+    let parameter_canonical = serde_json::to_string(&parameters)
+        .map_err(|error| format!("system_one parameter encode: {error}"))?;
+    let parameter_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(parameter_canonical.as_bytes())
+    );
+    serde_json::to_string(&serde_json::json!({
+        "model": bind.model,
+        "type_id": type_def.type_id,
+        "version": type_def.version,
+        "bind_digest": bind_digest,
+        "parameter_digest": parameter_digest,
+    }))
+    .map_err(|error| format!("system_one fill provenance encode: {error}"))
 }
 
 pub fn project_object_state(
@@ -178,6 +214,39 @@ mod tests {
         unbound.system_one = None;
         assert!(!should_fill(&unbound, ""));
         assert!(!should_fill(&unbound, "{}"));
+    }
+
+    #[test]
+    fn fill_provenance_binds_model_and_parameter_body() {
+        let filled = r#"{"object_id":"ticket-1","department":"technical"}"#;
+        let first = fill_provenance_json(&type_def(), filled).unwrap();
+        let again = fill_provenance_json(&type_def(), filled).unwrap();
+        assert_eq!(first, again);
+        let value: Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["model"], "jev-1.13.0");
+        assert_eq!(value["type_id"], "support.triage");
+        assert_eq!(value["version"], "1");
+        assert!(
+            value["bind_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            value["parameter_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        let other = fill_provenance_json(
+            &type_def(),
+            r#"{"object_id":"ticket-1","department":"billing"}"#,
+        )
+        .unwrap();
+        assert_ne!(first, other);
+        let mut unbound = type_def();
+        unbound.system_one = None;
+        assert_eq!(fill_provenance_json(&unbound, filled).unwrap(), "");
     }
 
     #[test]
