@@ -466,6 +466,9 @@ fn looks_like_postgres_url(value: &str) -> bool {
 
 pub fn is_mutating_rpc(method: &str) -> bool {
     let name = method.rsplit('/').next().unwrap_or(method);
+    if name == "PreviewObjectAction" {
+        return true;
+    }
     !(name.starts_with("Get")
         || name.starts_with("List")
         || name.starts_with("Evaluate")
@@ -944,7 +947,8 @@ mod tests {
         assert!(!is_mutating_rpc("GetActionInstance"));
         assert!(!is_mutating_rpc("ListGrants"));
         assert!(!is_mutating_rpc("EvaluateObjectSet"));
-        assert!(!is_mutating_rpc("PreviewObjectAction"));
+        assert!(is_mutating_rpc("PreviewObjectAction"));
+        assert!(is_mutating_rpc("/sekai.SekaiService/PreviewObjectAction"));
         assert!(!is_mutating_rpc("DescribeObjectAction"));
         assert!(!is_mutating_rpc("CheckAccess"));
     }

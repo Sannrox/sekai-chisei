@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Restore fence treats `PreviewObjectAction` as mutating so TypeSafe fill,
+  egress, and Decision audit stay refused while split generations disagree
+  (#1048).
 - Preview records TypeSafe egress audit only when the post-fill preview
   stays `valid`. A filled body that fails the second preview clears
   proposed parameters and does not persist a typesafe Decision (#1044).

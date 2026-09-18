@@ -67,7 +67,9 @@ sekaictl admin store restamp --sekai ./data/sekai.db --chisei ./data/chisei.db
 PostgreSQL destinations take two URLs instead of paths. Independent backups
 are not a paired restore set. Restoring one store and leaving the other
 does not resume writes. Read RPCs stay available so operators can inspect
-receipts; `operation_id` correlation is unchanged after restamp.
+receipts; `PreviewObjectAction` is refused with the mutating set because
+fill, TypeSafe egress, and Decision audit are side effects.
+`operation_id` correlation is unchanged after restamp.
 
 ## Fresh installs
 
