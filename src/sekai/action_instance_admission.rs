@@ -252,6 +252,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision = "budget_exceeded".into();
         }
 
+        let system_one_fill_json = crate::chisei::system_one_action::fill_provenance_json(
+            &type_def,
+            &request.parameters_json,
+        )
+        .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
         let instance = ActionInstance {
             instance_id: instance_id.clone(),
             namespace: namespace.clone(),
@@ -269,6 +274,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision,
             created_at_ms: now,
             decided_at_ms: now,
+            system_one_fill_json,
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -764,6 +770,49 @@ mod tests {
             policy_context: PrincipalPolicyContext::default(),
             budget_already_reserved: false,
         }
+    }
+
+    #[test]
+    fn admit_stamps_fill_provenance_for_a_bound_type() {
+        let db = setup();
+        let type_def = GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "dispatch.bound".into(),
+            version: "1".into(),
+            description: "bound dispatch".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string","enum":["shikigami"]}},"required":["runtime"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
+            system_one: Some(sekai_provider::system_one::SystemOneBind {
+                model: "jev-1.13.0".into(),
+                questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
+                    parameter: "runtime".into(),
+                    question_type: "choice".into(),
+                    instructions: "Which runtime".into(),
+                    criteria: serde_json::json!({"shikigami": null}),
+                }],
+            }),
+            enabled: true,
+            ..Default::default()
+        };
+        db.put_governed_action_type(type_def.clone(), "operator", 2)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut bound_request = request(r#"{"runtime":"shikigami"}"#);
+        bound_request.type_id = "dispatch.bound".into();
+        bound_request.idempotency_key = "idem-bound".into();
+        let admitted = admission.admit(bound_request, "alice", 10).unwrap();
+        let expected = crate::chisei::system_one_action::fill_provenance_json(
+            &type_def,
+            r#"{"runtime":"shikigami"}"#,
+        )
+        .unwrap();
+        assert_eq!(admitted.instance.system_one_fill_json, expected);
+        assert!(!expected.is_empty());
+        let stored = db
+            .get_action_instance(&admitted.instance.instance_id)
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.system_one_fill_json, expected);
     }
 
     #[test]
@@ -1389,6 +1438,7 @@ mod tests {
             budget_decision: "not_configured".into(),
             created_at_ms: 10,
             decided_at_ms: 10,
+            system_one_fill_json: String::new(),
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

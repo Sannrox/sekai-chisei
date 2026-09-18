@@ -38,6 +38,9 @@ pub struct ActionInstance {
     pub budget_decision: String,
     pub created_at_ms: i64,
     pub decided_at_ms: i64,
+    /// Bind + parameter-body provenance when the type has a System One bind.
+    #[serde(default)]
+    pub system_one_fill_json: String,
 }
 
 impl ActionInstance {
@@ -457,6 +460,7 @@ mod tests {
             budget_decision: "allow".into(),
             created_at_ms: 10,
             decided_at_ms: 10,
+            system_one_fill_json: String::new(),
         }
     }
 
