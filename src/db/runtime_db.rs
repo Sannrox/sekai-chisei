@@ -21,6 +21,7 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
+use crate::db::chisei_operation_reservation::OperationReservation;
 use crate::db::definition_branch::DefinitionBranchBackend;
 use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
@@ -1323,6 +1324,37 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_operation_receipt(operation_id),
             Self::Postgres(db) => db.get_operation_receipt(operation_id),
+        }
+    }
+
+    pub fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_operation_reservation(namespace, operation_id),
+            Self::Postgres(db) => db.get_operation_reservation(namespace, operation_id),
+        }
+    }
+
+    pub fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String> {
+        match self {
+            Self::Sqlite(db) => db.put_operation_reservation(reservation),
+            Self::Postgres(db) => db.put_operation_reservation(reservation),
+        }
+    }
+
+    pub fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_pending_operation_reservations(limit),
+            Self::Postgres(db) => db.list_pending_operation_reservations(limit),
         }
     }
 

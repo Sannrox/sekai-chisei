@@ -56,3 +56,14 @@ mixed pair.
 
 New combined installs that already use distinct destination paths do not
 need relocate. They never had Chisei families in a shared writer.
+
+## Cross-store admission after the split
+
+`SubmitActionInstance` no longer shares one local transaction with Chisei
+budget and receipts. Combined mode uses the same reserve → submit →
+finalize clerk as a later split process: Chisei keys the reservation by
+`(namespace, operation_id)`, Sekai admits and commits, and reconcile
+finalizes a pending reservation only after Sekai reports the instance.
+A timeout or failed lookup stays pending. Public `GetOperationReceipt`
+projects a live Sekai commit handle onto the Chisei decision receipt and
+does not copy the Sekai receipt body.

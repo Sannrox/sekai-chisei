@@ -114,6 +114,8 @@ pub struct ChiseiServiceImpl {
     pub(super) db: crate::db::store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
+    pub(super) sekai_commit_lookup:
+        Option<Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>>,
 }
 
 #[derive(Clone)]
@@ -338,6 +340,7 @@ impl ChiseiServiceImpl {
             db,
             config,
             provider_registry_state_path,
+            sekai_commit_lookup: None,
         }
     }
 
@@ -417,7 +420,16 @@ impl ChiseiServiceImpl {
             db,
             config,
             provider_registry_state_path,
+            sekai_commit_lookup: None,
         }
+    }
+
+    pub fn with_sekai_commit_lookup(
+        mut self,
+        lookup: Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>,
+    ) -> Self {
+        self.sekai_commit_lookup = Some(lookup);
+        self
     }
 
     fn bind_gunshi_allocation(

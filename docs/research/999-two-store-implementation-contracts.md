@@ -104,8 +104,8 @@ snapshot, not a mixed pair.
 | Same public API on combined and split | Public-API integration, gateway smoke | proposed |
 | SQLite and PostgreSQL conformance per store | Shared conformance | proposed |
 | Fresh install + upgraded retained data | Migration tests | implemented (#1006) |
-| Crash after reserve / after commit | Fault-injection | proposed |
-| Duplicate admission | Integration | proposed |
+| Crash after reserve / after commit | Fault-injection | implemented (#1007) |
+| Duplicate admission | Integration | implemented (#1007) |
 | One-sided restore fence | Restore test | proposed |
 | Wrong-plane RPC rejection | Subprocess isolation | proposed |
 | Unit-only proof of the split | — | insufficient |

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Combined two-store admission reserves on Chisei, commits through
+  `SubmitActionInstance` on Sekai, and finalizes or releases only after a
+  typed hop. Timeout is not rejection; reconcile never treats a late commit
+  as reject. Gateway and native submit share the same clerk (#1007).
 - Combined two-store startup reconciles Sekai execution evidence against
   the Sekai runtime, not the Chisei destination (#1013).
 - Offline Chisei-family relocation copies destination tables family by

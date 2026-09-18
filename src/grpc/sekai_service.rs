@@ -160,6 +160,8 @@ pub struct SekaiServiceImpl {
     pub(super) object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind,
     pub(super) object_index_dual_read: bool,
     pub(super) object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead,
+    pub(super) cross_store:
+        Option<std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>>,
 }
 
 impl SekaiServiceImpl {
@@ -192,7 +194,16 @@ impl SekaiServiceImpl {
             object_index_dual_read:
                 crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
             object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
+            cross_store: None,
         }
+    }
+
+    pub fn with_cross_store_admission(
+        mut self,
+        clerk: std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+    ) -> Self {
+        self.cross_store = Some(clerk);
+        self
     }
 
     /// Construct sharing a chisei budget tracker so governed actions can be

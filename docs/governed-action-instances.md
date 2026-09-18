@@ -69,7 +69,10 @@ already stores a supported contract.
    create-id conflict fail closed
    before a durable success receipt. Policy or budget deny persists a `denied`
    instance and does not write the record.
-10. Persist instance first so same-key replay wins the idempotency insert.
+10. After tables split, Chisei reserves `(namespace, operation_id)` first.
+    Sekai then admits. Chisei finalizes or, on crash, reconcile does. A
+    missing or timed-out Sekai lookup is not a reject.
+11. Persist instance first so same-key replay wins the idempotency insert.
     Replay returns only after that instance has a receipt; an in-flight
     reservation fails closed as still in progress. On a fresh admit the plane
     then applies the planned mutation. Mutation or receipt failure deletes
