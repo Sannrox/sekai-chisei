@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Preview records TypeSafe egress audit only when the post-fill preview
+  stays `valid`. A filled body that fails the second preview clears
+  proposed parameters and does not persist a typesafe Decision (#1044).
 - Admit and valid Preview stamp `system_one_fill_json` with the type
   version's pinned System One bind and a digest of the admitted parameter
   body. Submit does not re-invoke the Function (#981).
