@@ -390,6 +390,16 @@ fn with_plane<I>(plane: ProcessPlane, served: ProcessPlane, inner: I) -> PlaneAw
     }
 }
 
+#[derive(Clone)]
+struct RestoreFenceInterceptor<I> {
+    stores: Arc<CombinedStoreLayout>,
+    inner: I,
+}
+
+fn with_restore_fence<I>(stores: Arc<CombinedStoreLayout>, inner: I) -> RestoreFenceInterceptor<I> {
+    RestoreFenceInterceptor { stores, inner }
+}
+
 impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareInterceptor<I> {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         let allowed = match self.served {
@@ -404,6 +414,23 @@ impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareI
         }
         self.inner.call(req)
     }
+}
+
+impl<I: tonic::service::Interceptor> tonic::service::Interceptor for RestoreFenceInterceptor<I> {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        if request_is_mutating_rpc(&req) {
+            crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
+                .map_err(Status::failed_precondition)?;
+        }
+        self.inner.call(req)
+    }
+}
+
+fn request_is_mutating_rpc<T>(req: &Request<T>) -> bool {
+    req.extensions()
+        .get::<tonic::GrpcMethod>()
+        .map(|method| crate::store_relocate::is_mutating_rpc(method.method()))
+        .unwrap_or(false)
 }
 
 fn local_or_token_interceptor(
@@ -574,6 +601,7 @@ pub fn run_for_plane(
                         db.clone(),
                         assertion_authority.clone(),
                     ),
+                    stores.clone(),
                 )
                 .await?;
             } else {
@@ -587,6 +615,7 @@ pub fn run_for_plane(
                         db.clone(),
                         assertion_authority.clone(),
                     ),
+                    stores.clone(),
                 )
                 .await?;
             }
@@ -607,6 +636,7 @@ pub fn run_for_plane(
                 ),
                 health_service.clone(),
                 plane,
+                stores.clone(),
             );
 
             if tcp_mode.auth_configured || config.insecure {
@@ -621,6 +651,7 @@ pub fn run_for_plane(
                     assertion_authority,
                     health_service,
                     plane,
+                    stores,
                 );
                 return tokio::select! {
                     result = tcp_server => result,
@@ -649,6 +680,7 @@ pub fn run_for_plane(
             assertion_authority,
             health_service,
             plane,
+            stores,
         )
         .await
     })
@@ -706,6 +738,7 @@ async fn run_tcp<H>(
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     health_service: H,
     plane: ProcessPlane,
+    stores: Arc<CombinedStoreLayout>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     H: tower::Service<http::Request<tonic::body::Body>, Error = Infallible>
@@ -729,6 +762,7 @@ where
             TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
             health_service,
             plane,
+            stores,
         )
         .await
     } else {
@@ -741,6 +775,7 @@ where
             local_or_token_interceptor(credential_store, db, assertion_authority),
             health_service,
             plane,
+            stores,
         )
         .await
     }
@@ -756,6 +791,7 @@ async fn serve_tcp_listener<I, H>(
     interceptor: I,
     health_service: H,
     plane: ProcessPlane,
+    stores: Arc<CombinedStoreLayout>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
@@ -784,7 +820,10 @@ where
             RpcMaturityLayer::from_env().layer(
                 pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             ),
-            with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
+            with_restore_fence(
+                stores.clone(),
+                with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
+            ),
         ))
         .add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
@@ -792,7 +831,7 @@ where
                     chisei_svc.clone(),
                 ),
             ),
-            with_plane(plane, ProcessPlane::Chisei, interceptor),
+            with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
         ))
         .serve(addr)
         .await
@@ -806,6 +845,7 @@ async fn serve_uds<I, H>(
     interceptor: I,
     health_service: H,
     plane: ProcessPlane,
+    stores: Arc<CombinedStoreLayout>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
@@ -844,7 +884,10 @@ where
             RpcMaturityLayer::from_env().layer(
                 pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             ),
-            with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
+            with_restore_fence(
+                stores.clone(),
+                with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
+            ),
         ))
         .add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
@@ -852,7 +895,7 @@ where
                     chisei_svc.clone(),
                 ),
             ),
-            with_plane(plane, ProcessPlane::Chisei, interceptor),
+            with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
         ))
         .serve_with_incoming(UnixListenerStream::new(listener))
         .await?)
@@ -1758,5 +1801,54 @@ mod tests {
             LocalInterceptor::new(true),
         );
         assert!(allowed.call(Request::new(())).is_ok());
+    }
+
+    fn dest_pair_layout(dir: &tempfile::TempDir) -> CombinedStoreLayout {
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        crate::combined_stores::CombinedStoreSources {
+            backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+            default_sqlite_path: sekai.to_str().unwrap().into(),
+            sekai_sqlite_path: Some(sekai.to_str().unwrap().into()),
+            chisei_sqlite_path: Some(chisei.to_str().unwrap().into()),
+            postgres_max_connections: 16,
+            ..crate::combined_stores::CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_fence_refuses_mutating_rpc_until_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = dest_pair_layout(&dir);
+        crate::store_relocate::align_split_generations(&layout).unwrap();
+        crate::store_relocate::write_runtime_generation(&layout.sekai_runtime(), 3).unwrap();
+        crate::store_relocate::write_runtime_generation(&layout.chisei_runtime(), 4).unwrap();
+        let stores = Arc::new(layout);
+        let mut interceptor = with_restore_fence(stores.clone(), LocalInterceptor::new(true));
+        let mut mutating = Request::new(());
+        mutating.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "SubmitActionInstance",
+        ));
+        let error = interceptor.call(mutating).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("restamp"), "{}", error.message());
+
+        let mut reading = Request::new(());
+        reading.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "GetActionInstance",
+        ));
+        assert!(interceptor.call(reading).is_ok());
+
+        crate::store_relocate::restamp_split_generation(&stores).unwrap();
+        let mut after = Request::new(());
+        after.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "SubmitActionInstance",
+        ));
+        assert!(interceptor.call(after).is_ok());
     }
 }

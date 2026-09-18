@@ -733,7 +733,8 @@ fn print_admin_usage() {
            sekaictl admin autonomy ...\n\
          \n\
          Store:\n\
-           sekaictl admin store relocate ..."
+           sekaictl admin store relocate ...\n\
+           sekaictl admin store restamp ..."
     );
 }
 

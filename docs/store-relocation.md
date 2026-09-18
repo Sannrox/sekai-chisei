@@ -52,6 +52,22 @@ combined mode against the destination pair.
 Rollback after the fence is restore-both from the pre-fence snapshot, not a
 mixed pair.
 
+## One-sided restore
+
+Each destination store carries its own split generation in
+`sekai_store_cutover`. Combined or split open compares the pair. A missing
+or unequal generation keeps mutating RPCs refused until an operator restamps
+both stores:
+
+```sh
+sekaictl admin store restamp --sekai ./data/sekai.db --chisei ./data/chisei.db
+```
+
+PostgreSQL destinations take two URLs instead of paths. Independent backups
+are not a paired restore set. Restoring one store and leaving the other
+does not resume writes. Read RPCs stay available so operators can inspect
+receipts; `operation_id` correlation is unchanged after restamp.
+
 ## Fresh installs
 
 New combined installs that already use distinct destination paths do not
