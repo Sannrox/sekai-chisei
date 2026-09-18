@@ -5,6 +5,8 @@
 - Concurrent governed-fact profile creates take an Immediate writer lock
   and treat SQLite lock errors as converge-if-identical, so two pools on
   one file no longer unwrap `database is locked` (#1030).
+- Preview fills System One proposals only after revision, criteria, policy,
+  and budget would allow, and records a TypeSafe egress audit (#982).
 - Object-log dual-read samples and skips unexpressible compares before
   loading `active_object_policy`, so unsampled evaluates do not pay
   per-kind policy fetches (#1024).

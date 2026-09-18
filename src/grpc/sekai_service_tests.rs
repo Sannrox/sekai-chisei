@@ -5644,6 +5644,243 @@ async fn describe_and_preview_object_action_are_observational() {
     assert!(!hidden.message().contains("missing"));
 }
 
+fn system_one_bind_json() -> String {
+    serde_json::json!({
+        "model": "jev-1.13.0",
+        "questions": [{
+            "parameter": "department",
+            "type": "choice",
+            "instructions": "Which team should handle this",
+            "criteria": {"billing": null, "technical": null, "sales": null}
+        }]
+    })
+    .to_string()
+}
+
+fn put_system_one_ticket_type(svc: &SekaiServiceImpl) {
+    svc.db
+        .upsert_object_type(&crate::sekai::schema::ObjectType {
+            kind: "support_ticket".into(),
+            description: "fixture".into(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec![],
+        })
+        .unwrap();
+    let object = crate::domain::Object {
+        id: "ticket-preview".into(),
+        kind: "support_ticket".into(),
+        name: "Payouts".into(),
+        namespace: "acme".into(),
+        external_id: String::new(),
+        properties: HashMap::from([
+            ("title".into(), "payouts failing".into()),
+            (
+                crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+                "title".into(),
+            ),
+            ("secret".into(), "do-not-send".into()),
+        ]),
+        created: 10,
+        updated: 20,
+    };
+    svc.db.create_object(&object).unwrap();
+}
+
+#[tokio::test]
+async fn preview_does_not_fill_system_one_when_stale_or_denied() {
+    let svc = service();
+    grant_action_admin(&svc);
+    put_system_one_ticket_type(&svc);
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            description: "Triage a support ticket".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","department"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+            object_kind: "support_ticket".into(),
+            object_mutation: "update".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
+            system_one_json: system_one_bind_json(),
+        }),
+        request_id: "put-triage".into(),
+    }))
+    .await
+    .unwrap();
+
+    let stale = svc
+        .preview_object_action(with_principal(PreviewObjectActionRequest {
+            namespace: "acme".into(),
+            object_id: "ticket-preview".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            parameters_json: String::new(),
+            expected_object_updated_ms: 21,
+            expected_object_revision: String::new(),
+            evidence_submission_ids: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stale.outcome, "stale");
+    assert!(stale.proposed_parameters_json.is_empty());
+    assert!(
+        svc.db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("preview_object_action".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+    );
+
+    svc.db
+        .upsert_action_policy(&action_policy::ActionPolicy {
+            scope: "agent:tester".into(),
+            default_decision: action_policy::ActionDecision::Allow,
+            action_overrides: HashMap::from([(
+                crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+                action_policy::ActionDecision::Deny,
+            )]),
+            risk_overrides: HashMap::new(),
+            max_mutations_per_work_unit: None,
+            max_deletes_per_work_unit: None,
+        })
+        .unwrap();
+    let denied = svc
+        .preview_object_action(with_principal(PreviewObjectActionRequest {
+            namespace: "acme".into(),
+            object_id: "ticket-preview".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            parameters_json: String::new(),
+            expected_object_updated_ms: 20,
+            expected_object_revision: String::new(),
+            evidence_submission_ids: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(denied.outcome, "denied");
+    assert!(denied.proposed_parameters_json.is_empty());
+}
+
+#[tokio::test]
+async fn preview_records_typesafe_egress_after_admission() {
+    let app = axum::Router::new().route(
+        "/v1/systemone",
+        axum::routing::post(|| async {
+            axum::Json(sekai_provider::system_one::SystemOneResponse {
+                model: "jev-1.13.0".into(),
+                answers: [(
+                    "department".into(),
+                    serde_json::json!({"type":"choice","choice":"technical"}),
+                )]
+                .into_iter()
+                .collect(),
+                usage: None,
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    unsafe {
+        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(
+            sekai_provider::system_one::BASE_URL_ENV,
+            format!("http://{addr}/v1/systemone"),
+        );
+    }
+
+    let svc = service();
+    grant_action_admin(&svc);
+    put_system_one_ticket_type(&svc);
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            description: "Triage a support ticket".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","department"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+            object_kind: "support_ticket".into(),
+            object_mutation: "update".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
+            system_one_json: system_one_bind_json(),
+        }),
+        request_id: "put-triage-fill".into(),
+    }))
+    .await
+    .unwrap();
+
+    let preview = svc
+        .preview_object_action(with_principal(PreviewObjectActionRequest {
+            namespace: "acme".into(),
+            object_id: "ticket-preview".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            parameters_json: String::new(),
+            expected_object_updated_ms: 20,
+            expected_object_revision: String::new(),
+            evidence_submission_ids: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(preview.outcome, "valid");
+    assert!(
+        preview
+            .proposed_parameters_json
+            .contains("\"department\":\"technical\""),
+        "{}",
+        preview.proposed_parameters_json
+    );
+    let audits = svc
+        .db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("preview_object_action".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(
+        audits[0].evidence.get("provider").map(String::as_str),
+        Some("typesafe")
+    );
+    assert_eq!(
+        svc.db
+            .list_action_instances("acme", None, None, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    unsafe {
+        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+    }
+}
+
 #[tokio::test]
 async fn ontology_class_crud_round_trip() {
     let svc = service();
