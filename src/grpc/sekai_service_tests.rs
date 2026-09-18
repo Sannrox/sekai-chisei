@@ -5657,6 +5657,8 @@ fn system_one_bind_json() -> String {
     .to_string()
 }
 
+static TYPE_SAFE_TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn put_system_one_ticket_type(svc: &SekaiServiceImpl) {
     svc.db
         .upsert_object_type(&crate::sekai::schema::ObjectType {
@@ -5776,7 +5778,11 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn preview_records_typesafe_egress_after_admission() {
+    let _env = TYPE_SAFE_TEST_ENV
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
@@ -5882,7 +5888,11 @@ async fn preview_records_typesafe_egress_after_admission() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid() {
+    let _env = TYPE_SAFE_TEST_ENV
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
