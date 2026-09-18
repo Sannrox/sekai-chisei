@@ -108,6 +108,7 @@ pub mod sekai_rpc_inventory;
 mod source_type_descriptor_store;
 mod source_webhook_store;
 pub mod store;
+pub(crate) mod store_plane;
 pub mod team_namespace;
 mod warehouse_projection_store;
 mod workflow_action_store;

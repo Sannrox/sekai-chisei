@@ -528,7 +528,7 @@ pub(super) async fn get_operation_receipt(
             "exactly one of operation_id or request_id is required",
         ));
     }
-    let mut receipt = if !operation_id.is_empty() {
+    let receipt = if !operation_id.is_empty() {
         if let Some(attempt) = attempt {
             match service
                 .db
@@ -587,9 +587,25 @@ pub(super) async fn get_operation_receipt(
         } else {
             Status::internal(error)
         }
-    })?
-    .ok_or(Status::not_found("operation receipt not found"))?;
-    if let Some(lookup) = &service.sekai_commit_lookup
+    })?;
+    let mut receipt = match receipt {
+        Some(receipt) => receipt,
+        None => {
+            if operation_id.is_empty() {
+                return Err(Status::not_found("operation receipt not found"));
+            }
+            let Some(lookup) = &service.sekai_commit_lookup else {
+                return Err(Status::not_found("operation receipt not found"));
+            };
+            let commit = lookup
+                .lookup_commit(operation_id)
+                .map_err(Status::unavailable)?
+                .ok_or_else(|| Status::not_found("operation receipt not found"))?;
+            crate::chisei::cross_store_admission::hop_projection_receipt(operation_id, &commit)
+        }
+    };
+    if receipt.operation_class != "sekai_commit_projection"
+        && let Some(lookup) = &service.sekai_commit_lookup
         && let Ok(Some(commit)) = lookup.lookup_commit(&receipt.operation_id)
     {
         crate::chisei::cross_store_admission::project_commit_handles(&mut receipt, &commit);

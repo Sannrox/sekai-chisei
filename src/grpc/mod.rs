@@ -21,6 +21,7 @@ use crate::db::sekai::PrincipalCredential;
 use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
+use crate::plane::ProcessPlane;
 use crate::rpc_maturity::RpcMaturityLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
@@ -374,6 +375,37 @@ impl tonic::service::Interceptor for LocalOrTokenAuthInterceptor {
     }
 }
 
+#[derive(Clone)]
+struct PlaneAwareInterceptor<I> {
+    plane: ProcessPlane,
+    served: ProcessPlane,
+    inner: I,
+}
+
+fn with_plane<I>(plane: ProcessPlane, served: ProcessPlane, inner: I) -> PlaneAwareInterceptor<I> {
+    PlaneAwareInterceptor {
+        plane,
+        served,
+        inner,
+    }
+}
+
+impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareInterceptor<I> {
+    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
+        let allowed = match self.served {
+            ProcessPlane::Sekai => self.plane.serves_sekai(),
+            ProcessPlane::Chisei => self.plane.serves_chisei(),
+            ProcessPlane::Combined => true,
+        };
+        if !allowed {
+            return Err(Status::failed_precondition(
+                crate::plane::wrong_plane_message(self.plane),
+            ));
+        }
+        self.inner.call(req)
+    }
+}
+
 fn local_or_token_interceptor(
     credential_store: Arc<PrincipalCredentialStore>,
     db: Arc<RuntimeDb>,
@@ -441,6 +473,25 @@ pub fn run(
     impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
     Box<dyn std::error::Error>,
 > {
+    run_for_plane(
+        config,
+        stores,
+        active_credentials,
+        tcp_mode,
+        ProcessPlane::Combined,
+    )
+}
+
+pub fn run_for_plane(
+    config: Config,
+    stores: Arc<CombinedStoreLayout>,
+    active_credentials: Vec<PrincipalCredential>,
+    tcp_mode: GrpcTcpMode,
+    plane: ProcessPlane,
+) -> Result<
+    impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    Box<dyn std::error::Error>,
+> {
     // This setup deliberately executes when `run` is called, before the
     // returned future is polled. The PostgreSQL backend uses synchronous
     // clients, so service construction must not acquire or release them from
@@ -456,7 +507,10 @@ pub fn run(
         stores
             .validate_required_surfaces()
             .map_err(std::io::Error::other)?;
-        let db = stores.sekai_runtime();
+        let db = match plane {
+            ProcessPlane::Chisei => stores.chisei_runtime(),
+            ProcessPlane::Combined | ProcessPlane::Sekai => stores.sekai_runtime(),
+        };
         let chisei_db = stores.chisei_runtime();
         let registry_anchor = stores
             .registry_anchor_path()
@@ -473,7 +527,7 @@ pub fn run(
             .assertion_authority()
             .map_err(std::io::Error::other)?
             .map(Arc::new);
-        let services = build_services(&config, &stores);
+        let services = build_services_for_plane(&config, &stores, plane);
         Ok((
             db,
             chisei_db,
@@ -486,7 +540,7 @@ pub fn run(
 
     let evidence_db = execution_evidence_runtime(&stores);
     Ok(async move {
-        spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc);
+        spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc, plane);
 
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
@@ -501,7 +555,9 @@ pub fn run(
             .await?;
         }
 
-        if crate::http_projection::should_bind(&config, &tcp_mode) {
+        if plane == ProcessPlane::Combined
+            && crate::http_projection::should_bind(&config, &tcp_mode)
+        {
             let http_port = config
                 .http_port
                 .expect("HTTP projection bind requires SEKAI_HTTP_PORT");
@@ -550,6 +606,7 @@ pub fn run(
                     assertion_authority.clone(),
                 ),
                 health_service.clone(),
+                plane,
             );
 
             if tcp_mode.auth_configured || config.insecure {
@@ -563,6 +620,7 @@ pub fn run(
                     db,
                     assertion_authority,
                     health_service,
+                    plane,
                 );
                 return tokio::select! {
                     result = tcp_server => result,
@@ -590,6 +648,7 @@ pub fn run(
             db,
             assertion_authority,
             health_service,
+            plane,
         )
         .await
     })
@@ -646,6 +705,7 @@ async fn run_tcp<H>(
     db: Arc<RuntimeDb>,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     health_service: H,
+    plane: ProcessPlane,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     H: tower::Service<http::Request<tonic::body::Body>, Error = Infallible>
@@ -668,6 +728,7 @@ where
             chisei_svc,
             TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
             health_service,
+            plane,
         )
         .await
     } else {
@@ -679,12 +740,13 @@ where
             chisei_svc,
             local_or_token_interceptor(credential_store, db, assertion_authority),
             health_service,
+            plane,
         )
         .await
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn serve_tcp_listener<I, H>(
     bind_addr: &str,
     port: u16,
@@ -693,6 +755,7 @@ async fn serve_tcp_listener<I, H>(
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
     interceptor: I,
     health_service: H,
+    plane: ProcessPlane,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
@@ -721,7 +784,7 @@ where
             RpcMaturityLayer::from_env().layer(
                 pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             ),
-            interceptor.clone(),
+            with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
         ))
         .add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
@@ -729,7 +792,7 @@ where
                     chisei_svc.clone(),
                 ),
             ),
-            interceptor,
+            with_plane(plane, ProcessPlane::Chisei, interceptor),
         ))
         .serve(addr)
         .await
@@ -742,6 +805,7 @@ async fn serve_uds<I, H>(
     chisei_svc: Arc<chisei_service::ChiseiServiceImpl>,
     interceptor: I,
     health_service: H,
+    plane: ProcessPlane,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     I: tonic::service::Interceptor + Clone + Send + Sync + 'static,
@@ -780,7 +844,7 @@ where
             RpcMaturityLayer::from_env().layer(
                 pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
             ),
-            interceptor.clone(),
+            with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
         ))
         .add_service(InterceptedService::new(
             RpcMaturityLayer::from_env().layer(
@@ -788,7 +852,7 @@ where
                     chisei_svc.clone(),
                 ),
             ),
-            interceptor,
+            with_plane(plane, ProcessPlane::Chisei, interceptor),
         ))
         .serve_with_incoming(UnixListenerStream::new(listener))
         .await?)
@@ -801,33 +865,57 @@ pub fn build_services(
     Arc<sekai_service::SekaiServiceImpl>,
     Arc<chisei_service::ChiseiServiceImpl>,
 ) {
+    build_services_for_plane(config, stores, ProcessPlane::Combined)
+}
+
+pub fn build_services_for_plane(
+    config: &Config,
+    stores: &CombinedStoreLayout,
+    plane: ProcessPlane,
+) -> (
+    Arc<sekai_service::SekaiServiceImpl>,
+    Arc<chisei_service::ChiseiServiceImpl>,
+) {
     let (sekai_store, chisei_store) = stores.handles();
     let budget = Arc::new(BudgetTracker::with_topology(
         chisei_store.clone(),
         config.budget_topology.clone(),
     ));
-    let clerk = Arc::new(
-        crate::chisei::cross_store_admission::CrossStoreAdmission::new(
-            chisei_store.clone(),
-            sekai_store.clone(),
-            Some(budget.clone()),
-        ),
-    );
-    let sekai_svc = Arc::new(
-        sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
-            sekai_store.clone(),
-            budget.clone(),
-            config.gateway_receipt_principals.clone(),
-        )
-        .with_site_id(config.site_id.clone())
-        .with_cross_store_admission(clerk),
-    );
-    let chisei_svc = Arc::new(
-        chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget)
-            .with_sekai_commit_lookup(Arc::new(sekai_store)),
-    );
+    let mut sekai_svc = sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
+        sekai_store.clone(),
+        budget.clone(),
+        config.gateway_receipt_principals.clone(),
+    )
+    .with_site_id(config.site_id.clone());
+    if plane == ProcessPlane::Combined {
+        let clerk = Arc::new(
+            crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+                chisei_store.clone(),
+                sekai_store.clone(),
+                Some(budget.clone()),
+            ),
+        );
+        sekai_svc = sekai_svc.with_cross_store_admission(clerk);
+    }
+    let mut chisei_svc =
+        chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget);
+    match plane {
+        ProcessPlane::Combined => {
+            chisei_svc = chisei_svc.with_sekai_commit_lookup(Arc::new(sekai_store));
+        }
+        ProcessPlane::Chisei => {
+            if let Some(endpoint) = &config.sekai_endpoint {
+                chisei_svc = chisei_svc.with_sekai_commit_lookup(Arc::new(
+                    crate::chisei::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                        endpoint.clone(),
+                    ),
+                ));
+            }
+        }
+        ProcessPlane::Sekai => {}
+    }
 
-    (sekai_svc, chisei_svc)
+    (Arc::new(sekai_svc), Arc::new(chisei_svc))
 }
 
 fn spawn_service_background_tasks(
@@ -835,8 +923,9 @@ fn spawn_service_background_tasks(
     db: Arc<RuntimeDb>,
     sekai_svc: &Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: &Arc<chisei_service::ChiseiServiceImpl>,
+    plane: ProcessPlane,
 ) {
-    if config.scoring_enabled {
+    if plane == ProcessPlane::Combined && config.scoring_enabled {
         tracing::info!(
             model = %config.scoring_model,
             interval_secs = config.scoring_interval_secs,
@@ -850,8 +939,12 @@ fn spawn_service_background_tasks(
                 .run_loop(),
         );
     }
-    spawn_execution_evidence_reconciler(db);
-    if let Some(clerk) = &sekai_svc.cross_store {
+    if plane.serves_sekai() {
+        spawn_execution_evidence_reconciler(db);
+    }
+    if plane == ProcessPlane::Combined
+        && let Some(clerk) = &sekai_svc.cross_store
+    {
         spawn_admission_reconciler(clerk.clone());
     }
 }
@@ -1647,5 +1740,23 @@ mod tests {
         let mut config = base_config();
         config.allow_plaintext = true;
         assert!(tls_policy("0.0.0.0", &config).is_ok());
+    }
+
+    #[test]
+    fn plane_interceptor_rejects_the_other_service() {
+        let mut interceptor = with_plane(
+            ProcessPlane::Sekai,
+            ProcessPlane::Chisei,
+            LocalInterceptor::new(true),
+        );
+        let error = interceptor.call(Request::new(())).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("wrong-plane"));
+        let mut allowed = with_plane(
+            ProcessPlane::Sekai,
+            ProcessPlane::Sekai,
+            LocalInterceptor::new(true),
+        );
+        assert!(allowed.call(Request::new(())).is_ok());
     }
 }

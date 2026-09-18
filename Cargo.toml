@@ -97,6 +97,14 @@ chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 tempfile = "3"
 
 [[bin]]
+name = "sekai"
+path = "src/bin/sekai.rs"
+
+[[bin]]
+name = "chisei"
+path = "src/bin/chisei.rs"
+
+[[bin]]
 name = "sekai-mcp"
 path = "src/bin/sekai_mcp.rs"
 

@@ -27,7 +27,8 @@ template.
 | `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
-| `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, and the gateway; never bootstraps server authority |
+| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup (`http://127.0.0.1:50051`) |
+| `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. |
@@ -72,7 +73,9 @@ configuration is refused; a second file is never invented from one path.
 the writer fence. After the fence a single-store writer refuses to start;
 set the destination pair instead.
 
-The gateway is a translator and does not own a third store.
+The `sekai` and `chisei` binaries each open only their own store. See
+[two-plane processes](two-plane-processes.md). Combined mode still uses the
+typed dest-pair. The gateway is a translator and does not own a third store.
 See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
 [ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
 
