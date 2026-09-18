@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- MCP Preview that may fill uses the Function host request timeout
+  (`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) instead of a hard 5s
+  deadline. Submit stays at 5s (#987).
 - Admit and valid Preview stamp `system_one_fill_json` with the type
   version's pinned System One bind and a digest of the admitted parameter
   body. Submit does not re-invoke the Function (#981).
