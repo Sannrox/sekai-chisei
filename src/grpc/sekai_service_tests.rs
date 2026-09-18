@@ -5657,6 +5657,8 @@ fn system_one_bind_json() -> String {
     .to_string()
 }
 
+static TYPE_SAFE_TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn put_system_one_ticket_type(svc: &SekaiServiceImpl) {
     svc.db
         .upsert_object_type(&crate::sekai::schema::ObjectType {
@@ -5776,7 +5778,11 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn preview_records_typesafe_egress_after_admission() {
+    let _env = TYPE_SAFE_TEST_ENV
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let app = axum::Router::new().route(
         "/v1/systemone",
         axum::routing::post(|| async {
@@ -5874,6 +5880,109 @@ async fn preview_records_typesafe_egress_after_admission() {
             .unwrap()
             .len(),
         0
+    );
+    unsafe {
+        std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);
+        std::env::remove_var(sekai_provider::system_one::BASE_URL_ENV);
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid() {
+    let _env = TYPE_SAFE_TEST_ENV
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let app = axum::Router::new().route(
+        "/v1/systemone",
+        axum::routing::post(|| async {
+            axum::Json(sekai_provider::system_one::SystemOneResponse {
+                model: "jev-1.13.0".into(),
+                answers: [(
+                    "dept-name".into(),
+                    serde_json::json!({"type":"choice","choice":"technical"}),
+                )]
+                .into_iter()
+                .collect(),
+                usage: None,
+            })
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    unsafe {
+        std::env::set_var(sekai_provider::system_one::API_KEY_ENV, "test-key");
+        std::env::set_var(
+            sekai_provider::system_one::BASE_URL_ENV,
+            format!("http://{addr}/v1/systemone"),
+        );
+    }
+
+    let svc = service();
+    grant_action_admin(&svc);
+    put_system_one_ticket_type(&svc);
+    svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: "acme".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            description: "Triage a support ticket".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"dept-name":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","dept-name"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["notify".into()],
+            policy_scope: String::new(),
+            budget_scope: String::new(),
+            enabled: true,
+            created_by: String::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            disabled_at_ms: 0,
+            object_kind: "support_ticket".into(),
+            object_mutation: "update".into(),
+            submission_criteria: vec![],
+            declared_effect_kinds: vec![],
+            system_one_json: serde_json::json!({
+                "model": "jev-1.13.0",
+                "questions": [{
+                    "parameter": "dept-name",
+                    "type": "choice",
+                    "instructions": "Which team should handle this",
+                    "criteria": {"billing": null, "technical": null, "sales": null}
+                }]
+            })
+            .to_string(),
+        }),
+        request_id: "put-triage-invalid-fill".into(),
+    }))
+    .await
+    .unwrap();
+
+    let preview = svc
+        .preview_object_action(with_principal(PreviewObjectActionRequest {
+            namespace: "acme".into(),
+            object_id: "ticket-preview".into(),
+            type_id: "support.triage".into(),
+            version: "1".into(),
+            parameters_json: String::new(),
+            expected_object_updated_ms: 20,
+            expected_object_revision: String::new(),
+            evidence_submission_ids: Vec::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(preview.outcome, "invalid");
+    assert!(preview.proposed_parameters_json.is_empty());
+    assert!(
+        svc.db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("preview_object_action".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
     );
     unsafe {
         std::env::remove_var(sekai_provider::system_one::API_KEY_ENV);

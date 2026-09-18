@@ -284,6 +284,7 @@ pub(super) async fn preview_object_action(
     }
     let mut parameters_json = inner.parameters_json;
     let mut proposed_parameters_json = String::new();
+    let mut fill_audit = None;
     if crate::chisei::system_one_action::should_fill(&type_def, &parameters_json) {
         let object_type = service.db.get_object_type(&object.kind).ok().flatten();
         let client = sekai_provider::system_one::TypeSafeClient::from_env()
@@ -302,14 +303,12 @@ pub(super) async fn preview_object_action(
                 Status::unavailable(error)
             }
         })?;
-        record_system_one_egress_audit(
-            &service.db,
-            &record,
+        fill_audit = Some((
+            record,
             crate::chisei::system_one_action::bind_of(&type_def)
-                .map(|bind| bind.model.as_str())
-                .unwrap_or("typesafe"),
-            &object.id,
-        );
+                .map(|bind| bind.model.clone())
+                .unwrap_or_else(|| "typesafe".into()),
+        ));
         parameters_json = filled;
         proposed_parameters_json.clone_from(&parameters_json);
     }
@@ -335,6 +334,8 @@ pub(super) async fn preview_object_action(
     let mut proto = object_action_preview_to_proto(preview);
     if proto.outcome != crate::sekai::action_describe_preview::PREVIEW_VALID {
         proposed_parameters_json.clear();
+    } else if let Some((record, model)) = fill_audit {
+        record_system_one_egress_audit(&service.db, &record, &model, &object.id);
     }
     proto.proposed_parameters_json = proposed_parameters_json;
     Ok(Response::new(proto))
