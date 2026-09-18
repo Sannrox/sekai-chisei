@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Shared-compatibility Combined open refuses when the writer fence is
+  raised, so `from_env` cannot boot a single-file writer after relocate
+  (#1019).
 - Preview records TypeSafe egress audit only when the post-fill preview
   stays `valid`. A filled body that fails the second preview clears
   proposed parameters and does not persist a typesafe Decision (#1044).
