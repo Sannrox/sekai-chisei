@@ -454,6 +454,7 @@ pub(super) fn to_proto_action_instance(
         budget_decision: domain.budget_decision.clone(),
         created_at_ms: domain.created_at_ms,
         decided_at_ms: domain.decided_at_ms,
+        system_one_fill_json: domain.system_one_fill_json.clone(),
     }
 }
 pub(super) fn to_proto_action_effect(
@@ -1559,6 +1560,7 @@ pub(super) fn object_action_preview_to_proto(
         compensation: preview.compensation,
         failing_criterion: preview.failing_criterion,
         proposed_parameters_json: preview.proposed_parameters_json,
+        system_one_fill_json: preview.system_one_fill_json,
     }
 }
 

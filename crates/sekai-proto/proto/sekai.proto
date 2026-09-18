@@ -1078,6 +1078,8 @@ message ActionInstance {
   string budget_decision = 14;
   int64 created_at_ms = 15;
   int64 decided_at_ms = 16;
+  // Bind + admitted parameter-body provenance. Empty when the type has no bind.
+  string system_one_fill_json = 17;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -1146,6 +1148,8 @@ message PreviewObjectActionResponse {
   string failing_criterion = 12;
   // Filled when parameters_json is empty and the type has a System One bind.
   string proposed_parameters_json = 13;
+  // Bind + parameter-body provenance on a valid preview of a bound type.
+  string system_one_fill_json = 14;
 }
 message GetActionInstanceRequest {
   string instance_id = 1;
