@@ -70,8 +70,8 @@ fn spawn_plane(bin: &str, port: u16, extras: &[(&str, &str)]) -> ChildGuard {
         .env_remove("SEKAI_DATABASE_URL")
         .env_remove("CHISEI_DATABASE_URL")
         .env_remove("DATABASE_URL")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     for (key, value) in extras {
         command.env(key, value);
     }
@@ -88,6 +88,22 @@ fn wait_ready(port: u16) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("process on {addr} did not become ready");
+}
+
+fn run_until_exit(mut command: Command, timeout: Duration) -> std::process::ExitStatus {
+    let mut child = command.spawn().unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command exceeded {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 async fn sekai_client(port: u16) -> SekaiServiceClient<tonic::transport::Channel> {
@@ -111,6 +127,15 @@ fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request
 
 #[tokio::test]
 async fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(),
+    )
+    .await
+    .expect("two-plane process test timed out")
+}
+
+async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner() {
     let dir = tempdir().unwrap();
     let sekai_db = dir.path().join("sekai.db");
     let chisei_db = dir.path().join("chisei.db");
@@ -247,18 +272,23 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
         "{wrong_submit}"
     );
     let _ = wrong_receipt;
+    drop(_sekai);
+    drop(_chisei);
 
     let mut refuse = Command::new(sekai_bin);
-    let status = refuse
+    refuse
         .env("SEKAI_INSECURE", "1")
         .env("SEKAI_BIND", "127.0.0.1")
         .env("GRPC_PORT", free_port().to_string())
         .env("SEKAI_SOCKET", "")
         .env("OPS_PORT", "")
         .env("SEKAI_HTTP_PORT", "")
+        .env_remove("CHISEI_DB_PATH")
+        .env_remove("CHISEI_DATABASE_URL")
         .env("SEKAI_DB_PATH", chisei_db.to_str().unwrap())
-        .status()
-        .unwrap();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = run_until_exit(refuse, Duration::from_secs(10));
     assert!(!status.success(), "sekai process opened a Chisei store");
 }
 
@@ -267,7 +297,8 @@ fn sekai_binary_refuses_chisei_destination_variables() {
     let dir = tempdir().unwrap();
     let sekai_db = dir.path().join("sekai.db");
     let chisei_db = dir.path().join("chisei.db");
-    let status = Command::new(env!("CARGO_BIN_EXE_sekai"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    command
         .env("SEKAI_INSECURE", "1")
         .env("SEKAI_BIND", "127.0.0.1")
         .env("GRPC_PORT", free_port().to_string())
@@ -276,7 +307,8 @@ fn sekai_binary_refuses_chisei_destination_variables() {
         .env("SEKAI_HTTP_PORT", "")
         .env("SEKAI_DB_PATH", sekai_db.to_str().unwrap())
         .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap())
-        .status()
-        .unwrap();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = run_until_exit(command, Duration::from_secs(10));
     assert!(!status.success());
 }
