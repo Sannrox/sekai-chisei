@@ -806,19 +806,26 @@ pub fn build_services(
         chisei_store.clone(),
         config.budget_topology.clone(),
     ));
+    let clerk = Arc::new(
+        crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            chisei_store.clone(),
+            sekai_store.clone(),
+            Some(budget.clone()),
+        ),
+    );
     let sekai_svc = Arc::new(
         sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
-            sekai_store,
+            sekai_store.clone(),
             budget.clone(),
             config.gateway_receipt_principals.clone(),
         )
-        .with_site_id(config.site_id.clone()),
+        .with_site_id(config.site_id.clone())
+        .with_cross_store_admission(clerk),
     );
-    let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        chisei_store,
-        config.clone(),
-        budget,
-    ));
+    let chisei_svc = Arc::new(
+        chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget)
+            .with_sekai_commit_lookup(Arc::new(sekai_store)),
+    );
 
     (sekai_svc, chisei_svc)
 }
@@ -844,6 +851,34 @@ fn spawn_service_background_tasks(
         );
     }
     spawn_execution_evidence_reconciler(db);
+    if let Some(clerk) = &sekai_svc.cross_store {
+        spawn_admission_reconciler(clerk.clone());
+    }
+}
+
+fn spawn_admission_reconciler(
+    clerk: Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let clerk = clerk.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                clerk.reconcile_pending(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(?error, "admission reservation reconciliation failed")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "admission reservation reconciliation task failed")
+                }
+            }
+        }
+    });
 }
 
 fn execution_evidence_runtime(stores: &CombinedStoreLayout) -> Arc<RuntimeDb> {
@@ -982,6 +1017,33 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&evidence, &layout.chisei_runtime()),
             "Sekai execution-evidence reconcile must not use the Chisei runtime"
+        );
+    }
+
+    #[test]
+    fn build_services_wires_reserve_commit_finalize_clerk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = crate::combined_stores::CombinedStoreSources {
+            backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+            default_sqlite_path: "unused.db".into(),
+            sekai_sqlite_path: Some(sekai.to_string_lossy().into_owned()),
+            chisei_sqlite_path: Some(chisei.to_string_lossy().into_owned()),
+            postgres_max_connections: 16,
+            ..crate::combined_stores::CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        let (sekai_svc, chisei_svc) = build_services(&crate::config::Config::from_env(), &layout);
+        let clerk = sekai_svc
+            .cross_store
+            .as_ref()
+            .expect("combined mode must own the typed admission hop");
+        assert!(clerk.distinct_stores());
+        assert!(
+            chisei_svc.sekai_commit_lookup.is_some(),
+            "GetOperationReceipt must be able to project a live Sekai commit handle"
         );
     }
 

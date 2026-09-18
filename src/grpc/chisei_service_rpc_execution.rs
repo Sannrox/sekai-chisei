@@ -528,7 +528,7 @@ pub(super) async fn get_operation_receipt(
             "exactly one of operation_id or request_id is required",
         ));
     }
-    let receipt = if !operation_id.is_empty() {
+    let mut receipt = if !operation_id.is_empty() {
         if let Some(attempt) = attempt {
             match service
                 .db
@@ -589,6 +589,11 @@ pub(super) async fn get_operation_receipt(
         }
     })?
     .ok_or(Status::not_found("operation receipt not found"))?;
+    if let Some(lookup) = &service.sekai_commit_lookup
+        && let Ok(Some(commit)) = lookup.lookup_commit(&receipt.operation_id)
+    {
+        crate::chisei::cross_store_admission::project_commit_handles(&mut receipt, &commit);
+    }
     if actor != receipt.initiating_actor
             // The UDS interceptor assigns `local`; local socket access is the
             // administrative inspection boundary used by sekaictl. This

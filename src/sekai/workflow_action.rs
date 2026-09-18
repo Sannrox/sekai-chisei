@@ -256,6 +256,7 @@ pub fn submit_step(
                 ontology_digest: String::new(),
                 autonomous_envelope_id: String::new(),
                 policy_context: crate::sekai::object_security::PrincipalPolicyContext::default(),
+                budget_already_reserved: false,
             },
             actor,
             now_ms,

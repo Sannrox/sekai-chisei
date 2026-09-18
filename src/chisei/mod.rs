@@ -4,6 +4,7 @@ pub mod budget;
 pub mod cache_policy;
 pub mod capability;
 pub mod controller;
+pub mod cross_store_admission;
 pub mod data_quality;
 pub mod egress;
 pub mod entitlements;
