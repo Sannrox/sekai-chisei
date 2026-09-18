@@ -18,7 +18,7 @@ use crate::chisei::gunshi_policy::{
     ActiveAllocationPolicy, AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
     PolicyTransition, PolicyTransitionDecision, apply_promotion, monitor_and_rollback,
 };
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::audit::Decision;
 
 pub const STATE_CONTRACT_VERSION: &str = "gunshi.allocation-control/v1";
@@ -125,7 +125,7 @@ impl NamespaceAllocationState {
 }
 
 pub fn load_state(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
 ) -> Result<Option<NamespaceAllocationState>, String> {
     required("namespace", namespace)?;
@@ -142,7 +142,7 @@ pub fn load_state(
 }
 
 pub fn get_status(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
 ) -> Result<Option<NamespaceAllocationStatus>, String> {
     Ok(load_state(db, namespace)?.map(|state| state.status()))
@@ -150,7 +150,7 @@ pub fn get_status(
 
 /// Install the first advisory baseline for a namespace. Auto-dispatch remains off.
 pub fn install_baseline(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     mut snapshot: AllocationPolicySnapshot,
@@ -215,7 +215,7 @@ pub struct PromoteRequest {
 }
 
 pub fn promote(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     request: PromoteRequest,
 ) -> Result<NamespaceAllocationStatus, String> {
     required("actor", &request.actor)?;
@@ -272,7 +272,7 @@ pub fn promote(
 }
 
 pub fn rollback(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     expected_revision: &str,
@@ -349,7 +349,7 @@ pub fn rollback(
 
 /// Monitor live outcomes and auto-rollback when the promotion gate regresses.
 pub fn monitor(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     observed: PolicyEvaluation,
@@ -396,7 +396,7 @@ pub fn monitor(
 }
 
 pub fn set_auto_opt_in(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     opt_in: bool,
@@ -455,7 +455,7 @@ pub fn set_auto_opt_in(
 }
 
 pub fn set_kill_switch(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     enabled: bool,
@@ -507,7 +507,7 @@ pub fn set_kill_switch(
 
 /// Authorize auto-dispatch for a plan under the durable namespace control plane.
 pub fn authorize_namespace_auto_dispatch(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     plan: &AllocationPlan,
     operation: &PendingOperation,
@@ -612,7 +612,7 @@ pub fn receipt_attributes(
 }
 
 fn persist(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     state: &NamespaceAllocationState,
     expected_revision: Option<&str>,
 ) -> Result<bool, String> {
@@ -628,7 +628,7 @@ fn persist(
 }
 
 fn audit(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     action: &str,
     state: &NamespaceAllocationState,
@@ -681,8 +681,8 @@ mod tests {
     use crate::chisei::gunshi::OperationRisk;
     use crate::chisei::gunshi_dispatch::AutoDispatchPolicy;
     use crate::chisei::gunshi_optimization::OptimizationPolicy;
-    fn db() -> RuntimeDb {
-        RuntimeDb::memory()
+    fn db() -> ChiseiStore {
+        ChiseiStore::memory()
     }
 
     fn snapshot(revision: &str, enabled: bool) -> AllocationPolicySnapshot {

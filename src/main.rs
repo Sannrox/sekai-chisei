@@ -1,5 +1,6 @@
+use sekai_chisei::combined_stores::{CombinedStoreLayout, registry_db_anchor};
 use sekai_chisei::config::Config;
-use sekai_chisei::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use sekai_chisei::store_relocate::open_layout_or_fence;
 use std::sync::Arc;
 use tokio::signal;
 
@@ -18,8 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sekai-chisei starting"
     );
 
-    let provider_registry_state_path =
-        sekai_chisei::provider_profile::provider_registry_state_path(&config.db_path);
+    let provider_registry_state_path = sekai_chisei::provider_profile::provider_registry_state_path(
+        &registry_db_anchor(&config.db_path),
+    );
     sekai_chisei::provider_profile::validate_provider_registry_storage(
         &provider_registry_state_path,
     )
@@ -27,11 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sekai_chisei::provider_profile::refresh_provider_registry(&provider_registry_state_path)
         .map_err(std::io::Error::other)?;
 
-    let backend_config =
-        RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
-    let backend =
-        Arc::new(RuntimeBackend::initialize(backend_config).map_err(std::io::Error::other)?);
-    let db = backend.database();
+    let stores = Arc::new(open_layout_or_fence(&config.db_path).map_err(std::io::Error::other)?);
+    let db = stores.sekai_runtime();
     let active_credentials = db.list_active_credentials()?;
     let external_credentials_active = active_credentials.iter().any(|credential| {
         !matches!(
@@ -74,10 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!(
         db_path = %config.db_path,
-        backend = ?backend.capabilities().backend,
-        backend_contract = %backend.capabilities().contract_version,
+        store_mode = stores.mode_name(),
+        sekai_store = %stores.sekai_identity(),
+        chisei_store = %stores.chisei_identity(),
         db_lock_poisoned_total = db.db_lock_poisoned_total(),
-        "database configured"
+        "durable stores configured"
     );
     tracing::info!(
         anthropic = config.anthropic_api_key.is_some(),
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let server = sekai_chisei::grpc::run(
         config,
-        Arc::clone(&backend),
+        Arc::clone(&stores),
         active_credentials,
         grpc_tcp_mode,
     )?;
@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     telemetry.shutdown();
     drop(async_runtime);
-    drop(backend);
+    drop(stores);
     result
 }
 
@@ -139,10 +139,8 @@ fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Error>>
         .and_then(|value| value.parse::<i32>().ok())
         .unwrap_or(500);
 
-    let backend_config =
-        RuntimeBackendConfig::from_env(&config.db_path).map_err(std::io::Error::other)?;
-    let backend = RuntimeBackend::initialize(backend_config).map_err(std::io::Error::other)?;
-    let db = backend.database();
+    let stores = CombinedStoreLayout::from_env(&config.db_path).map_err(std::io::Error::other)?;
+    let db = stores.sekai_runtime();
     let rows = sekai_chisei::gateway_report::egress_rows(&db, after, limit)?;
 
     match format {

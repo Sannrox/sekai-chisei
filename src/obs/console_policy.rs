@@ -9,6 +9,7 @@ use crate::chisei::gunshi_policy::{AllocationPolicySnapshot, PolicyEvaluation};
 use crate::chisei::policy::Policy;
 use crate::chisei::policy_dry_run::{self, PolicyDryRunReport};
 use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::{ListFilter, Object};
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::obs::console_pressure::principal_can_write_namespace;
@@ -110,7 +111,7 @@ pub fn load_effective_policy_view(
         .ok()
         .flatten()
         .or_else(|| db.get_action_policy(namespace).ok().flatten());
-    let gunshi = gunshi_auto::get_status(db, namespace).unwrap_or(None);
+    let gunshi = gunshi_auto::get_status(&ChiseiStore::from(db), namespace).unwrap_or(None);
     let can_write = principal_can_write_namespace(db, principal, namespace).unwrap_or(false);
     Ok(EffectivePolicyView {
         namespace: namespace.into(),
@@ -237,7 +238,7 @@ pub fn console_promote(
     let candidate_evaluation: PolicyEvaluation = serde_json::from_str(candidate_eval_json)
         .map_err(|e| format!("invalid candidate evaluation JSON: {e}"))?;
     gunshi_auto::promote(
-        db,
+        &ChiseiStore::from(db),
         PromoteRequest {
             actor: principal.into(),
             namespace: namespace.into(),
@@ -261,7 +262,7 @@ pub fn console_rollback(
         return Err("namespace write access denied".into());
     }
     gunshi_auto::rollback(
-        db,
+        &ChiseiStore::from(db),
         principal,
         namespace,
         expected_revision,

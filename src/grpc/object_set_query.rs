@@ -96,6 +96,27 @@ impl SekaiServiceImpl {
                 bound.filter.kind.as_deref(),
                 queried_properties,
             )?;
+            if let Some(aggregation) = &bound.descriptor.aggregation
+                && !aggregation.property.is_empty()
+            {
+                let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
+                let leaf_kind = hops
+                    .last()
+                    .map(|hop| hop.far_kind.as_str())
+                    .unwrap_or(bound.descriptor.kind.as_str());
+                ensure_property_query_allowed(
+                    &schema,
+                    &principals,
+                    leaf_kind,
+                    [aggregation.property.clone()],
+                )?;
+                ensure_property_grant_query_allowed(
+                    &self.db,
+                    Some(bound.descriptor.namespace.as_str()),
+                    Some(leaf_kind),
+                    [aggregation.property.as_str()],
+                )?;
+            }
         }
         let principal_context_digest =
             crate::sekai::purpose_authorization::purpose_bound_context_digest(
@@ -314,26 +335,14 @@ impl SekaiServiceImpl {
         let published = bound.descriptor.definition_digest.as_str();
         let mut kinds = vec![bound.descriptor.kind.as_str()];
         kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
-        for kind in kinds {
-            if !self
-                .db
-                .hop_projection_ready(&bound.descriptor.namespace, kind)
-                .map_err(Status::internal)?
-            {
-                return Err(Status::failed_precondition(
-                    "object index hop projection is stale",
-                ));
-            }
-            if let Some(datasource) = self
-                .db
-                .get_object_type_datasource(&bound.descriptor.namespace, kind)
-                .map_err(Status::internal)?
-                && datasource.definition_digest != published
-            {
-                return Err(Status::failed_precondition(
-                    "object index hop projection is stale",
-                ));
-            }
+        if !self
+            .db
+            .hop_projection_kinds_ready(&bound.descriptor.namespace, &kinds, published)
+            .map_err(Status::internal)?
+        {
+            return Err(Status::failed_precondition(
+                "object index hop projection is stale",
+            ));
         }
         Ok(())
     }
@@ -344,6 +353,7 @@ impl SekaiServiceImpl {
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
         roots: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
         meter: &mut crate::sekai::object_set::CostMeter,
+        needed_leaf: &[String],
     ) -> Result<Vec<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>>, Status> {
         let mut key_paths: Vec<Vec<crate::sekai::object_index_engine::HopKey>> = roots
             .iter()
@@ -383,10 +393,11 @@ impl SekaiServiceImpl {
             let child_by_key = if last {
                 let children = self
                     .db
-                    .list_index_members_by_keys(
+                    .list_index_members_by_keys_projected(
                         &bound.descriptor.namespace,
                         &hop.far_kind,
                         &child_keys,
+                        Some(needed_leaf),
                     )
                     .map_err(Status::internal)?;
                 meter
@@ -483,6 +494,18 @@ impl SekaiServiceImpl {
                 "object index dual-read requires max_rows_scanned",
             ));
         }
+        if self.object_log_dual_read.enabled && bound.descriptor.cost_limit.max_rows_scanned <= 0 {
+            return Err(Status::failed_precondition(
+                "object-log dual-read requires max_rows_scanned",
+            ));
+        }
+        let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
+            Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
+        })?;
+        let needed_root =
+            aggregate_plan_properties(&aggregation, &bound.descriptor.property_filters, &[]);
+        let needed_leaf = aggregate_plan_properties(&aggregation, &[], &[]);
+        let needed_nested = aggregate_plan_properties(&aggregation, &[], hops);
         let mut layers = Vec::new();
         let mut kind = bound.descriptor.kind.clone();
         let empty = crate::sekai::dataset::RowQuery::default();
@@ -538,24 +561,30 @@ impl SekaiServiceImpl {
             } else {
                 empty.clone()
             };
+            let needed = if index == 0 {
+                needed_root.as_slice()
+            } else {
+                needed_nested.as_slice()
+            };
             let members = self
                 .db
-                .list_visible_index_members(&bound.descriptor.namespace, &kind, &query)
+                .list_visible_index_members_projected(
+                    &bound.descriptor.namespace,
+                    &kind,
+                    &query,
+                    Some(needed),
+                )
                 .map_err(Status::internal)?;
             meter
                 .charge(members.len() as i32)
                 .map_err(map_object_set_error)?;
             layers.push(members);
         }
-        if self.object_index_engine
-            == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
-        {
-            self.require_hop_projection_ready(bound, hops)?;
-        }
+        self.require_hop_projection_ready(bound, hops)?;
         let projected = if self.object_index_engine
             == crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection
         {
-            Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter)?)
+            Some(self.hop_projection_paths(bound, hops, &layers[0], &mut meter, &needed_leaf)?)
         } else {
             None
         };
@@ -595,27 +624,50 @@ impl SekaiServiceImpl {
                 ));
             }
         }
-        let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
-            Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
-        })?;
         if self.object_log_dual_read.enabled {
-            let sql_paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
-                if let Some(projected) = projected.as_ref() {
-                    projected.iter().map(|path| path.iter().collect()).collect()
-                } else {
-                    paths.clone()
-                };
-            crate::sekai::object_log::compare_sql_to_log(
-                &self.object_log_dual_read,
-                &bound.descriptor,
-                hops,
-                &aggregation,
-                &sql_paths,
-                // Tagged evaluate is not principal-aware. Clerk grants stay on
-                // SQL; a later mapper can project a deny-list after soak.
-                mikura::PropertyAcl::allow_all(),
-            )
-            .map_err(|error| Status::failed_precondition(error.message()))?;
+            let mut kinds = vec![bound.descriptor.kind.as_str()];
+            kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
+            let mut policies = Vec::new();
+            for kind in &kinds {
+                policies.push(
+                    self.db
+                        .active_object_policy(&bound.descriptor.namespace, kind)
+                        .map_err(Status::internal)?,
+                );
+            }
+            match crate::sekai::object_log::project_object_log_acl(
+                policies.iter().map(|policy| policy.as_ref()),
+            ) {
+                Ok(acl) => {
+                    let sql_paths: Vec<
+                        Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>,
+                    > = if let Some(projected) = projected.as_ref() {
+                        projected.iter().map(|path| path.iter().collect()).collect()
+                    } else {
+                        paths.clone()
+                    };
+                    match crate::sekai::object_log::compare_sql_to_log(
+                        &self.object_log_dual_read,
+                        &bound.descriptor,
+                        hops,
+                        &aggregation,
+                        &sql_paths,
+                        acl,
+                        bound.descriptor.cost_limit.max_rows_scanned,
+                    ) {
+                        Ok(())
+                        | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
+                        Err(error) => {
+                            return Err(Status::failed_precondition(error.message()));
+                        }
+                    }
+                }
+                Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed)
+                | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
+                Err(error) => {
+                    return Err(Status::failed_precondition(error.message()));
+                }
+            }
         }
         let rows: Vec<(String, Option<f64>)> = if let Some(projected) = projected.as_ref() {
             projected
@@ -649,6 +701,33 @@ impl SekaiServiceImpl {
                 .collect(),
         }))
     }
+}
+
+fn aggregate_plan_properties(
+    aggregation: &crate::sekai::object_set::ObjectSetAggregation,
+    filters: &[crate::domain::PropertyFilter],
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if !aggregation.group_by.is_empty() {
+        keys.push(aggregation.group_by.clone());
+    }
+    if !aggregation.function.eq_ignore_ascii_case("count") && !aggregation.property.is_empty() {
+        keys.push(aggregation.property.clone());
+    }
+    for filter in filters {
+        if !filter.key.is_empty() {
+            keys.push(filter.key.clone());
+        }
+    }
+    for hop in hops {
+        if !hop.join_property.is_empty() {
+            keys.push(hop.join_property.clone());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 fn aggregate_path_row(
@@ -831,6 +910,42 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn aggregate_plan_properties_keeps_group_numeric_filter_and_join_keys() {
+        let aggregation = crate::sekai::object_set::ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: "region".into(),
+        };
+        let filters = [crate::domain::PropertyFilter {
+            key: "tier".into(),
+            op: "eq".into(),
+            value: "1".into(),
+        }];
+        let hops = [crate::sekai::object_set::ObjectSetTraversal {
+            join_property: "customer_id".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &filters, &[]),
+            vec!["amount".to_string(), "region".into(), "tier".into()]
+        );
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &[], &[]),
+            vec!["amount".to_string(), "region".into()]
+        );
+        assert_eq!(
+            aggregate_plan_properties(&aggregation, &[], &hops),
+            vec!["amount".to_string(), "customer_id".into(), "region".into()]
+        );
+        let count = crate::sekai::object_set::ObjectSetAggregation {
+            function: "count".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        assert!(aggregate_plan_properties(&count, &[], &[]).is_empty());
+    }
 
     fn service() -> SekaiServiceImpl {
         let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
@@ -1838,6 +1953,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hop_projection_evaluate_fails_closed_when_same_digest_binding_changes() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
+        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let mut rebound = svc
+            .db
+            .get_object_type_datasource("sales", "Order")
+            .unwrap()
+            .unwrap();
+        rebound.dataset_id = "ds-orders-v2".into();
+        svc.db
+            .register_object_type_datasource(&rebound, 99)
+            .unwrap();
+        assert!(!svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
+    async fn nested_loop_evaluate_fails_closed_when_join_is_unready() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop;
+        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        svc.db
+            .set_hop_projection_ready("sales", "Order", false, 99)
+            .unwrap();
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
+    async fn nested_loop_evaluate_fails_closed_when_same_digest_binding_changes() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop;
+        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let mut rebound = svc
+            .db
+            .get_object_type_datasource("sales", "Order")
+            .unwrap()
+            .unwrap();
+        rebound.dataset_id = "ds-orders-v2".into();
+        svc.db
+            .register_object_type_datasource(&rebound, 99)
+            .unwrap();
+        assert!(!svc.db.hop_projection_ready("sales", "Order").unwrap());
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("hop projection is stale"));
+    }
+
+    #[tokio::test]
     async fn evaluate_object_set_object_log_dual_read_matches_and_fails_closed() {
         let mut svc = service();
         grant_namespace(&svc, "sales", "alice");
@@ -1850,6 +2129,7 @@ mod tests {
         svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
             enabled: true,
             log_path: Some(log.clone()),
+            sample_n: 1,
         };
         let request = EvaluateObjectSetRequest {
             descriptor: Some(ObjectSetDescriptor {
@@ -1895,27 +2175,187 @@ mod tests {
         assert_eq!(page.aggregates[0].value, 10.0);
         assert!(!page.authority);
 
-        let mut store = mikura::Store::open(&log).unwrap();
-        mikura::BatchIngest::run(
-            &mut store,
-            vec![mikura::ObjectRecord {
-                r#gen: 1,
-                kind: "Shipment".into(),
-                key: "s2".into(),
-                hidden: false,
-                props: std::collections::HashMap::from([
-                    ("order_id".into(), "o1".into()),
-                    ("amount".into(), "5".into()),
-                ]),
-            }],
-        )
-        .unwrap();
-        let mismatch = svc
+        svc.object_log_dual_read.enabled = false;
+        let off = svc
             .evaluate_object_set(with_named_principal(request, "alice"))
             .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(off.aggregates, page.aggregates);
+    }
+
+    #[tokio::test]
+    async fn object_log_dual_read_fails_closed_without_row_cost_limit() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
+            enabled: true,
+            log_path: None,
+            sample_n: 1,
+        };
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![ObjectSetTraversal {
+                            relation: "placed".into(),
+                            direction: "outgoing".into(),
+                            far_kind: "Order".into(),
+                            join_property: "customer_id".into(),
+                        }],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            property: String::new(),
+                            group_by: "region".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
             .unwrap_err();
-        assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
-        assert!(mismatch.message().contains("object-log dual-read mismatch"));
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("object-log dual-read requires max_rows_scanned")
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_property_fails_closed_when_leaf_grant_denies() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        svc.db
+            .create_object(&object(
+                "s-gate",
+                "Shipment",
+                "S1",
+                &[("order_id", "o1"), ("amount", "10")],
+                30,
+            ))
+            .unwrap();
+        let shipment = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Shipment".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+                property: "order_id".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: None,
+            required_purpose: None,
+        };
+        let shipment_revision = svc
+            .db
+            .put_object_security_policy(&shipment, "root", "put-shipment", 1)
+            .unwrap();
+        let instantiated = svc
+            .db
+            .list_objects(&domain::ListFilter {
+                namespace: Some("sales".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut activation = std::collections::BTreeMap::from([(
+            "Shipment".into(),
+            shipment_revision.revision_digest,
+        )]);
+        for (index, kind) in instantiated
+            .iter()
+            .map(|object| object.kind.as_str())
+            .filter(|kind| *kind != "Shipment")
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            let extra = crate::sekai::object_security::ObjectSecurityPolicy {
+                contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION
+                    .into(),
+                namespace: "sales".into(),
+                kind: kind.into(),
+                rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                    operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                    predicates: vec![
+                        crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
+                    ],
+                }],
+                property_grants: None,
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = svc
+                .db
+                .put_object_security_policy(
+                    &extra,
+                    "root",
+                    &format!("put-{kind}"),
+                    10 + index as i64,
+                )
+                .unwrap();
+            activation.insert(kind.to_string(), revision.revision_digest);
+        }
+        svc.db
+            .activate_object_security_policies("sales", &activation, "root", "activate", 40)
+            .unwrap();
+        let err = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        hops: vec![
+                            ObjectSetTraversal {
+                                relation: "placed".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Order".into(),
+                                join_property: "customer_id".into(),
+                            },
+                            ObjectSetTraversal {
+                                relation: "ships".into(),
+                                direction: "outgoing".into(),
+                                far_kind: "Shipment".into(),
+                                join_property: "order_id".into(),
+                            },
+                        ],
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "sum".into(),
+                            property: "amount".into(),
+                            group_by: "region".into(),
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     fn seed_sales_with_shipments(svc: &SekaiServiceImpl) -> String {

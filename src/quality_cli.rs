@@ -2,6 +2,7 @@
 
 use crate::chisei::data_quality::{self, PublishDataQualityRule};
 use crate::config::Config;
+use crate::db::store::ChiseiStore;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use chrono::Utc;
 
@@ -64,7 +65,7 @@ enum MutateOp {
 async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = data_quality::publish_rule(
-        db.as_ref(),
+        &ChiseiStore::from(db.as_ref()),
         &config.actor,
         &config.request,
         Utc::now().timestamp_millis(),
@@ -77,7 +78,7 @@ async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
 async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = data_quality::evaluate_rule(
-        db.as_ref(),
+        &ChiseiStore::from(db.as_ref()),
         &config.actor,
         &config.namespace,
         &config.rule_id,
@@ -91,15 +92,19 @@ async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
 
 async fn show_rule(config: ShowConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let record = data_quality::show_rule(db.as_ref(), &config.namespace, &config.rule_id)
-        .map_err(std::io::Error::other)?;
+    let record = data_quality::show_rule(
+        &ChiseiStore::from(db.as_ref()),
+        &config.namespace,
+        &config.rule_id,
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 
 async fn list_rules(namespace: Option<String>) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let records = data_quality::list_rules(db.as_ref(), namespace.as_deref())
+    let records = data_quality::list_rules(&ChiseiStore::from(db.as_ref()), namespace.as_deref())
         .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
@@ -107,8 +112,8 @@ async fn list_rules(namespace: Option<String>) -> Result<(), BoxErr> {
 
 async fn show_result(config: ResultConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let record =
-        data_quality::show_result(db.as_ref(), &config.result_id).map_err(std::io::Error::other)?;
+    let record = data_quality::show_result(&ChiseiStore::from(db.as_ref()), &config.result_id)
+        .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
@@ -117,12 +122,18 @@ async fn mutate_result(config: ResultConfig, op: MutateOp) -> Result<(), BoxErr>
     let db = open_db().await?;
     let now = Utc::now().timestamp_millis();
     let record = match op {
-        MutateOp::Cancel => {
-            data_quality::cancel_evaluation(db.as_ref(), &config.actor, &config.result_id, now)
-        }
-        MutateOp::Restart => {
-            data_quality::restart_evaluation(db.as_ref(), &config.actor, &config.result_id, now)
-        }
+        MutateOp::Cancel => data_quality::cancel_evaluation(
+            &ChiseiStore::from(db.as_ref()),
+            &config.actor,
+            &config.result_id,
+            now,
+        ),
+        MutateOp::Restart => data_quality::restart_evaluation(
+            &ChiseiStore::from(db.as_ref()),
+            &config.actor,
+            &config.result_id,
+            now,
+        ),
     }
     .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);

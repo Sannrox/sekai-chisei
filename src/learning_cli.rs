@@ -2,6 +2,7 @@
 
 use crate::chisei::learning_change::{self, ProposeLearningChange};
 use crate::config::Config;
+use crate::db::store::ChiseiStore;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use chrono::Utc;
 
@@ -60,7 +61,7 @@ enum MutateOp {
 async fn propose(config: ProposeConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = learning_change::propose_change(
-        db.as_ref(),
+        &ChiseiStore::from(db.as_ref()),
         &config.actor,
         &ProposeLearningChange {
             namespace: config.namespace,
@@ -79,28 +80,28 @@ async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
     let now = Utc::now().timestamp_millis();
     let record = match op {
         MutateOp::Approve => learning_change::approve_change(
-            db.as_ref(),
+            &ChiseiStore::from(db.as_ref()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Activate => learning_change::activate_change(
-            db.as_ref(),
+            &ChiseiStore::from(db.as_ref()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Rollback => learning_change::rollback_change(
-            db.as_ref(),
+            &ChiseiStore::from(db.as_ref()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::LeaseLoss => learning_change::note_lease_loss(
-            db.as_ref(),
+            &ChiseiStore::from(db.as_ref()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
@@ -114,25 +115,33 @@ async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
 
 async fn inspect(config: TargetConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let comparison =
-        learning_change::inspect_change(db.as_ref(), &config.namespace, &config.learning_id)
-            .map_err(std::io::Error::other)?;
+    let comparison = learning_change::inspect_change(
+        &ChiseiStore::from(db.as_ref()),
+        &config.namespace,
+        &config.learning_id,
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&comparison)?);
     Ok(())
 }
 
 async fn show(config: TargetConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let record = learning_change::get_change(db.as_ref(), &config.namespace, &config.learning_id)
-        .map_err(std::io::Error::other)?;
+    let record = learning_change::get_change(
+        &ChiseiStore::from(db.as_ref()),
+        &config.namespace,
+        &config.learning_id,
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 
 async fn list_changes(namespace: Option<String>) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let records = learning_change::list_changes(db.as_ref(), namespace.as_deref())
-        .map_err(std::io::Error::other)?;
+    let records =
+        learning_change::list_changes(&ChiseiStore::from(db.as_ref()), namespace.as_deref())
+            .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }

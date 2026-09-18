@@ -111,9 +111,11 @@ pub struct ChiseiServiceImpl {
     pub(super) active_promotions: Arc<ActivePromotions>,
     pub(super) evaluation_execution_lifecycle:
         evaluation_execution_lifecycle::EvaluationExecutionLifecycle,
-    pub(super) db: Arc<RuntimeDb>,
+    pub(super) db: crate::db::store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
+    pub(super) sekai_commit_lookup:
+        Option<Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>>,
 }
 
 #[derive(Clone)]
@@ -261,7 +263,7 @@ impl ChiseiServiceImpl {
         }
     }
 
-    pub fn new(db: Arc<RuntimeDb>, config: Config) -> Self {
+    pub fn new(db: impl Into<crate::db::store::ChiseiStore>, config: Config) -> Self {
         Self::new_with_evaluator_registries(
             db,
             config.clone(),
@@ -279,7 +281,7 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registry(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
     ) -> Self {
@@ -292,13 +294,14 @@ impl ChiseiServiceImpl {
     }
 
     pub fn new_with_evaluator_registries(
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::ChiseiStore>,
         config: Config,
         evaluator_registry: Arc<evaluation_execution_domain::DeterministicEvaluatorRegistry>,
         stochastic_evaluator_registry: Arc<
             evaluation_execution_domain::StochasticEvaluatorRegistry,
         >,
     ) -> Self {
+        let db = db.into();
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -337,6 +340,7 @@ impl ChiseiServiceImpl {
             db,
             config,
             provider_registry_state_path,
+            sekai_commit_lookup: None,
         }
     }
 
@@ -365,7 +369,12 @@ impl ChiseiServiceImpl {
         self.active_promotions.clone()
     }
 
-    pub fn with_budget(db: Arc<RuntimeDb>, config: Config, budget: Arc<BudgetTracker>) -> Self {
+    pub fn with_budget(
+        db: impl Into<crate::db::store::ChiseiStore>,
+        config: Config,
+        budget: Arc<BudgetTracker>,
+    ) -> Self {
+        let db = db.into();
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
@@ -411,7 +420,16 @@ impl ChiseiServiceImpl {
             db,
             config,
             provider_registry_state_path,
+            sekai_commit_lookup: None,
         }
+    }
+
+    pub fn with_sekai_commit_lookup(
+        mut self,
+        lookup: Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>,
+    ) -> Self {
+        self.sekai_commit_lookup = Some(lookup);
+        self
     }
 
     fn bind_gunshi_allocation(

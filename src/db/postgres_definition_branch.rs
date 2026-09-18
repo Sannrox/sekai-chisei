@@ -538,7 +538,7 @@ impl PostgresDb {
         transaction
             .execute(
                 "UPDATE sekai_object_type_index_join_status
-                 SET ready = FALSE, rebuilt_at_ms = $1 WHERE namespace = $2",
+                 SET ready = FALSE, generation = '', rebuilt_at_ms = $1 WHERE namespace = $2",
                 &[&now_ms, &proposal.namespace],
             )
             .map_err(|error| error.to_string())?;

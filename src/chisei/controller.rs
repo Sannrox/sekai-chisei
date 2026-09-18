@@ -17,9 +17,7 @@ use crate::chisei::promotion::{
     Candidate, CandidateStore, KIND_ROUTING_BIAS, RoutingBiasPayload, STATUS_GATE_PASSED,
     STATUS_PROMOTED, STATUS_ROLLED_BACK,
 };
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 
 /// Live, governed routing-bias overrides keyed by (namespace, task_class), consulted by
 /// `resolve_policy` (`grpc/chisei_service/policy_resolution.rs`) alongside the static `cheap_route_bias` heuristic.
@@ -106,7 +104,7 @@ impl ActivePromotions {
 pub fn promote_candidate(
     store: &CandidateStore,
     active: &ActivePromotions,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     candidate_id: &str,
 ) -> Option<()> {
     let promoted = store.transition(candidate_id, STATUS_GATE_PASSED, STATUS_PROMOTED)?;
@@ -155,7 +153,7 @@ pub fn check_rollbacks(
     store: &CandidateStore,
     active: &ActivePromotions,
     eval: &EvalStore,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> usize {
     let mut rolled_back = 0;
     for candidate in store.list_by_status(STATUS_PROMOTED) {
@@ -193,7 +191,7 @@ pub fn check_rollbacks(
     rolled_back
 }
 
-fn record(db: &RuntimeDb, outcome: &str, candidate: &Candidate, reason: &str) {
+fn record(db: &ChiseiStore, outcome: &str, candidate: &Candidate, reason: &str) {
     let mut evidence = HashMap::new();
     evidence.insert("kind".to_string(), candidate.kind.clone());
     evidence.insert("namespace".to_string(), candidate.namespace.clone());
@@ -215,13 +213,10 @@ fn record(db: &RuntimeDb, outcome: &str, candidate: &Candidate, reason: &str) {
 mod tests {
     use super::*;
     use crate::chisei::eval::{CaseResult, Run};
-    use std::sync::Arc;
 
-    fn setup() -> (Arc<RuntimeDb>, EvalStore, CandidateStore, ActivePromotions) {
+    fn setup() -> (ChiseiStore, EvalStore, CandidateStore, ActivePromotions) {
         (
-            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(":memory:").unwrap(),
-            ))),
+            ChiseiStore::memory(),
             EvalStore::new(),
             CandidateStore::new(),
             ActivePromotions::new(),

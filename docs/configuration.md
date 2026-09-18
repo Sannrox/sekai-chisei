@@ -10,8 +10,12 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | `./data/sekai.db` | SQLite database path |
-| `DATABASE_URL` | unset | PostgreSQL connection URL; required when `SEKAI_DB_BACKEND=postgres` |
+| `DB_PATH` | `./data/sekai.db` | SQLite compatibility path when destination variables are unset |
+| `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
+| `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
+| `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; required when `SEKAI_DB_BACKEND=postgres` without destination URLs |
+| `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
+| `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
 | `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | PostgreSQL pool size |
 | `SEKAI_POSTGRES_CA_CERT` | unset | Optional PEM CA certificate path for TLS trust |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
@@ -32,9 +36,10 @@ template.
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
-| `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Switching engines requires `ReindexObjectType` |
+| `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Unset or empty parses as hop-projection. After the default switch, operators must `ReindexObjectType` for hop kinds. Pinning nested-loop does not bypass an unready generation. Both engines fail closed while hop-projection ready is false after a binding-generation bump. Switching engines requires `ReindexObjectType` |
 | `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Canary/CI only. Set `1` to compare both engines and fail closed on mismatch; evaluate also requires `max_rows_scanned` because both plans share the cost meter |
-| `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Set `1` to compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
+| `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Canary/CI only. Set `1` to sample-compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch, missing log, or missing `max_rows_scanned`. Plans the log cannot witness (`group_by`, path multiplicity, non-i64 sum, incoming hop direction) keep the SQL answer and skip the canary instead of refusing evaluate. After #980 every production multi-hop has `group_by`, so those requests skip. Stays off when property grants narrow visibility (allow-all soak only) ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
+| `SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE` | `32` when dual-read is on | Compare one of N armed evaluates. `1` is CI. Unsampled requests do not open the log |
 | `SEKAI_OBJECT_LOG` | unset | Path to the mikura object log required when `SEKAI_OBJECT_LOG_DUAL_READ=1` |
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
 | `CHISEI_PERMIT_ISSUER` | `chisei.local` | Issuer id embedded in signed permits |
@@ -58,8 +63,24 @@ explicit operator decision.
 Malformed governed-subject provenance key-window or TTL values disable new
 provenance issuance; they never fall back to a wider activation window.
 
+`SEKAI_DB_PATH` + `CHISEI_DB_PATH` (SQLite) or `SEKAI_DATABASE_URL` +
+`CHISEI_DATABASE_URL` (PostgreSQL) open two physical stores. Combined mode
+refuses a pair that resolves to the same file or database. Partial destination
+configuration is refused; a second file is never invented from one path.
+`DB_PATH` and `DATABASE_URL` remain migration compatibility until
+[store relocation](store-relocation.md) copies Chisei families and raises
+the writer fence. After the fence a single-store writer refuses to start;
+set the destination pair instead.
+
+The gateway is a translator and does not own a third store.
+See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
+[ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
+
 Backend configuration is validated before any listener binds. `DB_PATH` and
-`DATABASE_URL` are mutually exclusive. The public
+`DATABASE_URL` are mutually exclusive. Destination pairs win over the matching
+legacy variable when both are present for SQLite; a leftover `DATABASE_URL`
+cannot be mixed with SQLite destination paths, and a leftover `DB_PATH`
+cannot be mixed with PostgreSQL destination URLs. The public
 `sekai.runtime-backend/v1` capability contract identifies the backend, its
 supported reusable surfaces, and (for PostgreSQL) the applied migration version.
 PostgreSQL implements the reusable community surface set—Sekai, Chisei, gateway

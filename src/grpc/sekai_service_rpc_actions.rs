@@ -158,28 +158,30 @@ pub(super) async fn submit_action_instance(
         "governed action identity bound"
     );
 
+    let admission_request = ActionInstanceAdmissionRequest {
+        namespace,
+        type_id: inner.type_id,
+        version: inner.version,
+        parameters_json: inner.parameters_json,
+        idempotency_key: inner.idempotency_key,
+        evidence_submission_ids: inner.evidence_submission_ids,
+        request_id: inner.request_id,
+        ontology_digest: inner.ontology_digest,
+        autonomous_envelope_id: String::new(),
+        policy_context,
+        budget_already_reserved: false,
+    };
     let outcome = span.in_scope(|| {
-        ActionInstanceAdmission::new(
-            &service.db,
-            service.budget.as_ref().map(std::convert::AsRef::as_ref),
-        )
-        .admit(
-            ActionInstanceAdmissionRequest {
-                namespace,
-                type_id: inner.type_id,
-                version: inner.version,
-                parameters_json: inner.parameters_json,
-                idempotency_key: inner.idempotency_key,
-                evidence_submission_ids: inner.evidence_submission_ids,
-                request_id: inner.request_id,
-                ontology_digest: inner.ontology_digest,
-                autonomous_envelope_id: String::new(),
-                policy_context,
-            },
-            &actor,
-            now_millis(),
-        )
-        .map_err(|error| match error {
+        let result = if let Some(clerk) = &service.cross_store {
+            clerk.admit(admission_request, &actor, now_millis())
+        } else {
+            ActionInstanceAdmission::new(
+                &service.db,
+                service.budget.as_ref().map(std::convert::AsRef::as_ref),
+            )
+            .admit(admission_request, &actor, now_millis())
+        };
+        result.map_err(|error| match error {
             ActionInstanceAdmissionError::InvalidArgument(message) => {
                 Status::invalid_argument(message)
             }

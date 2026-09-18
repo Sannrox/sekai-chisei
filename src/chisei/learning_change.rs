@@ -5,7 +5,7 @@
 //! activation are explicit. Rollback supersedes history without rewriting
 //! source evidence.
 
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::KIND_LEARNING;
 use crate::sekai::audit::Decision;
 use crate::shomei;
@@ -92,7 +92,7 @@ pub fn change_id_for(namespace: &str, learning_id: &str) -> String {
 }
 
 pub fn propose_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     request: &ProposeLearningChange,
     now_ms: i64,
@@ -165,7 +165,7 @@ pub fn propose_change(
 }
 
 pub fn approve_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -201,7 +201,7 @@ pub fn approve_change(
 }
 
 pub fn activate_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -235,7 +235,7 @@ pub fn activate_change(
 }
 
 pub fn rollback_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -268,7 +268,7 @@ pub fn rollback_change(
 }
 
 pub fn note_lease_loss(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -290,7 +290,7 @@ pub fn note_lease_loss(
 }
 
 pub fn get_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     learning_id: &str,
 ) -> Result<LearningChange, String> {
@@ -307,14 +307,14 @@ pub fn get_change(
 }
 
 pub fn list_changes(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<LearningChange>, String> {
     db.list_learning_changes(namespace)
 }
 
 pub fn inspect_change(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     learning_id: &str,
 ) -> Result<LearningChangeComparison, String> {
@@ -328,7 +328,7 @@ pub fn inspect_change(
 }
 
 fn visible_learning(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     learning_id: &str,
 ) -> Result<crate::domain::Object, String> {
@@ -341,7 +341,7 @@ fn visible_learning(
     Ok(learning)
 }
 
-fn require_current_candidate(db: &RuntimeDb, record: &LearningChange) -> Result<(), String> {
+fn require_current_candidate(db: &ChiseiStore, record: &LearningChange) -> Result<(), String> {
     let learning = visible_learning(db, &record.namespace, &record.learning_id)?;
     let current = learning_digest(&learning)?;
     if current != record.candidate_digest {
@@ -358,7 +358,7 @@ fn deny_if_unusable(record: &LearningChange) -> Result<(), String> {
 }
 
 fn live_baseline_digest(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     learning_id: &str,
 ) -> Result<String, String> {
@@ -372,7 +372,7 @@ fn live_baseline_digest(
         .unwrap_or_default())
 }
 
-fn set_learning_status(db: &RuntimeDb, learning_id: &str, status: &str) -> Result<(), String> {
+fn set_learning_status(db: &ChiseiStore, learning_id: &str, status: &str) -> Result<(), String> {
     let mut learning = db
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
@@ -421,7 +421,7 @@ fn validate_digest(name: &str, value: &str) -> Result<(), String> {
 }
 
 fn audit(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     action: &str,
     outcome: &str,
@@ -464,15 +464,15 @@ mod tests {
     use crate::sekai::schema::SchemaRegistry;
     use std::collections::HashMap;
 
-    fn db() -> RuntimeDb {
-        RuntimeDb::memory()
+    fn db() -> ChiseiStore {
+        ChiseiStore::memory()
     }
 
     fn evidence() -> String {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
     }
 
-    fn record_candidate(db: &RuntimeDb) {
+    fn record_candidate(db: &ChiseiStore) {
         db.create_object(&Object {
             id: "target-1".into(),
             kind: "component".into(),
@@ -509,7 +509,7 @@ mod tests {
         .unwrap();
     }
 
-    fn propose(db: &RuntimeDb, now_ms: i64) -> LearningChange {
+    fn propose(db: &ChiseiStore, now_ms: i64) -> LearningChange {
         propose_change(
             db,
             "operator",
@@ -620,7 +620,7 @@ mod tests {
             UNAVAILABLE
         );
 
-        let lost = RuntimeDb::memory();
+        let lost = ChiseiStore::memory();
         record_candidate(&lost);
         propose(&lost, 4_000);
         note_lease_loss(&lost, "operator", "payments", "learning-1", 4_100).unwrap();

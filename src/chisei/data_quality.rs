@@ -1,6 +1,6 @@
 //! Content-bound data-quality rules and results (#681).
 
-use crate::db::runtime_db::RuntimeDb;
+use crate::db::store::ChiseiStore;
 use crate::domain::Object;
 use crate::sekai::audit::Decision;
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ pub struct PublishDataQualityRule {
 }
 
 pub fn publish_rule(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     request: &PublishDataQualityRule,
     now_ms: i64,
@@ -176,7 +176,7 @@ pub fn publish_rule(
 }
 
 pub fn start_evaluation(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     rule_id: &str,
@@ -219,7 +219,7 @@ pub fn start_evaluation(
 }
 
 pub fn evaluate_rule(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     rule_id: &str,
@@ -234,7 +234,7 @@ pub fn evaluate_rule(
 }
 
 pub fn cancel_evaluation(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     result_id: &str,
     now_ms: i64,
@@ -266,7 +266,7 @@ pub fn cancel_evaluation(
 }
 
 pub fn restart_evaluation(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     result_id: &str,
     now_ms: i64,
@@ -283,7 +283,7 @@ pub fn restart_evaluation(
 }
 
 pub fn show_rule(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: &str,
     rule_id: &str,
 ) -> Result<DataQualityRule, String> {
@@ -293,25 +293,28 @@ pub fn show_rule(
         .ok_or_else(|| UNAVAILABLE.to_string())
 }
 
-pub fn list_rules(db: &RuntimeDb, namespace: Option<&str>) -> Result<Vec<DataQualityRule>, String> {
+pub fn list_rules(
+    db: &ChiseiStore,
+    namespace: Option<&str>,
+) -> Result<Vec<DataQualityRule>, String> {
     db.list_data_quality_rules(namespace)
 }
 
-pub fn show_result(db: &RuntimeDb, result_id: &str) -> Result<DataQualityResult, String> {
+pub fn show_result(db: &ChiseiStore, result_id: &str) -> Result<DataQualityResult, String> {
     required("result id", result_id)?;
     db.get_data_quality_result(result_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())
 }
 
 pub fn list_results(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<DataQualityResult>, String> {
     db.list_data_quality_results(namespace)
 }
 
 fn finish_evaluation(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     result_id: &str,
     now_ms: i64,
@@ -356,7 +359,7 @@ fn finish_evaluation(
 }
 
 fn prepare_evaluation(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     rule_id: &str,
@@ -470,7 +473,7 @@ fn apply_evaluator(
 }
 
 fn authorized_dataset(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     namespace: &str,
     dataset_id: &str,
@@ -591,7 +594,7 @@ fn required(name: &str, value: &str) -> Result<(), String> {
 
 #[allow(clippy::too_many_arguments)]
 fn audit(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     actor: &str,
     action: &str,
     outcome: &str,
@@ -622,15 +625,15 @@ fn audit(
 mod tests {
     use super::*;
 
-    fn db() -> RuntimeDb {
-        RuntimeDb::memory()
+    fn db() -> ChiseiStore {
+        ChiseiStore::memory()
     }
 
     fn expected() -> String {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
     }
 
-    fn put_dataset(db: &RuntimeDb, rows: &str, extra: &[(&str, &str)]) {
+    fn put_dataset(db: &ChiseiStore, rows: &str, extra: &[(&str, &str)]) {
         let mut properties = HashMap::from([("row_count".into(), rows.into())]);
         for (key, value) in extra {
             properties.insert((*key).into(), (*value).into());
@@ -648,7 +651,7 @@ mod tests {
         .unwrap();
     }
 
-    fn publish_pin(db: &RuntimeDb) -> DataQualityRule {
+    fn publish_pin(db: &ChiseiStore) -> DataQualityRule {
         let dataset = db
             .get_object(&dataset_object_id("quality", "orders"))
             .unwrap()

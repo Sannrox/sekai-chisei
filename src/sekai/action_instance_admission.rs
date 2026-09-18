@@ -38,6 +38,7 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub ontology_digest: String,
     pub autonomous_envelope_id: String,
     pub policy_context: PrincipalPolicyContext,
+    pub budget_already_reserved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +71,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         actor: &str,
         now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let budget_already_reserved = request.budget_already_reserved;
         let namespace = request.namespace.trim().to_string();
         require_value("namespace", &namespace)?;
         require_value("type_id", request.type_id.trim())?;
@@ -349,6 +351,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             planned_effects.as_deref(),
             applied_object.as_ref(),
             ontology_digest,
+            budget_already_reserved,
             now,
         ) {
             let receipt_exists = self
@@ -402,6 +405,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         planned_effects: Option<&[action_effect::ActionEffect]>,
         applied_object: Option<&AppliedObjectMutation>,
         ontology_digest: Option<String>,
+        budget_already_reserved: bool,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
         let operation_id = &stored.operation_id;
@@ -565,7 +569,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             .map_err(ActionInstanceAdmissionError::Internal)?;
 
         if stored.status == STATUS_ADMITTED {
-            if let Some(budget) = self.budget {
+            if let Some(budget) = self.budget
+                && !budget_already_reserved
+            {
                 budget.record(budget_subject, 1);
             }
             let effects = planned_effects.ok_or_else(|| {
@@ -756,6 +762,7 @@ mod tests {
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
             policy_context: PrincipalPolicyContext::default(),
+            budget_already_reserved: false,
         }
     }
 
@@ -970,6 +977,7 @@ mod tests {
                     ontology_digest: ONTOLOGY_DIGEST.into(),
                     autonomous_envelope_id: String::new(),
                     policy_context: PrincipalPolicyContext::default(),
+                    budget_already_reserved: false,
                 },
                 "alice",
                 10,
@@ -1138,6 +1146,7 @@ mod tests {
             ontology_digest: ONTOLOGY_DIGEST.into(),
             autonomous_envelope_id: String::new(),
             policy_context: PrincipalPolicyContext::default(),
+            budget_already_reserved: false,
         }
     }
 

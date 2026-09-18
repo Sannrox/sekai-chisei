@@ -21,6 +21,7 @@ use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelec
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
+use crate::db::chisei_operation_reservation::OperationReservation;
 use crate::db::definition_branch::DefinitionBranchBackend;
 use crate::db::object_sync::ObjectSyncBackend;
 use crate::domain::{Direction, Link, ListFilter, Object};
@@ -245,9 +246,23 @@ impl RuntimeDb {
         kind: &str,
         query: &RowQuery,
     ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        self.list_visible_index_members_projected(namespace, kind, query, None)
+    }
+
+    pub fn list_visible_index_members_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        query: &RowQuery,
+        needed: Option<&[String]>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
         match self {
-            Self::Sqlite(db) => db.list_visible_index_members(namespace, kind, query),
-            Self::Postgres(db) => db.list_visible_index_members(namespace, kind, query),
+            Self::Sqlite(db) => {
+                db.list_visible_index_members_projected(namespace, kind, query, needed)
+            }
+            Self::Postgres(db) => {
+                db.list_visible_index_members_projected(namespace, kind, query, needed)
+            }
         }
     }
 
@@ -262,6 +277,18 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.hop_projection_ready(namespace, kind),
             Self::Postgres(db) => db.hop_projection_ready(namespace, kind),
+        }
+    }
+
+    pub fn hop_projection_kinds_ready(
+        &self,
+        namespace: &str,
+        kinds: &[&str],
+        published: &str,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.hop_projection_kinds_ready(namespace, kinds, published),
+            Self::Postgres(db) => db.hop_projection_kinds_ready(namespace, kinds, published),
         }
     }
 
@@ -315,9 +342,23 @@ impl RuntimeDb {
         kind: &str,
         keys: &[String],
     ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
+        self.list_index_members_by_keys_projected(namespace, kind, keys, None)
+    }
+
+    pub fn list_index_members_by_keys_projected(
+        &self,
+        namespace: &str,
+        kind: &str,
+        keys: &[String],
+        needed: Option<&[String]>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, String> {
         match self {
-            Self::Sqlite(db) => db.list_index_members_by_keys(namespace, kind, keys),
-            Self::Postgres(db) => db.list_index_members_by_keys(namespace, kind, keys),
+            Self::Sqlite(db) => {
+                db.list_index_members_by_keys_projected(namespace, kind, keys, needed)
+            }
+            Self::Postgres(db) => {
+                db.list_index_members_by_keys_projected(namespace, kind, keys, needed)
+            }
         }
     }
 
@@ -1283,6 +1324,37 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.get_operation_receipt(operation_id),
             Self::Postgres(db) => db.get_operation_receipt(operation_id),
+        }
+    }
+
+    pub fn get_operation_reservation(
+        &self,
+        namespace: &str,
+        operation_id: &str,
+    ) -> Result<Option<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_operation_reservation(namespace, operation_id),
+            Self::Postgres(db) => db.get_operation_reservation(namespace, operation_id),
+        }
+    }
+
+    pub fn put_operation_reservation(
+        &self,
+        reservation: &OperationReservation,
+    ) -> Result<OperationReservation, String> {
+        match self {
+            Self::Sqlite(db) => db.put_operation_reservation(reservation),
+            Self::Postgres(db) => db.put_operation_reservation(reservation),
+        }
+    }
+
+    pub fn list_pending_operation_reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<OperationReservation>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_pending_operation_reservations(limit),
+            Self::Postgres(db) => db.list_pending_operation_reservations(limit),
         }
     }
 

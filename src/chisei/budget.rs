@@ -1,10 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 use crate::sekai::audit::Decision;
 
 pub use crate::db::chisei_budget::BudgetTransferRecord;
@@ -192,20 +189,23 @@ fn now_ms() -> i64 {
 /// auto-allocation paths that share this tracker all hit the **same** store
 /// APIs — there is no process-local or region-shadow ledger for durable spend.
 pub struct BudgetTracker {
-    db: Arc<RuntimeDb>,
+    db: ChiseiStore,
     topology: BudgetTopologyConfig,
 }
 
 impl BudgetTracker {
-    pub fn new(db: Arc<RuntimeDb>) -> Self {
+    pub fn new(db: impl Into<ChiseiStore>) -> Self {
         Self {
-            db,
+            db: db.into(),
             topology: BudgetTopologyConfig::single_region(),
         }
     }
 
-    pub fn with_topology(db: Arc<RuntimeDb>, topology: BudgetTopologyConfig) -> Self {
-        Self { db, topology }
+    pub fn with_topology(db: impl Into<ChiseiStore>, topology: BudgetTopologyConfig) -> Self {
+        Self {
+            db: db.into(),
+            topology,
+        }
     }
 
     pub fn topology(&self) -> &BudgetTopologyConfig {
@@ -600,20 +600,14 @@ impl BudgetTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn tracker() -> BudgetTracker {
-        BudgetTracker::new(Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        ))))
+        BudgetTracker::new(ChiseiStore::memory())
     }
 
     fn tracker_with(topology: BudgetTopologyConfig) -> BudgetTracker {
-        BudgetTracker::with_topology(
-            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(":memory:").unwrap(),
-            ))),
-            topology,
-        )
+        BudgetTracker::with_topology(ChiseiStore::memory(), topology)
     }
 
     #[test]
@@ -665,9 +659,7 @@ mod tests {
     fn regional_with_transfer_partition_cannot_overspend_combined_ceiling() {
         // Combined pool ceiling 100, pre-split us=60 / eu=40. Under partition,
         // each home can only spend its local allocation; total ≤ 100.
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         let us = BudgetTracker::with_topology(
             db.clone(),
             BudgetTopologyConfig {
@@ -735,9 +727,7 @@ mod tests {
 
     #[test]
     fn transfer_moves_capacity_and_is_audited_idempotent() {
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         let t = BudgetTracker::with_topology(
             db.clone(),
             BudgetTopologyConfig {
@@ -817,9 +807,7 @@ mod tests {
         use std::sync::Barrier;
         use std::thread;
 
-        let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(":memory:").unwrap(),
-        )));
+        let db = ChiseiStore::memory();
         let setup = BudgetTracker::with_topology(
             db.clone(),
             BudgetTopologyConfig {

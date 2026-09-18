@@ -13,6 +13,208 @@ pub fn join_value_digest(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Keep only plan-needed properties from a stored member JSON map.
+/// `None` keeps the full map. An empty slice skips deserialize of unused keys
+/// by returning an empty map when `raw` is ignored by callers; when `raw` is
+/// present this still parses once and retains named keys.
+pub fn project_member_properties(
+    raw: &str,
+    needed: Option<&[String]>,
+) -> Result<BTreeMap<String, String>, String> {
+    match needed {
+        None => serde_json::from_str(raw).map_err(|error| error.to_string()),
+        Some([]) => Ok(BTreeMap::new()),
+        Some(keys) => {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).map_err(|error| error.to_string())?;
+            let Some(object) = value.as_object() else {
+                return Err("index member properties must be a JSON object".into());
+            };
+            let mut properties = BTreeMap::new();
+            for key in keys {
+                if let Some(serde_json::Value::String(text)) = object.get(key) {
+                    properties.insert(key.clone(), text.clone());
+                }
+            }
+            Ok(properties)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexSqlDialect {
+    Sqlite,
+    Postgres,
+}
+
+/// Push eq/gt/gte/lt/lte onto stored member JSON so evaluate does not
+/// decode every kind row. Unknown ops fail closed (no rows).
+pub fn member_filter_sql(
+    dialect: IndexSqlDialect,
+    filters: &[crate::sekai::dataset::RowFilter],
+) -> Result<(String, Vec<String>), String> {
+    let mut clause = String::new();
+    let mut values = Vec::new();
+    let mut param = 3usize;
+    for filter in filters {
+        if filter.column.is_empty() || filter.column.contains('\'') || filter.column.contains('"') {
+            return Err(format!("invalid index filter key {}", filter.column));
+        }
+        let extract = match dialect {
+            IndexSqlDialect::Sqlite => {
+                format!("json_extract(properties, '$.{}')", filter.column)
+            }
+            IndexSqlDialect::Postgres => {
+                format!("(properties::json ->> '{}')", filter.column)
+            }
+        };
+        let placeholder = match dialect {
+            IndexSqlDialect::Sqlite => format!("?{param}"),
+            IndexSqlDialect::Postgres => format!("${param}"),
+        };
+        let pred = match filter.op.as_str() {
+            "eq" | "" => {
+                values.push(filter.value.clone());
+                param += 1;
+                format!("{extract} = {placeholder}")
+            }
+            "gt" | "lt" | "gte" | "lte" => {
+                let cmp = match filter.op.as_str() {
+                    "gt" => ">",
+                    "lt" => "<",
+                    "gte" => ">=",
+                    _ => "<=",
+                };
+                values.push(filter.value.clone());
+                param += 1;
+                match dialect {
+                    IndexSqlDialect::Sqlite => format!(
+                        "({extract} IS NOT NULL AND {extract} GLOB '*[0-9]*' AND {extract} NOT GLOB '*[A-Za-z]*' AND CAST({extract} AS REAL) {cmp} CAST({placeholder} AS REAL))"
+                    ),
+                    IndexSqlDialect::Postgres => format!(
+                        "({extract} IS NOT NULL AND {extract} ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::float8 {cmp} ({placeholder})::float8)"
+                    ),
+                }
+            }
+            _ => "0".into(),
+        };
+        clause.push_str(" AND ");
+        clause.push_str(&pred);
+    }
+    Ok((clause, values))
+}
+
+/// SQL expression for the member properties column. `None` keeps the stored
+/// wide JSON. Named keys are projected with `json_object` / `jsonb_build_object`.
+pub fn member_properties_sql(
+    dialect: IndexSqlDialect,
+    needed: Option<&[String]>,
+) -> Result<String, String> {
+    let Some(keys) = needed else {
+        return Ok("properties".into());
+    };
+    for key in keys {
+        if key.is_empty() || key.contains('\'') || key.contains('"') {
+            return Err(format!("invalid index projection key {key}"));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(match dialect {
+            IndexSqlDialect::Sqlite => "json_object()".into(),
+            IndexSqlDialect::Postgres => "'{}'::text".into(),
+        });
+    }
+    Ok(match dialect {
+        IndexSqlDialect::Sqlite => {
+            let pairs = keys
+                .iter()
+                .map(|key| format!("'{key}', json_extract(properties, '$.{key}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("json_object({pairs})")
+        }
+        IndexSqlDialect::Postgres => {
+            let pairs = keys
+                .iter()
+                .map(|key| format!("'{key}', properties::json -> '{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("jsonb_build_object({pairs})::text")
+        }
+    })
+}
+
+/// `LIMIT`/`OFFSET` after a filter clause. `next_param` is the next bind index.
+pub fn member_page_sql(
+    dialect: IndexSqlDialect,
+    limit: i32,
+    offset: i32,
+    mut next_param: usize,
+) -> (String, Vec<i32>, usize) {
+    let mut sql = String::new();
+    let mut values = Vec::new();
+    let offset = offset.max(0);
+    if limit > 0 {
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" LIMIT ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" LIMIT ${next_param}"),
+        });
+        values.push(limit);
+        next_param += 1;
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" OFFSET ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
+        });
+        values.push(offset);
+        next_param += 1;
+    } else if offset > 0 {
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" LIMIT -1 OFFSET ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
+        });
+        values.push(offset);
+        next_param += 1;
+    }
+    (sql, values, next_param)
+}
+
+/// One evaluate fence row: ready bit, join generation, and catalog digest.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HopProjectionFence {
+    pub ready: bool,
+    pub generation: String,
+    pub definition_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopProjectionAdmit {
+    Admit,
+    Reject,
+    CountFallback,
+}
+
+/// Admit from the stamped receipt. Skip COUNT when generation matches the
+/// published catalog. Digest mismatch fails closed. Empty generation keeps
+/// the wipe-detector COUNT path for rows that have not been restamped.
+pub fn admit_hop_projection_fence(
+    fence: &HopProjectionFence,
+    published: &str,
+) -> HopProjectionAdmit {
+    if !fence.ready {
+        return HopProjectionAdmit::Reject;
+    }
+    if !published.is_empty()
+        && !fence.definition_digest.is_empty()
+        && fence.definition_digest != published
+    {
+        return HopProjectionAdmit::Reject;
+    }
+    if !fence.generation.is_empty() && (published.is_empty() || fence.generation == published) {
+        return HopProjectionAdmit::Admit;
+    }
+    HopProjectionAdmit::CountFallback
+}
+
 pub const CONTRACT_VERSION: &str = "sekai.object-type-index/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +289,18 @@ pub struct ReindexReport {
 }
 
 impl ObjectTypeDatasource {
+    /// Physical join generation, distinct from catalog `definition_digest`.
+    /// Changing dataset, key, mapping, hidden, edits-only, or digest is a new
+    /// hop-projection generation and must fail closed until reindex.
+    pub fn changes_hop_generation(&self, next: &Self) -> bool {
+        self.definition_digest != next.definition_digest
+            || self.dataset_id != next.dataset_id
+            || self.key_column != next.key_column
+            || self.property_mapping != next.property_mapping
+            || self.hidden_column != next.hidden_column
+            || self.edits_only != next.edits_only
+    }
+
     pub fn prepare(self) -> Result<Self, ObjectTypeIndexError> {
         if self.contract_version != CONTRACT_VERSION {
             return Err(ObjectTypeIndexError::InvalidArgument(
@@ -300,5 +514,105 @@ mod tests {
         status.lag_ms = 1;
         status.stale = true;
         assert!(!freshness_holds(&status, 10_000));
+    }
+
+    #[test]
+    fn project_member_properties_keeps_only_needed_keys() {
+        let raw = r#"{"region":"eu","amount":"10","extra":"drop"}"#;
+        let needed = ["region".into(), "amount".into()];
+        let projected = project_member_properties(raw, Some(&needed)).unwrap();
+        assert_eq!(
+            projected,
+            BTreeMap::from([
+                ("region".into(), "eu".into()),
+                ("amount".into(), "10".into())
+            ])
+        );
+        assert!(
+            project_member_properties(raw, Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(project_member_properties(raw, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn member_filter_sql_pushes_eq_and_numeric_predicates() {
+        let filters = [
+            crate::sekai::dataset::RowFilter {
+                column: "tier".into(),
+                op: "gte".into(),
+                value: "2".into(),
+            },
+            crate::sekai::dataset::RowFilter {
+                column: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            },
+        ];
+        let (sqlite, values) = member_filter_sql(IndexSqlDialect::Sqlite, &filters).unwrap();
+        assert!(sqlite.contains("json_extract(properties, '$.tier')"));
+        assert!(sqlite.contains("CAST("));
+        assert!(sqlite.contains("json_extract(properties, '$.region') = ?4"));
+        assert_eq!(values, ["2".to_string(), "eu".into()]);
+        let (postgres, _) = member_filter_sql(IndexSqlDialect::Postgres, &filters).unwrap();
+        assert!(postgres.contains("properties::json ->> 'tier'"));
+        assert!(postgres.contains("::float8"));
+    }
+
+    #[test]
+    fn member_properties_and_page_sql_are_exact() {
+        let needed = ["region".into()];
+        let sqlite_props = member_properties_sql(IndexSqlDialect::Sqlite, Some(&needed)).unwrap();
+        assert_eq!(
+            sqlite_props,
+            "json_object('region', json_extract(properties, '$.region'))"
+        );
+        let postgres_props =
+            member_properties_sql(IndexSqlDialect::Postgres, Some(&needed)).unwrap();
+        assert_eq!(
+            postgres_props,
+            "jsonb_build_object('region', properties::json -> 'region')::text"
+        );
+        let (sqlite_page, sqlite_values, next) = member_page_sql(IndexSqlDialect::Sqlite, 1, 1, 4);
+        assert_eq!(sqlite_page, " LIMIT ?4 OFFSET ?5");
+        assert_eq!(sqlite_values, [1, 1]);
+        assert_eq!(next, 6);
+        let (postgres_page, postgres_values, _) =
+            member_page_sql(IndexSqlDialect::Postgres, 1, 1, 4);
+        assert_eq!(postgres_page, " LIMIT $4 OFFSET $5");
+        assert_eq!(postgres_values, [1, 1]);
+    }
+
+    #[test]
+    fn admit_hop_projection_fence_skips_count_when_generation_matches() {
+        let fence = HopProjectionFence {
+            ready: true,
+            generation: "rev-1".into(),
+            definition_digest: "rev-1".into(),
+        };
+        assert_eq!(
+            admit_hop_projection_fence(&fence, "rev-1"),
+            HopProjectionAdmit::Admit
+        );
+        assert_eq!(
+            admit_hop_projection_fence(&fence, "rev-2"),
+            HopProjectionAdmit::Reject
+        );
+        assert_eq!(
+            admit_hop_projection_fence(
+                &HopProjectionFence {
+                    ready: true,
+                    generation: String::new(),
+                    definition_digest: "rev-1".into(),
+                },
+                "rev-1"
+            ),
+            HopProjectionAdmit::CountFallback
+        );
+        assert_eq!(
+            admit_hop_projection_fence(&HopProjectionFence::default(), "rev-1"),
+            HopProjectionAdmit::Reject
+        );
     }
 }

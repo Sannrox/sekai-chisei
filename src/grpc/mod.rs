@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::chisei::budget::BudgetTracker;
+use crate::combined_stores::CombinedStoreLayout;
 use crate::config::{Config, GrpcTcpMode};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::PrincipalCredential;
@@ -21,7 +22,6 @@ use crate::db::sekai::SekaiDb;
 use crate::gateway_keys::hash_gateway_key;
 use crate::obs::grpc_layer::MetricsLayer;
 use crate::rpc_maturity::RpcMaturityLayer;
-use crate::runtime_backend::RuntimeBackend;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
 use std::convert::Infallible;
@@ -45,15 +45,18 @@ pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization
 #[derive(Clone)]
 pub struct TokenAuthInterceptor {
     store: Arc<PrincipalCredentialStore>,
-    db: Arc<RuntimeDb>,
+    db: crate::db::store::SekaiStore,
     assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
 }
 
 impl TokenAuthInterceptor {
-    pub fn new(store: Arc<PrincipalCredentialStore>, db: Arc<RuntimeDb>) -> Self {
+    pub fn new(
+        store: Arc<PrincipalCredentialStore>,
+        db: impl Into<crate::db::store::SekaiStore>,
+    ) -> Self {
         Self {
             store,
-            db,
+            db: db.into(),
             assertion_authority: None,
         }
     }
@@ -68,7 +71,7 @@ impl TokenAuthInterceptor {
 
     pub fn from_runtime(
         store: Arc<PrincipalCredentialStore>,
-        db: Arc<RuntimeDb>,
+        db: impl Into<crate::db::store::SekaiStore>,
         assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         Self::new(store, db).with_assertion_authority(assertion_authority)
@@ -431,7 +434,7 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
 
 pub fn run(
     config: Config,
-    backend: Arc<RuntimeBackend>,
+    stores: Arc<CombinedStoreLayout>,
     active_credentials: Vec<PrincipalCredential>,
     tcp_mode: GrpcTcpMode,
 ) -> Result<
@@ -444,18 +447,22 @@ pub fn run(
     // inside Tokio.
     let (
         db,
+        chisei_db,
         provider_registry_state_path,
         credential_store,
         assertion_authority,
         (sekai_svc, chisei_svc),
     ) = (|| -> Result<_, std::io::Error> {
-        backend
-            .capabilities()
-            .validate_required(crate::runtime_backend::COMMUNITY_REQUIRED_SURFACES)
+        stores
+            .validate_required_surfaces()
             .map_err(std::io::Error::other)?;
-        let db = backend.database();
+        let db = stores.sekai_runtime();
+        let chisei_db = stores.chisei_runtime();
+        let registry_anchor = stores
+            .registry_anchor_path()
+            .unwrap_or(config.db_path.as_str());
         let provider_registry_state_path =
-            crate::provider_profile::provider_registry_state_path(&config.db_path);
+            crate::provider_profile::provider_registry_state_path(registry_anchor);
         let credential_store = Arc::new(PrincipalCredentialStore::new());
         credential_store.load(&active_credentials);
 
@@ -466,9 +473,10 @@ pub fn run(
             .assertion_authority()
             .map_err(std::io::Error::other)?
             .map(Arc::new);
-        let services = build_services(&config, db.clone());
+        let services = build_services(&config, &stores);
         Ok((
             db,
+            chisei_db,
             provider_registry_state_path,
             credential_store,
             assertion_authority,
@@ -476,14 +484,16 @@ pub fn run(
         ))
     })()?;
 
+    let evidence_db = execution_evidence_runtime(&stores);
     Ok(async move {
-        spawn_service_background_tasks(&config, db.clone(), &sekai_svc, &chisei_svc);
+        spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc);
 
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
                 &config.ops_bind,
                 ops_port,
                 db.clone(),
+                Some(chisei_db.clone()),
                 provider_registry_state_path.clone(),
                 credential_store.clone(),
                 assertion_authority.clone(),
@@ -784,30 +794,38 @@ where
         .await?)
 }
 
-fn build_services(
+pub fn build_services(
     config: &Config,
-    db: Arc<RuntimeDb>,
+    stores: &CombinedStoreLayout,
 ) -> (
     Arc<sekai_service::SekaiServiceImpl>,
     Arc<chisei_service::ChiseiServiceImpl>,
 ) {
+    let (sekai_store, chisei_store) = stores.handles();
     let budget = Arc::new(BudgetTracker::with_topology(
-        db.clone(),
+        chisei_store.clone(),
         config.budget_topology.clone(),
     ));
+    let clerk = Arc::new(
+        crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            chisei_store.clone(),
+            sekai_store.clone(),
+            Some(budget.clone()),
+        ),
+    );
     let sekai_svc = Arc::new(
         sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
-            db.clone(),
+            sekai_store.clone(),
             budget.clone(),
             config.gateway_receipt_principals.clone(),
         )
-        .with_site_id(config.site_id.clone()),
+        .with_site_id(config.site_id.clone())
+        .with_cross_store_admission(clerk),
     );
-    let chisei_svc = Arc::new(chisei_service::ChiseiServiceImpl::with_budget(
-        db.clone(),
-        config.clone(),
-        budget,
-    ));
+    let chisei_svc = Arc::new(
+        chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget)
+            .with_sekai_commit_lookup(Arc::new(sekai_store)),
+    );
 
     (sekai_svc, chisei_svc)
 }
@@ -833,6 +851,38 @@ fn spawn_service_background_tasks(
         );
     }
     spawn_execution_evidence_reconciler(db);
+    if let Some(clerk) = &sekai_svc.cross_store {
+        spawn_admission_reconciler(clerk.clone());
+    }
+}
+
+fn spawn_admission_reconciler(
+    clerk: Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let clerk = clerk.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                clerk.reconcile_pending(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(?error, "admission reservation reconciliation failed")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "admission reservation reconciliation task failed")
+                }
+            }
+        }
+    });
+}
+
+fn execution_evidence_runtime(stores: &CombinedStoreLayout) -> Arc<RuntimeDb> {
+    stores.sekai_runtime()
 }
 
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
@@ -926,9 +976,12 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
-        let backend = Arc::new(
-            RuntimeBackend::from_sqlite_with_enterprise_extension(":memory:", None).unwrap(),
-        );
+        let stores = Arc::new(CombinedStoreLayout::from_backend(
+            crate::runtime_backend::RuntimeBackend::from_sqlite_with_enterprise_extension(
+                ":memory:", None,
+            )
+            .unwrap(),
+        ));
         let tcp_mode = GrpcTcpMode {
             bind_addr: "127.0.0.1".into(),
             token_auth_mode: false,
@@ -936,9 +989,62 @@ mod tests {
             bind_inferred_from_active_credentials: false,
         };
 
-        let result = run(config, backend, Vec::new(), tcp_mode);
+        let result = run(config, stores, Vec::new(), tcp_mode);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn execution_evidence_reconciler_binds_sekai_store_in_split_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = crate::combined_stores::CombinedStoreSources {
+            backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+            default_sqlite_path: "unused.db".into(),
+            sekai_sqlite_path: Some(sekai.to_string_lossy().into_owned()),
+            chisei_sqlite_path: Some(chisei.to_string_lossy().into_owned()),
+            postgres_max_connections: 16,
+            ..crate::combined_stores::CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        let evidence = execution_evidence_runtime(&layout);
+        assert!(
+            Arc::ptr_eq(&evidence, &layout.sekai_runtime()),
+            "Sekai execution-evidence reconcile must use the Sekai runtime"
+        );
+        assert!(
+            !Arc::ptr_eq(&evidence, &layout.chisei_runtime()),
+            "Sekai execution-evidence reconcile must not use the Chisei runtime"
+        );
+    }
+
+    #[test]
+    fn build_services_wires_reserve_commit_finalize_clerk() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = crate::combined_stores::CombinedStoreSources {
+            backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+            default_sqlite_path: "unused.db".into(),
+            sekai_sqlite_path: Some(sekai.to_string_lossy().into_owned()),
+            chisei_sqlite_path: Some(chisei.to_string_lossy().into_owned()),
+            postgres_max_connections: 16,
+            ..crate::combined_stores::CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        let (sekai_svc, chisei_svc) = build_services(&crate::config::Config::from_env(), &layout);
+        let clerk = sekai_svc
+            .cross_store
+            .as_ref()
+            .expect("combined mode must own the typed admission hop");
+        assert!(clerk.distinct_stores());
+        assert!(
+            chisei_svc.sekai_commit_lookup.is_some(),
+            "GetOperationReceipt must be able to project a live Sekai commit handle"
+        );
     }
 
     #[test]

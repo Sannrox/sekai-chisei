@@ -11,9 +11,7 @@ use crate::chisei::gunshi::{
     load_kioku_evidence,
 };
 use crate::chisei::receipt::ReceiptEventKind;
-use crate::db::runtime_db::RuntimeDb;
-#[cfg(test)]
-use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiStore;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoDispatchPolicy {
@@ -116,7 +114,7 @@ pub fn authorize_dispatch(
     capacity: &CapacityEnvelope,
     policy: &AutoDispatchPolicy,
     calibration: &AdvisoryScorecard,
-    db: &RuntimeDb,
+    db: &ChiseiStore,
 ) -> Result<DispatchAuthorization, String> {
     plan.validate()?;
     operation.validate()?;
@@ -292,7 +290,7 @@ pub fn authorize_dispatch(
 }
 
 fn dispatch_evidence_matches_receipt(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     evidence: &crate::chisei::gunshi::KiokuEvidence,
 ) -> Result<bool, String> {
     let Some(request_id) = evidence.receipt_reference.as_deref() else {
@@ -473,8 +471,8 @@ mod tests {
         }
     }
 
-    fn db() -> RuntimeDb {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+    fn db() -> ChiseiStore {
+        let db = ChiseiStore::memory();
         db.create_object(&Object {
             id: "memory-1".into(),
             kind: crate::domain::KIND_LEARNING.into(),

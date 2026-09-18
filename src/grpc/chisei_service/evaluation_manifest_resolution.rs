@@ -908,12 +908,12 @@ fn resolve_evaluation_manifest_live(
 }
 
 pub(super) struct EvaluationManifestResolutionLifecycle {
-    db: Arc<RuntimeDb>,
+    db: crate::db::store::ChiseiStore,
 }
 
 impl EvaluationManifestResolutionLifecycle {
-    pub(super) fn new(db: Arc<RuntimeDb>) -> Self {
-        Self { db }
+    pub(super) fn new(db: impl Into<crate::db::store::ChiseiStore>) -> Self {
+        Self { db: db.into() }
     }
 
     pub(super) fn resolve(

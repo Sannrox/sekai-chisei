@@ -21,8 +21,8 @@ pub enum ObjectIndexEngineKind {
 impl ObjectIndexEngineKind {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
-            NESTED_LOOP | "" => Ok(Self::NestedLoop),
-            HOP_PROJECTION => Ok(Self::HopProjection),
+            NESTED_LOOP => Ok(Self::NestedLoop),
+            HOP_PROJECTION | "" => Ok(Self::HopProjection),
             other => Err(format!(
                 "unsupported SEKAI_OBJECT_INDEX_ENGINE {other:?}; expected {NESTED_LOOP} or {HOP_PROJECTION}"
             )),
@@ -265,6 +265,10 @@ mod tests {
             ObjectIndexEngineKind::HopProjection
         );
         assert!(ObjectIndexEngineKind::parse("lucene").is_err());
+        assert_eq!(
+            ObjectIndexEngineKind::parse("").unwrap(),
+            ObjectIndexEngineKind::HopProjection
+        );
     }
 
     #[test]

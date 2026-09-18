@@ -3,10 +3,84 @@
 ## Unreleased
 
 - Bind TypeSafe Jev as an Action-filling Function, not a write path
-  ([ADR 0082](docs/decisions/0082-system-one-action-function.md), #975). A
+  ([ADR 0084](docs/decisions/0084-system-one-action-function.md), #975). A
   registered Action type may declare a pinned System One bind. Preview with
   empty parameters returns `proposed_parameters_json` from an authorized
   object projection. `SubmitActionInstance` remains the only write.
+- Project object-type index member properties and page bounds in SQL so
+  EvaluateObjectSet does not decode the wide JSON row and apply
+  `LIMIT`/`OFFSET` after the stream (#1023).
+- Combined two-store admission reserves on Chisei, commits through
+  `SubmitActionInstance` on Sekai, and finalizes or releases only after a
+  typed hop. Timeout is not rejection; reconcile never treats a late commit
+  as reject. Gateway and native submit share the same clerk (#1007).
+- Combined two-store startup reconciles Sekai execution evidence against
+  the Sekai runtime, not the Chisei destination (#1013).
+- Offline Chisei-family relocation copies destination tables family by
+  family, validates counts, and raises a writer fence so a single `DB_PATH`
+  writer refuses to start (`sekaictl admin store relocate`, #1006).
+- Combined mode opens two physical stores when `SEKAI_DB_PATH` and
+  `CHISEI_DB_PATH` (or two PostgreSQL destination URLs) are set, and refuses
+  a pair that resolves to the same file or database (#1005). Gateway stays a
+  translator. A single `DB_PATH` / `DATABASE_URL` remains one-file
+  compatibility until relocation.
+- Introduce typed `SekaiStore` / `ChiseiStore` handles so Chisei constructors
+  no longer take `RuntimeDb` (#1004). Combined destination mode now opens two
+  files (#1005); a single `DB_PATH` still uses `split_shared_runtime`.
+- Record two-store implementation contracts (#999): ADR 0083 (offline
+  relocation, lifecycle ownership, reservation recovery, one-sided restore
+  fence), ADR 0082 corrections (`SubmitActionInstance`, per-plane
+  `operation_id` collision scope, no cross-plane store handles), and
+  implementation Issues #1004–#1009 (first slice #1004 ready).
+- Document the #963 hop-projection default ops contract (#970): unset or
+  empty `SEKAI_OBJECT_INDEX_ENGINE` is hop-projection, including `parse("")`.
+  Operators must `ReindexObjectType` for hop kinds. Pinning nested-loop
+  does not bypass an unready generation.
+- Object-log dual-read skips unexpressible grammar (`group_by`, filters,
+  incoming hops, path multiplicity, non-i64 sum) and keeps the SQL answer
+  (#990). After #980 every production multi-hop has `group_by`; the canary
+  is no longer a kill switch. Mismatch, missing log, and missing
+  `max_rows_scanned` still fail closed.
+- Object-log dual-read refuses incoming (and other non-outgoing) hop
+  directions instead of comparing them as outbound (#989). Tagged mikura
+  `v0.1.0` has no incoming hop; mapping waits on a later published tag.
+- `.env.example` object-log dual-read comments match configuration.md after
+  #980: refuse `group_by`, path multiplicity, and non-i64 sum, and note that
+  production multi-hop always refuses the canary (#986).
+- Incremental `ReindexObjectType` clears hop-projection ready before member
+  upserts and keeps it false until join rewrite commits (#985). Concurrent
+  evaluate cannot pair updated member JSON with stale hop edges.
+- Nested-loop multi-hop EvaluateObjectSet honors the hop-projection ready
+  fence (#984). After a same-digest datasource rebind or an unready join
+  generation, the debug engine fails closed until `ReindexObjectType`.
+- Aggregate EvaluateObjectSet checks `aggregation.property` against property
+  grants on the leaf hop kind (#983). Denied numeric properties fail closed
+  instead of contributing to sum/min/max.
+- Object-log dual-read projects clerk property grants into the tagged deny-list
+  (#969). A non-empty grant allow-list cannot be witnessed by the tagged
+  single-deny API, so the canary stays off and evaluate keeps the SQL answer.
+  Soak remains allow-all-only.
+- Object-log dual-read is a canary: it requires `max_rows_scanned` and samples
+  one of `SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE` requests (default 32) so enabling
+  the flag does not open the object store on every evaluate (#968). Set
+  sample to `1` for CI. Unsampled requests keep the SQL answer.
+- Hop-projection evaluate reads one ready+generation+digest fence per query
+  (#967). Matching generation skips join/member COUNT; empty generation keeps
+  the wipe-detector COUNT path. Publish and invalidate clear the stamp.
+- Indexed EvaluateObjectSet filters push eq/gt/gte/lt/lte onto stored member
+  JSON in SQL (#966). Non-matching kind rows are excluded before the full
+  property map is decoded. Unknown operators fail closed.
+- Object-log dual-read fails closed when the tagged evaluate API cannot
+  witness the SQL answer: `group_by` buckets, path multiplicity, or a
+  non-i64/missing sum (#965). Vacuous root-count/sum matches no longer
+  stamp Ok.
+- `RegisterObjectTypeDatasource` that changes join-relevant binding fields
+  clears hop-projection ready even when `definition_digest` is unchanged
+  (#964). Identical re-register does not. Evaluate stays fail-closed until
+  `ReindexObjectType`.
+- Aggregate `EvaluateObjectSet` loads only group_by, numeric, filter, and
+  nested-loop join properties on hop members (#953). Unused JSON keys are
+  dropped; count-only leaf fetches skip property maps.
 - Hop-projection join lookup uses the stored raw join value instead of
   SHA-256 hashing every parent key on each hop (#952). PostgreSQL binds
   `ANY($::text[])`; SQLite keeps a bounded `IN` list. Digest remains the

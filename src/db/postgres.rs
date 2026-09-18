@@ -66,6 +66,10 @@ const OBJECT_TYPE_INDEX_JOIN_SCHEMA: &str =
     include_str!("postgres/0043_object_type_index_join.sql");
 const OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA: &str =
     include_str!("postgres/0044_object_type_index_join_value.sql");
+const OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA: &str =
+    include_str!("postgres/0045_object_type_index_join_generation.sql");
+const CHISEI_OPERATION_RESERVATIONS_SCHEMA: &str =
+    include_str!("postgres/0046_chisei_operation_reservations.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -289,6 +293,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 43,
         name: "object_type_index_join_value",
         sql: OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA,
+    },
+    Migration {
+        version: 44,
+        name: "object_type_index_join_generation",
+        sql: OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA,
+    },
+    Migration {
+        version: 45,
+        name: "chisei_operation_reservations",
+        sql: CHISEI_OPERATION_RESERVATIONS_SCHEMA,
     },
 ];
 
@@ -869,6 +883,10 @@ mod tests {
         }
         assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("AUTOINCREMENT"));
         assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("INSERT OR"));
+        assert!(
+            CHISEI_OPERATION_RESERVATIONS_SCHEMA
+                .contains("CREATE TABLE IF NOT EXISTS chisei_operation_reservations")
+        );
         for table in ["chisei_budget_pools", "chisei_budget_transfers"] {
             assert!(
                 BUDGET_TOPOLOGY_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),

@@ -1,4 +1,4 @@
-# ADR 0082: Bind System One as an Action-filling Function
+# ADR 0084: Bind System One as an Action-filling Function
 
 - Status: accepted
 - Date: 2026-09-17

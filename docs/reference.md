@@ -48,6 +48,8 @@ lives in the separate [research index](research/README.md).
   precedence.
 - [Operations and security](operations.md) — transport, credentials, TLS,
   observability, backups, and deployment checks.
+- [Two-store relocation](store-relocation.md) — offline Chisei-family copy,
+  resume, rollback point, and writer fence.
 - [Docker](docker.md) — container quick start and transport choices.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.
