@@ -106,7 +106,7 @@ snapshot, not a mixed pair.
 | Fresh install + upgraded retained data | Migration tests | implemented (#1006) |
 | Crash after reserve / after commit | Fault-injection | implemented (#1007) |
 | Duplicate admission | Integration | implemented (#1007) |
-| One-sided restore fence | Restore test | proposed |
+| One-sided restore fence | Restore test | implemented (#1009) |
 | Wrong-plane RPC rejection | Subprocess isolation | proposed |
 | Unit-only proof of the split | — | insufficient |
 

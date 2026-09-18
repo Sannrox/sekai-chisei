@@ -5,6 +5,9 @@
 - Admit and valid Preview stamp `system_one_fill_json` with the type
   version's pinned System One bind and a digest of the admitted parameter
   body. Submit does not re-invoke the Function (#981).
+- Combined destination pairs stamp a split generation on each store and
+  refuse mutating RPCs when the pair disagrees after a one-sided restore
+  until `sekaictl admin store restamp` (#1009).
 - Preview treats a blank string, JSON `null`, or `{}` as empty parameters
   for System One fill. After a fill, `request_digest` binds to the filled
   body (#988).
