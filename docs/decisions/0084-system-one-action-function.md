@@ -30,8 +30,12 @@ versioned Action. Function results are not type-revision facts
 3. Function input is an **authorized object projection**. Ungranted
    properties never leave the object.
 4. `PreviewObjectAction` may fill `proposed_parameters_json` when the
-   caller sends empty parameters and the type has a bind. Preview does not
-   persist ([ADR 0063](0063-object-action-describe-preview.md)).
+   caller sends empty parameters and the type has a bind. Empty means a
+   blank string, JSON `null`, or an empty object (`{}`). Any other JSON,
+   including a partial object, is caller-supplied and is not filled.
+   After a fill, `request_digest` binds to the filled parameter body, not
+   the empty caller string. Preview does not persist
+   ([ADR 0063](0063-object-action-describe-preview.md)).
 5. `SubmitActionInstance` remains the only write.
 6. The bind pins an exact model id. `jev-latest` is refused.
 7. Hosted TypeSafe is opt-in. Missing `TYPESAFE_API_KEY` fails closed.
