@@ -484,8 +484,9 @@ pub fn run(
         ))
     })()?;
 
+    let evidence_db = execution_evidence_runtime(&stores);
     Ok(async move {
-        spawn_service_background_tasks(&config, chisei_db.clone(), &sekai_svc, &chisei_svc);
+        spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc);
 
         if let Some(ops_port) = config.ops_port {
             crate::obs::ops::bind_and_spawn(
@@ -845,6 +846,10 @@ fn spawn_service_background_tasks(
     spawn_execution_evidence_reconciler(db);
 }
 
+fn execution_evidence_runtime(stores: &CombinedStoreLayout) -> Arc<RuntimeDb> {
+    stores.sekai_runtime()
+}
+
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -952,6 +957,32 @@ mod tests {
         let result = run(config, stores, Vec::new(), tcp_mode);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn execution_evidence_reconciler_binds_sekai_store_in_split_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = crate::combined_stores::CombinedStoreSources {
+            backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+            default_sqlite_path: "unused.db".into(),
+            sekai_sqlite_path: Some(sekai.to_string_lossy().into_owned()),
+            chisei_sqlite_path: Some(chisei.to_string_lossy().into_owned()),
+            postgres_max_connections: 16,
+            ..crate::combined_stores::CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        let evidence = execution_evidence_runtime(&layout);
+        assert!(
+            Arc::ptr_eq(&evidence, &layout.sekai_runtime()),
+            "Sekai execution-evidence reconcile must use the Sekai runtime"
+        );
+        assert!(
+            !Arc::ptr_eq(&evidence, &layout.chisei_runtime()),
+            "Sekai execution-evidence reconcile must not use the Chisei runtime"
+        );
     }
 
     #[test]
