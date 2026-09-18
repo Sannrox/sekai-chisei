@@ -27,7 +27,7 @@ impl ProcessKiller {
     }
 
     fn kill_all(&self) {
-        for pid in self.0.lock().expect("process killer").iter().copied() {
+        for pid in self.0.lock().expect("process killer").iter() {
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
         }
     }
