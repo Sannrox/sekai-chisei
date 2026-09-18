@@ -258,13 +258,37 @@ pub(super) async fn preview_object_action(
             ),
         ) => return Err(Status::invalid_argument(error)),
     };
+    let admission = crate::sekai::action_describe_preview::preview_object_action_admission(
+        &service.db,
+        service.budget.as_ref().map(std::convert::AsRef::as_ref),
+        crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
+            actor: &actor,
+            object: &object,
+            type_id: &inner.type_id,
+            version: &inner.version,
+            parameters_json: "",
+            expected_object_updated_ms: inner.expected_object_updated_ms,
+            expected_object_revision: &inner.expected_object_revision,
+            evidence_submission_ids: &[],
+            policy_context: Some(&policy_context),
+        },
+    )
+    .map_err(map_object_action_projection_error)?;
+    if admission.outcome == crate::sekai::action_describe_preview::PREVIEW_UNAVAILABLE {
+        return Err(Status::permission_denied("object action unavailable"));
+    }
+    if !crate::sekai::action_describe_preview::allows_function_fill(&admission) {
+        let mut proto = object_action_preview_to_proto(admission);
+        proto.proposed_parameters_json.clear();
+        return Ok(Response::new(proto));
+    }
     let mut parameters_json = inner.parameters_json;
     let mut proposed_parameters_json = String::new();
     if crate::chisei::system_one_action::should_fill(&type_def, &parameters_json) {
         let object_type = service.db.get_object_type(&object.kind).ok().flatten();
         let client = sekai_provider::system_one::TypeSafeClient::from_env()
             .map_err(Status::failed_precondition)?;
-        parameters_json = crate::chisei::system_one_action::fill_proposed_parameters(
+        let (filled, record) = crate::chisei::system_one_action::fill_proposed_parameters(
             &type_def,
             &object,
             object_type.as_ref(),
@@ -278,6 +302,15 @@ pub(super) async fn preview_object_action(
                 Status::unavailable(error)
             }
         })?;
+        record_system_one_egress_audit(
+            &service.db,
+            &record,
+            crate::chisei::system_one_action::bind_of(&type_def)
+                .map(|bind| bind.model.as_str())
+                .unwrap_or("typesafe"),
+            &object.id,
+        );
+        parameters_json = filled;
         proposed_parameters_json.clone_from(&parameters_json);
     }
     let preview = crate::sekai::action_describe_preview::preview_object_action(
@@ -300,8 +333,52 @@ pub(super) async fn preview_object_action(
         return Err(Status::permission_denied("object action unavailable"));
     }
     let mut proto = object_action_preview_to_proto(preview);
+    if proto.outcome != crate::sekai::action_describe_preview::PREVIEW_VALID {
+        proposed_parameters_json.clear();
+    }
     proto.proposed_parameters_json = proposed_parameters_json;
     Ok(Response::new(proto))
+}
+
+fn record_system_one_egress_audit(
+    db: &crate::db::runtime_db::RuntimeDb,
+    record: &crate::chisei::egress::ContextEgressRecord,
+    model: &str,
+    request_id: &str,
+) {
+    let mut evidence = std::collections::HashMap::new();
+    evidence.insert("provider".into(), "typesafe".into());
+    evidence.insert("model".into(), model.into());
+    evidence.insert(
+        "included_count".into(),
+        record.included_fields.len().to_string(),
+    );
+    evidence.insert(
+        "redacted_count".into(),
+        record.redacted_fields.len().to_string(),
+    );
+    evidence.insert(
+        "included_fields".into(),
+        serde_json::to_string(&record.included_fields).unwrap_or_else(|_| "[]".into()),
+    );
+    evidence.insert(
+        "redacted_fields".into(),
+        serde_json::to_string(&record.redacted_fields).unwrap_or_else(|_| "[]".into()),
+    );
+    let _ = db.record_decision(&crate::sekai::audit::Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: "chisei.egress".into(),
+        action: "preview_object_action".into(),
+        reason: "context egress policy applied".into(),
+        evidence,
+        target_id: request_id.into(),
+        outcome: if record.redacted_fields.is_empty() {
+            "included".into()
+        } else {
+            "redacted".into()
+        },
+    });
 }
 pub(super) async fn get_action_instance(
     service: &SekaiServiceImpl,

@@ -81,10 +81,10 @@ pub async fn fill_proposed_parameters(
     object: &Object,
     object_type: Option<&ObjectType>,
     client: &TypeSafeClient,
-) -> Result<String, String> {
-    let (request, _record) = request_for_object(type_def, object, object_type)?;
+) -> Result<(String, ContextEgressRecord), String> {
+    let (request, record) = request_for_object(type_def, object, object_type)?;
     let response = client.evaluate(&request).await?;
-    proposed_parameters(type_def, object, &response)
+    Ok((proposed_parameters(type_def, object, &response)?, record))
 }
 
 #[cfg(test)]
@@ -197,9 +197,11 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = TypeSafeClient::new("test-key", format!("http://{addr}/v1/systemone"));
-        let filled = fill_proposed_parameters(&type_def(), &object(), None, &client)
+        let (filled, record) = fill_proposed_parameters(&type_def(), &object(), None, &client)
             .await
             .unwrap();
+        assert!(record.included_fields.contains(&"title".to_string()));
+        assert!(record.redacted_fields.contains(&"secret".to_string()));
         let parameters: Value = serde_json::from_str(&filled).unwrap();
         assert_eq!(
             parameters,

@@ -118,50 +118,43 @@ pub fn describe_object_action(
     Ok(description_from(object, &type_def))
 }
 
+pub fn allows_function_fill(preview: &ObjectActionPreview) -> bool {
+    preview.outcome == PREVIEW_VALID
+}
+
+pub fn preview_object_action_admission(
+    db: &RuntimeDb,
+    budget: Option<&BudgetTracker>,
+    request: ObjectActionPreviewRequest<'_>,
+) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
+    match admit_object_action(db, budget, &request)? {
+        Admission::Complete(preview) => Ok(preview),
+        Admission::Allowed(allowed) => Ok(valid_admission_preview(&allowed, request.object)),
+    }
+}
+
 pub fn preview_object_action(
     db: &RuntimeDb,
     budget: Option<&BudgetTracker>,
     request: ObjectActionPreviewRequest<'_>,
 ) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
     let ObjectActionPreviewRequest {
-        actor,
         object,
-        type_id,
-        version,
         parameters_json,
-        expected_object_updated_ms,
-        expected_object_revision,
         evidence_submission_ids,
-        policy_context,
+        ..
     } = request;
-    let type_def = match load_object_bound_type(db, object, type_id, version) {
-        Ok(type_def) => type_def,
-        Err(ObjectActionProjectionError::Unavailable) => {
-            return Ok(unavailable_preview(object));
-        }
-        Err(error) => return Err(error),
+    let allowed = match admit_object_action(db, budget, &request)? {
+        Admission::Complete(preview) => return Ok(preview),
+        Admission::Allowed(allowed) => allowed,
     };
-    let live_revision = object_revision(object);
-    if (expected_object_updated_ms != 0 && expected_object_updated_ms != object.updated)
-        || (!expected_object_revision.trim().is_empty()
-            && expected_object_revision != live_revision)
-    {
-        return Ok(ObjectActionPreview {
-            outcome: PREVIEW_STALE.into(),
-            reason_code: "stale".into(),
-            request_digest: String::new(),
-            object_revision: live_revision,
-            object_updated_ms: object.updated,
-            type_id: type_def.type_id.clone(),
-            version: type_def.version.clone(),
-            policy_decision: String::new(),
-            budget_decision: String::new(),
-            approval_state: String::new(),
-            compensation: COMPENSATION_UNSUPPORTED.into(),
-            failing_criterion: String::new(),
-            proposed_parameters_json: String::new(),
-        });
-    }
+    let AdmissionAllowed {
+        type_def,
+        live_revision,
+        policy_decision,
+        approval_state,
+        budget_decision,
+    } = allowed;
 
     if let Err(error) = validate_parameters_json(parameters_json) {
         return Ok(invalid_preview(&type_def, object, &live_revision, error));
@@ -217,15 +210,107 @@ pub fn preview_object_action(
         ));
     }
 
+    Ok(ObjectActionPreview {
+        outcome: PREVIEW_VALID.into(),
+        reason_code: "valid".into(),
+        request_digest,
+        object_revision: live_revision,
+        object_updated_ms: object.updated,
+        type_id: type_def.type_id,
+        version: type_def.version,
+        policy_decision,
+        budget_decision,
+        approval_state,
+        compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: String::new(),
+        proposed_parameters_json: String::new(),
+    })
+}
+
+enum Admission {
+    Complete(ObjectActionPreview),
+    Allowed(AdmissionAllowed),
+}
+
+struct AdmissionAllowed {
+    type_def: GovernedActionType,
+    live_revision: String,
+    policy_decision: String,
+    approval_state: String,
+    budget_decision: String,
+}
+
+fn valid_admission_preview(allowed: &AdmissionAllowed, object: &Object) -> ObjectActionPreview {
+    ObjectActionPreview {
+        outcome: PREVIEW_VALID.into(),
+        reason_code: "valid".into(),
+        request_digest: String::new(),
+        object_revision: allowed.live_revision.clone(),
+        object_updated_ms: object.updated,
+        type_id: allowed.type_def.type_id.clone(),
+        version: allowed.type_def.version.clone(),
+        policy_decision: allowed.policy_decision.clone(),
+        budget_decision: allowed.budget_decision.clone(),
+        approval_state: allowed.approval_state.clone(),
+        compensation: COMPENSATION_UNSUPPORTED.into(),
+        failing_criterion: String::new(),
+        proposed_parameters_json: String::new(),
+    }
+}
+
+fn admit_object_action(
+    db: &RuntimeDb,
+    budget: Option<&BudgetTracker>,
+    request: &ObjectActionPreviewRequest<'_>,
+) -> Result<Admission, ObjectActionProjectionError> {
+    let ObjectActionPreviewRequest {
+        actor,
+        object,
+        type_id,
+        version,
+        expected_object_updated_ms,
+        expected_object_revision,
+        policy_context,
+        ..
+    } = request;
+    let type_def = match load_object_bound_type(db, object, type_id, version) {
+        Ok(type_def) => type_def,
+        Err(ObjectActionProjectionError::Unavailable) => {
+            return Ok(Admission::Complete(unavailable_preview(object)));
+        }
+        Err(error) => return Err(error),
+    };
+    let live_revision = object_revision(object);
+    if (*expected_object_updated_ms != 0 && *expected_object_updated_ms != object.updated)
+        || (!expected_object_revision.trim().is_empty()
+            && *expected_object_revision != live_revision)
+    {
+        return Ok(Admission::Complete(ObjectActionPreview {
+            outcome: PREVIEW_STALE.into(),
+            reason_code: "stale".into(),
+            request_digest: String::new(),
+            object_revision: live_revision,
+            object_updated_ms: object.updated,
+            type_id: type_def.type_id.clone(),
+            version: type_def.version.clone(),
+            policy_decision: String::new(),
+            budget_decision: String::new(),
+            approval_state: String::new(),
+            compensation: COMPENSATION_UNSUPPORTED.into(),
+            failing_criterion: String::new(),
+            proposed_parameters_json: String::new(),
+        }));
+    }
+
     let stored_object = db
         .get_object(&object.id)
         .map_err(|_| ObjectActionProjectionError::Unavailable)?;
     let bound_object = stored_object.as_ref().unwrap_or(object);
     let policy = match db.active_object_policy(&bound_object.namespace, &bound_object.kind) {
         Ok(policy) => policy,
-        Err(_) => return Ok(unavailable_preview(object)),
+        Err(_) => return Ok(Admission::Complete(unavailable_preview(object))),
     };
-    let invoker = invoker_context(actor, policy_context);
+    let invoker = invoker_context(actor, *policy_context);
     match evaluate_submission_criteria(
         &type_def.submission_criteria,
         Some(bound_object),
@@ -234,14 +319,16 @@ pub fn preview_object_action(
     ) {
         CriterionDecision::Pass => {}
         CriterionDecision::Fail { criterion_id } => {
-            return Ok(criterion_preview(
+            return Ok(Admission::Complete(criterion_preview(
                 &type_def,
                 object,
                 &live_revision,
                 criterion_id,
-            ));
+            )));
         }
-        CriterionDecision::Unavailable => return Ok(unavailable_preview(object)),
+        CriterionDecision::Unavailable => {
+            return Ok(Admission::Complete(unavailable_preview(object)));
+        }
     }
 
     let policy_project = if type_def.policy_scope.trim().is_empty() {
@@ -274,36 +361,38 @@ pub fn preview_object_action(
         "not_configured".to_string()
     };
 
-    let denied = policy_decision == "deny"
+    if policy_decision == "deny"
         || policy_decision == "require_approval"
-        || budget_decision == "budget_exceeded";
-    Ok(ObjectActionPreview {
-        outcome: if denied {
-            PREVIEW_DENIED.into()
-        } else {
-            PREVIEW_VALID.into()
-        },
-        reason_code: if denied {
-            if budget_decision == "budget_exceeded" {
+        || budget_decision == "budget_exceeded"
+    {
+        return Ok(Admission::Complete(ObjectActionPreview {
+            outcome: PREVIEW_DENIED.into(),
+            reason_code: if budget_decision == "budget_exceeded" {
                 "budget_exceeded".into()
             } else {
                 policy_decision.clone()
-            }
-        } else {
-            "valid".into()
-        },
-        request_digest,
-        object_revision: live_revision,
-        object_updated_ms: object.updated,
-        type_id: type_def.type_id,
-        version: type_def.version,
+            },
+            request_digest: String::new(),
+            object_revision: live_revision,
+            object_updated_ms: object.updated,
+            type_id: type_def.type_id,
+            version: type_def.version,
+            policy_decision,
+            budget_decision,
+            approval_state,
+            compensation: COMPENSATION_UNSUPPORTED.into(),
+            failing_criterion: String::new(),
+            proposed_parameters_json: String::new(),
+        }));
+    }
+
+    Ok(Admission::Allowed(AdmissionAllowed {
+        type_def,
+        live_revision,
         policy_decision,
-        budget_decision,
         approval_state,
-        compensation: COMPENSATION_UNSUPPORTED.into(),
-        failing_criterion: String::new(),
-        proposed_parameters_json: String::new(),
-    })
+        budget_decision,
+    }))
 }
 
 pub(crate) fn load_object_bound_type(
@@ -664,6 +753,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(unknown.outcome, PREVIEW_INVALID);
+    }
+
+    fn admission_request<'a>(
+        object: &'a Object,
+        parameters_json: &'a str,
+        expected_object_updated_ms: i64,
+    ) -> ObjectActionPreviewRequest<'a> {
+        ObjectActionPreviewRequest {
+            actor: "alice",
+            object,
+            type_id: "customer.record.update",
+            version: "1",
+            parameters_json,
+            expected_object_updated_ms,
+            expected_object_revision: "",
+            evidence_submission_ids: &[],
+            policy_context: None,
+        }
+    }
+
+    #[test]
+    fn admission_rejects_stale_and_deny_before_parameters() {
+        let (db, object) = setup();
+        let stale = preview_object_action_admission(
+            &db,
+            None,
+            admission_request(&object, "", object.updated + 1),
+        )
+        .unwrap();
+        assert_eq!(stale.outcome, PREVIEW_STALE);
+        assert!(!allows_function_fill(&stale));
+
+        let mut criterion_type = update_type();
+        criterion_type.version = "2".into();
+        criterion_type.submission_criteria = vec![
+            crate::sekai::action_type_criteria::ActionSubmissionCriterion {
+                criterion_id: "ready_for_review".into(),
+                kind: crate::sekai::action_type_criteria::CRITERION_KIND_PROPERTY_EQUALS.into(),
+                property: "state".into(),
+                value: "ready".into(),
+            },
+        ];
+        db.put_governed_action_type(criterion_type, "operator", 2)
+            .unwrap();
+        let criterion = preview_object_action_admission(
+            &db,
+            None,
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.update",
+                version: "2",
+                parameters_json: "",
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: "",
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(criterion.outcome, PREVIEW_INVALID);
+        assert_eq!(criterion.failing_criterion, "ready_for_review");
+        assert!(!allows_function_fill(&criterion));
+
+        db.upsert_action_policy(&crate::sekai::action_policy::ActionPolicy {
+            scope: "agent:alice".into(),
+            default_decision: crate::sekai::action_policy::ActionDecision::Allow,
+            action_overrides: HashMap::from([(
+                SUBMIT_POLICY_ACTION.into(),
+                crate::sekai::action_policy::ActionDecision::Deny,
+            )]),
+            risk_overrides: HashMap::new(),
+            max_mutations_per_work_unit: None,
+            max_deletes_per_work_unit: None,
+        })
+        .unwrap();
+        let denied = preview_object_action_admission(
+            &db,
+            None,
+            admission_request(&object, "", object.updated),
+        )
+        .unwrap();
+        assert_eq!(denied.outcome, PREVIEW_DENIED);
+        assert!(!allows_function_fill(&denied));
     }
 
     #[test]
