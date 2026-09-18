@@ -811,7 +811,7 @@ mod tests {
         );
         assert!(writer_fence_raised(source_s).unwrap());
 
-        let shared = CombinedStoreSources {
+        let err = CombinedStoreSources {
             backend: Some(BackendIdentity::Sqlite),
             default_sqlite_path: source_s.into(),
             legacy_sqlite_path: Some(source_s.into()),
@@ -819,12 +819,8 @@ mod tests {
             ..CombinedStoreSources::default()
         }
         .open()
-        .unwrap();
-        assert!(
-            refuse_shared_writer_if_fenced(&shared)
-                .unwrap_err()
-                .contains("writer fence")
-        );
+        .unwrap_err();
+        assert!(err.contains("writer fence"), "{err}");
     }
 
     #[test]
