@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Shared and owned-plane opens of a stamped store compare `SEKAI_STORE_PEER`
+  or refuse mutating RPCs until an operator restamp. An unstamped single
+  file stays Shared compatibility (#1049).
 - Combined destination pairs stamp a split generation on each store and
   refuse mutating RPCs when the pair disagrees after a one-sided restore
   until `sekaictl admin store restamp` (#1009).

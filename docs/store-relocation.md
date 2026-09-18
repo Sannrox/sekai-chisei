@@ -55,9 +55,10 @@ mixed pair.
 ## One-sided restore
 
 Each destination store carries its own split generation in
-`sekai_store_cutover`. Combined or split open compares the pair. A missing
-or unequal generation keeps mutating RPCs refused until an operator restamps
-both stores:
+`sekai_store_cutover`. Combined split open compares the pair. A Shared or
+owned-plane process that opens one stamped dest compares `SEKAI_STORE_PEER`
+(read-only; not a writer destination). A missing peer or unequal generation
+keeps mutating RPCs refused until an operator restamps both stores:
 
 ```sh
 sekaictl admin store restamp --sekai ./data/sekai.db --chisei ./data/chisei.db

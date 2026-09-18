@@ -4,9 +4,10 @@
 //! validate counts, then raise a fence so a single `DB_PATH` / `DATABASE_URL`
 //! writer refuses to start. Rollback before the fence keeps the pre-copy files.
 //!
-//! Destination pairs also carry a split generation. Combined or split open
-//! compares the pair; a mismatch refuses mutating RPCs until an operator
-//! restamp. Independent backups are not a paired restore set.
+//! Destination pairs also carry a split generation. Combined split open
+//! compares the pair. A Shared or owned-plane open of a stamped store
+//! compares `SEKAI_STORE_PEER` (read-only) or refuses mutations until an
+//! operator restamp. Independent backups are not a paired restore set.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -344,13 +345,45 @@ pub fn compare_split_generations(sekai: Option<i64>, chisei: Option<i64>) -> Spl
 pub fn split_generation_state(
     layout: &CombinedStoreLayout,
 ) -> Result<SplitGenerationState, String> {
-    if !layout.is_split() {
+    split_generation_state_with_peer(layout, store_generation_peer().as_deref())
+}
+
+fn store_generation_peer() -> Option<String> {
+    crate::combined_stores::optional_trimmed_env("SEKAI_STORE_PEER")
+}
+
+pub(crate) fn split_generation_state_with_peer(
+    layout: &CombinedStoreLayout,
+    peer: Option<&str>,
+) -> Result<SplitGenerationState, String> {
+    if layout.is_split() {
+        return Ok(compare_split_generations(
+            read_runtime_generation(&layout.sekai_runtime())?,
+            read_runtime_generation(&layout.chisei_runtime())?,
+        ));
+    }
+    let local = read_runtime_generation(&layout.sekai_runtime())?;
+    if local.is_none() {
         return Ok(SplitGenerationState::Shared);
     }
-    Ok(compare_split_generations(
-        read_runtime_generation(&layout.sekai_runtime())?,
-        read_runtime_generation(&layout.chisei_runtime())?,
-    ))
+    let peer_generation = match peer {
+        Some(dest) => read_dest_generation(dest)?,
+        None => None,
+    };
+    Ok(compare_split_generations(local, peer_generation))
+}
+
+fn read_dest_generation(dest: &str) -> Result<Option<i64>, String> {
+    if looks_like_postgres_url(dest) {
+        return Err(
+            "SEKAI_STORE_PEER PostgreSQL compare requires restamp of the destination pair".into(),
+        );
+    }
+    if dest == ":memory:" || !Path::new(dest).exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(dest).map_err(|error| error.to_string())?;
+    read_sqlite_generation(&conn)
 }
 
 /// Stamp a matching generation when both destinations are empty; leave a
@@ -378,7 +411,7 @@ pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> R
 
 pub fn generation_mismatch_guidance(sekai: Option<i64>, chisei: Option<i64>) -> String {
     format!(
-        "split generations disagree (sekai={sekai:?}, chisei={chisei:?}); mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Independent backups are not a paired restore set"
+        "split generations disagree (sekai={sekai:?}, chisei={chisei:?}); mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. An owned or Shared open of a stamped store must set SEKAI_STORE_PEER to the other dest for the compare. Independent backups are not a paired restore set"
     )
 }
 
@@ -837,6 +870,30 @@ mod tests {
         assert!(err.contains("shared source"), "{err}");
     }
 
+    fn open_shared(path: &str) -> CombinedStoreLayout {
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(path),
+                path,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: path.into(),
+            legacy_sqlite_path: Some(path.into()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap()
+    }
+
     fn open_dest_pair(sekai: &str, chisei: &str) -> CombinedStoreLayout {
         CombinedStoreSources {
             backend: Some(BackendIdentity::Sqlite),
@@ -953,33 +1010,39 @@ mod tests {
     fn shared_layout_does_not_compare_generations() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.db");
-        let path_s = path.to_str().unwrap();
-        RuntimeBackend::initialize(
-            RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(path_s),
-                path_s,
-                None,
-                16,
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let layout = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: path_s.into(),
-            legacy_sqlite_path: Some(path_s.into()),
-            postgres_max_connections: 16,
-            ..CombinedStoreSources::default()
-        }
-        .open()
-        .unwrap();
+        let layout = open_shared(path.to_str().unwrap());
         assert_eq!(
-            split_generation_state(&layout).unwrap(),
+            split_generation_state_with_peer(&layout, None).unwrap(),
             SplitGenerationState::Shared
         );
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn stamped_shared_layout_refuses_without_a_matching_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let owned = dir.path().join("owned.db");
+        let peer = dir.path().join("peer.db");
+        let owned_s = owned.to_str().unwrap();
+        let peer_s = peer.to_str().unwrap();
+        let layout = open_shared(owned_s);
+        write_runtime_generation(&layout.sekai_runtime(), 11).unwrap();
+        assert_eq!(
+            split_generation_state_with_peer(&layout, None).unwrap(),
+            SplitGenerationState::Mismatched {
+                sekai: Some(11),
+                chisei: None
+            }
+        );
+        let peer_layout = open_shared(peer_s);
+        write_runtime_generation(&peer_layout.sekai_runtime(), 11).unwrap();
+        assert_eq!(
+            split_generation_state_with_peer(&layout, Some(peer_s)).unwrap(),
+            SplitGenerationState::Matched { generation: 11 }
+        );
+        write_runtime_generation(&peer_layout.sekai_runtime(), 12).unwrap();
+        let mismatch = split_generation_state_with_peer(&layout, Some(peer_s)).unwrap();
+        assert!(mismatch.refuses_mutations(), "{mismatch:?}");
     }
 
     #[test]
