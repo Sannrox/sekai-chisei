@@ -214,7 +214,8 @@ pub fn apply_profile(
     match db.create_object_with_audit(&profile_to_object(&profile), actor) {
         Ok(()) => Ok(profile),
         Err(error) => {
-            let Some(existing) = db.get_object(&object_id)? else {
+            let Some(existing) = existing_profile_after_create_conflict(db, &object_id, &error)?
+            else {
                 return Err(error);
             };
             let existing = profile_from_object(&existing)?;
@@ -327,6 +328,31 @@ pub fn put_waiver(
         Ok(()) => Ok(waiver),
         Err(error) => replay_waiver_after_create_conflict(db, &waiver, error),
     }
+}
+
+fn sqlite_lock_contention(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("database is locked") || error.contains("database is busy")
+}
+
+fn existing_profile_after_create_conflict(
+    db: &RuntimeDb,
+    object_id: &str,
+    create_error: &str,
+) -> Result<Option<crate::domain::Object>, String> {
+    if let Some(existing) = db.get_object(object_id)? {
+        return Ok(Some(existing));
+    }
+    if !sqlite_lock_contention(create_error) {
+        return Ok(None);
+    }
+    for _ in 0..16 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if let Some(existing) = db.get_object(object_id)? {
+            return Ok(Some(existing));
+        }
+    }
+    Ok(None)
 }
 
 fn replay_fact_after_create_conflict(
@@ -1420,5 +1446,12 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn sqlite_lock_errors_are_treated_as_converge_candidates() {
+        assert!(sqlite_lock_contention("database is locked"));
+        assert!(sqlite_lock_contention("SQLITE_BUSY: database is busy"));
+        assert!(!sqlite_lock_contention("UNIQUE constraint failed"));
     }
 }

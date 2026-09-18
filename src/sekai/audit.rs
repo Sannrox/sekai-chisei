@@ -2,7 +2,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -904,7 +904,9 @@ impl SekaiDb {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
         }
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         require_sqlite_policy_generation(&tx, &object.namespace, expected_policy_generation)?;
         let historical_changes: i64 = tx
             .query_row(
