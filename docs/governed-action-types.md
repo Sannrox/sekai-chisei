@@ -34,6 +34,7 @@ row for history.
 | `object_kind` | Admitted schema kind this type may create or update. Empty means admit-only |
 | `object_mutation` | `create` or `update` when `object_kind` is set. Empty means admit-only |
 | `enabled` | Fail-closed gate for submit ([#397](governed-action-instances.md) uses `require_enabled`) |
+| `system_one` | Optional Function bind. Pinned model plus question-to-parameter map. Empty means preview does not fill. See [ADR 0084](decisions/0084-system-one-action-function.md) |
 
 ## Operator CLI
 

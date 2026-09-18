@@ -372,6 +372,7 @@ pub(super) fn from_proto_governed_action_type(
             .map(from_proto_submission_criterion)
             .collect(),
         declared_effect_kinds: proto.declared_effect_kinds,
+        system_one: parse_system_one_json(&proto.system_one_json)?,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -400,6 +401,12 @@ pub(super) fn to_proto_governed_action_type(
             .map(to_proto_submission_criterion)
             .collect(),
         declared_effect_kinds: domain.declared_effect_kinds.clone(),
+        system_one_json: domain
+            .system_one
+            .as_ref()
+            .filter(|bind| !bind.is_empty())
+            .map(|bind| serde_json::to_string(bind).unwrap_or_default())
+            .unwrap_or_default(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -1551,6 +1558,25 @@ pub(super) fn object_action_preview_to_proto(
         approval_state: preview.approval_state,
         compensation: preview.compensation,
         failing_criterion: preview.failing_criterion,
+        proposed_parameters_json: preview.proposed_parameters_json,
+    }
+}
+
+fn parse_system_one_json(
+    raw: &str,
+) -> Result<Option<sekai_provider::system_one::SystemOneBind>, Status> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let bind: sekai_provider::system_one::SystemOneBind =
+        serde_json::from_str(raw).map_err(|error| {
+            Status::invalid_argument(format!("system_one_json must be JSON: {error}"))
+        })?;
+    if bind.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(bind))
     }
 }
 pub(super) fn authorize_action_instance_submit(

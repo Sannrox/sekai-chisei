@@ -118,6 +118,8 @@ Operator runbook and data model: [budget-topology.md](budget-topology.md). Desig
 | --- | --- | --- |
 | `OPENAI_API_KEY` | unset | OpenAI provider credential |
 | `ANTHROPIC_API_KEY` | unset | Anthropic provider credential |
+| `TYPESAFE_API_KEY` | unset | TypeSafe System One credential used only to fill Action parameters. Missing key fails closed. |
+| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai/v1/systemone` | TypeSafe System One endpoint |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama-compatible server used by native provider calls |
 | `NATIVE_LLM_URL` | unset | Native local model endpoint |
 | `LLM_HTTP_CONNECT_TIMEOUT_SECS` | `10` | Outbound connection timeout |
