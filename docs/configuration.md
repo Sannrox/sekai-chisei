@@ -13,6 +13,7 @@ template.
 | `DB_PATH` | `./data/sekai.db` | SQLite compatibility path when destination variables are unset |
 | `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
 | `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
+| `SEKAI_STORE_PEER` | unset | Read-only generation peer for an owned-plane or Shared open of a stamped dest |
 | `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; required when `SEKAI_DB_BACKEND=postgres` without destination URLs |
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
 | `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
