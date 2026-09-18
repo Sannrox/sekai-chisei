@@ -370,12 +370,28 @@ fn open_split_postgres(
 }
 
 fn refuse_shared_identity(sekai: &StoreIdentity, chisei: &StoreIdentity) -> Result<(), String> {
-    if sekai == chisei {
+    if sekai == chisei || sqlite_same_inode(sekai, chisei) {
         Err(format!(
             "combined mode refuses a shared store identity ({sekai}); set distinct SEKAI_DB_PATH and CHISEI_DB_PATH, or distinct SEKAI_DATABASE_URL and CHISEI_DATABASE_URL. A single DB_PATH or DATABASE_URL remains migration compatibility until relocation"
         ))
     } else {
         Ok(())
+    }
+}
+
+fn sqlite_same_inode(sekai: &StoreIdentity, chisei: &StoreIdentity) -> bool {
+    match (sekai, chisei) {
+        (
+            StoreIdentity::Sqlite {
+                canonical_path: sekai_path,
+            },
+            StoreIdentity::Sqlite {
+                canonical_path: chisei_path,
+            },
+        ) if sekai_path != ":memory:" && chisei_path != ":memory:" => {
+            same_file::is_same_file(Path::new(sekai_path), Path::new(chisei_path)).unwrap_or(false)
+        }
+        _ => false,
     }
 }
 
@@ -508,6 +524,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.db");
         let err = sqlite_pair(path.to_str().unwrap(), path.to_str().unwrap())
+            .open()
+            .unwrap_err();
+        assert!(err.contains("refuses a shared store identity"), "{err}");
+    }
+
+    #[test]
+    fn hardlink_destinations_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        std::fs::write(&sekai, []).unwrap();
+        std::fs::hard_link(&sekai, &chisei).unwrap();
+        let err = sqlite_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap())
             .open()
             .unwrap_err();
         assert!(err.contains("refuses a shared store identity"), "{err}");
