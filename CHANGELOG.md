@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Object-log dual-read samples and skips unexpressible compares before
+  loading `active_object_policy`, so unsampled evaluates do not pay
+  per-kind policy fetches (#1024).
 - Project object-type index member properties and page bounds in SQL so
   EvaluateObjectSet does not decode the wide JSON row and apply
   `LIMIT`/`OFFSET` after the stream (#1023).
