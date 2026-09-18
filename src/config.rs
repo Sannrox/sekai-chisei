@@ -57,6 +57,8 @@ pub struct Config {
     pub assertion_issuer: Option<String>,
     pub assertion_audience: Option<String>,
     pub assertion_hmac_key: Option<String>,
+    /// Authenticated hop target for a Chisei process (`http://127.0.0.1:50051`).
+    pub sekai_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +134,7 @@ impl Config {
             assertion_issuer: optional_env("SEKAI_ASSERTION_ISSUER"),
             assertion_audience: optional_env("SEKAI_ASSERTION_AUDIENCE"),
             assertion_hmac_key: optional_env("SEKAI_ASSERTION_HMAC_KEY"),
+            sekai_endpoint: optional_env("SEKAI_ENDPOINT"),
         }
     }
 

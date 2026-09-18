@@ -673,6 +673,7 @@ mod tests {
             assertion_issuer: None,
             assertion_audience: None,
             assertion_hmac_key: None,
+            sekai_endpoint: None,
         }
     }
 

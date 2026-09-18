@@ -4865,6 +4865,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             instance_id: inst.instance_id.clone(),
             namespace: String::new(),
             idempotency_key: String::new(),
+            operation_id: String::new(),
         }))
         .await
         .unwrap()
