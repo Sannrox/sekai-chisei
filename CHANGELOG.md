@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Combined SQLite destinations that resolve to the same inode are refused
+  even when the path strings differ (hardlinks). Canonical-equal paths
+  still refuse (#1017).
 - Shared and owned-plane opens of a stamped store compare `SEKAI_STORE_PEER`
   or refuse mutating RPCs until an operator restamp. An unstamped single
   file stays Shared compatibility (#1049).

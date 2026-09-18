@@ -67,7 +67,8 @@ provenance issuance; they never fall back to a wider activation window.
 
 `SEKAI_DB_PATH` + `CHISEI_DB_PATH` (SQLite) or `SEKAI_DATABASE_URL` +
 `CHISEI_DATABASE_URL` (PostgreSQL) open two physical stores. Combined mode
-refuses a pair that resolves to the same file or database. Partial destination
+refuses a pair that resolves to the same file, including hardlinks to one
+inode, or the same database. Partial destination
 configuration is refused; a second file is never invented from one path.
 `DB_PATH` and `DATABASE_URL` remain migration compatibility until
 [store relocation](store-relocation.md) copies Chisei families and raises
