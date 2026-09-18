@@ -1836,12 +1836,32 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("restamp"), "{}", error.message());
 
+        let mut preview = Request::new(());
+        preview.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "PreviewObjectAction",
+        ));
+        let preview_error = interceptor.call(preview).unwrap_err();
+        assert_eq!(preview_error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            preview_error.message().contains("restamp"),
+            "{}",
+            preview_error.message()
+        );
+
         let mut reading = Request::new(());
         reading.extensions_mut().insert(tonic::GrpcMethod::new(
             "sekai.SekaiService",
             "GetActionInstance",
         ));
         assert!(interceptor.call(reading).is_ok());
+
+        let mut describe = Request::new(());
+        describe.extensions_mut().insert(tonic::GrpcMethod::new(
+            "sekai.SekaiService",
+            "DescribeObjectAction",
+        ));
+        assert!(interceptor.call(describe).is_ok());
 
         crate::store_relocate::restamp_split_generation(&stores).unwrap();
         let mut after = Request::new(());

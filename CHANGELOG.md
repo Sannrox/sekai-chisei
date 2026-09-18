@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Restore fence treats `PreviewObjectAction` as mutating so TypeSafe fill,
+  egress, and Decision audit stay refused while split generations disagree
+  (#1048).
 - Remote Sekai commit lookup reuses one gRPC channel and the current Tokio
   runtime (or one parked fallback runtime) instead of spawning a thread,
   runtime, and connect on every hop (#1046). Combined stays in-process.
