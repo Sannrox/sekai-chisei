@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Remote Sekai commit lookup reuses one gRPC channel and the current Tokio
+  runtime (or one parked fallback runtime) instead of spawning a thread,
+  runtime, and connect on every hop (#1046). Combined stays in-process.
 - Shared-compatibility Combined open refuses when the writer fence is
   raised, so `from_env` cannot boot a single-file writer after relocate
   (#1019).
