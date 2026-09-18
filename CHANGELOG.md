@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Project object-type index member properties and page bounds in SQL so
+  EvaluateObjectSet does not decode the wide JSON row and apply
+  `LIMIT`/`OFFSET` after the stream (#1023).
 - Combined two-store admission reserves on Chisei, commits through
   `SubmitActionInstance` on Sekai, and finalizes or releases only after a
   typed hop. Timeout is not rejection; reconcile never treats a late commit

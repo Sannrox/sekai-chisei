@@ -25,9 +25,17 @@ pub fn project_member_properties(
         None => serde_json::from_str(raw).map_err(|error| error.to_string()),
         Some([]) => Ok(BTreeMap::new()),
         Some(keys) => {
-            let mut properties: BTreeMap<String, String> =
+            let value: serde_json::Value =
                 serde_json::from_str(raw).map_err(|error| error.to_string())?;
-            properties.retain(|key, _| keys.iter().any(|needed| needed == key));
+            let Some(object) = value.as_object() else {
+                return Err("index member properties must be a JSON object".into());
+            };
+            let mut properties = BTreeMap::new();
+            for key in keys {
+                if let Some(serde_json::Value::String(text)) = object.get(key) {
+                    properties.insert(key.clone(), text.clone());
+                }
+            }
             Ok(properties)
         }
     }
@@ -94,6 +102,80 @@ pub fn member_filter_sql(
         clause.push_str(&pred);
     }
     Ok((clause, values))
+}
+
+/// SQL expression for the member properties column. `None` keeps the stored
+/// wide JSON. Named keys are projected with `json_object` / `jsonb_build_object`.
+pub fn member_properties_sql(
+    dialect: IndexSqlDialect,
+    needed: Option<&[String]>,
+) -> Result<String, String> {
+    let Some(keys) = needed else {
+        return Ok("properties".into());
+    };
+    for key in keys {
+        if key.is_empty() || key.contains('\'') || key.contains('"') {
+            return Err(format!("invalid index projection key {key}"));
+        }
+    }
+    if keys.is_empty() {
+        return Ok(match dialect {
+            IndexSqlDialect::Sqlite => "json_object()".into(),
+            IndexSqlDialect::Postgres => "'{}'::text".into(),
+        });
+    }
+    Ok(match dialect {
+        IndexSqlDialect::Sqlite => {
+            let pairs = keys
+                .iter()
+                .map(|key| format!("'{key}', json_extract(properties, '$.{key}')"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("json_object({pairs})")
+        }
+        IndexSqlDialect::Postgres => {
+            let pairs = keys
+                .iter()
+                .map(|key| format!("'{key}', properties::json -> '{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("jsonb_build_object({pairs})::text")
+        }
+    })
+}
+
+/// `LIMIT`/`OFFSET` after a filter clause. `next_param` is the next bind index.
+pub fn member_page_sql(
+    dialect: IndexSqlDialect,
+    limit: i32,
+    offset: i32,
+    mut next_param: usize,
+) -> (String, Vec<i32>, usize) {
+    let mut sql = String::new();
+    let mut values = Vec::new();
+    let offset = offset.max(0);
+    if limit > 0 {
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" LIMIT ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" LIMIT ${next_param}"),
+        });
+        values.push(limit);
+        next_param += 1;
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" OFFSET ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
+        });
+        values.push(offset);
+        next_param += 1;
+    } else if offset > 0 {
+        sql.push_str(&match dialect {
+            IndexSqlDialect::Sqlite => format!(" LIMIT -1 OFFSET ?{next_param}"),
+            IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
+        });
+        values.push(offset);
+        next_param += 1;
+    }
+    (sql, values, next_param)
 }
 
 /// One evaluate fence row: ready bit, join generation, and catalog digest.
@@ -476,6 +558,30 @@ mod tests {
         let (postgres, _) = member_filter_sql(IndexSqlDialect::Postgres, &filters).unwrap();
         assert!(postgres.contains("properties::json ->> 'tier'"));
         assert!(postgres.contains("::float8"));
+    }
+
+    #[test]
+    fn member_properties_and_page_sql_are_exact() {
+        let needed = ["region".into()];
+        let sqlite_props = member_properties_sql(IndexSqlDialect::Sqlite, Some(&needed)).unwrap();
+        assert_eq!(
+            sqlite_props,
+            "json_object('region', json_extract(properties, '$.region'))"
+        );
+        let postgres_props =
+            member_properties_sql(IndexSqlDialect::Postgres, Some(&needed)).unwrap();
+        assert_eq!(
+            postgres_props,
+            "jsonb_build_object('region', properties::json -> 'region')::text"
+        );
+        let (sqlite_page, sqlite_values, next) = member_page_sql(IndexSqlDialect::Sqlite, 1, 1, 4);
+        assert_eq!(sqlite_page, " LIMIT ?4 OFFSET ?5");
+        assert_eq!(sqlite_values, [1, 1]);
+        assert_eq!(next, 6);
+        let (postgres_page, postgres_values, _) =
+            member_page_sql(IndexSqlDialect::Postgres, 1, 1, 4);
+        assert_eq!(postgres_page, " LIMIT $4 OFFSET $5");
+        assert_eq!(postgres_values, [1, 1]);
     }
 
     #[test]

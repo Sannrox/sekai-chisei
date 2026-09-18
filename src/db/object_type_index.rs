@@ -357,15 +357,27 @@ impl SekaiDb {
         query: &RowQuery,
         needed: Option<&[String]>,
     ) -> Result<Vec<ObjectTypeIndexMember>, String> {
-        let (filter_sql, filter_values) = crate::sekai::object_type_index::member_filter_sql(
-            crate::sekai::object_type_index::IndexSqlDialect::Sqlite,
-            &query.filters,
-        )?;
+        let dialect = crate::sekai::object_type_index::IndexSqlDialect::Sqlite;
+        let project = match needed {
+            Some(keys) => Some(keys),
+            None if !query.columns.is_empty() => Some(query.columns.as_slice()),
+            None => None,
+        };
+        let properties_sql =
+            crate::sekai::object_type_index::member_properties_sql(dialect, project)?;
+        let (filter_sql, filter_values) =
+            crate::sekai::object_type_index::member_filter_sql(dialect, &query.filters)?;
+        let (page_sql, page_values, _) = crate::sekai::object_type_index::member_page_sql(
+            dialect,
+            query.limit,
+            query.offset,
+            3 + filter_values.len(),
+        );
         let sql = format!(
-            "SELECT source_key, object_id, properties, content_hash, hidden, from_edit
+            "SELECT source_key, object_id, {properties_sql}, content_hash, hidden, from_edit
              FROM sekai_object_type_index_member
              WHERE namespace = ?1 AND kind = ?2 AND hidden = 0{filter_sql}
-             ORDER BY source_key"
+             ORDER BY source_key{page_sql}"
         );
         let conn = self.conn();
         let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
@@ -373,31 +385,24 @@ impl SekaiDb {
         for value in &filter_values {
             params.push(value);
         }
+        for value in &page_values {
+            params.push(value);
+        }
         let mut rows = stmt
             .query(params.as_slice())
             .map_err(|error| error.to_string())?;
         let mut members = Vec::new();
-        let mut skipped = 0i32;
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let properties: String = row.get(2).map_err(|error| error.to_string())?;
-            let properties =
-                crate::sekai::object_type_index::project_member_properties(&properties, needed)?;
-            if !index_member_matches(&properties, query) {
-                continue;
-            }
-            if skipped < query.offset {
-                skipped += 1;
-                continue;
-            }
-            if query.limit > 0 && members.len() as i32 >= query.limit {
-                continue;
-            }
             members.push(ObjectTypeIndexMember {
                 namespace: namespace.into(),
                 kind: kind.into(),
                 source_key: row.get(0).map_err(|error| error.to_string())?,
                 object_id: row.get(1).map_err(|error| error.to_string())?,
-                properties,
+                properties: crate::sekai::object_type_index::project_member_properties(
+                    &properties,
+                    project,
+                )?,
                 content_hash: row.get(3).map_err(|error| error.to_string())?,
                 hidden: false,
                 from_edit: row.get::<_, i64>(5).map_err(|error| error.to_string())? != 0,
@@ -870,14 +875,6 @@ impl SekaiDb {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
-}
-
-fn index_member_matches(properties: &BTreeMap<String, String>, query: &RowQuery) -> bool {
-    query.filters.iter().all(|filter| {
-        properties.get(&filter.column).is_some_and(|value| {
-            crate::sekai::dataset::row_value_matches(value, &filter.op, &filter.value)
-        })
-    })
 }
 
 trait OptionalRow<T> {
@@ -1376,6 +1373,77 @@ mod tests {
             )
             .unwrap();
         assert!(non_numeric.is_empty());
+    }
+
+    #[test]
+    fn projected_index_members_use_sql_keys_and_page_bounds() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "notes", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[
+                HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("notes".into(), "wide-1".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+                HashMap::from([
+                    ("customer_id".into(), "c2".into()),
+                    ("region".into(), "eu".into()),
+                    ("notes".into(), "wide-2".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+                HashMap::from([
+                    ("customer_id".into(), "c3".into()),
+                    ("region".into(), "us".into()),
+                    ("notes".into(), "wide-3".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+            ],
+        )
+        .unwrap();
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("notes".into(), "notes".into());
+        db.register_object_type_datasource(&binding, 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+
+        let page = db
+            .list_visible_index_members_projected(
+                "sales",
+                "Customer",
+                &RowQuery {
+                    filters: vec![RowFilter {
+                        column: "region".into(),
+                        op: "eq".into(),
+                        value: "eu".into(),
+                    }],
+                    columns: vec!["region".into()],
+                    limit: 1,
+                    offset: 1,
+                },
+                Some(&["region".into()]),
+            )
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].source_key, "c2");
+        assert_eq!(
+            page[0].properties,
+            BTreeMap::from([("region".into(), "eu".into())])
+        );
+        assert!(!page[0].properties.contains_key("notes"));
+
+        let unfiltered = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert!(unfiltered[0].properties.contains_key("notes"));
     }
 
     #[test]
