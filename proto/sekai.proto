@@ -1035,6 +1035,8 @@ message GovernedActionType {
   repeated ActionSubmissionCriterion submission_criteria = 16;
   // Subset of allowed_effect_kinds to materialize. Empty means all allowed kinds.
   repeated string declared_effect_kinds = 17;
+  // Additive System One Function bind. Empty means preview does not fill.
+  string system_one_json = 18;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -1142,6 +1144,8 @@ message PreviewObjectActionResponse {
   string approval_state = 10;
   string compensation = 11;
   string failing_criterion = 12;
+  // Filled when parameters_json is empty and the type has a System One bind.
+  string proposed_parameters_json = 13;
 }
 message GetActionInstanceRequest {
   string instance_id = 1;

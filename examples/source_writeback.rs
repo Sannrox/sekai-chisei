@@ -664,6 +664,7 @@ async fn bootstrap_types(sekai: &SekaiServiceImpl) -> Result<(), String> {
                     object_mutation: String::new(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+                    system_one_json: String::new(),
                 }),
                 request_id: "put-writeback-type".into(),
             },

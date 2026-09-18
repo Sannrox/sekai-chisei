@@ -4656,6 +4656,7 @@ async fn governed_action_type_registry_put_get_list_disable() {
         object_mutation: String::new(),
         submission_criteria: vec![],
         declared_effect_kinds: vec![],
+        system_one_json: String::new(),
     };
     let put = svc
         .put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
@@ -4782,6 +4783,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         object_mutation: String::new(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+        system_one_json: String::new(),
     };
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(type_def),
@@ -4978,6 +4980,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
             object_mutation: String::new(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+            system_one_json: String::new(),
         }),
         request_id: "put-validated-action".into(),
     }))
@@ -5118,6 +5121,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
             object_mutation: String::new(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+            system_one_json: String::new(),
         }),
         request_id: "put-nul".into(),
     }))
@@ -5341,6 +5345,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
             object_mutation: "create".into(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+            system_one_json: String::new(),
         }),
         request_id: "put-record".into(),
     }))
@@ -5415,6 +5420,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
             object_mutation: "create".into(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+            system_one_json: String::new(),
         }),
         request_id: "put-record-corr".into(),
     }))
@@ -5545,6 +5551,7 @@ async fn describe_and_preview_object_action_are_observational() {
             object_mutation: "update".into(),
             submission_criteria: vec![],
             declared_effect_kinds: vec![],
+            system_one_json: String::new(),
         }),
         request_id: "put-update".into(),
     }))

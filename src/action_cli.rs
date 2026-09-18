@@ -95,6 +95,8 @@ struct TypeFile {
     submission_criteria: Vec<crate::sekai::action_type_criteria::ActionSubmissionCriterion>,
     #[serde(default)]
     declared_effect_kinds: Vec<String>,
+    #[serde(default)]
+    system_one: Option<Value>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     #[serde(default)]
@@ -187,6 +189,13 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
                 )
                 .collect(),
             declared_effect_kinds: parsed.declared_effect_kinds,
+            system_one_json: parsed
+                .system_one
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .map(serde_json::to_string)
+                .transpose()?
+                .unwrap_or_default(),
             enabled: parsed.enabled,
             created_by: String::new(),
             created_at_ms: 0,

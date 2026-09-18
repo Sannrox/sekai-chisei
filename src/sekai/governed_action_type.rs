@@ -47,6 +47,9 @@ pub struct GovernedActionType {
     /// Subset of `allowed_effect_kinds` materialized on admit. Empty means all allowed.
     #[serde(default)]
     pub declared_effect_kinds: Vec<String>,
+    /// Optional System One Function bind. Empty means preview does not fill.
+    #[serde(default)]
+    pub system_one: Option<sekai_provider::system_one::SystemOneBind>,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -120,6 +123,12 @@ impl GovernedActionType {
             &self.object_kind,
             &self.object_mutation,
         )?;
+        if let Some(bind) = self.system_one.as_ref().filter(|bind| !bind.is_empty()) {
+            sekai_provider::system_one::validate_bind_against_schema(
+                bind,
+                &self.parameter_schema_json,
+            )?;
+        }
         Ok(())
     }
 
@@ -184,7 +193,7 @@ fn validate_object_binding(
     Ok(())
 }
 
-fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
+pub(crate) fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
     // Version immutability: identity is (namespace, type_id, version); body
     // fields other than enabled/disabled timestamps must match on re-put.
     let body = serde_json::json!({
@@ -197,6 +206,7 @@ fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "object_mutation": t.object_mutation,
         "submission_criteria": t.submission_criteria,
         "declared_effect_kinds": t.declared_effect_kinds,
+        "system_one": t.system_one,
     });
     serde_json::to_string(&body).map_err(|e| e.to_string())
 }
@@ -566,5 +576,34 @@ mod tests {
         bad.declared_effect_kinds = vec![EFFECT_KIND_EXTERNAL_MUTATE.into()];
         let error = db.put_governed_action_type(bad, "op", 1).unwrap_err();
         assert!(error.contains("undeclared effect kind"), "{error}");
+    }
+
+    #[test]
+    fn system_one_bind_must_be_pinned_and_schema_aligned() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut type_def = sample(true);
+        type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical"]}},"required":["object_id","department"],"additionalProperties":false}"#.into();
+        type_def.object_kind = "customer_record".into();
+        type_def.object_mutation = OBJECT_MUTATION_UPDATE.into();
+        type_def.system_one = Some(sekai_provider::system_one::SystemOneBind {
+            model: "jev-latest".into(),
+            questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
+                parameter: "department".into(),
+                question_type: "choice".into(),
+                instructions: "Which team".into(),
+                criteria: serde_json::json!({"billing": null, "technical": null}),
+            }],
+        });
+        let error = db
+            .put_governed_action_type(type_def.clone(), "op", 1)
+            .unwrap_err();
+        assert!(error.contains("pinned"), "{error}");
+
+        type_def.system_one.as_mut().unwrap().model = "jev-1.13.0".into();
+        db.put_governed_action_type(type_def.clone(), "op", 1)
+            .unwrap();
+        type_def.system_one.as_mut().unwrap().model = "jev-1.14.0".into();
+        let error = db.put_governed_action_type(type_def, "op", 2).unwrap_err();
+        assert!(error.contains("immutable"), "{error}");
     }
 }

@@ -74,6 +74,7 @@ pub struct ObjectActionPreview {
     pub approval_state: String,
     pub compensation: String,
     pub failing_criterion: String,
+    pub proposed_parameters_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +159,7 @@ pub fn preview_object_action(
             approval_state: String::new(),
             compensation: COMPENSATION_UNSUPPORTED.into(),
             failing_criterion: String::new(),
+            proposed_parameters_json: String::new(),
         });
     }
 
@@ -300,10 +302,11 @@ pub fn preview_object_action(
         approval_state,
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
+        proposed_parameters_json: String::new(),
     })
 }
 
-fn load_object_bound_type(
+pub(crate) fn load_object_bound_type(
     db: &RuntimeDb,
     object: &Object,
     type_id: &str,
@@ -365,6 +368,7 @@ fn unavailable_preview(object: &Object) -> ObjectActionPreview {
         approval_state: String::new(),
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
+        proposed_parameters_json: String::new(),
     }
 }
 
@@ -387,6 +391,7 @@ fn invalid_preview(
         approval_state: String::new(),
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: String::new(),
+        proposed_parameters_json: String::new(),
     }
 }
 
@@ -409,6 +414,7 @@ fn criterion_preview(
         approval_state: String::new(),
         compensation: COMPENSATION_UNSUPPORTED.into(),
         failing_criterion: criterion_id,
+        proposed_parameters_json: String::new(),
     }
 }
 
@@ -544,6 +550,63 @@ mod tests {
         assert_eq!(
             db.get_object("cust-1").unwrap().unwrap().properties["title"],
             "account"
+        );
+    }
+
+    #[test]
+    fn preview_accepts_function_filled_parameters_without_writing() {
+        let (db, object) = setup();
+        let mut type_def = update_type();
+        type_def.type_id = "customer.record.triage".into();
+        type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","department"],"additionalProperties":false}"#.into();
+        type_def.system_one = Some(sekai_provider::system_one::SystemOneBind {
+            model: "jev-1.13.0".into(),
+            questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
+                parameter: "department".into(),
+                question_type: "choice".into(),
+                instructions: "Which team".into(),
+                criteria: serde_json::json!({"billing":null,"technical":null,"sales":null}),
+            }],
+        });
+        let filled = crate::chisei::system_one_action::proposed_parameters(
+            &type_def,
+            &object,
+            &sekai_provider::system_one::SystemOneResponse {
+                model: "jev-1.13.0".into(),
+                answers: [(
+                    "department".into(),
+                    serde_json::json!({"type":"choice","choice":"technical"}),
+                )]
+                .into_iter()
+                .collect(),
+                usage: None,
+            },
+        )
+        .unwrap();
+        db.put_governed_action_type(type_def, "operator", 2)
+            .unwrap();
+        let preview = preview_object_action(
+            &db,
+            None,
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.triage",
+                version: "1",
+                parameters_json: &filled,
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: &object_revision(&object),
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.outcome, PREVIEW_VALID);
+        assert_eq!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .len(),
+            0
         );
     }
 

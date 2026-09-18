@@ -105,3 +105,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0081: EvaluateObjectSet dual-reads an in-process object-log library](0081-evaluate-reads-mikura-library.md)
 - [ADR 0082: Separate Chisei and Sekai durable stores](0082-separate-chisei-and-sekai-durable-stores.md)
 - [ADR 0083: Two-store cutover and recovery contract](0083-two-store-cutover-and-recovery.md)
+- [ADR 0084: Bind System One as an Action-filling Function](0084-system-one-action-function.md)

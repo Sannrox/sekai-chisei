@@ -1,20 +1,7 @@
 //! PostgreSQL governed Action type registry (#396).
 
 use crate::db::postgres::PostgresDb;
-use crate::sekai::governed_action_type::GovernedActionType;
-
-fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
-    let body = serde_json::json!({
-        "description": t.description,
-        "parameter_schema_json": t.parameter_schema_json,
-        "allowed_effect_kinds": t.allowed_effect_kinds,
-        "policy_scope": t.policy_scope,
-        "budget_scope": t.budget_scope,
-        "object_kind": t.object_kind,
-        "object_mutation": t.object_mutation,
-    });
-    serde_json::to_string(&body).map_err(|e| e.to_string())
-}
+use crate::sekai::governed_action_type::{GovernedActionType, body_fingerprint};
 
 impl PostgresDb {
     pub fn put_governed_action_type(

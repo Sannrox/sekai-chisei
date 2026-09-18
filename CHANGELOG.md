@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Bind TypeSafe Jev as an Action-filling Function, not a write path
+  ([ADR 0084](docs/decisions/0084-system-one-action-function.md), #975). A
+  registered Action type may declare a pinned System One bind. Preview with
+  empty parameters returns `proposed_parameters_json` from an authorized
+  object projection. `SubmitActionInstance` remains the only write.
 - Project object-type index member properties and page bounds in SQL so
   EvaluateObjectSet does not decode the wide JSON row and apply
   `LIMIT`/`OFFSET` after the stream (#1023).
