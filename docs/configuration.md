@@ -17,7 +17,7 @@ template.
 | `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; required when `SEKAI_DB_BACKEND=postgres` without destination URLs |
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
 | `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
-| `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | PostgreSQL pool size |
+| `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | Process connection-pool budget. Shared uses the full value. Combined Split divides it across the two stores (16 → 8+8). Also sizes persistent SQLite pools opened through the runtime backend. |
 | `SEKAI_POSTGRES_CA_CERT` | unset | Optional PEM CA certificate path for TLS trust |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
 | `SEKAI_BIND` | inferred | TCP bind address; see [transport modes](operations.md#transport-modes) |
