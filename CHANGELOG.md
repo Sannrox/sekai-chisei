@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Execution-evidence reconcile takes one Immediate writer lock for a due
+  batch and backs off to 60s when idle, so empty 10s ticks no longer hit
+  the Sekai evaluate pool (#1022).
 - ADR 0084 records that a valid System One Preview fill may persist a
   bounded typesafe Decision; Submit stays the only ActionInstance write
   (#1050).
