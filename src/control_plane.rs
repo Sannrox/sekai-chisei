@@ -209,7 +209,6 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
@@ -230,7 +229,7 @@ mod tests {
             .set_limit("report-user", 3_000, PeriodType::Daily)
             .unwrap();
 
-        let report = relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
+        let report = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
         assert!(report.fence_raised);
 
         let err = open_gateway_report_layout(source_s).unwrap_err();
