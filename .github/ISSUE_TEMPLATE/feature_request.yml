@@ -64,5 +64,7 @@ body:
       options:
         - label: I searched existing issues and pull requests.
           required: true
+        - label: I omitted hostnames, home paths, and other private environment details.
+          required: true
         - label: This keeps domain-specific concepts out of the core contract, or explains why the boundary should change.
           required: true

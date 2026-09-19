@@ -115,7 +115,7 @@ is available.
 
 ## Report the frontier
 
-Return:
+Return to the maintainer in the session (not on GitHub):
 
 - trigger and mutation authority;
 - newly unblocked Issues;
@@ -141,3 +141,8 @@ If nothing changed, say so without manufacturing work.
 - Do not assign contributors or invent priority, deadlines, or milestones.
 - Do not silently repair dependency text or choose between conflicting sources.
 - Do not exceed the active-lane limit when recommending simultaneous delivery.
+- Never put hostnames, FQDNs, home directories, absolute worktree paths, LAN
+  or employer network names, or other private environment inventory on public
+  Issues, comments, or other GitHub text. Keep local checkout paths in the
+  session. GitHub-facing lane text may list only claim branch, repo-relative
+  worktree, base SHA, and published SHA.

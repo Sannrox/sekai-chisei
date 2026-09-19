@@ -61,7 +61,7 @@ Add focused tests for changes touching provider routing, LLM calls, authenticati
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: sync proto copies`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications. `.agents/skills/` is tracked; do not treat it as gitignored.
+Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: sync proto copies`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications. Do not put hostnames, FQDNs, home directories, absolute worktree paths, LAN or employer network names, or other private environment inventory on public Issues, Pull Requests, comments, or commit messages. Delivery and lane briefs on GitHub may list only claim branch, repo-relative worktree (for example `.worktrees/issue-N`), base SHA, and published SHA. `.agents/skills/` is tracked; do not treat it as gitignored.
 
 ### Verified commits on GitHub
 
@@ -92,4 +92,4 @@ immediately after the correction.
 
 ## Security & Configuration Tips
 
-Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. `SEKAI_CREDENTIAL` is a client-side bearer input and never bootstraps server authority. Report vulnerabilities through `SECURITY.md`.
+Never commit secrets, tokens, provider credentials, logs, or local SQLite databases. Never put hostnames, FQDNs, home directories, absolute worktree paths, LAN or employer network names, or other private environment inventory on public Issues, Pull Requests, comments, or commit messages. Use `SEKAI_INSECURE=1` only for trusted local development. For network-accessible runs, create principal-scoped credentials with `sekaictl admin access credential create <principal>` and require `authorization: Bearer <token>` on gRPC requests. `SEKAI_CREDENTIAL` is a client-side bearer input and never bootstraps server authority. Report vulnerabilities through `SECURITY.md`.
