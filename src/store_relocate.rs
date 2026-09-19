@@ -6,9 +6,11 @@
 //! before the snapshot keeps the pre-copy files.
 //!
 //! Destination pairs also carry a split generation. Combined split open
-//! compares the pair. A Shared or owned-plane open of a stamped store
-//! compares `SEKAI_STORE_PEER` (read-only) or refuses mutations until an
-//! operator restamp. Independent backups are not a paired restore set.
+//! compares the pair. Dual-unstamped stores auto-stamp only when both are
+//! empty; operator facts without a cutover stay unattested until restamp.
+//! A Shared or owned-plane open of a stamped store compares
+//! `SEKAI_STORE_PEER` (read-only) or refuses mutations until an operator
+//! restamp. Independent backups are not a paired restore set.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -746,6 +748,7 @@ pub enum SplitGenerationState {
         generation: i64,
     },
     Unstamped,
+    Unattested,
     Mismatched {
         sekai: Option<i64>,
         chisei: Option<i64>,
@@ -754,7 +757,7 @@ pub enum SplitGenerationState {
 
 impl SplitGenerationState {
     pub fn refuses_mutations(&self) -> bool {
-        matches!(self, Self::Mismatched { .. })
+        matches!(self, Self::Mismatched { .. } | Self::Unattested)
     }
 }
 
@@ -782,21 +785,115 @@ pub(crate) fn split_generation_state_with_peer(
     layout: &CombinedStoreLayout,
     peer: Option<&str>,
 ) -> Result<SplitGenerationState, String> {
-    if layout.is_split() {
-        return Ok(compare_split_generations(
+    let state = if layout.is_split() {
+        compare_split_generations(
             read_runtime_generation(&layout.sekai_runtime())?,
             read_runtime_generation(&layout.chisei_runtime())?,
-        ));
-    }
-    let local = read_runtime_generation(&layout.sekai_runtime())?;
-    if local.is_none() {
-        return Ok(SplitGenerationState::Shared);
-    }
-    let peer_generation = match peer {
-        Some(dest) => read_dest_generation(dest)?,
-        None => None,
+        )
+    } else {
+        let local = read_runtime_generation(&layout.sekai_runtime())?;
+        if local.is_none() {
+            return Ok(SplitGenerationState::Shared);
+        }
+        let peer_generation = match peer {
+            Some(dest) => read_dest_generation(dest)?,
+            None => None,
+        };
+        compare_split_generations(local, peer_generation)
     };
-    Ok(compare_split_generations(local, peer_generation))
+    if matches!(state, SplitGenerationState::Unstamped) && layout_has_operator_facts(layout)? {
+        return Ok(SplitGenerationState::Unattested);
+    }
+    Ok(state)
+}
+
+fn layout_has_operator_facts(layout: &CombinedStoreLayout) -> Result<bool, String> {
+    Ok(runtime_has_operator_facts(&layout.sekai_runtime())?
+        || runtime_has_operator_facts(&layout.chisei_runtime())?)
+}
+
+fn runtime_has_operator_facts(db: &RuntimeDb) -> Result<bool, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(sqlite_has_operator_facts)?,
+        RuntimeDb::Postgres(db) => postgres_has_operator_facts(db),
+    }
+}
+
+const OPERATOR_FACT_TABLES: &[&str] = &[
+    "sekai_objects",
+    "sekai_grants",
+    "sekai_links",
+    "sekai_governed_action_instances",
+    "sekai_decisions",
+];
+
+fn sqlite_has_operator_facts(conn: &Connection) -> Result<bool, String> {
+    for table in OPERATOR_FACT_TABLES {
+        if sqlite_table_row_count(conn, table)? > 0 {
+            return Ok(true);
+        }
+    }
+    for table in list_chisei_tables(conn, "main")? {
+        if sqlite_table_row_count(conn, &table)? > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn sqlite_table_row_count(conn: &Connection, table: &str) -> Result<i64, String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if exists.is_none() {
+        return Ok(0);
+    }
+    conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+        row.get(0)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn postgres_has_operator_facts(db: &PostgresDb) -> Result<bool, String> {
+    let mut conn = db.connection()?;
+    for table in OPERATOR_FACT_TABLES {
+        match conn.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[]) {
+            Ok(row) => {
+                let count: i64 = row.get(0);
+                if count > 0 {
+                    return Ok(true);
+                }
+            }
+            Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let tables = conn
+        .query(
+            "SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public'
+               AND tablename LIKE 'chisei_%'
+               AND tablename <> $1
+             ORDER BY tablename",
+            &[&JOURNAL_TABLE],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in tables {
+        let table: String = row.get(0);
+        let count: i64 = conn
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_dest_generation(dest: &str) -> Result<Option<i64>, String> {
@@ -812,8 +909,10 @@ fn read_dest_generation(dest: &str) -> Result<Option<i64>, String> {
     read_sqlite_generation(&conn)
 }
 
-/// Stamp a matching generation when both destinations are empty; leave a
-/// mismatch in place so mutating RPCs stay refused.
+/// Stamp a matching generation on empty green-field destinations. Dual-
+/// unstamped stores that already hold operator facts stay unattested so
+/// mutating RPCs remain refused until an operator restamp. Relocate stamps
+/// independently as the first cutover.
 pub fn align_split_generations(
     layout: &CombinedStoreLayout,
 ) -> Result<SplitGenerationState, String> {
@@ -838,6 +937,7 @@ pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> R
         SplitGenerationState::Mismatched { sekai, chisei } => {
             Err(generation_mismatch_guidance(sekai, chisei))
         }
+        SplitGenerationState::Unattested => Err(unattested_guidance()),
         SplitGenerationState::Matched { generation } => {
             if !pairing_epochs_match(layout)? {
                 return Err(pairing_epoch_guidance());
@@ -852,6 +952,10 @@ pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> R
 
 fn pairing_epoch_guidance() -> String {
     "split pairing epochs disagree after a one-sided restore; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Equal cutover generation is not a pairing proof".into()
+}
+
+fn unattested_guidance() -> String {
+    "split stores hold operator facts without a cutover generation; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Dual-unstamped is not a green-field pair".into()
 }
 
 fn pairing_epochs_match(layout: &CombinedStoreLayout) -> Result<bool, String> {
@@ -1630,6 +1734,8 @@ mod tests {
         );
         assert!(compare_split_generations(Some(1), Some(2)).refuses_mutations());
         assert!(!compare_split_generations(Some(1), Some(1)).refuses_mutations());
+        assert!(SplitGenerationState::Unattested.refuses_mutations());
+        assert!(!SplitGenerationState::Unstamped.refuses_mutations());
     }
 
     #[test]
@@ -1647,6 +1753,32 @@ mod tests {
         assert!(!is_mutating_rpc("CheckAccess"));
     }
 
+    fn insert_sekai_object(layout: &CombinedStoreLayout, object_id: &str) {
+        layout
+            .sekai_runtime()
+            .with_sqlite_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated)
+                     VALUES (?1, 'thing', 'n', 'ns', 'ext', '{}', 1, 1)",
+                    params![object_id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    fn wipe_cutover(layout: &CombinedStoreLayout) {
+        for runtime in [layout.sekai_runtime(), layout.chisei_runtime()] {
+            runtime
+                .with_sqlite_conn(|conn| {
+                    conn.execute_batch(&format!("DROP TABLE IF EXISTS {CUTOVER_TABLE}"))
+                })
+                .unwrap()
+                .unwrap();
+        }
+        layout.invalidate_matched_generation();
+    }
+
     #[test]
     fn dest_pair_aligns_empty_generations_and_allows_mutations() {
         let dir = tempfile::tempdir().unwrap();
@@ -1660,6 +1792,48 @@ mod tests {
             read_runtime_generation(&layout.sekai_runtime()).unwrap(),
             read_runtime_generation(&layout.chisei_runtime()).unwrap()
         );
+    }
+
+    #[test]
+    fn dual_unstamped_with_facts_refuses_until_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        insert_sekai_object(&layout, "obj-1043");
+        BudgetTracker::new(ChiseiStore::from_shared_runtime(layout.chisei_runtime()))
+            .set_limit("unattested-user", 100, PeriodType::Daily)
+            .unwrap();
+        wipe_cutover(&layout);
+
+        assert_eq!(
+            split_generation_state(&layout).unwrap(),
+            SplitGenerationState::Unattested
+        );
+        assert!(
+            read_runtime_generation(&layout.sekai_runtime())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_runtime_generation(&layout.chisei_runtime())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            align_split_generations(&layout).unwrap(),
+            SplitGenerationState::Unattested
+        );
+        assert!(
+            read_runtime_generation(&layout.sekai_runtime())
+                .unwrap()
+                .is_none()
+        );
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("operator facts"), "{err}");
+        assert!(err.contains("restamp"), "{err}");
+        restamp_split_generation(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
     }
 
     #[test]

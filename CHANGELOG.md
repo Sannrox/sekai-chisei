@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Dual-unstamped Split open auto-stamps only empty green-field stores;
+  operator facts without cutover stay refused until restamp (#1043).
 - Split pairing epoch advances on both stores at mutating admit so a
   same-generation one-sided restore refuses writes until restamp (#1042).
 - Shared Combined Postgres consults the writer fence, and `store relocate`

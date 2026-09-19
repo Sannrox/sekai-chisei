@@ -69,10 +69,13 @@ mixed pair.
 ## One-sided restore
 
 Each destination store carries its own split generation in
-`sekai_store_cutover`. Combined split open compares the pair. Mutating
-admits also dual-write a pairing epoch. Equal generation after a one-sided
-restore of a matched backup is not a pairing proof; the restored plane
-keeps the old epoch and writes stay refused until restamp. A Shared or
+`sekai_store_cutover`. Combined split open compares the pair. Empty
+green-field destinations receive the first stamp on open; relocate stamps
+as part of cutover. Dual-unstamped stores that already hold operator facts
+are not a pair: writes stay refused until restamp. Mutating admits also
+dual-write a pairing epoch. Equal generation after a one-sided restore of
+a matched backup is not a pairing proof; the restored plane keeps the old
+epoch and writes stay refused until restamp. A Shared or
 owned-plane process that opens one stamped dest compares `SEKAI_STORE_PEER`
 (read-only; not a writer destination). A missing peer or unequal generation
 keeps mutating RPCs refused until an operator restamps both stores:
