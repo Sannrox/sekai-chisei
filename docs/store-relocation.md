@@ -24,6 +24,9 @@ sekaictl admin store relocate \
   --chisei ./data/chisei.db
 ```
 
+`--sekai` and `--chisei` must be distinct SQLite files (including
+hardlinks). The same physical destination is refused.
+
 The command:
 
 1. Initializes missing destination schema.

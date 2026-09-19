@@ -139,10 +139,17 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         return Err("relocate paths must not be empty".into());
     }
     let source_id = crate::combined_stores::sqlite_identity(source)?;
+    let sekai_id = crate::combined_stores::sqlite_identity(sekai)?;
     let chisei_id = crate::combined_stores::sqlite_identity(chisei)?;
     if source_id == chisei_id {
         return Err(
             "relocate refuses a shared source and Chisei destination; copy into a distinct file"
+                .into(),
+        );
+    }
+    if sekai_id == chisei_id || crate::combined_stores::sqlite_same_inode(&sekai_id, &chisei_id) {
+        return Err(
+            "relocate refuses the same physical destination for --sekai and --chisei; Split cutover needs two files"
                 .into(),
         );
     }
@@ -821,6 +828,28 @@ mod tests {
         .open()
         .unwrap_err();
         assert!(err.contains("writer fence"), "{err}");
+    }
+
+    #[test]
+    fn relocate_refuses_the_same_sekai_and_chisei_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let dest = dir.path().join("shared.db");
+        let source_s = source.to_str().unwrap();
+        let dest_s = dest.to_str().unwrap();
+        std::fs::write(&source, []).unwrap();
+        std::fs::write(&dest, []).unwrap();
+        let err = relocate_sqlite(source_s, dest_s, dest_s).unwrap_err();
+        assert!(err.contains("same physical destination"), "{err}");
+
+        let linked = dir.path().join("linked.db");
+        std::fs::hard_link(&dest, &linked).unwrap();
+        let linked_s = linked.to_str().unwrap();
+        let hardlink_err = relocate_sqlite(source_s, dest_s, linked_s).unwrap_err();
+        assert!(
+            hardlink_err.contains("same physical destination"),
+            "{hardlink_err}"
+        );
     }
 
     #[test]
