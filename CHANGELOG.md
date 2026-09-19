@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split restore-fence admits a matched generation once per restamp/open
+  epoch instead of selecting both stores on every mutating RPC (#1047).
 - Audited object create takes a Deferred writer lock and upgrades to
   Immediate only after SQLITE_BUSY. Profile conflict converge waits at
   most 30ms instead of 160ms (#1045).

@@ -9,6 +9,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use postgres::Config as PostgresConfig;
 
@@ -57,7 +58,14 @@ pub enum CombinedStoreLayout {
         chisei: RuntimeBackend,
         sekai_identity: StoreIdentity,
         chisei_identity: StoreIdentity,
+        matched_generation: Arc<AtomicI64>,
     },
+}
+
+const UNCACHED_MATCHED_GENERATION: i64 = i64::MIN;
+
+fn new_matched_generation_cache() -> Arc<AtomicI64> {
+    Arc::new(AtomicI64::new(UNCACHED_MATCHED_GENERATION))
 }
 
 /// Testable inputs for [`CombinedStoreLayout`].
@@ -259,6 +267,36 @@ impl CombinedStoreLayout {
         }
     }
 
+    pub(crate) fn cached_matched_generation(&self) -> Option<i64> {
+        match self {
+            Self::Split {
+                matched_generation, ..
+            } => {
+                let generation = matched_generation.load(Ordering::Acquire);
+                (generation != UNCACHED_MATCHED_GENERATION).then_some(generation)
+            }
+            Self::Shared { .. } => None,
+        }
+    }
+
+    pub(crate) fn cache_matched_generation(&self, generation: i64) {
+        if let Self::Split {
+            matched_generation, ..
+        } = self
+        {
+            matched_generation.store(generation, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn invalidate_matched_generation(&self) {
+        if let Self::Split {
+            matched_generation, ..
+        } = self
+        {
+            matched_generation.store(UNCACHED_MATCHED_GENERATION, Ordering::Release);
+        }
+    }
+
     pub fn handles(&self) -> (SekaiStore, ChiseiStore) {
         match self {
             Self::Shared { backend, .. } => split_shared_runtime(backend.database()),
@@ -335,6 +373,7 @@ fn open_split_sqlite(
         chisei,
         sekai_identity,
         chisei_identity,
+        matched_generation: new_matched_generation_cache(),
     })
 }
 
@@ -368,6 +407,7 @@ fn open_split_postgres(
         chisei,
         sekai_identity,
         chisei_identity,
+        matched_generation: new_matched_generation_cache(),
     })
 }
 
