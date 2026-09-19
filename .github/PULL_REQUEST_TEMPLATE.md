@@ -1,6 +1,8 @@
 ## Summary
 
-<!-- What behavior or problem does this change address? -->
+<!-- What behavior or problem does this change address? Do not include
+hostnames, home paths, absolute worktree paths, or other private
+environment details. -->
 
 <!-- Use "Closes #123" when a primary Issue exists. -->
 
@@ -60,4 +62,4 @@ operator impact. Write "None" where applicable. -->
 - [ ] The PR implements one focused outcome.
 - [ ] New behavior and regressions have focused tests where practical.
 - [ ] Documentation, examples, configuration, and migrations are updated where required.
-- [ ] No secrets, credentials, local databases, or sensitive logs are included.
+- [ ] No secrets, credentials, local databases, sensitive logs, hostnames, home paths, or absolute worktree paths are included.

@@ -132,6 +132,11 @@ A pull request should include:
 - configuration, migration, compatibility, and security implications; and
 - a linked issue or context when one exists.
 
+Do not put hostnames, home directories, absolute worktree paths, or other
+private environment details in public pull request or issue text. Delivery
+briefs on GitHub may list only claim branch, repo-relative worktree (for
+example `.worktrees/issue-N`), base SHA, and published SHA.
+
 Close the primary Issue with a GitHub closing keyword when applicable. Disclose
 AI assistance, confirm that the submitting author understands the change, and
 state the actual testing level. AI-assisted changes are reviewed by the same

@@ -13,7 +13,8 @@ that remain.
 ## Procedure
 
 1. Inspect `git status`, the diff, and the stated outcome. Preserve unrelated
-   worktree changes. Record the full `git rev-parse HEAD`, the checkout path,
+   worktree changes. Record the full `git rev-parse HEAD`, the checkout path
+   (session-only; GitHub-facing evidence uses SHAs and repo-relative paths),
    and `git status --porcelain=v1 --untracked-files=all --ignore-submodules=none`
    before checking behavior. Use `assess-change-impact` when risk is unclear.
    A dirty implementation worktree is allowed, but record which paths are
@@ -123,7 +124,8 @@ Report at least:
 - baseline and candidate identity: full commit SHAs or the approved candidate
   fingerprint for accepted evidence; intermediate dirty-worktree evidence must
   identify `HEAD` plus its intentional diff and excluded unrelated paths;
-- checkout status and any intentional dirty paths;
+- checkout status and any intentional dirty paths (repo-relative on GitHub;
+  keep absolute checkout paths and hostnames in the session);
 - stated outcome and affected user path or documentation surface;
 - observed before behavior and expected behavior, when applicable;
 - canonical owner and root cause, when applicable;
@@ -138,3 +140,6 @@ Report at least:
 - remaining uncertainty.
 
 Never use “all tests pass” unless all stated tests actually ran and passed.
+Never put hostnames, FQDNs, home directories, absolute worktree paths, or
+other private environment inventory on public Issues, Pull Requests, comments,
+or commit messages.

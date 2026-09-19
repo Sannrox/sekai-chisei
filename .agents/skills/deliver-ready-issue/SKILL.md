@@ -163,11 +163,15 @@ mark the Issue unless documented maintainer policy requires it.
    it ready once verification and review are complete and `mergeable` is no
    longer `UNKNOWN` (`gh pr ready <pr>`). The Pull Request:
    - closes the Issue with a visible `Closes #<issue>` line;
-   - carries the lane brief: agent, machine, base SHA, authority ceiling;
+   - may list public lane fields only: claim branch, repo-relative worktree
+     (for example `.worktrees/issue-N`), base SHA, published SHA, authority
+     ceiling. Never hostname, FQDN, home path, absolute worktree path, LAN
+     or employer network name, or other environment inventory;
    - summarizes behavior rather than file operations;
    - lists verification evidence and any skipped checks;
    - calls out configuration, compatibility, migration, and security impact;
-   - includes an agent transcript when the project workflow requires it.
+   - includes an agent transcript when the project workflow requires it,
+     with local paths already omitted.
 6. Return the Pull Request URL. Do not publish when the ceiling is Implement.
 
 ### 6. Land when authorized
@@ -210,11 +214,12 @@ authority ceiling.
 
 ## Report completion
 
-Return:
+Return to the maintainer in the session (not on GitHub):
 
 - Issue and authority ceiling;
-- claim state (claimed, unclaimed under Implement, or taken over), machine and
-  worktree, branch, base SHA, final commit, and Pull Request when created;
+- claim state (claimed, unclaimed under Implement, or taken over), local
+  worktree path if useful privately, branch, base SHA, final commit, and Pull
+  Request when created;
 - implemented outcome;
 - verification evidence state, review disposition, delivery status, exact
   baseline/candidate identities, and remaining uncertainty;
@@ -232,5 +237,8 @@ Return:
 - Never work around a lost claim race with a differently named branch, a
   forced ref update, or by removing another lane's assignment.
 - Keep secrets, credentials, logs, databases, and runtime state out of Git.
+- Never put hostnames, FQDNs, home directories, absolute worktree paths, LAN
+  or employer network names, or other private environment inventory on public
+  Issues, Pull Requests, comments, or commit messages.
 - Do not substitute a successful build for Issue acceptance evidence.
 - Do not close an Issue manually when the implementation has not landed.

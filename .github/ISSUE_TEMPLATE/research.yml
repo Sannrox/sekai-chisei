@@ -53,5 +53,7 @@ body:
       options:
         - label: I searched existing issues, discussions, and pull requests.
           required: true
+        - label: I omitted hostnames, home paths, and other private environment details.
+          required: true
         - label: I will close this investigation with a recommendation or explicit no-action result.
           required: true
