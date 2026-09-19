@@ -1262,6 +1262,55 @@ mod tests {
     }
 
     #[test]
+    fn admitted_object_apply_ingests_and_denied_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+            policy.default_decision = crate::sekai::action_policy::ActionDecision::Deny;
+            db.upsert_action_policy(&policy).unwrap();
+            let mut denied = record_request(
+                "customer.record.create",
+                r#"{"object_id":"rec-log","name":"Denied"}"#,
+            );
+            denied.idempotency_key = "record-denied-log".into();
+            denied.request_id = "operation-denied-log".into();
+            let denied = admission.admit(denied, "alice", 10).unwrap();
+            assert_eq!(denied.instance.status, STATUS_DENIED);
+            assert!(db.get_object("rec-log").unwrap().is_none());
+            assert!(!log.exists(), "denied admit must not create an object log");
+
+            policy.default_decision = crate::sekai::action_policy::ActionDecision::Allow;
+            db.upsert_action_policy(&policy).unwrap();
+            let mut admitted = record_request(
+                "customer.record.create",
+                r#"{"object_id":"rec-log","name":"Admitted","title":"live"}"#,
+            );
+            admitted.idempotency_key = "record-admitted-log".into();
+            admitted.request_id = "operation-admitted-log".into();
+            let admitted = admission.admit(admitted, "alice", 20).unwrap();
+            assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+            assert!(db.get_object("rec-log").unwrap().is_some());
+            let receipt = db
+                .get_operation_receipt("operation-admitted-log")
+                .unwrap()
+                .expect("clerk receipt stays out of the object log");
+            assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+            let store = mikura::Store::open(&log).unwrap();
+            assert_eq!(
+                crate::sekai::object_log::identity_generation(&store, "customer_record", "rec-log")
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
     fn submit_updates_one_admitted_record() {
         let db = setup();
         ensure_record_kind(&db);

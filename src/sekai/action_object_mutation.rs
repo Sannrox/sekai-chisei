@@ -12,6 +12,7 @@ use crate::sekai::governed_action_type::{
 };
 use crate::sekai::governed_facts;
 use crate::sekai::markings::PRINCIPAL_PROFILE_KIND;
+use crate::sekai::object_log;
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::HashMap;
 
@@ -221,14 +222,19 @@ pub(crate) fn apply(
                 })?,
         )
     };
-    Ok(AppliedObjectMutation {
+    let applied = AppliedObjectMutation {
         object_id,
         object_kind,
         mutation,
         created,
         previous,
         applied_updated: object.updated,
-    })
+    };
+    if let Err(error) = object_log::apply_admitted_object_to_configured_log(&object) {
+        compensate(db, &applied, actor);
+        return Err(ActionObjectMutationError::Internal(error));
+    }
+    Ok(applied)
 }
 
 pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) {

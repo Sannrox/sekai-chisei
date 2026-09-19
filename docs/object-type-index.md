@@ -23,6 +23,12 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
    visible `member_count`.
 4. `PutObjectTypeIndexEdit` — Action delta that survives a full rebuild.
 
+Admitted object create/update still persists clerk objects and receipts
+here. When `SEKAI_OBJECT_LOG` is set, the same admitted mutation is
+appended through tagged mikura ingest so the log owns identity
+generations. A denied or unadmitted Action does not append. SQL index
+writes continue until the later retirement ADR.
+
 `EvaluateObjectSet` reads the index when a datasource is registered. Set
 `required_freshness_ms` to fail closed when the index is stale or lagging.
 Hidden rows never appear in members, counts, order, errors, or continuation

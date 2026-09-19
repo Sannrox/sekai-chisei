@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Admitted Action object apply appends through tagged mikura ingest when
+  `SEKAI_OBJECT_LOG` is set; denied submits do not write the log (#943).
 - Dual-unstamped Split open auto-stamps only empty green-field stores;
   operator facts without cutover stay refused until restamp (#1043).
 - Split pairing epoch advances on both stores at mutating admit so a
