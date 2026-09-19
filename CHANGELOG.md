@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`;
+  destination pairs stay the default Combined topology (#1032).
 - Store relocate takes a `VACUUM INTO` snapshot, fences the source, then
   copies Chisei families from the snapshot instead of ATTACH'ing the live
   file for a long DELETE+INSERT window (#1021).
