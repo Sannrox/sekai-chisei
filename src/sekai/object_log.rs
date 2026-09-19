@@ -3,11 +3,13 @@
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
 
+use crate::domain::Object;
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use mikura::{
-    Aggregate, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectSet, PropertyAcl, Store,
+    Aggregate, BatchIngest, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
+    ObjectSet, PropertyAcl, Store,
 };
 use std::collections::HashSet;
 use std::env;
@@ -20,6 +22,11 @@ pub const SAMPLE_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE";
 const DEFAULT_SAMPLE_N: u32 = 32;
 
 static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LOG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectLogDualRead {
@@ -314,6 +321,85 @@ pub fn compare_sql_to_log_path(
     })
 }
 
+/// Append an admitted object mutation through tagged mikura ingest.
+///
+/// Clerk admission and receipts stay here. The log owns identity generations.
+/// Missing `SEKAI_OBJECT_LOG` skips ingest so SQL-only fixtures keep working
+/// until an operator points Combined at a log.
+pub fn apply_admitted_object_to_configured_log(object: &Object) -> Result<Option<u64>, String> {
+    let path = configured_log_path();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    apply_admitted_object_to_log(&path, object).map(Some)
+}
+
+fn configured_log_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        let override_path = TEST_LOG_PATH.with(|slot| slot.borrow().clone());
+        if override_path.is_some() {
+            return override_path;
+        }
+    }
+    env::var(LOG_PATH_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            TEST_LOG_PATH.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+    TEST_LOG_PATH.with(|slot| {
+        *slot.borrow_mut() = Some(path.to_path_buf());
+    });
+    let _clear = ClearOnDrop;
+    body()
+}
+
+pub fn apply_admitted_object_to_log(path: &Path, object: &Object) -> Result<u64, String> {
+    let mut store = if path.exists() {
+        Store::open(path)?
+    } else if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        Store::create(path)?
+    } else {
+        Store::create(path)?
+    };
+    BatchIngest::run(&mut store, vec![object_record(object)])?;
+    identity_generation(&store, &object.kind, &object.id)
+}
+
+fn object_record(object: &Object) -> ObjectRecord {
+    ObjectRecord {
+        r#gen: 0,
+        kind: object.kind.clone(),
+        key: object.id.clone(),
+        hidden: false,
+        props: object.properties.clone(),
+    }
+}
+
+pub fn identity_generation(store: &Store, kind: &str, key: &str) -> Result<u64, String> {
+    store
+        .visible_of_kind(kind)
+        .into_iter()
+        .find(|record| record.key == key)
+        .map(|record| record.r#gen)
+        .ok_or_else(|| format!("mikura identity missing for {kind}:{key}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +414,26 @@ mod tests {
             properties: BTreeMap::from([(property.into(), value.into())]),
             ..ObjectTypeIndexMember::default()
         }
+    }
+
+    #[test]
+    fn admitted_ingest_advances_identity_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let object = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "Acme".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 1);
+        assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
+        let store = Store::open(&log).unwrap();
+        assert_eq!(identity_generation(&store, "Customer", "c1").unwrap(), 2);
     }
 
     #[test]
