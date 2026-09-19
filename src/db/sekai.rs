@@ -15,6 +15,8 @@ use crate::domain::{
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 
+pub const DEFAULT_SQLITE_POOL_MAX: u32 = 16;
+
 pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
     enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
@@ -75,14 +77,29 @@ impl SekaiDb {
     }
 
     pub fn new(path: &str) -> Result<Self, String> {
-        Self::new_with_enterprise_extension(path, None)
+        Self::new_with_pool_max(path, DEFAULT_SQLITE_POOL_MAX)
+    }
+
+    pub fn new_with_pool_max(path: &str, pool_max: u32) -> Result<Self, String> {
+        Self::open(path, pool_max, None)
     }
 
     pub fn new_with_enterprise_extension(
         path: &str,
         enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
     ) -> Result<Self, String> {
+        Self::open(path, DEFAULT_SQLITE_POOL_MAX, enterprise_extension)
+    }
+
+    fn open(
+        path: &str,
+        pool_max: u32,
+        enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+    ) -> Result<Self, String> {
         let persistent = path != ":memory:";
+        if persistent && pool_max == 0 {
+            return Err("SQLite pool size must be greater than zero".into());
+        }
         let manager = if persistent {
             std::fs::create_dir_all(
                 std::path::Path::new(path)
@@ -107,7 +124,7 @@ impl SekaiDb {
         // Separate in-memory SQLite connections do not share state. Keep the
         // embedded test backend single-connection while allowing persistent
         // databases to serve concurrent readers and writers.
-        let max_size = if persistent { 16 } else { 1 };
+        let max_size = if persistent { pool_max } else { 1 };
         let pool = Pool::builder()
             .max_size(max_size)
             .connection_customizer(Box::new(SqliteConnectionSetup))
@@ -120,6 +137,11 @@ impl SekaiDb {
         };
         db.migrate_all()?;
         Ok(db)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_max_size(&self) -> u32 {
+        self.pool.max_size()
     }
 
     pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
