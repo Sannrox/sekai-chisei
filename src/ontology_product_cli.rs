@@ -1200,7 +1200,9 @@ mod tests {
                 &case.namespace,
                 &case.actor,
                 &case.input.to_string(),
-                &crate::db::store::ChiseiStore::from(&db),
+                &crate::db::store::ChiseiStore::from_shared_runtime(std::sync::Arc::new(
+                    db.clone(),
+                )),
             )
             .expect("lookup-first case");
             match case.expected_path.as_str() {

@@ -55,7 +55,7 @@ impl ChiseiServiceImpl {
             .clone()
             .ok_or(Status::invalid_argument("plan input required"))?;
         require_execution_namespace_access_with_context(
-            &self.db,
+            self.db.runtime(),
             &self.config,
             &actor,
             context.as_ref(),
@@ -79,7 +79,7 @@ impl ChiseiServiceImpl {
             .filter(|signal| signal.regressed)
         {
             record_failed_operation_on(
-                &self.db,
+                self.db.runtime(),
                 &plan,
                 &actor,
                 "evaluation_regressed_after_planning",
@@ -94,7 +94,8 @@ impl ChiseiServiceImpl {
         // selection, residency, egress, or model payload preparation. A
         // complete structured hit must not enter the provider-routing path at
         // all.
-        let lookup_refusal = match evaluate_execute_lookup_first(&self.db, &input, &actor) {
+        let lookup_refusal = match evaluate_execute_lookup_first(self.db.runtime(), &input, &actor)
+        {
             ExecuteLookupFirst::Hit {
                 response,
                 capability,
@@ -118,7 +119,7 @@ impl ChiseiServiceImpl {
                     0,
                 ) {
                     record_failed_operation_on(
-                        &self.db,
+                        self.db.runtime(),
                         &plan,
                         &actor,
                         "execution_bookkeeping_failed",
@@ -128,7 +129,7 @@ impl ChiseiServiceImpl {
                 }
                 let completed_at_ms = chrono::Utc::now().timestamp_millis();
                 record_completed_lookup_operation_on(
-                    &self.db,
+                    self.db.runtime(),
                     &plan,
                     &actor,
                     &response,
@@ -161,7 +162,7 @@ impl ChiseiServiceImpl {
             &plan.resolved_model,
             data_class.as_str(),
         ) {
-            record_failed_operation_on(&self.db, &plan, &actor, "residency_denied")
+            record_failed_operation_on(self.db.runtime(), &plan, &actor, "residency_denied")
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
@@ -169,7 +170,7 @@ impl ChiseiServiceImpl {
         if crate::chisei::egress::is_external_provider(&provider)
             && plan.egress_decisions.is_empty()
         {
-            record_failed_operation_on(&self.db, &plan, &actor, "egress_evidence_missing")
+            record_failed_operation_on(self.db.runtime(), &plan, &actor, "egress_evidence_missing")
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "external execution plan missing egress decisions",
@@ -208,7 +209,7 @@ impl ChiseiServiceImpl {
         let chat_stream = match execute_native_chat_request_stream(
             &self.config,
             self.budget.clone(),
-            self.db.as_ref(),
+            self.db.runtime(),
             context.as_ref(),
             llm_req,
             cacheable_message_count,
@@ -217,8 +218,13 @@ impl ChiseiServiceImpl {
         {
             Ok(stream) => stream,
             Err(status) => {
-                record_failed_operation_on(&self.db, &plan, &actor, "model_stream_start_failed")
-                    .map_err(Status::internal)?;
+                record_failed_operation_on(
+                    self.db.runtime(),
+                    &plan,
+                    &actor,
+                    "model_stream_start_failed",
+                )
+                .map_err(Status::internal)?;
                 return Err(status);
             }
         };
@@ -252,7 +258,7 @@ impl ChiseiServiceImpl {
                     Ok(chunk) => chunk,
                     Err(err) => {
                         if let Err(receipt_error) = record_failed_operation_on(
-                            &db,
+                            db.runtime(),
                             &receipt_plan,
                             &actor,
                             "model_stream_failed",
@@ -307,7 +313,7 @@ impl ChiseiServiceImpl {
                         cache_creation_input_tokens,
                     };
                     let execution = FinishStreamedExecution {
-                        db: db.as_ref(),
+                        db: db.runtime(),
                         evolve_history: &evolve_history,
                         request_id: &request_id,
                         namespace: &namespace_hint,
@@ -322,7 +328,7 @@ impl ChiseiServiceImpl {
                     };
                     if let Err(error) = finish_streamed_execution(&execution) {
                         if let Err(receipt_error) = record_failed_operation_on(
-                            &db,
+                            db.runtime(),
                             &receipt_plan,
                             &actor,
                             "stream_bookkeeping_failed",
@@ -338,7 +344,7 @@ impl ChiseiServiceImpl {
                         .as_ref()
                         .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
                     if let Err(error) = record_completed_operation_on_with_path(
-                        db.as_ref(),
+                        db.runtime(),
                         &receipt_plan,
                         &actor,
                         &response,
@@ -384,7 +390,7 @@ impl ChiseiServiceImpl {
                     cache_creation_input_tokens,
                 };
                 let execution = FinishStreamedExecution {
-                    db: db.as_ref(),
+                    db: db.runtime(),
                     evolve_history: &evolve_history,
                     request_id: &request_id,
                     namespace: &namespace_hint,
@@ -399,7 +405,7 @@ impl ChiseiServiceImpl {
                 };
                 if let Err(error) = finish_streamed_execution(&execution) {
                     if let Err(receipt_error) = record_failed_operation_on(
-                        &db,
+                        db.runtime(),
                         &receipt_plan,
                         &actor,
                         "stream_bookkeeping_failed",
@@ -415,7 +421,7 @@ impl ChiseiServiceImpl {
                     .as_ref()
                     .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
                 if let Err(error) = record_completed_operation_on_with_path(
-                    &db,
+                    db.runtime(),
                     &receipt_plan,
                     &actor,
                     &response,
@@ -448,6 +454,7 @@ impl ChiseiServiceImpl {
         for reference in references {
             let memory = self
                 .db
+                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::failed_precondition("planned memory version not found"))?;
@@ -463,6 +470,7 @@ impl ChiseiServiceImpl {
             }
             let authorized_ceiling = self
                 .db
+                .runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .map_err(|_| {
                     Status::permission_denied(
@@ -482,6 +490,7 @@ impl ChiseiServiceImpl {
         }
         for reference in references {
             self.db
+                .runtime()
                 .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                     memory_id: reference.memory_id.clone(),
                     memory_version: reference.memory_version,
@@ -507,6 +516,7 @@ impl ChiseiServiceImpl {
         for reference in references {
             let Some(memory) = self
                 .db
+                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
             else {
@@ -514,6 +524,7 @@ impl ChiseiServiceImpl {
             };
             let authorized = self
                 .db
+                .runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .is_ok_and(|ceiling| memory.classification <= ceiling);
             let eligible = memory_lifecycle_allows_execution(
@@ -526,6 +537,7 @@ impl ChiseiServiceImpl {
                 && crate::chisei::kioku::memory_claim_digest(&memory) == reference.content_digest;
             if !eligible {
                 self.db
+                    .runtime()
                     .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                         memory_id: reference.memory_id.clone(),
                         memory_version: reference.memory_version,
@@ -562,7 +574,7 @@ impl ChiseiServiceImpl {
                 task_class,
                 "cached_plan_unsafe_provider",
             );
-            record_failed_operation_on(&self.db, plan, actor, "provider_became_unsafe")
+            record_failed_operation_on(self.db.runtime(), plan, actor, "provider_became_unsafe")
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 crate::chisei::privacy::gate_reason(data_class, task_class, provider),
@@ -594,7 +606,7 @@ impl ChiseiServiceImpl {
                 &leak_findings,
             );
             record_failed_operation_on(
-                &self.db,
+                self.db.runtime(),
                 plan,
                 actor,
                 "privacy_leak_detected_after_planning",
@@ -616,7 +628,7 @@ impl ChiseiServiceImpl {
         tokens_used: i32,
     ) -> Result<(), String> {
         record_evolve_task_on(
-            &self.db,
+            self.db.runtime(),
             &self.evolve_history,
             EvolveTaskRecord {
                 request_id,
@@ -886,7 +898,7 @@ pub(super) fn evaluate_execute_lookup_first(
         &input.namespace,
         actor,
         &input.spec,
-        &crate::db::store::ChiseiStore::from(db),
+        &crate::db::store::ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
     ) {
         Ok(crate::chisei::lookup_first::LookupDecision::Hit {
             answer_json,

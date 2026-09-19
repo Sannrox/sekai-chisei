@@ -1326,7 +1326,10 @@ mod tests {
         }
         ConsoleState {
             db: db.clone(),
-            auth: TokenAuthInterceptor::new(store, db),
+            auth: TokenAuthInterceptor::new(
+                store,
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+            ),
             sessions: Arc::new(SessionStore::new()),
             session_ttl: Duration::from_secs(3600),
         }

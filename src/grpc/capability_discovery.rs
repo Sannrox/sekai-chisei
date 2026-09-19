@@ -11,7 +11,7 @@ impl SekaiServiceImpl {
         namespace: &str,
         principals: &[String],
     ) -> Result<Vec<CapabilityEntry>, Status> {
-        check_team_namespace(&self.db, principals, namespace, false)
+        check_team_namespace(self.db.runtime(), principals, namespace, false)
             .map_err(|_| Status::permission_denied("capability discovery denied"))?;
         let schema = self
             .schema_definitions

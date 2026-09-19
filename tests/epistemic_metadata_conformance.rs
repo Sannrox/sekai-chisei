@@ -87,7 +87,9 @@ fn fixture(include_hidden: bool) -> (Arc<RuntimeDb>, SekaiServiceImpl) {
         }
     }
 
-    let service = SekaiServiceImpl::new(Arc::clone(&db));
+    let service = SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
+        Arc::clone(&db),
+    ));
     (db, service)
 }
 

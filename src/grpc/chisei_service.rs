@@ -305,17 +305,18 @@ impl ChiseiServiceImpl {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(&db, &policy);
+        load_namespace_policies(db.runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.list_evolve_task_records()
+            db.runtime()
+                .list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(&db, &policy);
+        load_namespace_policies(db.runtime(), &policy);
         let budget = Arc::new(BudgetTracker::new(db.clone()));
         let evaluation_execution_lifecycle =
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
@@ -378,17 +379,18 @@ impl ChiseiServiceImpl {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(&db, &policy);
+        load_namespace_policies(db.runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.list_evolve_task_records()
+            db.runtime()
+                .list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(&db, &policy);
+        load_namespace_policies(db.runtime(), &policy);
         let evaluator_registry =
             Arc::new(evaluation_execution_domain::DeterministicEvaluatorRegistry::default());
         let stochastic_evaluator_registry = Arc::new(

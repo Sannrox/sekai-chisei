@@ -189,7 +189,7 @@ pub fn promote_feedback_to_eval(
         return Err("feedback namespace does not match request namespace".into());
     }
     let case = case_from_feedback(&record)?;
-    let existing = db.get_eval_suite_record(suite_id)?;
+    let existing = db.runtime().get_eval_suite_record(suite_id)?;
     let (suite, created) = match existing {
         Some(mut suite) => {
             if let Some(existing_case) = suite.cases.iter().find(|item| item.id == case.id) {
@@ -216,7 +216,7 @@ pub fn promote_feedback_to_eval(
             }
             suite.cases.push(case.clone());
             suite.cases.sort_by(|left, right| left.id.cmp(&right.id));
-            db.append_feedback_eval_suite(&suite)?;
+            db.runtime().append_feedback_eval_suite(&suite)?;
             (suite, true)
         }
         None => {
@@ -229,7 +229,7 @@ pub fn promote_feedback_to_eval(
                 description: "Operator feedback promoted into evaluation cases".into(),
                 cases: vec![case.clone()],
             };
-            db.append_feedback_eval_suite(&suite)?;
+            db.runtime().append_feedback_eval_suite(&suite)?;
             (suite, true)
         }
     };
@@ -291,7 +291,7 @@ fn audit_promotion(
             "unchanged".into()
         },
     };
-    db.record_decision(&decision)
+    db.runtime().record_decision(&decision)
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

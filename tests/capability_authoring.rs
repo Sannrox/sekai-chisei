@@ -62,7 +62,7 @@ fn capability_authoring_requires_exact_review_and_gate_proof_before_launch() {
     let db = RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").expect("open in-memory database"),
     ));
-    let store = ChiseiStore::from(&db);
+    let store = ChiseiStore::from_shared_runtime(std::sync::Arc::new(db));
     let observations = vec![
         observation("task-1", "done", &["comment", "invented"], 1),
         observation("task-2", "done", &["comment"], 2),

@@ -147,8 +147,12 @@ fn credential_reload_and_eval_share_across_replicas() {
     assert!(store.maybe_reload(&pair.b));
     assert!(store.resolve(secret).is_none());
 
-    let writer = EvalStore::with_db(Arc::clone(&pair.a));
-    let reader = EvalStore::with_db(Arc::clone(&pair.b));
+    let writer = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.a),
+    ));
+    let reader = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.b),
+    ));
     writer
         .put_suite(Suite {
             id: "closeout-suite".into(),

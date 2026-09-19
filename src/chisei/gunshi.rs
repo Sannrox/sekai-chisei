@@ -625,7 +625,7 @@ pub fn load_kioku_evidence(
     namespace: &str,
     operation_class: &str,
 ) -> Result<Vec<KiokuEvidence>, String> {
-    let objects = db.list_all_objects(&ListFilter {
+    let objects = db.runtime().list_all_objects(&ListFilter {
         kind: Some(KIND_LEARNING.into()),
         namespace: Some(namespace.trim().to_string()),
         ..Default::default()
@@ -1472,24 +1472,25 @@ mod tests {
         use std::collections::HashMap;
 
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "learning-1".into(),
-            kind: KIND_LEARNING.into(),
-            name: "Scored learning".into(),
-            namespace: "support".into(),
-            external_id: "learning-1".into(),
-            properties: HashMap::from([
-                ("task_class".into(), "triage".into()),
-                ("model".into(), "local-small".into()),
-                ("score".into(), "87".into()),
-                ("passed".into(), "true".into()),
-                ("status".into(), "active".into()),
-                ("source_request_id".into(), "receipt-1".into()),
-            ]),
-            created: 1,
-            updated: 2,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "learning-1".into(),
+                kind: KIND_LEARNING.into(),
+                name: "Scored learning".into(),
+                namespace: "support".into(),
+                external_id: "learning-1".into(),
+                properties: HashMap::from([
+                    ("task_class".into(), "triage".into()),
+                    ("model".into(), "local-small".into()),
+                    ("score".into(), "87".into()),
+                    ("passed".into(), "true".into()),
+                    ("status".into(), "active".into()),
+                    ("source_request_id".into(), "receipt-1".into()),
+                ]),
+                created: 1,
+                updated: 2,
+            })
+            .unwrap();
 
         let loaded = load_kioku_evidence(&db, "support", "triage").unwrap();
         assert_eq!(loaded.len(), 1);

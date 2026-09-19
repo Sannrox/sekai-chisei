@@ -15,7 +15,7 @@ impl SekaiServiceImpl {
         require_authenticated(&principals)?;
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let actor = principals
             .first()
             .cloned()
@@ -25,12 +25,12 @@ impl SekaiServiceImpl {
             .scope
             .ok_or_else(|| Status::invalid_argument("object-change scope required"))?;
         enforce_namespace_tenant_context(
-            &self.db,
+            self.db.runtime(),
             tenant_context.as_ref(),
             &scope.namespace,
             false,
         )?;
-        check_team_namespace(&self.db, &principals, &scope.namespace, false)?;
+        check_team_namespace(self.db.runtime(), &principals, &scope.namespace, false)?;
         authorize_source_sync_namespace(
             self,
             &principals,
@@ -67,7 +67,7 @@ impl SekaiServiceImpl {
             descending: false,
         };
         let (visible, _) = list_objects_with_marking(
-            &self.db,
+            self.db.runtime(),
             &filter,
             &principals,
             &policy_context,
@@ -87,6 +87,7 @@ impl SekaiServiceImpl {
         };
         let activation_id = self
             .db
+            .runtime()
             .get_object_security_activation(&domain_scope.namespace)
             .map_err(|_| Status::unavailable("object authorization unavailable"))?
             .map(|activation| activation.activation_id)
@@ -95,7 +96,7 @@ impl SekaiServiceImpl {
             .map_err(|_| Status::internal("object-change authorization pin unavailable"))?;
         let now_ms = now_millis();
         let page = read_object_change_subscription(
-            &self.db,
+            self.db.runtime(),
             &actor,
             &ObjectChangeReadRequest {
                 subscription_id: input.subscription_id,
@@ -181,7 +182,7 @@ mod tests {
         let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
             SekaiDb::new(":memory:").unwrap(),
         )));
-        SekaiServiceImpl::new(db)
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
     }
 
     fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
@@ -194,6 +195,7 @@ mod tests {
     fn grant_namespace(svc: &SekaiServiceImpl, namespace: &str, principal: &str) {
         let (_, grants) = svc
             .db
+            .runtime()
             .ensure_team_namespace(namespace, principal, security::Role::Admin, "local")
             .unwrap();
         for grant in grants {

@@ -30,12 +30,17 @@ impl SekaiServiceImpl {
             )?;
         }
         self.ensure_mapped_kind(&parsed, principals)?;
-        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let mut registry = self
+            .db
+            .runtime()
+            .load_ontology_registry()
+            .map_err(Status::internal)?;
         let existing = registry.get_class(&parsed.name).cloned();
         registry.remove_class(&parsed.name);
         ontology::validate_class_definition(&parsed, existing.as_ref(), &registry)
             .map_err(Status::invalid_argument)?;
         self.db
+            .runtime()
             .upsert_ontology_class_with_audit(&parsed, actor(principals))
             .map_err(Status::internal)?;
         Ok(parsed)
@@ -47,7 +52,11 @@ impl SekaiServiceImpl {
         name: &str,
     ) -> Result<(), Status> {
         check_ontology_admin(&self.security, &ontology_class_object_id(name), principals)?;
-        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let registry = self
+            .db
+            .runtime()
+            .load_ontology_registry()
+            .map_err(Status::internal)?;
         for class in registry.classes() {
             if class.name != name
                 && class
@@ -72,9 +81,14 @@ impl SekaiServiceImpl {
             }
         }
         let object_id = ontology_class_object_id(name);
-        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
+        let grants = self
+            .db
+            .runtime()
+            .list_grants(&object_id)
+            .map_err(Status::internal)?;
         if !self
             .db
+            .runtime()
             .delete_ontology_class_with_audit(name, actor(principals))
             .map_err(Status::internal)?
         {
@@ -110,7 +124,11 @@ impl SekaiServiceImpl {
                 principals,
             )?;
         }
-        let mut registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let mut registry = self
+            .db
+            .runtime()
+            .load_ontology_registry()
+            .map_err(Status::internal)?;
         let existing = registry.get_relation(&parsed.name).cloned();
         registry.remove_relation(&parsed.name);
         ontology::validate_relation_definition(&parsed, existing.as_ref(), &registry)
@@ -128,6 +146,7 @@ impl SekaiServiceImpl {
             }
         }
         self.db
+            .runtime()
             .upsert_ontology_relation_with_audit(&parsed, actor(principals))
             .map_err(Status::internal)?;
         Ok(parsed)
@@ -143,7 +162,11 @@ impl SekaiServiceImpl {
             &ontology_relation_object_id(name),
             principals,
         )?;
-        let registry = self.db.load_ontology_registry().map_err(Status::internal)?;
+        let registry = self
+            .db
+            .runtime()
+            .load_ontology_registry()
+            .map_err(Status::internal)?;
         if let Some(referencing) = registry
             .relations()
             .into_iter()
@@ -155,9 +178,14 @@ impl SekaiServiceImpl {
             )));
         }
         let object_id = ontology_relation_object_id(name);
-        let grants = self.db.list_grants(&object_id).map_err(Status::internal)?;
+        let grants = self
+            .db
+            .runtime()
+            .list_grants(&object_id)
+            .map_err(Status::internal)?;
         if !self
             .db
+            .runtime()
             .delete_ontology_relation_with_audit(name, actor(principals))
             .map_err(Status::internal)?
         {

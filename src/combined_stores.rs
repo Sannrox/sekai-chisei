@@ -301,8 +301,8 @@ impl CombinedStoreLayout {
         match self {
             Self::Shared { backend, .. } => split_shared_runtime(backend.database()),
             Self::Split { sekai, chisei, .. } => (
-                SekaiStore::from(sekai.database()),
-                ChiseiStore::from(chisei.database()),
+                SekaiStore::from_shared_runtime(sekai.database()),
+                ChiseiStore::from_shared_runtime(chisei.database()),
             ),
         }
     }

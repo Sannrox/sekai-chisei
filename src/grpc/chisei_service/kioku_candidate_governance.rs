@@ -136,12 +136,14 @@ impl KiokuCandidateGovernance {
         let mut seen = HashSet::new();
         let classification_ceiling = self
             .db
+            .runtime()
             .kioku_authorized_classification_ceiling(&namespace, &actor)
             .ok();
         let mut has_more = false;
         for _ in 0..MAX_CANDIDATE_PAGES {
             let page = self
                 .db
+                .runtime()
                 .list_kioku_candidate_page(&namespace, CANDIDATE_PAGE_SIZE, cursor.as_ref())
                 .map_err(Status::internal)?;
             let page_len = page.len();
@@ -185,6 +187,7 @@ impl KiokuCandidateGovernance {
                     basis.source_submission_id.is_empty()
                         || self
                             .db
+                            .runtime()
                             .authorize_kioku_evidence(
                                 &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest {
                                     source_submission_id: basis.source_submission_id.clone(),
@@ -239,6 +242,7 @@ impl KiokuCandidateGovernance {
             } => {
                 let result = self
                     .db
+                    .runtime()
                     .reassess_kioku_memory(KiokuEvidenceReassessmentRequest {
                         memory_id,
                         memory_version,
@@ -250,6 +254,7 @@ impl KiokuCandidateGovernance {
                     .map_err(Status::failed_precondition)?;
                 let lifecycle_events = self
                     .db
+                    .runtime()
                     .list_kioku_lifecycle_events(&result.candidate.id, result.candidate.version)
                     .map_err(Status::internal)?;
                 Ok(CandidateReviewOutcome {
@@ -271,6 +276,7 @@ impl KiokuCandidateGovernance {
                     "promote" | "reject" | "supersede" => {
                         let memory = self
                             .db
+                            .runtime()
                             .get_kioku_memory(&memory_id, memory_version)
                             .map_err(Status::internal)?
                             .ok_or_else(|| Status::not_found("memory version not found"))?;
@@ -280,6 +286,7 @@ impl KiokuCandidateGovernance {
                             ));
                         }
                         self.db
+                            .runtime()
                             .review_kioku_candidate(
                                 &memory_id,
                                 memory_version,
@@ -298,6 +305,7 @@ impl KiokuCandidateGovernance {
                     }
                     "disable" => self
                         .db
+                        .runtime()
                         .disable_kioku_memory(
                             &memory_id,
                             memory_version,
@@ -314,6 +322,7 @@ impl KiokuCandidateGovernance {
                 };
                 let lifecycle_events = self
                     .db
+                    .runtime()
                     .list_kioku_lifecycle_events(&memory.id, memory.version)
                     .map_err(Status::internal)?;
                 Ok(CandidateReviewOutcome {

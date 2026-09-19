@@ -264,7 +264,10 @@ impl ScoringJob {
     /// Consume one batch of unscored observations, score them, and emit one eval run per namespace.
     /// Returns the number of observations scored.
     pub async fn run_once(&self) -> Result<usize, String> {
-        let observations = self.db.list_unscored_observations(self.batch_size)?;
+        let observations = self
+            .db
+            .runtime()
+            .list_unscored_observations(self.batch_size)?;
         if observations.is_empty() {
             return Ok(0);
         }
@@ -410,7 +413,7 @@ impl ScoringJob {
             // already committed, so a rare delete failure must not abort the cycle (skipping the
             // remaining namespace groups); the row is simply re-scored on a later cycle.
             for obs in &scored_obs {
-                if let Err(e) = self.db.delete_observation(&obs.request_id) {
+                if let Err(e) = self.db.runtime().delete_observation(&obs.request_id) {
                     warn!(
                         request_id = %obs.request_id,
                         error = %e,
@@ -456,6 +459,7 @@ impl ScoringJob {
         // counter hiccup just means "retry", never "retire on first failure".
         let attempts = self
             .db
+            .runtime()
             .bump_observation_attempts(&obs.request_id)
             .unwrap_or(0);
         if attempts >= MAX_JUDGE_ATTEMPTS {
@@ -470,17 +474,20 @@ impl ScoringJob {
             evidence.insert("attempts".to_string(), attempts.to_string());
             evidence.insert("error".to_string(), message.clone());
             evidence.insert("request_id".to_string(), obs.request_id.clone());
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: "chisei.scoring".into(),
-                action: "judge_failed".into(),
-                reason: format!("retired after {attempts} judge failures"),
-                evidence,
-                target_id: obs.request_id.clone(),
-                outcome: "retired".into(),
-            });
-            let _ = self.db.delete_observation(&obs.request_id);
+            let _ = self
+                .db
+                .runtime()
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    actor: "chisei.scoring".into(),
+                    action: "judge_failed".into(),
+                    reason: format!("retired after {attempts} judge failures"),
+                    evidence,
+                    target_id: obs.request_id.clone(),
+                    outcome: "retired".into(),
+                });
+            let _ = self.db.runtime().delete_observation(&obs.request_id);
         } else {
             warn!(
                 request_id = %obs.request_id,
@@ -604,23 +611,26 @@ impl ScoringJob {
         // Capture audit time after iteration tracking so a class-scoped signal
         // from this batch is never considered older than its namespace signal.
         let decision_timestamp = chrono::Utc::now().timestamp_millis();
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: decision_timestamp,
-            actor: "chisei.scoring".into(),
-            action: "scored".into(),
-            reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
-            evidence,
-            target_id: namespace.to_string(),
-            outcome: if regressed {
-                "regressed".into()
-            } else {
-                "stable".into()
-            },
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: decision_timestamp,
+                actor: "chisei.scoring".into(),
+                action: "scored".into(),
+                reason: format!("scored {total} sampled observation(s) for namespace {namespace}"),
+                evidence,
+                target_id: namespace.to_string(),
+                outcome: if regressed {
+                    "regressed".into()
+                } else {
+                    "stable".into()
+                },
+            });
         for (task_class, delta) in &class_deltas {
             let regressed = *delta < -TASK_CLASS_REGRESSION_THRESHOLD;
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            let _ = self.db.runtime().record_decision(&crate::sekai::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: decision_timestamp,
                 actor: "chisei.scoring".into(),
@@ -649,7 +659,7 @@ impl ScoringJob {
             });
         }
         for (task_class, delta) in class_regressions {
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            let _ = self.db.runtime().record_decision(&crate::sekai::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: decision_timestamp,
                 actor: "chisei.scoring".into(),
@@ -674,9 +684,11 @@ impl ScoringJob {
         // failure must not drop the scored run.
         let _ = self
             .db
+            .runtime()
             .prune_eval_runs_for_suite(&suite_id, SAMPLING_RETENTION);
         let _ = self
             .db
+            .runtime()
             .prune_eval_iterations_for_suite(&suite_id, SAMPLING_RETENTION);
         self.eval
             .retain_recent_runs(&suite_id, SAMPLING_RETENTION as usize);
@@ -944,15 +956,16 @@ fn task_class_breakdown_json(group: &[&SampleObservation], results: &[eval::Case
 }
 
 fn scored_decisions(db: &ChiseiStore, namespace: &str) -> Vec<crate::sekai::audit::Decision> {
-    db.list_decisions(&DecisionFilter {
-        actor: Some("chisei.scoring".to_string()),
-        action: Some("scored".to_string()),
-        target_id: Some(namespace.to_string()),
-        after: chrono::Utc::now().timestamp_millis() - TASK_CLASS_SIGNAL_LOOKBACK_MS,
-        limit: TASK_CLASS_SIGNAL_SCAN_LIMIT,
-        ..Default::default()
-    })
-    .unwrap_or_default()
+    db.runtime()
+        .list_decisions(&DecisionFilter {
+            actor: Some("chisei.scoring".to_string()),
+            action: Some("scored".to_string()),
+            target_id: Some(namespace.to_string()),
+            after: chrono::Utc::now().timestamp_millis() - TASK_CLASS_SIGNAL_LOOKBACK_MS,
+            limit: TASK_CLASS_SIGNAL_SCAN_LIMIT,
+            ..Default::default()
+        })
+        .unwrap_or_default()
 }
 
 fn task_class_deltas(
@@ -999,6 +1012,7 @@ pub fn task_class_regression_signal(
         return None;
     }
     let decision = db
+        .runtime()
         .list_decisions(&DecisionFilter {
             actor: Some("chisei.scoring".to_string()),
             action: Some("task_class_signal".to_string()),
@@ -1259,22 +1273,23 @@ mod tests {
         ts: i64,
         output: &str,
     ) {
-        db.put_sample_observation(&SampleObservation {
-            request_id: request_id.into(),
-            namespace: namespace.into(),
-            spec: "do the thing".into(),
-            resolved_model: "claude-opus-4-8".into(),
-            output_content: output.into(),
-            sample_reason: "base".into(),
-            input_tokens: 10,
-            output_tokens: 20,
-            stop_reason: "end_turn".into(),
-            timestamp: ts,
-            scored: false,
-            task_class: task_class.into(),
-            cost_usd_micros: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .put_sample_observation(&SampleObservation {
+                request_id: request_id.into(),
+                namespace: namespace.into(),
+                spec: "do the thing".into(),
+                resolved_model: "claude-opus-4-8".into(),
+                output_content: output.into(),
+                sample_reason: "base".into(),
+                input_tokens: 10,
+                output_tokens: 20,
+                stop_reason: "end_turn".into(),
+                timestamp: ts,
+                scored: false,
+                task_class: task_class.into(),
+                cost_usd_micros: 0,
+            })
+            .unwrap();
     }
 
     /// Seed `count` observations for a namespace with distinct ids/timestamps from `base`.
@@ -1326,13 +1341,18 @@ mod tests {
         assert_eq!(scored, MIN_OBS_FOR_REGRESSION);
 
         // One run holding every case result is persisted under the synthetic namespace suite.
-        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        let runs = db.runtime().list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].results.len(), MIN_OBS_FOR_REGRESSION);
         assert!(runs[0].results.iter().all(|r| r.passed && r.score == 90));
 
         // Observations are consumed.
-        assert!(db.list_unscored_observations(16).unwrap().is_empty());
+        assert!(
+            db.runtime()
+                .list_unscored_observations(16)
+                .unwrap()
+                .is_empty()
+        );
 
         // An iteration exists and the namespace now has a (stable) regression signal.
         let signal = eval.namespace_regression_signal("acme").unwrap();
@@ -1342,22 +1362,23 @@ mod tests {
     #[tokio::test]
     async fn scored_metered_observation_updates_model_frontier() {
         let (db, eval) = setup();
-        db.put_sample_observation(&SampleObservation {
-            request_id: "metered".into(),
-            namespace: "acme".into(),
-            spec: "do the thing".into(),
-            resolved_model: "model-a".into(),
-            output_content: "done".into(),
-            sample_reason: "base".into(),
-            input_tokens: 10,
-            output_tokens: 20,
-            stop_reason: "end_turn".into(),
-            timestamp: 100,
-            scored: false,
-            task_class: "primary".into(),
-            cost_usd_micros: 42,
-        })
-        .unwrap();
+        db.runtime()
+            .put_sample_observation(&SampleObservation {
+                request_id: "metered".into(),
+                namespace: "acme".into(),
+                spec: "do the thing".into(),
+                resolved_model: "model-a".into(),
+                output_content: "done".into(),
+                sample_reason: "base".into(),
+                input_tokens: 10,
+                output_tokens: 20,
+                stop_reason: "end_turn".into(),
+                timestamp: 100,
+                scored: false,
+                task_class: "primary".into(),
+                cost_usd_micros: 42,
+            })
+            .unwrap();
         let job = ScoringJob::with_judge(
             db.clone(),
             eval,
@@ -1429,6 +1450,7 @@ mod tests {
         assert!(class_signal.regressed);
         assert_eq!(class_signal.delta, -85.0);
         let notifications = db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("cheap_tier_regressed".into()),
                 ..Default::default()
@@ -1457,17 +1479,18 @@ mod tests {
             "an under-sampled batch must not clear a statistically meaningful regression"
         );
         for index in 0..25 {
-            db.record_decision(&crate::sekai::audit::Decision {
-                id: format!("unrelated-{index}"),
-                timestamp: 1_000 + index,
-                actor: "chisei.scoring".into(),
-                action: "scored".into(),
-                reason: String::new(),
-                evidence: std::collections::HashMap::new(),
-                target_id: "acme".into(),
-                outcome: "stable".into(),
-            })
-            .unwrap();
+            db.runtime()
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: format!("unrelated-{index}"),
+                    timestamp: 1_000 + index,
+                    actor: "chisei.scoring".into(),
+                    action: "scored".into(),
+                    reason: String::new(),
+                    evidence: std::collections::HashMap::new(),
+                    target_id: "acme".into(),
+                    outcome: "stable".into(),
+                })
+                .unwrap();
         }
         assert!(
             task_class_regression_signal(&db, "acme", "background")
@@ -1496,7 +1519,13 @@ mod tests {
 
         assert_eq!(job.run_once().await.unwrap(), MIN_OBS_FOR_REGRESSION - 1);
         // The run is recorded (data preserved)…
-        assert_eq!(db.list_eval_run_records("sampling-acme").unwrap().len(), 1);
+        assert_eq!(
+            db.runtime()
+                .list_eval_run_records("sampling-acme")
+                .unwrap()
+                .len(),
+            1
+        );
         // …but no iteration was created, so there is no regression signal to gate execution.
         assert!(eval.namespace_regression_signal("acme").is_none());
     }
@@ -1520,13 +1549,13 @@ mod tests {
         let scored = job.run_once().await.unwrap();
         assert_eq!(scored, 1);
 
-        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        let runs = db.runtime().list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].results.len(), 1);
         assert_eq!(runs[0].results[0].case_id, "req-ok");
 
         // The poisoned record remains queued for a later retry (no head-of-line block).
-        let remaining = db.list_unscored_observations(16).unwrap();
+        let remaining = db.runtime().list_unscored_observations(16).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].request_id, "req-bad");
     }
@@ -1550,10 +1579,10 @@ mod tests {
         .with_knowledge_writer(Arc::new(SelectiveKnowledgeWriter));
 
         assert_eq!(job.run_once().await.unwrap(), 2);
-        let remaining = db.list_unscored_observations(16).unwrap();
+        let remaining = db.runtime().list_unscored_observations(16).unwrap();
         assert!(remaining.is_empty());
 
-        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        let runs = db.runtime().list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].results.len(), 2);
         assert!(
@@ -1586,12 +1615,16 @@ mod tests {
         assert_eq!(job.run_once().await.unwrap(), 0);
         // No empty run (which would falsely regress), and the record is retained.
         assert!(
-            db.list_eval_run_records("sampling-acme")
+            db.runtime()
+                .list_eval_run_records("sampling-acme")
                 .unwrap()
                 .is_empty()
         );
         assert!(eval.namespace_regression_signal("acme").is_none());
-        assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
+        assert_eq!(
+            db.runtime().list_unscored_observations(16).unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1611,13 +1644,22 @@ mod tests {
         // occupying an (oldest-first) batch slot and starve healthy work.
         for _ in 0..(MAX_JUDGE_ATTEMPTS - 1) {
             assert_eq!(job.run_once().await.unwrap(), 0);
-            assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
+            assert_eq!(
+                db.runtime().list_unscored_observations(16).unwrap().len(),
+                1
+            );
         }
         assert_eq!(job.run_once().await.unwrap(), 0);
-        assert!(db.list_unscored_observations(16).unwrap().is_empty());
+        assert!(
+            db.runtime()
+                .list_unscored_observations(16)
+                .unwrap()
+                .is_empty()
+        );
 
         // Retirement is auditable.
         let retired = db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("judge_failed".into()),
                 ..Default::default()
@@ -1645,8 +1687,12 @@ mod tests {
         for _ in 0..(MAX_JUDGE_ATTEMPTS + 5) {
             assert_eq!(job.run_once().await.unwrap(), 0);
         }
-        assert_eq!(db.list_unscored_observations(16).unwrap().len(), 1);
+        assert_eq!(
+            db.runtime().list_unscored_observations(16).unwrap().len(),
+            1
+        );
         let retired = db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("judge_failed".into()),
                 ..Default::default()
@@ -1687,8 +1733,16 @@ mod tests {
         }
 
         let suite = "sampling-acme";
-        assert!(db.list_eval_run_records(suite).unwrap().len() as i64 <= SAMPLING_RETENTION);
-        assert!(db.list_eval_iteration_records(suite).unwrap().len() as i64 <= SAMPLING_RETENTION);
+        assert!(
+            db.runtime().list_eval_run_records(suite).unwrap().len() as i64 <= SAMPLING_RETENTION
+        );
+        assert!(
+            db.runtime()
+                .list_eval_iteration_records(suite)
+                .unwrap()
+                .len() as i64
+                <= SAMPLING_RETENTION
+        );
         assert!(eval.list_runs(suite).len() as i64 <= SAMPLING_RETENTION);
         assert!(eval.list_iterations(suite).len() as i64 <= SAMPLING_RETENTION);
 
@@ -1768,13 +1822,14 @@ mod tests {
 
         // Both classes score into the single per-namespace suite/run (topology is unaffected by
         // task_class)...
-        let runs = db.list_eval_run_records("sampling-acme").unwrap();
+        let runs = db.runtime().list_eval_run_records("sampling-acme").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].results.len(), MIN_OBS_FOR_REGRESSION * 2);
         assert!(!eval.namespace_regression_signal("acme").unwrap().regressed);
 
         // ...but the audit decision still carries a per-task-class breakdown.
         let decisions = db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("scored".into()),
                 ..Default::default()

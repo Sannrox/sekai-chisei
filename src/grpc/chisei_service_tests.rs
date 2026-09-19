@@ -145,6 +145,7 @@ async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(
         svc.db
+            .runtime()
             .list_decisions(&Default::default())
             .unwrap()
             .is_empty()
@@ -588,7 +589,10 @@ async fn resolve_policy_rejects_unknown_explicit_provider_without_policy() {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+    let svc = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(":memory:"),
+    );
     let request = resolve_policy_request("unscoped", "bogus", "bogus/model");
 
     let error = svc.resolve_policy(Request::new(request)).await.unwrap_err();
@@ -663,7 +667,10 @@ async fn live_model_resolution_rejects_unknown_explicit_provider() {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+    let svc = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(":memory:"),
+    );
 
     let error = svc
         .resolve_live_model(
@@ -685,7 +692,10 @@ async fn resolve_policy_normalizes_loaded_legacy_native_runtime() {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let svc = ChiseiServiceImpl::new(db, config(":memory:"));
+    let svc = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(":memory:"),
+    );
     svc.policy.set_namespace_policy(
         "private",
         crate::chisei::policy::Policy {
@@ -729,7 +739,7 @@ async fn resolve_policy_routes_bulk_task_class_to_cheaper_model() {
     let mut cfg = config(":memory:");
     // Treat openai as available without a key so routing can resolve.
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -777,7 +787,7 @@ async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -801,6 +811,7 @@ async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
     let now = chrono::Utc::now().timestamp_millis();
     for (task_class, delta, regressed) in [("background", -80.0, true), ("bulk", 0.0, false)] {
         svc.db
+            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{task_class}"),
                 timestamp: now,
@@ -860,7 +871,7 @@ async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "project-scope",
         crate::chisei::policy::Policy {
@@ -874,6 +885,7 @@ async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
     let now = chrono::Utc::now().timestamp_millis();
     for (scope, delta, regressed) in [("project-scope", 0.0, false), ("request-ns", -80.0, true)] {
         svc.db
+            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{scope}"),
                 timestamp: now,
@@ -917,7 +929,7 @@ async fn resolve_policy_respects_a_promoted_capable_override() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "proj",
         crate::chisei::policy::Policy {
@@ -989,7 +1001,7 @@ async fn resolve_policy_records_no_bias_when_no_cheaper_model_exists() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     // Only one allowed model, so the cheap tier resolves to the same model.
     svc.policy.set_namespace_policy(
         "proj",
@@ -1022,7 +1034,7 @@ async fn resolve_policy_records_no_bias_for_equal_cost_models() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     // Both allowed models are the same cost tier ("mini"), so the cheap
     // alias finds nothing strictly cheaper than the capable default.
     svc.policy.set_namespace_policy(
@@ -1229,7 +1241,10 @@ fn memory_service() -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    ChiseiServiceImpl::new(db, config(":memory:"))
+    ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(":memory:"),
+    )
 }
 
 fn gunshi_planning_service() -> ChiseiServiceImpl {
@@ -1238,7 +1253,10 @@ fn gunshi_planning_service() -> ChiseiServiceImpl {
     )));
     let mut config = config(":memory:");
     config.gateway_provided_providers = vec!["openai".into()];
-    ChiseiServiceImpl::new(db, config)
+    ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config,
+    )
 }
 
 fn issue_native_gunshi_plan(
@@ -1373,6 +1391,7 @@ async fn issued_gunshi_allocation_feeds_native_planning_before_kioku_enrichment(
 
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -1586,7 +1605,10 @@ fn managed_execution_service() -> ChiseiServiceImpl {
     )));
     let mut managed_config = config(":memory:");
     managed_config.openai_api_key = Some("synthetic-server-side-key".into());
-    let service = ChiseiServiceImpl::new(db, managed_config);
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        managed_config,
+    );
     service.policy.set_namespace_policy(
         "managed-conformance",
         crate::chisei::policy::Policy {
@@ -1689,6 +1711,7 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
     ] {
         let receipts_before = service
             .db
+            .runtime()
             .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100)
             .unwrap()
             .len();
@@ -1701,6 +1724,7 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
         assert_eq!(
             service
                 .db
+                .runtime()
                 .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100,)
                 .unwrap()
                 .len(),
@@ -1822,7 +1846,10 @@ fn managed_ollama_execution_service(provider_url: String) -> ChiseiServiceImpl {
     )));
     let mut managed_config = config(":memory:");
     managed_config.ollama_url = provider_url;
-    let service = ChiseiServiceImpl::new(db, managed_config);
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        managed_config,
+    );
     service.policy.set_namespace_policy(
         "managed-conformance",
         crate::chisei::policy::Policy {
@@ -1899,6 +1926,7 @@ async fn managed_stream_preserves_tool_calls_usage_and_receipt_without_route_ove
 
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("operation receipt");
@@ -2004,6 +2032,7 @@ async fn managed_unary_execution_accepts_machine_context_and_normalizes_receipt(
 
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("completed unary receipt");
@@ -2090,6 +2119,7 @@ async fn managed_provider_failure_records_failed_receipt_without_route_switch() 
 
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed operation receipt");
@@ -2150,6 +2180,7 @@ async fn managed_stream_read_failure_records_failed_receipt_without_route_switch
 
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed stream receipt");
@@ -2198,6 +2229,7 @@ async fn managed_explicit_retry_creates_distinct_correlated_attempts() {
             .unwrap();
         let receipt = service
             .db
+            .runtime()
             .get_operation_receipt(&plan.plan_id)
             .unwrap()
             .expect("planned retry receipt");
@@ -2260,7 +2292,11 @@ fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
             Arc::new(SchemaFixtureEvaluator { delay_ms }),
         )
         .unwrap();
-    ChiseiServiceImpl::new_with_evaluator_registry(db, config(":memory:"), registry)
+    ChiseiServiceImpl::new_with_evaluator_registry(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(":memory:"),
+        registry,
+    )
 }
 
 fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
@@ -2331,7 +2367,7 @@ fn install_invariant_with_contract(
     requirement_version_ids: Vec<String>,
 ) -> String {
     governed_fact_domain::apply_profile(
-        &svc.db,
+        svc.db.runtime(),
         namespace,
         governed_fact_domain::PROFILE_CONTRACT_VERSION,
         "root",
@@ -2339,7 +2375,7 @@ fn install_invariant_with_contract(
     )
     .unwrap();
     governed_fact_domain::put_fact(
-        &svc.db,
+        svc.db.runtime(),
         governed_fact_domain::GovernedFactInput {
             contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
             namespace: namespace.into(),
@@ -2379,7 +2415,7 @@ fn install_requirement_with_evidence(
     evidence_refs: Vec<String>,
 ) -> String {
     governed_fact_domain::apply_profile(
-        &svc.db,
+        svc.db.runtime(),
         namespace,
         governed_fact_domain::PROFILE_CONTRACT_VERSION,
         "root",
@@ -2387,7 +2423,7 @@ fn install_requirement_with_evidence(
     )
     .unwrap();
     governed_fact_domain::put_fact(
-        &svc.db,
+        svc.db.runtime(),
         governed_fact_domain::GovernedFactInput {
             contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
             namespace: namespace.into(),
@@ -2435,11 +2471,13 @@ fn project_evaluation_evidence(
     let target_id = format!("target:{}", target_external_id.replace(':', "-"));
     if svc
         .db
+        .runtime()
         .find_by_external_id(target_external_id)
         .unwrap()
         .is_none()
     {
         svc.db
+            .runtime()
             .create_object(&Object {
                 id: target_id,
                 kind: "document".into(),
@@ -2453,6 +2491,7 @@ fn project_evaluation_evidence(
             .unwrap();
     }
     svc.db
+        .runtime()
         .upsert_evidence_producer(
             &EvidenceProducerCapability {
                 producer_identity: producer_identity.clone(),
@@ -2477,6 +2516,7 @@ fn project_evaluation_evidence(
         )
         .unwrap();
     svc.db
+        .runtime()
         .register_evidence_schema(
             &EvidenceSchemaDefinition {
                 schema_id: "schema://evidence/schema-check/v1".into(),
@@ -2520,7 +2560,7 @@ fn project_evaluation_evidence(
         intent: EvidenceIntent::Upsert,
         causality: None,
     };
-    crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(&svc.db)
+    crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(svc.db.runtime())
         .admit(&envelope, &producer_identity, now)
         .unwrap()
         .projection
@@ -2713,6 +2753,7 @@ async fn evaluation_plan_rejects_evidence_outside_evaluator_classifications() {
     let svc = memory_service();
     let evidence_id = "evidence-confidential";
     svc.db
+        .runtime()
         .create_object(&Object {
             id: evidence_id.into(),
             kind: crate::domain::KIND_EXTERNAL_EVIDENCE.into(),
@@ -2853,6 +2894,7 @@ async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
         .plan
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "evaluation-namespace-acme".into(),
             kind: "namespace".into(),
@@ -2865,6 +2907,7 @@ async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_grant(&Grant {
             id: "alice-evaluation-acme".into(),
             object_id: "evaluation-namespace-acme".into(),
@@ -2875,6 +2918,7 @@ async fn evaluation_resource_reads_are_namespace_and_reference_authorized() {
         .unwrap();
 
     svc.db
+        .runtime()
         .create_grant(&Grant {
             id: "root-only-invariant".into(),
             object_id: invariant_id,
@@ -3104,6 +3148,7 @@ async fn deterministic_manifest_execution_is_receipt_authoritative_and_idempoten
     assert_eq!(tighter.code(), tonic::Code::FailedPrecondition);
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&first.operation_id)
         .unwrap()
         .unwrap();
@@ -3122,7 +3167,7 @@ async fn deterministic_manifest_execution_is_receipt_authoritative_and_idempoten
             && event.attributes.contains_key("evaluation_gate_decision")
     }));
     let quality = crate::quality_trend::query_quality_trends(
-        &svc.db,
+        svc.db.runtime(),
         "local",
         "acme",
         receipt.started_at_ms.saturating_sub(1),
@@ -3191,7 +3236,8 @@ async fn get_quality_trend_denies_hidden_namespaces_and_invalid_windows() {
 async fn get_quality_trend_matches_canonical_reducer_digest() {
     let svc = evaluation_execution_service(0);
     let canonical =
-        crate::quality_trend::query_quality_trends(&svc.db, "local", "acme", 0, 100).unwrap();
+        crate::quality_trend::query_quality_trends(svc.db.runtime(), "local", "acme", 0, 100)
+            .unwrap();
     let mut authorized = Request::new(GetQualityTrendRequest {
         namespace: "acme".into(),
         since_ms: 0,
@@ -3261,6 +3307,7 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
     let manifest = resolved_execution_fixture(&svc, "cancel-race-resolve").await;
     let manifest = svc
         .db
+        .runtime()
         .get_evaluation_manifest(&manifest.manifest_digest)
         .unwrap()
         .unwrap();
@@ -3270,6 +3317,7 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
         .unwrap();
     let stale_receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3283,6 +3331,7 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
 
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3298,7 +3347,7 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
         .unwrap();
     assert_eq!(cancellation.actor, "first-writer");
     let quality = crate::quality_trend::query_quality_trends(
-        &svc.db,
+        svc.db.runtime(),
         "local",
         "acme",
         receipt.started_at_ms.saturating_sub(1),
@@ -3368,6 +3417,7 @@ async fn cancellation_is_durable_and_reduces_fail_closed() {
     );
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&cancelled.operation_id)
         .unwrap()
         .unwrap();
@@ -3421,7 +3471,7 @@ async fn evaluation_resolution_fails_closed_for_uncovered_invariants() {
     assert_eq!(outcome.findings[0].invariant_version_id, uncovered_id);
 
     let waiver = governed_fact_domain::put_waiver(
-        &svc.db,
+        svc.db.runtime(),
         governed_fact_domain::GovernedWaiverInput {
             contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
             namespace: "acme".into(),
@@ -3750,7 +3800,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
         .plan
         .unwrap();
     let waiver = governed_fact_domain::put_waiver(
-        &svc.db,
+        svc.db.runtime(),
         governed_fact_domain::GovernedWaiverInput {
             contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
             namespace: "acme".into(),
@@ -3774,6 +3824,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
     )
     .unwrap();
     svc.db
+        .runtime()
         .create_grant(&Grant {
             id: "root-only-manifest-waiver".into(),
             object_id: waiver.object_id,
@@ -3783,6 +3834,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "evaluation-resolution-namespace-acme".into(),
             kind: "namespace".into(),
@@ -3795,6 +3847,7 @@ async fn evaluation_resolution_detects_hidden_applicable_waivers() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_grant(&Grant {
             id: "alice-evaluation-resolution-acme".into(),
             object_id: "evaluation-resolution-namespace-acme".into(),
@@ -3915,6 +3968,7 @@ async fn governed_subject_profiles_share_receipt_and_idempotency_contract() {
         );
         let receipt = svc
             .db
+            .runtime()
             .get_operation_receipt(&first.operation_id)
             .unwrap()
             .unwrap();
@@ -4151,6 +4205,7 @@ async fn governed_subject_provenance_is_tenkai_compatible_and_replay_safe() {
         .unwrap();
 
     svc.db
+        .runtime()
         .ensure_team_namespace("team-a", "alice", Role::Editor, "root")
         .unwrap();
     let mut delegated = governed_subject_provenance_request("publish-delegated", &result);
@@ -4358,6 +4413,7 @@ fn external_action_request(
 async fn external_action_authorization_allows_and_replays_idempotently() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
             "agent:local",
         ))
@@ -4394,7 +4450,7 @@ async fn external_action_authorization_denies_by_policy_and_expiry() {
         "external_action/repository.write/v1".into(),
         ActionDecision::Deny,
     );
-    svc.db.upsert_action_policy(&policy).unwrap();
+    svc.db.runtime().upsert_action_policy(&policy).unwrap();
     let denied = svc
         .authorize_external_action(external_action_request("local", "idem-deny"))
         .await
@@ -4405,6 +4461,7 @@ async fn external_action_authorization_denies_by_policy_and_expiry() {
     assert_eq!(denied.decision, "deny");
 
     svc.db
+        .runtime()
         .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
             "agent:local",
         ))
@@ -4461,6 +4518,7 @@ async fn external_action_authorization_denies_when_action_policy_is_missing() {
 async fn external_action_permit_replay_re_evaluates_current_policy() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
             "agent:local",
         ))
@@ -4475,7 +4533,7 @@ async fn external_action_permit_replay_re_evaluates_current_policy() {
 
     let mut deny = crate::sekai::action_policy::ActionPolicy::allow_all("agent:local");
     deny.default_decision = ActionDecision::Deny;
-    svc.db.upsert_action_policy(&deny).unwrap();
+    svc.db.runtime().upsert_action_policy(&deny).unwrap();
     let replay = svc
         .authorize_external_action(external_action_request("local", "idem-replay-policy"))
         .await
@@ -4518,6 +4576,7 @@ fn available_models_request(
 async fn available_models_are_authenticated_namespace_scoped_and_filterable() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
         .unwrap();
 
@@ -4551,6 +4610,7 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
 
     let svc = memory_service();
     svc.db
+        .runtime()
         .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
         .unwrap();
     svc.policy.set_namespace_policy(
@@ -4564,12 +4624,15 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
+        .runtime()
         .budget_set_limit("global", METRIC_REQUESTS, 100, "daily")
         .unwrap();
     svc.db
+        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 1_000, "weekly")
         .unwrap();
     svc.db
+        .runtime()
         .budget_adjust_chain("project:acme", METRIC_TOKENS, 37, 1)
         .unwrap();
     let mut action_policy = ActionPolicy::allow_all("project:acme");
@@ -4579,7 +4642,10 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
     action_policy
         .risk_overrides
         .insert(RiskClass::Destructive, ActionDecision::Deny);
-    svc.db.upsert_action_policy(&action_policy).unwrap();
+    svc.db
+        .runtime()
+        .upsert_action_policy(&action_policy)
+        .unwrap();
     let denied = svc
         .get_effective_policy_summary(effective_summary_request("acme", "mallory"))
         .await
@@ -4615,6 +4681,7 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
+        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 2_000, "weekly")
         .unwrap();
     let changed = svc
@@ -4640,6 +4707,7 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
 async fn effective_policy_summary_reports_unconfigured_sections() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .ensure_team_namespace("empty", "alice", Role::Viewer, "local")
         .unwrap();
     let summary = svc
@@ -4658,7 +4726,10 @@ async fn effective_policy_summary_reports_unconfigured_sections() {
 
 fn file_service(path: &str) -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
-    ChiseiServiceImpl::new(db, config(path))
+    ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config(path),
+    )
 }
 
 fn resolve_policy_request(
@@ -4818,6 +4889,7 @@ fn run_test_gateway_pipeline(
 async fn gunshi_scorecards_require_namespace_membership() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .ensure_team_namespace(
             "acme",
             "alice",
@@ -4854,8 +4926,9 @@ async fn gunshi_scorecards_require_namespace_membership() {
     )
     .unwrap();
     assert_eq!(scorecard.comparisons, 0);
-    assert!(require_namespace_write_access(&svc.db, "alice", "acme").is_err());
+    assert!(require_namespace_write_access(svc.db.runtime(), "alice", "acme").is_err());
     svc.db
+        .runtime()
         .ensure_team_namespace(
             "acme",
             "alice",
@@ -4863,7 +4936,7 @@ async fn gunshi_scorecards_require_namespace_membership() {
             "local",
         )
         .unwrap();
-    require_namespace_write_access(&svc.db, "alice", "acme").unwrap();
+    require_namespace_write_access(svc.db.runtime(), "alice", "acme").unwrap();
 }
 
 #[tokio::test]
@@ -4900,6 +4973,7 @@ async fn configuration_mutations_require_control_plane_administration() {
 fn team_execution_uses_authenticated_namespace_and_budget_scope() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "existing-namespace-acme".into(),
             kind: "namespace".into(),
@@ -4912,6 +4986,7 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_grant(&crate::sekai::security::Grant {
             id: "alice-acme".into(),
             object_id: "existing-namespace-acme".into(),
@@ -4921,23 +4996,28 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
         })
         .unwrap();
 
-    require_namespace_access(&svc.db, "alice", "acme").unwrap();
+    require_namespace_access(svc.db.runtime(), "alice", "acme").unwrap();
     assert_eq!(
-        require_namespace_access(&svc.db, "alice", " acme ")
+        require_namespace_access(svc.db.runtime(), "alice", " acme ")
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument
     );
     assert_eq!(
-        require_namespace_access(&svc.db, "mallory", "acme")
+        require_namespace_access(svc.db.runtime(), "mallory", "acme")
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
     );
-    require_execution_namespace_access(&svc.db, &svc.config, "chisei-gateway", "unmanaged")
-        .unwrap();
+    require_execution_namespace_access(
+        svc.db.runtime(),
+        &svc.config,
+        "chisei-gateway",
+        "unmanaged",
+    )
+    .unwrap();
     assert_eq!(
-        require_execution_namespace_access(&svc.db, &svc.config, "alice", "unmanaged")
+        require_execution_namespace_access(svc.db.runtime(), &svc.config, "alice", "unmanaged")
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
@@ -4973,6 +5053,7 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
 async fn team_policy_resolution_requires_namespace_membership() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .ensure_team_namespace(
             "acme",
             "alice",
@@ -5045,6 +5126,7 @@ async fn team_principals_cannot_mutate_usage_accounting() {
 async fn cached_plan_execution_rechecks_namespace_membership() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "namespace-revocation".into(),
             kind: "namespace".into(),
@@ -5057,6 +5139,7 @@ async fn cached_plan_execution_rechecks_namespace_membership() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_grant(&crate::sekai::security::Grant {
             id: "revocation-alice".into(),
             object_id: "namespace-revocation".into(),
@@ -5088,7 +5171,7 @@ async fn cached_plan_execution_rechecks_namespace_membership() {
         .into_inner()
         .plan
         .unwrap();
-    svc.db.delete_grant("revocation-alice").unwrap();
+    svc.db.runtime().delete_grant("revocation-alice").unwrap();
 
     let mut execution = Request::new(ExecutePlanRequest { plan: Some(plan) });
     execution
@@ -5128,6 +5211,7 @@ fn project_test_evidence_from_source(
     };
 
     svc.db
+        .runtime()
         .upsert_evidence_producer(
             &EvidenceProducerCapability {
                 producer_identity: producer_identity.into(),
@@ -5152,6 +5236,7 @@ fn project_test_evidence_from_source(
         )
         .unwrap();
     svc.db
+        .runtime()
         .register_evidence_schema(
             &EvidenceSchemaDefinition {
                 schema_id: "verification.result".into(),
@@ -5195,7 +5280,7 @@ fn project_test_evidence_from_source(
         intent: EvidenceIntent::Upsert,
         causality: None,
     };
-    crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(&svc.db)
+    crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(svc.db.runtime())
         .admit(&envelope, producer_identity, now)
         .unwrap()
         .submission
@@ -5206,6 +5291,7 @@ fn project_test_evidence_from_source(
 async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "ticker-aapl".into(),
             kind: "ticker".into(),
@@ -5224,6 +5310,7 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "analysis-aapl".into(),
             kind: "analysis".into(),
@@ -5242,6 +5329,7 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_link(&crate::domain::Link {
             id: "analysis-touches-aapl".into(),
             from_id: "analysis-aapl".into(),
@@ -5344,6 +5432,7 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
 
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.context_expansion".into()),
             ..Default::default()
@@ -5357,6 +5446,7 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
     }));
     let evidence_decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.evidence_context_admission".into()),
             ..Default::default()
@@ -5439,6 +5529,7 @@ fn evidence_context_keys_do_not_alias_delimited_source_classes() {
 async fn native_harness_evidence_requires_its_own_baseline_comparison() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "ticker-aapl".into(),
             kind: "ticker".into(),
@@ -5685,7 +5776,10 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
 
     svc.record_usage(Request::new(usage.clone())).await.unwrap();
     assert_eq!(
-        svc.db.get_operation_receipt(operation_id).unwrap(),
+        svc.db
+            .runtime()
+            .get_operation_receipt(operation_id)
+            .unwrap(),
         Some(receipt)
     );
 
@@ -5997,6 +6091,7 @@ async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
 
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.portfolio_route_shift".into()),
             ..Default::default()
@@ -6086,8 +6181,8 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
         let mut cfg = config(&path);
         cfg.gateway_provided_providers = vec!["openai".into()];
         let svc = ChiseiServiceImpl::new(
-            Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-                SekaiDb::new(&path).unwrap(),
+            crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+                std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
             ))),
             cfg,
         );
@@ -6103,6 +6198,7 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
         .await
         .unwrap();
         svc.db
+            .runtime()
             .create_object(&crate::domain::Object {
                 id: "legacy-ns-policy-team-a".into(),
                 kind: "namespace_policy".into(),
@@ -6143,8 +6239,8 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
     let mut cfg = config(&path);
     cfg.gateway_provided_providers = vec!["openai".into()];
     let svc = ChiseiServiceImpl::new(
-        Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(&path).unwrap(),
+        crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+            std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
         ))),
         cfg,
     );
@@ -6202,6 +6298,7 @@ async fn internal_eval_run_tracking_is_visible_to_gateway_reads() {
 async fn restored_read_contracts_return_bounded_projections() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .put_sample_observation(&crate::chisei::scoring::SampleObservation {
             request_id: "observation-1".into(),
             namespace: "context-a".into(),
@@ -6414,6 +6511,7 @@ async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
     let svc = memory_service();
     lookup_first::seed_s1_fixture_graph(&svc.db).unwrap();
     svc.db
+        .runtime()
         .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
         .unwrap();
 
@@ -6458,6 +6556,7 @@ async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
     assert!(!report.audit_decision_id.is_empty());
     let decision = svc
         .db
+        .runtime()
         .get_decision(&report.audit_decision_id)
         .unwrap()
         .unwrap();
@@ -6741,6 +6840,7 @@ async fn sqlite_reload_restores_iterations_and_regression_gate() {
     );
     let denied_receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -6819,6 +6919,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
     let mut svc = memory_service();
     svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
     svc.db
+        .runtime()
         .ensure_team_namespace(
             "acme",
             "alice",
@@ -6827,6 +6928,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
         )
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "delegated-context".into(),
             kind: "asset".into(),
@@ -6845,6 +6947,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_grant(&crate::sekai::security::Grant {
             id: "delegated-context-alice".into(),
             object_id: "delegated-context".into(),
@@ -6854,17 +6957,31 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
         })
         .unwrap();
     assert_eq!(
-        execution_context_actor(&svc.db, &svc.config, "Gateway-Prod", Some("alice"), "acme",)
-            .unwrap_err()
-            .code(),
+        execution_context_actor(
+            svc.db.runtime(),
+            &svc.config,
+            "Gateway-Prod",
+            Some("alice"),
+            "acme",
+        )
+        .unwrap_err()
+        .code(),
         tonic::Code::PermissionDenied
     );
     assert_eq!(
-        execution_context_actor(&svc.db, &svc.config, "local", Some("alice"), "acme",).unwrap(),
+        execution_context_actor(
+            svc.db.runtime(),
+            &svc.config,
+            "local",
+            Some("alice"),
+            "acme",
+        )
+        .unwrap(),
         "alice"
     );
     assert_eq!(
-        execution_context_actor(&svc.db, &svc.config, "root", Some("alice"), "acme",).unwrap(),
+        execution_context_actor(svc.db.runtime(), &svc.config, "root", Some("alice"), "acme",)
+            .unwrap(),
         "alice"
     );
     let response = svc
@@ -6952,6 +7069,7 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     svc.record_planned_operation(&plan, "agent:test").unwrap();
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -7024,6 +7142,7 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     assert_eq!(memory.disclosed_fields, ["claim"]);
     assert!(
         svc.db
+            .runtime()
             .list_kioku_lifecycle_events("memory-7", 3)
             .unwrap()
             .is_empty(),
@@ -7053,6 +7172,7 @@ fn execution_memory_injection_revalidates_cached_versions() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(
         svc.db
+            .runtime()
             .list_kioku_lifecycle_events("purged-memory", 4)
             .unwrap()
             .is_empty()
@@ -7219,6 +7339,7 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
     // A matching audit decision was recorded.
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("sample".into()),
             ..Default::default()
@@ -7236,6 +7357,7 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
 async fn plan_execution_exposes_and_audits_egress_decisions() {
     let svc = memory_service();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -7297,6 +7419,7 @@ async fn plan_execution_exposes_and_audits_egress_decisions() {
 
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -7332,6 +7455,7 @@ fn egress_audit_serializes_epistemic_descriptor_fields() {
 
     let decision = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -7526,6 +7650,7 @@ async fn sensitive_template_only_skips_context_enrichment() {
         },
     );
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -7590,6 +7715,7 @@ async fn template_only_plan_blocks_known_entity_leak() {
         },
     );
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "asset-secret".into(),
             kind: "asset".into(),
@@ -7602,6 +7728,7 @@ async fn template_only_plan_blocks_known_entity_leak() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&Object {
             id: "leak-rule-secretco".into(),
             kind: "leak_rule".into(),
@@ -7665,6 +7792,7 @@ async fn template_only_plan_blocks_known_entity_leak() {
     }));
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.privacy".into()),
             action: Some("leak_check".into()),
@@ -7734,6 +7862,7 @@ async fn execute_plan_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected execution receipt");
@@ -7798,6 +7927,7 @@ async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected streamed execution receipt");
@@ -8039,6 +8169,7 @@ async fn sqlite_reload_backfills_legacy_iteration_context_gates() {
     );
 
     svc.db
+        .runtime()
         .conn()
         .execute("UPDATE chisei_eval_iterations SET namespace = ''", [])
         .unwrap();
@@ -8352,7 +8483,7 @@ async fn decide_gateway_execution_admits_and_denies_closed() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -8567,7 +8698,7 @@ fn openai_team_a_service() -> ChiseiServiceImpl {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -8721,7 +8852,7 @@ async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
     )));
     let mut cfg = config(":memory:");
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(db, cfg);
+    let svc = ChiseiServiceImpl::new(crate::db::store::ChiseiStore::from_shared_runtime(db), cfg);
     svc.policy.set_namespace_policy(
         "team-a",
         crate::chisei::policy::Policy {
@@ -8963,6 +9094,7 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt("lookup-hit-plan")
         .unwrap()
         .unwrap();
@@ -9047,7 +9179,10 @@ async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path(
     // Only evaluate the decision path here — full model execute needs a live
     // provider. The fail-closed refusal is unit-tested below via evaluate.
     let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from(&db)).unwrap();
+    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from_shared_runtime(
+        std::sync::Arc::new(db.clone()),
+    ))
+    .unwrap();
     let input = ExecutionInput {
         request_id: "incomplete".into(),
         namespace: "acme".into(),
@@ -9083,8 +9218,10 @@ fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
     use crate::sekai::semantic;
 
     let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from(&db))
-        .expect("seed lookup fixtures");
+    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from_shared_runtime(
+        std::sync::Arc::new(db.clone()),
+    ))
+    .expect("seed lookup fixtures");
     for (capability, spec) in [
         (
             semantic::CAPABILITY_EXPAND_RELATIONS,

@@ -61,7 +61,7 @@ enum MutateOp {
 async fn propose(config: ProposeConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = learning_change::propose_change(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.actor,
         &ProposeLearningChange {
             namespace: config.namespace,
@@ -80,28 +80,28 @@ async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
     let now = Utc::now().timestamp_millis();
     let record = match op {
         MutateOp::Approve => learning_change::approve_change(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Activate => learning_change::activate_change(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Rollback => learning_change::rollback_change(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::LeaseLoss => learning_change::note_lease_loss(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.namespace,
             &config.learning_id,
@@ -116,7 +116,7 @@ async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
 async fn inspect(config: TargetConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let comparison = learning_change::inspect_change(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.namespace,
         &config.learning_id,
     )
@@ -128,7 +128,7 @@ async fn inspect(config: TargetConfig) -> Result<(), BoxErr> {
 async fn show(config: TargetConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = learning_change::get_change(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.namespace,
         &config.learning_id,
     )
@@ -139,9 +139,11 @@ async fn show(config: TargetConfig) -> Result<(), BoxErr> {
 
 async fn list_changes(namespace: Option<String>) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let records =
-        learning_change::list_changes(&ChiseiStore::from(db.as_ref()), namespace.as_deref())
-            .map_err(std::io::Error::other)?;
+    let records = learning_change::list_changes(
+        &ChiseiStore::from_shared_runtime(db.clone()),
+        namespace.as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }

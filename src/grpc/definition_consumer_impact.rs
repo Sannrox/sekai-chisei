@@ -14,7 +14,7 @@ impl SekaiServiceImpl {
         require_authenticated(&principals)?;
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let input = req.into_inner();
         authorize_source_sync_namespace(
             self,
@@ -49,7 +49,7 @@ impl SekaiServiceImpl {
             descending: false,
         };
         let (bindings, _) = list_objects_with_marking(
-            &self.db,
+            self.db.runtime(),
             &filter,
             &principals,
             &policy_context,
@@ -94,7 +94,7 @@ mod tests {
         let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
             SekaiDb::new(":memory:").unwrap(),
         )));
-        SekaiServiceImpl::new(db)
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
     }
 
     fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
@@ -109,6 +109,7 @@ mod tests {
         let svc = service();
         let (_, grants) = svc
             .db
+            .runtime()
             .ensure_team_namespace("sales", "alice", security::Role::Admin, "local")
             .unwrap();
         for grant in grants {
@@ -137,6 +138,7 @@ mod tests {
         )
         .unwrap();
         svc.db
+            .runtime()
             .seed_published_definition_revision(&revision, &[member])
             .unwrap();
         let report = svc

@@ -54,7 +54,7 @@ pub(super) async fn expand_relations(
     if namespace.is_empty() || namespace != req.get_ref().namespace {
         return Err(Status::invalid_argument("canonical namespace required"));
     }
-    check_team_namespace(&service.db, &principals, &namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let mut receipt_guard = service.begin_semantic_catalog_invocation(
         &req,
         semantic::CAPABILITY_EXPAND_RELATIONS,
@@ -150,7 +150,7 @@ pub(super) async fn explain_derivation(
     if namespace.is_empty() || namespace != req.get_ref().namespace {
         return Err(Status::invalid_argument("canonical namespace required"));
     }
-    check_team_namespace(&service.db, &principals, &namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let mut receipt_guard = service.begin_semantic_catalog_invocation(
         &req,
         semantic::CAPABILITY_EXPLAIN_DERIVATION,
@@ -335,7 +335,7 @@ pub(super) async fn get_governed_fact_version(
 ) -> Result<Response<GetGovernedFactVersionResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let object_id = req.into_inner().object_id;
     let object = governed_object_for_read(
         service,
@@ -355,15 +355,15 @@ pub(super) async fn resolve_invariant_set(
 ) -> Result<Response<ResolveInvariantSetResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &inner.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &inner.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &inner.namespace, false)?;
     let profile_object = governed_object_for_read(
         service,
         &principals,
@@ -473,6 +473,7 @@ pub(super) async fn list_ontology_classes(
     require_authenticated(&principals)?;
     let classes = service
         .db
+        .runtime()
         .list_ontology_classes()
         .map_err(Status::internal)?
         .iter()
@@ -498,6 +499,7 @@ pub(super) async fn get_ontology_class(
     )?;
     let class = service
         .db
+        .runtime()
         .get_ontology_class(&name)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("ontology class not found"))?;
@@ -543,6 +545,7 @@ pub(super) async fn list_ontology_relations(
     require_authenticated(&principals)?;
     let relations = service
         .db
+        .runtime()
         .list_ontology_relations()
         .map_err(Status::internal)?
         .iter()
@@ -570,6 +573,7 @@ pub(super) async fn get_ontology_relation(
     )?;
     let relation = service
         .db
+        .runtime()
         .get_ontology_relation(&name)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("ontology relation not found"))?;

@@ -65,7 +65,7 @@ enum MutateOp {
 async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = data_quality::publish_rule(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.actor,
         &config.request,
         Utc::now().timestamp_millis(),
@@ -78,7 +78,7 @@ async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
 async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = data_quality::evaluate_rule(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.actor,
         &config.namespace,
         &config.rule_id,
@@ -93,7 +93,7 @@ async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
 async fn show_rule(config: ShowConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
     let record = data_quality::show_rule(
-        &ChiseiStore::from(db.as_ref()),
+        &ChiseiStore::from_shared_runtime(db.clone()),
         &config.namespace,
         &config.rule_id,
     )
@@ -104,16 +104,22 @@ async fn show_rule(config: ShowConfig) -> Result<(), BoxErr> {
 
 async fn list_rules(namespace: Option<String>) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let records = data_quality::list_rules(&ChiseiStore::from(db.as_ref()), namespace.as_deref())
-        .map_err(std::io::Error::other)?;
+    let records = data_quality::list_rules(
+        &ChiseiStore::from_shared_runtime(db.clone()),
+        namespace.as_deref(),
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
 
 async fn show_result(config: ResultConfig) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let record = data_quality::show_result(&ChiseiStore::from(db.as_ref()), &config.result_id)
-        .map_err(std::io::Error::other)?;
+    let record = data_quality::show_result(
+        &ChiseiStore::from_shared_runtime(db.clone()),
+        &config.result_id,
+    )
+    .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
@@ -123,13 +129,13 @@ async fn mutate_result(config: ResultConfig, op: MutateOp) -> Result<(), BoxErr>
     let now = Utc::now().timestamp_millis();
     let record = match op {
         MutateOp::Cancel => data_quality::cancel_evaluation(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.result_id,
             now,
         ),
         MutateOp::Restart => data_quality::restart_evaluation(
-            &ChiseiStore::from(db.as_ref()),
+            &ChiseiStore::from_shared_runtime(db.clone()),
             &config.actor,
             &config.result_id,
             now,

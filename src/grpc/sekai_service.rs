@@ -152,7 +152,6 @@ pub struct SekaiServiceImpl {
     pub(super) db: crate::db::store::SekaiStore,
     pub(super) security: Arc<SecurityChecker>,
     pub(super) schema_definitions: SchemaDefinitionLifecycle,
-    pub(super) budget: Option<Arc<crate::chisei::budget::BudgetTracker>>,
     pub(super) gateway_schema_principals: Vec<String>,
     /// Region/site pin from `SEKAI_SITE_ID` (default `"local"`).
     pub(super) site_id: String,
@@ -165,27 +164,26 @@ pub struct SekaiServiceImpl {
 }
 
 impl SekaiServiceImpl {
-    pub fn new(db: impl Into<crate::db::store::SekaiStore>) -> Self {
+    pub fn new(db: crate::db::store::SekaiStore) -> Self {
         Self::new_with_gateway_schema_principals(db, Vec::new())
     }
 
     pub fn new_with_gateway_schema_principals(
-        db: impl Into<crate::db::store::SekaiStore>,
+        db: crate::db::store::SekaiStore,
         gateway_schema_principals: Vec<String>,
     ) -> Self {
-        let db = db.into();
         let security = Arc::new(SecurityChecker::new());
-        let grants = db.list_all_grants().unwrap_or_default();
+        let grants = db.runtime().list_all_grants().unwrap_or_default();
         security.load(&grants);
         let schema_definitions = SchemaDefinitionLifecycle::load(db.runtime_arc());
         let object_query_cursor_key = db
+            .runtime()
             .object_query_cursor_key()
             .expect("initialize durable object query cursor key");
         Self {
             db,
             security,
             schema_definitions,
-            budget: None,
             gateway_schema_principals,
             site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
             object_query_cursor_key,
@@ -204,27 +202,6 @@ impl SekaiServiceImpl {
     ) -> Self {
         self.cross_store = Some(clerk);
         self
-    }
-
-    /// Construct sharing a chisei budget tracker so governed actions can be
-    /// metered against action-class budgets.
-    pub fn with_budget(
-        db: impl Into<crate::db::store::SekaiStore>,
-        budget: Arc<crate::chisei::budget::BudgetTracker>,
-    ) -> Self {
-        let mut svc = Self::new(db);
-        svc.budget = Some(budget);
-        svc
-    }
-
-    pub fn with_budget_and_gateway_schema_principals(
-        db: impl Into<crate::db::store::SekaiStore>,
-        budget: Arc<crate::chisei::budget::BudgetTracker>,
-        gateway_schema_principals: Vec<String>,
-    ) -> Self {
-        let mut svc = Self::new_with_gateway_schema_principals(db, gateway_schema_principals);
-        svc.budget = Some(budget);
-        svc
     }
 
     pub fn with_site_id(mut self, site_id: impl Into<String>) -> Self {
@@ -282,7 +259,7 @@ impl SekaiServiceImpl {
             .any(|entry| entry.name == capability_name && capability_name == expected_capability);
         if !visible {
             CatalogInvocation::record_refusal(
-                &self.db,
+                self.db.runtime(),
                 &operation_id,
                 namespace,
                 &actor,
@@ -294,7 +271,7 @@ impl SekaiServiceImpl {
         }
 
         let invocation = CatalogInvocation::begin(
-            &self.db,
+            self.db.runtime(),
             operation_id.clone(),
             namespace,
             actor,

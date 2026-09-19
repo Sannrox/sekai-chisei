@@ -171,6 +171,7 @@ impl ChiseiServiceImpl {
                 .filter(|reference| reference.source_type == class_gate.source_type)
                 .count();
             self.db
+                .runtime()
                 .record_decision(&crate::sekai::audit::Decision {
                     id: uuid::Uuid::new_v4().to_string(),
                     timestamp: chrono::Utc::now().timestamp_millis(),
@@ -242,6 +243,7 @@ impl ChiseiServiceImpl {
         expanded_context_items: usize,
     ) -> Result<(), Status> {
         self.db
+            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: chrono::Utc::now().timestamp_millis(),

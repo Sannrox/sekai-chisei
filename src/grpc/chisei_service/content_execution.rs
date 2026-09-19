@@ -51,7 +51,7 @@ impl ChiseiServiceImpl {
                 Ok(messages) => messages,
                 Err(status) => {
                     record_failed_operation_on(
-                        &self.db,
+                        self.db.runtime(),
                         &execution,
                         actor,
                         "content_disclosure_denied",
@@ -65,7 +65,7 @@ impl ChiseiServiceImpl {
                 Ok(capabilities) => capabilities,
                 Err(status) => {
                     record_failed_operation_on(
-                        &self.db,
+                        self.db.runtime(),
                         &execution,
                         actor,
                         "content_capability_denied",
@@ -261,7 +261,7 @@ impl ChiseiServiceImpl {
             .clone()
             .ok_or_else(|| Status::data_loss("content execution input missing"))?;
         require_execution_namespace_access_with_context(
-            &self.db,
+            self.db.runtime(),
             &self.config,
             &actor,
             context.as_ref(),
@@ -276,7 +276,7 @@ impl ChiseiServiceImpl {
             .filter(|signal| signal.regressed)
         {
             record_failed_operation_on(
-                &self.db,
+                self.db.runtime(),
                 &execution,
                 &actor,
                 "evaluation_regressed_after_planning",
@@ -293,14 +293,19 @@ impl ChiseiServiceImpl {
             &execution.resolved_model,
             data_class.as_str(),
         ) {
-            record_failed_operation_on(&self.db, &execution, &actor, "residency_denied")
+            record_failed_operation_on(self.db.runtime(), &execution, &actor, "residency_denied")
                 .map_err(Status::internal)?;
             return Err(Status::permission_denied(error));
         }
         self.enforce_execution_provider_privacy(&execution, &input, &actor, &provider, data_class)?;
         if !has_content_disclosure_evidence(&execution, &plan.content_messages, &provider) {
-            record_failed_operation_on(&self.db, &execution, &actor, "egress_evidence_missing")
-                .map_err(Status::internal)?;
+            record_failed_operation_on(
+                self.db.runtime(),
+                &execution,
+                &actor,
+                "egress_evidence_missing",
+            )
+            .map_err(Status::internal)?;
             return Err(Status::failed_precondition(
                 "content execution plan missing disclosure evidence",
             ));
@@ -324,8 +329,13 @@ impl ChiseiServiceImpl {
                 &provider,
                 &leak_findings,
             );
-            record_failed_operation_on(&self.db, &execution, &actor, "content_leak_check_denied")
-                .map_err(Status::internal)?;
+            record_failed_operation_on(
+                self.db.runtime(),
+                &execution,
+                &actor,
+                "content_leak_check_denied",
+            )
+            .map_err(Status::internal)?;
             return Err(Status::permission_denied(
                 "privacy policy requires content redaction or blocking",
             ));
@@ -382,7 +392,7 @@ impl ChiseiServiceImpl {
         let provider_stream = match execute_native_content_request_stream(
             &self.config,
             self.budget.clone(),
-            self.db.as_ref(),
+            self.db.runtime(),
             context.as_ref(),
             provider_request,
         )
@@ -391,7 +401,7 @@ impl ChiseiServiceImpl {
             Ok(stream) => stream,
             Err(status) => {
                 record_failed_operation_on(
-                    &self.db,
+                    self.db.runtime(),
                     &execution,
                     &actor,
                     "content_stream_start_failed",
@@ -428,7 +438,7 @@ impl ChiseiServiceImpl {
                     Ok(chunk) => chunk,
                     Err(error) => {
                         if let Err(receipt_error) = record_failed_operation_on(
-                            &db,
+                            db.runtime(),
                             &receipt_plan,
                             &actor,
                             "content_stream_failed",
@@ -476,7 +486,7 @@ impl ChiseiServiceImpl {
                         cache_creation_input_tokens,
                     );
                     if let Err(error) = finish_content_execution(
-                        &db,
+                        db.runtime(),
                         &evolve_history,
                         &receipt_plan,
                         &actor,
@@ -531,7 +541,7 @@ impl ChiseiServiceImpl {
                     cache_creation_input_tokens,
                 );
                 if let Err(error) = finish_content_execution(
-                    &db,
+                    db.runtime(),
                     &evolve_history,
                     &receipt_plan,
                     &actor,

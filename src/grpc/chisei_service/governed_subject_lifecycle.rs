@@ -26,7 +26,7 @@ impl GovernedSubjectLifecycle {
         envelope: subject::GovernedSubjectEnvelope,
         now_ms: i64,
     ) -> Result<subject::GovernedSubjectResult, Status> {
-        require_namespace_write_access(&self.db, actor, &envelope.namespace)?;
+        require_namespace_write_access(self.db.runtime(), actor, &envelope.namespace)?;
         let fresh = subject::validate_envelope(&envelope, actor, now_ms)
             .map_err(Status::invalid_argument)?;
         if !matches!(actor, "root" | "local") {
@@ -38,6 +38,7 @@ impl GovernedSubjectLifecycle {
         let operation_id = subject::operation_id(&envelope.namespace, actor, &envelope.request_id);
         if let Some(existing) = self
             .db
+            .runtime()
             .get_operation_receipt(&operation_id)
             .map_err(Status::internal)?
         {
@@ -53,9 +54,10 @@ impl GovernedSubjectLifecycle {
             fresh,
             now_ms,
         );
-        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
+        if let Err(error) = self.db.runtime().insert_operation_receipt(&receipt) {
             if let Some(existing) = self
                 .db
+                .runtime()
                 .get_operation_receipt(&operation_id)
                 .map_err(Status::internal)?
             {
@@ -84,6 +86,7 @@ impl GovernedSubjectLifecycle {
             subject_provenance::binding_digest(&binding).map_err(Status::invalid_argument)?;
         if let Some(existing) = self
             .db
+            .runtime()
             .get_governed_subject_provenance_export(&binding.actor, &binding.export_id)
             .map_err(Status::internal)?
         {
@@ -92,7 +95,7 @@ impl GovernedSubjectLifecycle {
                     "export_id is already bound to different governed-subject evidence",
                 ));
             }
-            require_namespace_access(&self.db, &binding.actor, &existing.namespace)?;
+            require_namespace_access(self.db.runtime(), &binding.actor, &existing.namespace)?;
             validate_export_record(&existing, now_ms)?;
             return Ok(ProvenanceExportOutcome {
                 record: existing,
@@ -102,10 +105,11 @@ impl GovernedSubjectLifecycle {
 
         let receipt = self
             .db
+            .runtime()
             .get_operation_receipt(&binding.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
-        require_namespace_write_access(&self.db, &binding.actor, &receipt.namespace)?;
+        require_namespace_write_access(self.db.runtime(), &binding.actor, &receipt.namespace)?;
         let (namespace, content_digest) = reconcile_receipt(&receipt, &binding, now_ms)?;
         let key_hex = self
             .config
@@ -161,6 +165,7 @@ impl GovernedSubjectLifecycle {
         };
         let (stored, inserted) = self
             .db
+            .runtime()
             .put_governed_subject_provenance_export(&binding.actor, &binding.export_id, &record)
             .map_err(map_export_persistence_error)?;
         validate_export_record(&stored, now_ms)?;

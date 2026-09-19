@@ -30,9 +30,11 @@ fn with_principal<T>(payload: T, principal: &str) -> Request<T> {
 }
 
 fn service() -> SekaiServiceImpl {
-    SekaiServiceImpl::new(Arc::new(RuntimeDb::Sqlite(Arc::new(
-        SekaiDb::new(":memory:").unwrap(),
-    ))))
+    SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
+        Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        ))),
+    ))
 }
 
 #[test]
@@ -187,7 +189,7 @@ async fn grpc_allows_namespace_admin_and_rejects_editor() {
         .unwrap();
     db.ensure_team_namespace("ops", "bob", Role::Editor, "local")
         .unwrap();
-    let svc = SekaiServiceImpl::new(db);
+    let svc = SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(db));
     let pager = synthetic_pager_alert_v1();
     let registered = svc
         .register_source_type_descriptor(with_principal(

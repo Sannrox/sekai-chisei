@@ -111,7 +111,11 @@ pub fn load_effective_policy_view(
         .ok()
         .flatten()
         .or_else(|| db.get_action_policy(namespace).ok().flatten());
-    let gunshi = gunshi_auto::get_status(&ChiseiStore::from(db), namespace).unwrap_or(None);
+    let gunshi = gunshi_auto::get_status(
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
+        namespace,
+    )
+    .unwrap_or(None);
     let can_write = principal_can_write_namespace(db, principal, namespace).unwrap_or(false);
     Ok(EffectivePolicyView {
         namespace: namespace.into(),
@@ -238,7 +242,7 @@ pub fn console_promote(
     let candidate_evaluation: PolicyEvaluation = serde_json::from_str(candidate_eval_json)
         .map_err(|e| format!("invalid candidate evaluation JSON: {e}"))?;
     gunshi_auto::promote(
-        &ChiseiStore::from(db),
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
         PromoteRequest {
             actor: principal.into(),
             namespace: namespace.into(),
@@ -262,7 +266,7 @@ pub fn console_rollback(
         return Err("namespace write access denied".into());
     }
     gunshi_auto::rollback(
-        &ChiseiStore::from(db),
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
         principal,
         namespace,
         expected_revision,

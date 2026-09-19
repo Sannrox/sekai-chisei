@@ -193,6 +193,7 @@ pub fn propose_routing_bias_candidate(
     }
 
     let decisions = db
+        .runtime()
         .list_decisions(&DecisionFilter {
             actor: Some("chisei.scoring".to_string()),
             action: Some("scored".to_string()),
@@ -397,22 +398,23 @@ mod tests {
     }
 
     fn observe(db: &ChiseiStore, request_id: &str, namespace: &str, task_class: &str, ts: i64) {
-        db.put_sample_observation(&SampleObservation {
-            request_id: request_id.into(),
-            namespace: namespace.into(),
-            spec: "do the thing".into(),
-            resolved_model: "claude-opus-4-8".into(),
-            output_content: "here is the thing".into(),
-            sample_reason: "base".into(),
-            input_tokens: 10,
-            output_tokens: 20,
-            stop_reason: "end_turn".into(),
-            timestamp: ts,
-            scored: false,
-            task_class: task_class.into(),
-            cost_usd_micros: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .put_sample_observation(&SampleObservation {
+                request_id: request_id.into(),
+                namespace: namespace.into(),
+                spec: "do the thing".into(),
+                resolved_model: "claude-opus-4-8".into(),
+                output_content: "here is the thing".into(),
+                sample_reason: "base".into(),
+                input_tokens: 10,
+                output_tokens: 20,
+                stop_reason: "end_turn".into(),
+                timestamp: ts,
+                scored: false,
+                task_class: task_class.into(),
+                cost_usd_micros: 0,
+            })
+            .unwrap();
     }
 
     fn observe_batch(

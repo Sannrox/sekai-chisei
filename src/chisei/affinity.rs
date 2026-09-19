@@ -12,7 +12,8 @@ fn namespace_object(db: &ChiseiStore, namespace: &str) -> Option<crate::domain::
         return None;
     }
 
-    db.find_by_external_id(&format!("namespace:{namespace}"))
+    db.runtime()
+        .find_by_external_id(&format!("namespace:{namespace}"))
         .ok()
         .flatten()
 }
@@ -32,6 +33,7 @@ fn model_for_namespace(db: &ChiseiStore, namespace: &str) -> String {
         return String::new();
     };
     let comps = db
+        .runtime()
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     let mut best = String::new();
@@ -41,6 +43,7 @@ fn model_for_namespace(db: &ChiseiStore, namespace: &str) -> String {
             continue;
         }
         let models = db
+            .runtime()
             .get_linked_objects(&comp.id, REL_TOUCHES, &Direction::Incoming)
             .unwrap_or_default();
         for m in &models {
@@ -79,6 +82,7 @@ fn low_success_namespace(db: &ChiseiStore, namespace: &str) -> bool {
         return false;
     };
     let comps = db
+        .runtime()
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     comps.iter().any(|c| {
@@ -108,39 +112,42 @@ mod tests {
     #[test]
     fn test_low_success_namespace() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "r1".into(),
-            kind: "namespace".into(),
-            name: "namespace".into(),
-            namespace: "".into(),
-            external_id: "namespace:namespace".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "c1".into(),
-            kind: KIND_COMPONENT.into(),
-            name: "c".into(),
-            namespace: "".into(),
-            external_id: "".into(),
-            properties: HashMap::from([
-                ("task_total".into(), "5".into()),
-                ("success_rate".into(), "20".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "l1".into(),
-            from_id: "r1".into(),
-            to_id: "c1".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "r1".into(),
+                kind: "namespace".into(),
+                name: "namespace".into(),
+                namespace: "".into(),
+                external_id: "namespace:namespace".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "c1".into(),
+                kind: KIND_COMPONENT.into(),
+                name: "c".into(),
+                namespace: "".into(),
+                external_id: "".into(),
+                properties: HashMap::from([
+                    ("task_total".into(), "5".into()),
+                    ("success_rate".into(), "20".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "l1".into(),
+                from_id: "r1".into(),
+                to_id: "c1".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
         assert!(low_success_namespace(&db, "namespace"));
     }
 }

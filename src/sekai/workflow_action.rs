@@ -242,7 +242,9 @@ pub fn submit_step(
     if prepared.envelope.cursor != 0 {
         return Err(WORKFLOW_UNAVAILABLE.into());
     }
-    let budget = BudgetTracker::new(db.clone());
+    let budget = BudgetTracker::new(crate::db::store::ChiseiStore::from_shared_runtime(
+        std::sync::Arc::new(db.clone()),
+    ));
     let admitted = ActionInstanceAdmission::new(db, Some(&budget))
         .admit(
             ActionInstanceAdmissionRequest {

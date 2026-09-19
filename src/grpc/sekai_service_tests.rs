@@ -6,7 +6,7 @@ fn service() -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    SekaiServiceImpl::new(db)
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
 }
 
 struct TestEnterpriseExtension;
@@ -200,7 +200,7 @@ fn enterprise_service() -> SekaiServiceImpl {
         SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
             .unwrap(),
     )));
-    SekaiServiceImpl::new(db)
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
 }
 
 fn test_tenant_context() -> crate::enterprise::AuthenticatedContext {
@@ -230,6 +230,7 @@ fn with_tenant_context<T>(payload: T) -> Request<T> {
 
 fn seed_lineage_object(svc: &SekaiServiceImpl, id: &str, namespace: &str) {
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: id.into(),
             kind: "widget".into(),
@@ -303,6 +304,7 @@ async fn get_lineage_filters_nodes_outside_tenant_namespace() {
     seed_lineage_object(&svc, "lineage-root", "allowed");
     seed_lineage_object(&svc, "other-tenant-node", "denied");
     svc.db
+        .runtime()
         .create_link(&domain::Link {
             id: "lineage-edge".into(),
             from_id: "lineage-root".into(),
@@ -408,6 +410,7 @@ fn grant_source_namespace(
 ) {
     let (_, grants) = svc
         .db
+        .runtime()
         .ensure_team_namespace(namespace, principal, role, "local")
         .unwrap();
     for grant in grants {
@@ -440,7 +443,7 @@ fn seed_definition_parent(
         1,
     )
     .unwrap();
-    let RuntimeDb::Sqlite(db) = svc.db.as_ref() else {
+    let RuntimeDb::Sqlite(db) = svc.db.runtime() else {
         panic!("test service must use SQLite");
     };
     db.seed_published_definition_revision(&revision, &[member])
@@ -522,6 +525,7 @@ async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
         svc.db
+            .runtime()
             .get_definition_revision("definition-team", &parent.revision_digest)
             .unwrap()
             .unwrap(),
@@ -540,7 +544,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         role: security::Role::Viewer,
         created: 1,
     };
-    svc.db.create_grant(&read_grant).unwrap();
+    svc.db.runtime().create_grant(&read_grant).unwrap();
     svc.security.add_grant(&read_grant);
     svc.create_definition_branch(with_principal(CreateDefinitionBranchRequest {
         namespace: "definition-denial".into(),
@@ -577,7 +581,7 @@ async fn definition_branch_edit_rechecks_member_admin() {
         role: security::Role::Admin,
         created: 2,
     };
-    svc.db.create_grant(&object_admin_grant).unwrap();
+    svc.db.runtime().create_grant(&object_admin_grant).unwrap();
     svc.security.add_grant(&object_admin_grant);
     let error = svc
         .apply_definition_branch_edit(with_principal(ApplyDefinitionBranchEditRequest {
@@ -718,7 +722,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
         role: security::Role::Admin,
         created: 1,
     };
-    svc.db.create_grant(&ticket_admin).unwrap();
+    svc.db.runtime().create_grant(&ticket_admin).unwrap();
     svc.security.add_grant(&ticket_admin);
 
     let parent_member = definition_branch_domain::DefinitionMemberInput {
@@ -743,6 +747,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
     )
     .unwrap();
     svc.db
+        .runtime()
         .seed_published_definition_revision(&parent, &[parent_member])
         .unwrap();
     svc.create_definition_branch(with_named_principal(
@@ -814,6 +819,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
     .await
     .unwrap();
     svc.db
+        .runtime()
         .create_object(&crate::domain::Object {
             id: format!("{namespace}:open"),
             kind: "Ticket".into(),
@@ -988,7 +994,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             role: security::Role::Admin,
             created: 1,
         };
-        svc.db.create_grant(&grant).unwrap();
+        svc.db.runtime().create_grant(&grant).unwrap();
         svc.security.add_grant(&grant);
     }
     svc.create_definition_branch(with_named_principal(
@@ -1461,6 +1467,7 @@ async fn source_sync_rejects_anonymous_ambiguous_and_unauthorized_principals() {
     let viewer = "connector/github-viewer";
     let boundary_id = svc
         .db
+        .runtime()
         .find_namespace_boundary(namespace)
         .unwrap()
         .unwrap()
@@ -1987,7 +1994,7 @@ fn grant_schema_admin(svc: &SekaiServiceImpl) {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 }
 
@@ -1999,7 +2006,7 @@ fn grant_ontology_admin(svc: &SekaiServiceImpl) {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 }
 
@@ -2011,7 +2018,7 @@ fn grant_ontology_reader(svc: &SekaiServiceImpl, object_id: &str) {
         role: security::Role::Viewer,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 }
 
@@ -2036,7 +2043,7 @@ fn grant_action_admin(svc: &SekaiServiceImpl) {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 }
 
@@ -2053,13 +2060,14 @@ fn grant_object_role(
         role,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 }
 
 fn seed_scoring_namespace(svc: &SekaiServiceImpl, namespace: &str) -> String {
     let id = format!("namespace-{namespace}");
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: id.clone(),
             kind: "namespace".into(),
@@ -2090,6 +2098,7 @@ fn scored_knowledge_request(namespace: &str, request_id: &str) -> KnowledgeWrite
 async fn get_object_denies_marked_artifact_without_clearance() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "artifact-1".into(),
             kind: "artifact".into(),
@@ -2149,6 +2158,7 @@ async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
     ] {
         let svc = service();
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: "document".into(),
@@ -2177,9 +2187,11 @@ async fn activated_get_object_hides_acl_and_marking_denials_as_missing() {
         };
         let revision = svc
             .db
+            .runtime()
             .put_object_security_policy(&policy, "root", &format!("put-{id}"), 1)
             .unwrap();
         svc.db
+            .runtime()
             .activate_object_security_policies(
                 namespace,
                 &BTreeMap::from([("document".into(), revision.revision_digest)]),
@@ -2214,6 +2226,7 @@ async fn purpose_bound_reads_record_success_and_hide_denials() {
     let namespace = "purpose-bound";
     for (id, name) in [("purpose-doc-a", "alpha"), ("purpose-doc-b", "beta")] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: "document".into(),
@@ -2240,10 +2253,12 @@ async fn purpose_bound_reads_record_success_and_hide_denials() {
     };
     let revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&policy, "root", "put-purpose-bound", 1)
         .unwrap();
     let activation = svc
         .db
+        .runtime()
         .activate_object_security_policies(
             namespace,
             &BTreeMap::from([("document".into(), revision.revision_digest)]),
@@ -2332,6 +2347,7 @@ async fn purpose_bound_reads_record_success_and_hide_denials() {
 
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("alice".into()),
             action: Some("purpose.read".into()),
@@ -2392,6 +2408,7 @@ async fn purpose_bound_reads_record_success_and_hide_denials() {
     assert!(!first_page.next_page_token.is_empty());
     let list_decisions = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("alice".into()),
             action: Some("purpose.read".into()),
@@ -2536,6 +2553,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
         ("lattice-unknown", "unknown"),
     ] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: "document".into(),
@@ -2552,6 +2570,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
             .unwrap();
     }
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "legacy-unknown".into(),
             kind: "document".into(),
@@ -2571,6 +2590,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
         ("principal-bob-conf", "bob", "confidential"),
     ] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: markings::PRINCIPAL_PROFILE_KIND.into(),
@@ -2647,6 +2667,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
     assert_eq!(legacy.id, "legacy-unknown");
 
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "foreign-health".into(),
             kind: "document".into(),
@@ -2662,6 +2683,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_link(&domain::Link {
             id: "lattice-hop".into(),
             from_id: "lattice-confidential".into(),
@@ -2671,6 +2693,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_link(&domain::Link {
             id: "lattice-foreign-hop".into(),
             from_id: "lattice-confidential".into(),
@@ -2732,6 +2755,7 @@ async fn hierarchical_classifications_enforce_lattice_and_hide_denials() {
 async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "artifact-2".into(),
             kind: "artifact".into(),
@@ -2747,6 +2771,7 @@ async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "principal-alice".into(),
             kind: markings::PRINCIPAL_PROFILE_KIND.into(),
@@ -2782,6 +2807,7 @@ async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
     assert_eq!(resp.object.unwrap().id, "artifact-2");
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&audit::DecisionFilter {
             action: Some("marking.read".into()),
             ..Default::default()
@@ -2794,6 +2820,7 @@ async fn get_object_allows_marked_artifact_with_sufficient_ceiling() {
 async fn find_by_external_id_hides_marked_artifact_without_clearance() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "artifact-3".into(),
             kind: "artifact".into(),
@@ -2824,6 +2851,7 @@ async fn find_by_external_id_hides_marked_artifact_without_clearance() {
 async fn find_by_external_id_hides_activated_marking_denial_as_missing() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "artifact-activated-hidden".into(),
             kind: "artifact".into(),
@@ -2852,9 +2880,11 @@ async fn find_by_external_id_hides_activated_marking_denial_as_missing() {
     };
     let revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&policy, "root", "put-find-activated", 1)
         .unwrap();
     svc.db
+        .runtime()
         .activate_object_security_policies(
             "ns",
             &BTreeMap::from([("artifact".into(), revision.revision_digest)]),
@@ -2930,7 +2960,12 @@ async fn record_decision_strips_reserved_attestation_evidence_keys() {
     assert!(!recorded.evidence.contains_key("attestation_id"));
     assert!(!recorded.evidence.contains_key("attestation_hash"));
     assert_eq!(recorded.evidence["note"], "kept");
-    let stored = svc.db.get_decision(&recorded.id).unwrap().unwrap();
+    let stored = svc
+        .db
+        .runtime()
+        .get_decision(&recorded.id)
+        .unwrap()
+        .unwrap();
     assert!(!stored.evidence.contains_key("attestation_id"));
     assert!(!stored.evidence.contains_key("attestation_hash"));
 }
@@ -3025,7 +3060,7 @@ async fn struct_property_round_trips_through_create_update_and_list() {
     }))
     .await
     .unwrap();
-    let stored = svc.db.get_object("widget-ai").unwrap().unwrap();
+    let stored = svc.db.runtime().get_object("widget-ai").unwrap().unwrap();
     assert_eq!(stored.properties["ai_result"], updated_value);
 
     let err = svc
@@ -3141,6 +3176,7 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
     .await
     .unwrap();
     svc.db
+        .runtime()
         .with_sqlite_conn(|connection| {
             connection.execute(
                 "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
@@ -3187,7 +3223,7 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 
     let error = svc
@@ -3207,7 +3243,12 @@ async fn update_dataset_requires_write_access_to_existing_binding() {
         .unwrap_err();
 
     assert_eq!(error.code(), tonic::Code::PermissionDenied);
-    let stored = svc.db.get_dataset("protected-dataset").unwrap().unwrap();
+    let stored = svc
+        .db
+        .runtime()
+        .get_dataset("protected-dataset")
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.name, "original");
     assert_eq!(stored.object_id, "protected-object");
 }
@@ -3464,7 +3505,7 @@ async fn computed_property_resolves_from_function_without_persisting() {
         .into_inner();
     assert_eq!(listed.objects[0].properties["child_count"], "1");
 
-    let stored = svc.db.get_object("cluster-1").unwrap().unwrap();
+    let stored = svc.db.runtime().get_object("cluster-1").unwrap().unwrap();
     assert!(!stored.properties.contains_key("child_count"));
 }
 
@@ -3520,6 +3561,7 @@ async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
         ("denied-child", "policy-component", "bob"),
     ] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: kind.into(),
@@ -3534,6 +3576,7 @@ async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
     }
     for child in ["allowed-child", "denied-child"] {
         svc.db
+            .runtime()
             .create_link(&domain::Link {
                 id: format!("policy-cluster->{child}"),
                 from_id: "policy-cluster".into(),
@@ -3574,13 +3617,16 @@ async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
     };
     let cluster_revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&allow_cluster, "root", "put-computed-cluster", 1)
         .unwrap();
     let component_revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&owned_component, "root", "put-computed-component", 2)
         .unwrap();
     svc.db
+        .runtime()
         .activate_object_security_policies(
             namespace,
             &BTreeMap::from([
@@ -3868,7 +3914,12 @@ async fn unresolved_computed_property_hides_stored_value() {
         .unwrap();
     assert!(!got.properties.contains_key("child_count"));
 
-    let stored = svc.db.get_object("cluster-spoofed").unwrap().unwrap();
+    let stored = svc
+        .db
+        .runtime()
+        .get_object("cluster-spoofed")
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.properties["child_count"], "spoofed");
 }
 
@@ -4045,6 +4096,7 @@ async fn noop_update_does_not_record_audit_change() {
 async fn audit_insert_failure_rolls_back_create() {
     let svc = service();
     svc.db
+        .runtime()
         .conn()
         .execute("DROP TABLE sekai_object_changes", [])
         .unwrap();
@@ -4067,7 +4119,13 @@ async fn audit_insert_failure_rolls_back_create() {
         .unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::Internal);
-    assert!(svc.db.get_object("audit-fail-closed").unwrap().is_none());
+    assert!(
+        svc.db
+            .runtime()
+            .get_object("audit-fail-closed")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -4089,6 +4147,7 @@ async fn delete_fails_closed_when_delete_audit_insert_fails() {
     .await
     .unwrap();
     svc.db
+        .runtime()
         .conn()
         .execute("DROP TABLE sekai_object_changes", [])
         .unwrap();
@@ -4102,7 +4161,13 @@ async fn delete_fails_closed_when_delete_audit_insert_fails() {
         .unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::Internal);
-    assert!(svc.db.get_object("delete-audit-fail").unwrap().is_some());
+    assert!(
+        svc.db
+            .runtime()
+            .get_object("delete-audit-fail")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -4242,6 +4307,7 @@ async fn object_bound_lease_requires_target_object_authorization() {
         updated: 1,
     };
     svc.db
+        .runtime()
         .create_object_with_audit(&from_proto_obj(&target), "alice")
         .unwrap();
     grant_object_role(&svc, "coord-target", "alice", security::Role::Editor);
@@ -4416,6 +4482,7 @@ async fn object_bound_lease_requires_target_object_authorization() {
         updated: 1,
     };
     svc.db
+        .runtime()
         .create_object_with_audit(&from_proto_obj(&other), "alice")
         .unwrap();
     grant_object_role(&svc, "other-target", "alice", security::Role::Editor);
@@ -4467,6 +4534,7 @@ async fn guarded_update_requires_object_and_lease_namespace_authorization() {
         updated: 1,
     };
     svc.db
+        .runtime()
         .create_object_with_audit(&from_proto_obj(&original), "alice")
         .unwrap();
     grant_object_role(&svc, "guarded-auth", "alice", security::Role::Editor);
@@ -4506,7 +4574,12 @@ async fn guarded_update_requires_object_and_lease_namespace_authorization() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::PermissionDenied);
     assert_eq!(
-        svc.db.get_object("guarded-auth").unwrap().unwrap().name,
+        svc.db
+            .runtime()
+            .get_object("guarded-auth")
+            .unwrap()
+            .unwrap()
+            .name,
         "after"
     );
 }
@@ -4542,6 +4615,7 @@ async fn update_object_with_lease_precondition_enforces_fencing() {
         updated: 1,
     };
     svc.db
+        .runtime()
         .create_object_with_audit(&from_proto_obj(&original), "alice")
         .unwrap();
     grant_object_role(&svc, "unified-guarded", "alice", security::Role::Editor);
@@ -4564,7 +4638,12 @@ async fn update_object_with_lease_precondition_enforces_fencing() {
     .await
     .unwrap();
     assert_eq!(
-        svc.db.get_object("unified-guarded").unwrap().unwrap().name,
+        svc.db
+            .runtime()
+            .get_object("unified-guarded")
+            .unwrap()
+            .unwrap()
+            .name,
         "fenced"
     );
 
@@ -4587,7 +4666,12 @@ async fn update_object_with_lease_precondition_enforces_fencing() {
         .unwrap_err();
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
     assert_eq!(
-        svc.db.get_object("unified-guarded").unwrap().unwrap().name,
+        svc.db
+            .runtime()
+            .get_object("unified-guarded")
+            .unwrap()
+            .unwrap()
+            .name,
         "fenced"
     );
 }
@@ -4606,6 +4690,7 @@ async fn update_object_without_lease_precondition_remains_unguarded() {
         updated: 1,
     };
     svc.db
+        .runtime()
         .create_object_with_audit(&from_proto_obj(&original), "alice")
         .unwrap();
     grant_object_role(&svc, "unified-unguarded", "alice", security::Role::Editor);
@@ -4624,6 +4709,7 @@ async fn update_object_without_lease_precondition_remains_unguarded() {
     .unwrap();
     assert_eq!(
         svc.db
+            .runtime()
             .get_object("unified-unguarded")
             .unwrap()
             .unwrap()
@@ -4731,6 +4817,7 @@ async fn governed_action_type_registry_put_get_list_disable() {
     .unwrap();
     let deny = svc
         .db
+        .runtime()
         .require_enabled_governed_action_type("acme", "review.intake", "1.0.0")
         .unwrap_err();
     assert!(deny.contains("disabled"), "{deny}");
@@ -4758,11 +4845,18 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let budget = Arc::new(BudgetTracker::new(db.clone()));
+    let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
+    let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
     budget
         .set_limit("action:governed", 1, PeriodType::Daily)
         .unwrap();
-    let svc = SekaiServiceImpl::with_budget(db, budget.clone());
+    let clerk = crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+        chisei_store,
+        sekai_store.clone(),
+        Some(budget.clone()),
+    );
+    let svc = SekaiServiceImpl::new(sekai_store).with_cross_store_admission(Arc::new(clerk));
     grant_action_admin(&svc);
 
     let type_def = GovernedActionType {
@@ -4818,6 +4912,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
     // Receipt spine bound to operation_id.
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(&inst.operation_id)
         .unwrap()
         .expect("operation receipt");
@@ -4834,7 +4929,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             parameters_json: params.clone(),
             idempotency_key: "idem-1".into(),
             evidence_submission_ids: vec!["ev-1".into()],
-            request_id: "req-2".into(),
+            request_id: "req-1".into(),
             ontology_digest: String::new(),
         }))
         .await
@@ -4852,7 +4947,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             parameters_json: r#"{"summary":"other"}"#.into(),
             idempotency_key: "idem-1".into(),
             evidence_submission_ids: vec![],
-            request_id: "req-3".into(),
+            request_id: "req-1".into(),
             ontology_digest: String::new(),
         }))
         .await
@@ -4887,7 +4982,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
         .instances;
     assert_eq!(listed.len(), 1);
 
-    // Budget deny (limit was 1; second distinct admit exhausts)
+    // Clerk refuses a second operation before Sekai records a denied instance.
     let budget_denied = svc
         .submit_action_instance(with_principal(SubmitActionInstanceRequest {
             namespace: "acme".into(),
@@ -4900,16 +4995,17 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             ontology_digest: String::new(),
         }))
         .await
-        .unwrap()
-        .into_inner()
-        .instance
+        .unwrap_err();
+    assert_eq!(budget_denied.code(), tonic::Code::FailedPrecondition);
+    assert!(budget_denied.message().contains("budget"));
+
+    budget
+        .set_limit("action:governed", 8, PeriodType::Daily)
         .unwrap();
-    assert_eq!(budget_denied.status, STATUS_DENIED);
-    assert_eq!(budget_denied.budget_decision, "budget_exceeded");
-    assert!(budget_denied.deny_reason.contains("budget"));
 
     // Policy deny
     svc.db
+        .runtime()
         .upsert_action_policy(&action_policy::ActionPolicy {
             scope: "agent:tester".into(),
             default_decision: action_policy::ActionDecision::Allow,
@@ -5038,6 +5134,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
         assert!(error.message().contains(expected_error), "{key}: {error}");
         assert!(
             svc.db
+                .runtime()
                 .get_action_instance_by_idempotency("acme", key)
                 .unwrap()
                 .is_none(),
@@ -5064,6 +5161,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
     assert!(duplicate_error.message().contains("duplicate object keys"));
     assert!(
         svc.db
+            .runtime()
             .get_action_instance_by_idempotency("acme", "duplicate-key")
             .unwrap()
             .is_none()
@@ -5089,6 +5187,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
     assert_eq!(valid.status, STATUS_ADMITTED);
     assert_eq!(
         svc.db
+            .runtime()
             .list_action_effects_for_instance(&valid.instance_id)
             .unwrap()
             .len(),
@@ -5144,6 +5243,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(
         svc.db
+            .runtime()
             .get_action_instance_by_idempotency("acme", "nul-admission")
             .unwrap()
             .is_none()
@@ -5215,7 +5315,7 @@ async fn ontology_list_hides_unreadable_definitions() {
         role: security::Role::Viewer,
         created: 0,
     };
-    svc.db.create_grant(&hidden_grant).unwrap();
+    svc.db.runtime().create_grant(&hidden_grant).unwrap();
     svc.security.add_grant(&hidden_grant);
 
     let listed = svc
@@ -5373,6 +5473,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
     assert_eq!(instance.operation_id, "operation-record-grpc");
     let stored = svc
         .db
+        .runtime()
         .get_object("rec-grpc-1")
         .unwrap()
         .expect("created record");
@@ -5381,6 +5482,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
     assert_eq!(stored.name, "Northwind");
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt("operation-record-grpc")
         .unwrap()
         .expect("receipt");
@@ -5454,6 +5556,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
 
     let receipt = svc
         .db
+        .runtime()
         .get_operation_receipt(operation_id)
         .unwrap()
         .expect("receipt");
@@ -5513,6 +5616,7 @@ async fn describe_and_preview_object_action_are_observational() {
     let svc = service();
     grant_action_admin(&svc);
     svc.db
+        .runtime()
         .upsert_object_type(&crate::sekai::schema::ObjectType {
             kind: "customer_record".into(),
             description: "fixture".into(),
@@ -5531,7 +5635,7 @@ async fn describe_and_preview_object_action_are_observational() {
         created: 10,
         updated: 20,
     };
-    svc.db.create_object(&object).unwrap();
+    svc.db.runtime().create_object(&object).unwrap();
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
             namespace: "acme".into(),
@@ -5601,13 +5705,19 @@ async fn describe_and_preview_object_action_are_observational() {
     assert!(!preview.request_digest.is_empty());
     assert_eq!(
         svc.db
+            .runtime()
             .list_action_instances("acme", None, None, 10)
             .unwrap()
             .len(),
         0
     );
     assert_eq!(
-        svc.db.get_object("cust-preview").unwrap().unwrap().name,
+        svc.db
+            .runtime()
+            .get_object("cust-preview")
+            .unwrap()
+            .unwrap()
+            .name,
         "Northwind"
     );
 
@@ -5661,6 +5771,7 @@ static TYPE_SAFE_TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn put_system_one_ticket_type(svc: &SekaiServiceImpl) {
     svc.db
+        .runtime()
         .upsert_object_type(&crate::sekai::schema::ObjectType {
             kind: "support_ticket".into(),
             description: "fixture".into(),
@@ -5686,7 +5797,7 @@ fn put_system_one_ticket_type(svc: &SekaiServiceImpl) {
         created: 10,
         updated: 20,
     };
-    svc.db.create_object(&object).unwrap();
+    svc.db.runtime().create_object(&object).unwrap();
 }
 
 #[tokio::test]
@@ -5738,6 +5849,7 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
     assert!(stale.proposed_parameters_json.is_empty());
     assert!(
         svc.db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("preview_object_action".into()),
                 ..Default::default()
@@ -5747,6 +5859,7 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
     );
 
     svc.db
+        .runtime()
         .upsert_action_policy(&action_policy::ActionPolicy {
             scope: "agent:tester".into(),
             default_decision: action_policy::ActionDecision::Allow,
@@ -5864,6 +5977,7 @@ async fn preview_records_typesafe_egress_after_admission() {
     );
     let audits = svc
         .db
+        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("preview_object_action".into()),
             ..Default::default()
@@ -5876,6 +5990,7 @@ async fn preview_records_typesafe_egress_after_admission() {
     );
     assert_eq!(
         svc.db
+            .runtime()
             .list_action_instances("acme", None, None, 10)
             .unwrap()
             .len(),
@@ -5977,6 +6092,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
     assert!(preview.proposed_parameters_json.is_empty());
     assert!(
         svc.db
+            .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
                 action: Some("preview_object_action".into()),
                 ..Default::default()
@@ -6048,6 +6164,7 @@ async fn ontology_class_crud_round_trip() {
 
     let audit = svc
         .db
+        .runtime()
         .list_decisions(&audit::DecisionFilter {
             target_id: Some("ontology:class:Person".into()),
             ..Default::default()
@@ -6393,7 +6510,7 @@ async fn ontology_delete_clears_durable_and_cached_grants() {
     .unwrap();
 
     for object_id in ["ontology:class:Person", "ontology:relation:works_for"] {
-        assert!(svc.db.list_grants(object_id).unwrap().is_empty());
+        assert!(svc.db.runtime().list_grants(object_id).unwrap().is_empty());
         assert!(svc.security.can_access(object_id, &["other-reader"]));
     }
 }
@@ -6452,6 +6569,7 @@ async fn ontology_grants_are_managed_through_public_rpcs() {
     .unwrap();
     assert!(
         svc.db
+            .runtime()
             .list_grants("ontology:class:Restricted")
             .unwrap()
             .is_empty()
@@ -6478,7 +6596,7 @@ async fn schema_type_implements_interface_and_list_filters_by_interface() {
         }],
         is_builtin: false,
     };
-    svc.db.upsert_interface(&interface).unwrap();
+    svc.db.runtime().upsert_interface(&interface).unwrap();
     svc.schema_definitions
         .register_interface(interface)
         .unwrap();
@@ -6592,7 +6710,9 @@ async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
         )
         .unwrap();
     }
-    let svc = SekaiServiceImpl::new(db.clone());
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+        db.clone(),
+    ));
     grant_schema_admin(&svc);
 
     svc.create_object(with_principal(CreateObjectRequest {
@@ -6673,7 +6793,9 @@ async fn schema_table_read_failure_blocks_object_writes() {
         )
         .unwrap();
     }
-    let svc = SekaiServiceImpl::new(db.clone());
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+        db.clone(),
+    ));
 
     let err = svc
         .create_object(with_principal(CreateObjectRequest {
@@ -6720,7 +6842,7 @@ async fn schema_table_read_failure_blocks_object_writes() {
 async fn malformed_object_row_returns_internal_and_next_request_succeeds() {
     let svc = service();
     {
-        let conn = svc.db.conn();
+        let conn = svc.db.runtime().conn();
         conn.execute(
             "INSERT INTO sekai_objects
              (id, kind, name, namespace, external_id, properties, created, updated)
@@ -6766,6 +6888,7 @@ async fn malformed_object_row_returns_internal_and_next_request_succeeds() {
 async fn grant_and_audit_rpcs_round_trip() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "o1".into(),
             kind: "note".into(),
@@ -6784,9 +6907,10 @@ async fn grant_and_audit_rpcs_round_trip() {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&admin_grant).unwrap();
+    svc.db.runtime().create_grant(&admin_grant).unwrap();
     svc.security.add_grant(&admin_grant);
     svc.db
+        .runtime()
         .record_decision(&audit::Decision {
             id: "d1".into(),
             timestamp: 10,
@@ -6799,6 +6923,7 @@ async fn grant_and_audit_rpcs_round_trip() {
         })
         .unwrap();
     svc.db
+        .runtime()
         .record_object_change(&audit::ObjectChange {
             id: "c1".into(),
             object_id: "o1".into(),
@@ -6885,6 +7010,7 @@ async fn grant_and_audit_rpcs_round_trip() {
 async fn control_plane_admin_can_recover_managed_acl() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "namespace:acme".into(),
             kind: "namespace".into(),
@@ -6903,7 +7029,7 @@ async fn control_plane_admin_can_recover_managed_acl() {
         role: security::Role::Viewer,
         created: 0,
     };
-    svc.db.create_grant(&member_grant).unwrap();
+    svc.db.runtime().create_grant(&member_grant).unwrap();
     svc.security.add_grant(&member_grant);
 
     svc.create_grant(with_named_principal(
@@ -6939,7 +7065,13 @@ async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
         .await
         .unwrap_err();
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-    assert!(svc.db.find_namespace_boundary("acme").unwrap().is_none());
+    assert!(
+        svc.db
+            .runtime()
+            .find_namespace_boundary("acme")
+            .unwrap()
+            .is_none()
+    );
 
     let created = svc
         .ensure_team_namespace(with_named_principal(
@@ -7025,9 +7157,16 @@ async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
         .await
         .unwrap_err();
     assert_eq!(delete_namespace.code(), tonic::Code::FailedPrecondition);
-    assert!(svc.db.find_namespace_boundary("acme").unwrap().is_some());
+    assert!(
+        svc.db
+            .runtime()
+            .find_namespace_boundary("acme")
+            .unwrap()
+            .is_some()
+    );
 
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "legacy-boundary".into(),
             kind: "namespace".into(),
@@ -7123,6 +7262,7 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
     assert_eq!(denied.code(), tonic::Code::InvalidArgument);
 
     svc.db
+        .runtime()
         .create_grant(&security::Grant {
             id: "legacy-orphan".into(),
             object_id: "namespace:future".into(),
@@ -7143,7 +7283,13 @@ async fn grants_cannot_preclaim_future_namespace_boundaries() {
         .await
         .unwrap_err();
     assert_eq!(bootstrap.code(), tonic::Code::Internal);
-    assert!(svc.db.find_namespace_boundary("future").unwrap().is_none());
+    assert!(
+        svc.db
+            .runtime()
+            .find_namespace_boundary("future")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -7445,12 +7591,13 @@ async fn coordination_filters_paginates_and_dry_run_reconciles() {
     }))
     .await
     .unwrap();
-    let mut stale_candidate = svc.db.get_work_unit("wu-f1").unwrap().unwrap();
+    let mut stale_candidate = svc.db.runtime().get_work_unit("wu-f1").unwrap().unwrap();
     stale_candidate.started_at = 1;
     stale_candidate.last_heartbeat_at = 1;
     stale_candidate.updated_at = 1;
-    svc.db.update_work_unit(&stale_candidate).unwrap();
+    svc.db.runtime().update_work_unit(&stale_candidate).unwrap();
     svc.db
+        .runtime()
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
@@ -7535,6 +7682,7 @@ async fn coordination_filters_paginates_and_dry_run_reconciles() {
 async fn list_work_units_paginates_over_visible_rows_only() {
     let svc = service();
     svc.db
+        .runtime()
         .create_contention_scope(&coordination::ContentionScope {
             id: "scope-visible-page".into(),
             name: "visible".into(),
@@ -7557,6 +7705,7 @@ async fn list_work_units_paginates_over_visible_rows_only() {
         ("wu-vis-2", "alice", 13),
     ] {
         svc.db
+            .runtime()
             .create_work_unit(&coordination::WorkUnit {
                 id: id.into(),
                 kind: "build".into(),
@@ -7770,12 +7919,13 @@ async fn reconcile_requires_scope_ownership_for_target_scope() {
     ))
     .await
     .unwrap();
-    let mut stale_candidate = svc.db.get_work_unit("wu-other").unwrap().unwrap();
+    let mut stale_candidate = svc.db.runtime().get_work_unit("wu-other").unwrap().unwrap();
     stale_candidate.started_at = 1;
     stale_candidate.last_heartbeat_at = 1;
     stale_candidate.updated_at = 1;
-    svc.db.update_work_unit(&stale_candidate).unwrap();
+    svc.db.runtime().update_work_unit(&stale_candidate).unwrap();
     svc.db
+        .runtime()
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
@@ -7880,12 +8030,18 @@ async fn reconcile_with_mismatched_scope_and_work_unit_returns_empty() {
     }))
     .await
     .unwrap();
-    let mut stale_candidate = svc.db.get_work_unit("wu-mismatch").unwrap().unwrap();
+    let mut stale_candidate = svc
+        .db
+        .runtime()
+        .get_work_unit("wu-mismatch")
+        .unwrap()
+        .unwrap();
     stale_candidate.started_at = 1;
     stale_candidate.last_heartbeat_at = 1;
     stale_candidate.updated_at = 1;
-    svc.db.update_work_unit(&stale_candidate).unwrap();
+    svc.db.runtime().update_work_unit(&stale_candidate).unwrap();
     svc.db
+        .runtime()
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
@@ -7927,6 +8083,7 @@ async fn list_objects_without_filters_keeps_unactivated_namespace_compatibility(
         ("legacy-list-object", "legacy-list"),
     ] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: "document".into(),
@@ -7953,9 +8110,11 @@ async fn list_objects_without_filters_keeps_unactivated_namespace_compatibility(
     };
     let revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&policy, "root", "put-list-compat", 1)
         .unwrap();
     svc.db
+        .runtime()
         .activate_object_security_policies(
             "activated-list",
             &BTreeMap::from([("document".into(), revision.revision_digest)]),
@@ -7999,7 +8158,7 @@ async fn list_objects_enforces_limit_and_returns_total() {
             created: i64::from(i),
             updated: i64::from(i),
         };
-        svc.db.create_object(&object).unwrap();
+        svc.db.runtime().create_object(&object).unwrap();
     }
 
     let response = svc
@@ -8028,6 +8187,7 @@ async fn list_objects_enforces_limit_and_returns_total() {
 async fn list_objects_omits_filter_uses_defaults() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "default-filter".into(),
             kind: "query-demo".into(),
@@ -8178,6 +8338,7 @@ async fn action_policy_set_requires_action_admin() {
     // Nothing was persisted.
     assert!(
         svc.db
+            .runtime()
             .get_action_policy("agent:codex-app")
             .unwrap()
             .is_none()
@@ -8212,7 +8373,7 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
         svc.write_knowledge(&request).await.unwrap(),
         KnowledgeWriteOutcome::Accepted
     );
-    let learning = svc.db.get_object(&learning_id).unwrap().unwrap();
+    let learning = svc.db.runtime().get_object(&learning_id).unwrap().unwrap();
     assert_eq!(learning.kind, domain::KIND_LEARNING);
     assert_eq!(learning.namespace, "acme");
     assert_eq!(learning.name, "Scored learning");
@@ -8233,6 +8394,7 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
 
     let link = svc
         .db
+        .runtime()
         .get_link(&format!("{learning_id}->{namespace_id}"))
         .unwrap()
         .unwrap();
@@ -8240,7 +8402,7 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
     assert_eq!(link.to_id, namespace_id);
     assert_eq!(link.relation, domain::REL_TOUCHES);
 
-    let grants = svc.db.list_grants(&learning.id).unwrap();
+    let grants = svc.db.runtime().list_grants(&learning.id).unwrap();
     assert_eq!(grants.len(), 1);
     assert_eq!(grants[0].principal, "chisei.scoring");
     assert_eq!(grants[0].role, security::Role::Admin);
@@ -8267,16 +8429,18 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
     );
     let learnings = svc
         .db
+        .runtime()
         .list_objects(&domain::ListFilter {
             kind: Some(domain::KIND_LEARNING.into()),
             ..Default::default()
         })
         .unwrap();
     assert_eq!(learnings.len(), 1);
-    assert_eq!(svc.db.list_grants(&learning.id).unwrap().len(), 1);
+    assert_eq!(svc.db.runtime().list_grants(&learning.id).unwrap().len(), 1);
 
     let decisions = svc
         .db
+        .runtime()
         .list_decisions(&audit::DecisionFilter {
             action: Some(crate::sekai::learning::RECORD_LEARNING_ACTION.into()),
             ..Default::default()
@@ -8303,6 +8467,7 @@ async fn scoring_writer_records_private_typed_learning_and_retries_idempotently(
 async fn scoring_writer_uses_a_project_target_when_namespace_object_is_absent() {
     let svc = service();
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "project-acme".into(),
             kind: "project".into(),
@@ -8321,9 +8486,10 @@ async fn scoring_writer_uses_a_project_target_when_namespace_object_is_absent() 
         svc.write_knowledge(&request).await.unwrap(),
         KnowledgeWriteOutcome::Accepted
     );
-    assert!(svc.db.get_object(&learning_id).unwrap().is_some());
+    assert!(svc.db.runtime().get_object(&learning_id).unwrap().is_some());
     assert!(
         svc.db
+            .runtime()
             .get_link(&format!("{learning_id}->project-acme"))
             .unwrap()
             .is_some()
@@ -8352,6 +8518,7 @@ async fn scoring_writer_obeys_namespace_deny_and_approval_policies() {
     seed_scoring_namespace(&denied_svc, "denied");
     denied_svc
         .db
+        .runtime()
         .upsert_action_policy(&action_policy::ActionPolicy {
             scope: "denied".into(),
             default_decision: action_policy::ActionDecision::Allow,
@@ -8371,9 +8538,17 @@ async fn scoring_writer_obeys_namespace_deny_and_approval_policies() {
         denied_svc.write_knowledge(&denied_request).await.unwrap(),
         KnowledgeWriteOutcome::PolicyDenied
     );
-    assert!(denied_svc.db.get_object(&denied_id).unwrap().is_none());
+    assert!(
+        denied_svc
+            .db
+            .runtime()
+            .get_object(&denied_id)
+            .unwrap()
+            .is_none()
+    );
     let denied_decisions = denied_svc
         .db
+        .runtime()
         .list_decisions(&audit::DecisionFilter {
             action: Some(crate::sekai::learning::RECORD_LEARNING_ACTION.into()),
             ..Default::default()
@@ -8387,6 +8562,7 @@ async fn scoring_writer_obeys_namespace_deny_and_approval_policies() {
     seed_scoring_namespace(&approval_svc, "approval");
     approval_svc
         .db
+        .runtime()
         .upsert_action_policy(&action_policy::ActionPolicy {
             scope: "approval".into(),
             default_decision: action_policy::ActionDecision::Allow,
@@ -8409,7 +8585,14 @@ async fn scoring_writer_obeys_namespace_deny_and_approval_policies() {
             .unwrap(),
         KnowledgeWriteOutcome::PolicyDenied
     );
-    assert!(approval_svc.db.get_object(&approval_id).unwrap().is_none());
+    assert!(
+        approval_svc
+            .db
+            .runtime()
+            .get_object(&approval_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -8423,7 +8606,7 @@ async fn list_attestations_paginates_over_visible_rows_only() {
         role: security::Role::Admin,
         created: 0,
     };
-    svc.db.create_grant(&grant).unwrap();
+    svc.db.runtime().create_grant(&grant).unwrap();
     svc.security.add_grant(&grant);
 
     for (scope, created) in [
@@ -8444,7 +8627,7 @@ async fn list_attestations_paginates_over_visible_rows_only() {
                 decision: action_policy::ActionDecision::Allow,
                 created,
             });
-        svc.db.insert_attestation(&attestation).unwrap();
+        svc.db.runtime().insert_attestation(&attestation).unwrap();
     }
 
     // limit/offset apply to visible rows: skipping 1 of the 3 visible
@@ -8471,6 +8654,7 @@ async fn list_attestations_paginates_over_visible_rows_only() {
 async fn reserved_governance_objects_are_hidden_from_generic_crud() {
     let svc = service();
     svc.db
+        .runtime()
         .upsert_action_policy(&action_policy::ActionPolicy::allow_all("agent:tester"))
         .unwrap();
 
@@ -8561,6 +8745,7 @@ async fn seed_authorized_query_visibility_graph(svc: &SekaiServiceImpl) {
         .unwrap();
     }
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "internal-policy".into(),
             kind: action_policy::ACTION_POLICY_KIND.into(),
@@ -8609,7 +8794,7 @@ async fn seed_authorized_query_visibility_graph(svc: &SekaiServiceImpl) {
             created: 0,
         },
     ] {
-        svc.db.create_link(&link).unwrap();
+        svc.db.runtime().create_link(&link).unwrap();
     }
     grant_object_role(svc, "context-denied", "bob", security::Role::Viewer);
 }
@@ -8780,9 +8965,10 @@ async fn authorized_graph_queries_hide_reserved_kinds_and_objects_behind_hidden_
 #[tokio::test]
 async fn blast_radius_object_not_writable_via_update_object() {
     let svc = service();
-    svc.db.add_blast_radius("wu-1", 1, 0).unwrap();
+    svc.db.runtime().add_blast_radius("wu-1", 1, 0).unwrap();
     let counter_id = svc
         .db
+        .runtime()
         .find_by_external_id("action_blast_radius:wu-1")
         .unwrap()
         .unwrap()
@@ -8804,7 +8990,7 @@ async fn blast_radius_object_not_writable_via_update_object() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
-    assert_eq!(svc.db.get_blast_radius("wu-1").unwrap(), (1, 0));
+    assert_eq!(svc.db.runtime().get_blast_radius("wu-1").unwrap(), (1, 0));
 }
 
 #[tokio::test]
@@ -8855,6 +9041,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
         .unwrap();
     }
     svc.db
+        .runtime()
         .create_object(&domain::Object {
             id: "internal-policy".into(),
             kind: action_policy::ACTION_POLICY_KIND.into(),
@@ -8903,7 +9090,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
             created: 0,
         },
     ] {
-        svc.db.create_link(&link).unwrap();
+        svc.db.runtime().create_link(&link).unwrap();
     }
     let denied_grant = security::Grant {
         id: "context-denied-grant".into(),
@@ -8912,7 +9099,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
         role: security::Role::Viewer,
         created: 0,
     };
-    svc.db.create_grant(&denied_grant).unwrap();
+    svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
 
     let response = svc
@@ -8991,6 +9178,7 @@ async fn property_level_reads_omit_hidden_values_across_query_surfaces() {
     let namespace = "column-reads";
     for (id, secret) in [("visible-a", "classified"), ("visible-b", "other")] {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: id.into(),
                 kind: "document".into(),
@@ -9009,6 +9197,7 @@ async fn property_level_reads_omit_hidden_values_across_query_surfaces() {
             .unwrap();
     }
     svc.db
+        .runtime()
         .create_link(&domain::Link {
             id: "column-reads-link".into(),
             from_id: "visible-a".into(),
@@ -9044,9 +9233,11 @@ async fn property_level_reads_omit_hidden_values_across_query_surfaces() {
     };
     let revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&grants, "root", "put-column-reads", 1)
         .unwrap();
     svc.db
+        .runtime()
         .activate_object_security_policies(
             namespace,
             &BTreeMap::from([("document".into(), revision.revision_digest)]),
@@ -9303,9 +9494,11 @@ async fn property_level_reads_omit_hidden_values_across_query_surfaces() {
     ]);
     let revoked_revision = svc
         .db
+        .runtime()
         .put_object_security_policy(&revoked, "root", "put-column-revoke", 3)
         .unwrap();
     svc.db
+        .runtime()
         .activate_object_security_policies(
             namespace,
             &BTreeMap::from([("document".into(), revoked_revision.revision_digest)]),
@@ -9407,7 +9600,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
             created: 0,
         },
     ] {
-        svc.db.create_link(&link).unwrap();
+        svc.db.runtime().create_link(&link).unwrap();
     }
     let denied_grant = security::Grant {
         id: "sem-denied-grant".into(),
@@ -9416,7 +9609,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
         role: security::Role::Viewer,
         created: 0,
     };
-    svc.db.create_grant(&denied_grant).unwrap();
+    svc.db.runtime().create_grant(&denied_grant).unwrap();
     svc.security.add_grant(&denied_grant);
 
     grant_ontology_admin(svc);
@@ -9588,7 +9781,7 @@ async fn managed_team_classification_is_atomic_with_credential_rotation() {
     ))
     .await
     .unwrap();
-    assert!(!svc.db.is_team_principal("team-agent").unwrap());
+    assert!(!svc.db.runtime().is_team_principal("team-agent").unwrap());
 
     svc.rotate_credential(with_named_principal(
         RotateCredentialRequest {
@@ -9600,9 +9793,10 @@ async fn managed_team_classification_is_atomic_with_credential_rotation() {
     ))
     .await
     .unwrap();
-    assert!(svc.db.is_team_principal("team-agent").unwrap());
+    assert!(svc.db.runtime().is_team_principal("team-agent").unwrap());
     assert_eq!(
         svc.db
+            .runtime()
             .list_credentials(Some("team-agent"), Some("active"))
             .unwrap()
             .len(),
@@ -9700,6 +9894,7 @@ async fn provenance_report_is_served_without_direct_database_access() {
 async fn configured_evidence_service(with_target: bool) -> SekaiServiceImpl {
     let svc = service();
     svc.db
+        .runtime()
         .upsert_evidence_producer(
             &DomainEvidenceProducerCapability {
                 producer_identity: "producer:checks".into(),
@@ -9742,6 +9937,7 @@ async fn configured_evidence_service(with_target: bool) -> SekaiServiceImpl {
     .unwrap();
     if with_target {
         svc.db
+            .runtime()
             .create_object(&domain::Object {
                 id: "service-1".into(),
                 kind: "service".into(),
@@ -9795,7 +9991,7 @@ async fn evidence_admission_lifecycle_projects_and_resolves_domain_outcome() {
     let svc = configured_evidence_service(true).await;
     let envelope = from_proto_evidence_envelope(proto_evidence("lifecycle-run", 1)).unwrap();
 
-    let outcome = EvidenceAdmissionLifecycle::new(&svc.db)
+    let outcome = EvidenceAdmissionLifecycle::new(svc.db.runtime())
         .admit(&envelope, "producer:checks", now_millis())
         .unwrap();
 

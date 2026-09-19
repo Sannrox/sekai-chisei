@@ -476,20 +476,22 @@ pub fn record_lookup_promotion_gate(
     evidence.insert("passed".into(), report.passed.to_string());
     evidence.insert("failed".into(), report.failed.to_string());
     let verdict = report.verdict.as_str();
-    db.record_decision(&crate::sekai::audit::Decision {
-        id: decision_id.clone(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        actor: actor.into(),
-        action: LOOKUP_FIRST_GATE_AUDIT_ACTION.into(),
-        reason: if verdict == "allow" {
-            "lookup-vs-golden promotion gate passed".into()
-        } else {
-            "lookup-vs-golden promotion gate failed; prior route policy remains unchanged".into()
-        },
-        evidence: evidence.into_iter().collect(),
-        target_id: format!("lookup-first:{}:{}", report.namespace, report.suite_id),
-        outcome: verdict.into(),
-    })?;
+    db.runtime()
+        .record_decision(&crate::sekai::audit::Decision {
+            id: decision_id.clone(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: actor.into(),
+            action: LOOKUP_FIRST_GATE_AUDIT_ACTION.into(),
+            reason: if verdict == "allow" {
+                "lookup-vs-golden promotion gate passed".into()
+            } else {
+                "lookup-vs-golden promotion gate failed; prior route policy remains unchanged"
+                    .into()
+            },
+            evidence: evidence.into_iter().collect(),
+            target_id: format!("lookup-first:{}:{}", report.namespace, report.suite_id),
+            outcome: verdict.into(),
+        })?;
     Ok(decision_id)
 }
 
@@ -853,7 +855,7 @@ fn run_lookup_retrieval(
     query.source_rows_truncated = source_rows_truncated;
     let namespace = namespace.to_string();
     let mut result = retrieval::retrieve_with_ontology_started(
-        db,
+        db.runtime(),
         &query,
         ontology.as_ref(),
         started,
@@ -909,19 +911,25 @@ fn preflight_root_access(
 ) -> Result<Option<&'static str>, String> {
     for root in roots {
         let objects = match root {
-            RetrievalRoot::Object(id) => db.get_object(id)?.into_iter().collect::<Vec<_>>(),
+            RetrievalRoot::Object(id) => {
+                db.runtime().get_object(id)?.into_iter().collect::<Vec<_>>()
+            }
             RetrievalRoot::External(external_id) => db
+                .runtime()
                 .find_by_external_id(external_id)?
                 .into_iter()
                 .collect::<Vec<_>>(),
             RetrievalRoot::Link(id) => {
-                let Some(link) = db.get_link(id)? else {
+                let Some(link) = db.runtime().get_link(id)? else {
                     continue;
                 };
-                [db.get_object(&link.from_id)?, db.get_object(&link.to_id)?]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
+                [
+                    db.runtime().get_object(&link.from_id)?,
+                    db.runtime().get_object(&link.to_id)?,
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
             }
         };
         for object in objects {
@@ -945,19 +953,23 @@ fn explain_target_is_authorized(
     db: &ChiseiStore,
 ) -> Result<bool, String> {
     let objects = match target {
-        RetrievalRoot::Object(id) => db.get_object(id)?.into_iter().collect::<Vec<_>>(),
+        RetrievalRoot::Object(id) => db.runtime().get_object(id)?.into_iter().collect::<Vec<_>>(),
         RetrievalRoot::External(external_id) => db
+            .runtime()
             .find_by_external_id(external_id)?
             .into_iter()
             .collect::<Vec<_>>(),
         RetrievalRoot::Link(id) => {
-            let Some(link) = db.get_link(id)? else {
+            let Some(link) = db.runtime().get_link(id)? else {
                 return Ok(false);
             };
-            [db.get_object(&link.from_id)?, db.get_object(&link.to_id)?]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
+            [
+                db.runtime().get_object(&link.from_id)?,
+                db.runtime().get_object(&link.to_id)?,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
         }
     };
     if objects.is_empty() {
@@ -979,7 +991,7 @@ fn lookup_ontology_snapshot(
     if query.reasoning_mode != ReasoningMode::Entailment {
         return Ok((None, 0, false));
     }
-    if db.backend_name() == "postgres" {
+    if db.runtime().backend_name() == "postgres" {
         return Err(RetrievalLookupError::Refusal("backend_unsupported"));
     }
     let deadline = started + lookup_reasoning_timeout(query.max_time_ms);
@@ -990,7 +1002,7 @@ fn lookup_ontology_snapshot(
     };
     let mut source_rows = 0u32;
     let mut source_rows_truncated = false;
-    let mut classes = match db.list_readable_ontology_classes(
+    let mut classes = match db.runtime().list_readable_ontology_classes(
         principals,
         deadline,
         source_limit.saturating_add(1),
@@ -1022,7 +1034,7 @@ fn lookup_ontology_snapshot(
     }
     let remaining_rows = source_limit.saturating_sub(source_rows);
     let mut relations = if !source_rows_truncated && started < deadline {
-        match db.list_readable_ontology_relations(
+        match db.runtime().list_readable_ontology_relations(
             principals,
             deadline,
             remaining_rows.saturating_add(1),
@@ -1275,9 +1287,9 @@ fn resolve_object_ref(
     db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
     let object = if !input.object_id.trim().is_empty() {
-        db.get_object(input.object_id.trim())?
+        db.runtime().get_object(input.object_id.trim())?
     } else {
-        db.find_by_external_id(input.external_id.trim())?
+        db.runtime().find_by_external_id(input.external_id.trim())?
     };
 
     let Some(object) = object else {
@@ -1301,7 +1313,7 @@ fn resolve_object_ref(
             reason: "acl_denied".into(),
         });
     }
-    let object = db.project_object_property_grants(object)?;
+    let object = db.runtime().project_object_property_grants(object)?;
 
     let answer = json!({
         "capability": semantic::CAPABILITY_RESOLVE_REF,
@@ -1333,7 +1345,7 @@ fn resolve_ontology_class(
     class_name: &str,
     db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
-    let Some(class) = db.get_ontology_class(class_name)? else {
+    let Some(class) = db.runtime().get_ontology_class(class_name)? else {
         return Ok(LookupDecision::Refusal {
             capability: semantic::CAPABILITY_RESOLVE_REF.into(),
             reason: "incomplete".into(),
@@ -1375,7 +1387,7 @@ fn resolve_ontology_relation(
     relation_name: &str,
     db: &ChiseiStore,
 ) -> Result<LookupDecision, String> {
-    let Some(relation) = db.get_ontology_relation(relation_name)? else {
+    let Some(relation) = db.runtime().get_ontology_relation(relation_name)? else {
         return Ok(LookupDecision::Refusal {
             capability: semantic::CAPABILITY_RESOLVE_REF.into(),
             reason: "incomplete".into(),
@@ -1426,7 +1438,7 @@ fn id_readable(object_id: &str, actor: &str, db: &ChiseiStore) -> Result<bool, S
     if matches!(actor, "root" | "local") {
         return Ok(true);
     }
-    let grants = db.list_grants(object_id)?;
+    let grants = db.runtime().list_grants(object_id)?;
     if grants.is_empty() {
         return Ok(true);
     }
@@ -1444,7 +1456,7 @@ fn id_readable_for_principals(
     {
         return Ok(true);
     }
-    let grants = db.list_grants(object_id)?;
+    let grants = db.runtime().list_grants(object_id)?;
     if grants.is_empty() {
         return Ok(true);
     }
@@ -1468,7 +1480,7 @@ fn lookup_object_readable(
     }
     let primary = principals.first().map(String::as_str).unwrap_or_default();
     let authority = lookup_principal_authority(primary, db)?;
-    let lattice = db.get_classification_lattice(&object.namespace)?;
+    let lattice = db.runtime().get_classification_lattice(&object.namespace)?;
     Ok(
         crate::sekai::classification_lattice::evaluate_lattice_access(
             "lookup-first",
@@ -1488,7 +1500,9 @@ fn lookup_principal_authority(
     if let Some(trusted) = markings::trusted_service_authority(actor) {
         return Ok(trusted);
     }
-    let candidates = db.find_all_by_external_id(&markings::principal_profile_external_id(actor))?;
+    let candidates = db
+        .runtime()
+        .find_all_by_external_id(&markings::principal_profile_external_id(actor))?;
     let mut trusted_profiles = Vec::new();
     for object in &candidates {
         if object.kind != markings::PRINCIPAL_PROFILE_KIND
@@ -1499,7 +1513,7 @@ fn lookup_principal_authority(
         {
             continue;
         }
-        let grants = db.list_grants(&object.id)?;
+        let grants = db.runtime().list_grants(&object.id)?;
         if grants.iter().any(|grant| matches!(grant.role, Role::Admin)) {
             trusted_profiles.push(object);
         }
@@ -1517,13 +1531,13 @@ fn redact_lookup_object(
     db: &ChiseiStore,
 ) -> Result<Object, String> {
     let mut schema_registry = SchemaRegistry::new();
-    if let Some(object_type) = db.get_object_type(&object.kind)? {
+    if let Some(object_type) = db.runtime().get_object_type(&object.kind)? {
         schema_registry.register(object_type);
     }
     let mut projected = object.clone();
     compute::resolve_schema_computed_with_filter(
         &mut projected,
-        db,
+        db.runtime(),
         &schema_registry,
         |candidate| {
             (candidate.namespace.is_empty() || candidate.namespace == namespace)
@@ -1534,17 +1548,18 @@ fn redact_lookup_object(
         .iter()
         .any(|principal| matches!(principal.as_str(), "root" | "local"))
     {
-        return db.project_object_property_grants(projected);
+        return db.runtime().project_object_property_grants(projected);
     }
     let is_admin = db
+        .runtime()
         .list_grants(&projected.id)?
         .iter()
         .any(|grant| principals.contains(&grant.principal) && matches!(grant.role, Role::Admin));
     if is_admin {
-        return db.project_object_property_grants(projected);
+        return db.runtime().project_object_property_grants(projected);
     }
     let Some(object_type) = schema_registry.get(&projected.kind) else {
-        return db.project_object_property_grants(projected);
+        return db.runtime().project_object_property_grants(projected);
     };
     let mut redacted = projected;
     for property in &object_type.properties {
@@ -1556,7 +1571,7 @@ fn redact_lookup_object(
                 .insert(property.name.clone(), "[redacted]".into());
         }
     }
-    db.project_object_property_grants(redacted)
+    db.runtime().project_object_property_grants(redacted)
 }
 
 /// Run the lookup-first fixture suite against a prepared database.
@@ -2129,17 +2144,17 @@ pub fn seed_s1_fixture_graph(db: &ChiseiStore) -> Result<(), String> {
             created: now,
             updated: now,
         };
-        db.create_object(&object)?;
+        db.runtime().create_object(&object)?;
     }
     // Restrict acl-denied so only bob can read it.
-    db.create_grant(&Grant {
+    db.runtime().create_grant(&Grant {
         id: "grant-acl-denied-bob".into(),
         object_id: "acl-denied".into(),
         principal: "bob".into(),
         role: Role::Viewer,
         created: now,
     })?;
-    db.create_link(&Link {
+    db.runtime().create_link(&Link {
         id: "lookup-link-contains".into(),
         from_id: "lookup-root".into(),
         to_id: "lookup-child".into(),
@@ -2444,7 +2459,11 @@ mod tests {
         assert!(report.suite_digest.starts_with("sha256:"));
 
         let decision_id = record_lookup_promotion_gate(&db, "alice", &report).expect("audit");
-        let decision = db.get_decision(&decision_id).expect("read audit").unwrap();
+        let decision = db
+            .runtime()
+            .get_decision(&decision_id)
+            .expect("read audit")
+            .unwrap();
         assert_eq!(decision.action, LOOKUP_FIRST_GATE_AUDIT_ACTION);
         assert_eq!(decision.outcome, "allow");
         assert_eq!(decision.evidence["failed"], "0");
@@ -2476,7 +2495,11 @@ mod tests {
         assert_eq!(report.cases[0].answer_path, ANSWER_PATH_LOOKUP_HIT);
         assert!(!report.cases[0].passed);
         let decision_id = record_lookup_promotion_gate(&db, "alice", &report).expect("audit");
-        let decision = db.get_decision(&decision_id).expect("read audit").unwrap();
+        let decision = db
+            .runtime()
+            .get_decision(&decision_id)
+            .expect("read audit")
+            .unwrap();
         assert_eq!(decision.outcome, "deny");
         assert!(
             decision

@@ -43,7 +43,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
@@ -76,27 +76,32 @@ impl SekaiServiceImpl {
             ));
         }
         enforce_namespace_tenant_context(
-            &self.db,
+            self.db.runtime(),
             tenant_context.as_ref(),
             &object.namespace,
             true,
         )?;
-        check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+        check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
         enforce_optional_ontology_revision_pin(
-            &self.db,
+            self.db.runtime(),
             revision_pin.as_deref(),
             &object.namespace,
         )?;
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
-            LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            check_team_namespace(
+                self.db.runtime(),
+                &principals,
+                &precondition.namespace,
+                true,
+            )?;
+            LeaseLifecycle::new(self.db.runtime(), &self.security, &self.site_id)
                 .with_policy_context(principal_policy_context_from(
                     &principals,
                     tenant_context.as_ref(),
@@ -109,12 +114,12 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         let domain_object = from_proto_obj(&object);
-        validate_written_access_marking(&self.db, &domain_object)?;
+        validate_written_access_marking(self.db.runtime(), &domain_object)?;
         let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
+            || ObjectMutation::direct(self.db.runtime()),
             |precondition| {
                 ObjectMutation::guarded(
-                    &self.db,
+                    self.db.runtime(),
                     MutationLeasePrecondition {
                         namespace: &precondition.namespace,
                         key: &precondition.key,
@@ -129,7 +134,7 @@ impl SekaiServiceImpl {
             .map_err(map_mutation_persistence_error)?
         {
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 &created,
                 &principals,
                 tenant_context.as_ref(),
@@ -177,9 +182,9 @@ impl SekaiServiceImpl {
             )?;
             drop(schema);
         }
-        enforce_property_grant_mutation(&self.db, None, &mut domain_object)?;
+        enforce_property_grant_mutation(self.db.runtime(), None, &mut domain_object)?;
         enforce_object_operation_access(
-            &self.db,
+            self.db.runtime(),
             &domain_object,
             &principals,
             tenant_context.as_ref(),
@@ -187,7 +192,8 @@ impl SekaiServiceImpl {
             &format!("guarded_create_object:{}", domain_object.id),
             purpose.as_ref(),
         )?;
-        let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
+        let policy_generation =
+            object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let created = mutation
             .with_policy_generation(&policy_generation)
@@ -205,8 +211,8 @@ impl SekaiServiceImpl {
                 role: security::Role::Admin,
                 created: now_millis(),
             };
-            if let Err(error) = self.db.create_grant(&grant) {
-                let _ = self.db.delete_object(&created.id);
+            if let Err(error) = self.db.runtime().create_grant(&grant) {
+                let _ = self.db.runtime().delete_object(&created.id);
                 return Err(Status::internal(error));
             }
             self.security.add_grant(&grant);
@@ -229,7 +235,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
@@ -246,10 +252,14 @@ impl SekaiServiceImpl {
                 "namespace:* external IDs are reserved for namespace boundaries",
             ));
         }
-        let existing = self.db.get_object(&object.id).map_err(Status::internal)?;
+        let existing = self
+            .db
+            .runtime()
+            .get_object(&object.id)
+            .map_err(Status::internal)?;
         if let Some(current) = &existing
             && evaluate_active_object_policy(
-                &self.db,
+                self.db.runtime(),
                 current,
                 &principals,
                 tenant_context.as_ref(),
@@ -279,29 +289,29 @@ impl SekaiServiceImpl {
         }
         if let Some(existing) = &existing {
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &existing.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+            check_team_namespace(self.db.runtime(), &principals, &existing.namespace, true)?;
         }
         enforce_namespace_tenant_context(
-            &self.db,
+            self.db.runtime(),
             tenant_context.as_ref(),
             &object.namespace,
             true,
         )?;
-        check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+        check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
         check_write(&self.security, &object.id, &principals)?;
         enforce_optional_ontology_revision_pin(
-            &self.db,
+            self.db.runtime(),
             revision_pin.as_deref(),
             &object.namespace,
         )?;
         if let Some(existing) = &existing {
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 existing,
                 &principals,
                 tenant_context.as_ref(),
@@ -312,13 +322,18 @@ impl SekaiServiceImpl {
         }
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
-            LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            check_team_namespace(
+                self.db.runtime(),
+                &principals,
+                &precondition.namespace,
+                true,
+            )?;
+            LeaseLifecycle::new(self.db.runtime(), &self.security, &self.site_id)
                 .with_policy_context(principal_policy_context_from(
                     &principals,
                     tenant_context.as_ref(),
@@ -334,13 +349,13 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         let mut domain_object = from_proto_obj(&object);
-        validate_written_access_marking(&self.db, &domain_object)?;
+        validate_written_access_marking(self.db.runtime(), &domain_object)?;
         let request_object = domain_object.clone();
         let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
+            || ObjectMutation::direct(self.db.runtime()),
             |precondition| {
                 ObjectMutation::guarded(
-                    &self.db,
+                    self.db.runtime(),
                     MutationLeasePrecondition {
                         namespace: &precondition.namespace,
                         key: &precondition.key,
@@ -355,7 +370,7 @@ impl SekaiServiceImpl {
             .map_err(map_mutation_persistence_error)?
         {
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 &updated,
                 &principals,
                 tenant_context.as_ref(),
@@ -387,7 +402,11 @@ impl SekaiServiceImpl {
                 markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
                 "true".into(),
             );
-            enforce_property_grant_mutation(&self.db, existing.as_ref(), &mut domain_object)?;
+            enforce_property_grant_mutation(
+                self.db.runtime(),
+                existing.as_ref(),
+                &mut domain_object,
+            )?;
         } else {
             self.require_schema_kind_loaded(&domain_object.kind)?;
             let schema = self
@@ -396,14 +415,18 @@ impl SekaiServiceImpl {
                 .map_err(map_schema_definition_lifecycle_error)?;
             if existing.is_some() {
                 preserve_redacted_restricted_properties(
-                    &self.db,
+                    self.db.runtime(),
                     &schema,
                     &self.security,
                     &principals,
                     &mut domain_object,
                 )?;
             }
-            enforce_property_grant_mutation(&self.db, existing.as_ref(), &mut domain_object)?;
+            enforce_property_grant_mutation(
+                self.db.runtime(),
+                existing.as_ref(),
+                &mut domain_object,
+            )?;
             schema
                 .validate(&domain_object)
                 .map_err(Status::invalid_argument)?;
@@ -411,14 +434,14 @@ impl SekaiServiceImpl {
         }
         if let Some(existing) = &existing {
             validate_object_kind_change_access(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 &principals,
                 existing,
                 &domain_object,
             )?;
             ensure_policy_driving_update_allowed(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 existing,
                 &domain_object,
@@ -426,7 +449,7 @@ impl SekaiServiceImpl {
             )?;
         }
         enforce_object_operation_access(
-            &self.db,
+            self.db.runtime(),
             &domain_object,
             &principals,
             tenant_context.as_ref(),
@@ -434,7 +457,8 @@ impl SekaiServiceImpl {
             &format!("guarded_update_object_proposed:{}", domain_object.id),
             purpose.as_ref(),
         )?;
-        let policy_generation = object_security_generation(&self.db, &domain_object.namespace)?;
+        let policy_generation =
+            object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let updated = mutation
             .with_policy_generation(&policy_generation)
@@ -463,16 +487,20 @@ impl SekaiServiceImpl {
     ) -> Result<Response<GuardedDeleteObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
             require_authenticated(&principals)?;
         }
-        let expected = self.db.get_object(&input.id).map_err(Status::internal)?;
+        let expected = self
+            .db
+            .runtime()
+            .get_object(&input.id)
+            .map_err(Status::internal)?;
         if let Some(current) = &expected
             && evaluate_active_object_policy(
-                &self.db,
+                self.db.runtime(),
                 current,
                 &principals,
                 tenant_context.as_ref(),
@@ -491,20 +519,25 @@ impl SekaiServiceImpl {
         check_write(&self.security, &input.id, &principals)?;
         if let Some(current) = &expected {
             enforce_optional_ontology_revision_pin(
-                &self.db,
+                self.db.runtime(),
                 revision_pin.as_deref(),
                 &current.namespace,
             )?;
         }
         if let Some(precondition) = &precondition {
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &precondition.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &precondition.namespace, true)?;
-            LeaseLifecycle::new(&self.db, &self.security, &self.site_id)
+            check_team_namespace(
+                self.db.runtime(),
+                &principals,
+                &precondition.namespace,
+                true,
+            )?;
+            LeaseLifecycle::new(self.db.runtime(), &self.security, &self.site_id)
                 .with_policy_context(principal_policy_context_from(
                     &principals,
                     tenant_context.as_ref(),
@@ -521,14 +554,14 @@ impl SekaiServiceImpl {
         }
         if let Some(existing) = &expected {
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &existing.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &existing.namespace, true)?;
+            check_team_namespace(self.db.runtime(), &principals, &existing.namespace, true)?;
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 existing,
                 &principals,
                 tenant_context.as_ref(),
@@ -560,13 +593,13 @@ impl SekaiServiceImpl {
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let policy_generation = expected
             .as_ref()
-            .map(|object| object_security_generation(&self.db, &object.namespace))
+            .map(|object| object_security_generation(self.db.runtime(), &object.namespace))
             .transpose()?;
         let mutation = precondition.as_ref().map_or_else(
-            || ObjectMutation::direct(&self.db),
+            || ObjectMutation::direct(self.db.runtime()),
             |precondition| {
                 ObjectMutation::guarded(
-                    &self.db,
+                    self.db.runtime(),
                     MutationLeasePrecondition {
                         namespace: &precondition.namespace,
                         key: &precondition.key,

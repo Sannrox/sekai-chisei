@@ -17,23 +17,24 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let id = req.into_inner().id;
         let obj = self
             .db
+            .runtime()
             .get_object_with_policy_context(&id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         let namespace = obj.namespace.clone();
         require_purpose_for_kind(
-            &self.db,
+            self.db.runtime(),
             &namespace,
             &obj.kind,
             purpose.as_ref(),
             &format!("get_object:{id}"),
         )?;
         let visibility = require_visible_read_root(
-            &self.db,
+            self.db.runtime(),
             &self.security,
             obj,
             &principals,
@@ -46,6 +47,7 @@ impl SekaiServiceImpl {
             Err(status) if status.code() == tonic::Code::PermissionDenied => {
                 let activated = self
                     .db
+                    .runtime()
                     .get_object_security_activation(&namespace)
                     .map_err(Status::internal)?
                     .is_some();
@@ -53,7 +55,11 @@ impl SekaiServiceImpl {
             }
             Err(status) => return Err(status),
         };
-        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &namespace)?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &namespace,
+        )?;
         if marking.decision != markings::MarkingDecision::NotApplicable {
             let actor = principals.first().cloned().unwrap_or_default();
             let mut evidence = HashMap::new();
@@ -65,7 +71,7 @@ impl SekaiServiceImpl {
             }
             evidence.insert("detail".into(), marking.detail.clone());
             record_marking_or_purpose_decision(
-                &self.db,
+                self.db.runtime(),
                 &actor,
                 "marking.read",
                 &obj.id,
@@ -93,7 +99,7 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let invoked_capability = req
             .metadata()
             .get("x-sekai-capability")
@@ -140,7 +146,7 @@ impl SekaiServiceImpl {
                 .or(metadata_namespace)
                 .unwrap_or_default();
             enforce_optional_ontology_revision_pin(
-                &self.db,
+                self.db.runtime(),
                 revision_pin.as_deref(),
                 &list_namespace,
             )?;
@@ -149,7 +155,12 @@ impl SekaiServiceImpl {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("tenant context requires an explicit namespace filter")
             })?;
-            enforce_namespace_tenant_context(&self.db, tenant_context.as_ref(), namespace, false)?;
+            enforce_namespace_tenant_context(
+                self.db.runtime(),
+                tenant_context.as_ref(),
+                namespace,
+                false,
+            )?;
         }
         let operation_id = invoked_capability.as_ref().map(|_| {
             requested_operation_id
@@ -166,7 +177,7 @@ impl SekaiServiceImpl {
             let operation_id = operation_id.as_ref().unwrap();
             let actor = principals.first().cloned().unwrap_or_default();
             receipt_guard = Some(CatalogInvocation::begin(
-                &self.db,
+                self.db.runtime(),
                 operation_id.clone(),
                 namespace,
                 actor,
@@ -183,11 +194,11 @@ impl SekaiServiceImpl {
                 return Err(Status::failed_precondition("capability unavailable"));
             }
         }
-        if is_managed_team_principal(&self.db, &principals)? {
+        if is_managed_team_principal(self.db.runtime(), &principals)? {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {
                 Status::permission_denied("team principals must filter by namespace")
             })?;
-            check_team_namespace(&self.db, &principals, namespace, false)?;
+            check_team_namespace(self.db.runtime(), &principals, namespace, false)?;
         }
         // Never expose internal governance objects through generic listing.
         if filter
@@ -221,7 +232,7 @@ impl SekaiServiceImpl {
                 queried_properties.clone(),
             )?;
             ensure_property_grant_query_allowed(
-                &self.db,
+                self.db.runtime(),
                 filter.namespace.as_deref(),
                 filter.kind.as_deref(),
                 queried_properties,
@@ -245,6 +256,7 @@ impl SekaiServiceImpl {
         } else {
             match self
                 .db
+                .runtime()
                 .get_object_security_activation(&cursor_namespace)
                 .map_err(Status::internal)?
             {
@@ -281,7 +293,7 @@ impl SekaiServiceImpl {
         // The API now defaults paging at 100 rows when no limit is provided;
         // DB callers using list_objects(&filter) remain unchanged.
         let (objects, total) = list_objects_with_marking(
-            &self.db,
+            self.db.runtime(),
             &filter,
             &principals,
             &policy_context,
@@ -343,10 +355,11 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let external_id = req.into_inner().external_id;
         let candidates = self
             .db
+            .runtime()
             .find_all_by_external_id_with_policy_context(&external_id, &policy_context)
             .map_err(Status::internal)?;
         let mut first_acl_denied = None;
@@ -354,7 +367,7 @@ impl SekaiServiceImpl {
         for candidate in candidates {
             if tenant_context.is_some()
                 && !object_is_visible(
-                    &self.db,
+                    self.db.runtime(),
                     &self.security,
                     &candidate,
                     &principals,
@@ -365,19 +378,24 @@ impl SekaiServiceImpl {
             }
             let Some(obj) = self
                 .db
+                .runtime()
                 .get_object_with_policy_context(&candidate.id, &policy_context)
                 .map_err(Status::internal)?
             else {
                 continue;
             };
             let namespace = obj.namespace.clone();
-            if enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &namespace)
-                .is_err()
+            if enforce_optional_ontology_revision_pin(
+                self.db.runtime(),
+                revision_pin.as_deref(),
+                &namespace,
+            )
+            .is_err()
             {
                 continue;
             }
             if !purpose_allows_kind(
-                &self.db,
+                self.db.runtime(),
                 &namespace,
                 &obj.kind,
                 purpose.as_ref(),
@@ -386,7 +404,7 @@ impl SekaiServiceImpl {
                 continue;
             }
             let visibility = require_visible_read_root(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 obj,
                 &principals,
@@ -399,6 +417,7 @@ impl SekaiServiceImpl {
                 Err(status) if status.code() == tonic::Code::PermissionDenied => {
                     let activated = self
                         .db
+                        .runtime()
                         .get_object_security_activation(&namespace)
                         .map_err(Status::internal)?
                         .is_some();
@@ -422,7 +441,7 @@ impl SekaiServiceImpl {
                 }
                 evidence.insert("detail".into(), marking.detail.clone());
                 record_marking_or_purpose_decision(
-                    &self.db,
+                    self.db.runtime(),
                     &actor,
                     "marking.read",
                     &obj.id,
@@ -455,7 +474,7 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let r = req.into_inner();
         if is_reserved_governance_kind(&r.kind) {
             return Ok(Response::new(ListObjectsResponse {
@@ -470,10 +489,16 @@ impl SekaiServiceImpl {
                 .snapshot()
                 .map_err(map_schema_definition_lifecycle_error)?;
             ensure_property_query_allowed(&schema, &principals, &r.kind, [r.key.clone()])?;
-            ensure_property_grant_query_allowed(&self.db, None, Some(&r.kind), [r.key.clone()])?;
+            ensure_property_grant_query_allowed(
+                self.db.runtime(),
+                None,
+                Some(&r.kind),
+                [r.key.clone()],
+            )?;
         }
         let objs = self
             .db
+            .runtime()
             .find_by_property_with_policy_context(&r.kind, &r.key, &r.value, &policy_context)
             .map_err(Status::internal)?;
         let refs: Vec<&str> = principals.iter().map(|s| s.as_str()).collect();
@@ -482,19 +507,19 @@ impl SekaiServiceImpl {
         let mut visible = Vec::new();
         for object in filtered {
             if object_is_visible(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 object,
                 &principals,
                 tenant_context.as_ref(),
             ) && enforce_optional_ontology_revision_pin(
-                &self.db,
+                self.db.runtime(),
                 revision_pin.as_deref(),
                 &object.namespace,
             )
             .is_ok()
                 && purpose_allows_kind(
-                    &self.db,
+                    self.db.runtime(),
                     &object.namespace,
                     &object.kind,
                     purpose.as_ref(),
@@ -525,23 +550,24 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
         let r = req.into_inner();
         let root = self
             .db
+            .runtime()
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         require_purpose_for_kind(
-            &self.db,
+            self.db.runtime(),
             &root.namespace,
             &root.kind,
             purpose.as_ref(),
             &format!("get_links:{}", r.object_id),
         )?;
         let (root, _) = require_visible_read_root(
-            &self.db,
+            self.db.runtime(),
             &self.security,
             root,
             &principals,
@@ -549,7 +575,11 @@ impl SekaiServiceImpl {
             &format!("get_links:{}", r.object_id),
             purpose.as_ref(),
         )?;
-        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &root.namespace,
+        )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -557,6 +587,7 @@ impl SekaiServiceImpl {
         };
         let links = self
             .db
+            .runtime()
             .get_links_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
         let mut recorded_purposes = HashSet::new();
@@ -564,18 +595,18 @@ impl SekaiServiceImpl {
         for link in links {
             let mut keep = true;
             for object_id in [&link.from_id, &link.to_id] {
-                let Some(object) = self.db.get_object(object_id).ok().flatten() else {
+                let Some(object) = self.db.runtime().get_object(object_id).ok().flatten() else {
                     keep = false;
                     break;
                 };
                 if !object_is_visible(
-                    &self.db,
+                    self.db.runtime(),
                     &self.security,
                     &object,
                     &principals,
                     tenant_context.as_ref(),
                 ) || !purpose_allows_kind(
-                    &self.db,
+                    self.db.runtime(),
                     &object.namespace,
                     &object.kind,
                     purpose.as_ref(),
@@ -602,22 +633,23 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let r = req.into_inner();
         let root = self
             .db
+            .runtime()
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         require_purpose_for_kind(
-            &self.db,
+            self.db.runtime(),
             &root.namespace,
             &root.kind,
             purpose.as_ref(),
             &format!("get_linked_objects:{}", r.object_id),
         )?;
         let (root, _) = require_visible_read_root(
-            &self.db,
+            self.db.runtime(),
             &self.security,
             root,
             &principals,
@@ -625,7 +657,11 @@ impl SekaiServiceImpl {
             &format!("get_linked_objects:{}", r.object_id),
             purpose.as_ref(),
         )?;
-        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &root.namespace,
+        )?;
         let dir = if r.direction == "incoming" {
             domain::Direction::Incoming
         } else {
@@ -633,19 +669,20 @@ impl SekaiServiceImpl {
         };
         let objs = self
             .db
+            .runtime()
             .get_linked_objects_with_policy_context(&root.id, &r.relation, &dir, &policy_context)
             .map_err(Status::internal)?;
         let mut recorded_purposes = HashSet::new();
         let mut visible_objs = Vec::new();
         for object in objs {
             if object_is_visible(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 &object,
                 &principals,
                 tenant_context.as_ref(),
             ) && purpose_allows_kind(
-                &self.db,
+                self.db.runtime(),
                 &object.namespace,
                 &object.kind,
                 purpose.as_ref(),
@@ -674,7 +711,7 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let q = req
             .into_inner()
             .query
@@ -695,18 +732,20 @@ impl SekaiServiceImpl {
         };
         let start = if !gq.start_id.is_empty() {
             self.db
+                .runtime()
                 .get_object_with_policy_context(&gq.start_id, &policy_context)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("not found"))?
         } else if !gq.start_external_id.is_empty() {
             let external_id = gq.start_external_id.clone();
             self.db
+                .runtime()
                 .find_all_by_external_id_with_policy_context(&external_id, &policy_context)
                 .map_err(Status::internal)?
                 .into_iter()
                 .find(|candidate| {
                     object_is_visible(
-                        &self.db,
+                        self.db.runtime(),
                         &self.security,
                         candidate,
                         &principals,
@@ -721,14 +760,14 @@ impl SekaiServiceImpl {
         };
         let start_operation = format!("traverse:{}", start.id);
         require_purpose_for_kind(
-            &self.db,
+            self.db.runtime(),
             &start.namespace,
             &start.kind,
             purpose.as_ref(),
             &start_operation,
         )?;
         let (start, _) = require_visible_read_root(
-            &self.db,
+            self.db.runtime(),
             &self.security,
             start,
             &principals,
@@ -737,7 +776,7 @@ impl SekaiServiceImpl {
             purpose.as_ref(),
         )?;
         enforce_optional_ontology_revision_pin(
-            &self.db,
+            self.db.runtime(),
             revision_pin.as_deref(),
             &start.namespace,
         )?;
@@ -756,7 +795,7 @@ impl SekaiServiceImpl {
                 queried_properties.clone(),
             )?;
             ensure_property_grant_query_allowed(
-                &self.db,
+                self.db.runtime(),
                 Some(&start.namespace),
                 Some(&start.kind),
                 queried_properties,
@@ -770,16 +809,17 @@ impl SekaiServiceImpl {
                     queried_properties.clone(),
                 )?;
                 ensure_property_grant_query_allowed(
-                    &self.db,
+                    self.db.runtime(),
                     Some(&start.namespace),
                     Some(kind),
                     queried_properties.clone(),
                 )?;
             }
         }
-        let authority = resolve_principal_authority(&self.db, &principals)?;
+        let authority = resolve_principal_authority(self.db.runtime(), &principals)?;
         let start_lattice = self
             .db
+            .runtime()
             .get_classification_lattice(&start.namespace)
             .map_err(|_| Status::unavailable("classification lattice unavailable"))?;
         let start_digest = start_lattice
@@ -797,13 +837,13 @@ impl SekaiServiceImpl {
             BTreeSet::from([start_path]),
         )]));
         let mut res = crate::sekai::query::traverse_with_policy_context(
-            &self.db,
+            self.db.runtime(),
             &gq,
             Some(&schema),
             Some(&policy_context),
             Some(&|parent, object| {
                 if !purpose_kind_permitted(
-                    &self.db,
+                    self.db.runtime(),
                     &object.namespace,
                     &object.kind,
                     purpose.as_ref(),
@@ -812,7 +852,7 @@ impl SekaiServiceImpl {
                 {
                     return Ok(None);
                 }
-                hop_marking_permitted(&self.db, &authority, &accumulated, parent, object)
+                hop_marking_permitted(self.db.runtime(), &authority, &accumulated, parent, object)
             }),
         )
         .map_err(|error| {
@@ -829,13 +869,13 @@ impl SekaiServiceImpl {
         let mut visible_objects = Vec::new();
         for object in res.objects {
             if object_is_visible(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 &object,
                 &principals,
                 tenant_context.as_ref(),
             ) && purpose_allows_kind(
-                &self.db,
+                self.db.runtime(),
                 &object.namespace,
                 &object.kind,
                 purpose.as_ref(),
@@ -868,22 +908,23 @@ impl SekaiServiceImpl {
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let r = req.into_inner();
         let root = self
             .db
+            .runtime()
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
         require_purpose_for_kind(
-            &self.db,
+            self.db.runtime(),
             &root.namespace,
             &root.kind,
             purpose.as_ref(),
             &format!("get_lineage:{}", r.object_id),
         )?;
         let (root, _) = require_visible_read_root(
-            &self.db,
+            self.db.runtime(),
             &self.security,
             root,
             &principals,
@@ -891,22 +932,27 @@ impl SekaiServiceImpl {
             &format!("get_lineage:{}", r.object_id),
             purpose.as_ref(),
         )?;
-        enforce_optional_ontology_revision_pin(&self.db, revision_pin.as_deref(), &root.namespace)?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &root.namespace,
+        )?;
         let mut res = self
             .db
+            .runtime()
             .get_lineage_with_policy_context(&root.id, r.max_nodes as usize, &policy_context)
             .map_err(Status::internal)?;
         let mut recorded_purposes = HashSet::new();
         let mut visible_nodes = Vec::new();
         for node in res.nodes {
             if object_is_visible(
-                &self.db,
+                self.db.runtime(),
                 &self.security,
                 &node.object,
                 &principals,
                 tenant_context.as_ref(),
             ) && purpose_allows_kind(
-                &self.db,
+                self.db.runtime(),
                 &node.object.namespace,
                 &node.object.kind,
                 purpose.as_ref(),

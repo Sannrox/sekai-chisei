@@ -36,7 +36,7 @@ impl ChiseiServiceImpl {
     pub(super) fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
         let mut rules = Vec::new();
         for ns in ["", namespace] {
-            let Ok(objects) = self.db.list_all_objects(&ListFilter {
+            let Ok(objects) = self.db.runtime().list_all_objects(&ListFilter {
                 kind: Some("leak_rule".into()),
                 namespace: Some(ns.to_string()),
                 ..Default::default()
@@ -74,6 +74,7 @@ impl ChiseiServiceImpl {
     pub(super) fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
         let objects = self
             .db
+            .runtime()
             .list_all_objects(&ListFilter {
                 namespace: Some(namespace.to_string()),
                 ..Default::default()
@@ -118,20 +119,23 @@ impl ChiseiServiceImpl {
             )
             .unwrap_or_else(|_| "[]".into()),
         );
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.egress".into(),
-            action: action.into(),
-            reason: "context egress policy applied".into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: if redacted_count > 0 {
-                "redacted".into()
-            } else {
-                "included".into()
-            },
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.egress".into(),
+                action: action.into(),
+                reason: "context egress policy applied".into(),
+                evidence,
+                target_id: request_id.into(),
+                outcome: if redacted_count > 0 {
+                    "redacted".into()
+                } else {
+                    "included".into()
+                },
+            });
     }
 
     pub(super) fn record_privacy_audit(
@@ -147,16 +151,19 @@ impl ChiseiServiceImpl {
         evidence.insert("provider".to_string(), provider.to_string());
         evidence.insert("data_class".to_string(), data_class.as_str().to_string());
         evidence.insert("task_class".to_string(), task_class.as_str().to_string());
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: "gate".into(),
-            reason: reason.into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: outcome.into(),
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.privacy".into(),
+                action: "gate".into(),
+                reason: reason.into(),
+                evidence,
+                target_id: request_id.into(),
+                outcome: outcome.into(),
+            });
     }
 
     pub(super) fn record_leak_audit(
@@ -185,23 +192,26 @@ impl ChiseiServiceImpl {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: action.into(),
-            reason: "leak checker evaluated outbound payload".into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: if findings
-                .iter()
-                .any(|finding| finding.action == LeakAction::Block)
-            {
-                "leak_blocked".into()
-            } else {
-                "leak_warned".into()
-            },
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.privacy".into(),
+                action: action.into(),
+                reason: "leak checker evaluated outbound payload".into(),
+                evidence,
+                target_id: request_id.into(),
+                outcome: if findings
+                    .iter()
+                    .any(|finding| finding.action == LeakAction::Block)
+                {
+                    "leak_blocked".into()
+                } else {
+                    "leak_warned".into()
+                },
+            });
     }
 
     pub(super) async fn run_leak_reviewer(
@@ -313,15 +323,18 @@ impl ChiseiServiceImpl {
         let mut evidence = std::collections::HashMap::new();
         evidence.insert("provider".to_string(), provider.to_string());
         evidence.insert("reviewer_model".to_string(), reviewer_model.to_string());
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.privacy".into(),
-            action: "leak_review".into(),
-            reason: reason.into(),
-            evidence,
-            target_id: request_id.into(),
-            outcome: outcome.into(),
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.privacy".into(),
+                action: "leak_review".into(),
+                reason: reason.into(),
+                evidence,
+                target_id: request_id.into(),
+                outcome: outcome.into(),
+            });
     }
 }

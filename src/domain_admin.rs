@@ -121,7 +121,9 @@ impl DomainAdminSurface {
         Self {
             invitations: Arc::new(MemoryInvitationHooks::new()),
             entitlements: Arc::new(EntitlementRegistry::new()),
-            quotas: TenantQuotaGate::new(Arc::new(RuntimeDb::Sqlite(db.clone()))),
+            quotas: TenantQuotaGate::new(crate::db::store::ChiseiStore::from_shared_runtime(
+                Arc::new(RuntimeDb::Sqlite(db.clone())),
+            )),
             credentials: Arc::new(MemoryTenantProviderCredentialResolver::new()),
             db,
             roles: std::sync::RwLock::new(std::collections::HashMap::new()),

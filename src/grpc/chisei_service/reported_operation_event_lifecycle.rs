@@ -402,6 +402,7 @@ async fn report_operation_event(
     }
     let receipt = service
         .db
+        .runtime()
         .get_operation_receipt(&request.operation_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("operation receipt not found"))?;
@@ -423,6 +424,7 @@ async fn report_operation_event(
     }
     let receipt_has_kioku_context = !service
         .db
+        .runtime()
         .list_kioku_outcome_assignments(&receipt.operation_id)
         .map_err(Status::internal)?
         .is_empty()
@@ -504,7 +506,7 @@ async fn report_operation_event(
         && complete_kioku_outcome
         && trusted_outcome_reporter;
     let namespace_writer =
-        require_namespace_write_access(&service.db, &actor, &receipt.namespace).is_ok();
+        require_namespace_write_access(service.db.runtime(), &actor, &receipt.namespace).is_ok();
     if actor != receipt.initiating_actor
         && actor != "root"
         && !namespace_writer
@@ -677,7 +679,7 @@ async fn report_operation_event(
                 )));
     if should_preflight_attribution {
         reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
+            service.db.runtime(),
             &prospective_receipt,
             &actor,
             now,
@@ -691,6 +693,7 @@ async fn report_operation_event(
     }
     let (receipt, recorded) = service
         .db
+        .runtime()
         .append_operation_receipt_event(&request.operation_id, event)
         .map_err(|error| {
             if error.contains("not found") {
@@ -713,7 +716,7 @@ async fn report_operation_event(
                 )));
     if should_attribute
         && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            &service.db,
+            service.db.runtime(),
             &receipt,
             &actor,
             now,
@@ -722,19 +725,22 @@ async fn report_operation_event(
             false,
         )
     {
-        let _ = service.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: "chisei.kioku".into(),
-            action: "kioku.outcome_attribution".into(),
-            reason: error,
-            evidence: std::collections::HashMap::from([
-                ("operation_id".into(), receipt.operation_id.clone()),
-                ("receipt_event_id".into(), event_id.clone()),
-            ]),
-            target_id: receipt.operation_id.clone(),
-            outcome: "failed".into(),
-        });
+        let _ = service
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now,
+                actor: "chisei.kioku".into(),
+                action: "kioku.outcome_attribution".into(),
+                reason: error,
+                evidence: std::collections::HashMap::from([
+                    ("operation_id".into(), receipt.operation_id.clone()),
+                    ("receipt_event_id".into(), event_id.clone()),
+                ]),
+                target_id: receipt.operation_id.clone(),
+                outcome: "failed".into(),
+            });
     }
     Ok(Response::new(ReportOperationEventResponse {
         event_id,

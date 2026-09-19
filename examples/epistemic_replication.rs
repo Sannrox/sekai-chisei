@@ -1345,7 +1345,10 @@ fn install_evaluation_plan(
         ACTOR,
         NOW_MS,
     )?;
-    let service = ChiseiServiceImpl::new(Arc::new(db.clone()), fixture_config());
+    let service = ChiseiServiceImpl::new(
+        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(Arc::new(db.clone())),
+        fixture_config(),
+    );
     let definition_response = block_on_fixture(ChiseiGrpcService::put_evaluator_definition(
         &service,
         authenticated_request(chisei::PutEvaluatorDefinitionRequest {
@@ -1453,7 +1456,10 @@ fn execute_evaluation_plan(
     ),
     String,
 > {
-    let service = ChiseiServiceImpl::new(Arc::new(db.clone()), fixture_config());
+    let service = ChiseiServiceImpl::new(
+        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(Arc::new(db.clone())),
+        fixture_config(),
+    );
     let (manifest_digest, step_status, verdict, operation_id) = block_on_fixture(async {
         let resolution = ChiseiGrpcService::resolve_evaluation_plan(
             &service,

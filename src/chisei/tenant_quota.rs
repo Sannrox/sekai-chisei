@@ -109,7 +109,7 @@ pub struct TenantQuotaGate {
 impl TenantQuotaGate {
     pub fn new(db: impl Into<ChiseiStore>) -> Self {
         Self {
-            tracker: BudgetTracker::new(db),
+            tracker: BudgetTracker::new(db.into()),
         }
     }
 

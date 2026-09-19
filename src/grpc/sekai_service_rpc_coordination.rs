@@ -6,7 +6,7 @@ pub(super) async fn create_contention_scope(
 ) -> Result<Response<CreateContentionScopeResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    if is_managed_team_principal(&service.db, &principals)? {
+    if is_managed_team_principal(service.db.runtime(), &principals)? {
         return Err(Status::permission_denied(
             "managed team principals cannot create global contention scopes",
         ));
@@ -22,12 +22,14 @@ pub(super) async fn create_contention_scope(
         .ok_or(Status::unauthenticated("principal required"))?;
     if let Some(existing) = service
         .db
+        .runtime()
         .get_dedup_request(&inner.request_id, "create_contention_scope")
         .map_err(Status::internal)?
         .filter(|record| record.principal == owner)
     {
         let scope = service
             .db
+            .runtime()
             .get_contention_scope(&existing.scope_id)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("scope not found"))?;
@@ -40,10 +42,12 @@ pub(super) async fn create_contention_scope(
     }
     service
         .db
+        .runtime()
         .create_contention_scope(&scope)
         .map_err(Status::invalid_argument)?;
     service
         .db
+        .runtime()
         .record_dedup_request(&coordination::RequestDedup {
             request_id: inner.request_id,
             operation: "create_contention_scope".into(),
@@ -70,18 +74,21 @@ pub(super) async fn update_contention_scope(
         .map(|scope| from_proto_contention_scope(&scope))?;
     let existing = service
         .db
+        .runtime()
         .get_contention_scope(&scope.id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("scope not found"))?;
     check_scope_write(&existing, &principals)?;
     if let Some(record) = service
         .db
+        .runtime()
         .get_dedup_request(&inner.request_id, "update_contention_scope")
         .map_err(Status::internal)?
     {
         if record.scope_id == scope.id && record.principal == dedup_principal(&principals) {
             let scope = service
                 .db
+                .runtime()
                 .get_contention_scope(&scope.id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("scope not found"))?;
@@ -92,10 +99,12 @@ pub(super) async fn update_contention_scope(
     }
     service
         .db
+        .runtime()
         .update_contention_scope(&scope)
         .map_err(Status::invalid_argument)?;
     service
         .db
+        .runtime()
         .record_dedup_request(&coordination::RequestDedup {
             request_id: inner.request_id,
             operation: "update_contention_scope".into(),
@@ -117,6 +126,7 @@ pub(super) async fn get_contention_scope(
     require_authenticated(&principals)?;
     let scope = service
         .db
+        .runtime()
         .get_contention_scope(&req.into_inner().id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("scope not found"))?;
@@ -133,6 +143,7 @@ pub(super) async fn list_contention_scopes(
     require_authenticated(&principals)?;
     let scopes = service
         .db
+        .runtime()
         .list_contention_scopes()
         .map_err(Status::internal)?
         .into_iter()
@@ -156,7 +167,7 @@ pub(super) async fn create_work_unit(
         .first()
         .cloned()
         .ok_or(Status::unauthenticated("principal required"))?;
-    let work_unit = WorkUnitLifecycle::new(&service.db)
+    let work_unit = WorkUnitLifecycle::new(service.db.runtime())
         .create(
             CreateWorkUnit {
                 work_unit,
@@ -165,25 +176,29 @@ pub(super) async fn create_work_unit(
                 now_ms: chrono::Utc::now().timestamp_millis(),
             },
             |target| match target {
-                CreateAuthorizationTarget::IdempotencyReplay(existing) => {
-                    check_work_unit_read(&service.db, &service.security, existing, &principals)
-                }
+                CreateAuthorizationTarget::IdempotencyReplay(existing) => check_work_unit_read(
+                    service.db.runtime(),
+                    &service.security,
+                    existing,
+                    &principals,
+                ),
                 CreateAuthorizationTarget::New(candidate) => {
                     if !candidate.target_object_id.is_empty() {
                         check_object_namespace_access(
-                            &service.db,
+                            service.db.runtime(),
                             &principals,
                             &candidate.target_object_id,
                             true,
                         )?;
                         check_write(&service.security, &candidate.target_object_id, &principals)?;
-                    } else if is_managed_team_principal(&service.db, &principals)? {
+                    } else if is_managed_team_principal(service.db.runtime(), &principals)? {
                         return Err(Status::permission_denied(
                             "team work units require a namespace-bound target object",
                         ));
                     }
                     let scope = service
                         .db
+                        .runtime()
                         .get_contention_scope(&candidate.scope_id)
                         .map_err(Status::internal)?
                         .ok_or(Status::not_found("scope not found"))?;
@@ -207,10 +222,16 @@ pub(super) async fn get_work_unit(
     require_authenticated(&principals)?;
     let work_unit = service
         .db
+        .runtime()
         .get_work_unit(&req.into_inner().id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_read(&service.db, &service.security, &work_unit, &principals)?;
+    check_work_unit_read(
+        service.db.runtime(),
+        &service.security,
+        &work_unit,
+        &principals,
+    )?;
     Ok(Response::new(GetWorkUnitResponse {
         work_unit: Some(to_proto_work_unit(&work_unit)),
     }))
@@ -244,6 +265,7 @@ pub(super) async fn list_work_units(
             };
             let batch = service
                 .db
+                .runtime()
                 .list_work_units(&batch_filter)
                 .map_err(Status::internal)?;
             if batch.is_empty() {
@@ -261,8 +283,13 @@ pub(super) async fn list_work_units(
                 page_token = coordination::make_page_token(last.created_at, &last.id);
             }
             for work_unit in rows {
-                if check_work_unit_read(&service.db, &service.security, work_unit, &principals)
-                    .is_ok()
+                if check_work_unit_read(
+                    service.db.runtime(),
+                    &service.security,
+                    work_unit,
+                    &principals,
+                )
+                .is_ok()
                 {
                     visible.push(work_unit.clone());
                     if visible.len() > visible_limit {
@@ -283,11 +310,18 @@ pub(super) async fn list_work_units(
     } else {
         service
             .db
+            .runtime()
             .list_work_units(&from_proto_work_unit_filter(&filter))
             .map_err(Status::internal)?
             .into_iter()
             .filter(|work_unit| {
-                check_work_unit_read(&service.db, &service.security, work_unit, &principals).is_ok()
+                check_work_unit_read(
+                    service.db.runtime(),
+                    &service.security,
+                    work_unit,
+                    &principals,
+                )
+                .is_ok()
             })
             .collect::<Vec<_>>()
     };
@@ -316,17 +350,23 @@ pub(super) async fn try_admit_work_unit(
     let work_unit_id = inner.work_unit_id;
     let work_unit = service
         .db
+        .runtime()
         .get_work_unit(&work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_write(&service.db, &service.security, &work_unit, &principals)?;
+    check_work_unit_write(
+        service.db.runtime(),
+        &service.security,
+        &work_unit,
+        &principals,
+    )?;
     let owner = principals
         .first()
         .cloned()
         .ok_or(Status::unauthenticated("principal required"))?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let principal = dedup_principal(&principals);
-    let result = WorkUnitLifecycle::new(&service.db)
+    let result = WorkUnitLifecycle::new(service.db.runtime())
         .admit(AdmitWorkUnit {
             work_unit_id: &work_unit_id,
             request_id: &inner.request_id,
@@ -357,12 +397,18 @@ pub(super) async fn heartbeat_work_unit(
     let work_unit_id = inner.work_unit_id;
     let existing = service
         .db
+        .runtime()
         .get_work_unit(&work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_write(&service.db, &service.security, &existing, &principals)?;
+    check_work_unit_write(
+        service.db.runtime(),
+        &service.security,
+        &existing,
+        &principals,
+    )?;
     let work_unit = transition_work_unit(
-        &service.db,
+        service.db.runtime(),
         &principals,
         &work_unit_id,
         &inner.request_id,
@@ -382,12 +428,18 @@ pub(super) async fn complete_work_unit(
     let work_unit_id = inner.work_unit_id;
     let existing = service
         .db
+        .runtime()
         .get_work_unit(&work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_write(&service.db, &service.security, &existing, &principals)?;
+    check_work_unit_write(
+        service.db.runtime(),
+        &service.security,
+        &existing,
+        &principals,
+    )?;
     let work_unit = transition_work_unit(
-        &service.db,
+        service.db.runtime(),
         &principals,
         &work_unit_id,
         &inner.request_id,
@@ -406,12 +458,18 @@ pub(super) async fn fail_work_unit(
     let inner = req.into_inner();
     let existing = service
         .db
+        .runtime()
         .get_work_unit(&inner.work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_write(&service.db, &service.security, &existing, &principals)?;
+    check_work_unit_write(
+        service.db.runtime(),
+        &service.security,
+        &existing,
+        &principals,
+    )?;
     let work_unit = transition_work_unit(
-        &service.db,
+        service.db.runtime(),
         &principals,
         &inner.work_unit_id,
         &inner.request_id,
@@ -430,12 +488,18 @@ pub(super) async fn cancel_work_unit(
     let inner = req.into_inner();
     let existing = service
         .db
+        .runtime()
         .get_work_unit(&inner.work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_write(&service.db, &service.security, &existing, &principals)?;
+    check_work_unit_write(
+        service.db.runtime(),
+        &service.security,
+        &existing,
+        &principals,
+    )?;
     let work_unit = transition_work_unit(
-        &service.db,
+        service.db.runtime(),
         &principals,
         &inner.work_unit_id,
         &inner.request_id,
@@ -454,6 +518,7 @@ pub(super) async fn list_reservations(
     let inner = req.into_inner();
     let reservations = service
         .db
+        .runtime()
         .list_reservations(&coordination::ReservationFilter {
             work_unit_id: if inner.work_unit_id.is_empty() {
                 None
@@ -476,10 +541,17 @@ pub(super) async fn list_reservations(
     for reservation in reservations {
         if let Some(work_unit) = service
             .db
+            .runtime()
             .get_work_unit(&reservation.work_unit_id)
             .map_err(Status::internal)?
         {
-            if check_work_unit_read(&service.db, &service.security, &work_unit, &principals).is_ok()
+            if check_work_unit_read(
+                service.db.runtime(),
+                &service.security,
+                &work_unit,
+                &principals,
+            )
+            .is_ok()
             {
                 visible.push(to_proto_reservation(&reservation));
             }
@@ -498,13 +570,20 @@ pub(super) async fn list_run_events(
     let inner = req.into_inner();
     let work_unit = service
         .db
+        .runtime()
         .get_work_unit(&inner.work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_read(&service.db, &service.security, &work_unit, &principals)?;
+    check_work_unit_read(
+        service.db.runtime(),
+        &service.security,
+        &work_unit,
+        &principals,
+    )?;
     let limit = inner.limit;
     let mut events = service
         .db
+        .runtime()
         .list_run_events(
             &inner.work_unit_id,
             inner.limit,
@@ -541,7 +620,7 @@ pub(super) async fn reconcile_work_units(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    let summary = WorkUnitLifecycle::new(&service.db)
+    let summary = WorkUnitLifecycle::new(service.db.runtime())
         .reconcile(ReconcileWorkUnits {
             work_unit_id: &inner.work_unit_id,
             scope_id: &inner.scope_id,

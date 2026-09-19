@@ -2,8 +2,10 @@
 //!
 //! Combined mode opens two physical stores when destination variables are
 //! set. One [`RuntimeDb`] behind both handles remains an explicit
-//! compatibility facade (`split_shared_runtime`) for a single `DB_PATH` /
-//! `DATABASE_URL` until relocation. Chisei constructors never take
+//! compatibility facade (`from_shared_runtime` / `split_shared_runtime`)
+//! for a single `DB_PATH` / `DATABASE_URL` until relocation. Handles do
+//! not `Deref`, `From`, or `AsRef` to [`RuntimeDb`]: wrong-plane access
+//! has to name that constructor. Chisei constructors never take
 //! `RuntimeDb` and Sekai constructors never take a Chisei handle.
 
 use std::sync::Arc;
@@ -42,12 +44,11 @@ impl SekaiStore {
         ))))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn runtime(&self) -> &RuntimeDb {
+    pub fn runtime(&self) -> &RuntimeDb {
         &self.inner
     }
 
-    pub(crate) fn runtime_arc(&self) -> Arc<RuntimeDb> {
+    pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
     }
 }
@@ -67,72 +68,12 @@ impl ChiseiStore {
         ))))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn runtime(&self) -> &RuntimeDb {
+    pub fn runtime(&self) -> &RuntimeDb {
         &self.inner
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn runtime_arc(&self) -> Arc<RuntimeDb> {
+    pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
-    }
-}
-
-impl From<Arc<RuntimeDb>> for SekaiStore {
-    fn from(db: Arc<RuntimeDb>) -> Self {
-        Self::from_shared_runtime(db)
-    }
-}
-
-impl From<Arc<RuntimeDb>> for ChiseiStore {
-    fn from(db: Arc<RuntimeDb>) -> Self {
-        Self::from_shared_runtime(db)
-    }
-}
-
-impl From<RuntimeDb> for SekaiStore {
-    fn from(db: RuntimeDb) -> Self {
-        Self::from_shared_runtime(Arc::new(db))
-    }
-}
-
-impl From<RuntimeDb> for ChiseiStore {
-    fn from(db: RuntimeDb) -> Self {
-        Self::from_shared_runtime(Arc::new(db))
-    }
-}
-
-impl From<&RuntimeDb> for ChiseiStore {
-    fn from(db: &RuntimeDb) -> Self {
-        Self::from(db.clone())
-    }
-}
-
-impl std::ops::Deref for SekaiStore {
-    type Target = RuntimeDb;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::Deref for ChiseiStore {
-    type Target = RuntimeDb;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl AsRef<RuntimeDb> for SekaiStore {
-    fn as_ref(&self) -> &RuntimeDb {
-        &self.inner
-    }
-}
-
-impl AsRef<RuntimeDb> for ChiseiStore {
-    fn as_ref(&self) -> &RuntimeDb {
-        &self.inner
     }
 }
 
@@ -144,14 +85,47 @@ mod tests {
     fn split_shared_runtime_is_one_physical_store() {
         let db = Arc::new(RuntimeDb::memory());
         let (sekai, chisei) = split_shared_runtime(db);
-        assert_eq!(sekai.backend_name(), chisei.backend_name());
-        assert_eq!(sekai.backend_name(), "sqlite");
+        assert_eq!(
+            sekai.runtime().backend_name(),
+            chisei.runtime().backend_name()
+        );
+        assert_eq!(sekai.runtime().backend_name(), "sqlite");
     }
 
     #[test]
     fn chisei_memory_does_not_require_naming_runtime_db_at_callers() {
         let store = ChiseiStore::memory();
-        store.ping().expect("memory store pings");
+        store.runtime().ping().expect("memory store pings");
+    }
+
+    #[test]
+    fn typed_handles_do_not_coerce_to_runtime_db() {
+        let production = include_str!("store.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production handle module");
+        assert!(
+            !production.contains("impl std::ops::Deref"),
+            "typed handles must not Deref to RuntimeDb"
+        );
+        assert!(
+            !production.contains("impl From<"),
+            "typed handles must not From RuntimeDb"
+        );
+        assert!(
+            !production.contains("impl AsRef<RuntimeDb>"),
+            "typed handles must not AsRef RuntimeDb"
+        );
+        let sekai_service = include_str!("../grpc/sekai_service.rs");
+        assert!(
+            !sekai_service.contains("BudgetTracker"),
+            "Sekai service must not hold a Chisei BudgetTracker"
+        );
+        let budget = include_str!("../chisei/budget.rs");
+        assert!(
+            budget.contains("pub fn new(db: ChiseiStore)"),
+            "BudgetTracker::new must take ChiseiStore only"
+        );
     }
 
     #[test]

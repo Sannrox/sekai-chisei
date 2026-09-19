@@ -20,7 +20,7 @@ pub(super) async fn plan_execution(
             ));
         }
         require_execution_namespace_access_with_context(
-            &service.db,
+            service.db.runtime(),
             &service.config,
             &actor,
             context.as_ref(),
@@ -123,7 +123,7 @@ pub(super) async fn plan_content_execution(
             ));
         }
         require_execution_namespace_access_with_context(
-            &service.db,
+            service.db.runtime(),
             &service.config,
             &actor,
             context.as_ref(),
@@ -219,7 +219,12 @@ pub(super) async fn list_kioku_candidates(
     service: &ChiseiServiceImpl,
     req: Request<ListKiokuCandidatesRequest>,
 ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
-    require_team_namespace_access(&service.db, &service.config, &req, &req.get_ref().namespace)?;
+    require_team_namespace_access(
+        service.db.runtime(),
+        &service.config,
+        &req,
+        &req.get_ref().namespace,
+    )?;
     let actor = authenticated_actor(&req);
     let request = req.into_inner();
     if request.namespace.trim().is_empty() {
@@ -253,10 +258,12 @@ pub(super) async fn list_kioku_candidates(
         .map(|memory| -> Result<KiokuCandidateRecord, Status> {
             let evidence = service
                 .db
+                .runtime()
                 .list_kioku_evidence(&memory.id, memory.version)
                 .map_err(Status::internal)?;
             let validation = service
                 .db
+                .runtime()
                 .validate_kioku_candidate(&memory.id, memory.version)
                 .map_err(Status::internal)?;
             Ok(KiokuCandidateRecord {
@@ -424,10 +431,11 @@ pub(super) async fn get_sample_observation(
         return Err(Status::invalid_argument("namespace required"));
     }
     if !matches!(actor.as_str(), "root" | "local") {
-        require_namespace_access(&service.db, &actor, namespace.trim())?;
+        require_namespace_access(service.db.runtime(), &actor, namespace.trim())?;
     }
     let observation = service
         .db
+        .runtime()
         .get_sample_observation_in_namespace(request_id, namespace)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("sample observation not found"))?;
@@ -489,6 +497,7 @@ pub(super) async fn claim_gateway_dispatch(
     }
     let reserved = service
         .db
+        .runtime()
         .reserve_gateway_request_alias(
             &request.caller_scope,
             &request.request_alias,
@@ -503,6 +512,7 @@ pub(super) async fn claim_gateway_dispatch(
     }
     let claimed = service
         .db
+        .runtime()
         .claim_gateway_request_alias_dispatch(
             &request.caller_scope,
             &request.request_alias,
@@ -532,17 +542,21 @@ pub(super) async fn get_operation_receipt(
         if let Some(attempt) = attempt {
             match service
                 .db
+                .runtime()
                 .find_gateway_receipt_by_logical_operation_id(operation_id, Some(attempt))
             {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
-                Ok(None) if attempt == 1 => service.db.get_operation_receipt(operation_id),
+                Ok(None) if attempt == 1 => {
+                    service.db.runtime().get_operation_receipt(operation_id)
+                }
                 Ok(None) => Ok(None),
                 Err(error) => Err(error),
             }
         } else {
-            let exact = service.db.get_operation_receipt(operation_id);
+            let exact = service.db.runtime().get_operation_receipt(operation_id);
             let derived = service
                 .db
+                .runtime()
                 .find_gateway_receipt_by_logical_operation_id(operation_id, None);
             match (exact, derived) {
                 (Ok(Some(_)), Ok(Some(_))) => {
@@ -561,14 +575,21 @@ pub(super) async fn get_operation_receipt(
             ));
         }
         let alias_lookup = || {
-            service.db.find_operation_receipt_by_lookup_request_id(
-                request_id,
-                (!caller_scope.is_empty()).then_some(caller_scope),
-                None,
-            )
+            service
+                .db
+                .runtime()
+                .find_operation_receipt_by_lookup_request_id(
+                    request_id,
+                    (!caller_scope.is_empty()).then_some(caller_scope),
+                    None,
+                )
         };
         if caller_scope.is_empty() {
-            match service.db.find_operation_receipt_by_request_id(request_id) {
+            match service
+                .db
+                .runtime()
+                .find_operation_receipt_by_request_id(request_id)
+            {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
                 Ok(None) => alias_lookup(),
                 Err(error) => Err(error),
@@ -576,7 +597,10 @@ pub(super) async fn get_operation_receipt(
         } else {
             match alias_lookup() {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
-                Ok(None) => service.db.find_operation_receipt_by_request_id(request_id),
+                Ok(None) => service
+                    .db
+                    .runtime()
+                    .find_operation_receipt_by_request_id(request_id),
                 Err(error) => Err(error),
             }
         }
@@ -640,9 +664,9 @@ pub(super) async fn get_quality_trend(
     let actor = authenticated_actor(&req);
     let request = req.into_inner();
     let namespace = canonical_namespace(&request.namespace)?.to_string();
-    require_namespace_access(&service.db, &actor, &namespace)?;
+    require_namespace_access(service.db.runtime(), &actor, &namespace)?;
     let report = crate::quality_trend::query_quality_trends(
-        &service.db,
+        service.db.runtime(),
         &actor,
         &namespace,
         request.since_ms,
@@ -663,12 +687,14 @@ pub(super) async fn put_evaluator_definition(
     if request.definition.is_none() {
         let definition = service
             .db
+            .runtime()
             .get_evaluator_definition(&request.definition_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
-        require_namespace_write_access(&service.db, &actor, &definition.namespace)?;
+        require_namespace_write_access(service.db.runtime(), &actor, &definition.namespace)?;
         let availability = service
             .db
+            .runtime()
             .set_evaluator_availability(
                 &request.definition_id,
                 &request.availability_state,
@@ -697,9 +723,10 @@ pub(super) async fn put_evaluator_definition(
         ));
     }
     let definition = from_proto_evaluator_definition(request.definition.unwrap())?;
-    require_namespace_write_access(&service.db, &actor, &definition.namespace)?;
+    require_namespace_write_access(service.db.runtime(), &actor, &definition.namespace)?;
     let definition = service
         .db
+        .runtime()
         .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
         .map_err(map_evaluation_resource_error)?;
     let (implementation_executable, implementation_status) = service
@@ -707,7 +734,7 @@ pub(super) async fn put_evaluator_definition(
         .evaluator_capability(&definition);
     Ok(Response::new(PutEvaluatorDefinitionResponse {
         record: Some(evaluator_record(
-            &service.db,
+            service.db.runtime(),
             &definition,
             implementation_executable,
             &implementation_status,
@@ -725,12 +752,13 @@ pub(super) async fn put_evaluation_plan(
             .plan
             .ok_or_else(|| Status::invalid_argument("evaluation plan required"))?,
     );
-    require_namespace_write_access(&service.db, &actor, &plan.namespace)?;
+    require_namespace_write_access(service.db.runtime(), &actor, &plan.namespace)?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let plan = evaluation_plan_domain::prepare_plan(plan, &actor, now_ms)
         .map_err(map_evaluation_resource_error)?;
     if let Some(existing) = service
         .db
+        .runtime()
         .get_evaluation_plan(&plan.plan_version_id)
         .map_err(Status::internal)?
     {
@@ -739,8 +767,12 @@ pub(super) async fn put_evaluation_plan(
                 "evaluation plan version already exists with different content",
             ));
         }
-        if !evaluation_manifest_resolution::evaluation_plan_visible(&service.db, &existing, &actor)
-            .map_err(Status::internal)?
+        if !evaluation_manifest_resolution::evaluation_plan_visible(
+            service.db.runtime(),
+            &existing,
+            &actor,
+        )
+        .map_err(Status::internal)?
         {
             return Err(Status::failed_precondition(
                 "governed invariant reference unavailable",
@@ -751,12 +783,13 @@ pub(super) async fn put_evaluation_plan(
         }));
     }
     evaluation_manifest_resolution::validate_evaluation_plan_references(
-        &service.db,
+        service.db.runtime(),
         &plan,
         &actor,
     )?;
     let plan = service
         .db
+        .runtime()
         .put_evaluation_plan(plan, &actor, now_ms)
         .map_err(map_evaluation_resource_error)?;
     Ok(Response::new(PutEvaluationPlanResponse {
@@ -919,7 +952,7 @@ pub(super) async fn run_lookup_first_promotion_gate(
         )));
     }
     let namespace = canonical_namespace(&request.namespace)?;
-    require_namespace_access(&service.db, &actor, namespace)?;
+    require_namespace_access(service.db.runtime(), &actor, namespace)?;
     if request.suite_json.len() > lookup_first::LOOKUP_FIRST_GATE_MAX_SUITE_BYTES {
         return Err(Status::resource_exhausted(format!(
             "lookup promotion suite exceeds {} bytes",
@@ -934,7 +967,7 @@ pub(super) async fn run_lookup_first_promotion_gate(
         ));
     }
     for case in &suite.cases {
-        require_namespace_access(&service.db, &case.actor, namespace)?;
+        require_namespace_access(service.db.runtime(), &case.actor, namespace)?;
     }
 
     let mut report = lookup_first::run_lookup_promotion_gate(&suite, &service.db)
@@ -982,9 +1015,10 @@ pub(super) async fn execute_evaluation_manifest(
                 .ok_or_else(|| Status::invalid_argument("evaluation execution required"))?,
         ))
         .map_err(map_evaluation_resource_error)?;
-    require_namespace_write_access(&service.db, &actor, &request.namespace)?;
+    require_namespace_write_access(service.db.runtime(), &actor, &request.namespace)?;
     let manifest = service
         .db
+        .runtime()
         .get_evaluation_manifest(&request.manifest_digest)
         .map_err(Status::internal)?
         .filter(|manifest| manifest.namespace == request.namespace)
@@ -1013,15 +1047,17 @@ pub(super) async fn cancel_evaluation_execution(
         },
     )
     .map_err(map_evaluation_resource_error)?;
-    require_namespace_write_access(&service.db, &actor, &validated.namespace)?;
+    require_namespace_write_access(service.db.runtime(), &actor, &validated.namespace)?;
     let manifest = service
         .db
+        .runtime()
         .get_evaluation_manifest(&validated.manifest_digest)
         .map_err(Status::internal)?
         .filter(|manifest| manifest.namespace == validated.namespace)
         .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
     let index = service
         .db
+        .runtime()
         .get_evaluation_execution_index(&validated.manifest_digest)
         .map_err(Status::internal)?
         .filter(|index| index.namespace == validated.namespace)
