@@ -187,6 +187,7 @@ mod tests {
             "SEKAI_DATABASE_URL",
             "CHISEI_DATABASE_URL",
             "SEKAI_DB_BACKEND",
+            "SEKAI_SHARED_STORE",
         ];
         struct RestoreEnv(Vec<(String, Option<String>)>);
         impl Drop for RestoreEnv {
@@ -207,9 +208,11 @@ mod tests {
         for key in keys {
             unsafe { std::env::remove_var(key) };
         }
+        // Shared is a named hatch. This fixture opens the fenced source as
+        // one identity so the writer-fence check can run.
+        unsafe { std::env::set_var("SEKAI_SHARED_STORE", "1") };
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
@@ -230,7 +233,7 @@ mod tests {
             .set_limit("report-user", 3_000, PeriodType::Daily)
             .unwrap();
 
-        let report = relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
+        let report = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
         assert!(report.fence_raised);
 
         let err = open_gateway_report_layout(source_s).unwrap_err();
