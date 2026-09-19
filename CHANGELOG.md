@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- ADR 0084 records that a valid System One Preview fill may persist a
+  bounded typesafe Decision; Submit stays the only ActionInstance write
+  (#1050).
 - Gateway-report opens Combined stores through `open_layout_or_fence`, so a
   fenced Shared `DB_PATH` cannot still boot a writer for egress rows (#1029).
 - Restore fence treats `PreviewObjectAction` as mutating so TypeSafe fill,
