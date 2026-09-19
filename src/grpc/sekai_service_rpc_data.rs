@@ -6,7 +6,7 @@ pub(super) async fn create_function(
 ) -> Result<Response<CreateFunctionResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    if is_managed_team_principal(&service.db, &principals)? {
+    if is_managed_team_principal(service.db.runtime(), &principals)? {
         return Err(Status::permission_denied(
             "team principals cannot create global stored functions",
         ));
@@ -18,6 +18,7 @@ pub(super) async fn create_function(
     let parsed = from_proto_function(&function);
     service
         .db
+        .runtime()
         .create_function(&parsed)
         .map_err(Status::invalid_argument)?;
     Ok(Response::new(CreateFunctionResponse {
@@ -30,13 +31,14 @@ pub(super) async fn list_functions(
 ) -> Result<Response<ListFunctionsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    if is_managed_team_principal(&service.db, &principals)? {
+    if is_managed_team_principal(service.db.runtime(), &principals)? {
         return Err(Status::permission_denied(
             "team principals cannot list global stored functions",
         ));
     }
     let functions = service
         .db
+        .runtime()
         .list_functions()
         .map_err(Status::internal)?
         .iter()
@@ -50,10 +52,11 @@ pub(super) async fn invoke_function(
 ) -> Result<Response<InvokeFunctionResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     let function = service
         .db
+        .runtime()
         .get_function(&input.name)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
@@ -87,12 +90,12 @@ pub(super) async fn invoke_function(
         rng_seed: input.rng_seed,
     };
     let invocation = crate::sekai::function::invoke(
-        &service.db,
+        service.db.runtime(),
         &function,
         &input.params,
         |object| {
             object_passes_security_policy(
-                &service.db,
+                service.db.runtime(),
                 object,
                 &principals,
                 tenant_context.as_ref(),
@@ -130,9 +133,16 @@ pub(super) async fn create_dataset(
         .dataset
         .ok_or(Status::invalid_argument("dataset required"))?;
     let parsed = from_proto_dataset(&dataset);
-    check_dataset_access(&service.db, &service.security, &principals, &parsed, true)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &parsed,
+        true,
+    )?;
     service
         .db
+        .runtime()
         .create_dataset(&parsed)
         .map_err(Status::invalid_argument)?;
     Ok(Response::new(CreateDatasetResponse {
@@ -152,10 +162,17 @@ pub(super) async fn update_dataset(
     let parsed = from_proto_dataset(&dataset);
     let existing = service
         .db
+        .runtime()
         .get_dataset(&parsed.id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(&service.db, &service.security, &principals, &existing, true)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &existing,
+        true,
+    )?;
     if existing.object_id.is_empty() {
         // Unbound system datasets are not ACL-bound. Allow reserved
         // control-plane admins (`root` / UDS transport `local`) and the
@@ -175,13 +192,21 @@ pub(super) async fn update_dataset(
             ));
         }
     }
-    check_dataset_access(&service.db, &service.security, &principals, &parsed, true)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &parsed,
+        true,
+    )?;
     service
         .db
+        .runtime()
         .update_dataset(&parsed)
         .map_err(Status::internal)?;
     let updated = service
         .db
+        .runtime()
         .get_dataset(&parsed.id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
@@ -197,12 +222,19 @@ pub(super) async fn list_datasets(
     require_authenticated(&principals)?;
     let datasets = service
         .db
+        .runtime()
         .list_datasets()
         .map_err(Status::internal)?
         .into_iter()
         .filter(|dataset| {
-            check_dataset_access(&service.db, &service.security, &principals, dataset, false)
-                .is_ok()
+            check_dataset_access(
+                service.db.runtime(),
+                &service.security,
+                &principals,
+                dataset,
+                false,
+            )
+            .is_ok()
         })
         .collect::<Vec<_>>()
         .iter()
@@ -219,13 +251,21 @@ pub(super) async fn append_rows(
     let inner = req.into_inner();
     let dataset = service
         .db
+        .runtime()
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(&service.db, &service.security, &principals, &dataset, true)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        true,
+    )?;
     let rows: Vec<_> = inner.rows.into_iter().map(|r| r.values).collect();
     let count = service
         .db
+        .runtime()
         .append_rows(&inner.dataset_id, &rows)
         .map_err(Status::invalid_argument)?;
     Ok(Response::new(AppendRowsResponse { count }))
@@ -239,13 +279,21 @@ pub(super) async fn query_rows(
     let inner = req.into_inner();
     let dataset = service
         .db
+        .runtime()
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(&service.db, &service.security, &principals, &dataset, false)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        false,
+    )?;
     let query = inner.query.unwrap_or_default();
     let rows = service
         .db
+        .runtime()
         .query_rows(
             &inner.dataset_id,
             &dataset::RowQuery {
@@ -273,12 +321,20 @@ pub(super) async fn create_virtual_table(
     let parsed = from_proto_virtual_table(&table);
     let dataset = service
         .db
+        .runtime()
         .get_dataset(&parsed.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(&service.db, &service.security, &principals, &dataset, true)?;
+    check_dataset_access(
+        service.db.runtime(),
+        &service.security,
+        &principals,
+        &dataset,
+        true,
+    )?;
     service
         .db
+        .runtime()
         .create_virtual_table(&parsed)
         .map_err(Status::invalid_argument)?;
     Ok(Response::new(CreateVirtualTableResponse {
@@ -293,18 +349,20 @@ pub(super) async fn list_virtual_tables(
     require_authenticated(&principals)?;
     let tables = service
         .db
+        .runtime()
         .list_virtual_tables()
         .map_err(Status::internal)?
         .into_iter()
         .filter(|table| {
             service
                 .db
+                .runtime()
                 .get_dataset(&table.dataset_id)
                 .ok()
                 .flatten()
                 .map(|dataset| {
                     check_dataset_access(
-                        &service.db,
+                        service.db.runtime(),
                         &service.security,
                         &principals,
                         &dataset,
@@ -332,13 +390,14 @@ pub(super) async fn create_grant(
         .ok_or(Status::invalid_argument("grant required"))?;
     let parsed = from_proto_grant(&grant)?;
     if check_ontology_grant_target(
-        &service.db,
+        service.db.runtime(),
         &service.security,
         &parsed.object_id,
         &principals,
     )? {
         service
             .db
+            .runtime()
             .create_grant(&parsed)
             .map_err(Status::invalid_argument)?;
         service.security.add_grant(&parsed);
@@ -348,17 +407,24 @@ pub(super) async fn create_grant(
     }
     let target = service
         .db
+        .runtime()
         .get_object(&parsed.object_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::invalid_argument("grant target object does not exist"))?;
     if target.kind == "namespace" {
         require_credential_admin(&principals)?;
     } else {
-        check_team_namespace(&service.db, &principals, &target.namespace, true)?;
+        check_team_namespace(service.db.runtime(), &principals, &target.namespace, true)?;
     }
-    check_object_admin(&service.db, &service.security, &target, &principals)?;
+    check_object_admin(
+        service.db.runtime(),
+        &service.security,
+        &target,
+        &principals,
+    )?;
     service
         .db
+        .runtime()
         .create_grant(&parsed)
         .map_err(Status::invalid_argument)?;
     service.security.add_grant(&parsed);
@@ -375,16 +441,21 @@ pub(super) async fn delete_grant(
     let id = req.into_inner().id;
     let existing = service
         .db
+        .runtime()
         .get_grant(&id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("grant not found"))?;
     if check_ontology_grant_target(
-        &service.db,
+        service.db.runtime(),
         &service.security,
         &existing.object_id,
         &principals,
     )? {
-        let deleted = service.db.delete_grant(&id).map_err(Status::internal)?;
+        let deleted = service
+            .db
+            .runtime()
+            .delete_grant(&id)
+            .map_err(Status::internal)?;
         if let Some(grant) = deleted {
             service
                 .security
@@ -394,6 +465,7 @@ pub(super) async fn delete_grant(
     }
     let target = service
         .db
+        .runtime()
         .get_object(&existing.object_id)
         .map_err(Status::internal)?;
     if target
@@ -402,11 +474,20 @@ pub(super) async fn delete_grant(
     {
         require_credential_admin(&principals)?;
     } else if let Some(target) = &target {
-        check_team_namespace(&service.db, &principals, &target.namespace, true)?;
+        check_team_namespace(service.db.runtime(), &principals, &target.namespace, true)?;
     }
     let target = target.ok_or(Status::not_found("grant target not found"))?;
-    check_object_admin(&service.db, &service.security, &target, &principals)?;
-    let deleted = service.db.delete_grant(&id).map_err(Status::internal)?;
+    check_object_admin(
+        service.db.runtime(),
+        &service.security,
+        &target,
+        &principals,
+    )?;
+    let deleted = service
+        .db
+        .runtime()
+        .delete_grant(&id)
+        .map_err(Status::internal)?;
     if let Some(grant) = deleted {
         service
             .security
@@ -421,9 +502,15 @@ pub(super) async fn list_grants(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let object_id = req.into_inner().object_id;
-    if check_ontology_grant_target(&service.db, &service.security, &object_id, &principals)? {
+    if check_ontology_grant_target(
+        service.db.runtime(),
+        &service.security,
+        &object_id,
+        &principals,
+    )? {
         let grants = service
             .db
+            .runtime()
             .list_grants(&object_id)
             .map_err(Status::internal)?
             .iter()
@@ -433,17 +520,24 @@ pub(super) async fn list_grants(
     }
     let target = service
         .db
+        .runtime()
         .get_object(&object_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("grant target not found"))?;
     if target.kind == "namespace" {
         require_credential_admin(&principals)?;
     } else {
-        check_team_namespace(&service.db, &principals, &target.namespace, true)?;
+        check_team_namespace(service.db.runtime(), &principals, &target.namespace, true)?;
     }
-    check_object_admin(&service.db, &service.security, &target, &principals)?;
+    check_object_admin(
+        service.db.runtime(),
+        &service.security,
+        &target,
+        &principals,
+    )?;
     let grants = service
         .db
+        .runtime()
         .list_grants(&object_id)
         .map_err(Status::internal)?
         .iter()
@@ -458,7 +552,7 @@ pub(super) async fn check_access(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    check_object_namespace_access(&service.db, &principals, &inner.object_id, false)?;
+    check_object_namespace_access(service.db.runtime(), &principals, &inner.object_id, false)?;
     check_read(&service.security, &inner.object_id, &principals)?;
     let refs: Vec<&str> = inner.principals.iter().map(String::as_str).collect();
     Ok(Response::new(CheckAccessResponse {
@@ -479,6 +573,7 @@ pub(super) async fn ensure_team_namespace(
     let actor = principals.first().map(String::as_str).unwrap_or("root");
     let (namespace, grants) = service
         .db
+        .runtime()
         .ensure_team_namespace(&namespace, &principal, role, actor)
         .map_err(Status::internal)?;
     for grant in &grants {
@@ -504,13 +599,18 @@ pub(super) async fn record_decision(
         .cloned()
         .ok_or(Status::unauthenticated("principal required"))?;
     if decision.target_id.is_empty() {
-        if is_managed_team_principal(&service.db, &principals)? {
+        if is_managed_team_principal(service.db.runtime(), &principals)? {
             return Err(Status::permission_denied(
                 "team decisions require a namespace-bound target object",
             ));
         }
     } else {
-        check_object_namespace_access(&service.db, &principals, &decision.target_id, true)?;
+        check_object_namespace_access(
+            service.db.runtime(),
+            &principals,
+            &decision.target_id,
+            true,
+        )?;
         check_write(&service.security, &decision.target_id, &principals)?;
     }
     if decision.id.is_empty() {
@@ -534,6 +634,7 @@ pub(super) async fn record_decision(
         .remove(attestation::EVIDENCE_ATTESTATION_HASH);
     service
         .db
+        .runtime()
         .record_decision(&audit::Decision {
             id: decision.id.clone(),
             timestamp: decision.timestamp,
@@ -574,16 +675,16 @@ pub(super) async fn list_decisions(
     let target_filter = if inner.target_id.is_empty() {
         None
     } else {
-        check_object_namespace_access(&service.db, &principals, &inner.target_id, false)?;
+        check_object_namespace_access(service.db.runtime(), &principals, &inner.target_id, false)?;
         check_read(&service.security, &inner.target_id, &principals)?;
         Some(inner.target_id.clone())
     };
-    let managed_team_principal = is_managed_team_principal(&service.db, &principals)?;
+    let managed_team_principal = is_managed_team_principal(service.db.runtime(), &principals)?;
     let decisions = scan_visible_page(
         visible_limit,
         0,
         |limit, offset| {
-            service.db.list_decisions(&audit::DecisionFilter {
+            service.db.runtime().list_decisions(&audit::DecisionFilter {
                 actor: actor_filter.clone(),
                 action: action_filter.clone(),
                 target_id: target_filter.clone(),
@@ -598,7 +699,7 @@ pub(super) async fn list_decisions(
                     return false;
                 }
             } else if check_object_namespace_access(
-                &service.db,
+                service.db.runtime(),
                 &principals,
                 &decision.target_id,
                 false,
@@ -636,26 +737,27 @@ pub(super) async fn list_object_changes(
     req: Request<ListObjectChangesRequest>,
 ) -> Result<Response<ListObjectChangesResponse>, Status> {
     let principals = caller_principals(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    check_object_namespace_access(&service.db, &principals, &inner.object_id, false)?;
+    check_object_namespace_access(service.db.runtime(), &principals, &inner.object_id, false)?;
     check_read(&service.security, &inner.object_id, &principals)?;
     let object = service
         .db
+        .runtime()
         .get_object(&inner.object_id)
         .map_err(Status::internal)?;
     match object.as_ref() {
         Some(object) => {
             enforce_namespace_tenant_context(
-                &service.db,
+                service.db.runtime(),
                 tenant_context.as_ref(),
                 &object.namespace,
                 false,
             )
             .map_err(|_| Status::not_found("not found"))?;
             if evaluate_active_object_policy(
-                &service.db,
+                service.db.runtime(),
                 object,
                 &principals,
                 tenant_context.as_ref(),
@@ -666,7 +768,7 @@ pub(super) async fn list_object_changes(
                 return Err(Status::not_found("not found"));
             }
             enforce_object_marking_access(
-                &service.db,
+                service.db.runtime(),
                 object,
                 &principals,
                 &format!("list_object_changes:{}", object.id),
@@ -679,15 +781,21 @@ pub(super) async fn list_object_changes(
             // Deleted rows cannot be re-evaluated against the live object.
             // If the inferred namespace is activated, refuse rather than
             // leak field history under ACL-only residual access.
-            let activated = match service.db.object_change_namespace(&inner.object_id) {
+            let activated = match service
+                .db
+                .runtime()
+                .object_change_namespace(&inner.object_id)
+            {
                 Ok(Some(namespace)) => service
                     .db
+                    .runtime()
                     .get_object_security_activation(&namespace)
                     .map_err(|_| Status::unavailable("object authorization unavailable"))?
                     .is_some(),
                 Ok(None) => false,
                 Err(_) => service
                     .db
+                    .runtime()
                     .has_object_security_activations()
                     .map_err(|_| Status::unavailable("object authorization unavailable"))?,
             };
@@ -700,6 +808,7 @@ pub(super) async fn list_object_changes(
         Some(object) => Some(object.kind.clone()),
         None => service
             .db
+            .runtime()
             .object_change_kind(&inner.object_id)
             .map_err(Status::internal)?,
     };
@@ -710,12 +819,13 @@ pub(super) async fn list_object_changes(
     let property_policy = match object.as_ref() {
         Some(object) => service
             .db
+            .runtime()
             .active_object_policy(&object.namespace, &object.kind)
             .map_err(|_| Status::unavailable("object authorization unavailable"))?,
         None => None,
     };
     let operation_id = crate::sekai::operation_correlation::operation_ids_for_objects(
-        &service.db,
+        service.db.runtime(),
         &[inner.object_id.clone()].into_iter().collect(),
     )
     .map_err(Status::internal)?
@@ -723,6 +833,7 @@ pub(super) async fn list_object_changes(
     .unwrap_or_default();
     let changes = service
         .db
+        .runtime()
         .list_visible_object_changes(&inner.object_id, inner.limit, inner.offset)
         .map_err(Status::internal)?
         .into_iter()
@@ -767,6 +878,7 @@ pub(super) async fn get_attestation(
     }
     let attestation = service
         .db
+        .runtime()
         .get_attestation(&id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("attestation not found"))?;
@@ -806,7 +918,7 @@ pub(super) async fn list_attestations(
         visible_limit,
         visible_offset,
         |limit, offset| {
-            service.db.list_attestations(
+            service.db.runtime().list_attestations(
                 decision_id.as_deref(),
                 policy_scope.as_deref(),
                 limit,
@@ -840,11 +952,17 @@ pub(super) async fn verify_attestation(
     }
     // Verification results expose the replayed decision for a scope's
     // policy; gate like the other attestation reads.
-    if let Some(attestation) = service.db.get_attestation(&id).map_err(Status::internal)? {
+    if let Some(attestation) = service
+        .db
+        .runtime()
+        .get_attestation(&id)
+        .map_err(Status::internal)?
+    {
         check_action_admin(&service.security, &attestation.policy_scope, &principals)?;
     }
     let report = service
         .db
+        .runtime()
         .verify_attestation(&id)
         .map_err(Status::internal)?;
     Ok(Response::new(VerifyAttestationResponse {
@@ -861,7 +979,7 @@ pub(super) async fn create_credential(
     service: &SekaiServiceImpl,
     req: Request<CreateCredentialRequest>,
 ) -> Result<Response<CreateCredentialResponse>, Status> {
-    credential_admin_actor(&service.db, &req, "")?;
+    credential_admin_actor(service.db.runtime(), &req, "")?;
     let request = req.into_inner();
     let principal = if request.managed_team_principal {
         validate_team_principal(&request.principal)?
@@ -870,6 +988,7 @@ pub(super) async fn create_credential(
     };
     let existing = service
         .db
+        .runtime()
         .list_unbound_credentials(Some(&principal), Some("active"));
     if !existing.map_err(Status::internal)?.is_empty() {
         return Err(Status::already_exists(format!(
@@ -882,10 +1001,12 @@ pub(super) async fn create_credential(
     let credential = if request.managed_team_principal {
         service
             .db
+            .runtime()
             .create_managed_team_credential(&principal, &token_hash, now)
     } else {
         service
             .db
+            .runtime()
             .create_principal_credential(&principal, &token_hash, now)
     }
     .map_err(Status::internal)?;
@@ -898,7 +1019,7 @@ pub(super) async fn rotate_credential(
     service: &SekaiServiceImpl,
     req: Request<RotateCredentialRequest>,
 ) -> Result<Response<RotateCredentialResponse>, Status> {
-    credential_admin_actor(&service.db, &req, "")?;
+    credential_admin_actor(service.db.runtime(), &req, "")?;
     let request = req.into_inner();
     let principal = if request.managed_team_principal {
         validate_team_principal(&request.principal)?
@@ -907,6 +1028,7 @@ pub(super) async fn rotate_credential(
     };
     let existing = service
         .db
+        .runtime()
         .list_unbound_credentials(Some(&principal), Some("active"));
     if existing.map_err(Status::internal)?.is_empty() {
         return Err(Status::not_found(format!(
@@ -918,11 +1040,13 @@ pub(super) async fn rotate_credential(
     let credential = if request.managed_team_principal {
         service
             .db
+            .runtime()
             .rotate_managed_team_credential(&principal, &token_hash)
             .map_err(Status::internal)
     } else {
         service
             .db
+            .runtime()
             .rotate_principal_credential(&principal, &token_hash)
             .map_err(Status::internal)
     }?;
@@ -935,11 +1059,12 @@ pub(super) async fn revoke_credential(
     service: &SekaiServiceImpl,
     req: Request<RevokeCredentialRequest>,
 ) -> Result<Response<RevokeCredentialResponse>, Status> {
-    credential_admin_actor(&service.db, &req, "")?;
+    credential_admin_actor(service.db.runtime(), &req, "")?;
     let request = req.into_inner();
     let principal = validate_credential_principal(&request.principal)?;
     let credential = service
         .db
+        .runtime()
         .revoke_principal_credential(&principal)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found(format!("no active credential for {principal:?}")))?;
@@ -951,9 +1076,10 @@ pub(super) async fn list_credentials(
     service: &SekaiServiceImpl,
     req: Request<ListCredentialsRequest>,
 ) -> Result<Response<ListCredentialsResponse>, Status> {
-    credential_admin_actor(&service.db, &req, "")?;
+    credential_admin_actor(service.db.runtime(), &req, "")?;
     let credentials = service
         .db
+        .runtime()
         .list_unbound_credentials(None, None)
         .map_err(Status::internal)?
         .into_iter()
@@ -973,6 +1099,7 @@ pub(super) async fn register_evidence_schema(
         .ok_or_else(|| Status::invalid_argument("definition required"))?;
     service
         .db
+        .runtime()
         .register_evidence_schema(
             &DomainEvidenceSchemaDefinition {
                 schema_id: definition.schema_id,
@@ -996,6 +1123,7 @@ pub(super) async fn list_evidence_adapters(
     for profile in crate::evidence_adapter_catalog::built_in_evidence_adapters() {
         let schema_registered = service
             .db
+            .runtime()
             .is_evidence_schema_registered(&profile.schema_id, &profile.schema_version)
             .map_err(Status::internal)?;
         if registered_only && !schema_registered {
@@ -1053,7 +1181,7 @@ pub(super) async fn submit_evidence(
             "authenticated producer must match envelope attribution",
         ));
     }
-    let result = EvidenceAdmissionLifecycle::new(&service.db)
+    let result = EvidenceAdmissionLifecycle::new(service.db.runtime())
         .admit(&envelope, &envelope.producer_identity, now_millis())
         .map_err(map_evidence_admission_lifecycle_error)?;
     if let Some(object_id) = result
@@ -1063,6 +1191,7 @@ pub(super) async fn submit_evidence(
     {
         for grant in service
             .db
+            .runtime()
             .list_grants(object_id)
             .map_err(Status::internal)?
         {
@@ -1082,6 +1211,7 @@ pub(super) async fn get_evidence_submission(
     let submission_id = req.into_inner().submission_id;
     let submission = service
         .db
+        .runtime()
         .get_evidence_submission(&submission_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("evidence submission not found"))?;
@@ -1090,6 +1220,7 @@ pub(super) async fn get_evidence_submission(
     }
     let history = service
         .db
+        .runtime()
         .evidence_lifecycle_history(&submission_id)
         .map_err(Status::internal)?
         .into_iter()
@@ -1135,6 +1266,7 @@ pub(super) async fn list_evidence_submissions(
     };
     let submissions = service
         .db
+        .runtime()
         .list_evidence_submissions(&EvidenceSubmissionFilter {
             producer_identity,
             source_instance: optional_nonempty(request.source_instance),
@@ -1165,12 +1297,18 @@ pub(super) async fn get_provenance_report(
     }
     let work_unit = service
         .db
+        .runtime()
         .get_work_unit(&work_unit_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("work unit not found"))?;
-    check_work_unit_read(&service.db, &service.security, &work_unit, &principals)?;
-    let report =
-        crate::provenance::assemble_report(&service.db, &work_unit_id).map_err(Status::internal)?;
+    check_work_unit_read(
+        service.db.runtime(),
+        &service.security,
+        &work_unit,
+        &principals,
+    )?;
+    let report = crate::provenance::assemble_report(service.db.runtime(), &work_unit_id)
+        .map_err(Status::internal)?;
     Ok(Response::new(GetProvenanceReportResponse {
         report: crate::provenance::render_text(&report),
     }))
@@ -1210,6 +1348,7 @@ pub(super) async fn put_governed_transform(
     .map_err(|error| Status::invalid_argument(error.message()))?;
     service
         .db
+        .runtime()
         .put_governed_transform(&transform, now_millis())
         .map_err(Status::internal)?;
     Ok(Response::new(PutGovernedTransformResponse {
@@ -1226,6 +1365,7 @@ pub(super) async fn run_governed_transform(
     let input = req.into_inner();
     let run = service
         .db
+        .runtime()
         .run_governed_transform(
             &input.namespace,
             &input.transform_id,
@@ -1251,6 +1391,7 @@ pub(super) async fn get_governed_transform_run(
     require_authenticated(&principals)?;
     let run = service
         .db
+        .runtime()
         .get_governed_transform_run(&req.into_inner().run_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;

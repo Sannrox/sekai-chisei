@@ -14,6 +14,7 @@ pub(super) async fn put_governed_action_type(
     let domain = from_proto_governed_action_type(proto)?;
     let existing = service
         .db
+        .runtime()
         .get_governed_action_type(&domain.namespace, &domain.type_id, &domain.version)
         .map_err(Status::internal)?;
     if existing.is_none() {
@@ -21,6 +22,7 @@ pub(super) async fn put_governed_action_type(
     }
     let stored = service
         .db
+        .runtime()
         .put_governed_action_type(domain, &actor, now_millis())
         .map_err(|e| {
             if e.contains("immutable")
@@ -51,7 +53,7 @@ pub(super) async fn get_governed_action_type(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    check_team_namespace(&service.db, &principals, &inner.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &inner.namespace, true)?;
     check_action_admin(
         &service.security,
         &format!("governed_action:{}", inner.namespace),
@@ -59,6 +61,7 @@ pub(super) async fn get_governed_action_type(
     )?;
     let stored = service
         .db
+        .runtime()
         .get_governed_action_type(&inner.namespace, &inner.type_id, &inner.version)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("governed action type not found"))?;
@@ -73,7 +76,7 @@ pub(super) async fn list_governed_action_types(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    check_team_namespace(&service.db, &principals, &inner.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &inner.namespace, true)?;
     check_action_admin(
         &service.security,
         &format!("governed_action:{}", inner.namespace),
@@ -86,6 +89,7 @@ pub(super) async fn list_governed_action_types(
     };
     let types = service
         .db
+        .runtime()
         .list_governed_action_types(&inner.namespace, type_id, inner.enabled_only)
         .map_err(Status::internal)?
         .iter()
@@ -102,6 +106,7 @@ pub(super) async fn set_governed_action_type_enabled(
     let _actor = authorize_namespace_action_admin(service, &principals, &inner.namespace)?;
     let stored = service
         .db
+        .runtime()
         .set_governed_action_type_enabled(
             &inner.namespace,
             &inner.type_id,
@@ -130,7 +135,7 @@ pub(super) async fn submit_action_instance(
 
     let principals = caller_principals(&req);
     let policy_context = principal_policy_context(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let header_operation_id = SekaiServiceImpl::catalog_metadata_value(
         &req,
         crate::sekai::operation_correlation::OPERATION_METADATA,
@@ -141,7 +146,12 @@ pub(super) async fn submit_action_instance(
         return Err(Status::invalid_argument("namespace required"));
     }
     let actor = authorize_action_instance_submit(service, &principals, &namespace)?;
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &namespace,
+        true,
+    )?;
     let operation_id = crate::sekai::operation_correlation::bind_submit_identity(
         header_operation_id.as_deref(),
         &inner.request_id,
@@ -175,11 +185,11 @@ pub(super) async fn submit_action_instance(
         let result = if let Some(clerk) = &service.cross_store {
             clerk.admit(admission_request, &actor, now_millis())
         } else {
-            ActionInstanceAdmission::new(
-                &service.db,
-                service.budget.as_ref().map(std::convert::AsRef::as_ref),
+            ActionInstanceAdmission::new(service.db.runtime(), None).admit(
+                admission_request,
+                &actor,
+                now_millis(),
             )
-            .admit(admission_request, &actor, now_millis())
         };
         result.map_err(|error| match error {
             ActionInstanceAdmissionError::InvalidArgument(message) => {
@@ -203,7 +213,7 @@ pub(super) async fn describe_object_action(
 ) -> Result<Response<DescribeObjectActionResponse>, Status> {
     let principals = caller_principals(&req);
     let policy_context = principal_policy_context(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     require_authenticated(&principals)?;
     let inner = req.into_inner();
     let object = visible_action_object(
@@ -215,7 +225,7 @@ pub(super) async fn describe_object_action(
         &inner.object_id,
     )?;
     let description = crate::sekai::action_describe_preview::describe_object_action(
-        &service.db,
+        service.db.runtime(),
         &object,
         &inner.type_id,
         &inner.version,
@@ -231,7 +241,7 @@ pub(super) async fn preview_object_action(
 ) -> Result<Response<PreviewObjectActionResponse>, Status> {
     let principals = caller_principals(&req);
     let policy_context = principal_policy_context(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let actor = authorize_action_instance_submit(service, &principals, &req.get_ref().namespace)?;
     let inner = req.into_inner();
     let object = visible_action_object(
@@ -243,7 +253,7 @@ pub(super) async fn preview_object_action(
         &inner.object_id,
     )?;
     let type_def = match crate::sekai::action_describe_preview::load_object_bound_type(
-        &service.db,
+        service.db.runtime(),
         &object,
         &inner.type_id,
         &inner.version,
@@ -259,8 +269,8 @@ pub(super) async fn preview_object_action(
         ) => return Err(Status::invalid_argument(error)),
     };
     let admission = crate::sekai::action_describe_preview::preview_object_action_admission(
-        &service.db,
-        service.budget.as_ref().map(std::convert::AsRef::as_ref),
+        service.db.runtime(),
+        None,
         crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
             actor: &actor,
             object: &object,
@@ -286,7 +296,12 @@ pub(super) async fn preview_object_action(
     let mut proposed_parameters_json = String::new();
     let mut fill_audit = None;
     if crate::chisei::system_one_action::should_fill(&type_def, &parameters_json) {
-        let object_type = service.db.get_object_type(&object.kind).ok().flatten();
+        let object_type = service
+            .db
+            .runtime()
+            .get_object_type(&object.kind)
+            .ok()
+            .flatten();
         let client = sekai_provider::system_one::TypeSafeClient::from_env()
             .map_err(Status::failed_precondition)?;
         let (filled, record) = crate::chisei::system_one_action::fill_proposed_parameters(
@@ -313,8 +328,8 @@ pub(super) async fn preview_object_action(
         proposed_parameters_json.clone_from(&parameters_json);
     }
     let preview = crate::sekai::action_describe_preview::preview_object_action(
-        &service.db,
-        service.budget.as_ref().map(std::convert::AsRef::as_ref),
+        service.db.runtime(),
+        None,
         crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
             actor: &actor,
             object: &object,
@@ -335,7 +350,7 @@ pub(super) async fn preview_object_action(
     if proto.outcome != crate::sekai::action_describe_preview::PREVIEW_VALID {
         proposed_parameters_json.clear();
     } else if let Some((record, model)) = fill_audit {
-        record_system_one_egress_audit(&service.db, &record, &model, &object.id);
+        record_system_one_egress_audit(service.db.runtime(), &record, &model, &object.id);
     }
     proto.proposed_parameters_json = proposed_parameters_json;
     Ok(Response::new(proto))
@@ -390,18 +405,21 @@ pub(super) async fn get_action_instance(
     let stored = if !inner.instance_id.trim().is_empty() {
         service
             .db
+            .runtime()
             .get_action_instance(&inner.instance_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action instance not found"))?
     } else if !inner.namespace.trim().is_empty() && !inner.idempotency_key.trim().is_empty() {
         service
             .db
+            .runtime()
             .get_action_instance_by_idempotency(&inner.namespace, &inner.idempotency_key)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action instance not found"))?
     } else if !inner.operation_id.trim().is_empty() {
         service
             .db
+            .runtime()
             .get_action_instance_by_operation_id(&inner.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("action instance not found"))?
@@ -442,6 +460,7 @@ pub(super) async fn list_action_instances(
     };
     let instances = service
         .db
+        .runtime()
         .list_action_instances(&inner.namespace, type_id, status, limit)
         .map_err(Status::internal)?
         .iter()
@@ -460,6 +479,7 @@ pub(super) async fn get_action_effect(
     }
     let stored = service
         .db
+        .runtime()
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
@@ -480,6 +500,7 @@ pub(super) async fn list_action_effects(
     let effects = if !inner.instance_id.trim().is_empty() {
         let listed = service
             .db
+            .runtime()
             .list_action_effects_for_instance(&inner.instance_id)
             .map_err(Status::internal)?;
         if let Some(first) = listed.first() {
@@ -500,6 +521,7 @@ pub(super) async fn list_action_effects(
         };
         service
             .db
+            .runtime()
             .list_pending_runtime_dispatch_effects(&inner.namespace, limit)
             .map_err(Status::internal)?
     } else {
@@ -531,7 +553,7 @@ pub(super) async fn list_claimable_action_work(
     } else {
         inner.limit as usize
     };
-    let effects = ActionWorkLifecycle::new(&service.db)
+    let effects = ActionWorkLifecycle::new(service.db.runtime())
         .list_claimable(&inner.namespace, runtime, now_millis(), limit)
         .map_err(action_work_lifecycle_status)?
         .iter()
@@ -557,13 +579,14 @@ pub(super) async fn claim_action_work(
     }
     let existing = service
         .db
+        .runtime()
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
     // Claim requires namespace write so only authorized hosts can take work.
-    check_team_namespace(&service.db, &principals, &existing.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let claimed = ActionWorkLifecycle::new(&service.db)
+    let claimed = ActionWorkLifecycle::new(service.db.runtime())
         .claim(
             ClaimActionWorkCommand {
                 effect_id: &inner.effect_id,
@@ -593,12 +616,13 @@ pub(super) async fn heartbeat_action_claim(
     let inner = req.into_inner();
     let existing = service
         .db
+        .runtime()
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(&service.db, &principals, &existing.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let stored = ActionWorkLifecycle::new(&service.db)
+    let stored = ActionWorkLifecycle::new(service.db.runtime())
         .heartbeat(
             HeartbeatActionClaimCommand {
                 effect_id: &inner.effect_id,
@@ -624,13 +648,14 @@ pub(super) async fn ack_action_work(
     let inner = req.into_inner();
     let existing = service
         .db
+        .runtime()
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(&service.db, &principals, &existing.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)?;
     let now = now_millis();
     let actor = principals.first().cloned().unwrap_or_default();
-    let acked = ActionWorkLifecycle::new(&service.db)
+    let acked = ActionWorkLifecycle::new(service.db.runtime())
         .ack(
             AckActionWorkCommand {
                 effect_id: &inner.effect_id,
@@ -664,12 +689,13 @@ pub(super) async fn report_action_claim_event(
     let inner = req.into_inner();
     let effect = service
         .db
+        .runtime()
         .get_action_effect(&inner.effect_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("action effect not found"))?;
-    check_team_namespace(&service.db, &principals, &effect.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &effect.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let replay = ActionWorkLifecycle::new(&service.db)
+    let replay = ActionWorkLifecycle::new(service.db.runtime())
         .report_event(
             ReportActionClaimEventCommand {
                 effect_id: &inner.effect_id,
@@ -701,6 +727,7 @@ pub(super) async fn set_action_policy(
     check_action_admin(&service.security, &domain_policy.scope, &principals)?;
     service
         .db
+        .runtime()
         .upsert_action_policy(&domain_policy)
         .map_err(Status::internal)?;
     Ok(Response::new(SetActionPolicyResponse {
@@ -716,6 +743,7 @@ pub(super) async fn get_action_policy(
     check_action_admin(&service.security, &r.scope, &principals)?;
     let policy = service
         .db
+        .runtime()
         .get_action_policy(&r.scope)
         .map_err(Status::internal)?;
     Ok(Response::new(GetActionPolicyResponse {
@@ -730,6 +758,7 @@ pub(super) async fn list_action_policies(
     check_action_admin(&service.security, "", &principals)?;
     let policies = service
         .db
+        .runtime()
         .list_action_policies()
         .map_err(Status::internal)?;
     Ok(Response::new(ListActionPoliciesResponse {

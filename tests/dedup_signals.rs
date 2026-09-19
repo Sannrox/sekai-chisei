@@ -28,7 +28,9 @@ fn replays_and_conflicts_are_counted_separately() {
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new(":memory:").expect("open in-memory database"),
     )));
-    let budget = BudgetTracker::new(db);
+    let budget = BudgetTracker::new(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        db,
+    ));
 
     let before = sekai_chisei::obs::metrics::handle().render();
     assert_eq!(dedup_count(&before, "idempotent_replay"), 0);

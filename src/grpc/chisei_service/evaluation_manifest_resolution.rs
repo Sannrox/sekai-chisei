@@ -920,15 +920,16 @@ impl EvaluationManifestResolutionLifecycle {
         &self,
         prepared: &evaluation_manifest_domain::PreparedResolutionRequest,
     ) -> Result<evaluation_manifest_domain::EvaluationResolutionOutcome, Status> {
-        let (mut outcome, stored) = self.db.with_evaluation_resolution_snapshot(
+        let (mut outcome, stored) = self.db.runtime().with_evaluation_resolution_snapshot(
             || {
                 require_namespace_write_access(
-                    &self.db,
+                    self.db.runtime(),
                     &prepared.actor,
                     &prepared.request.namespace,
                 )?;
                 if let Some(replay) = self
                     .db
+                    .runtime()
                     .get_evaluation_manifest_for_request(
                         &prepared.request.namespace,
                         &prepared.actor,
@@ -947,7 +948,7 @@ impl EvaluationManifestResolutionLifecycle {
                     ));
                 }
                 let outcome = resolve_evaluation_manifest_live(
-                    &self.db,
+                    self.db.runtime(),
                     prepared,
                     chrono::Utc::now().timestamp_millis(),
                 )?;

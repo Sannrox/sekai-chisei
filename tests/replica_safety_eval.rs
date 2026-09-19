@@ -27,8 +27,12 @@ fn process_local_eval_store_is_not_shared() {
 #[test]
 fn suite_written_on_one_replica_is_visible_on_the_other() {
     let pair = TwoReplicaSqlite::open().unwrap();
-    let writer = EvalStore::with_db(Arc::clone(&pair.a));
-    let reader = EvalStore::with_db(Arc::clone(&pair.b));
+    let writer = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.a),
+    ));
+    let reader = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.b),
+    ));
     assert!(writer.is_shared());
     assert!(reader.is_shared());
 
@@ -49,8 +53,12 @@ fn suite_written_on_one_replica_is_visible_on_the_other() {
 #[test]
 fn run_written_on_one_replica_is_listed_on_the_other() {
     let pair = TwoReplicaSqlite::open().unwrap();
-    let a = EvalStore::with_db(Arc::clone(&pair.a));
-    let b = EvalStore::with_db(Arc::clone(&pair.b));
+    let a = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.a),
+    ));
+    let b = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.b),
+    ));
     a.put_suite(Suite {
         id: "suite-runs".into(),
         name: "runs".into(),
@@ -91,8 +99,12 @@ fn process_local_eval_is_not_visible_across_stores() {
 #[test]
 fn portfolio_observation_is_shared_across_replicas() {
     let pair = TwoReplicaSqlite::open().unwrap();
-    let a = PortfolioStore::new(Arc::clone(&pair.a));
-    let b = PortfolioStore::new(Arc::clone(&pair.b));
+    let a = PortfolioStore::new(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.a),
+    ));
+    let b = PortfolioStore::new(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.b),
+    ));
     a.record(&Observation {
         namespace: "ns".into(),
         task_class: "code review".into(),
@@ -117,6 +129,8 @@ fn grpc_chisei_service_constructs_shared_eval_store() {
     // Static guarantee: production service uses with_db (see ChiseiServiceImpl::new).
     // Behavioral check uses the same wiring.
     let pair = TwoReplicaSqlite::open().unwrap();
-    let eval = EvalStore::with_db(Arc::clone(&pair.a));
+    let eval = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        Arc::clone(&pair.a),
+    ));
     assert!(eval.is_shared());
 }

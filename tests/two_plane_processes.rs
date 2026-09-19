@@ -53,7 +53,7 @@ fn free_port() -> u16 {
 fn seed_sekai(path: &Path) {
     let store = SekaiStore::open_sqlite(path.to_str().unwrap());
     store
-        .put_governed_action_type(
+        .runtime().put_governed_action_type(
             GovernedActionType {
                 namespace: "acme".into(),
                 type_id: "dispatch".into(),
@@ -69,6 +69,7 @@ fn seed_sekai(path: &Path) {
         )
         .unwrap();
     store
+        .runtime()
         .create_principal_credential("operator", &hash_gateway_key(TOKEN), 1)
         .unwrap();
 }

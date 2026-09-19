@@ -32,6 +32,7 @@ impl SekaiServiceImpl {
     ) -> Result<domain::Object, Status> {
         object = self
             .db
+            .runtime()
             .project_object_property_grants(object)
             .map_err(|error| {
                 if error.starts_with("object_security_denied") {
@@ -46,12 +47,12 @@ impl SekaiServiceImpl {
             .map_err(map_schema_definition_lifecycle_error)?;
         compute::resolve_schema_computed_with_result_filter(
             &mut object,
-            &self.db,
+            self.db.runtime(),
             &schema,
             |candidate| {
                 if is_reserved_governance_kind(&candidate.kind)
                     || !object_is_visible(
-                        &self.db,
+                        self.db.runtime(),
                         &self.security,
                         candidate,
                         principals,
@@ -60,14 +61,20 @@ impl SekaiServiceImpl {
                 {
                     return Ok(false);
                 }
-                if !purpose_kind_permitted(&self.db, &candidate.namespace, &candidate.kind, purpose)
-                    .map_err(|status| status.to_string())?
+                if !purpose_kind_permitted(
+                    self.db.runtime(),
+                    &candidate.namespace,
+                    &candidate.kind,
+                    purpose,
+                )
+                .map_err(|status| status.to_string())?
                 {
                     return Ok(false);
                 }
                 match policy_context {
                     Some(context) => Ok(self
                         .db
+                        .runtime()
                         .get_object_with_policy_context(&candidate.id, context)?
                         .is_some_and(|authorized| authorized.updated == candidate.updated)),
                     None => Ok(true),
@@ -87,6 +94,7 @@ impl SekaiServiceImpl {
         })?;
         let object = self
             .db
+            .runtime()
             .project_object_property_grants(object)
             .map_err(|error| {
                 if error.starts_with("object_security_denied") {

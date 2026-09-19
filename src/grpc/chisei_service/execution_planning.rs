@@ -320,16 +320,19 @@ impl ChiseiServiceImpl {
             );
             evidence.insert("risk_score".to_string(), run.risk_score.to_string());
             evidence.insert("model".to_string(), resolved_model.clone());
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor: "chisei.sampling".into(),
-                action: "sample".into(),
-                reason: sampling.reason.clone(),
-                evidence,
-                target_id: input.request_id.clone(),
-                outcome: "sampled".into(),
-            });
+            let _ = self
+                .db
+                .runtime()
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().timestamp_millis(),
+                    actor: "chisei.sampling".into(),
+                    action: "sample".into(),
+                    reason: sampling.reason.clone(),
+                    evidence,
+                    target_id: input.request_id.clone(),
+                    outcome: "sampled".into(),
+                });
         }
         if safe_only {
             let provider_safe =
@@ -848,6 +851,7 @@ impl ChiseiServiceImpl {
             .map(|holdout| (holdout.memory_id.clone(), holdout.memory_version))
             .collect::<Vec<_>>();
         self.db
+            .runtime()
             .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
         Ok(())
     }

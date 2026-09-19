@@ -448,7 +448,7 @@ async fn get_source_sync_state_authorizes_before_catalog_lookup() {
         .unwrap();
     let pager = synthetic_pager_alert_v1();
     register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
-    let svc = SekaiServiceImpl::new(db);
+    let svc = SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(db));
     let mut live = Request::new(GetSourceSyncStateRequest {
         namespace: "ops".into(),
         source_instance: "ops-local".into(),

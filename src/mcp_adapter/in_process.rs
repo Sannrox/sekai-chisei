@@ -63,9 +63,16 @@ impl InProcessSurface {
             })
             .map_err(|error| error.to_string())?;
         }
-        let budget = Arc::new(BudgetTracker::new(db.clone()));
-        let sekai = SekaiServiceImpl::with_budget(db.clone(), budget);
-        let chisei = ChiseiServiceImpl::new(db, fixture_config());
+        let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
+        let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db);
+        let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
+        let clerk = crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            chisei_store.clone(),
+            sekai_store.clone(),
+            Some(budget),
+        );
+        let sekai = SekaiServiceImpl::new(sekai_store).with_cross_store_admission(Arc::new(clerk));
+        let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config());
 
         let surface = Self {
             principal: PRINCIPAL.into(),

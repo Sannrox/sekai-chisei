@@ -160,7 +160,10 @@ pub fn load_pressure_snapshot(
             }
         },
     };
-    let gunshi = match gunshi_auto::get_status(&ChiseiStore::from(db), namespace) {
+    let gunshi = match gunshi_auto::get_status(
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
+        namespace,
+    ) {
         Ok(Some(status)) => GunshiTiles::from(&status),
         Ok(None) => empty_gunshi(),
         Err(error) => GunshiTiles {
@@ -192,7 +195,7 @@ pub fn apply_kill_switch(
         return Err("namespace write access denied".into());
     }
     gunshi_auto::set_kill_switch(
-        &ChiseiStore::from(db),
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
         principal,
         namespace,
         enabled,
@@ -473,7 +476,7 @@ mod tests {
             maximum_latency_increase_ms: 1_000_000.0,
         };
         gunshi_auto::install_baseline(
-            &ChiseiStore::from(db),
+            &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
             "root",
             namespace,
             snapshot,

@@ -1111,7 +1111,7 @@ pub(super) fn handoff_reference_available(
         "operation_receipt" => {
             if let Some(receipt) = service
                 .db
-                .get_operation_receipt(&reference.id)
+                .runtime().get_operation_receipt(&reference.id)
                 .map_err(Status::internal)?
             {
                 let version = reference_content_digest(&receipt)?;
@@ -1126,7 +1126,7 @@ pub(super) fn handoff_reference_available(
         }
         "work_unit" => service
             .db
-            .get_work_unit(&reference.id)
+            .runtime().get_work_unit(&reference.id)
             .map_err(Status::internal)?
             .is_some_and(|work_unit| {
                 reference_content_digest(&work_unit).is_ok_and(|digest| digest == reference.version)
@@ -1135,33 +1135,33 @@ pub(super) fn handoff_reference_available(
                     && !work_unit.target_object_id.is_empty()
                     && service
                         .db
-                        .get_object(&work_unit.target_object_id)
+                        .runtime().get_object(&work_unit.target_object_id)
                         .is_ok_and(|object| {
                             object.is_some_and(|object| object.namespace == namespace)
                         })
-                    && check_work_unit_read(&service.db, &service.security, &work_unit, principals)
+                    && check_work_unit_read(service.db.runtime(), &service.security, &work_unit, principals)
                         .is_ok()
             }),
         "object" => service
             .db
-            .get_object(&reference.id)
+            .runtime().get_object(&reference.id)
             .map_err(Status::internal)?
             .is_some_and(|object| {
                 object.namespace == namespace
                     && reference_content_digest(&object)
                         .is_ok_and(|digest| digest == reference.version)
-                    && check_team_namespace(&service.db, principals, namespace, false).is_ok()
+                    && check_team_namespace(service.db.runtime(), principals, namespace, false).is_ok()
                     && check_read(&service.security, &object.id, principals).is_ok()
             }),
         "evidence_submission" => {
             if let Some(submission) = service
                 .db
-                .get_evidence_submission(&reference.id)
+                .runtime().get_evidence_submission(&reference.id)
                 .map_err(Status::internal)?
             {
                 let projected = service
                     .db
-                    .get_evidence_projection_object_id(&reference.id)
+                    .runtime().get_evidence_projection_object_id(&reference.id)
                     .map_err(Status::internal)?;
                 submission.namespace == namespace
                     && submission.content_digest == reference.version
@@ -1181,7 +1181,7 @@ pub(super) fn handoff_reference_available(
             };
             if let Some(memory) = service
                 .db
-                .get_kioku_memory(&reference.id, version)
+                .runtime().get_kioku_memory(&reference.id, version)
                 .map_err(Status::internal)?
             {
                 memory.namespace == namespace
@@ -1193,7 +1193,7 @@ pub(super) fn handoff_reference_available(
                     && principals.iter().any(|principal| {
                         service
                             .db
-                            .kioku_authorized_classification_ceiling(namespace, principal)
+                            .runtime().kioku_authorized_classification_ceiling(namespace, principal)
                             .is_ok_and(|ceiling| memory.classification <= ceiling)
                     })
             } else {

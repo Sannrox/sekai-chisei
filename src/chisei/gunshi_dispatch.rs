@@ -296,7 +296,10 @@ fn dispatch_evidence_matches_receipt(
     let Some(request_id) = evidence.receipt_reference.as_deref() else {
         return Ok(false);
     };
-    let Some(receipt) = db.find_operation_receipt_by_request_id(request_id)? else {
+    let Some(receipt) = db
+        .runtime()
+        .find_operation_receipt_by_request_id(request_id)?
+    else {
         return Ok(false);
     };
     if !receipt.completeness().complete
@@ -473,24 +476,25 @@ mod tests {
 
     fn db() -> ChiseiStore {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "memory-1".into(),
-            kind: crate::domain::KIND_LEARNING.into(),
-            name: "Fleet evidence".into(),
-            namespace: "support".into(),
-            external_id: "memory-1".into(),
-            properties: HashMap::from([
-                ("task_class".into(), "triage".into()),
-                ("model".into(), "local".into()),
-                ("score".into(), "90".into()),
-                ("passed".into(), "true".into()),
-                ("status".into(), "active".into()),
-                ("source_request_id".into(), "receipt-1".into()),
-            ]),
-            created: 1,
-            updated: 2,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "memory-1".into(),
+                kind: crate::domain::KIND_LEARNING.into(),
+                name: "Fleet evidence".into(),
+                namespace: "support".into(),
+                external_id: "memory-1".into(),
+                properties: HashMap::from([
+                    ("task_class".into(), "triage".into()),
+                    ("model".into(), "local".into()),
+                    ("score".into(), "90".into()),
+                    ("passed".into(), "true".into()),
+                    ("status".into(), "active".into()),
+                    ("source_request_id".into(), "receipt-1".into()),
+                ]),
+                created: 1,
+                updated: 2,
+            })
+            .unwrap();
         let event =
             |id: &str,
              parent: Option<&str>,
@@ -506,58 +510,59 @@ mod tests {
                 references: Vec::new(),
                 attributes,
             };
-        db.put_operation_receipt(&OperationReceipt {
-            version: OPERATION_RECEIPT_VERSION.into(),
-            operation_id: "receipt-op-1".into(),
-            parent_operation_id: None,
-            namespace: "support".into(),
-            operation_class: "triage".into(),
-            initiating_actor: "agent:test".into(),
-            schema_version: "schema-v1".into(),
-            policy_version: "governance-v1".into(),
-            started_at_ms: 1,
-            completed_at_ms: Some(2),
-            events: vec![
-                event(
-                    "intent",
-                    None,
-                    ReceiptEventKind::IntentRecorded,
-                    BTreeMap::from([("request_id".into(), "receipt-1".into())]),
-                ),
-                event(
-                    "policy",
-                    Some("intent"),
-                    ReceiptEventKind::PolicyDecided,
-                    BTreeMap::new(),
-                ),
-                event(
-                    "route",
-                    Some("policy"),
-                    ReceiptEventKind::RouteSelected,
-                    BTreeMap::from([("resolved_model".into(), "local".into())]),
-                ),
-                event(
-                    "budget",
-                    Some("route"),
-                    ReceiptEventKind::BudgetDecided,
-                    BTreeMap::new(),
-                ),
-                event(
-                    "outcome",
-                    Some("budget"),
-                    ReceiptEventKind::OutcomeRecorded,
-                    BTreeMap::from([
-                        ("passed".into(), "true".into()),
-                        ("score".into(), "90".into()),
-                    ]),
-                ),
-            ],
-            uncovered_surfaces: Vec::new(),
-            reporter_grants: Vec::new(),
-            ontology_digest: None,
-            artifact: None,
-        })
-        .unwrap();
+        db.runtime()
+            .put_operation_receipt(&OperationReceipt {
+                version: OPERATION_RECEIPT_VERSION.into(),
+                operation_id: "receipt-op-1".into(),
+                parent_operation_id: None,
+                namespace: "support".into(),
+                operation_class: "triage".into(),
+                initiating_actor: "agent:test".into(),
+                schema_version: "schema-v1".into(),
+                policy_version: "governance-v1".into(),
+                started_at_ms: 1,
+                completed_at_ms: Some(2),
+                events: vec![
+                    event(
+                        "intent",
+                        None,
+                        ReceiptEventKind::IntentRecorded,
+                        BTreeMap::from([("request_id".into(), "receipt-1".into())]),
+                    ),
+                    event(
+                        "policy",
+                        Some("intent"),
+                        ReceiptEventKind::PolicyDecided,
+                        BTreeMap::new(),
+                    ),
+                    event(
+                        "route",
+                        Some("policy"),
+                        ReceiptEventKind::RouteSelected,
+                        BTreeMap::from([("resolved_model".into(), "local".into())]),
+                    ),
+                    event(
+                        "budget",
+                        Some("route"),
+                        ReceiptEventKind::BudgetDecided,
+                        BTreeMap::new(),
+                    ),
+                    event(
+                        "outcome",
+                        Some("budget"),
+                        ReceiptEventKind::OutcomeRecorded,
+                        BTreeMap::from([
+                            ("passed".into(), "true".into()),
+                            ("score".into(), "90".into()),
+                        ]),
+                    ),
+                ],
+                uncovered_surfaces: Vec::new(),
+                reporter_grants: Vec::new(),
+                ontology_digest: None,
+                artifact: None,
+            })
+            .unwrap();
         db
     }
 

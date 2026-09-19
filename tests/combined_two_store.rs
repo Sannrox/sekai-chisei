@@ -71,7 +71,7 @@ fn create_object_request() -> CreateObjectRequest {
 fn assert_plane_isolation(sekai_path: &Path, chisei_path: &Path) {
     let sekai = SekaiStore::open_sqlite(sekai_path.to_str().unwrap());
     assert!(
-        sekai.get_object(OBJECT_ID).unwrap().is_some(),
+        sekai.runtime().get_object(OBJECT_ID).unwrap().is_some(),
         "Sekai fact must persist on the Sekai file"
     );
     assert_eq!(
@@ -84,7 +84,7 @@ fn assert_plane_isolation(sekai_path: &Path, chisei_path: &Path) {
 
     let chisei = ChiseiStore::open_sqlite(chisei_path.to_str().unwrap());
     assert!(
-        chisei.get_object(OBJECT_ID).unwrap().is_none(),
+        chisei.runtime().get_object(OBJECT_ID).unwrap().is_none(),
         "Sekai fact must not persist on the Chisei file"
     );
     assert_eq!(

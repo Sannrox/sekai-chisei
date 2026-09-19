@@ -13,7 +13,7 @@ impl SekaiServiceImpl {
         req: Request<CreateLinkRequest>,
     ) -> Result<Response<CreateLinkResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
         let inner = req.into_inner();
         let fail_if_exists = inner.fail_if_exists;
@@ -24,11 +24,12 @@ impl SekaiServiceImpl {
         for object_id in [&l.from_id, &l.to_id] {
             let object = self
                 .db
+                .runtime()
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
             if evaluate_active_object_policy(
-                &self.db,
+                self.db.runtime(),
                 &object,
                 &principals,
                 tenant_context.as_ref(),
@@ -39,15 +40,15 @@ impl SekaiServiceImpl {
                 return Err(Status::not_found("link endpoint not found"));
             }
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &object.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+            check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 &object,
                 &principals,
                 tenant_context.as_ref(),
@@ -57,8 +58,18 @@ impl SekaiServiceImpl {
             )?;
             endpoints.push(object);
         }
-        if self.db.get_link(&l.id).map_err(Status::internal)?.is_none() {
-            let ontology = self.db.load_ontology_registry().map_err(Status::internal)?;
+        if self
+            .db
+            .runtime()
+            .get_link(&l.id)
+            .map_err(Status::internal)?
+            .is_none()
+        {
+            let ontology = self
+                .db
+                .runtime()
+                .load_ontology_registry()
+                .map_err(Status::internal)?;
             validate_mapped_link(
                 &ontology,
                 &l.relation,
@@ -73,10 +84,12 @@ impl SekaiServiceImpl {
             relation: l.relation.clone(),
             created: l.created,
         };
-        let from_generation = object_security_generation(&self.db, &endpoints[0].namespace)?;
-        let to_generation = object_security_generation(&self.db, &endpoints[1].namespace)?;
+        let from_generation =
+            object_security_generation(self.db.runtime(), &endpoints[0].namespace)?;
+        let to_generation = object_security_generation(self.db.runtime(), &endpoints[1].namespace)?;
         let created = self
             .db
+            .runtime()
             .create_link_with_authorized_endpoints(
                 &dl,
                 &endpoints[0],
@@ -97,21 +110,22 @@ impl SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         let principals = caller_principals(&req);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
         let id = req.into_inner().id;
-        let Some(link) = self.db.get_link(&id).map_err(Status::internal)? else {
+        let Some(link) = self.db.runtime().get_link(&id).map_err(Status::internal)? else {
             return Ok(Response::new(DeleteLinkResponse {}));
         };
         let mut endpoints = Vec::with_capacity(2);
         for object_id in [&link.from_id, &link.to_id] {
             let object = self
                 .db
+                .runtime()
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
             if evaluate_active_object_policy(
-                &self.db,
+                self.db.runtime(),
                 &object,
                 &principals,
                 tenant_context.as_ref(),
@@ -122,15 +136,15 @@ impl SekaiServiceImpl {
                 return Err(Status::not_found("link endpoint not found"));
             }
             enforce_namespace_tenant_context(
-                &self.db,
+                self.db.runtime(),
                 tenant_context.as_ref(),
                 &object.namespace,
                 true,
             )?;
-            check_team_namespace(&self.db, &principals, &object.namespace, true)?;
+            check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
             check_write(&self.security, object_id, &principals)?;
             enforce_object_operation_access(
-                &self.db,
+                self.db.runtime(),
                 &object,
                 &principals,
                 tenant_context.as_ref(),
@@ -140,9 +154,11 @@ impl SekaiServiceImpl {
             )?;
             endpoints.push(object);
         }
-        let from_generation = object_security_generation(&self.db, &endpoints[0].namespace)?;
-        let to_generation = object_security_generation(&self.db, &endpoints[1].namespace)?;
+        let from_generation =
+            object_security_generation(self.db.runtime(), &endpoints[0].namespace)?;
+        let to_generation = object_security_generation(self.db.runtime(), &endpoints[1].namespace)?;
         self.db
+            .runtime()
             .delete_link_with_authorized_endpoints(
                 &id,
                 &endpoints[0],

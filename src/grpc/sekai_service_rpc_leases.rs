@@ -6,12 +6,17 @@ pub(super) async fn acquire_lease(
 ) -> Result<Response<AcquireLeaseResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let lease = LeaseLifecycle::new(&service.db, &service.security, &service.site_id)
+    let lease = LeaseLifecycle::new(service.db.runtime(), &service.security, &service.site_id)
         .with_policy_context(principal_policy_context_from(
             &principals,
             tenant_context.as_ref(),
@@ -37,16 +42,16 @@ pub(super) async fn get_lease(
 ) -> Result<Response<GetLeaseResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
-    let lease = LeaseLifecycle::new(&service.db, &service.security, &service.site_id)
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
+    let lease = LeaseLifecycle::new(service.db.runtime(), &service.security, &service.site_id)
         .with_policy_context(principal_policy_context_from(
             &principals,
             tenant_context.as_ref(),
@@ -67,12 +72,17 @@ pub(super) async fn refresh_lease(
 ) -> Result<Response<RefreshLeaseResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let lease = LeaseLifecycle::new(&service.db, &service.security, &service.site_id)
+    let lease = LeaseLifecycle::new(service.db.runtime(), &service.security, &service.site_id)
         .with_policy_context(principal_policy_context_from(
             &principals,
             tenant_context.as_ref(),
@@ -98,12 +108,17 @@ pub(super) async fn release_lease(
 ) -> Result<Response<ReleaseLeaseResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let lease = LeaseLifecycle::new(&service.db, &service.security, &service.site_id)
+    let lease = LeaseLifecycle::new(service.db.runtime(), &service.security, &service.site_id)
         .with_policy_context(principal_policy_context_from(
             &principals,
             tenant_context.as_ref(),
@@ -128,12 +143,17 @@ pub(super) async fn takeover_expired_lease(
 ) -> Result<Response<TakeoverExpiredLeaseResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
-    let lease = LeaseLifecycle::new(&service.db, &service.security, &service.site_id)
+    let lease = LeaseLifecycle::new(service.db.runtime(), &service.security, &service.site_id)
         .with_policy_context(principal_policy_context_from(
             &principals,
             tenant_context.as_ref(),
@@ -161,7 +181,7 @@ pub(super) async fn apply_source_batch(
 ) -> Result<Response<ApplySourceBatchResponse>, Status> {
     let principals = caller_principals(&req);
     let principal = require_single_source_principal(&principals)?.to_string();
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let proto = req
         .into_inner()
         .batch
@@ -179,14 +199,15 @@ pub(super) async fn apply_source_batch(
     let mut batch = from_proto_source_batch(proto)?;
     batch.producer_identity = principal.clone();
     let authorized_objects = authorize_source_batch_object_policy(
-        &service.db,
+        service.db.runtime(),
         &batch,
         &principals,
         tenant_context.as_ref(),
     )?;
-    let policy_generation = object_security_generation(&service.db, &batch.namespace)?;
+    let policy_generation = object_security_generation(service.db.runtime(), &batch.namespace)?;
     let result = service
         .db
+        .runtime()
         .apply_source_batch_with_policy_generation(
             &batch,
             &principal,
@@ -206,7 +227,7 @@ pub(super) async fn get_source_sync_state(
 ) -> Result<Response<GetSourceSyncStateResponse>, Status> {
     let principals = caller_principals(&req);
     require_single_source_principal(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     validate_source_sync_lookup(&input)?;
     authorize_source_sync_namespace(
@@ -216,9 +237,10 @@ pub(super) async fn get_source_sync_state(
         &input.namespace,
         false,
     )?;
-    require_admitted_source_type(&service.db, &input.namespace, &input.type_digest)?;
+    require_admitted_source_type(service.db.runtime(), &input.namespace, &input.type_digest)?;
     let state = service
         .db
+        .runtime()
         .get_source_sync_state(&input.namespace, &input.source_instance, &input.type_digest)
         .map_err(|_| Status::internal("source sync state unavailable"))?;
     Ok(Response::new(GetSourceSyncStateResponse {
@@ -231,9 +253,14 @@ pub(super) async fn register_source_type_descriptor(
     req: Request<RegisterSourceTypeDescriptorRequest>,
 ) -> Result<Response<RegisterSourceTypeDescriptorResponse>, Status> {
     let principals = caller_principals(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
     let actor = authorize_source_type_namespace_admin(service, &principals, &input.namespace)?;
     let proposed = crate::sekai::source_type_descriptor::ProposedSourceTypeDescriptor::prepare(
         input.source,
@@ -242,7 +269,7 @@ pub(super) async fn register_source_type_descriptor(
     )
     .map_err(map_source_type_descriptor_error)?;
     let descriptor = crate::sekai::source_type_descriptor::register_source_type_descriptor(
-        &service.db,
+        service.db.runtime(),
         &actor,
         &input.namespace,
         &proposed,
@@ -258,17 +285,17 @@ pub(super) async fn inspect_source_type_descriptor(
     req: Request<InspectSourceTypeDescriptorRequest>,
 ) -> Result<Response<InspectSourceTypeDescriptorResponse>, Status> {
     let principals = caller_principals(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
     let actor = authorize_source_type_namespace_admin(service, &principals, &input.namespace)?;
     let descriptor = crate::sekai::source_type_descriptor::inspect_source_type_descriptor(
-        &service.db,
+        service.db.runtime(),
         &actor,
         &input.namespace,
         &input.digest,
@@ -283,12 +310,17 @@ pub(super) async fn retire_source_type_descriptor(
     req: Request<RetireSourceTypeDescriptorRequest>,
 ) -> Result<Response<RetireSourceTypeDescriptorResponse>, Status> {
     let principals = caller_principals(&req);
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
     let actor = authorize_source_type_namespace_admin(service, &principals, &input.namespace)?;
     let descriptor = crate::sekai::source_type_descriptor::retire_source_type_descriptor(
-        &service.db,
+        service.db.runtime(),
         &actor,
         &input.namespace,
         &input.digest,

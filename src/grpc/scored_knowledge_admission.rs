@@ -72,6 +72,7 @@ pub(super) async fn admit(
 
     let target = match service
         .db
+        .runtime()
         .find_by_external_id(&format!("namespace:{namespace}"))?
     {
         Some(target) if target.kind == "namespace" => target,
@@ -83,9 +84,11 @@ pub(super) async fn admit(
         }
         None => service
             .db
+            .runtime()
             .find_by_external_id(&format!("policy:{namespace}"))?
             .or(service
                 .db
+                .runtime()
                 .find_by_external_id(&format!("project:{namespace}"))?)
             .ok_or_else(|| format!("no governed target found for namespace: {namespace}"))?,
     };
@@ -148,6 +151,7 @@ pub(super) async fn admit(
     let resolved_policy =
         service
             .db
+            .runtime()
             .resolve_action_policy("chisei.scoring", namespace, namespace)?;
     let decision = resolved_policy
         .as_ref()
@@ -159,7 +163,7 @@ pub(super) async fn admit(
         })
         .unwrap_or(ActionDecision::Allow);
     if decision != ActionDecision::Allow {
-        service.db.record_decision(&audit::Decision {
+        service.db.runtime().record_decision(&audit::Decision {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: now_millis(),
             actor: "chisei.scoring".into(),
@@ -184,18 +188,23 @@ pub(super) async fn admit(
         .schema_definitions
         .refresh_snapshot()
         .map_err(|error| format!("learning schema unavailable: {error:?}"))?;
-    crate::sekai::learning::record_learning(&service.db, &schema, &params, "chisei.scoring")?;
+    crate::sekai::learning::record_learning(
+        service.db.runtime(),
+        &schema,
+        &params,
+        "chisei.scoring",
+    )?;
     // Refresh the process ACL cache before any post-commit audit work so a
     // durable private Learning object cannot remain world-readable on cache miss
     // if later bookkeeping fails.
-    let grants = service.db.list_grants(&learning_id)?;
+    let grants = service.db.runtime().list_grants(&learning_id)?;
     if grants.is_empty() {
         return Err("record_learning completed without a learning ACL".into());
     }
     for grant in &grants {
         service.security.add_grant(grant);
     }
-    service.db.record_decision(&audit::Decision {
+    service.db.runtime().record_decision(&audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: now_millis(),
         actor: "chisei.scoring".into(),

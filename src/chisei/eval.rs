@@ -189,7 +189,7 @@ impl EvalStore {
     }
     pub fn put_suite(&self, suite: Suite) -> Result<(), String> {
         if let Some(db) = &self.db {
-            return db.put_eval_suite(&suite);
+            return db.runtime().put_eval_suite(&suite);
         }
         let mut suites = self.suites.lock().unwrap();
         match suites.get(&suite.id) {
@@ -207,19 +207,25 @@ impl EvalStore {
     }
     pub fn get_suite(&self, id: &str) -> Option<Suite> {
         if let Some(db) = &self.db {
-            return db.get_eval_suite_record(id).unwrap_or_else(|error| {
-                tracing::error!(%error, suite_id = id, "failed to read shared eval suite");
-                None
-            });
+            return db
+                .runtime()
+                .get_eval_suite_record(id)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, suite_id = id, "failed to read shared eval suite");
+                    None
+                });
         }
         self.suites.lock().unwrap().get(id).cloned()
     }
     pub fn list_suites(&self) -> Vec<Suite> {
         if let Some(db) = &self.db {
-            return db.list_eval_suite_records().unwrap_or_else(|error| {
-                tracing::error!(%error, "failed to list shared eval suites");
-                Vec::new()
-            });
+            return db
+                .runtime()
+                .list_eval_suite_records()
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "failed to list shared eval suites");
+                    Vec::new()
+                });
         }
         self.suites.lock().unwrap().values().cloned().collect()
     }
@@ -231,7 +237,7 @@ impl EvalStore {
     }
     pub fn put_run(&self, run: Run) -> Result<(), String> {
         if let Some(db) = &self.db {
-            return db.put_eval_run(&run);
+            return db.runtime().put_eval_run(&run);
         }
         let mut runs = self.runs.lock().unwrap();
         match runs.get(&run.id) {
@@ -245,19 +251,25 @@ impl EvalStore {
     }
     pub fn get_run(&self, id: &str) -> Option<Run> {
         if let Some(db) = &self.db {
-            return db.get_eval_run_record(id).unwrap_or_else(|error| {
-                tracing::error!(%error, run_id = id, "failed to read shared eval run");
-                None
-            });
+            return db
+                .runtime()
+                .get_eval_run_record(id)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, run_id = id, "failed to read shared eval run");
+                    None
+                });
         }
         self.runs.lock().unwrap().get(id).cloned()
     }
     pub fn list_runs(&self, suite_id: &str) -> Vec<Run> {
         if let Some(db) = &self.db {
-            return db.list_eval_run_records(suite_id).unwrap_or_else(|error| {
-                tracing::error!(%error, suite_id, "failed to list shared eval runs");
-                Vec::new()
-            });
+            return db
+                .runtime()
+                .list_eval_run_records(suite_id)
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, suite_id, "failed to list shared eval runs");
+                    Vec::new()
+                });
         }
         self.runs
             .lock()
@@ -273,7 +285,7 @@ impl EvalStore {
     /// from an unavailable evaluation plane.
     pub fn read_suite_for_gate(&self, suite_id: &str) -> Result<Option<Suite>, String> {
         if let Some(db) = &self.db {
-            return db.get_eval_suite_record_for_gate(suite_id);
+            return db.runtime().get_eval_suite_record_for_gate(suite_id);
         }
         let suite = self.suites.lock().unwrap().get(suite_id).cloned();
         if suite
@@ -297,7 +309,11 @@ impl EvalStore {
         max_timestamp_ms: i64,
     ) -> Result<Option<Run>, String> {
         if let Some(db) = &self.db {
-            return db.get_latest_eval_run_record_for_gate(suite_id, config_ref, max_timestamp_ms);
+            return db.runtime().get_latest_eval_run_record_for_gate(
+                suite_id,
+                config_ref,
+                max_timestamp_ms,
+            );
         }
         let run = self
             .runs
@@ -334,7 +350,7 @@ impl EvalStore {
     }
     pub fn put_iteration(&self, iteration: Iteration) -> Result<(), String> {
         if let Some(db) = &self.db {
-            return db.put_eval_iteration(&iteration);
+            return db.runtime().put_eval_iteration(&iteration);
         }
         self.iterations
             .lock()
@@ -381,13 +397,15 @@ impl EvalStore {
     pub fn list_iterations(&self, suite_id: &str) -> Vec<Iteration> {
         let mut iterations: Vec<_> = if let Some(db) = &self.db {
             if suite_id.is_empty() {
-                db.list_all_eval_iteration_records()
+                db.runtime()
+                    .list_all_eval_iteration_records()
                     .unwrap_or_else(|error| {
                         tracing::error!(%error, "failed to list shared eval iterations");
                         Vec::new()
                     })
             } else {
-                db.list_eval_iteration_records(suite_id)
+                db.runtime()
+                    .list_eval_iteration_records(suite_id)
                     .unwrap_or_else(|error| {
                         tracing::error!(%error, suite_id, "failed to list shared eval iterations");
                         Vec::new()
@@ -876,7 +894,7 @@ mod tests {
             description: String::new(),
             cases: Vec::new(),
         };
-        writer.put_eval_suite(&suite).unwrap();
+        writer.runtime().put_eval_suite(&suite).unwrap();
         assert_eq!(store.get_suite("shared-suite").unwrap().name, "shared");
 
         let run = Run {
@@ -886,7 +904,7 @@ mod tests {
             results: Vec::new(),
             timestamp: 1,
         };
-        writer.put_eval_run(&run).unwrap();
+        writer.runtime().put_eval_run(&run).unwrap();
         assert_eq!(store.get_run("shared-run").unwrap().config_ref, "v1");
         assert_eq!(store.list_runs("shared-suite").len(), 1);
 
@@ -907,9 +925,9 @@ mod tests {
             description: String::new(),
             cases: Vec::new(),
         };
-        first.put_eval_suite(&promotion).unwrap();
+        first.runtime().put_eval_suite(&promotion).unwrap();
         promotion.name = "b".into();
-        assert!(second.put_eval_suite(&promotion).is_err());
+        assert!(second.runtime().put_eval_suite(&promotion).is_err());
 
         let sampling = Suite {
             id: "sampling-live".into(),
@@ -917,16 +935,16 @@ mod tests {
             description: String::new(),
             cases: Vec::new(),
         };
-        first.put_eval_suite(&sampling).unwrap();
+        first.runtime().put_eval_suite(&sampling).unwrap();
         let mut updated = sampling.clone();
         updated.name = "second".into();
-        second.put_eval_suite(&updated).unwrap();
+        second.runtime().put_eval_suite(&updated).unwrap();
 
         let mut uppercase = sampling.clone();
         uppercase.id = "Sampling-locked".into();
-        first.put_eval_suite(&uppercase).unwrap();
+        first.runtime().put_eval_suite(&uppercase).unwrap();
         uppercase.name = "changed".into();
-        assert!(second.put_eval_suite(&uppercase).is_err());
+        assert!(second.runtime().put_eval_suite(&uppercase).is_err());
 
         let run = Run {
             id: "immutable-run".into(),
@@ -937,8 +955,8 @@ mod tests {
         };
         let mut changed = run.clone();
         changed.config_ref = "v2".into();
-        first.put_eval_run(&run).unwrap();
-        let error = second.put_eval_run(&changed).unwrap_err();
+        first.runtime().put_eval_run(&run).unwrap();
+        let error = second.runtime().put_eval_run(&changed).unwrap_err();
         assert!(error.contains("immutable-run") && error.contains("immutable"));
 
         drop((first, second));

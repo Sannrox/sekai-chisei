@@ -109,7 +109,7 @@ pub fn propose_change(
     let candidate_digest = learning_digest(&learning)?;
     let baseline_digest = live_baseline_digest(db, &request.namespace, &request.learning_id)?;
     let change_id = change_id_for(&request.namespace, &request.learning_id);
-    if let Some(mut existing) = db.get_learning_change(&change_id)? {
+    if let Some(mut existing) = db.runtime().get_learning_change(&change_id)? {
         if existing.namespace != request.namespace || existing.learning_id != request.learning_id {
             return Err(UNAVAILABLE.into());
         }
@@ -136,7 +136,7 @@ pub fn propose_change(
             restored_change_id: None,
         });
         existing.updated_at_ms = now_ms;
-        db.put_learning_change(&existing)?;
+        db.runtime().put_learning_change(&existing)?;
         audit(db, actor, PROPOSE_ACTION, "proposed", &existing, now_ms)?;
         return Ok(existing);
     }
@@ -159,7 +159,7 @@ pub fn propose_change(
         proposed_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
-    db.put_learning_change(&record)?;
+    db.runtime().put_learning_change(&record)?;
     audit(db, actor, PROPOSE_ACTION, "proposed", &record, now_ms)?;
     Ok(record)
 }
@@ -195,7 +195,7 @@ pub fn approve_change(
         approved_at_ms: now_ms,
     });
     record.updated_at_ms = now_ms;
-    db.put_learning_change(&record)?;
+    db.runtime().put_learning_change(&record)?;
     audit(db, actor, APPROVE_ACTION, "approved", &record, now_ms)?;
     Ok(record)
 }
@@ -229,7 +229,7 @@ pub fn activate_change(
     });
     record.updated_at_ms = now_ms;
     set_learning_status(db, &record.learning_id, "active")?;
-    db.put_learning_change(&record)?;
+    db.runtime().put_learning_change(&record)?;
     audit(db, actor, ACTIVATE_ACTION, "activated", &record, now_ms)?;
     Ok(record)
 }
@@ -262,7 +262,7 @@ pub fn rollback_change(
     });
     record.updated_at_ms = now_ms;
     set_learning_status(db, &record.learning_id, "candidate")?;
-    db.put_learning_change(&record)?;
+    db.runtime().put_learning_change(&record)?;
     audit(db, actor, ROLLBACK_ACTION, "rolled_back", &record, now_ms)?;
     Ok(record)
 }
@@ -284,7 +284,7 @@ pub fn note_lease_loss(
     }
     record.reconciliation = RECONCILE_LEASE_LOST.into();
     record.updated_at_ms = now_ms;
-    db.put_learning_change(&record)?;
+    db.runtime().put_learning_change(&record)?;
     audit(db, actor, RECONCILE_ACTION, "lease_lost", &record, now_ms)?;
     Ok(record)
 }
@@ -298,6 +298,7 @@ pub fn get_change(
     required("learning id", learning_id)?;
     let change_id = change_id_for(namespace, learning_id);
     let record = db
+        .runtime()
         .get_learning_change(&change_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if record.namespace != namespace || record.learning_id != learning_id {
@@ -310,7 +311,7 @@ pub fn list_changes(
     db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<LearningChange>, String> {
-    db.list_learning_changes(namespace)
+    db.runtime().list_learning_changes(namespace)
 }
 
 pub fn inspect_change(
@@ -333,6 +334,7 @@ fn visible_learning(
     learning_id: &str,
 ) -> Result<crate::domain::Object, String> {
     let learning = db
+        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if learning.kind != KIND_LEARNING || learning.namespace != namespace {
@@ -364,6 +366,7 @@ fn live_baseline_digest(
 ) -> Result<String, String> {
     let current = change_id_for(namespace, learning_id);
     Ok(db
+        .runtime()
         .list_learning_changes(Some(namespace))?
         .into_iter()
         .filter(|record| record.status == STATUS_ACTIVE && record.change_id != current)
@@ -374,11 +377,12 @@ fn live_baseline_digest(
 
 fn set_learning_status(db: &ChiseiStore, learning_id: &str, status: &str) -> Result<(), String> {
     let mut learning = db
+        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     learning.properties.insert("status".into(), status.into());
     learning.updated = learning.updated.saturating_add(1);
-    db.update_object(&learning)
+    db.runtime().update_object(&learning)
 }
 
 fn learning_digest(object: &crate::domain::Object) -> Result<String, String> {
@@ -428,7 +432,7 @@ fn audit(
     record: &LearningChange,
     now_ms: i64,
 ) -> Result<(), String> {
-    db.record_decision(&Decision {
+    db.runtime().record_decision(&Decision {
         id: format!("{action}:{}:{now_ms}", record.change_id),
         timestamp: now_ms,
         actor: actor.into(),
@@ -473,19 +477,20 @@ mod tests {
     }
 
     fn record_candidate(db: &ChiseiStore) {
-        db.create_object(&Object {
-            id: "target-1".into(),
-            kind: "component".into(),
-            name: "checkout".into(),
-            namespace: "payments".into(),
-            external_id: String::new(),
-            properties: HashMap::new(),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "target-1".into(),
+                kind: "component".into(),
+                name: "checkout".into(),
+                namespace: "payments".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
         record_learning(
-            db,
+            db.runtime(),
             &SchemaRegistry::new(),
             &HashMap::from([
                 ("id".into(), "learning-1".into()),
@@ -550,10 +555,15 @@ mod tests {
         assert_eq!(replay_activate.lineage.len(), 1);
         assert_eq!(replay_activate.updated_at_ms, 3_000);
         assert_eq!(
-            db.get_object("learning-1").unwrap().unwrap().properties["status"],
+            db.runtime()
+                .get_object("learning-1")
+                .unwrap()
+                .unwrap()
+                .properties["status"],
             "active"
         );
         let title_before = db
+            .runtime()
             .get_object("learning-1")
             .unwrap()
             .unwrap()
@@ -566,11 +576,16 @@ mod tests {
         assert_eq!(rolled.lineage.len(), 2);
         assert_eq!(rolled.lineage[1].action, "rollback");
         assert_eq!(
-            db.get_object("learning-1").unwrap().unwrap().properties["status"],
+            db.runtime()
+                .get_object("learning-1")
+                .unwrap()
+                .unwrap()
+                .properties["status"],
             "candidate"
         );
         assert_eq!(
-            db.get_object("learning-1")
+            db.runtime()
+                .get_object("learning-1")
                 .unwrap()
                 .unwrap()
                 .properties
@@ -592,11 +607,11 @@ mod tests {
         propose(&db, 1_000);
         approve_change(&db, "reviewer", "payments", "learning-1", 2_000).unwrap();
 
-        let mut learning = db.get_object("learning-1").unwrap().unwrap();
+        let mut learning = db.runtime().get_object("learning-1").unwrap().unwrap();
         learning
             .properties
             .insert("title".into(), "changed after pin".into());
-        db.update_object(&learning).unwrap();
+        db.runtime().update_object(&learning).unwrap();
         assert_eq!(
             activate_change(&db, "operator", "payments", "learning-1", 3_000).unwrap_err(),
             UNAVAILABLE

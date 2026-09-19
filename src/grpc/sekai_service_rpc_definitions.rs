@@ -6,7 +6,7 @@ pub(super) async fn create_definition_branch(
 ) -> Result<Response<CreateDefinitionBranchResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -34,6 +34,7 @@ pub(super) async fn create_definition_branch(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .create_definition_branch(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::CreateBranch { branch } = result else {
@@ -49,7 +50,7 @@ pub(super) async fn get_definition_branch(
 ) -> Result<Response<GetDefinitionBranchResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -67,6 +68,7 @@ pub(super) async fn get_definition_branch(
     }
     let branch = service
         .db
+        .runtime()
         .get_definition_branch(&input.namespace, &input.branch_id)
         .map_err(|_| Status::internal("definition branch unavailable"))?
         .ok_or_else(|| Status::not_found("definition branch unavailable"))?;
@@ -87,7 +89,7 @@ pub(super) async fn apply_definition_branch_edit(
 ) -> Result<Response<ApplyDefinitionBranchEditResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -141,6 +143,7 @@ pub(super) async fn apply_definition_branch_edit(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .apply_definition_branch_edit(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::ApplyEdit { result } = result else {
@@ -159,7 +162,7 @@ pub(super) async fn create_definition_proposal(
 ) -> Result<Response<CreateDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -205,6 +208,7 @@ pub(super) async fn create_definition_proposal(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .create_definition_proposal(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::CreateProposal { proposal } = result
@@ -221,7 +225,7 @@ pub(super) async fn get_definition_proposal(
 ) -> Result<Response<GetDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -239,6 +243,7 @@ pub(super) async fn get_definition_proposal(
     }
     let proposal = service
         .db
+        .runtime()
         .get_definition_proposal(&input.namespace, &input.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
@@ -259,7 +264,7 @@ pub(super) async fn approve_definition_proposal(
 ) -> Result<Response<ApproveDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -276,6 +281,7 @@ pub(super) async fn approve_definition_proposal(
     request.request_digest().map_err(Status::invalid_argument)?;
     let proposal = service
         .db
+        .runtime()
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
@@ -291,6 +297,7 @@ pub(super) async fn approve_definition_proposal(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .approve_definition_proposal(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::ApproveProposal { proposal } = result
@@ -307,7 +314,7 @@ pub(super) async fn merge_definition_proposal(
 ) -> Result<Response<MergeDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -325,6 +332,7 @@ pub(super) async fn merge_definition_proposal(
     request.request_digest().map_err(Status::invalid_argument)?;
     let proposal = service
         .db
+        .runtime()
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
@@ -365,6 +373,7 @@ pub(super) async fn merge_definition_proposal(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .merge_definition_proposal(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::MergeProposal { result } = result else {
@@ -383,7 +392,7 @@ pub(super) async fn close_definition_proposal(
 ) -> Result<Response<CloseDefinitionProposalResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -401,6 +410,7 @@ pub(super) async fn close_definition_proposal(
     request.request_digest().map_err(Status::invalid_argument)?;
     let proposal = service
         .db
+        .runtime()
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
@@ -416,6 +426,7 @@ pub(super) async fn close_definition_proposal(
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let result = service
         .db
+        .runtime()
         .close_definition_proposal(&request, actor, now_millis())
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::CloseProposal { proposal } = result else {
@@ -431,7 +442,7 @@ pub(super) async fn get_published_definition_revision(
 ) -> Result<Response<GetPublishedDefinitionRevisionResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -442,6 +453,7 @@ pub(super) async fn get_published_definition_revision(
     )?;
     let revision = service
         .db
+        .runtime()
         .get_published_definition_revision(&input.namespace)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
@@ -462,7 +474,7 @@ pub(super) async fn compare_definition_revisions(
 ) -> Result<Response<CompareDefinitionRevisionsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -501,7 +513,7 @@ pub(super) async fn classify_definition_revision_compatibility(
 ) -> Result<Response<ClassifyDefinitionRevisionCompatibilityResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -536,7 +548,7 @@ pub(super) async fn execute_definition_fact_migration(
 ) -> Result<Response<ExecuteDefinitionFactMigrationResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let policy_context = principal_policy_context(&req);
     let input = req.into_inner();
     authorize_source_sync_namespace(
@@ -556,6 +568,7 @@ pub(super) async fn execute_definition_fact_migration(
     let actor = principals.first().cloned().unwrap_or_default();
     let result = service
         .db
+        .runtime()
         .execute_definition_fact_migration(
             &crate::sekai::definition_migration::ExecuteFactMigration {
                 namespace: input.namespace,
@@ -580,7 +593,7 @@ pub(super) async fn get_definition_fact_migration(
 ) -> Result<Response<GetDefinitionFactMigrationResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -591,6 +604,7 @@ pub(super) async fn get_definition_fact_migration(
     )?;
     let result = service
         .db
+        .runtime()
         .get_definition_fact_migration(&input.namespace, &input.migration_id)
         .map_err(|_| Status::internal("definition resource unavailable"))?;
     let Some(result) = result else {
@@ -620,7 +634,7 @@ pub(super) async fn create_handoff(
     let proto = inner
         .manifest
         .ok_or(Status::invalid_argument("manifest required"))?;
-    check_team_namespace(&service.db, &principals, &proto.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &proto.namespace, true)?;
     let creator = principals
         .first()
         .cloned()
@@ -649,7 +663,7 @@ pub(super) async fn create_handoff(
     };
     let current_time = now_millis();
     let namespace = manifest.namespace.clone();
-    let stored = HandoffLifecycle::new(&service.db)
+    let stored = HandoffLifecycle::new(service.db.runtime())
         .create(
             CreateHandoffCommand {
                 manifest,
@@ -680,7 +694,7 @@ pub(super) async fn revoke_handoff(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let inner = req.into_inner();
-    let revoked = HandoffLifecycle::new(&service.db)
+    let revoked = HandoffLifecycle::new(service.db.runtime())
         .revoke(RevokeHandoffCommand {
             manifest_id: &inner.manifest_id,
             reason: &inner.reason,

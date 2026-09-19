@@ -33,7 +33,7 @@ impl ChiseiServiceImpl {
         } else {
             r.namespace.trim()
         };
-        require_team_namespace_actor_access(&self.db, actor, requested_namespace)?;
+        require_team_namespace_actor_access(self.db.runtime(), actor, requested_namespace)?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let capability_requirements = if r.capability_requirements_json.is_empty() {
@@ -453,35 +453,38 @@ impl ChiseiServiceImpl {
         if !selection.shifted {
             return;
         }
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.portfolio".into(),
-            action: "chisei.portfolio_route_shift".into(),
-            reason: selection.reason.clone(),
-            evidence: HashMap::from([
-                ("task_class".into(), task_class.to_string()),
-                ("previous_model".into(), selection.previous_model.clone()),
-                (
-                    "previous_prompt_variant".into(),
-                    selection.previous_prompt_variant.clone(),
-                ),
-                ("selected_model".into(), selection.model.clone()),
-                (
-                    "selected_prompt_variant".into(),
-                    selection.prompt_variant.clone(),
-                ),
-                ("objective_mode".into(), objective.mode.as_str().into()),
-                (
-                    "budget_usd_micros".into(),
-                    objective.budget_usd_micros.to_string(),
-                ),
-                ("quality_bar".into(), objective.quality_bar.to_string()),
-                ("min_samples".into(), objective.min_samples.to_string()),
-            ]),
-            target_id: scope.to_string(),
-            outcome: outcome.to_string(),
-        });
+        let _ = self
+            .db
+            .runtime()
+            .record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+                actor: "chisei.portfolio".into(),
+                action: "chisei.portfolio_route_shift".into(),
+                reason: selection.reason.clone(),
+                evidence: HashMap::from([
+                    ("task_class".into(), task_class.to_string()),
+                    ("previous_model".into(), selection.previous_model.clone()),
+                    (
+                        "previous_prompt_variant".into(),
+                        selection.previous_prompt_variant.clone(),
+                    ),
+                    ("selected_model".into(), selection.model.clone()),
+                    (
+                        "selected_prompt_variant".into(),
+                        selection.prompt_variant.clone(),
+                    ),
+                    ("objective_mode".into(), objective.mode.as_str().into()),
+                    (
+                        "budget_usd_micros".into(),
+                        objective.budget_usd_micros.to_string(),
+                    ),
+                    ("quality_bar".into(), objective.quality_bar.to_string()),
+                    ("min_samples".into(), objective.min_samples.to_string()),
+                ]),
+                target_id: scope.to_string(),
+                outcome: outcome.to_string(),
+            });
     }
 }
 

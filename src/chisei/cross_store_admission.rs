@@ -39,6 +39,7 @@ pub trait SekaiCommitLookup: Send + Sync {
 impl SekaiCommitLookup for SekaiStore {
     fn lookup_commit(&self, operation_id: &str) -> Result<Option<SekaiCommitRef>, String> {
         Ok(self
+            .runtime()
             .get_action_instance_by_operation_id(operation_id)?
             .map(|instance| SekaiCommitRef {
                 namespace: instance.namespace,
@@ -112,6 +113,7 @@ impl CrossStoreAdmission {
 
         if let Some(existing) = self
             .chisei
+            .runtime()
             .get_operation_reservation(namespace, &operation_id)
             .map_err(ActionInstanceAdmissionError::Internal)?
         {
@@ -152,6 +154,7 @@ impl CrossStoreAdmission {
         };
         let stored = self
             .chisei
+            .runtime()
             .put_operation_reservation(&reservation)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
@@ -167,8 +170,11 @@ impl CrossStoreAdmission {
         now_ms: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         request.budget_already_reserved = self.budget.is_some();
-        ActionInstanceAdmission::new(&self.sekai, self.budget.as_ref().map(AsRef::as_ref))
-            .admit(request, actor, now_ms)
+        ActionInstanceAdmission::new(
+            self.sekai.runtime(),
+            self.budget.as_ref().map(AsRef::as_ref),
+        )
+        .admit(request, actor, now_ms)
     }
 
     pub(crate) fn finalize(
@@ -189,6 +195,7 @@ impl CrossStoreAdmission {
         }
         let stored = self
             .chisei
+            .runtime()
             .put_operation_reservation(&next)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
@@ -219,6 +226,7 @@ impl CrossStoreAdmission {
         next.updated_at_ms = now_ms;
         next.incurred_usage = 0;
         self.chisei
+            .runtime()
             .put_operation_reservation(&next)
             .map_err(ActionInstanceAdmissionError::Internal)
     }
@@ -249,6 +257,7 @@ impl CrossStoreAdmission {
     ) -> Result<Vec<OperationReservation>, ActionInstanceAdmissionError> {
         let pending = self
             .chisei
+            .runtime()
             .list_pending_operation_reservations(256)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         pending
@@ -329,6 +338,7 @@ impl CrossStoreAdmission {
             artifact: None,
         };
         self.chisei
+            .runtime()
             .put_operation_receipt(&receipt)
             .map_err(ActionInstanceAdmissionError::Internal)
     }
@@ -423,7 +433,7 @@ mod tests {
 
     fn seed_type(sekai: &SekaiStore) {
         sekai
-            .put_governed_action_type(
+            .runtime().put_governed_action_type(
                 GovernedActionType {
                     namespace: "acme".into(),
                     type_id: "dispatch".into(),
@@ -477,6 +487,7 @@ mod tests {
         assert!(
             clerk
                 .sekai
+                .runtime()
                 .get_action_instance_by_operation_id("op-reserve")
                 .unwrap()
                 .is_none()
@@ -494,6 +505,7 @@ mod tests {
         assert_eq!(outcome.instance.status, "admitted");
         let still = clerk
             .chisei
+            .runtime()
             .get_operation_reservation("acme", "op-commit")
             .unwrap()
             .unwrap();
@@ -552,6 +564,7 @@ mod tests {
         let outcome = clerk.admit(request("op-receipts"), "alice", 10).unwrap();
         let chisei_receipt = clerk
             .chisei
+            .runtime()
             .get_operation_receipt("op-receipts")
             .unwrap()
             .expect("chisei decision receipt");
@@ -561,6 +574,7 @@ mod tests {
         );
         let sekai_receipt = clerk
             .sekai
+            .runtime()
             .get_operation_receipt("op-receipts")
             .unwrap()
             .expect("sekai commit receipt");
@@ -569,6 +583,7 @@ mod tests {
         assert_eq!(
             clerk
                 .chisei
+                .runtime()
                 .get_operation_reservation("acme", "op-receipts")
                 .unwrap()
                 .unwrap()
@@ -587,6 +602,7 @@ mod tests {
         clerk.admit(request("op-shared"), "alice", 10).unwrap();
         let receipt = clerk
             .chisei
+            .runtime()
             .get_operation_receipt("op-shared")
             .unwrap()
             .expect("shared receipt");

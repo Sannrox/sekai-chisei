@@ -19,9 +19,10 @@ pub(super) fn authorize_source_type_namespace_admin(
     if canonical.is_empty() || canonical != namespace {
         return Err(Status::permission_denied("namespace access denied"));
     }
-    check_team_namespace(&service.db, principals, canonical, true)?;
+    check_team_namespace(service.db.runtime(), principals, canonical, true)?;
     let boundary = service
         .db
+        .runtime()
         .find_namespace_boundary(canonical)
         .map_err(Status::internal)?;
     let team_managed = boundary.as_ref().is_some_and(|object| {
@@ -33,7 +34,7 @@ pub(super) fn authorize_source_type_namespace_admin(
     if !team_managed {
         return Err(Status::permission_denied("namespace access denied"));
     }
-    let memberships = team_namespace_memberships(&service.db, principals)?;
+    let memberships = team_namespace_memberships(service.db.runtime(), principals)?;
     let is_admin = memberships.iter().any(|(member_namespace, role)| {
         member_namespace == canonical && matches!(role, security::Role::Admin)
     });
@@ -51,7 +52,7 @@ pub(super) fn authorize_namespace_action_admin(
     namespace: &str,
 ) -> Result<String, Status> {
     require_authenticated(principals)?;
-    check_team_namespace(&service.db, principals, namespace, true)?;
+    check_team_namespace(service.db.runtime(), principals, namespace, true)?;
     check_action_admin(
         &service.security,
         &format!("governed_action:{namespace}"),
@@ -186,12 +187,18 @@ pub(super) fn governed_reference_tree_visible(
             if !active.insert(id.clone()) {
                 return Ok(false);
             }
-            let object = service.db.get_object(&id).map_err(Status::internal)?;
+            let object = service
+                .db
+                .runtime()
+                .get_object(&id)
+                .map_err(Status::internal)?;
             let visible = object.as_ref().is_some_and(|object| {
                 object.namespace == namespace
-                    && check_team_namespace(&service.db, principals, namespace, false).is_ok()
+                    && check_team_namespace(service.db.runtime(), principals, namespace, false)
+                        .is_ok()
                     && check_read(&service.security, &id, principals).is_ok()
-                    && object_passes_marking(&service.db, object, principals).unwrap_or(false)
+                    && object_passes_marking(service.db.runtime(), object, principals)
+                        .unwrap_or(false)
             });
             if !visible {
                 active.remove(&id);
@@ -269,15 +276,21 @@ pub(super) fn governed_object_for_read(
 ) -> Result<domain::Object, Status> {
     let object = service
         .db
+        .runtime()
         .get_object(object_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("governed fact not found"))?;
     if object.kind != expected_kind
-        || enforce_namespace_tenant_context(&service.db, tenant_context, &object.namespace, false)
-            .is_err()
-        || check_team_namespace(&service.db, principals, &object.namespace, false).is_err()
+        || enforce_namespace_tenant_context(
+            service.db.runtime(),
+            tenant_context,
+            &object.namespace,
+            false,
+        )
+        .is_err()
+        || check_team_namespace(service.db.runtime(), principals, &object.namespace, false).is_err()
         || check_read(&service.security, object_id, principals).is_err()
-        || !object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+        || !object_passes_marking(service.db.runtime(), &object, principals).unwrap_or(false)
     {
         return Err(Status::not_found("governed fact not found"));
     }
@@ -321,6 +334,7 @@ pub(super) fn list_visible_governed_objects(
         };
         let (page, total) = service
             .db
+            .runtime()
             .list_objects_with_total_for_principals(&filter, &principal_refs, &[])
             .map_err(Status::internal)?;
         if page.is_empty() {
@@ -328,7 +342,7 @@ pub(super) fn list_visible_governed_objects(
         }
         offset = offset.saturating_add(page.len() as i32);
         for object in page {
-            if object_passes_marking(&service.db, &object, principals).unwrap_or(false)
+            if object_passes_marking(service.db.runtime(), &object, principals).unwrap_or(false)
                 && governed_reference_tree_visible(
                     service,
                     principals,
@@ -597,10 +611,11 @@ pub(super) fn authorize_source_sync_namespace(
     write: bool,
 ) -> Result<(), Status> {
     require_canonical_source_namespace(namespace)?;
-    enforce_namespace_tenant_context(&service.db, tenant_context, namespace, write)?;
-    check_team_namespace(&service.db, principals, namespace, write)?;
+    enforce_namespace_tenant_context(service.db.runtime(), tenant_context, namespace, write)?;
+    check_team_namespace(service.db.runtime(), principals, namespace, write)?;
     let boundary_id = service
         .db
+        .runtime()
         .find_namespace_boundary(namespace)
         .map_err(|_| Status::internal("namespace authorization unavailable"))?
         .map_or_else(|| format!("namespace:{namespace}"), |object| object.id);
@@ -674,12 +689,14 @@ pub(super) fn authorize_definition_revision(
 ) -> Result<(), Status> {
     let revision = service
         .db
+        .runtime()
         .get_definition_revision(namespace, revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .filter(|revision| !require_published || revision.published)
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
     let members = service
         .db
+        .runtime()
         .get_definition_members(namespace, &revision.revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
     if members.len() != revision.members.len() {
@@ -718,20 +735,24 @@ pub(super) fn load_authorized_definition_revisions(
     authorize_definition_revision(service, principals, namespace, to_revision_digest, false)?;
     let from = service
         .db
+        .runtime()
         .get_definition_revision(namespace, from_revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
     let to = service
         .db
+        .runtime()
         .get_definition_revision(namespace, to_revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
     let from_members = service
         .db
+        .runtime()
         .get_definition_members(namespace, &from.revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
     let to_members = service
         .db
+        .runtime()
         .get_definition_members(namespace, &to.revision_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?;
     Ok((from, from_members, to, to_members))
@@ -981,11 +1002,13 @@ pub(super) fn authorize_proposal_member_writes(
 ) -> Result<(), Status> {
     let base = service
         .db
+        .runtime()
         .get_definition_revision(namespace, base_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
     let candidate = service
         .db
+        .runtime()
         .get_definition_revision(namespace, candidate_digest)
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
@@ -1488,6 +1511,7 @@ pub(super) fn visible_action_object(
     }
     let object = service
         .db
+        .runtime()
         .get_object_with_policy_context(object_id, policy_context)
         .map_err(Status::internal)?
         .ok_or_else(unavailable)?;
@@ -1495,7 +1519,7 @@ pub(super) fn visible_action_object(
         return Err(unavailable());
     }
     require_visible_read_root(
-        &service.db,
+        service.db.runtime(),
         &service.security,
         object,
         principals,
@@ -1587,7 +1611,7 @@ pub(super) fn authorize_action_instance_submit(
     namespace: &str,
 ) -> Result<String, Status> {
     require_authenticated(principals)?;
-    check_team_namespace(&service.db, principals, namespace, true)?;
+    check_team_namespace(service.db.runtime(), principals, namespace, true)?;
     principals
         .first()
         .cloned()
@@ -1599,7 +1623,7 @@ pub(super) fn authorize_action_instance_read(
     namespace: &str,
 ) -> Result<(), Status> {
     require_authenticated(principals)?;
-    check_team_namespace(&service.db, principals, namespace, false)?;
+    check_team_namespace(service.db.runtime(), principals, namespace, false)?;
     Ok(())
 }
 

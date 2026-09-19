@@ -15,7 +15,7 @@ impl SekaiServiceImpl {
         require_authenticated(&principals)?;
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
-        let tenant_context = request_tenant_context(&self.db, &req)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let inner = req.into_inner();
         let descriptor = parse_object_set_descriptor(
             inner
@@ -23,12 +23,12 @@ impl SekaiServiceImpl {
                 .ok_or_else(|| Status::invalid_argument("object-set descriptor required"))?,
         )?;
         enforce_namespace_tenant_context(
-            &self.db,
+            self.db.runtime(),
             tenant_context.as_ref(),
             &descriptor.namespace,
             false,
         )?;
-        check_team_namespace(&self.db, &principals, &descriptor.namespace, false)?;
+        check_team_namespace(self.db.runtime(), &principals, &descriptor.namespace, false)?;
         authorize_source_sync_namespace(
             self,
             &principals,
@@ -46,6 +46,7 @@ impl SekaiServiceImpl {
         }
         let published = self
             .db
+            .runtime()
             .get_published_definition_revision(&descriptor.namespace)
             .map_err(|_| Status::internal("definition revision unavailable"))?
             .ok_or_else(|| {
@@ -60,6 +61,7 @@ impl SekaiServiceImpl {
         )?;
         let members = self
             .db
+            .runtime()
             .get_definition_members(&published.namespace, &published.revision_digest)
             .map_err(|_| Status::internal("definition revision unavailable"))?;
         let bound = descriptor
@@ -91,7 +93,7 @@ impl SekaiServiceImpl {
                 queried_properties.clone(),
             )?;
             ensure_property_grant_query_allowed(
-                &self.db,
+                self.db.runtime(),
                 bound.filter.namespace.as_deref(),
                 bound.filter.kind.as_deref(),
                 queried_properties,
@@ -111,7 +113,7 @@ impl SekaiServiceImpl {
                     [aggregation.property.clone()],
                 )?;
                 ensure_property_grant_query_allowed(
-                    &self.db,
+                    self.db.runtime(),
                     Some(bound.descriptor.namespace.as_str()),
                     Some(leaf_kind),
                     [aggregation.property.as_str()],
@@ -128,6 +130,7 @@ impl SekaiServiceImpl {
             .map_err(|_| Status::permission_denied("access denied"))?;
         let policy_activation_digest = match self
             .db
+            .runtime()
             .get_object_security_activation(&bound.descriptor.namespace)
             .map_err(Status::internal)?
         {
@@ -169,6 +172,7 @@ impl SekaiServiceImpl {
         }
         if self
             .db
+            .runtime()
             .get_object_type_datasource(&bound.descriptor.namespace, &bound.descriptor.kind)
             .map_err(Status::internal)?
             .is_some()
@@ -183,7 +187,7 @@ impl SekaiServiceImpl {
             );
         }
         let (near, total) = list_objects_with_marking(
-            &self.db,
+            self.db.runtime(),
             &filter,
             &principals,
             &policy_context,
@@ -253,6 +257,7 @@ impl SekaiServiceImpl {
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         let status = self
             .db
+            .runtime()
             .object_type_index_status(&bound.descriptor.namespace, &bound.descriptor.kind, now_ms)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::failed_precondition("object type index is stale"))?;
@@ -280,10 +285,12 @@ impl SekaiServiceImpl {
         };
         let members = self
             .db
+            .runtime()
             .list_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind, &query)
             .map_err(Status::internal)?;
         let total = self
             .db
+            .runtime()
             .count_visible_index_members(&bound.descriptor.namespace, &bound.descriptor.kind)
             .map_err(Status::internal)?;
         let objects: Vec<domain::Object> = members
@@ -337,6 +344,7 @@ impl SekaiServiceImpl {
         kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
         if !self
             .db
+            .runtime()
             .hop_projection_kinds_ready(&bound.descriptor.namespace, &kinds, published)
             .map_err(Status::internal)?
         {
@@ -377,6 +385,7 @@ impl SekaiServiceImpl {
             let parent_keys: Vec<String> = parent_keys.into_iter().collect();
             let pairs = self
                 .db
+                .runtime()
                 .list_index_join_children(
                     &bound.descriptor.namespace,
                     &hop.far_kind,
@@ -393,6 +402,7 @@ impl SekaiServiceImpl {
             let child_by_key = if last {
                 let children = self
                     .db
+                    .runtime()
                     .list_index_members_by_keys_projected(
                         &bound.descriptor.namespace,
                         &hop.far_kind,
@@ -415,6 +425,7 @@ impl SekaiServiceImpl {
             } else {
                 let idents = self
                     .db
+                    .runtime()
                     .list_index_member_idents(
                         &bound.descriptor.namespace,
                         &hop.far_kind,
@@ -518,6 +529,7 @@ impl SekaiServiceImpl {
             }
             if self
                 .db
+                .runtime()
                 .get_object_type_datasource(&bound.descriptor.namespace, &kind)
                 .map_err(Status::internal)?
                 .is_none()
@@ -528,6 +540,7 @@ impl SekaiServiceImpl {
             }
             let status = self
                 .db
+                .runtime()
                 .object_type_index_status(&bound.descriptor.namespace, &kind, now_ms)
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::failed_precondition("object type index is stale"))?;
@@ -568,6 +581,7 @@ impl SekaiServiceImpl {
             };
             let members = self
                 .db
+                .runtime()
                 .list_visible_index_members_projected(
                     &bound.descriptor.namespace,
                     &kind,
@@ -639,6 +653,7 @@ impl SekaiServiceImpl {
             for kind in &kinds {
                 policies.push(
                     self.db
+                        .runtime()
                         .active_object_policy(&bound.descriptor.namespace, kind)
                         .map_err(Status::internal)?,
                 );
@@ -849,6 +864,7 @@ fn collect_one_hop_members(
     for start in near {
         let links = service
             .db
+            .runtime()
             .get_links_with_policy_context(
                 &start.id,
                 &traversal.relation,
@@ -866,6 +882,7 @@ fn collect_one_hop_members(
             }
             let Some(object) = service
                 .db
+                .runtime()
                 .get_object_with_policy_context(target, policy_context)
                 .map_err(Status::internal)?
             else {
@@ -874,11 +891,16 @@ fn collect_one_hop_members(
             if object.kind != traversal.far_kind {
                 continue;
             }
-            if !purpose_kind_permitted(&service.db, &object.namespace, &object.kind, purpose)? {
+            if !purpose_kind_permitted(
+                service.db.runtime(),
+                &object.namespace,
+                &object.kind,
+                purpose,
+            )? {
                 continue;
             }
             if !object_is_visible(
-                &service.db,
+                service.db.runtime(),
                 &service.security,
                 &object,
                 principals,
@@ -887,7 +909,7 @@ fn collect_one_hop_members(
                 continue;
             }
             if !purpose_allows_kind(
-                &service.db,
+                service.db.runtime(),
                 &object.namespace,
                 &object.kind,
                 purpose,
@@ -968,7 +990,7 @@ mod tests {
         let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
             SekaiDb::new(":memory:").unwrap(),
         )));
-        SekaiServiceImpl::new(db)
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
     }
 
     fn with_named_principal<T>(payload: T, principal: &str) -> Request<T> {
@@ -981,6 +1003,7 @@ mod tests {
     fn grant_namespace(svc: &SekaiServiceImpl, namespace: &str, principal: &str) {
         let (_, grants) = svc
             .db
+            .runtime()
             .ensure_team_namespace(namespace, principal, security::Role::Admin, "local")
             .unwrap();
         for grant in grants {
@@ -1034,6 +1057,7 @@ mod tests {
         )
         .unwrap();
         svc.db
+            .runtime()
             .seed_published_definition_revision(&revision, &members)
             .unwrap();
         revision.revision_digest
@@ -1092,7 +1116,7 @@ mod tests {
                 13,
             ),
         ] {
-            svc.db.create_object(&item).unwrap();
+            svc.db.runtime().create_object(&item).unwrap();
         }
         for (id, name, created) in [
             ("o-south", "SO-1", 20),
@@ -1100,6 +1124,7 @@ mod tests {
             ("o-west", "WO-1", 22),
         ] {
             svc.db
+                .runtime()
                 .create_object(&object(id, "Order", name, &[("status", "open")], created))
                 .unwrap();
         }
@@ -1109,6 +1134,7 @@ mod tests {
             ("l-west", "c-us-2", "o-west"),
         ] {
             svc.db
+                .runtime()
                 .create_link(&domain::Link {
                     id: id.into(),
                     from_id: from.into(),
@@ -1274,10 +1300,12 @@ mod tests {
         };
         let customer_revision = svc
             .db
+            .runtime()
             .put_object_security_policy(&policy, "root", "put-object-set", 1)
             .unwrap();
         let instantiated = svc
             .db
+            .runtime()
             .list_objects(&domain::ListFilter {
                 namespace: Some("sales".into()),
                 ..Default::default()
@@ -1310,6 +1338,7 @@ mod tests {
             };
             let revision = svc
                 .db
+                .runtime()
                 .put_object_security_policy(
                     &extra,
                     "root",
@@ -1320,6 +1349,7 @@ mod tests {
             activation.insert(kind.to_string(), revision.revision_digest);
         }
         svc.db
+            .runtime()
             .activate_object_security_policies(
                 "sales",
                 &activation,
@@ -1370,6 +1400,7 @@ mod tests {
         grant_namespace(&svc, "sales", "local");
         let digest = seed_sales_definition(&svc);
         svc.db
+            .runtime()
             .create_dataset(&crate::sekai::dataset::Dataset {
                 id: "ds-customers".into(),
                 name: "customers".into(),
@@ -1395,6 +1426,7 @@ mod tests {
             })
             .unwrap();
         svc.db
+            .runtime()
             .append_rows(
                 "ds-customers",
                 &[
@@ -1468,6 +1500,7 @@ mod tests {
                 .any(|object| object.id.contains("hidden"))
         );
         svc.db
+            .runtime()
             .update_dataset(&crate::sekai::dataset::Dataset {
                 id: "ds-customers".into(),
                 name: "customers".into(),
@@ -1514,6 +1547,7 @@ mod tests {
         grant_namespace(&svc, "sales", "local");
         let digest = seed_sales_definition(&svc);
         svc.db
+            .runtime()
             .create_dataset(&crate::sekai::dataset::Dataset {
                 id: "ds-customers".into(),
                 name: "customers".into(),
@@ -1544,6 +1578,7 @@ mod tests {
             })
             .unwrap();
         svc.db
+            .runtime()
             .append_rows(
                 "ds-customers",
                 &[
@@ -1781,8 +1816,14 @@ mod tests {
         grant_namespace(&svc, "sales", "local");
         let digest = seed_sales_with_shipments(&svc);
         seed_indexed_customer_order_shipment(&svc, &digest);
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         svc.db
+            .runtime()
             .set_hop_projection_ready("sales", "Order", false, 99)
             .unwrap();
         let err = svc
@@ -1874,8 +1915,14 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.object_index_engine =
             crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         svc.db
+            .runtime()
             .set_hop_projection_ready("sales", "Order", false, 99)
             .unwrap();
         let err = svc
@@ -1924,14 +1971,23 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.object_index_engine =
             crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         let mut stale = svc
             .db
+            .runtime()
             .get_object_type_datasource("sales", "Order")
             .unwrap()
             .unwrap();
         stale.definition_digest = format!("sha256:{}", "ab".repeat(32));
-        svc.db.register_object_type_datasource(&stale, 99).unwrap();
+        svc.db
+            .runtime()
+            .register_object_type_datasource(&stale, 99)
+            .unwrap();
         let err = svc
             .evaluate_object_set(with_named_principal(
                 EvaluateObjectSetRequest {
@@ -1978,17 +2034,29 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.object_index_engine =
             crate::sekai::object_index_engine::ObjectIndexEngineKind::HopProjection;
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         let mut rebound = svc
             .db
+            .runtime()
             .get_object_type_datasource("sales", "Order")
             .unwrap()
             .unwrap();
         rebound.dataset_id = "ds-orders-v2".into();
         svc.db
+            .runtime()
             .register_object_type_datasource(&rebound, 99)
             .unwrap();
-        assert!(!svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            !svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         let err = svc
             .evaluate_object_set(with_named_principal(
                 EvaluateObjectSetRequest {
@@ -2035,8 +2103,14 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.object_index_engine =
             crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop;
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         svc.db
+            .runtime()
             .set_hop_projection_ready("sales", "Order", false, 99)
             .unwrap();
         let err = svc
@@ -2085,17 +2159,29 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.object_index_engine =
             crate::sekai::object_index_engine::ObjectIndexEngineKind::NestedLoop;
-        assert!(svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         let mut rebound = svc
             .db
+            .runtime()
             .get_object_type_datasource("sales", "Order")
             .unwrap()
             .unwrap();
         rebound.dataset_id = "ds-orders-v2".into();
         svc.db
+            .runtime()
             .register_object_type_datasource(&rebound, 99)
             .unwrap();
-        assert!(!svc.db.hop_projection_ready("sales", "Order").unwrap());
+        assert!(
+            !svc.db
+                .runtime()
+                .hop_projection_ready("sales", "Order")
+                .unwrap()
+        );
         let err = svc
             .evaluate_object_set(with_named_principal(
                 EvaluateObjectSetRequest {
@@ -2256,6 +2342,7 @@ mod tests {
         let digest = seed_sales_with_shipments(&svc);
         seed_indexed_customer_order_shipment(&svc, &digest);
         svc.db
+            .runtime()
             .create_object(&object(
                 "s-gate",
                 "Shipment",
@@ -2281,10 +2368,12 @@ mod tests {
         };
         let shipment_revision = svc
             .db
+            .runtime()
             .put_object_security_policy(&shipment, "root", "put-shipment", 1)
             .unwrap();
         let instantiated = svc
             .db
+            .runtime()
             .list_objects(&domain::ListFilter {
                 namespace: Some("sales".into()),
                 ..Default::default()
@@ -2319,6 +2408,7 @@ mod tests {
             };
             let revision = svc
                 .db
+                .runtime()
                 .put_object_security_policy(
                     &extra,
                     "root",
@@ -2329,6 +2419,7 @@ mod tests {
             activation.insert(kind.to_string(), revision.revision_digest);
         }
         svc.db
+            .runtime()
             .activate_object_security_policies("sales", &activation, "root", "activate", 40)
             .unwrap();
         let err = svc
@@ -2422,6 +2513,7 @@ mod tests {
         )
         .unwrap();
         svc.db
+            .runtime()
             .seed_published_definition_revision(&revision, &members)
             .unwrap();
         revision.revision_digest
@@ -2504,6 +2596,7 @@ mod tests {
         columns.sort();
         columns.dedup();
         svc.db
+            .runtime()
             .create_dataset(&crate::sekai::dataset::Dataset {
                 id: dataset_id.into(),
                 name: dataset_id.into(),
@@ -2519,7 +2612,7 @@ mod tests {
                 created: 1,
             })
             .unwrap();
-        svc.db.append_rows(dataset_id, &rows).unwrap();
+        svc.db.runtime().append_rows(dataset_id, &rows).unwrap();
         let binding = crate::sekai::object_type_index::ObjectTypeDatasource {
             contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
             namespace: "sales".into(),
@@ -2537,9 +2630,11 @@ mod tests {
         .prepare()
         .unwrap();
         svc.db
+            .runtime()
             .register_object_type_datasource(&binding, 10)
             .unwrap();
         svc.db
+            .runtime()
             .apply_object_type_index("sales", kind, true, 20)
             .unwrap();
     }

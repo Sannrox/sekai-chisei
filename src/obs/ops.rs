@@ -42,7 +42,7 @@ pub fn router(
         db: db.clone(),
         auth: crate::grpc::TokenAuthInterceptor::from_runtime(
             credential_store,
-            db,
+            crate::db::store::SekaiStore::from_shared_runtime(db),
             assertion_authority,
         ),
         sessions: Arc::new(SessionStore::new()),

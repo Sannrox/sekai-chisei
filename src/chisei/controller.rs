@@ -197,16 +197,18 @@ fn record(db: &ChiseiStore, outcome: &str, candidate: &Candidate, reason: &str) 
     evidence.insert("namespace".to_string(), candidate.namespace.clone());
     evidence.insert("task_class".to_string(), candidate.task_class.clone());
     evidence.insert("payload".to_string(), candidate.payload.clone());
-    let _ = db.record_decision(&crate::sekai::audit::Decision {
-        id: uuid::Uuid::new_v4().to_string(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        actor: "chisei.promotion".into(),
-        action: outcome.into(),
-        reason: reason.to_string(),
-        evidence,
-        target_id: candidate.id.clone(),
-        outcome: outcome.into(),
-    });
+    let _ = db
+        .runtime()
+        .record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor: "chisei.promotion".into(),
+            action: outcome.into(),
+            reason: reason.to_string(),
+            evidence,
+            target_id: candidate.id.clone(),
+            outcome: outcome.into(),
+        });
 }
 
 #[cfg(test)]

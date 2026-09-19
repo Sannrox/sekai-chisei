@@ -881,13 +881,22 @@ mod tests {
             .unwrap();
         let store = Arc::new(PrincipalCredentialStore::new());
         store.load(&db.list_active_credentials().unwrap());
-        let budget = Arc::new(BudgetTracker::new(db.clone()));
-        let sekai = Arc::new(SekaiServiceImpl::with_budget(db.clone(), budget));
-        let chisei = Arc::new(ChiseiServiceImpl::new(db.clone(), fixture_config()));
+        let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
+        let chisei_store = crate::db::store::ChiseiStore::from_shared_runtime(db.clone());
+        let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
+        let clerk = crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            chisei_store.clone(),
+            sekai_store.clone(),
+            Some(budget),
+        );
+        let sekai = Arc::new(
+            SekaiServiceImpl::new(sekai_store).with_cross_store_admission(Arc::new(clerk)),
+        );
+        let chisei = Arc::new(ChiseiServiceImpl::new(chisei_store, fixture_config()));
         (
             sekai,
             chisei,
-            TokenAuthInterceptor::new(store, db),
+            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db)),
             token.into(),
         )
     }

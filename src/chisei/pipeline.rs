@@ -374,7 +374,11 @@ fn resolve_context_objects(req: &PipelineRequest, db: &ChiseiStore) -> Vec<crate
         if !seen.insert(external_id.clone()) {
             continue;
         }
-        let obj = db.find_by_external_id(&external_id).ok().flatten();
+        let obj = db
+            .runtime()
+            .find_by_external_id(&external_id)
+            .ok()
+            .flatten();
         if let Some(obj) = obj
             && context_object_authorized(req, db, &obj)
         {
@@ -393,14 +397,14 @@ fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &O
     if object.namespace != req.namespace.trim() {
         return false;
     }
-    let namespace_authorized = match db.find_namespace_boundary(&req.namespace) {
+    let namespace_authorized = match db.runtime().find_namespace_boundary(&req.namespace) {
         Ok(Some(boundary))
             if boundary
                 .properties
                 .get("team_managed")
                 .is_some_and(|value| value == "true") =>
         {
-            db.list_grants(&boundary.id).is_ok_and(|grants| {
+            db.runtime().list_grants(&boundary.id).is_ok_and(|grants| {
                 grants
                     .iter()
                     .any(|grant| grant.principal == req.memory_actor)
@@ -412,7 +416,7 @@ fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &O
     if !namespace_authorized {
         return false;
     }
-    db.list_grants(&object.id).is_ok_and(|grants| {
+    db.runtime().list_grants(&object.id).is_ok_and(|grants| {
         grants.is_empty()
             || grants
                 .iter()
@@ -459,6 +463,7 @@ fn collect_external_evidence_context(
         .collect::<Vec<_>>();
     allowed_evidence_classes.sort();
     let evidence = db
+        .runtime()
         .list_usable_evidence_for_targets(
             target_object_ids,
             &allowed_evidence_classes
@@ -537,23 +542,25 @@ pub fn applicable_evidence_classes(
         .into_iter()
         .map(|object| object.id)
         .collect::<Vec<_>>();
-    db.list_usable_evidence_classes_for_targets(
-        &target_object_ids,
-        chrono::Utc::now().timestamp_millis(),
-    )
-    .map(|classes| {
-        classes
-            .into_iter()
-            .map(|(source_type, evidence_type)| EvidenceContextClass {
-                source_type,
-                evidence_type,
-            })
-            .collect()
-    })
+    db.runtime()
+        .list_usable_evidence_classes_for_targets(
+            &target_object_ids,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map(|classes| {
+            classes
+                .into_iter()
+                .map(|(source_type, evidence_type)| EvidenceContextClass {
+                    source_type,
+                    evidence_type,
+                })
+                .collect()
+        })
 }
 
 fn object_implements(db: &ChiseiStore, obj: &Object, interface_name: &str) -> bool {
-    db.get_object_type(&obj.kind)
+    db.runtime()
+        .get_object_type(&obj.kind)
         .ok()
         .flatten()
         .is_some_and(|object_type| {
@@ -603,7 +610,7 @@ fn filter_context_property(
 ) -> Option<String> {
     let object_type = type_cache
         .entry(obj.kind.clone())
-        .or_insert_with(|| db.get_object_type(&obj.kind).ok().flatten());
+        .or_insert_with(|| db.runtime().get_object_type(&obj.kind).ok().flatten());
     egress::filter_property_with_schema(obj, field, object_type.as_ref(), record, external)
 }
 
@@ -617,10 +624,12 @@ fn collect_related_verdict_context(
     let mut records = Vec::new();
     let mut type_cache = HashMap::new();
     let mut candidates = db
+        .runtime()
         .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
         .unwrap_or_default();
     candidates.extend(
-        db.get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Outgoing)
+        db.runtime()
+            .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Outgoing)
             .unwrap_or_default(),
     );
 
@@ -849,6 +858,7 @@ fn run_object_context_enrich(
 
         if context_expansion_allowed {
             let learnings = db
+                .runtime()
                 .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             let mut pitfalls = Vec::new();
@@ -1161,36 +1171,40 @@ fn run_kioku_enrich(
         .into_iter()
         .map(|object| object.id)
         .collect();
-    let actor_ceiling =
-        match db.kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor) {
-            Ok(ceiling) => ceiling,
-            Err(error) => {
-                return StepDecision {
-                    step: String::new(),
-                    action: "skipped".into(),
-                    reasoning: format!("memory retrieval denied: {error}"),
-                    confidence: 1.0,
-                    suggestion: String::new(),
-                    value: String::new(),
-                };
-            }
-        };
+    let actor_ceiling = match db
+        .runtime()
+        .kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor)
+    {
+        Ok(ceiling) => ceiling,
+        Err(error) => {
+            return StepDecision {
+                step: String::new(),
+                action: "skipped".into(),
+                reasoning: format!("memory retrieval denied: {error}"),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            };
+        }
+    };
     let classification_ceiling = if req.external_egress {
         actor_ceiling.min(EvidenceClassification::Public)
     } else {
         actor_ceiling
     };
     let retrieved =
-        match db.retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
-            namespace: req.namespace.clone(),
-            operation_class: req.task_type.clone(),
-            context_object_ids,
-            classification_ceiling,
-            min_confidence_bps: 0,
-            max_results: 16,
-            actor: req.memory_actor.clone(),
-            now_ms: chrono::Utc::now().timestamp_millis(),
-        }) {
+        match db
+            .runtime()
+            .retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
+                namespace: req.namespace.clone(),
+                operation_class: req.task_type.clone(),
+                context_object_ids,
+                classification_ceiling,
+                min_confidence_bps: 0,
+                max_results: 16,
+                actor: req.memory_actor.clone(),
+                now_ms: chrono::Utc::now().timestamp_millis(),
+            }) {
             Ok(retrieved) => retrieved,
             Err(error) => {
                 return StepDecision {
@@ -1469,6 +1483,7 @@ fn run_learnings_enrich(
         found_context = true;
         let mut sources = vec![context.id.clone()];
         if let Some(ns_obj) = db
+            .runtime()
             .find_by_external_id(&format!("namespace:{}", context.kind))
             .ok()
             .flatten()
@@ -1478,6 +1493,7 @@ fn run_learnings_enrich(
         }
         for source_id in sources {
             let learnings = db
+                .runtime()
                 .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             for obj in learnings {
@@ -1585,6 +1601,7 @@ impl Step for SpecEnrichStep {
         for context in resolve_context_objects(req, db) {
             found_context = true;
             let components = db
+                .runtime()
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default();
             for comp in components {
@@ -1717,7 +1734,7 @@ impl Step for RiskStep {
         let mut signals = Vec::new();
         let mut risk = 0.0f64;
         let mut type_cache = HashMap::new();
-        let snapshots = capacity::latest_snapshots(db, 24).unwrap_or_default();
+        let snapshots = capacity::latest_snapshots(db.runtime(), 24).unwrap_or_default();
         if snapshots.len() >= 3 {
             let latest = &snapshots[0];
             if latest.agent_count > 0 && latest.queue_depth > latest.agent_count * 2 {
@@ -1743,6 +1760,7 @@ impl Step for RiskStep {
                 continue;
             }
             let authorized_components = db
+                .runtime()
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default()
                 .into_iter()
@@ -1820,7 +1838,7 @@ impl Step for RiskStep {
 
 fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
     let mut risk = 0.0f64;
-    let snapshots = capacity::latest_snapshots(db, 24).unwrap_or_default();
+    let snapshots = capacity::latest_snapshots(db.runtime(), 24).unwrap_or_default();
     if snapshots.len() >= 3 {
         let latest = &snapshots[0];
         if latest.agent_count > 0 && latest.queue_depth > latest.agent_count * 2 {
@@ -1832,6 +1850,7 @@ fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
     }
     for context in resolve_context_objects(req, db) {
         let components = db
+            .runtime()
             .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
             .unwrap_or_default()
             .into_iter()
@@ -2125,14 +2144,15 @@ mod tests {
         implements: Vec<&str>,
         properties: Vec<PropertyDef>,
     ) {
-        db.upsert_object_type(&ObjectType {
-            kind: kind.into(),
-            description: format!("{kind} type"),
-            properties,
-            is_builtin: false,
-            implements: implements.into_iter().map(str::to_string).collect(),
-        })
-        .unwrap();
+        db.runtime()
+            .upsert_object_type(&ObjectType {
+                kind: kind.into(),
+                description: format!("{kind} type"),
+                properties,
+                is_builtin: false,
+                implements: implements.into_iter().map(str::to_string).collect(),
+            })
+            .unwrap();
     }
 
     fn make_req() -> PipelineRequest {
@@ -2191,15 +2211,16 @@ mod tests {
                 updated: 1,
             },
         ] {
-            db.create_object(&object).unwrap();
-            db.create_grant(&Grant {
-                id: format!("grant-{}", object.id),
-                object_id: object.id,
-                principal: "agent:planner".into(),
-                role: Role::Viewer,
-                created: 1,
-            })
-            .unwrap();
+            db.runtime().create_object(&object).unwrap();
+            db.runtime()
+                .create_grant(&Grant {
+                    id: format!("grant-{}", object.id),
+                    object_id: object.id,
+                    principal: "agent:planner".into(),
+                    role: Role::Viewer,
+                    created: 1,
+                })
+                .unwrap();
         }
         let memory = KiokuMemory {
             contract_version: KIOKU_MEMORY_VERSION.into(),
@@ -2229,33 +2250,35 @@ mod tests {
             reassessment_key: String::new(),
             reassessment_actor: String::new(),
         };
-        db.insert_kioku_memory(
-            &memory,
-            &[KiokuEvidenceLink {
-                memory_id: memory.id.clone(),
-                memory_version: 1,
-                operation_id: "operation-1".into(),
-                verification_event_id: "verify-1".into(),
-                evidence_reference: "evidence:operation-1".into(),
-                evidence_digest: "digest-1".into(),
-                stance: MemoryEvidenceStance::Supporting,
-                outcome_metric: "verification_pass_rate".into(),
-                outcome_value: 1.0,
-                observed_at_ms: 90,
-            }],
-        )
-        .unwrap();
-        db.review_kioku_candidate(
-            "memory-migrations",
-            1,
-            HumanMemoryReview {
-                action: HumanReviewAction::Promote,
-                reviewer: "human:operator".into(),
-                rationale: "representative evidence".into(),
-                reviewed_at_ms: 110,
-            },
-        )
-        .unwrap();
+        db.runtime()
+            .insert_kioku_memory(
+                &memory,
+                &[KiokuEvidenceLink {
+                    memory_id: memory.id.clone(),
+                    memory_version: 1,
+                    operation_id: "operation-1".into(),
+                    verification_event_id: "verify-1".into(),
+                    evidence_reference: "evidence:operation-1".into(),
+                    evidence_digest: "digest-1".into(),
+                    stance: MemoryEvidenceStance::Supporting,
+                    outcome_metric: "verification_pass_rate".into(),
+                    outcome_value: 1.0,
+                    observed_at_ms: 90,
+                }],
+            )
+            .unwrap();
+        db.runtime()
+            .review_kioku_candidate(
+                "memory-migrations",
+                1,
+                HumanMemoryReview {
+                    action: HumanReviewAction::Promote,
+                    reviewer: "human:operator".into(),
+                    rationale: "representative evidence".into(),
+                    reviewed_at_ms: 110,
+                },
+            )
+            .unwrap();
 
         let pipeline = Pipeline::new(vec![Box::new(KiokuEnrichStep)]);
         let mut request = make_req();
@@ -2305,7 +2328,8 @@ mod tests {
             ]
         );
         assert!(
-            db.list_kioku_lifecycle_events("memory-migrations", 1)
+            db.runtime()
+                .list_kioku_lifecycle_events("memory-migrations", 1)
                 .unwrap()
                 .iter()
                 .all(|event| event.action != "injected")
@@ -2423,52 +2447,55 @@ mod tests {
     }
 
     fn configure_evidence(db: &ChiseiStore) {
-        db.upsert_evidence_producer(
-            &EvidenceProducerCapability {
-                producer_identity: "producer:checks".into(),
-                config_version: 1,
-                source_types: vec!["verification_system".into()],
-                source_instances: vec!["checks-primary".into()],
-                namespaces: vec!["acme".into()],
-                evidence_types: vec![
-                    "verification.result".into(),
-                    "operations.health_snapshot".into(),
-                ],
-                target_kinds: vec!["service".into()],
-                classification_ceiling: EvidenceClassification::Restricted,
-                allowed_intents: vec![EvidenceIntent::Upsert],
-                allow_operation_attachment: false,
-                replay_window_ms: 60_000,
-                max_clock_skew_ms: 1_000,
-                max_payload_bytes: 1_024,
-                max_relationships: 4,
-                rate_limit_per_minute: 20,
-                max_retained_submissions: 100_000,
-                revoked: false,
-            },
-            1,
-        )
-        .unwrap();
-        db.register_evidence_schema(
-            &EvidenceSchemaDefinition {
-                schema_id: "verification.result".into(),
-                schema_version: "1.0.0".into(),
-                evidence_type: "verification.result".into(),
-                compatible_versions: vec![],
-            },
-            1,
-        )
-        .unwrap();
-        db.register_evidence_schema(
-            &EvidenceSchemaDefinition {
-                schema_id: "operations.health_snapshot".into(),
-                schema_version: "1.0.0".into(),
-                evidence_type: "operations.health_snapshot".into(),
-                compatible_versions: vec![],
-            },
-            1,
-        )
-        .unwrap();
+        db.runtime()
+            .upsert_evidence_producer(
+                &EvidenceProducerCapability {
+                    producer_identity: "producer:checks".into(),
+                    config_version: 1,
+                    source_types: vec!["verification_system".into()],
+                    source_instances: vec!["checks-primary".into()],
+                    namespaces: vec!["acme".into()],
+                    evidence_types: vec![
+                        "verification.result".into(),
+                        "operations.health_snapshot".into(),
+                    ],
+                    target_kinds: vec!["service".into()],
+                    classification_ceiling: EvidenceClassification::Restricted,
+                    allowed_intents: vec![EvidenceIntent::Upsert],
+                    allow_operation_attachment: false,
+                    replay_window_ms: 60_000,
+                    max_clock_skew_ms: 1_000,
+                    max_payload_bytes: 1_024,
+                    max_relationships: 4,
+                    rate_limit_per_minute: 20,
+                    max_retained_submissions: 100_000,
+                    revoked: false,
+                },
+                1,
+            )
+            .unwrap();
+        db.runtime()
+            .register_evidence_schema(
+                &EvidenceSchemaDefinition {
+                    schema_id: "verification.result".into(),
+                    schema_version: "1.0.0".into(),
+                    evidence_type: "verification.result".into(),
+                    compatible_versions: vec![],
+                },
+                1,
+            )
+            .unwrap();
+        db.runtime()
+            .register_evidence_schema(
+                &EvidenceSchemaDefinition {
+                    schema_id: "operations.health_snapshot".into(),
+                    schema_version: "1.0.0".into(),
+                    evidence_type: "operations.health_snapshot".into(),
+                    compatible_versions: vec![],
+                },
+                1,
+            )
+            .unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2515,9 +2542,11 @@ mod tests {
             causality: None,
         };
         let admission = db
+            .runtime()
             .submit_evidence(&envelope, "producer:checks", now)
             .unwrap();
-        db.project_evidence_submission(&admission.submission.id, now)
+        db.runtime()
+            .project_evidence_submission(&admission.submission.id, now)
             .unwrap();
         admission.submission.id
     }
@@ -2526,17 +2555,18 @@ mod tests {
     fn governed_evidence_is_gated_filtered_and_version_pinned() {
         let db = ChiseiStore::memory();
         configure_evidence(&db);
-        db.create_object(&Object {
-            id: "service-payments".into(),
-            kind: "service".into(),
-            name: "payments".into(),
-            namespace: "acme".into(),
-            external_id: "service:payments".into(),
-            properties: HashMap::new(),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-payments".into(),
+                kind: "service".into(),
+                name: "payments".into(),
+                namespace: "acme".into(),
+                external_id: "service:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         let public_id = project_evidence(
             &db,
@@ -2656,7 +2686,12 @@ mod tests {
                 .iter()
                 .any(|reference| reference.submission_id == internal_id)
         );
-        assert!(db.get_evidence_submission(&public_id).unwrap().is_some());
+        assert!(
+            db.runtime()
+                .get_evidence_submission(&public_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2674,54 +2709,58 @@ mod tests {
     #[test]
     fn test_context_expansion_allows_linked_learnings() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "r1".into(),
-            kind: "component".into(),
-            name: "service".into(),
-            namespace: "".into(),
-            external_id: "component:service".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "ns-component".into(),
-            kind: "namespace".into(),
-            name: "component".into(),
-            namespace: "".into(),
-            external_id: "namespace:component".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "learning-service".into(),
-            kind: KIND_LEARNING.into(),
-            name: "service learning".into(),
-            namespace: "".into(),
-            external_id: "learning:service".into(),
-            properties: HashMap::from([
-                ("title".into(), "always test".into()),
-                ("prevention".into(), "add tests".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "title,prevention".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "touches-service-learning".into(),
-            from_id: "learning-service".into(),
-            to_id: "r1".into(),
-            relation: REL_TOUCHES.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "r1".into(),
+                kind: "component".into(),
+                name: "service".into(),
+                namespace: "".into(),
+                external_id: "component:service".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "ns-component".into(),
+                kind: "namespace".into(),
+                name: "component".into(),
+                namespace: "".into(),
+                external_id: "namespace:component".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "learning-service".into(),
+                kind: KIND_LEARNING.into(),
+                name: "service learning".into(),
+                namespace: "".into(),
+                external_id: "learning:service".into(),
+                properties: HashMap::from([
+                    ("title".into(), "always test".into()),
+                    ("prevention".into(), "add tests".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "title,prevention".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "touches-service-learning".into(),
+                from_id: "learning-service".into(),
+                to_id: "r1".into(),
+                relation: REL_TOUCHES.into(),
+                created: 0,
+            })
+            .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "component:service".into();
@@ -2736,72 +2775,77 @@ mod tests {
     fn test_direct_context_survives_default_denied_expansion() {
         let db = ChiseiStore::memory();
         let created = chrono::Utc::now().timestamp_millis();
-        db.create_object(&Object {
-            id: "ticker-aapl".into(),
-            kind: "ticker".into(),
-            name: "AAPL".into(),
-            namespace: "".into(),
-            external_id: "ticker:AAPL".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "bullish".into()),
-                ("conviction".into(), "0.87".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "verdict,conviction".into(),
-                ),
-            ]),
-            created,
-            updated: created,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "learning-aapl".into(),
-            kind: KIND_LEARNING.into(),
-            name: "AAPL learning".into(),
-            namespace: "".into(),
-            external_id: "learning:conviction-signal".into(),
-            properties: HashMap::from([
-                ("title".into(), "avoid overstated upside".into()),
-                ("prevention".into(), "require earnings confirmation".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "title,prevention".into(),
-                ),
-            ]),
-            created,
-            updated: created,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "touches-learning".into(),
-            from_id: "learning-aapl".into(),
-            to_id: "ticker-aapl".into(),
-            relation: REL_TOUCHES.into(),
-            created,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "analysis-aapl".into(),
-            kind: "analysis".into(),
-            name: "AAPL analysis".into(),
-            namespace: "".into(),
-            external_id: "analysis:AAPL".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "related-only verdict".into()),
-                (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
-            ]),
-            created,
-            updated: created,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "touches-analysis".into(),
-            from_id: "analysis-aapl".into(),
-            to_id: "ticker-aapl".into(),
-            relation: REL_TOUCHES.into(),
-            created,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "ticker-aapl".into(),
+                kind: "ticker".into(),
+                name: "AAPL".into(),
+                namespace: "".into(),
+                external_id: "ticker:AAPL".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "bullish".into()),
+                    ("conviction".into(), "0.87".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "verdict,conviction".into(),
+                    ),
+                ]),
+                created,
+                updated: created,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "learning-aapl".into(),
+                kind: KIND_LEARNING.into(),
+                name: "AAPL learning".into(),
+                namespace: "".into(),
+                external_id: "learning:conviction-signal".into(),
+                properties: HashMap::from([
+                    ("title".into(), "avoid overstated upside".into()),
+                    ("prevention".into(), "require earnings confirmation".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "title,prevention".into(),
+                    ),
+                ]),
+                created,
+                updated: created,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "touches-learning".into(),
+                from_id: "learning-aapl".into(),
+                to_id: "ticker-aapl".into(),
+                relation: REL_TOUCHES.into(),
+                created,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "analysis-aapl".into(),
+                kind: "analysis".into(),
+                name: "AAPL analysis".into(),
+                namespace: "".into(),
+                external_id: "analysis:AAPL".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "related-only verdict".into()),
+                    (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
+                ]),
+                created,
+                updated: created,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "touches-analysis".into(),
+                from_id: "analysis-aapl".into(),
+                to_id: "ticker-aapl".into(),
+                relation: REL_TOUCHES.into(),
+                created,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = PipelineRequest {
@@ -2865,24 +2909,25 @@ mod tests {
                 prop("risk_reason", PropertyType::String),
             ],
         );
-        db.create_object(&Object {
-            id: "service-checkout".into(),
-            kind: "service".into(),
-            name: "checkout".into(),
-            namespace: "".into(),
-            external_id: "service:checkout".into(),
-            properties: HashMap::from([
-                ("risk_score".into(), "0.83".into()),
-                ("risk_reason".into(), "payment error spike".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "risk_score,risk_reason".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-checkout".into(),
+                kind: "service".into(),
+                name: "checkout".into(),
+                namespace: "".into(),
+                external_id: "service:checkout".into(),
+                properties: HashMap::from([
+                    ("risk_score".into(), "0.83".into()),
+                    ("risk_reason".into(), "payment error spike".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "risk_score,risk_reason".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -2910,24 +2955,25 @@ mod tests {
                 prop("risk_reason", PropertyType::String),
             ],
         );
-        db.create_object(&Object {
-            id: "service-checkout".into(),
-            kind: "service".into(),
-            name: "checkout".into(),
-            namespace: "".into(),
-            external_id: "service:checkout".into(),
-            properties: HashMap::from([
-                ("risk_score".into(), "0.83".into()),
-                ("risk_reason".into(), "payment error spike".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "risk_score,risk_reason".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-checkout".into(),
+                kind: "service".into(),
+                name: "checkout".into(),
+                namespace: "".into(),
+                external_id: "service:checkout".into(),
+                properties: HashMap::from([
+                    ("risk_score".into(), "0.83".into()),
+                    ("risk_reason".into(), "payment error spike".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "risk_score,risk_reason".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -2949,20 +2995,21 @@ mod tests {
     #[test]
     fn test_object_context_denies_unlabelled_properties() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "asset-secret".into(),
-            kind: "asset".into(),
-            name: "SecretCo".into(),
-            namespace: "".into(),
-            external_id: "asset:SECRET".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "do not disclose".into()),
-                ("score".into(), "99".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "asset-secret".into(),
+                kind: "asset".into(),
+                name: "SecretCo".into(),
+                namespace: "".into(),
+                external_id: "asset:SECRET".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "do not disclose".into()),
+                    ("score".into(), "99".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "asset:SECRET".into();
@@ -2980,17 +3027,18 @@ mod tests {
     #[test]
     fn context_admission_holds_unknown_and_explicitly_qualifies_it() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "asset-admission".into(),
-            kind: "asset".into(),
-            name: "AdmissionCo".into(),
-            namespace: "".into(),
-            external_id: "asset:ADMISSION".into(),
-            properties: HashMap::from([("verdict".into(), "untrusted context".into())]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "asset-admission".into(),
+                kind: "asset".into(),
+                name: "AdmissionCo".into(),
+                namespace: "".into(),
+                external_id: "asset:ADMISSION".into(),
+                properties: HashMap::from([("verdict".into(), "untrusted context".into())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let policy = crate::chisei::policy::ContextAdmissionPolicy {
             contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
             default_action: ContextAdmissionAction::Include,
@@ -3048,17 +3096,18 @@ mod tests {
             vec![INTERFACE_RISK_SCORED],
             vec![prop("risk_score", PropertyType::Float)],
         );
-        db.create_object(&Object {
-            id: "service-held-out-risk".into(),
-            kind: "service".into(),
-            name: "held-out-risk".into(),
-            namespace: String::new(),
-            external_id: "service:held-out-risk".into(),
-            properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-held-out-risk".into(),
+                kind: "service".into(),
+                name: "held-out-risk".into(),
+                namespace: String::new(),
+                external_id: "service:held-out-risk".into(),
+                properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let policy = ContextAdmissionPolicy {
             contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
             default_action: ContextAdmissionAction::Include,
@@ -3085,17 +3134,18 @@ mod tests {
             vec![INTERFACE_RISK_SCORED],
             vec![prop("risk_score", PropertyType::Float)],
         );
-        db.create_object(&Object {
-            id: "service-review-risk".into(),
-            kind: "service".into(),
-            name: "review-risk".into(),
-            namespace: String::new(),
-            external_id: "service:review-risk".into(),
-            properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-review-risk".into(),
+                kind: "service".into(),
+                name: "review-risk".into(),
+                namespace: String::new(),
+                external_id: "service:review-risk".into(),
+                properties: HashMap::from([(String::from("risk_score"), String::from("0.95"))]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let policy = ContextAdmissionPolicy {
             contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
             default_action: ContextAdmissionAction::Include,
@@ -3126,20 +3176,21 @@ mod tests {
     #[test]
     fn test_local_object_context_allows_unlabelled_properties() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "asset-local".into(),
-            kind: "asset".into(),
-            name: "LocalCo".into(),
-            namespace: "".into(),
-            external_id: "asset:LOCAL".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "local insight".into()),
-                ("score".into(), "99".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "asset-local".into(),
+                kind: "asset".into(),
+                name: "LocalCo".into(),
+                namespace: "".into(),
+                external_id: "asset:LOCAL".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "local insight".into()),
+                    ("score".into(), "99".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "asset:LOCAL".into();
@@ -3159,21 +3210,22 @@ mod tests {
     #[test]
     fn test_object_context_includes_identity_only_when_allowed() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "asset-secret".into(),
-            kind: "asset".into(),
-            name: "SecretCo".into(),
-            namespace: "".into(),
-            external_id: "asset:SECRET".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "approved".into()),
-                (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
-                (egress::INCLUDE_IDENTITY_KEY.into(), "true".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "asset-secret".into(),
+                kind: "asset".into(),
+                name: "SecretCo".into(),
+                namespace: "".into(),
+                external_id: "asset:SECRET".into(),
+                properties: HashMap::from([
+                    ("verdict".into(), "approved".into()),
+                    (egress::EXTERNAL_PROPERTIES_KEY.into(), "verdict".into()),
+                    (egress::INCLUDE_IDENTITY_KEY.into(), "true".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "asset:SECRET".into();
@@ -3185,39 +3237,42 @@ mod tests {
     #[test]
     fn test_learning_context_requires_explicit_allowed_fields() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "component-service".into(),
-            kind: "component".into(),
-            name: "service".into(),
-            namespace: "".into(),
-            external_id: "component:service".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "learning-secret".into(),
-            kind: KIND_LEARNING.into(),
-            name: "secret learning".into(),
-            namespace: "".into(),
-            external_id: "learning:secret".into(),
-            properties: HashMap::from([
-                ("title".into(), "sensitive title".into()),
-                ("prevention".into(), "sensitive prevention".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "touches-secret".into(),
-            from_id: "learning-secret".into(),
-            to_id: "component-service".into(),
-            relation: REL_TOUCHES.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "component-service".into(),
+                kind: "component".into(),
+                name: "service".into(),
+                namespace: "".into(),
+                external_id: "component:service".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "learning-secret".into(),
+                kind: KIND_LEARNING.into(),
+                name: "secret learning".into(),
+                namespace: "".into(),
+                external_id: "learning:secret".into(),
+                properties: HashMap::from([
+                    ("title".into(), "sensitive title".into()),
+                    ("prevention".into(), "sensitive prevention".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "touches-secret".into(),
+                from_id: "learning-secret".into(),
+                to_id: "component-service".into(),
+                relation: REL_TOUCHES.into(),
+                created: 0,
+            })
+            .unwrap();
         let p = default_pipeline();
         let mut req = make_req();
         req.namespace = "component:service".into();
@@ -3229,43 +3284,46 @@ mod tests {
     #[test]
     fn test_degraded_component_hint_requires_allowed_task_total() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "namespace-alpha".into(),
-            kind: "namespace".into(),
-            name: "alpha".into(),
-            namespace: "".into(),
-            external_id: "namespace:alpha".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "component-secret".into(),
-            kind: KIND_COMPONENT.into(),
-            name: "secret service".into(),
-            namespace: "".into(),
-            external_id: "component:secret-service".into(),
-            properties: HashMap::from([
-                ("task_total".into(), "5".into()),
-                ("success_rate".into(), "20".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "success_rate".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "contains-secret".into(),
-            from_id: "namespace-alpha".into(),
-            to_id: "component-secret".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "namespace-alpha".into(),
+                kind: "namespace".into(),
+                name: "alpha".into(),
+                namespace: "".into(),
+                external_id: "namespace:alpha".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "component-secret".into(),
+                kind: KIND_COMPONENT.into(),
+                name: "secret service".into(),
+                namespace: "".into(),
+                external_id: "component:secret-service".into(),
+                properties: HashMap::from([
+                    ("task_total".into(), "5".into()),
+                    ("success_rate".into(), "20".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "success_rate".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "contains-secret".into(),
+                from_id: "namespace-alpha".into(),
+                to_id: "component-secret".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3292,39 +3350,42 @@ mod tests {
                 prop("success_rate", PropertyType::Int),
             ],
         );
-        db.create_object(&Object {
-            id: "namespace-alpha".into(),
-            kind: "namespace".into(),
-            name: "alpha".into(),
-            namespace: "".into(),
-            external_id: "namespace:alpha".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "service-checkout".into(),
-            kind: "service".into(),
-            name: "checkout".into(),
-            namespace: "".into(),
-            external_id: "service:checkout".into(),
-            properties: HashMap::from([
-                ("task_total".into(), "5".into()),
-                ("success_rate".into(), "20".into()),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "contains-checkout".into(),
-            from_id: "namespace-alpha".into(),
-            to_id: "service-checkout".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "namespace-alpha".into(),
+                kind: "namespace".into(),
+                name: "alpha".into(),
+                namespace: "".into(),
+                external_id: "namespace:alpha".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-checkout".into(),
+                kind: "service".into(),
+                name: "checkout".into(),
+                namespace: "".into(),
+                external_id: "service:checkout".into(),
+                properties: HashMap::from([
+                    ("task_total".into(), "5".into()),
+                    ("success_rate".into(), "20".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "contains-checkout".into(),
+                from_id: "namespace-alpha".into(),
+                to_id: "service-checkout".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3353,43 +3414,46 @@ mod tests {
                 prop("success_rate", PropertyType::Int),
             ],
         );
-        db.create_object(&Object {
-            id: "namespace-alpha".into(),
-            kind: "namespace".into(),
-            name: "alpha".into(),
-            namespace: "".into(),
-            external_id: "namespace:alpha".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "service-secret".into(),
-            kind: "service".into(),
-            name: "secret".into(),
-            namespace: "".into(),
-            external_id: "service:secret".into(),
-            properties: HashMap::from([
-                ("task_total".into(), "5".into()),
-                ("success_rate".into(), "20".into()),
-                (
-                    egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "task_total,success_rate".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "contains-secret-service".into(),
-            from_id: "namespace-alpha".into(),
-            to_id: "service-secret".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "namespace-alpha".into(),
+                kind: "namespace".into(),
+                name: "alpha".into(),
+                namespace: "".into(),
+                external_id: "namespace:alpha".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-secret".into(),
+                kind: "service".into(),
+                name: "secret".into(),
+                namespace: "".into(),
+                external_id: "service:secret".into(),
+                properties: HashMap::from([
+                    ("task_total".into(), "5".into()),
+                    ("success_rate".into(), "20".into()),
+                    (
+                        egress::EXTERNAL_PROPERTIES_KEY.into(),
+                        "task_total,success_rate".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "contains-secret-service".into(),
+                from_id: "namespace-alpha".into(),
+                to_id: "service-secret".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3421,61 +3485,66 @@ mod tests {
                 "sensitive",
             )],
         );
-        db.create_object(&Object {
-            id: "namespace-alpha".into(),
-            kind: "namespace".into(),
-            name: "alpha".into(),
-            namespace: "".into(),
-            external_id: "namespace:alpha".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "service-checkout".into(),
-            kind: "service".into(),
-            name: "checkout".into(),
-            namespace: "".into(),
-            external_id: "service:checkout".into(),
-            properties: HashMap::from([("risk_score".into(), "0.91".into())]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "service-billing".into(),
-            kind: "service".into(),
-            name: "billing".into(),
-            namespace: "".into(),
-            external_id: "service:billing".into(),
-            properties: HashMap::from([
-                ("risk_score".into(), "0.95".into()),
-                (
-                    "chisei.egress.external_properties".into(),
-                    "risk_score".into(),
-                ),
-            ]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "contains-risk".into(),
-            from_id: "namespace-alpha".into(),
-            to_id: "service-checkout".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "contains-visible-risk".into(),
-            from_id: "namespace-alpha".into(),
-            to_id: "service-billing".into(),
-            relation: REL_CONTAINS.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "namespace-alpha".into(),
+                kind: "namespace".into(),
+                name: "alpha".into(),
+                namespace: "".into(),
+                external_id: "namespace:alpha".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-checkout".into(),
+                kind: "service".into(),
+                name: "checkout".into(),
+                namespace: "".into(),
+                external_id: "service:checkout".into(),
+                properties: HashMap::from([("risk_score".into(), "0.91".into())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-billing".into(),
+                kind: "service".into(),
+                name: "billing".into(),
+                namespace: "".into(),
+                external_id: "service:billing".into(),
+                properties: HashMap::from([
+                    ("risk_score".into(), "0.95".into()),
+                    (
+                        "chisei.egress.external_properties".into(),
+                        "risk_score".into(),
+                    ),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "contains-risk".into(),
+                from_id: "namespace-alpha".into(),
+                to_id: "service-checkout".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "contains-visible-risk".into(),
+                from_id: "namespace-alpha".into(),
+                to_id: "service-billing".into(),
+                relation: REL_CONTAINS.into(),
+                created: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3504,17 +3573,18 @@ mod tests {
                 "sensitive",
             )],
         );
-        db.create_object(&Object {
-            id: "service-checkout".into(),
-            kind: "service".into(),
-            name: "checkout".into(),
-            namespace: "".into(),
-            external_id: "service:checkout".into(),
-            properties: HashMap::from([("risk_score".into(), "0.91".into())]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "service-checkout".into(),
+                kind: "service".into(),
+                name: "checkout".into(),
+                namespace: "".into(),
+                external_id: "service:checkout".into(),
+                properties: HashMap::from([("risk_score".into(), "0.91".into())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3532,36 +3602,39 @@ mod tests {
     #[test]
     fn test_context_expansion_allows_related_verdict_context() {
         let db = ChiseiStore::memory();
-        db.create_object(&Object {
-            id: "asset-local".into(),
-            kind: "asset".into(),
-            name: "LocalCo".into(),
-            namespace: "".into(),
-            external_id: "asset:LOCAL".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_object(&Object {
-            id: "analysis-local".into(),
-            kind: "analysis".into(),
-            name: "Local analysis".into(),
-            namespace: "".into(),
-            external_id: "analysis:LOCAL".into(),
-            properties: HashMap::from([("verdict".into(), "watch margin risk".into())]),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
-        db.create_link(&Link {
-            id: "touches-analysis".into(),
-            from_id: "analysis-local".into(),
-            to_id: "asset-local".into(),
-            relation: REL_TOUCHES.into(),
-            created: 0,
-        })
-        .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "asset-local".into(),
+                kind: "asset".into(),
+                name: "LocalCo".into(),
+                namespace: "".into(),
+                external_id: "asset:LOCAL".into(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_object(&Object {
+                id: "analysis-local".into(),
+                kind: "analysis".into(),
+                name: "Local analysis".into(),
+                namespace: "".into(),
+                external_id: "analysis:LOCAL".into(),
+                properties: HashMap::from([("verdict".into(), "watch margin risk".into())]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+        db.runtime()
+            .create_link(&Link {
+                id: "touches-analysis".into(),
+                from_id: "analysis-local".into(),
+                to_id: "asset-local".into(),
+                relation: REL_TOUCHES.into(),
+                created: 0,
+            })
+            .unwrap();
 
         let p = default_pipeline();
         let mut req = make_req();
@@ -3588,7 +3661,7 @@ mod tests {
             created: 1,
             updated: 1,
         };
-        db.create_object(&object).unwrap();
+        db.runtime().create_object(&object).unwrap();
         let pipeline = default_pipeline();
         let mut request = make_req();
         request.namespace = "acme".into();
@@ -3599,42 +3672,46 @@ mod tests {
         let cross_namespace = pipeline.run(&mut request, &db);
         assert!(!cross_namespace.prepared_spec.contains("private context"));
 
-        db.delete_object(&object.id).unwrap();
-        db.ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+        db.runtime().delete_object(&object.id).unwrap();
+        db.runtime()
+            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
             .unwrap();
         object.id = "asset-protected".into();
         object.namespace = "acme".into();
-        db.create_object(&object).unwrap();
-        db.create_grant(&Grant {
-            id: "secret-bob".into(),
-            object_id: object.id.clone(),
-            principal: "bob".into(),
-            role: Role::Viewer,
-            created: 1,
-        })
-        .unwrap();
+        db.runtime().create_object(&object).unwrap();
+        db.runtime()
+            .create_grant(&Grant {
+                id: "secret-bob".into(),
+                object_id: object.id.clone(),
+                principal: "bob".into(),
+                role: Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
         let protected = pipeline.run(&mut request, &db);
         assert!(!protected.prepared_spec.contains("private context"));
 
-        db.create_grant(&Grant {
-            id: "secret-alice".into(),
-            object_id: object.id.clone(),
-            principal: "alice".into(),
-            role: Role::Viewer,
-            created: 2,
-        })
-        .unwrap();
+        db.runtime()
+            .create_grant(&Grant {
+                id: "secret-alice".into(),
+                object_id: object.id.clone(),
+                principal: "alice".into(),
+                role: Role::Viewer,
+                created: 2,
+            })
+            .unwrap();
         let authorized = pipeline.run(&mut request, &db);
         assert!(authorized.prepared_spec.contains("private context"));
 
-        db.create_grant(&Grant {
-            id: "secret-gateway".into(),
-            object_id: object.id.clone(),
-            principal: "chisei-gateway".into(),
-            role: Role::Viewer,
-            created: 3,
-        })
-        .unwrap();
+        db.runtime()
+            .create_grant(&Grant {
+                id: "secret-gateway".into(),
+                object_id: object.id.clone(),
+                principal: "chisei-gateway".into(),
+                role: Role::Viewer,
+                created: 3,
+            })
+            .unwrap();
         request.spec = "inspect asset:SECRET".into();
         request.memory_actor = "chisei-gateway".into();
         let namespace_denied = pipeline.run(&mut request, &db);

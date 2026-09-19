@@ -3309,8 +3309,13 @@ async fn spawn_control_plane_from_db(
     config: Config,
     db: Arc<RuntimeDb>,
 ) -> (String, Arc<RuntimeDb>) {
-    let sekai_svc = SekaiServiceImpl::new(db.clone());
-    let chisei_svc = ChiseiServiceImpl::new(db.clone(), config);
+    let sekai_svc = SekaiServiceImpl::new(
+        sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone()),
+    );
+    let chisei_svc = ChiseiServiceImpl::new(
+        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone()),
+        config,
+    );
     chisei_svc.seed_allow_by_default_context_admission(&["default", "sekai-chisei"]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3370,7 +3375,9 @@ async fn seed_regressed_namespace(target: &str, db: &Arc<RuntimeDb>, namespace: 
         }))
         .await
         .unwrap();
-    let eval = EvalStore::with_db(db.clone());
+    let eval = EvalStore::with_db(sekai_chisei::db::store::ChiseiStore::from_shared_runtime(
+        db.clone(),
+    ));
     eval.put_suite(InternalEvalSuite {
         id: "gateway-suite".to_string(),
         name: "Gateway suite".to_string(),

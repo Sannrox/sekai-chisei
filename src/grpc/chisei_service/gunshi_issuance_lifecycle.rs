@@ -59,7 +59,7 @@ impl ChiseiServiceImpl {
             })
             .collect::<std::collections::BTreeSet<_>>();
         for (namespace, _) in &scopes {
-            require_namespace_write_access(&self.db, &actor, namespace)?;
+            require_namespace_write_access(self.db.runtime(), &actor, namespace)?;
         }
         for (namespace, operation_class) in std::mem::take(&mut scopes) {
             input.kioku_evidence.extend(
@@ -166,7 +166,7 @@ impl ChiseiServiceImpl {
         actor: String,
         input: SetGunshiAllocationPolicyRequest,
     ) -> Result<SetGunshiAllocationPolicyResponse, Status> {
-        require_namespace_write_access(&self.db, &actor, &input.namespace)?;
+        require_namespace_write_access(self.db.runtime(), &actor, &input.namespace)?;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let status = match input.operation.as_str() {
             "install" => {
@@ -322,7 +322,7 @@ impl ChiseiServiceImpl {
         request: GetGunshiAllocationStatusRequest,
     ) -> Result<GetGunshiAllocationStatusResponse, Status> {
         let namespace = request.namespace.clone();
-        require_namespace_access(&self.db, &actor, &namespace)?;
+        require_namespace_access(self.db.runtime(), &actor, &namespace)?;
         let status = crate::chisei::gunshi_auto::get_status(&self.db, &namespace)
             .map_err(Status::internal)?;
         let status_json = match status {

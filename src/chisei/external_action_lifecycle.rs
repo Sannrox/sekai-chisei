@@ -178,34 +178,35 @@ pub fn ensure_audit(db: &ChiseiStore, record: &AuthorizationRecord) -> Result<()
     } else {
         record.approval_status.as_str()
     };
-    db.record_decisions_idempotently(&[crate::sekai::audit::Decision {
-        id: format!("{}:audit:{lifecycle}", record.decision.authorization_id),
-        timestamp: record.decision_updated_at_ms,
-        actor: record.decision_actor.clone(),
-        action: format!("external_action/{}", record.request.action_type),
-        reason: format!("external_action_authorization_{lifecycle}"),
-        evidence: HashMap::from([
-            (
-                "authorization_id".into(),
-                record.decision.authorization_id.clone(),
-            ),
-            (
-                "request_digest".into(),
-                record.decision.request_digest.clone(),
-            ),
-            ("namespace".into(), record.request.namespace.clone()),
-            ("action_type".into(), record.request.action_type.clone()),
-            ("risk_class".into(), record.request.risk_class.clone()),
-            ("decision".into(), record.decision.decision.clone()),
-            ("policy_scope".into(), record.decision.policy_scope.clone()),
-            (
-                "policy_version".into(),
-                record.decision.policy_version.clone(),
-            ),
-        ]),
-        target_id: record.decision.authorization_id.clone(),
-        outcome: record.decision.decision.clone(),
-    }])
+    db.runtime()
+        .record_decisions_idempotently(&[crate::sekai::audit::Decision {
+            id: format!("{}:audit:{lifecycle}", record.decision.authorization_id),
+            timestamp: record.decision_updated_at_ms,
+            actor: record.decision_actor.clone(),
+            action: format!("external_action/{}", record.request.action_type),
+            reason: format!("external_action_authorization_{lifecycle}"),
+            evidence: HashMap::from([
+                (
+                    "authorization_id".into(),
+                    record.decision.authorization_id.clone(),
+                ),
+                (
+                    "request_digest".into(),
+                    record.decision.request_digest.clone(),
+                ),
+                ("namespace".into(), record.request.namespace.clone()),
+                ("action_type".into(), record.request.action_type.clone()),
+                ("risk_class".into(), record.request.risk_class.clone()),
+                ("decision".into(), record.decision.decision.clone()),
+                ("policy_scope".into(), record.decision.policy_scope.clone()),
+                (
+                    "policy_version".into(),
+                    record.decision.policy_version.clone(),
+                ),
+            ]),
+            target_id: record.decision.authorization_id.clone(),
+            outcome: record.decision.decision.clone(),
+        }])
 }
 
 pub fn release_reservations(
@@ -227,7 +228,7 @@ pub fn release_reservations(
         record.budget_reserved = false;
     }
     if record.blast_radius_reserved {
-        db.release_external_action_blast_radius(
+        db.runtime().release_external_action_blast_radius(
             &record.decision.authorization_id,
             &record.request,
         )?;
@@ -242,7 +243,9 @@ pub fn persist_released_flags(
     released: &AuthorizationRecord,
 ) -> Result<(), String> {
     if reserved != released {
-        let _ = db.compare_and_swap_external_action_authorization(reserved, released)?;
+        let _ = db
+            .runtime()
+            .compare_and_swap_external_action_authorization(reserved, released)?;
     }
     Ok(())
 }
@@ -253,6 +256,7 @@ pub fn reclaim_expired(
     now_ms: i64,
 ) -> Result<(), String> {
     for expected in db
+        .runtime()
         .list_external_action_authorizations()?
         .into_iter()
         .filter(|record| {
@@ -266,7 +270,10 @@ pub fn reclaim_expired(
         expired.approval_status = "expired".into();
         expired.decision_actor = "chisei.external_action_expiry".into();
         expired.decision_updated_at_ms = now_ms;
-        if db.compare_and_swap_external_action_authorization(&expected, &expired)? {
+        if db
+            .runtime()
+            .compare_and_swap_external_action_authorization(&expected, &expired)?
+        {
             let reserved = expired.clone();
             release_reservations(db, budget, &mut expired)?;
             persist_released_flags(db, &reserved, &expired)?;

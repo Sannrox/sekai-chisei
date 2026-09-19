@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Typed plane handles no longer `Deref`/`From`/`AsRef` to `RuntimeDb`, and
+  Sekai no longer holds a Chisei `BudgetTracker`; shared identity stays an
+  explicit `from_shared_runtime` constructor (#1031).
+- Split restore-fence admits a matched generation once per restamp/open
+  epoch instead of selecting both stores on every mutating RPC (#1047).
+- Audited object create takes a Deferred writer lock and upgrades to
+  Immediate only after SQLITE_BUSY. Profile conflict converge waits at
+  most 30ms instead of 160ms (#1045).
 - Combined PostgreSQL Split treats `localhost`, `127.0.0.1`, and `::1` as
   one host so alias pairs cannot open two writers on the same database
   (#1018).

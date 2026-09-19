@@ -245,6 +245,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         let budget_subject = submit_budget_subject(&namespace, actor, &type_def.budget_scope);
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
+            && !budget_already_reserved
             && budget.check(&budget_subject, 1).is_err()
         {
             status = STATUS_DENIED.into();

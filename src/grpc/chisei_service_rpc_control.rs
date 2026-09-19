@@ -101,6 +101,7 @@ pub(super) async fn redeem_external_action_permit(
     }
     if let Some(redemption) = service
         .db
+        .runtime()
         .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
         .map_err(Status::failed_precondition)?
     {
@@ -131,6 +132,7 @@ pub(super) async fn redeem_external_action_permit(
         .map_err(Status::failed_precondition)?;
     let redemption = service
         .db
+        .runtime()
         .redeem_or_reconcile_permit(
             &value,
             &context,
@@ -179,6 +181,7 @@ pub(super) async fn set_external_action_policy(
             };
             service
                 .db
+                .runtime()
                 .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
                 .map_err(Status::invalid_argument)?;
             Ok(Response::new(SetExternalActionPolicyResponse {
@@ -193,6 +196,7 @@ pub(super) async fn set_external_action_policy(
             let now = chrono::Utc::now().timestamp_millis();
             let changed = service
                 .db
+                .runtime()
                 .set_permit_kill_switch(
                     &input.scope_kind,
                     &input.scope_value,
@@ -203,6 +207,7 @@ pub(super) async fn set_external_action_policy(
                 .map_err(Status::invalid_argument)?;
             service
                 .db
+                .runtime()
                 .record_decisions_idempotently(&[crate::sekai::audit::Decision {
                     id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
                     timestamp: now,
@@ -337,7 +342,7 @@ pub(super) async fn set_namespace_policy(
             ));
         }
         persist_namespace_policy(
-            &service.db,
+            service.db.runtime(),
             &r.namespace,
             &policy,
             context_admission_policy.as_ref(),
@@ -380,7 +385,7 @@ pub(super) async fn get_effective_policy_summary(
 ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
     let actor = required_authenticated_actor(&req)?;
     let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
-    require_namespace_access(&service.db, &actor, &namespace)?;
+    require_namespace_access(service.db.runtime(), &actor, &namespace)?;
 
     let routing = service.policy.effective_policy(&namespace).map_or_else(
         || EffectiveRoutingSummary {
@@ -400,6 +405,7 @@ pub(super) async fn get_effective_policy_summary(
 
     let raw_limits = service
         .db
+        .runtime()
         .budget_limits_for_scope(&format!("project:{namespace}"))
         .map_err(Status::internal)?;
     let budget_version = content_version(&raw_limits);
@@ -429,12 +435,14 @@ pub(super) async fn get_effective_policy_summary(
     let project_action_scope = format!("project:{namespace}");
     let action_policy = match service
         .db
+        .runtime()
         .get_action_policy(&project_action_scope)
         .map_err(Status::internal)?
     {
         some @ Some(_) => some,
         None => service
             .db
+            .runtime()
             .get_action_policy(&namespace)
             .map_err(Status::internal)?,
     };

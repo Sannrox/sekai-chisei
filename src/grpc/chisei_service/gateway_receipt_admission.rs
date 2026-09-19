@@ -47,6 +47,7 @@ impl ChiseiServiceImpl {
             }
             if self.config.scoring_enabled {
                 self.db
+                    .runtime()
                     .put_sample_observation(&crate::chisei::scoring::SampleObservation {
                         request_id: observation.request_id,
                         namespace: observation.namespace,
@@ -108,11 +109,13 @@ impl ChiseiServiceImpl {
                     .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
         }) || !self
             .db
+            .runtime()
             .list_kioku_outcome_assignments(&receipt.operation_id)
             .map_err(Status::internal)?
             .is_empty();
         let existing = self
             .db
+            .runtime()
             .get_operation_receipt(&receipt.operation_id)
             .map_err(Status::internal)?;
         if existing
@@ -125,7 +128,7 @@ impl ChiseiServiceImpl {
         }
         if existing.is_none() && has_kioku_context {
             reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                &self.db,
+                self.db.runtime(),
                 &receipt,
                 authenticated_principal,
                 now,
@@ -138,12 +141,13 @@ impl ChiseiServiceImpl {
             })?;
         }
         self.db
+            .runtime()
             .put_operation_receipt(&receipt)
             .map_err(Status::internal)?;
         if existing.is_none()
             && has_kioku_context
             && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                &self.db,
+                self.db.runtime(),
                 &receipt,
                 authenticated_principal,
                 now,
@@ -152,18 +156,25 @@ impl ChiseiServiceImpl {
                 false,
             )
         {
-            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now,
-                actor: "chisei.kioku".into(),
-                action: "kioku.outcome_attribution".into(),
-                reason: error,
-                evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
-                target_id: receipt.operation_id.clone(),
-                outcome: "failed".into(),
-            });
+            let _ = self
+                .db
+                .runtime()
+                .record_decision(&crate::sekai::audit::Decision {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: now,
+                    actor: "chisei.kioku".into(),
+                    action: "kioku.outcome_attribution".into(),
+                    reason: error,
+                    evidence: HashMap::from([(
+                        "operation_id".into(),
+                        receipt.operation_id.clone(),
+                    )]),
+                    target_id: receipt.operation_id.clone(),
+                    outcome: "failed".into(),
+                });
         }
         self.db
+            .runtime()
             .record_decisions_idempotently(&[crate::sekai::audit::Decision {
                 id: format!("{}:gateway-receipt", receipt.operation_id),
                 timestamp: now,

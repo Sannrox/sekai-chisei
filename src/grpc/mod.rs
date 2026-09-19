@@ -51,13 +51,10 @@ pub struct TokenAuthInterceptor {
 }
 
 impl TokenAuthInterceptor {
-    pub fn new(
-        store: Arc<PrincipalCredentialStore>,
-        db: impl Into<crate::db::store::SekaiStore>,
-    ) -> Self {
+    pub fn new(store: Arc<PrincipalCredentialStore>, db: crate::db::store::SekaiStore) -> Self {
         Self {
             store,
-            db: db.into(),
+            db,
             assertion_authority: None,
         }
     }
@@ -72,7 +69,7 @@ impl TokenAuthInterceptor {
 
     pub fn from_runtime(
         store: Arc<PrincipalCredentialStore>,
-        db: impl Into<crate::db::store::SekaiStore>,
+        db: crate::db::store::SekaiStore,
         assertion_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         Self::new(store, db).with_assertion_authority(assertion_authority)
@@ -80,7 +77,7 @@ impl TokenAuthInterceptor {
 
     pub fn from_config(
         store: Arc<PrincipalCredentialStore>,
-        db: Arc<RuntimeDb>,
+        db: crate::db::store::SekaiStore,
         config: &Config,
     ) -> Result<Self, String> {
         Ok(Self::from_runtime(
@@ -96,12 +93,12 @@ impl TokenAuthInterceptor {
     /// bypassed by a stale process-local cache. Used by gRPC interceptors and
     /// the authenticated operator console.
     pub fn resolve_credential(&self, token: &str) -> Option<PrincipalCredential> {
-        self.store.maybe_reload(&self.db);
+        self.store.maybe_reload(self.db.runtime());
         let token_hash = hash_gateway_key(token);
 
         // Recheck durable state for every authentication. The cache accelerates
         // startup discovery but never extends a rotated or revoked credential.
-        match self.db.get_principal_credential(&token_hash) {
+        match self.db.runtime().get_principal_credential(&token_hash) {
             Ok(Some(credential)) if credential.status == "active" => {
                 self.store.load_credential(&credential);
                 Some(credential)
@@ -255,12 +252,14 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
 
         let enterprise_result = self
             .db
+            .runtime()
             .enterprise_extension()
             .map(|extension| extension.authenticate_context(&token));
         let (authenticated_context, enterprise_scoped) = match enterprise_result {
             Some(Ok(context)) => {
                 let extension_version = self
                     .db
+                    .runtime()
                     .enterprise_extension()
                     .expect("enterprise authentication requires an installed extension")
                     .contract_version();
@@ -440,7 +439,11 @@ fn local_or_token_interceptor(
 ) -> LocalOrTokenAuthInterceptor {
     LocalOrTokenAuthInterceptor {
         local: LocalInterceptor::new(true),
-        token: TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
+        token: TokenAuthInterceptor::from_runtime(
+            credential_store,
+            crate::db::store::SekaiStore::from_shared_runtime(db),
+            assertion_authority,
+        ),
     }
 }
 
@@ -598,7 +601,7 @@ pub fn run_for_plane(
                     chisei_svc.clone(),
                     TokenAuthInterceptor::from_runtime(
                         credential_store.clone(),
-                        db.clone(),
+                        crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
                         assertion_authority.clone(),
                     ),
                     stores.clone(),
@@ -759,7 +762,11 @@ where
             config,
             sekai_svc,
             chisei_svc,
-            TokenAuthInterceptor::from_runtime(credential_store, db, assertion_authority),
+            TokenAuthInterceptor::from_runtime(
+                credential_store,
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+                assertion_authority,
+            ),
             health_service,
             plane,
             stores,
@@ -924,9 +931,8 @@ pub fn build_services_for_plane(
         chisei_store.clone(),
         config.budget_topology.clone(),
     ));
-    let mut sekai_svc = sekai_service::SekaiServiceImpl::with_budget_and_gateway_schema_principals(
+    let mut sekai_svc = sekai_service::SekaiServiceImpl::new_with_gateway_schema_principals(
         sekai_store.clone(),
-        budget.clone(),
         config.gateway_receipt_principals.clone(),
     )
     .with_site_id(config.site_id.clone());
@@ -1217,7 +1223,8 @@ mod tests {
     fn token_auth_interceptor_enforces_missing_authorization() {
         let db = in_memory_db();
         let store = Arc::new(PrincipalCredentialStore::new());
-        let mut interceptor = TokenAuthInterceptor::new(store, db);
+        let mut interceptor =
+            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db));
 
         let request = Request::new(());
         assert!(interceptor.call(request).is_err());
@@ -1227,7 +1234,8 @@ mod tests {
     fn token_auth_interceptor_rejects_assertion_with_caller_tenant_header() {
         let db = in_memory_db();
         let store = Arc::new(PrincipalCredentialStore::new());
-        let mut interceptor = TokenAuthInterceptor::new(store, db);
+        let mut interceptor =
+            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db));
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -1246,7 +1254,8 @@ mod tests {
     fn community_interceptor_treats_assertions_as_invalid_without_authority() {
         let db = in_memory_db();
         let store = Arc::new(PrincipalCredentialStore::new());
-        let mut interceptor = TokenAuthInterceptor::new(store, db);
+        let mut interceptor =
+            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db));
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -1287,7 +1296,7 @@ mod tests {
     ) -> TokenAuthInterceptor {
         TokenAuthInterceptor::from_runtime(
             Arc::new(PrincipalCredentialStore::new()),
-            in_memory_db(),
+            crate::db::store::SekaiStore::from_shared_runtime(in_memory_db()),
             Some(Arc::new(authority)),
         )
     }
@@ -1417,7 +1426,7 @@ mod tests {
         config.assertion_hmac_key = Some("test-hmac-key".into());
         let mut interceptor = TokenAuthInterceptor::from_config(
             Arc::new(PrincipalCredentialStore::new()),
-            in_memory_db(),
+            crate::db::store::SekaiStore::from_shared_runtime(in_memory_db()),
             &config,
         )
         .unwrap();
@@ -1520,8 +1529,10 @@ mod tests {
             )
             .unwrap(),
         )));
-        let mut interceptor =
-            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db);
+        let mut interceptor = TokenAuthInterceptor::new(
+            Arc::new(PrincipalCredentialStore::new()),
+            crate::db::store::SekaiStore::from_shared_runtime(db),
+        );
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -1545,8 +1556,10 @@ mod tests {
             )
             .unwrap(),
         )));
-        let mut interceptor =
-            TokenAuthInterceptor::new(Arc::new(PrincipalCredentialStore::new()), db);
+        let mut interceptor = TokenAuthInterceptor::new(
+            Arc::new(PrincipalCredentialStore::new()),
+            crate::db::store::SekaiStore::from_shared_runtime(db),
+        );
         let mut request = Request::new(());
         request.metadata_mut().insert(
             "authorization",
@@ -1592,7 +1605,10 @@ mod tests {
         let credentials = db.list_active_credentials().unwrap();
         store.load(&credentials);
 
-        let mut interceptor = TokenAuthInterceptor::new(Arc::new(store), db.clone());
+        let mut interceptor = TokenAuthInterceptor::new(
+            Arc::new(store),
+            crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
+        );
 
         let mut request = Request::new(());
         request.metadata_mut().insert(
@@ -1645,7 +1661,10 @@ mod tests {
         store.load(&db.list_active_credentials().unwrap());
         let mut interceptor = LocalOrTokenAuthInterceptor {
             local: LocalInterceptor::new(true),
-            token: TokenAuthInterceptor::new(Arc::new(store), db),
+            token: TokenAuthInterceptor::new(
+                Arc::new(store),
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+            ),
         };
 
         let mut request = Request::new(());
@@ -1674,7 +1693,10 @@ mod tests {
         let store = PrincipalCredentialStore::new();
         let mut interceptor = LocalOrTokenAuthInterceptor {
             local: LocalInterceptor::new(true),
-            token: TokenAuthInterceptor::new(Arc::new(store), db),
+            token: TokenAuthInterceptor::new(
+                Arc::new(store),
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+            ),
         };
 
         for forged in ["root", "local", "alice", "chisei-gateway"] {

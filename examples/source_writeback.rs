@@ -511,8 +511,13 @@ impl ControlPlane {
         config.db_path = db_path.display().to_string();
         Ok(Self {
             db_path,
-            sekai: SekaiServiceImpl::new(db.clone()),
-            chisei: ChiseiServiceImpl::new(db, config),
+            sekai: SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
+                db.clone(),
+            )),
+            chisei: ChiseiServiceImpl::new(
+                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
+                config,
+            ),
         })
     }
 
@@ -528,8 +533,13 @@ impl ControlPlane {
         config.db_path = db_path.display().to_string();
         Ok(Self {
             db_path,
-            sekai: SekaiServiceImpl::new(db.clone()),
-            chisei: ChiseiServiceImpl::new(db, config),
+            sekai: SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
+                db.clone(),
+            )),
+            chisei: ChiseiServiceImpl::new(
+                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
+                config,
+            ),
         })
     }
 }

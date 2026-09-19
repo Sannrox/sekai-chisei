@@ -90,13 +90,18 @@ pub(super) async fn register_object_type_datasource(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     let proto = input
         .datasource
         .ok_or_else(|| Status::invalid_argument("datasource required"))?;
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &proto.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &proto.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &proto.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &proto.namespace, true)?;
     let binding = crate::sekai::object_type_index::ObjectTypeDatasource {
         contract_version: proto.contract_version,
         namespace: proto.namespace,
@@ -112,6 +117,7 @@ pub(super) async fn register_object_type_datasource(
     .map_err(|error| Status::invalid_argument(error.message()))?;
     service
         .db
+        .runtime()
         .register_object_type_datasource(&binding, now_millis())
         .map_err(Status::internal)?;
     Ok(Response::new(RegisterObjectTypeDatasourceResponse {
@@ -125,12 +131,18 @@ pub(super) async fn reindex_object_type(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let report = service
         .db
+        .runtime()
         .apply_object_type_index(
             &input.namespace,
             &input.kind,
@@ -146,6 +158,7 @@ pub(super) async fn reindex_object_type(
         })?;
     let status = service
         .db
+        .runtime()
         .object_type_index_status(&input.namespace, &input.kind, now_millis())
         .map_err(Status::internal)?;
     Ok(Response::new(ReindexObjectTypeResponse {
@@ -162,17 +175,18 @@ pub(super) async fn get_object_type_index_status(
 ) -> Result<Response<GetObjectTypeIndexStatusResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let status = service
         .db
+        .runtime()
         .object_type_index_status(&input.namespace, &input.kind, now_millis())
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
@@ -187,12 +201,18 @@ pub(super) async fn put_object_type_index_edit(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     service
         .db
+        .runtime()
         .put_object_type_index_edit(&crate::sekai::object_type_index::ObjectTypeIndexEdit {
             namespace: input.namespace,
             kind: input.kind,
@@ -246,22 +266,23 @@ pub(super) async fn put_object_security_policy_revision(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
         &input.canonical_policy_json,
     )
     .map_err(Status::invalid_argument)?;
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &policy.namespace,
         true,
     )?;
-    check_team_namespace(&service.db, &principals, &policy.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &policy.namespace, true)?;
     let actor = principals.first().cloned().unwrap_or_default();
     let revision = service
         .db
+        .runtime()
         .put_object_security_policy(&policy, &actor, &input.idempotency_key, now_millis())
         .map_err(map_object_security_error)?;
     Ok(Response::new(PutObjectSecurityPolicyRevisionResponse {
@@ -275,17 +296,18 @@ pub(super) async fn get_object_security_policy_revision(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let revision = service
         .db
+        .runtime()
         .get_object_security_policy(&input.namespace, &input.revision_digest)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
@@ -300,10 +322,15 @@ pub(super) async fn activate_object_security_policies(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &input.namespace, true)?;
-    check_team_namespace(&service.db, &principals, &input.namespace, true)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &input.namespace,
+        true,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
     let mut policies = BTreeMap::new();
     for binding in input.policies {
         if binding.kind.trim().is_empty()
@@ -320,6 +347,7 @@ pub(super) async fn activate_object_security_policies(
     let actor = principals.first().cloned().unwrap_or_default();
     let activation = service
         .db
+        .runtime()
         .activate_object_security_policies(
             &input.namespace,
             &policies,
@@ -339,17 +367,18 @@ pub(super) async fn get_object_security_activation(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let activation = service
         .db
+        .runtime()
         .get_object_security_activation(&input.namespace)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("not found"))?;
@@ -364,18 +393,23 @@ pub(super) async fn put_purpose_authorization(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let authorization = req
         .into_inner()
         .authorization
         .ok_or_else(|| Status::invalid_argument("authorization required"))?;
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &authorization.namespace,
         true,
     )?;
-    check_team_namespace(&service.db, &principals, &authorization.namespace, true)?;
+    check_team_namespace(
+        service.db.runtime(),
+        &principals,
+        &authorization.namespace,
+        true,
+    )?;
     let mut authorization = from_proto_purpose_authorization(authorization);
     authorization.created_by = principals.first().cloned().unwrap_or_default();
     authorization.created_at_ms = now_millis();
@@ -383,6 +417,7 @@ pub(super) async fn put_purpose_authorization(
     authorization.prepare().map_err(Status::invalid_argument)?;
     let stored = service
         .db
+        .runtime()
         .put_purpose_authorization(&authorization)
         .map_err(map_purpose_authorization_error)?;
     Ok(Response::new(PutPurposeAuthorizationResponse {
@@ -399,6 +434,7 @@ pub(super) async fn revoke_purpose_authorization(
     let authorization_id = req.into_inner().authorization_id;
     let stored = service
         .db
+        .runtime()
         .revoke_purpose_authorization(&authorization_id, now_millis())
         .map_err(map_purpose_authorization_error)?;
     Ok(Response::new(RevokePurposeAuthorizationResponse {
@@ -412,22 +448,23 @@ pub(super) async fn put_classification_lattice(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let lattice = req
         .into_inner()
         .lattice
         .ok_or_else(|| Status::invalid_argument("lattice required"))?;
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &lattice.namespace,
         true,
     )?;
-    check_team_namespace(&service.db, &principals, &lattice.namespace, true)?;
+    check_team_namespace(service.db.runtime(), &principals, &lattice.namespace, true)?;
     let lattice = from_proto_classification_lattice(lattice);
     lattice.prepare().map_err(Status::invalid_argument)?;
     let stored = service
         .db
+        .runtime()
         .put_classification_lattice(
             &lattice,
             principals.first().map(String::as_str).unwrap_or_default(),
@@ -445,12 +482,18 @@ pub(super) async fn get_classification_lattice(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let namespace = req.into_inner().namespace;
-    enforce_namespace_tenant_context(&service.db, tenant_context.as_ref(), &namespace, false)?;
-    check_team_namespace(&service.db, &principals, &namespace, false)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &namespace,
+        false,
+    )?;
+    check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let lattice = service
         .db
+        .runtime()
         .get_classification_lattice(&namespace)
         .map_err(map_classification_lattice_error)?
         .ok_or_else(|| Status::not_found("not found"))?;
@@ -466,15 +509,15 @@ pub(super) async fn simulate_object_policy_change(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let operation = if input.operation.trim().is_empty() {
         crate::sekai::object_security::ObjectSecurityOperation::Read
     } else {
@@ -483,10 +526,14 @@ pub(super) async fn simulate_object_policy_change(
     };
     let current_activation = service
         .db
+        .runtime()
         .get_object_security_activation(&input.namespace)
         .map_err(map_object_security_error)?;
-    let current =
-        snapshot_from_activation(&service.db, &input.namespace, current_activation.as_ref())?;
+    let current = snapshot_from_activation(
+        service.db.runtime(),
+        &input.namespace,
+        current_activation.as_ref(),
+    )?;
     let mut candidate_policies = BTreeMap::new();
     for binding in &input.candidate_policies {
         if binding.kind.trim().is_empty() || binding.revision_digest.trim().is_empty() {
@@ -496,6 +543,7 @@ pub(super) async fn simulate_object_policy_change(
         }
         let revision = service
             .db
+            .runtime()
             .get_object_security_policy(&input.namespace, &binding.revision_digest)
             .map_err(map_object_security_error)?
             .ok_or_else(|| Status::not_found("candidate policy revision not found"))?;
@@ -525,6 +573,7 @@ pub(super) async fn simulate_object_policy_change(
     };
     let objects = service
         .db
+        .runtime()
         .list_objects(&crate::domain::ListFilter {
             namespace: Some(input.namespace.clone()),
             limit: if input.limit > 0 { input.limit } else { 10_000 },
@@ -538,7 +587,8 @@ pub(super) async fn simulate_object_policy_change(
         input.principals.clone()
     };
     for principal in named {
-        let authority = resolve_principal_authority(&service.db, std::slice::from_ref(&principal))?;
+        let authority =
+            resolve_principal_authority(service.db.runtime(), std::slice::from_ref(&principal))?;
         simulated.push(crate::sekai::policy_decision::SimulatedPrincipal {
             principal: principal.clone(),
             context: crate::sekai::object_security::PrincipalPolicyContext {
@@ -587,17 +637,18 @@ pub(super) async fn query_object_policy_audit(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(&service.db, &req)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
     enforce_namespace_tenant_context(
-        &service.db,
+        service.db.runtime(),
         tenant_context.as_ref(),
         &input.namespace,
         false,
     )?;
-    check_team_namespace(&service.db, &principals, &input.namespace, false)?;
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
     let records = service
         .db
+        .runtime()
         .query_policy_decisions(&crate::sekai::policy_decision::PolicyDecisionQuery {
             namespace: input.namespace,
             principal: input.principal,
@@ -720,8 +771,10 @@ mod policy_decision_rpc_tests {
     use tonic::metadata::MetadataValue;
 
     fn service() -> SekaiServiceImpl {
-        SekaiServiceImpl::new(Arc::new(crate::db::runtime_db::RuntimeDb::Sqlite(
-            Arc::new(crate::db::sekai::SekaiDb::new(":memory:").unwrap()),
+        SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(Arc::new(
+            crate::db::runtime_db::RuntimeDb::Sqlite(Arc::new(
+                crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
+            )),
         )))
     }
 
@@ -772,8 +825,14 @@ mod policy_decision_rpc_tests {
     #[tokio::test]
     async fn simulate_and_audit_rpcs_omit_hidden_values() {
         let svc = service();
-        svc.db.create_object(&document("doc-a", "alice")).unwrap();
-        svc.db.create_object(&document("doc-b", "bob")).unwrap();
+        svc.db
+            .runtime()
+            .create_object(&document("doc-a", "alice"))
+            .unwrap();
+        svc.db
+            .runtime()
+            .create_object(&document("doc-b", "bob"))
+            .unwrap();
         let broad = put_object_security_policy_revision(
             &svc,
             admin(PutObjectSecurityPolicyRevisionRequest {
@@ -854,7 +913,7 @@ mod policy_decision_rpc_tests {
 
         let alice = document("doc-a", "alice");
         enforce_object_operation_access(
-            &svc.db,
+            svc.db.runtime(),
             &alice,
             &["alice".into()],
             None,
@@ -864,7 +923,7 @@ mod policy_decision_rpc_tests {
         )
         .unwrap();
         let bob_err = enforce_object_operation_access(
-            &svc.db,
+            svc.db.runtime(),
             &alice,
             &["bob".into()],
             None,
@@ -915,7 +974,7 @@ mod policy_decision_rpc_tests {
     async fn compiled_decide_is_live_object_access_authority() {
         let svc = service();
         let alice = document("doc-purpose", "alice");
-        svc.db.create_object(&alice).unwrap();
+        svc.db.runtime().create_object(&alice).unwrap();
         let revision = put_object_security_policy_revision(
             &svc,
             admin(PutObjectSecurityPolicyRevisionRequest {
@@ -944,6 +1003,7 @@ mod policy_decision_rpc_tests {
 
         let policy = svc
             .db
+            .runtime()
             .active_object_policy("acme", "document")
             .unwrap()
             .expect("activated");
@@ -958,7 +1018,7 @@ mod policy_decision_rpc_tests {
         );
 
         let decision = decide_object_access(
-            &svc.db,
+            svc.db.runtime(),
             &alice,
             &["alice".into()],
             None,
@@ -976,7 +1036,7 @@ mod policy_decision_rpc_tests {
         );
         assert_eq!(
             evaluate_active_object_policy(
-                &svc.db,
+                svc.db.runtime(),
                 &alice,
                 &["alice".into()],
                 None,
@@ -987,7 +1047,7 @@ mod policy_decision_rpc_tests {
             Some(false)
         );
         let err = enforce_object_operation_access(
-            &svc.db,
+            svc.db.runtime(),
             &alice,
             &["alice".into()],
             None,

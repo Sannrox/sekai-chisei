@@ -273,7 +273,10 @@ async fn grpc_chat_round_trip_with_local_ollama() {
 
     let server = tokio::spawn(async move {
         Server::builder()
-            .add_service(ChiseiServiceServer::new(ChiseiServiceImpl::new(db, config)))
+            .add_service(ChiseiServiceServer::new(ChiseiServiceImpl::new(
+                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
+                config,
+            )))
             .serve(addr)
             .await
             .expect("serve test gRPC server");
@@ -404,7 +407,8 @@ async fn delegation_chain_keeps_private_context_local() {
     let server = tokio::spawn(async move {
         Server::builder()
             .add_service(ChiseiServiceServer::new(ChiseiServiceImpl::new(
-                server_db, config,
+                sekai_chisei::db::store::ChiseiStore::from_shared_runtime(server_db),
+                config,
             )))
             .serve(addr)
             .await

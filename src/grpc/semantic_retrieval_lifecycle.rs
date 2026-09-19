@@ -61,12 +61,12 @@ impl SekaiServiceImpl {
         let mut ontology_source_rows = 0u32;
         let mut ontology_source_truncated = false;
         let ontology = if reasoning_mode == retrieval::ReasoningMode::Entailment {
-            if self.db.backend_name() == "postgres" {
+            if self.db.runtime().backend_name() == "postgres" {
                 return Err(Status::failed_precondition(
                     "sekai.context.retrieve entailment is unavailable on the PostgreSQL community runtime; use asserted_only",
                 ));
             }
-            let mut classes = match self.db.list_readable_ontology_classes(
+            let mut classes = match self.db.runtime().list_readable_ontology_classes(
                 principals,
                 reasoning_deadline,
                 ontology_row_limit.saturating_add(1),
@@ -111,6 +111,7 @@ impl SekaiServiceImpl {
             let mut relation_rows =
                 if !ontology_source_truncated && reasoning_started.elapsed() < reasoning_timeout {
                     self.db
+                        .runtime()
                         .list_readable_ontology_relations(
                             principals,
                             reasoning_deadline,
@@ -170,13 +171,13 @@ impl SekaiServiceImpl {
         let purpose_error = std::cell::RefCell::new(None::<Status>);
         let recorded_purposes = std::cell::RefCell::new(HashSet::new());
         let mut result = retrieval::retrieve_with_ontology_started(
-            &self.db,
+            self.db.runtime(),
             &query,
             ontology.as_ref(),
             reasoning_started,
             |object| {
                 let purpose_ok = match purpose_allows_kind(
-                    &self.db,
+                    self.db.runtime(),
                     &object.namespace,
                     &object.kind,
                     purpose,
@@ -189,8 +190,9 @@ impl SekaiServiceImpl {
                     }
                 };
                 self.security.can_access(&object.id, &principal_refs)
-                    && check_team_namespace(&self.db, principals, &object.namespace, false).is_ok()
-                    && object_passes_marking(&self.db, object, principals).unwrap_or(false)
+                    && check_team_namespace(self.db.runtime(), principals, &object.namespace, false)
+                        .is_ok()
+                    && object_passes_marking(self.db.runtime(), object, principals).unwrap_or(false)
                     && purpose_ok
             },
             |object| is_reserved_governance_kind(&object.kind),
