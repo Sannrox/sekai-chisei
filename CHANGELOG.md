@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Shared Combined Postgres consults the writer fence, and `store relocate`
+  accepts three PostgreSQL URLs with the same snapshot-then-fence cutover
+  as SQLite (#1028).
 - Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`;
   destination pairs stay the default Combined topology (#1032).
 - Relocate refuses a `--sekai` that is not the historical `--source`, so a

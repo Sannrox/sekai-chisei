@@ -15,7 +15,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::combined_stores::{CombinedStoreLayout, CombinedStoreSources};
+use crate::combined_stores::{CombinedStoreLayout, CombinedStoreSources, StoreIdentity};
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
@@ -45,7 +45,7 @@ pub struct FamilyReport {
 }
 
 pub fn usage() -> &'static str {
-    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. --sekai must be the same physical file as --source. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
+    "sekaictl admin store relocate --source <path-or-url> --sekai <path-or-url> --chisei <path-or-url>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Three SQLite paths or three PostgreSQL URLs. --sekai must be the same physical identity as --source. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
 sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
 }
 
@@ -55,7 +55,7 @@ pub fn run_store_command(
     match args.first().map(String::as_str) {
         Some("relocate") => {
             let config = parse_relocate(&args[1..])?;
-            let report = relocate_sqlite(&config.source, &config.sekai, &config.chisei)?;
+            let report = relocate(&config.source, &config.sekai, &config.chisei)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -140,6 +140,23 @@ fn require_value(args: &[String], i: usize, flag: &str) -> Result<String, String
 
 /// Copy Chisei families from `source` into `chisei`, stamp both destinations,
 /// and raise the writer fence on the historical source.
+pub fn relocate(source: &str, sekai: &str, chisei: &str) -> Result<RelocateReport, String> {
+    match (
+        looks_like_postgres_url(source),
+        looks_like_postgres_url(sekai),
+        looks_like_postgres_url(chisei),
+    ) {
+        (true, true, true) => relocate_postgres(source, sekai, chisei),
+        (false, false, false) => relocate_sqlite(source, sekai, chisei),
+        _ => Err(
+            "relocate requires three SQLite paths or three PostgreSQL URLs; mixed backends are refused"
+                .into(),
+        ),
+    }
+}
+
+/// Copy Chisei families from `source` into `chisei`, stamp both destinations,
+/// and raise the writer fence on the historical source.
 pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<RelocateReport, String> {
     if source.trim().is_empty() || sekai.trim().is_empty() || chisei.trim().is_empty() {
         return Err("relocate paths must not be empty".into());
@@ -204,6 +221,282 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         generation,
         fence_raised: true,
     })
+}
+
+pub fn relocate_postgres(
+    source: &str,
+    sekai: &str,
+    chisei: &str,
+) -> Result<RelocateReport, String> {
+    if source.trim().is_empty() || sekai.trim().is_empty() || chisei.trim().is_empty() {
+        return Err("relocate URLs must not be empty".into());
+    }
+    let source_id = crate::combined_stores::postgres_identity(source)?;
+    let sekai_id = crate::combined_stores::postgres_identity(sekai)?;
+    let chisei_id = crate::combined_stores::postgres_identity(chisei)?;
+    if source_id != sekai_id {
+        return Err(
+            "relocate refuses a distinct --sekai; --sekai must be the historical source so Sekai facts are not orphaned"
+                .into(),
+        );
+    }
+    if source_id == chisei_id {
+        return Err(
+            "relocate refuses a shared source and Chisei destination; copy into a distinct database"
+                .into(),
+        );
+    }
+
+    let ca = postgres_ca_cert_path();
+    RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
+        BackendIdentity::Postgres,
+        None,
+        "unused.db",
+        Some(source),
+        16,
+        ca.as_deref(),
+    )?)?;
+    RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
+        BackendIdentity::Postgres,
+        None,
+        "unused.db",
+        Some(sekai),
+        16,
+        ca.as_deref(),
+    )?)?;
+    RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
+        BackendIdentity::Postgres,
+        None,
+        "unused.db",
+        Some(chisei),
+        16,
+        ca.as_deref(),
+    )?)?;
+
+    let source_db = connect_postgres(source)?;
+    let chisei_db = connect_postgres(chisei)?;
+    let snapshot_dir = relocate_postgres_snapshot_dir(chisei);
+    snapshot_postgres(&source_db, &snapshot_dir)?;
+    let generation = raise_postgres_writer_fence(&source_db)?;
+    let reports = copy_chisei_families_from_postgres_snapshot(&snapshot_dir, &chisei_db)?;
+    let _ = std::fs::remove_dir_all(&snapshot_dir);
+    raise_postgres_writer_fence_with_generation(&connect_postgres(sekai)?, generation)?;
+    raise_postgres_writer_fence_with_generation(&chisei_db, generation)?;
+
+    Ok(RelocateReport {
+        families: reports,
+        generation,
+        fence_raised: true,
+    })
+}
+
+fn postgres_ca_cert_path() -> Option<String> {
+    crate::combined_stores::optional_trimmed_env("SEKAI_POSTGRES_CA_CERT")
+}
+
+fn connect_postgres(url: &str) -> Result<PostgresDb, String> {
+    match postgres_ca_cert_path() {
+        Some(path) => {
+            let pem = std::fs::read(&path).map_err(|error| error.to_string())?;
+            PostgresDb::connect_with_ca_certificate(url, 4, &pem)
+        }
+        None => PostgresDb::connect(url, 4),
+    }
+}
+
+fn relocate_postgres_snapshot_dir(chisei: &str) -> String {
+    let digest = format!("{:x}", md5_ish(chisei));
+    std::env::temp_dir()
+        .join(format!("sekai-relocate-{digest}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn md5_ish(value: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn snapshot_postgres(source: &PostgresDb, snapshot_dir: &str) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(snapshot_dir);
+    std::fs::create_dir_all(snapshot_dir).map_err(|error| error.to_string())?;
+    let mut conn = source.connection()?;
+    conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .map_err(|error| format!("begin postgres snapshot: {error}"))?;
+    let tables = list_postgres_chisei_tables(&mut conn)?;
+    for table in &tables {
+        let path = std::path::Path::new(snapshot_dir).join(table);
+        let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
+        let mut reader = conn
+            .copy_out(&format!("COPY {table} TO STDOUT"))
+            .map_err(|error| format!("snapshot {table}: {error}"))?;
+        std::io::copy(&mut reader, &mut file)
+            .map_err(|error| format!("write {table} snapshot: {error}"))?;
+    }
+    conn.batch_execute("COMMIT")
+        .map_err(|error| format!("commit postgres snapshot: {error}"))?;
+    std::fs::write(
+        std::path::Path::new(snapshot_dir).join("tables.txt"),
+        tables.join("\n"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn list_postgres_chisei_tables(conn: &mut postgres::Client) -> Result<Vec<String>, String> {
+    let rows = conn
+        .query(
+            "SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public'
+               AND tablename LIKE 'chisei_%'
+               AND tablename <> $1
+             ORDER BY tablename",
+            &[&JOURNAL_TABLE],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut tables = Vec::new();
+    for row in rows {
+        let table: String = row.get(0);
+        if !table
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Err(format!("refusing unexpected table name {table}"));
+        }
+        tables.push(table);
+    }
+    Ok(tables)
+}
+
+fn copy_chisei_families_from_postgres_snapshot(
+    snapshot_dir: &str,
+    dest: &PostgresDb,
+) -> Result<Vec<FamilyReport>, String> {
+    let mut conn = dest.connection()?;
+    conn.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {JOURNAL_TABLE} (
+            family TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            table_count BIGINT NOT NULL,
+            row_count BIGINT NOT NULL,
+            digest TEXT NOT NULL,
+            completed_at_ms BIGINT NOT NULL
+        );"
+    ))
+    .map_err(|error| error.to_string())?;
+    let listing = std::fs::read_to_string(std::path::Path::new(snapshot_dir).join("tables.txt"))
+        .map_err(|error| error.to_string())?;
+    let tables: Vec<String> = listing
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let families = group_families(&tables);
+    let mut reports = Vec::new();
+    for (family, family_tables) in families {
+        if postgres_family_completed(&mut conn, &family)? {
+            reports.push(FamilyReport {
+                family,
+                skipped: true,
+                tables: family_tables,
+                row_count: 0,
+                digest: "skipped".into(),
+            });
+            continue;
+        }
+        let mut row_count = 0;
+        let mut digest_parts = Vec::new();
+        for table in &family_tables {
+            ensure_postgres_dest_table(&mut conn, table)?;
+            conn.execute(&format!("DELETE FROM {table}"), &[])
+                .map_err(|error| format!("clear {table}: {error}"))?;
+            let path = std::path::Path::new(snapshot_dir).join(table);
+            let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+            let mut writer = conn
+                .copy_in(&format!("COPY {table} FROM STDIN"))
+                .map_err(|error| format!("load {table}: {error}"))?;
+            std::io::copy(&mut file, &mut writer)
+                .map_err(|error| format!("copy {table}: {error}"))?;
+            writer
+                .finish()
+                .map_err(|error| format!("finish {table}: {error}"))?;
+            let dest_count = postgres_table_count(&mut conn, table)?;
+            row_count += dest_count;
+            digest_parts.push(format!("{table}={dest_count}"));
+        }
+        let digest = digest_parts.join(",");
+        conn.execute(
+            &format!(
+                "INSERT INTO {JOURNAL_TABLE}
+                 (family, status, table_count, row_count, digest, completed_at_ms)
+                 VALUES ($1, 'completed', $2, $3, $4, $5)
+                 ON CONFLICT (family) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    table_count = EXCLUDED.table_count,
+                    row_count = EXCLUDED.row_count,
+                    digest = EXCLUDED.digest,
+                    completed_at_ms = EXCLUDED.completed_at_ms"
+            ),
+            &[
+                &family,
+                &(family_tables.len() as i64),
+                &row_count,
+                &digest,
+                &chrono::Utc::now().timestamp_millis(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        reports.push(FamilyReport {
+            family,
+            skipped: false,
+            tables: family_tables,
+            row_count,
+            digest,
+        });
+    }
+    Ok(reports)
+}
+
+fn postgres_family_completed(conn: &mut postgres::Client, family: &str) -> Result<bool, String> {
+    match conn.query_opt(
+        &format!("SELECT status FROM {JOURNAL_TABLE} WHERE family = $1"),
+        &[&family],
+    ) {
+        Ok(Some(row)) => Ok(row.get::<_, String>(0) == "completed"),
+        Ok(None) => Ok(false),
+        Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn ensure_postgres_dest_table(conn: &mut postgres::Client, table: &str) -> Result<(), String> {
+    let exists: bool = conn
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_tables
+                WHERE schemaname = 'public' AND tablename = $1
+            )",
+            &[&table],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    if exists {
+        Ok(())
+    } else {
+        Err(format!(
+            "destination is missing {table}; initialize the Chisei store with the same schema before relocate"
+        ))
+    }
+}
+
+fn postgres_table_count(conn: &mut postgres::Client, table: &str) -> Result<i64, String> {
+    conn.query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+        .map(|row| row.get::<_, i64>(0))
+        .map_err(|error| format!("count {table}: {error}"))
 }
 
 fn relocate_snapshot_path(chisei: &str) -> String {
@@ -316,14 +609,19 @@ pub fn refuse_shared_writer_if_fenced(layout: &CombinedStoreLayout) -> Result<()
     if layout.is_split() {
         return Ok(());
     }
-    if let crate::combined_stores::StoreIdentity::Sqlite { canonical_path } =
-        layout.sekai_identity()
-    {
-        if canonical_path == ":memory:" {
-            return Ok(());
+    match layout.sekai_identity() {
+        StoreIdentity::Sqlite { canonical_path } => {
+            if canonical_path == ":memory:" {
+                return Ok(());
+            }
+            if writer_fence_raised(canonical_path)? {
+                return Err(shared_writer_guidance());
+            }
         }
-        if writer_fence_raised(canonical_path)? {
-            return Err(shared_writer_guidance());
+        StoreIdentity::Postgres { .. } => {
+            if runtime_writer_fence_raised(layout.sekai_runtime().as_ref())? {
+                return Err(shared_writer_guidance());
+            }
         }
     }
     Ok(())
@@ -355,6 +653,84 @@ pub fn writer_fence_raised(path: &str) -> Result<bool, String> {
         .map_err(|error| error.to_string())?
         .unwrap_or(0);
     Ok(raised == 1)
+}
+
+fn runtime_writer_fence_raised(db: &RuntimeDb) -> Result<bool, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![CUTOVER_TABLE],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if exists.is_none() {
+                return Ok(false);
+            }
+            let raised: i64 = conn
+                .query_row(
+                    &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            Ok(raised == 1)
+        })?,
+        RuntimeDb::Postgres(db) => postgres_writer_fence_raised(db),
+    }
+}
+
+fn postgres_writer_fence_raised(db: &PostgresDb) -> Result<bool, String> {
+    let mut conn = db.connection()?;
+    match conn.query_opt(
+        "SELECT fence_raised FROM sekai_store_cutover WHERE id = 1",
+        &[],
+    ) {
+        Ok(Some(row)) => Ok(row.get::<_, i64>(0) == 1),
+        Ok(None) => Ok(false),
+        Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => {
+            Ok(false)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn raise_postgres_writer_fence(db: &PostgresDb) -> Result<i64, String> {
+    let generation = chrono::Utc::now().timestamp_millis();
+    raise_postgres_writer_fence_with_generation(db, generation)?;
+    Ok(generation)
+}
+
+fn raise_postgres_writer_fence_with_generation(
+    db: &PostgresDb,
+    generation: i64,
+) -> Result<(), String> {
+    let mut conn = db.connection()?;
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS sekai_store_cutover (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation BIGINT NOT NULL,
+            fence_raised INTEGER NOT NULL,
+            raised_at_ms BIGINT NOT NULL
+        );",
+    )
+    .map_err(|error| error.to_string())?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
+         VALUES (1, $1, 1, $2)
+         ON CONFLICT (id) DO UPDATE SET
+            generation = EXCLUDED.generation,
+            fence_raised = 1,
+            raised_at_ms = EXCLUDED.raised_at_ms",
+        &[&generation, &now_ms],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 pub fn shared_writer_guidance() -> String {
@@ -1288,6 +1664,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relocate_refuses_mixed_sqlite_and_postgres_arguments() {
+        let err = relocate(
+            "legacy.db",
+            "postgres://alice@localhost:5432/sekai",
+            "postgres://alice@localhost:5432/chisei",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("three SQLite paths or three PostgreSQL URLs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relocate_postgres_refuses_a_distinct_sekai_url() {
+        let err = relocate(
+            "postgres://alice@localhost:5432/source",
+            "postgres://alice@localhost:5432/sekai",
+            "postgres://alice@localhost:5432/chisei",
+        )
+        .unwrap_err();
+        assert!(err.contains("distinct --sekai"), "{err}");
+    }
+
+    #[test]
+    fn relocate_postgres_refuses_the_same_source_and_chisei() {
+        let err = relocate(
+            "postgres://alice@127.0.0.1:5432/shared",
+            "postgres://alice@localhost:5432/shared",
+            "postgres://bob@localhost:5432/shared",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("shared source and Chisei destination"),
+            "{err}"
+        );
+    }
+
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     #[test]
     fn postgres_generation_roundtrip_covers_the_fence() {
@@ -1304,6 +1719,28 @@ mod tests {
         assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(41));
         write_runtime_generation(&runtime, 42).unwrap();
         assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(42));
+        assert!(
+            !postgres_writer_fence_raised(match &runtime {
+                RuntimeDb::Postgres(db) => db,
+                RuntimeDb::Sqlite(_) => panic!("expected postgres"),
+            })
+            .unwrap()
+        );
+        raise_postgres_writer_fence_with_generation(
+            match &runtime {
+                RuntimeDb::Postgres(db) => db,
+                RuntimeDb::Sqlite(_) => panic!("expected postgres"),
+            },
+            42,
+        )
+        .unwrap();
+        assert!(
+            postgres_writer_fence_raised(match &runtime {
+                RuntimeDb::Postgres(db) => db,
+                RuntimeDb::Sqlite(_) => panic!("expected postgres"),
+            })
+            .unwrap()
+        );
         assert!(compare_split_generations(Some(42), Some(41)).refuses_mutations());
         assert!(!compare_split_generations(Some(42), Some(42)).refuses_mutations());
     }
