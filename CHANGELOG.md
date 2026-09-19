@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Store relocate takes a `VACUUM INTO` snapshot, fences the source, then
+  copies Chisei families from the snapshot instead of ATTACH'ing the live
+  file for a long DELETE+INSERT window (#1021).
 - Typed plane handles no longer `Deref`/`From`/`AsRef` to `RuntimeDb`, and
   Sekai no longer holds a Chisei `BudgetTracker`; shared identity stays an
   explicit `from_shared_runtime` constructor (#1031).

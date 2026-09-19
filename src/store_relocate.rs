@@ -1,8 +1,9 @@
 //! Offline, restartable Chisei-family relocation and writer fence.
 //!
-//! Quiesce writers, copy each Chisei-owned family into the destination store,
-//! validate counts, then raise a fence so a single `DB_PATH` / `DATABASE_URL`
-//! writer refuses to start. Rollback before the fence keeps the pre-copy files.
+//! Take a short exclusive `VACUUM INTO` snapshot of the historical source,
+//! raise the writer fence, then copy each Chisei-owned family from that
+//! snapshot. The live source is not ATTACH'd for the family copy. Rollback
+//! before the snapshot keeps the pre-copy files.
 //!
 //! Destination pairs also carry a split generation. Combined split open
 //! compares the pair. A Shared or owned-plane open of a stamped store
@@ -42,7 +43,7 @@ pub struct FamilyReport {
 }
 
 pub fn usage() -> &'static str {
-    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Restartable per family. Raises a writer fence so DB_PATH-only writers refuse to start. Quiesce writers first. Rollback before the fence keeps the pre-copy files.\n\
+    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
 sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
 }
 
@@ -182,6 +183,40 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         None,
     )?)?;
 
+    let snapshot = relocate_snapshot_path(chisei);
+    snapshot_sqlite(source, &snapshot)?;
+    let generation = raise_writer_fence(source)?;
+    let reports = copy_chisei_families_from_snapshot(&snapshot, chisei)?;
+    remove_sqlite_sidecar(&snapshot);
+    raise_writer_fence_with_generation(sekai, generation)?;
+    raise_writer_fence_with_generation(chisei, generation)?;
+
+    Ok(RelocateReport {
+        families: reports,
+        generation,
+        fence_raised: true,
+    })
+}
+
+fn relocate_snapshot_path(chisei: &str) -> String {
+    format!("{chisei}.relocate-snapshot.db")
+}
+
+fn snapshot_sqlite(source: &str, snapshot: &str) -> Result<(), String> {
+    remove_sqlite_sidecar(snapshot);
+    let conn = Connection::open(source).map_err(|error| error.to_string())?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("checkpoint source before snapshot: {error}"))?;
+    let escaped = snapshot.replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))
+        .map_err(|error| format!("snapshot source: {error}"))?;
+    Ok(())
+}
+
+fn copy_chisei_families_from_snapshot(
+    snapshot: &str,
+    chisei: &str,
+) -> Result<Vec<FamilyReport>, String> {
     let dest = Connection::open(chisei).map_err(|error| error.to_string())?;
     dest.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {JOURNAL_TABLE} (
@@ -194,7 +229,7 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         );"
     ))
     .map_err(|error| error.to_string())?;
-    dest.execute("ATTACH DATABASE ?1 AS src", params![source])
+    dest.execute("ATTACH DATABASE ?1 AS src", params![snapshot])
         .map_err(|error| error.to_string())?;
 
     let tables = list_chisei_tables(&dest, "src")?;
@@ -259,17 +294,13 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
 
     dest.execute("DETACH DATABASE src", [])
         .map_err(|error| error.to_string())?;
-    drop(dest);
+    Ok(reports)
+}
 
-    let generation = raise_writer_fence(source)?;
-    raise_writer_fence_with_generation(sekai, generation)?;
-    raise_writer_fence_with_generation(chisei, generation)?;
-
-    Ok(RelocateReport {
-        families: reports,
-        generation,
-        fence_raised: true,
-    })
+fn remove_sqlite_sidecar(path: &str) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
 }
 
 /// Shared-compatibility writers refuse after the fence is raised.
@@ -901,6 +932,84 @@ mod tests {
                 .get_usage("restart-user")
                 .max_tokens,
             4_000
+        );
+        assert!(!Path::new(&relocate_snapshot_path(chisei_s)).exists());
+    }
+
+    #[test]
+    fn relocate_snapshots_source_and_fences_before_family_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let sekai_s = sekai.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(source_s),
+                source_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            .set_limit("snapshot-user", 3_000, PeriodType::Daily)
+            .unwrap();
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(sekai_s),
+                sekai_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(chisei_s),
+                chisei_s,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = relocate_snapshot_path(chisei_s);
+        snapshot_sqlite(source_s, &snapshot).unwrap();
+        let generation = raise_writer_fence(source_s).unwrap();
+        assert!(writer_fence_raised(source_s).unwrap());
+        assert_eq!(
+            BudgetTracker::new(ChiseiStore::open_sqlite(chisei_s))
+                .get_usage("snapshot-user")
+                .max_tokens,
+            0
+        );
+
+        let reports = copy_chisei_families_from_snapshot(&snapshot, chisei_s).unwrap();
+        assert!(
+            reports
+                .iter()
+                .any(|family| family.family == "budget" && family.row_count > 0)
+        );
+        raise_writer_fence_with_generation(sekai_s, generation).unwrap();
+        raise_writer_fence_with_generation(chisei_s, generation).unwrap();
+        remove_sqlite_sidecar(&snapshot);
+        assert_eq!(
+            BudgetTracker::new(ChiseiStore::open_sqlite(chisei_s))
+                .get_usage("snapshot-user")
+                .max_tokens,
+            3_000
         );
     }
 
