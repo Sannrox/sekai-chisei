@@ -71,6 +71,7 @@ const OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA: &str =
 const CHISEI_OPERATION_RESERVATIONS_SCHEMA: &str =
     include_str!("postgres/0046_chisei_operation_reservations.sql");
 const STORE_CUTOVER_SCHEMA: &str = include_str!("postgres/0047_store_cutover.sql");
+const STORE_CUTOVER_PAIRING_SCHEMA: &str = include_str!("postgres/0048_store_cutover_pairing.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -309,6 +310,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 46,
         name: "store_cutover",
         sql: STORE_CUTOVER_SCHEMA,
+    },
+    Migration {
+        version: 47,
+        name: "store_cutover_pairing",
+        sql: STORE_CUTOVER_PAIRING_SCHEMA,
     },
 ];
 
