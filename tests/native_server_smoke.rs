@@ -185,16 +185,16 @@ impl NativeServer {
             .expect("native server start lock");
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("sekai.sock");
-        let sekai_db = dir.path().join("sekai.db");
-        let chisei_db = dir.path().join("chisei.db");
+        let db_path = dir.path().join("sekai.db");
         let log_path = dir.path().join("sekai.log");
         let grpc_port = free_tcp_port();
         let log = std::fs::File::create(&log_path).expect("server log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         command
             .env("SEKAI_SOCKET", &socket)
-            .env("SEKAI_DB_PATH", &sekai_db)
-            .env("CHISEI_DB_PATH", &chisei_db)
+            .env("DB_PATH", &db_path)
+            // One physical identity: objects, grants, and lookup share a file.
+            .env("SEKAI_SHARED_STORE", "1")
             .env("GRPC_PORT", grpc_port.to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
@@ -212,8 +212,8 @@ impl NativeServer {
             .env_remove("SEKAI_TLS_KEY")
             .env_remove("SEKAI_DB_BACKEND")
             .env_remove("DATABASE_URL")
-            .env_remove("DB_PATH")
-            .env_remove("SEKAI_SHARED_STORE")
+            .env_remove("SEKAI_DB_PATH")
+            .env_remove("CHISEI_DB_PATH")
             .env_remove("SEKAI_DATABASE_URL")
             .env_remove("CHISEI_DATABASE_URL")
             .env_remove("OPENAI_API_KEY")
