@@ -193,6 +193,8 @@ impl NativeServer {
         command
             .env("SEKAI_SOCKET", &socket)
             .env("DB_PATH", &db_path)
+            // One physical identity: objects, grants, and lookup share a file.
+            .env("SEKAI_SHARED_STORE", "1")
             .env("GRPC_PORT", grpc_port.to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")

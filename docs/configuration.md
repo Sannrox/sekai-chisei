@@ -10,7 +10,8 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | `./data/sekai.db` | SQLite compatibility path when destination variables are unset |
+| `DB_PATH` | unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
+| `SEKAI_SHARED_STORE` | unset | Set `1` to boot Combined as one physical identity. Migration compatibility, not the default. |
 | `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
 | `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
 | `SEKAI_STORE_PEER` | unset | Read-only generation peer for an owned-plane or Shared open of a stamped dest |

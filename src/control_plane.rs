@@ -187,6 +187,7 @@ mod tests {
             "SEKAI_DATABASE_URL",
             "CHISEI_DATABASE_URL",
             "SEKAI_DB_BACKEND",
+            "SEKAI_SHARED_STORE",
         ];
         struct RestoreEnv(Vec<(String, Option<String>)>);
         impl Drop for RestoreEnv {
@@ -207,6 +208,9 @@ mod tests {
         for key in keys {
             unsafe { std::env::remove_var(key) };
         }
+        // Shared is a named hatch. This fixture opens the fenced source as
+        // one identity so the writer-fence check can run.
+        unsafe { std::env::set_var("SEKAI_SHARED_STORE", "1") };
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
         let chisei = dir.path().join("chisei.db");

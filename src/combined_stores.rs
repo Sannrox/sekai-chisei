@@ -81,7 +81,7 @@ fn new_matched_generation_cache() -> Arc<AtomicI64> {
 }
 
 /// Testable inputs for [`CombinedStoreLayout`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CombinedStoreSources {
     pub backend: Option<BackendIdentity>,
     pub default_sqlite_path: String,
@@ -93,6 +93,27 @@ pub struct CombinedStoreSources {
     pub chisei_postgres_url: Option<String>,
     pub postgres_max_connections: u32,
     pub postgres_ca_cert_path: Option<String>,
+    /// Constructed fixtures keep Shared. `from_env` sets this only when
+    /// `SEKAI_SHARED_STORE=1` so Combined does not silently boot one identity.
+    pub allow_shared_compatibility: bool,
+}
+
+impl Default for CombinedStoreSources {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            default_sqlite_path: String::new(),
+            legacy_sqlite_path: None,
+            legacy_postgres_url: None,
+            sekai_sqlite_path: None,
+            chisei_sqlite_path: None,
+            sekai_postgres_url: None,
+            chisei_postgres_url: None,
+            postgres_max_connections: 0,
+            postgres_ca_cert_path: None,
+            allow_shared_compatibility: true,
+        }
+    }
 }
 
 impl CombinedStoreSources {
@@ -121,6 +142,8 @@ impl CombinedStoreSources {
             chisei_postgres_url: optional_trimmed_env("CHISEI_DATABASE_URL"),
             postgres_max_connections,
             postgres_ca_cert_path: optional_trimmed_env("SEKAI_POSTGRES_CA_CERT"),
+            allow_shared_compatibility: std::env::var("SEKAI_SHARED_STORE").unwrap_or_default()
+                == "1",
         })
     }
 
@@ -179,6 +202,12 @@ impl CombinedStoreSources {
                 "SEKAI_DATABASE_URL / CHISEI_DATABASE_URL require SEKAI_DB_BACKEND=postgres".into(),
             ),
             ((None, None), (None, None), _) => {
+                if !self.allow_shared_compatibility {
+                    return Err(
+                        "combined mode refuses a shared store unless SEKAI_SHARED_STORE=1; set SEKAI_DB_PATH and CHISEI_DB_PATH, or SEKAI_DATABASE_URL and CHISEI_DATABASE_URL"
+                            .into(),
+                    );
+                }
                 let config = RuntimeBackendConfig::from_sources(
                     backend,
                     self.legacy_sqlite_path.as_deref(),
@@ -580,6 +609,20 @@ mod tests {
         assert_eq!(layout.mode_name(), "shared-compatibility");
         let (sekai, chisei) = layout.handles();
         assert!(Arc::ptr_eq(&sekai.runtime_arc(), &chisei.runtime_arc()));
+    }
+
+    #[test]
+    fn env_style_shared_boot_is_refused_without_explicit_compat() {
+        let err = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: ":memory:".into(),
+            postgres_max_connections: 16,
+            allow_shared_compatibility: false,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap_err();
+        assert!(err.contains("SEKAI_SHARED_STORE=1"), "{err}");
     }
 
     #[test]

@@ -305,14 +305,17 @@ wait_for_file "$PROVIDER_PORT_FILE"
 PROVIDER_PORT="$(cat "$PROVIDER_PORT_FILE")"
 
 SOCKET="$TMPDIR/sekai.sock"
-DB_PATH="$TMPDIR/sekai.db"
+SEKAI_DB_PATH="$TMPDIR/sekai.db"
+CHISEI_DB_PATH="$TMPDIR/chisei.db"
 SEKAI_INSECURE=1 \
 GRPC_PORT=0 \
 OPS_PORT="" \
 SEKAI_SOCKET="$SOCKET" \
-DB_PATH="$DB_PATH" \
+SEKAI_DB_PATH="$SEKAI_DB_PATH" \
+CHISEI_DB_PATH="$CHISEI_DB_PATH" \
 OPENAI_API_KEY="control-plane-openai-smoke-key" \
 ANTHROPIC_API_KEY="control-plane-anthropic-smoke-key" \
+env -u DB_PATH -u SEKAI_SHARED_STORE \
 "$SEKAI_CHISEI_BIN" >"$TMPDIR/sekai.log" 2>&1 &
 PIDS+=("$!")
 wait_for_file "$SOCKET"

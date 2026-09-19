@@ -201,7 +201,8 @@ impl GatewayStack {
         let fake = FakeUpstream::spawn().await;
         let dir = tempfile::tempdir().expect("temp dir");
         let socket = dir.path().join("sekai.sock");
-        let db_path = dir.path().join("sekai.db");
+        let sekai_db = dir.path().join("sekai.db");
+        let chisei_db = dir.path().join("chisei.db");
         let log_path = dir.path().join("sekai.log");
         let gateway_log_path = dir.path().join("gateway.log");
         let grpc_port = free_tcp_port();
@@ -209,7 +210,8 @@ impl GatewayStack {
         let mut control_plane = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         control_plane
             .env("SEKAI_SOCKET", &socket)
-            .env("DB_PATH", &db_path)
+            .env("SEKAI_DB_PATH", &sekai_db)
+            .env("CHISEI_DB_PATH", &chisei_db)
             .env("GRPC_PORT", grpc_port.to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
@@ -221,8 +223,8 @@ impl GatewayStack {
             .env_remove("SEKAI_BIND")
             .env_remove("SEKAI_DB_BACKEND")
             .env_remove("DATABASE_URL")
-            .env_remove("SEKAI_DB_PATH")
-            .env_remove("CHISEI_DB_PATH")
+            .env_remove("DB_PATH")
+            .env_remove("SEKAI_SHARED_STORE")
             .env_remove("SEKAI_DATABASE_URL")
             .env_remove("CHISEI_DATABASE_URL")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
@@ -296,7 +298,8 @@ impl GatewayStack {
             let log_file = std::fs::File::create(&attempt_log).expect("gateway log");
             let child = Command::new(chisei_gateway_bin())
                 .env("SEKAI_SOCKET", &socket)
-                .env("DB_PATH", &db_path)
+                .env("SEKAI_DB_PATH", &sekai_db)
+                .env("CHISEI_DB_PATH", &chisei_db)
                 .env("GATEWAY_BIND", format!("127.0.0.1:{gateway_port}"))
                 .env("CHISEI_OPENAI_BASE_URL", fake.openai_base())
                 .env("CHISEI_ANTHROPIC_BASE_URL", fake.anthropic_base())
