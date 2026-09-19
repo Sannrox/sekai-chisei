@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Store relocate takes a `VACUUM INTO` snapshot, fences the source, then
+  copies Chisei families from the snapshot instead of ATTACH'ing the live
+  file for a long DELETE+INSERT window (#1021).
 - Combined Split divides the process connection-pool budget across both
   stores so two identities do not double FDs or idle connections (#1020).
 - Typed plane handles no longer `Deref`/`From`/`AsRef` to `RuntimeDb`, and
