@@ -435,6 +435,12 @@ impl SekaiDb {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| error.to_string())?
         };
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let mut alerts = Vec::new();
         for (row, evidence_due_at_ms) in rows {
             let redemption: Redemption =
@@ -448,9 +454,6 @@ impl SekaiDb {
                 observed_at_ms: now_ms,
                 summary: "redeemed external action has no terminal host evidence within its signed window".into(),
             };
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| error.to_string())?;
             let still_missing: bool = tx
                 .query_row(
                     "SELECT NOT EXISTS(
@@ -473,12 +476,10 @@ impl SekaiDb {
                 .map_err(|error| error.to_string())?;
             if still_missing {
                 insert_alert_and_audit(&tx, &alert)?;
-            }
-            tx.commit().map_err(|error| error.to_string())?;
-            if still_missing {
                 alerts.push(alert);
             }
         }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(alerts)
     }
 }
@@ -932,6 +933,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(governance_events, 1);
+    }
+
+    #[test]
+    fn overdue_redemptions_alert_in_one_reconcile_batch() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.set_permit_kill_switch("executor", "unused", false, "", 0)
+            .unwrap();
+        for (n, redemption_id) in [("1", "redemption-1"), ("2", "redemption-2")] {
+            let redemption = Redemption {
+                version: "external-action.redemption/v1".into(),
+                permit_id: format!("permit-{n}"),
+                redemption_id: redemption_id.into(),
+                executor: "executor:file".into(),
+                execution_id: format!("execution-{n}"),
+                idempotency_key: format!("redeem-{n}"),
+                redeemed_at_ms: 1_000,
+                invocation_ordinal: 1,
+                evidence_due_at_ms: 2_000,
+                site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            };
+            db.conn()
+                .execute(
+                    "INSERT INTO chisei_external_action_redemptions
+                     (permit_id,idempotency_key,execution_id,redemption_json,redeemed_at_ms,invocation_ordinal,redemption_id,evidence_due_at_ms)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![
+                        redemption.permit_id,
+                        redemption.idempotency_key,
+                        redemption.execution_id,
+                        serde_json::to_string(&redemption).unwrap(),
+                        redemption.redeemed_at_ms,
+                        redemption.invocation_ordinal,
+                        redemption.redemption_id,
+                        redemption.evidence_due_at_ms
+                    ],
+                )
+                .unwrap();
+        }
+        let alerts = db.reconcile_missing_execution_evidence(2_000).unwrap();
+        assert_eq!(alerts.len(), 2);
+        let persisted: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_external_action_execution_alerts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 2);
+        assert!(
+            db.reconcile_missing_execution_evidence(2_001)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

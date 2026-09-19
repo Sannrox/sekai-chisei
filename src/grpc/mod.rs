@@ -1021,16 +1021,33 @@ fn execution_evidence_runtime(stores: &CombinedStoreLayout) -> Arc<RuntimeDb> {
     stores.sekai_runtime()
 }
 
+const EVIDENCE_RECONCILE_ACTIVE_SECS: u64 = 10;
+const EVIDENCE_RECONCILE_IDLE_SECS: u64 = 60;
+
+fn evidence_reconcile_backoff(last_alert_count: usize) -> std::time::Duration {
+    if last_alert_count == 0 {
+        std::time::Duration::from_secs(EVIDENCE_RECONCILE_IDLE_SECS)
+    } else {
+        std::time::Duration::from_secs(EVIDENCE_RECONCILE_ACTIVE_SECS)
+    }
+}
+
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut delay = std::time::Duration::ZERO;
         loop {
-            interval.tick().await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let db = db.clone();
             let result = tokio::task::spawn_blocking(move || {
                 db.reconcile_missing_execution_evidence(chrono::Utc::now().timestamp_millis())
             })
             .await;
+            let alert_count = match &result {
+                Ok(Ok(alerts)) => alerts.len(),
+                _ => 1,
+            };
             match result {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
@@ -1040,6 +1057,7 @@ fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
                     tracing::error!(%error, "execution evidence reconciliation task failed")
                 }
             }
+            delay = evidence_reconcile_backoff(alert_count);
         }
     });
 }
@@ -1153,6 +1171,18 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&evidence, &layout.chisei_runtime()),
             "Sekai execution-evidence reconcile must not use the Chisei runtime"
+        );
+    }
+
+    #[test]
+    fn evidence_reconcile_backoff_idles_when_empty() {
+        assert_eq!(
+            evidence_reconcile_backoff(0),
+            std::time::Duration::from_secs(EVIDENCE_RECONCILE_IDLE_SECS)
+        );
+        assert_eq!(
+            evidence_reconcile_backoff(1),
+            std::time::Duration::from_secs(EVIDENCE_RECONCILE_ACTIVE_SECS)
         );
     }
 
