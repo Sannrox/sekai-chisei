@@ -4,7 +4,8 @@
 - Date: 2026-09-17
 - Owners: @Sannrox
 - Discussion: https://github.com/Sannrox/sekai-chisei/discussions/974
-- Issue: https://github.com/Sannrox/sekai-chisei/issues/975 (#975)
+- Issue: https://github.com/Sannrox/sekai-chisei/issues/975 (#975);
+  amendment https://github.com/Sannrox/sekai-chisei/issues/1050 (#1050)
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0020](0020-shared-type-revisions-and-object-sync.md),
@@ -34,9 +35,12 @@ versioned Action. Function results are not type-revision facts
    blank string, JSON `null`, or an empty object (`{}`). Any other JSON,
    including a partial object, is caller-supplied and is not filled.
    After a fill, `request_digest` binds to the filled parameter body, not
-   the empty caller string. Preview does not persist
-   ([ADR 0063](0063-object-action-describe-preview.md)).
-5. `SubmitActionInstance` remains the only write.
+   the empty caller string. Preview does not persist an ActionInstance or
+   mutate the object ([ADR 0063](0063-object-action-describe-preview.md)).
+   A valid filled preview may persist one bounded egress audit Decision
+   (`provider=typesafe`) for that fill hop. An invalid post-fill preview
+   does not persist that Decision.
+5. `SubmitActionInstance` remains the only ActionInstance write.
 6. The bind pins an exact model id. `jev-latest` is refused.
 7. Hosted TypeSafe is opt-in. Missing `TYPESAFE_API_KEY` fails closed.
    Ontology guest functions stay out of scope ([ADR 0072](0072-in-process-function-host.md)).
@@ -60,9 +64,15 @@ versioned Action. Function results are not type-revision facts
 Action types may carry additive `system_one` metadata. Old types ignore
 it. Preview gains an additive `proposed_parameters_json` field. Domain
 question lists stay in namespace-scoped types, not the core ontology.
+A valid System One fill on Preview also writes a bounded `typesafe`
+Decision (actor `chisei.egress`, action `preview_object_action`). That
+row is egress evidence, not an ActionInstance. Submit stays the sole
+instance write.
 
 ## Validation
 
 Fixture answers must validate against a real Action parameter schema.
 Preview with those parameters must not create an instance or mutate the
-object. Ungranted properties must not appear in Function `state`.
+object. A valid fill records one typesafe Decision; an invalid post-fill
+preview does not. Ungranted properties must not appear in Function
+`state`.
