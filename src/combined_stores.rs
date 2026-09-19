@@ -381,7 +381,7 @@ fn refuse_shared_identity(sekai: &StoreIdentity, chisei: &StoreIdentity) -> Resu
     }
 }
 
-fn sqlite_same_inode(sekai: &StoreIdentity, chisei: &StoreIdentity) -> bool {
+pub(crate) fn sqlite_same_inode(sekai: &StoreIdentity, chisei: &StoreIdentity) -> bool {
     match (sekai, chisei) {
         (
             StoreIdentity::Sqlite {
