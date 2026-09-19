@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Combined Split divides the process connection-pool budget across both
+  stores so two identities do not double FDs or idle connections (#1020).
 - Typed plane handles no longer `Deref`/`From`/`AsRef` to `RuntimeDb`, and
   Sekai no longer holds a Chisei `BudgetTracker`; shared identity stays an
   explicit `from_shared_runtime` constructor (#1031).

@@ -64,6 +64,18 @@ pub enum CombinedStoreLayout {
 
 const UNCACHED_MATCHED_GENERATION: i64 = i64::MIN;
 
+/// Divide one process connection budget across two Split backends.
+///
+/// A one-connection budget still opens one connection per store.
+pub(crate) fn split_connection_pool_budget(total: u32) -> (u32, u32) {
+    let half = total / 2;
+    if half == 0 {
+        (1, 1)
+    } else {
+        (total - half, half)
+    }
+}
+
 fn new_matched_generation_cache() -> Arc<AtomicI64> {
     Arc::new(AtomicI64::new(UNCACHED_MATCHED_GENERATION))
 }
@@ -267,6 +279,19 @@ impl CombinedStoreLayout {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn connection_pool_maxes(&self) -> (u32, u32) {
+        match self {
+            Self::Shared { backend, .. } => {
+                let max = backend.connection_pool_max();
+                (max, max)
+            }
+            Self::Split { sekai, chisei, .. } => {
+                (sekai.connection_pool_max(), chisei.connection_pool_max())
+            }
+        }
+    }
+
     pub(crate) fn cached_matched_generation(&self) -> Option<i64> {
         match self {
             Self::Split {
@@ -349,12 +374,13 @@ fn open_split_sqlite(
     let sekai_identity = sqlite_identity(sekai_path)?;
     let chisei_identity = sqlite_identity(chisei_path)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
+    let (sekai_pool, chisei_pool) = split_connection_pool_budget(postgres_max_connections);
     let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
         BackendIdentity::Sqlite,
         Some(sekai_path),
         sekai_path,
         None,
-        postgres_max_connections,
+        sekai_pool,
         postgres_ca_cert_path,
     )?)?;
     let chisei = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
@@ -362,7 +388,7 @@ fn open_split_sqlite(
         Some(chisei_path),
         chisei_path,
         None,
-        postgres_max_connections,
+        chisei_pool,
         postgres_ca_cert_path,
     )?)?;
     let sekai_identity = sqlite_identity(sekai_path)?;
@@ -386,12 +412,13 @@ fn open_split_postgres(
     let sekai_identity = postgres_identity(sekai_url)?;
     let chisei_identity = postgres_identity(chisei_url)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
+    let (sekai_pool, chisei_pool) = split_connection_pool_budget(postgres_max_connections);
     let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
         BackendIdentity::Postgres,
         None,
         "unused.db",
         Some(sekai_url),
-        postgres_max_connections,
+        sekai_pool,
         postgres_ca_cert_path,
     )?)?;
     let chisei = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
@@ -399,7 +426,7 @@ fn open_split_postgres(
         None,
         "unused.db",
         Some(chisei_url),
-        postgres_max_connections,
+        chisei_pool,
         postgres_ca_cert_path,
     )?)?;
     Ok(CombinedStoreLayout::Split {
@@ -570,6 +597,48 @@ mod tests {
             &sekai_store.runtime_arc(),
             &chisei_store.runtime_arc()
         ));
+        let (sekai_pool, chisei_pool) = layout.connection_pool_maxes();
+        assert_eq!((sekai_pool, chisei_pool), (8, 8));
+        assert!(sekai_pool.saturating_add(chisei_pool) <= 16);
+    }
+
+    #[test]
+    fn split_sqlite_shares_an_odd_process_pool_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = CombinedStoreSources {
+            postgres_max_connections: 15,
+            ..sqlite_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap())
+        }
+        .open()
+        .unwrap();
+        let (sekai_pool, chisei_pool) = layout.connection_pool_maxes();
+        assert_eq!((sekai_pool, chisei_pool), (8, 7));
+        assert!(sekai_pool.saturating_add(chisei_pool) <= 15);
+    }
+
+    #[test]
+    fn shared_sqlite_keeps_the_full_process_pool_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let layout = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: path.to_str().unwrap().into(),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        assert!(!layout.is_split());
+        assert_eq!(layout.connection_pool_maxes(), (16, 16));
+    }
+
+    #[test]
+    fn split_connection_pool_budget_divides_the_process_ceiling() {
+        assert_eq!(split_connection_pool_budget(16), (8, 8));
+        assert_eq!(split_connection_pool_budget(15), (8, 7));
+        assert_eq!(split_connection_pool_budget(1), (1, 1));
     }
 
     #[test]

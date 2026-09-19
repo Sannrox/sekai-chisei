@@ -116,6 +116,8 @@ pub struct RuntimeBackendConfig {
     pub backend: BackendIdentity,
     pub sqlite_path: Option<String>,
     pub postgres_url: Option<String>,
+    /// Process pool ceiling for this backend. Combined Split divides the
+    /// operator budget across the two stores so topology does not double FDs.
     pub postgres_max_connections: u32,
     pub postgres_ca_cert_path: Option<String>,
 }
@@ -218,11 +220,12 @@ impl RuntimeBackend {
     pub fn initialize(config: RuntimeBackendConfig) -> Result<Self, String> {
         match config.backend {
             BackendIdentity::Sqlite => {
-                let sqlite = Arc::new(SekaiDb::new(
+                let sqlite = Arc::new(SekaiDb::new_with_pool_max(
                     config
                         .sqlite_path
                         .as_deref()
                         .ok_or("SQLite backend requires DB_PATH")?,
+                    config.postgres_max_connections,
                 )?);
                 let capabilities = BackendCapabilities {
                     contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
@@ -302,6 +305,14 @@ impl RuntimeBackend {
 
     pub fn database(&self) -> Arc<RuntimeDb> {
         self.db.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection_pool_max(&self) -> u32 {
+        match self.db.as_ref() {
+            RuntimeDb::Sqlite(db) => db.pool_max_size(),
+            RuntimeDb::Postgres(db) => db.max_connections(),
+        }
     }
 }
 
