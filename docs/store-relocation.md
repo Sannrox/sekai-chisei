@@ -24,9 +24,17 @@ sekaictl admin store relocate \
   --chisei ./data/chisei.db
 ```
 
-`--sekai` must be the same physical file as `--source` (including
-hardlinks). A new empty `--sekai` is refused so Sekai facts are not
-orphaned behind a fence. `--sekai` and `--chisei` must be distinct.
+PostgreSQL uses three URLs instead of paths. `--sekai` must name the same
+database as `--source` (loopback aliases compare as one host). A new empty
+`--sekai` is refused so Sekai facts are not orphaned behind a fence.
+`--sekai` and `--chisei` must be distinct.
+
+```sh
+sekaictl admin store relocate \
+  --source postgres://user@127.0.0.1:5432/sekai \
+  --sekai postgres://user@localhost:5432/sekai \
+  --chisei postgres://user@127.0.0.1:5432/chisei
+```
 
 The command:
 
@@ -36,8 +44,10 @@ The command:
 3. Validates row counts per table and fails closed on mismatch.
 4. Records completed families in `chisei_relocate_families` so a crash can
    resume from the last completed family.
-5. Stamps `sekai_store_cutover` on the source, Sekai file, and Chisei file
-   and raises the writer fence.
+5. Stamps `sekai_store_cutover` on the source, Sekai store, and Chisei
+   store and raises the writer fence. PostgreSQL takes a `REPEATABLE READ`
+   `COPY` snapshot, then fences, then loads the Chisei destination from
+   that snapshot.
 
 Sekai-owned tables stay in place. Source Chisei rows are left for rollback
 until an operator archives the pre-fence snapshot.
