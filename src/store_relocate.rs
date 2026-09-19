@@ -43,7 +43,7 @@ pub struct FamilyReport {
 }
 
 pub fn usage() -> &'static str {
-    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
+    "sekaictl admin store relocate --source <path> --sekai <path> --chisei <path>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. --sekai must be the same physical file as --source. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
 sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
 }
 
@@ -145,6 +145,12 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
     let source_id = crate::combined_stores::sqlite_identity(source)?;
     let sekai_id = crate::combined_stores::sqlite_identity(sekai)?;
     let chisei_id = crate::combined_stores::sqlite_identity(chisei)?;
+    if source_id != sekai_id && !crate::combined_stores::sqlite_same_inode(&source_id, &sekai_id) {
+        return Err(
+            "relocate refuses a distinct --sekai; --sekai must be the historical source so Sekai facts are not orphaned"
+                .into(),
+        );
+    }
     if source_id == chisei_id {
         return Err(
             "relocate refuses a shared source and Chisei destination; copy into a distinct file"
@@ -823,7 +829,6 @@ mod tests {
     fn relocate_copies_budget_family_and_fences_the_source() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
@@ -844,7 +849,7 @@ mod tests {
             .set_limit("relocate-user", 9_000, PeriodType::Daily)
             .unwrap();
 
-        let report = relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
+        let report = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
         assert!(report.fence_raised);
         assert!(
             report
@@ -877,20 +882,18 @@ mod tests {
     fn relocate_refuses_the_same_sekai_and_chisei_destination() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let dest = dir.path().join("shared.db");
         let source_s = source.to_str().unwrap();
-        let dest_s = dest.to_str().unwrap();
         std::fs::write(&source, []).unwrap();
-        std::fs::write(&dest, []).unwrap();
-        let err = relocate_sqlite(source_s, dest_s, dest_s).unwrap_err();
-        assert!(err.contains("same physical destination"), "{err}");
+        let err = relocate_sqlite(source_s, source_s, source_s).unwrap_err();
+        assert!(err.contains("shared source"), "{err}");
 
         let linked = dir.path().join("linked.db");
-        std::fs::hard_link(&dest, &linked).unwrap();
+        std::fs::hard_link(&source, &linked).unwrap();
         let linked_s = linked.to_str().unwrap();
-        let hardlink_err = relocate_sqlite(source_s, dest_s, linked_s).unwrap_err();
+        let hardlink_err = relocate_sqlite(source_s, source_s, linked_s).unwrap_err();
         assert!(
-            hardlink_err.contains("same physical destination"),
+            hardlink_err.contains("shared source")
+                || hardlink_err.contains("same physical destination"),
             "{hardlink_err}"
         );
     }
@@ -899,7 +902,6 @@ mod tests {
     fn relocate_is_restartable_from_completed_families() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
@@ -918,8 +920,8 @@ mod tests {
         BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
             .set_limit("restart-user", 4_000, PeriodType::Daily)
             .unwrap();
-        relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
-        let second = relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei_s).unwrap();
+        relocate_sqlite(source_s, source_s, chisei_s).unwrap();
+        let second = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
         assert!(
             second
                 .families
@@ -1015,8 +1017,26 @@ mod tests {
 
     #[test]
     fn same_source_and_destination_is_refused() {
-        let err = relocate_sqlite("shared.db", "sekai.db", "shared.db").unwrap_err();
+        let err = relocate_sqlite("shared.db", "shared.db", "shared.db").unwrap_err();
         assert!(err.contains("shared source"), "{err}");
+    }
+
+    #[test]
+    fn relocate_refuses_a_distinct_sekai_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        std::fs::write(&source, []).unwrap();
+        std::fs::write(&sekai, []).unwrap();
+        std::fs::write(&chisei, []).unwrap();
+        let err = relocate_sqlite(
+            source.to_str().unwrap(),
+            sekai.to_str().unwrap(),
+            chisei.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.contains("distinct --sekai"), "{err}");
     }
 
     fn open_shared(path: &str) -> CombinedStoreLayout {
@@ -1221,7 +1241,6 @@ mod tests {
     fn relocate_stamps_the_same_generation_on_both_destinations() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         RuntimeBackend::initialize(
@@ -1236,9 +1255,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let report =
-            relocate_sqlite(source_s, sekai.to_str().unwrap(), chisei.to_str().unwrap()).unwrap();
-        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        let report = relocate_sqlite(source_s, source_s, chisei.to_str().unwrap()).unwrap();
+        let layout = open_dest_pair(source_s, chisei.to_str().unwrap());
         assert_eq!(
             split_generation_state(&layout).unwrap(),
             SplitGenerationState::Matched {

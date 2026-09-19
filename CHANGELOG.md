@@ -4,6 +4,8 @@
 
 - Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`;
   destination pairs stay the default Combined topology (#1032).
+- Relocate refuses a `--sekai` that is not the historical `--source`, so a
+  new empty Sekai file cannot orphan facts behind the writer fence (#1026).
 - Store relocate takes a `VACUUM INTO` snapshot, fences the source, then
   copies Chisei families from the snapshot instead of ATTACH'ing the live
   file for a long DELETE+INSERT window (#1021).
