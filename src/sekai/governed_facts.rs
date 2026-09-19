@@ -346,7 +346,7 @@ fn existing_profile_after_create_conflict(
     if !sqlite_lock_contention(create_error) {
         return Ok(None);
     }
-    for _ in 0..16 {
+    for _ in 0..3 {
         std::thread::sleep(std::time::Duration::from_millis(10));
         if let Some(existing) = db.get_object(object_id)? {
             return Ok(Some(existing));
