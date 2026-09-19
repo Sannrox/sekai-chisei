@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split pairing epoch advances on both stores at mutating admit so a
+  same-generation one-sided restore refuses writes until restamp (#1042).
 - Shared Combined Postgres consults the writer fence, and `store relocate`
   accepts three PostgreSQL URLs with the same snapshot-then-fence cutover
   as SQLite (#1028).

@@ -721,12 +721,13 @@ fn raise_postgres_writer_fence_with_generation(
     .map_err(|error| error.to_string())?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     conn.execute(
-        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
-         VALUES (1, $1, 1, $2)
+        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+         VALUES (1, $1, 1, $2, 0)
          ON CONFLICT (id) DO UPDATE SET
             generation = EXCLUDED.generation,
             fence_raised = 1,
-            raised_at_ms = EXCLUDED.raised_at_ms",
+            raised_at_ms = EXCLUDED.raised_at_ms,
+            pairing_epoch = 0",
         &[&generation, &now_ms],
     )
     .map_err(|error| error.to_string())?;
@@ -827,18 +828,50 @@ pub fn align_split_generations(
 
 pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> Result<(), String> {
     if layout.cached_matched_generation().is_some() {
-        return Ok(());
+        if pairing_epochs_match(layout)? {
+            advance_pairing_epoch(layout)?;
+            return Ok(());
+        }
+        layout.invalidate_matched_generation();
     }
     match split_generation_state(layout)? {
         SplitGenerationState::Mismatched { sekai, chisei } => {
             Err(generation_mismatch_guidance(sekai, chisei))
         }
         SplitGenerationState::Matched { generation } => {
+            if !pairing_epochs_match(layout)? {
+                return Err(pairing_epoch_guidance());
+            }
             layout.cache_matched_generation(generation);
+            advance_pairing_epoch(layout)?;
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn pairing_epoch_guidance() -> String {
+    "split pairing epochs disagree after a one-sided restore; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Equal cutover generation is not a pairing proof".into()
+}
+
+fn pairing_epochs_match(layout: &CombinedStoreLayout) -> Result<bool, String> {
+    if !layout.is_split() {
+        return Ok(true);
+    }
+    Ok(read_runtime_pairing_epoch(&layout.sekai_runtime())?
+        == read_runtime_pairing_epoch(&layout.chisei_runtime())?)
+}
+
+fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
+    if !layout.is_split() {
+        return Ok(());
+    }
+    let next = read_runtime_pairing_epoch(&layout.sekai_runtime())?
+        .max(read_runtime_pairing_epoch(&layout.chisei_runtime())?)
+        .saturating_add(1);
+    write_runtime_pairing_epoch(&layout.sekai_runtime(), next)?;
+    write_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    Ok(())
 }
 
 pub fn generation_mismatch_guidance(sekai: Option<i64>, chisei: Option<i64>) -> String {
@@ -855,6 +888,8 @@ pub fn restamp_split_generation(layout: &CombinedStoreLayout) -> Result<i64, Str
     let generation = chrono::Utc::now().timestamp_millis();
     write_runtime_generation(&layout.sekai_runtime(), generation)?;
     write_runtime_generation(&layout.chisei_runtime(), generation)?;
+    write_runtime_pairing_epoch(&layout.sekai_runtime(), 0)?;
+    write_runtime_pairing_epoch(&layout.chisei_runtime(), 0)?;
     Ok(generation)
 }
 
@@ -955,16 +990,26 @@ fn read_sqlite_generation(conn: &Connection) -> Result<Option<i64>, String> {
     .map_err(|error| error.to_string())
 }
 
-fn write_sqlite_generation(conn: &Connection, generation: i64) -> Result<(), String> {
+fn ensure_sqlite_cutover(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {CUTOVER_TABLE} (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             generation INTEGER NOT NULL,
             fence_raised INTEGER NOT NULL,
-            raised_at_ms INTEGER NOT NULL
+            raised_at_ms INTEGER NOT NULL,
+            pairing_epoch INTEGER NOT NULL DEFAULT 0
         );"
     ))
     .map_err(|error| error.to_string())?;
+    let _ = conn.execute(
+        &format!("ALTER TABLE {CUTOVER_TABLE} ADD COLUMN pairing_epoch INTEGER NOT NULL DEFAULT 0"),
+        [],
+    );
+    Ok(())
+}
+
+fn write_sqlite_generation(conn: &Connection, generation: i64) -> Result<(), String> {
+    ensure_sqlite_cutover(conn)?;
     let fence_raised: i64 = conn
         .query_row(
             &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
@@ -974,16 +1019,26 @@ fn write_sqlite_generation(conn: &Connection, generation: i64) -> Result<(), Str
         .optional()
         .map_err(|error| error.to_string())?
         .unwrap_or(0);
+    let pairing_epoch: i64 = conn
+        .query_row(
+            &format!("SELECT pairing_epoch FROM {CUTOVER_TABLE} WHERE id=1"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or(0);
     conn.execute(
         &format!(
             "INSERT OR REPLACE INTO {CUTOVER_TABLE}
-             (id, generation, fence_raised, raised_at_ms)
-             VALUES (1, ?1, ?2, ?3)"
+             (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+             VALUES (1, ?1, ?2, ?3, ?4)"
         ),
         params![
             generation,
             fence_raised,
-            chrono::Utc::now().timestamp_millis()
+            chrono::Utc::now().timestamp_millis(),
+            pairing_epoch
         ],
     )
     .map_err(|error| error.to_string())?;
@@ -1010,8 +1065,11 @@ fn write_postgres_generation(db: &PostgresDb, generation: i64) -> Result<(), Str
             id INTEGER PRIMARY KEY CHECK (id = 1),
             generation BIGINT NOT NULL,
             fence_raised INTEGER NOT NULL,
-            raised_at_ms BIGINT NOT NULL
-        );",
+            raised_at_ms BIGINT NOT NULL,
+            pairing_epoch BIGINT NOT NULL DEFAULT 0
+        );
+        ALTER TABLE sekai_store_cutover
+            ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
     )
     .map_err(|error| error.to_string())?;
     let fence_raised: i64 = match conn.query_opt(
@@ -1023,16 +1081,115 @@ fn write_postgres_generation(db: &PostgresDb, generation: i64) -> Result<(), Str
         Err(error) => return Err(error.to_string()),
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let pairing_epoch: i64 = match conn.query_opt(
+        "SELECT pairing_epoch FROM sekai_store_cutover WHERE id = 1",
+        &[],
+    ) {
+        Ok(Some(row)) => row.get(0),
+        Ok(None) => 0,
+        Err(_) => 0,
+    };
     conn.execute(
-        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
-         VALUES (1, $1, $2, $3)
+        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+         VALUES (1, $1, $2, $3, $4)
          ON CONFLICT (id) DO UPDATE SET
             generation = EXCLUDED.generation,
-            raised_at_ms = EXCLUDED.raised_at_ms",
-        &[&generation, &fence_raised, &now_ms],
+            raised_at_ms = EXCLUDED.raised_at_ms,
+            pairing_epoch = EXCLUDED.pairing_epoch",
+        &[&generation, &fence_raised, &now_ms, &pairing_epoch],
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn read_runtime_pairing_epoch(db: &RuntimeDb) -> Result<i64, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+            ensure_sqlite_cutover(conn)?;
+            Ok(conn
+                .query_row(
+                    &format!("SELECT pairing_epoch FROM {CUTOVER_TABLE} WHERE id=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0))
+        })?,
+        RuntimeDb::Postgres(db) => {
+            let mut conn = db.connection()?;
+            match conn.query_opt(
+                "SELECT pairing_epoch FROM sekai_store_cutover WHERE id = 1",
+                &[],
+            ) {
+                Ok(Some(row)) => Ok(row.get(0)),
+                Ok(None) => Ok(0),
+                Err(error)
+                    if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+                        || error.code() == Some(&postgres::error::SqlState::UNDEFINED_COLUMN) =>
+                {
+                    Ok(0)
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        }
+    }
+}
+
+fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
+            ensure_sqlite_cutover(conn)?;
+            let generation: i64 = conn
+                .query_row(
+                    &format!("SELECT generation FROM {CUTOVER_TABLE} WHERE id=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            let fence_raised: i64 = conn
+                .query_row(
+                    &format!("SELECT fence_raised FROM {CUTOVER_TABLE} WHERE id=1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .unwrap_or(0);
+            conn.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO {CUTOVER_TABLE}
+                     (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+                     VALUES (1, ?1, ?2, ?3, ?4)"
+                ),
+                params![
+                    generation,
+                    fence_raised,
+                    chrono::Utc::now().timestamp_millis(),
+                    pairing_epoch
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })?,
+        RuntimeDb::Postgres(db) => {
+            let mut conn = db.connection()?;
+            conn.batch_execute(
+                "ALTER TABLE IF EXISTS sekai_store_cutover
+                 ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
+            )
+            .ok();
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "UPDATE sekai_store_cutover SET pairing_epoch = $1, raised_at_ms = $2 WHERE id = 1",
+                &[&pairing_epoch, &now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
 }
 
 fn list_chisei_tables(conn: &Connection, schema: &str) -> Result<Vec<String>, String> {
@@ -1141,20 +1298,12 @@ fn raise_writer_fence(path: &str) -> Result<i64, String> {
 
 fn raise_writer_fence_with_generation(path: &str, generation: i64) -> Result<(), String> {
     let conn = Connection::open(path).map_err(|error| error.to_string())?;
-    conn.execute_batch(&format!(
-        "CREATE TABLE IF NOT EXISTS {CUTOVER_TABLE} (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            generation INTEGER NOT NULL,
-            fence_raised INTEGER NOT NULL,
-            raised_at_ms INTEGER NOT NULL
-        );"
-    ))
-    .map_err(|error| error.to_string())?;
+    ensure_sqlite_cutover(&conn)?;
     conn.execute(
         &format!(
             "INSERT OR REPLACE INTO {CUTOVER_TABLE}
-             (id, generation, fence_raised, raised_at_ms)
-             VALUES (1, ?1, 1, ?2)"
+             (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+             VALUES (1, ?1, 1, ?2, 0)"
         ),
         params![generation, chrono::Utc::now().timestamp_millis()],
     )
@@ -1553,6 +1702,31 @@ mod tests {
             read_runtime_generation(&layout.sekai_runtime()).unwrap(),
             read_runtime_generation(&layout.chisei_runtime()).unwrap()
         );
+    }
+
+    #[test]
+    fn same_generation_one_sided_restore_refuses_until_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let backup = dir.path().join("sekai.bak");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        drop(layout);
+        std::fs::copy(&sekai, &backup).unwrap();
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        drop(layout);
+        std::fs::copy(&backup, &sekai).unwrap();
+        let restored = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        assert_eq!(
+            read_runtime_generation(&restored.sekai_runtime()).unwrap(),
+            read_runtime_generation(&restored.chisei_runtime()).unwrap()
+        );
+        let err = refuse_mutating_if_generation_mismatch(&restored).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
+        restamp_split_generation(&restored).unwrap();
+        refuse_mutating_if_generation_mismatch(&restored).unwrap();
     }
 
     #[test]
