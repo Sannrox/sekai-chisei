@@ -5,6 +5,9 @@
 - Audited object create takes a Deferred writer lock and upgrades to
   Immediate only after SQLITE_BUSY. Profile conflict converge waits at
   most 30ms instead of 160ms (#1045).
+- Combined PostgreSQL Split treats `localhost`, `127.0.0.1`, and `::1` as
+  one host so alias pairs cannot open two writers on the same database
+  (#1018).
 - Execution-evidence reconcile takes one Immediate writer lock for a due
   batch and backs off to 60s when idle, so empty 10s ticks no longer hit
   the Sekai evaluate pool (#1022).
