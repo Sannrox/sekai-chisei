@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -24,7 +23,10 @@ use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConf
 const CUTOVER_TABLE: &str = "sekai_store_cutover";
 const JOURNAL_TABLE: &str = "chisei_relocate_families";
 
-static GENERATION_READS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelocateReport {
@@ -539,7 +541,8 @@ pub fn is_mutating_rpc(method: &str) -> bool {
 }
 
 pub fn read_runtime_generation(db: &RuntimeDb) -> Result<Option<i64>, String> {
-    GENERATION_READS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    GENERATION_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     match db {
         RuntimeDb::Sqlite(_) => db.with_sqlite_conn(read_sqlite_generation)?,
         RuntimeDb::Postgres(db) => read_postgres_generation(db),
@@ -1141,19 +1144,19 @@ mod tests {
         let chisei = dir.path().join("chisei.db");
         let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
         align_split_generations(&layout).unwrap();
-        GENERATION_READS.store(0, Ordering::Relaxed);
+        GENERATION_READS.with(|reads| reads.set(0));
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
-        assert_eq!(GENERATION_READS.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(GENERATION_READS.with(|reads| reads.replace(0)), 2);
         for _ in 0..8 {
             refuse_mutating_if_generation_mismatch(&layout).unwrap();
         }
-        assert_eq!(GENERATION_READS.load(Ordering::Relaxed), 0);
+        assert_eq!(GENERATION_READS.with(|reads| reads.get()), 0);
         layout.invalidate_matched_generation();
-        GENERATION_READS.store(0, Ordering::Relaxed);
+        GENERATION_READS.with(|reads| reads.set(0));
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
-        assert_eq!(GENERATION_READS.swap(0, Ordering::Relaxed), 2);
+        assert_eq!(GENERATION_READS.with(|reads| reads.replace(0)), 2);
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
-        assert_eq!(GENERATION_READS.load(Ordering::Relaxed), 0);
+        assert_eq!(GENERATION_READS.with(|reads| reads.get()), 0);
     }
 
     #[test]
