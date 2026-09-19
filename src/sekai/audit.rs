@@ -274,6 +274,11 @@ fn push_if_changed(
     });
 }
 
+fn sqlite_write_lock_contention(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("database is locked") || error.contains("database is busy")
+}
+
 impl SekaiDb {
     pub fn find_namespace_boundary(&self, namespace: &str) -> Result<Option<Object>, String> {
         let conn = self.conn();
@@ -903,9 +908,33 @@ impl SekaiDb {
         if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
             return Err("namespace:* external IDs are reserved for namespace boundaries".into());
         }
+        match self.insert_created_object(
+            object,
+            actor,
+            expected_policy_generation,
+            TransactionBehavior::Deferred,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) if sqlite_write_lock_contention(&error) => self.insert_created_object(
+                object,
+                actor,
+                expected_policy_generation,
+                TransactionBehavior::Immediate,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn insert_created_object(
+        &self,
+        object: &Object,
+        actor: &str,
+        expected_policy_generation: Option<&str>,
+        behavior: TransactionBehavior,
+    ) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .transaction_with_behavior(behavior)
             .map_err(|e| e.to_string())?;
         require_sqlite_policy_generation(&tx, &object.namespace, expected_policy_generation)?;
         let historical_changes: i64 = tx
@@ -1811,5 +1840,14 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn write_lock_contention_matches_sqlite_busy_text() {
+        assert!(sqlite_write_lock_contention("database is locked"));
+        assert!(sqlite_write_lock_contention(
+            "SQLite failure: database is busy"
+        ));
+        assert!(!sqlite_write_lock_contention("UNIQUE constraint failed"));
     }
 }

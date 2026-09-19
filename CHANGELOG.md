@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Audited object create takes a Deferred writer lock and upgrades to
+  Immediate only after SQLITE_BUSY. Profile conflict converge waits at
+  most 30ms instead of 160ms (#1045).
 - ADR 0084 records that a valid System One Preview fill may persist a
   bounded typesafe Decision; Submit stays the only ActionInstance write
   (#1050).
