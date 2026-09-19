@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split restore-fence admits a matched generation once per restamp/open
+  epoch instead of selecting both stores on every mutating RPC (#1047).
 - Execution-evidence reconcile takes one Immediate writer lock for a due
   batch and backs off to 60s when idle, so empty 10s ticks no longer hit
   the Sekai evaluate pool (#1022).

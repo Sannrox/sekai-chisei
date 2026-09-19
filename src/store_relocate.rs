@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -21,6 +22,8 @@ use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConf
 
 const CUTOVER_TABLE: &str = "sekai_store_cutover";
 const JOURNAL_TABLE: &str = "chisei_relocate_families";
+
+static GENERATION_READS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelocateReport {
@@ -408,9 +411,16 @@ pub fn align_split_generations(
 }
 
 pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> Result<(), String> {
+    if layout.cached_matched_generation().is_some() {
+        return Ok(());
+    }
     match split_generation_state(layout)? {
         SplitGenerationState::Mismatched { sekai, chisei } => {
             Err(generation_mismatch_guidance(sekai, chisei))
+        }
+        SplitGenerationState::Matched { generation } => {
+            layout.cache_matched_generation(generation);
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -426,6 +436,7 @@ pub fn restamp_split_generation(layout: &CombinedStoreLayout) -> Result<i64, Str
     if !layout.is_split() {
         return Err("restamp requires a destination pair".into());
     }
+    layout.invalidate_matched_generation();
     let generation = chrono::Utc::now().timestamp_millis();
     write_runtime_generation(&layout.sekai_runtime(), generation)?;
     write_runtime_generation(&layout.chisei_runtime(), generation)?;
@@ -491,6 +502,7 @@ pub fn is_mutating_rpc(method: &str) -> bool {
 }
 
 pub fn read_runtime_generation(db: &RuntimeDb) -> Result<Option<i64>, String> {
+    GENERATION_READS.fetch_add(1, Ordering::Relaxed);
     match db {
         RuntimeDb::Sqlite(_) => db.with_sqlite_conn(read_sqlite_generation)?,
         RuntimeDb::Postgres(db) => read_postgres_generation(db),
@@ -991,6 +1003,28 @@ mod tests {
             read_runtime_generation(&layout.sekai_runtime()).unwrap(),
             read_runtime_generation(&layout.chisei_runtime()).unwrap()
         );
+    }
+
+    #[test]
+    fn matched_generation_is_read_once_per_admit_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+        GENERATION_READS.store(0, Ordering::Relaxed);
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(GENERATION_READS.swap(0, Ordering::Relaxed), 2);
+        for _ in 0..8 {
+            refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        }
+        assert_eq!(GENERATION_READS.load(Ordering::Relaxed), 0);
+        layout.invalidate_matched_generation();
+        GENERATION_READS.store(0, Ordering::Relaxed);
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(GENERATION_READS.swap(0, Ordering::Relaxed), 2);
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        assert_eq!(GENERATION_READS.load(Ordering::Relaxed), 0);
     }
 
     #[test]
