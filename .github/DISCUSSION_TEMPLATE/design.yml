@@ -6,6 +6,7 @@ body:
     attributes:
       value: |
         Use this form for cross-boundary, public-contract, trust-model, or difficult-to-reverse choices. Implementation tracking belongs in a follow-up Issue.
+        Do not include hostnames, home paths, absolute worktree paths, or other private environment details.
   - type: textarea
     id: problem
     attributes:

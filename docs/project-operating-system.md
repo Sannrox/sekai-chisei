@@ -182,7 +182,8 @@ punishment.
 ### Bug workflow
 
 1. Capture expected versus actual behavior, the smallest reproduction, affected
-   version, environment, and redacted diagnostics.
+   version, environment (OS and toolchain only; no hostnames or home paths),
+   and redacted diagnostics.
 2. Triage severity. Exploitable or sensitive reports move immediately to the
    private process in `SECURITY.md`.
 3. Add a regression test that fails for the reported behavior when practical.
@@ -346,22 +347,26 @@ and the same crate or ownership boundary. Lanes that would both change one of
 these surfaces run in sequence, not in parallel.
 
 A lane publishes its first Verified commit to the claim branch as a draft Pull
-Request that closes the Issue and carries the lane brief: agent, machine, base
-SHA, and authority ceiling. It marks the Pull Request ready when verification
-and review are complete. Immediately before publishing, the lane fetches and
-confirms that the default branch is an ancestor of its head; it refreshes onto
-`main` only for a conflict, a failing gate, an explicit request, or a sibling
-landing on a shared surface, not merely because `main` advanced.
+Request that closes the Issue and may list public lane fields only: claim
+branch, repo-relative worktree (for example `.worktrees/issue-N`), base SHA,
+published SHA, and authority ceiling. Never hostname, FQDN, home path,
+absolute worktree path, LAN or employer network name, or other environment
+inventory. It marks the Pull Request ready when verification and review are
+complete. Immediately before publishing, the lane fetches and confirms that
+the default branch is an ancestor of its head; it refreshes onto `main` only
+for a conflict, a failing gate, an explicit request, or a sibling landing on a
+shared surface, not merely because `main` advanced.
 
 Landing is sequential. After each merge, fetch, recompute the frontier, and let
 the remaining lanes recheck `mergeable` against the new `main`. A failed or
 timed-out merge response may still have merged; reconcile the remote state
 before retrying.
 
-The lead of a parallel run keeps a ledger per lane: Issue, branch, machine and
-checkout, base SHA, owner, state, Pull Request, evidence, blockers, and
-cleanup. Report verified outcomes, not launched work. The executable lead
-procedure is `.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
+The lead of a parallel run keeps a ledger per lane: Issue, branch, base SHA,
+owner, state, Pull Request, evidence, blockers, and cleanup. Absolute checkout
+paths and host names stay in the private session, never on GitHub. Report
+verified outcomes, not launched work. The executable lead procedure is
+`.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
 
 ## 5. Documentation strategy
 
@@ -414,8 +419,9 @@ AI follows the same workflow plus four explicit duties:
 - read `AGENTS.md`, the linked Issue/Discussion, and affected durable docs;
 - use repository Skills for repeated procedures and report actual evidence;
 - disclose AI assistance and testing level in the PR; and
-- never post secrets, fabricate command results, silently broaden scope, or
-  publish external changes without authorization.
+- never post secrets, hostnames, home paths, absolute worktree paths, or
+  other private environment inventory; never fabricate command results,
+  silently broaden scope, or publish external changes without authorization.
 
 The human or service account opening the PR owns the contribution. Session
 logs are optional supporting context; concise rationale and reproducible tests
@@ -457,7 +463,8 @@ Maintainers own routing and project coherence:
 ### Issue templates
 
 - **Bug:** expected/actual behavior, minimal reproduction, version,
-  environment, backend, redacted diagnostics, and regression evidence.
+  environment (OS and toolchain only), backend, redacted diagnostics, and
+  regression evidence.
 - **Feature:** problem, observable outcome, non-goals, acceptance evidence,
   affected boundary, and compatibility/security impact.
 - **Refactor:** friction, evidence, invariants, scope, and proof of unchanged
@@ -472,8 +479,9 @@ use private advisories and never a public template.
 
 PRs use a closing keyword for their primary Issue when one exists, describe
 behavior and approach, list exact validation, declare impact, and disclose AI
-assistance. Draft PRs are for active implementation; an abandoned draft should
-be closed rather than used as a permanent plan.
+assistance. Do not include hostnames, home paths, absolute worktree paths, or
+other private environment details. Draft PRs are for active implementation; an
+abandoned draft should be closed rather than used as a permanent plan.
 
 ### Labels
 

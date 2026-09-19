@@ -46,4 +46,5 @@ Return:
 
 Keep implementation design out of the Issue unless it is a validated
 constraint. Do not publish, assign, close, or prioritize GitHub work without
-explicit authorization.
+explicit authorization. Omit hostnames, home paths, absolute worktree paths,
+and other private environment inventory from any GitHub-facing draft.
