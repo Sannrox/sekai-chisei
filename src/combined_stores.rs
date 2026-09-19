@@ -481,13 +481,24 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+fn canonicalize_postgres_host(host: &str) -> String {
+    let host = host
+        .trim()
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    match host.as_str() {
+        "localhost" | "127.0.0.1" | "::1" | "0:0:0:0:0:0:0:1" => "127.0.0.1".into(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn postgres_identity(url: &str) -> Result<StoreIdentity, String> {
     let config = PostgresConfig::from_str(url)
         .map_err(|error| format!("invalid PostgreSQL destination URL: {error}"))?;
     let host = match config.get_hosts().first() {
-        Some(postgres::config::Host::Tcp(host)) => host.to_ascii_lowercase(),
+        Some(postgres::config::Host::Tcp(host)) => canonicalize_postgres_host(host),
         Some(postgres::config::Host::Unix(path)) => path.display().to_string(),
-        None => "localhost".to_string(),
+        None => canonicalize_postgres_host("localhost"),
     };
     let port = config.get_ports().first().copied().unwrap_or(5432);
     let database = config
@@ -641,5 +652,33 @@ mod tests {
         assert_eq!(left, right);
         let other = postgres_identity("postgres://alice@db.example:5432/sekai").unwrap();
         assert_ne!(left, other);
+    }
+
+    #[test]
+    fn postgres_identity_treats_loopback_aliases_as_one_host() {
+        let localhost = postgres_identity("postgres://alice@localhost:5432/sekai").unwrap();
+        let ipv4 = postgres_identity("postgres://bob@127.0.0.1:5432/sekai").unwrap();
+        let ipv6 = postgres_identity("postgres://carol@[::1]:5432/sekai").unwrap();
+        assert_eq!(localhost, ipv4);
+        assert_eq!(localhost, ipv6);
+        let other_db = postgres_identity("postgres://alice@127.0.0.1:5432/chisei").unwrap();
+        assert_ne!(localhost, other_db);
+        let remote = postgres_identity("postgres://alice@db.example:5432/sekai").unwrap();
+        assert_ne!(localhost, remote);
+    }
+
+    #[test]
+    fn postgres_loopback_alias_pair_is_refused() {
+        let err = CombinedStoreSources {
+            backend: Some(BackendIdentity::Postgres),
+            default_sqlite_path: "unused.db".into(),
+            sekai_postgres_url: Some("postgres://alice@localhost:5432/sekai".into()),
+            chisei_postgres_url: Some("postgres://bob@127.0.0.1:5432/sekai".into()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap_err();
+        assert!(err.contains("refuses a shared store identity"), "{err}");
     }
 }
