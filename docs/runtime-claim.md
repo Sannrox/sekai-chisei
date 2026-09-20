@@ -15,6 +15,9 @@ Authorized **runtime hosts** pull and claim admitted `runtime_dispatch` effects.
 The plane remains the system of record for claim state; hosts execute work and
 ack terminal outcomes. The plane never spawns processes or holds model tools.
 
+These claim RPCs are classified `experimental` and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+
 ## RPCs
 
 | RPC | Role |

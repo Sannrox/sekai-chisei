@@ -206,15 +206,16 @@ throwaway `sekai` database. It is not a built-in server ontology, not
 
 ## What works today
 
-- SQLite-backed typed-object graph with schemas, links, datasets, and virtual
-  tables, plus optional `SEKAI_DB_BACKEND=postgres` for the reusable community
-  surface (no tenant/OIDC);
+- SQLite-backed typed-object graph with schemas, links, and datasets, plus
+  optional `SEKAI_DB_BACKEND=postgres` for the reusable community surface (no
+  tenant/OIDC). Virtual-table RPCs are experimental (`SEKAI_EXPERIMENTAL_RPCS=1`);
 - namespace-first access control, audit, lineage, and retention primitives;
-- work-unit admission, heartbeat, completion, and reconciliation;
+- work-unit admission, heartbeat, completion, and reconciliation (experimental
+  RPCs; `SEKAI_EXPERIMENTAL_RPCS=1`);
 - policy resolution, context enrichment, budgets, model routing, and
   evaluation gates;
-- governed actions with dry runs, approval holds, risk classes, and
-  blast-radius limits;
+- governed actions with dry runs, risk classes, and blast-radius limits (no
+  public Action approval RPC);
 - OpenAI Responses and Chat Completions compatibility;
 - Anthropic Messages compatibility;
 - native governed execution and streaming gRPC APIs;
@@ -260,9 +261,9 @@ supported Responses harness contract.
 ## Development
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets -- -D warnings
+cargo fmt-check
+cargo clippy-all
+cargo test-all
 ```
 
 Run an end-to-end example against a local server:

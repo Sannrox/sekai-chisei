@@ -12,9 +12,9 @@ environment details. -->
 
 ## Validation
 
-- [ ] `cargo fmt --check`
-- [ ] `cargo test --workspace --locked`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo fmt-check`
+- [ ] `cargo clippy-all`
+- [ ] `cargo test-all`
 - [ ] Additional focused or smoke tests are listed below
 
 <!-- List additional commands and results. -->

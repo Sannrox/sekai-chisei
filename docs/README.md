@@ -110,8 +110,9 @@ If you want to deploy or operate the control plane:
   registered definition-consumer bindings joined to revision comparison.
   Zero visible dependents is not proof of zero impact.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
-  `sekai.object-set/v1` descriptors evaluated through authorized list and
-  one-hop traverse. A page is not authority.
+  `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
+  hops/aggregates, evaluated through authorized list and traverse. A page
+  is not authority.
 - [Object-change subscriptions](object-change-subscriptions.md) —
   plane-owned create/update/delete pages over event-subscription cursors.
   Snapshot, then stream; a page is not authority.

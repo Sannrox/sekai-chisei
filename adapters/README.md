@@ -1,7 +1,8 @@
 # External reference adapters
 
 Discovery of built-in adapter profiles and families is available through gRPC
-`SekaiService.ListEvidenceAdapters` and
+`SekaiService.ListEvidenceAdapters` (classified `experimental`; requires
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature) and
 `sekai_chisei::evidence_adapter_catalog` (control-plane scope, not tenant). See
 [evidence-adapter-catalog.md](../docs/evidence-adapter-catalog.md).
 

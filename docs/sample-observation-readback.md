@@ -1,10 +1,14 @@
 # Sample observation readback
 
-`RecordSampleObservation` is the authenticated admission path used by optional
-learning adapters. A bounded readback is available through
-`GetSampleObservation` for the same service principals that are authorized for
-telemetry admission. Non-`root`/`local` service principals must also hold a
-viewer grant on the requested namespace boundary.
+Sample observations are admitted internally through `put_sample_observation`
+during trusted `RecordUsage` and execution-lifecycle scoring. There is no
+public `RecordSampleObservation` RPC.
+
+A bounded readback is available through `GetSampleObservation` for the same
+service principals that are authorized for telemetry admission. That RPC is
+classified `remove` and is rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature is enabled. Non-`root`/`local` service
+principals must also hold a viewer grant on the requested namespace boundary.
 
 The request names both the observation `request_id` and its `namespace`. Chisei
 matches both identifiers exactly, preserving the existing v1 write and
@@ -27,6 +31,5 @@ queue: after the scoring worker compacts a consumed row, the read returns
 in this surface. Durable scored evidence is owned by the evaluation and
 receipt records.
 
-The contract is additive and preserves the existing write RPC and v1 clients.
 Recording and reading are separate authorization checks: a telemetry writer
 does not automatically receive namespace read access.

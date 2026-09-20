@@ -272,7 +272,7 @@ impl FallbackTrigger {
     }
 }
 
-/// Answer path taken by the S1 lookup-first short-circuit (#281).
+/// Answer path taken by the lookup-first short-circuit (#281).
 ///
 /// Closed vocabulary: either a full structured lookup hit or the model path
 /// (including fail-closed refusals). Never records free-form content.

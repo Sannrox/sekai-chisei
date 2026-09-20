@@ -6,7 +6,8 @@ which adapter families and schemas this release documents.
 
 ## API
 
-gRPC: `SekaiService.ListEvidenceAdapters`
+gRPC: `SekaiService.ListEvidenceAdapters` (classified `experimental`; requires
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature).
 
 ```text
 ListEvidenceAdaptersRequest { registered_only }

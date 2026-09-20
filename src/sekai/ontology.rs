@@ -8,8 +8,10 @@
 //! SQLite storage. PostgreSQL persistence is in `src/db/postgres_ontology.rs`.
 //!
 //! Class inheritance and equivalence live here (`kind_satisfies_class`,
-//! `kind_entailment_path`). Endpoint enforcement (#142) and query surfaces
-//! (#144/#145) stay out of this module.
+//! `kind_entailment_path`). This module also owns SQLite storage helpers and
+//! domain/range checks on link write and kind change (`validate_link_constraint`,
+//! `validate_object_kind_change`). gRPC list/get stay in
+//! `sekai_service_rpc_retrieval.rs`.
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
