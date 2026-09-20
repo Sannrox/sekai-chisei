@@ -47,6 +47,9 @@ evidence may expose its own digest only through its existing source check.
 
 `RetrieveContext` and `ExpandRelations` attach one descriptor to each returned
 candidate after object, namespace, classification, and ontology ACL checks.
+Those RPCs, and `ExplainDerivation` below, are classified `experimental` and
+are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+Cargo feature is enabled. See [rpc-maturity.md](rpc-maturity.md).
 Asserted candidates use their bounded source fact IDs. Entailed candidates use
 `origin_class=derived`, carry `derivation_ref=ontology_revision:<revision>`,
 and retain the complete authorized ontology revision and derivation steps in

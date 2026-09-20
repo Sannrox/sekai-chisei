@@ -1,9 +1,12 @@
 # Resolved evaluation manifests
 
 `ResolveEvaluationPlan` freezes one situation-specific evaluation into an
-immutable `chisei.resolved-evaluation-manifest/v1` document. It resolves exact
-inputs only. It does not run evaluators, collect evidence, create waivers, make
-a gate decision, or grant action authority.
+immutable `chisei.resolved-evaluation-manifest/v1` document. It is classified
+`experimental` and is rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature is enabled. See
+[rpc-maturity.md](rpc-maturity.md). It resolves exact inputs only. It does not
+run evaluators, collect evidence, create waivers, make a gate decision, or
+grant action authority.
 
 The caller supplies:
 

@@ -1,7 +1,10 @@
 # Authorized consumer impact
 
 `ReportDefinitionConsumerImpact` joins `CompareDefinitionRevisions` to
-explicit `sekai.definition-consumer-binding/v1` objects. Bindings may name
+explicit `sekai.definition-consumer-binding/v1` objects. Both RPCs are
+classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
+or the `experimental-rpcs` Cargo feature is enabled. See
+[rpc-maturity.md](rpc-maturity.md). Bindings may name
 `object_type`, `function`, `transform`, and `policy` members, and the
 report lists every visible hit across those kinds. The plane does not
 scan repositories or infer undeclared dependents.

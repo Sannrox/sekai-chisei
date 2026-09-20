@@ -2,6 +2,11 @@
 
 `sekaictl admin evaluation plan` is the experimental operator surface for authoring,
 publishing and running situation-specific evaluation plans.
+Those commands call `PutEvaluationPlan`, `ResolveEvaluationPlan`, and
+`ExecuteEvaluationManifest`, which are classified `experimental` and rejected
+unless the **server** is started with `SEKAI_EXPERIMENTAL_RPCS=1` or built with
+the `experimental-rpcs` Cargo feature. See [rpc-maturity.md](rpc-maturity.md).
+Setting the env only in the `sekaictl` client process does not enable the RPCs.
 It uses the existing Chisei plan, manifest, and bounded-execution APIs;
 it does not introduce a generic evaluator or workflow language.
 

@@ -23,7 +23,8 @@ lives in the separate [research index](research/README.md).
   provider capability behavior.
 - [Sample observation readback](sample-observation-readback.md) — gated
   `GetSampleObservation` projection of internally admitted scoring samples
-  (no public write RPC).
+  (classified `remove`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or
+  `experimental-rpcs`; no public write RPC).
 - [SDK facade](../sdk/README.md) — generated-client layering and capability
   code generation.
 - [Available models](available-models.md) — enumerate the governed routable
@@ -39,7 +40,9 @@ lives in the separate [research index](research/README.md).
 - [Social observation evidence adapters](social-evidence-adapters.md) —
   stdin funnel for `social.post_snapshot` and `social.reply`.
 - [Evidence adapter catalog](evidence-adapter-catalog.md) —
-  `ListEvidenceAdapters` discovery of built-in adapter families.
+  `ListEvidenceAdapters` discovery of built-in adapter families
+  (classified `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or
+  `experimental-rpcs`).
 - [Compatibility gateway](gateway.md) — optional integration for Codex, Claude
   Code, OpenAI-compatible, and Anthropic-compatible clients.
 

@@ -13,10 +13,15 @@ may admit later as `ActionInstance` records (#397).
 | Concept | RPC / message |
 | --- | --- |
 | Type record | `GovernedActionType` |
-| Create / idempotent put | `PutGovernedActionType` |
+| Create / idempotent put | `PutGovernedActionType` (`stable`) |
 | Read | `GetGovernedActionType` |
 | List | `ListGovernedActionTypes` |
 | Enable / disable (no history delete) | `SetGovernedActionTypeEnabled` |
+
+`GetGovernedActionType`, `ListGovernedActionTypes`, and
+`SetGovernedActionTypeEnabled` are classified `experimental` and are rejected
+unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md).
 
 Identity is `(namespace, type_id, version)`. Version bodies are **immutable**
 after first put; change fields by registering a new version. Disable keeps the
@@ -45,6 +50,7 @@ file; do not invent types from submit traffic.
 
 ```text
 sekaictl admin governance action type put --file <type.json|->
+# get/list need the server started with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 sekaictl admin governance action type get --namespace <ns> --type-id <id> --version <ver>
 sekaictl admin governance action type list --namespace <ns> [--type-id <id>] [--enabled-only]
 ```

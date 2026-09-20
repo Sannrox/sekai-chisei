@@ -69,7 +69,9 @@ cargo run --example demo_client
 
 - Creates a `namespace` object and a `service` object
 - Links them `namespace --deploys--> service`
-- Reads the relationship back with `GetLinkedObjects`
+- Reads the relationship back with `GetLinkedObjects` (classified
+  `experimental`; the server needs `SEKAI_EXPERIMENTAL_RPCS=1` or the
+  `experimental-rpcs` feature; see [rpc-maturity.md](../docs/rpc-maturity.md))
 - Traverses the graph outward from the namespace
 - Lists objects filtered by `kind`
 

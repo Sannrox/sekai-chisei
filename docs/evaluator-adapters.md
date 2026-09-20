@@ -2,7 +2,9 @@
 
 `external_adapter/v1` lets an operator add a domain evaluator without
 changing or loading code into the Chisei process. The evaluator definition is
-still created through the namespace-authorized `PutEvaluatorDefinition` RPC;
+still created through the namespace-authorized `PutEvaluatorDefinition` RPC
+(classified `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature; see [rpc-maturity.md](rpc-maturity.md));
 its `adapter_endpoint` names an already-deployed HTTPS service. Loopback HTTP
 is accepted only when `SEKAI_INSECURE=1` is explicitly set for local
 development.

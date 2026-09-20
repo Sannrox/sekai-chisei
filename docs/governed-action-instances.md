@@ -20,7 +20,7 @@ receipt / harvest spine.
 | Object-bound describe | `DescribeObjectAction` |
 | Object-bound preview | `PreviewObjectAction` |
 | Read by id or key | `GetActionInstance` |
-| List | `ListActionInstances` |
+| List | `ListActionInstances` (classified `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature; see [rpc-maturity.md](rpc-maturity.md)) |
 
 ## Describe and preview
 

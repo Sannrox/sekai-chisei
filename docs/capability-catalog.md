@@ -103,9 +103,9 @@ results, truncation metadata, evidence references, and receipts only.
 
 | Capability | RPC / input type | Product tier | Purpose |
 | --- | --- | --- | --- |
-| `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. |
-| `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. |
-| `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. |
+| `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
+| `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
+| `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
 
 ### Product tier filter (core pack)
 

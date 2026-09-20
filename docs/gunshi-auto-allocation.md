@@ -85,6 +85,7 @@ Denials set `auto_dispatch=false` and `dispatch_denial_reasons`.
 ## CLI
 
 ```text
+# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 sekaictl admin governance gunshi install-baseline --namespace <ns> --snapshot <json> --gate <json>
 sekaictl admin governance gunshi promote --namespace <ns> --candidate <json> --baseline-eval <json> --candidate-eval <json> --expected-revision <id>
 sekaictl admin governance gunshi auto-opt-in --namespace <ns> --expected-revision <id>

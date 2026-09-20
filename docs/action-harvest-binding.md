@@ -4,6 +4,10 @@ Issue: [#400](https://github.com/Sannrox/sekai-chisei/issues/400).
 Claim: [runtime-claim.md](runtime-claim.md).  
 Admission: [governed-action-instances.md](governed-action-instances.md).
 
+`AckActionWork` is classified `experimental` and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md).
+
 ## Correlation table (hosts and producers)
 
 | Identity | Owner | Purpose |

@@ -41,6 +41,7 @@ reference pages.
 | [Two-hop hop-projection envelope](889-hop-projection-envelope.md) | Product nested-loop misses at 10⁵; on-the-fly join misses at 10⁷; rebuildable hop-projection query holds; #889 unblocked without a vendor pick |
 | [Embedded-PostgreSQL envelope](870-embedded-postgres-envelope.md) | Cold start and ≤200 MB footprint hold; #870 closed as keep dual ([ADR 0080](../decisions/0080-dual-community-runtime-storage.md)) |
 | [Incremental governed-transform envelope](879-transform-envelope.md) | In-process projection; 1% append processes 2 of 200 rows; #880 landed without an engine pick |
+| [Two-store implementation contracts](999-two-store-implementation-contracts.md) | Implementation freeze for dest-pair Combined stores; see [ADR 0082](../decisions/0082-separate-chisei-and-sekai-durable-stores.md) |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).

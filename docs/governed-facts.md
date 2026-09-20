@@ -23,7 +23,9 @@ requirements database.
 
 `GetGovernedFactVersion` reads one authorized immutable fact version by object
 ID. `ResolveInvariantSet` is the bounded evaluation-facing projection described
-below.
+below. Both RPCs are classified `experimental` and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md).
 
 Each version binds:
 

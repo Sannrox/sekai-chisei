@@ -16,7 +16,7 @@ Status values:
 | Status | Meaning |
 | --- | --- |
 | supported | Authenticated callers may use the named RPC on current `main`. |
-| experimental | Shipped with an explicit product-tier or incomplete lifecycle. |
+| experimental | Shipped with an explicit product-tier or incomplete lifecycle. Requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature. See [rpc-maturity.md](rpc-maturity.md). |
 | unavailable | Not a public contract on current `main`. |
 | planned | Named by an open Issue; do not treat as shipped. |
 

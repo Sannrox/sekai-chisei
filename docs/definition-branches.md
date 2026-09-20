@@ -5,6 +5,11 @@ namespace-scoped definition revision without changing published definitions or
 runtime facts. The experimental product-tier contract now also publishes or
 rejects one pinned candidate through a proposal, compares two revisions, and
 classifies compatibility. It does not yet preview, rebase, or migrate facts.
+Branch, proposal, compare, compatibility, and fact-migration RPCs are
+classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
+or the `experimental-rpcs` Cargo feature is enabled. See
+[rpc-maturity.md](rpc-maturity.md). `GetPublishedDefinitionRevision` stays
+`stable`.
 
 ## Contract
 

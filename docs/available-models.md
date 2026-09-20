@@ -10,6 +10,7 @@ material.
 The CLI renders a table by default:
 
 ```bash
+# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 sekaictl models list
 sekaictl models list --provider openai
 sekaictl models list --json

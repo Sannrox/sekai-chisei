@@ -1,9 +1,11 @@
 # Evaluation gate evidence
 
 `GetEvaluationGateEvidence` is the narrow Chisei read contract for a Tenkai
-release gate. It is a server-owned projection of existing `EvalSuite` and
-`EvalRun` records; it does not replace the separate evaluation-plan and
-manifest contracts.
+release gate. It is classified `experimental` and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md). It is a server-owned
+projection of existing `EvalSuite` and `EvalRun` records; it does not replace
+the separate evaluation-plan and manifest contracts.
 
 The request binds the read to a suite ID, release digest, artifact digest, and
 an upper timestamp bound. Chisei authenticates the caller as an authorized

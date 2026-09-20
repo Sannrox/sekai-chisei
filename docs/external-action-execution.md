@@ -16,7 +16,11 @@ The 1.0 contract exposes four lifecycle surfaces:
   an existing authorization or permit.
 - `RedeemExternalActionPermit` verifies the signed envelope and atomically
   consumes online authority (or reconciles one offline invocation).
-- `SetExternalActionPolicy` updates permit policy or the emergency kill switch.
+- `SetExternalActionPolicy` updates permit policy or the emergency kill
+  switch. Classified `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or
+  the `experimental-rpcs` Cargo feature. See [rpc-maturity.md](rpc-maturity.md).
+  `AuthorizeExternalAction`, `TransitionExternalAction`, and
+  `RedeemExternalActionPermit` stay `stable`.
 
 Permit verification is part of redemption and executor-side conformance; a
 separate read-only verification RPC would create a race and is not an execution

@@ -14,11 +14,15 @@ row and marking residuals before materialization; it is a projection, not a
 second authority. `SimulateObjectPolicyChange` is a read projection over
 activation digests and never mutates. `QueryObjectPolicyAudit` returns allow or
 deny with policy identities and revision; export omits hidden values. Both RPCs
-are experimental. Inspection
-RPCs (`GetObjectSecurityPolicyRevision`, `GetObjectSecurityActivation`,
-`PutPurposeAuthorization`, `RevokePurposeAuthorization`,
-`PutClassificationLattice`, `GetClassificationLattice`) use the same
-credential-admin boundary as mutation. The server computes the content digest;
+are classified `experimental` and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md). Inspection
+RPCs (`GetObjectSecurityPolicyRevision`, `PutPurposeAuthorization`,
+`RevokePurposeAuthorization`, `PutClassificationLattice`,
+`GetClassificationLattice`) use that same experimental gate.
+`GetObjectSecurityActivation` stays `stable`.
+`PutObjectSecurityPolicyRevision` and `ActivateObjectSecurityPolicies` stay
+`stable`. Inspection and mutation share the credential-admin boundary. The server computes the content digest;
 generic object mutation cannot edit policy, purpose-authorization, or lattice
 state.
 
