@@ -8,6 +8,9 @@ track (#237). Community PostgreSQL runtime selection is activated by #238.
 Most reusable Chisei decision and execution surfaces have PostgreSQL
 persistence with shared SQLite/PostgreSQL conformance evidence, or are
 explicit computed/query paths with named durable dependencies.
+`GetEffectivePolicySummary` is also classified `experimental` and is rejected
+unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md).
 
 | Surface | Status | Evidence |
 | --- | --- | --- |

@@ -38,6 +38,11 @@ If you want to deploy or operate the control plane:
 3. Use [two-store relocation](store-relocation.md) when moving Chisei families off a historical single file, or [two-plane processes](two-plane-processes.md) to run `sekai-plane` and `chisei-plane` separately.
 4. Use the [Docker guide](docker.md) if you want the supported container
    topology.
+5. For live operations, see the [operator console](operator-console.md),
+   [leases](leases.md), [object security](object-security.md), and
+   [PostgreSQL parity](postgres-sekai-parity.md) /
+   [Chisei PostgreSQL parity](postgres-chisei-parity.md).
+   The [reference catalog](reference.md) lists every other maintained page.
 
 ## Core concepts
 

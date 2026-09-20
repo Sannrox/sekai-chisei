@@ -187,9 +187,12 @@ descriptor authorizes it. Unknown, retired, or unadmitted descriptors fail as
 `unbound_type_revision` without disclosure. GitHub identity and discovery stay
 unchanged. Register, inspect, and retire one later kind through
 `RegisterSourceTypeDescriptor` / `InspectSourceTypeDescriptor` /
-`RetireSourceTypeDescriptor` or:
+`RetireSourceTypeDescriptor` (classified `experimental`; require
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature; see
+[rpc-maturity.md](rpc-maturity.md)) or:
 
 ```text
+# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 sekaictl admin sync register-descriptor --namespace ops --descriptor ./pager.json
 sekaictl admin sync inspect-descriptor --namespace ops --digest sha256:...
 sekaictl admin sync retire-descriptor --namespace ops --digest sha256:...

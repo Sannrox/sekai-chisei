@@ -11,7 +11,11 @@ design (class, relation, property, cardinality, provenance, mapped_kind).
 Their I/O differs: a local SQLite file versus authenticated gRPC apply.
 Apply-only hints such as `ensure_kind` are not ontology meaning.
 
-The native `SekaiService` API exposes ontology classes and relations. Classes
+The native `SekaiService` API exposes ontology classes and relations.
+Create class/relation RPCs are `stable`. List, get, and delete ontology RPCs
+are classified `experimental` and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md). Classes
 can declare superclasses, equivalent classes, disjoint classes, and typed
 properties. Relations declare domain and range classes plus metadata that later
 validation and reasoning work can consume. Names are stable external
@@ -26,6 +30,9 @@ authoring and inspection metadata. Research
 read-only; computed properties and other derived views stay query-time
 overlays and are not persisted onto a type revision. The function product is
 that in-process host API (`CreateFunction` and its read-time pipeline).
+`CreateFunction` is classified `experimental` and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled. See [rpc-maturity.md](rpc-maturity.md).
 Customer guest code, if added, runs behind the same host; it is not an agent
 run and does not pick an engine here. See
 [ADR 0072](decisions/0072-in-process-function-host.md).
@@ -179,6 +186,8 @@ Generate a browser-readable snapshot through the same authenticated gRPC path:
 
 ```bash
 # Default target is ./data/sekai.sock (or CHISEI_GRPC_URL / SEKAI_SOCKET).
+# Inspect calls experimental list/get/retrieve RPCs. Start the server with
+# SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 export SEKAI_CREDENTIAL='<operator token>'
 cargo run --bin sekaictl -- ontology inspect \
   --root <object-id> \

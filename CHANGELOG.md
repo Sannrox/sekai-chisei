@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Operator pages that name experimental or remove-classified RPCs now
+  state the `SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs` gate.
 - Align agent instructions, operator docs, and comments with landed
   two-plane bins, dest-pair stores, and experimental RPC gates.
 - Admitted Action object apply appends through tagged mikura ingest when

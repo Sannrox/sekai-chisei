@@ -61,8 +61,10 @@ treat inventory “complete” as dual-backend for these RPCs):
 
 - audited ontology mutations (`upsert_*_with_audit`);
 - query-time ontology entailment (`RetrieveContext`, `ExpandRelations`, and
-  lookup-first expansion in `entailment` mode; see
-  [ADR 0001](decisions/0001-query-time-ontology-entailment.md) and
+  lookup-first expansion in `entailment` mode; those RPCs are classified
+  `experimental` and require `SEKAI_EXPERIMENTAL_RPCS=1` or the
+  `experimental-rpcs` feature; see [rpc-maturity.md](rpc-maturity.md),
+  [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
   [capability catalog](capability-catalog.md));
 - dataset row `append_rows` / `query_rows` through the community `RuntimeDb`
   dispatcher;

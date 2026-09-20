@@ -6,7 +6,10 @@ Design freeze: [research/292-multi-region-consistency.md](research/292-multi-reg
 ## Consistency class
 
 Coordination leases and online permit redemption use
-`region_pinned_single_writer`:
+`region_pinned_single_writer`. Lease RPCs (`GetLease` and siblings) are
+classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
+or the `experimental-rpcs` Cargo feature is enabled. See
+[rpc-maturity.md](rpc-maturity.md) and [leases.md](leases.md).
 
 - Each durable lease and signed online permit carries a `site_id` pin.
 - The process stamps its pin from `SEKAI_SITE_ID` (default `"local"`).

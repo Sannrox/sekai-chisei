@@ -19,7 +19,10 @@ may replace it with `sekai.classification-lattice/v1`. See
 ## Namespace lattices
 
 Credential admins publish a lattice through `PutClassificationLattice` and
-inspect it through `GetClassificationLattice`. The document names tokens,
+inspect it through `GetClassificationLattice`. Those RPCs are classified
+`experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature is enabled. See
+[rpc-maturity.md](rpc-maturity.md). The document names tokens,
 parent edges (child → more-dominant parents), and explicit incomparable pairs.
 Dominance is reachability from the marking to the caller’s sealed ceiling.
 

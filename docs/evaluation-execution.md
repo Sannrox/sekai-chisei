@@ -1,6 +1,8 @@
 # Evaluation execution
 
-`ExecuteEvaluationManifest` is an experimental 1.0 capability that executes one exact
+`ExecuteEvaluationManifest` is an experimental 1.0 capability (classified
+`experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+Cargo feature; see [rpc-maturity.md](rpc-maturity.md)) that executes one exact
 `chisei.resolved-evaluation-manifest/v1` through the
 established `chisei.deterministic-evaluation-executor/v1` request protocol.
 The frozen node execution class selects a separate deterministic or stochastic

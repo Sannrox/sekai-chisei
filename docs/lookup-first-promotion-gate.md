@@ -27,7 +27,8 @@ It expects the reference `acme` graph from the lookup-first fixture seed. Run
 it against a trusted local control plane after loading the corresponding graph:
 
 ```bash
-SEKAI_EXPERIMENTAL_RPCS=1 sekaictl admin evaluation lookup-first-gate run \
+# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
+sekaictl admin evaluation lookup-first-gate run \
   tests/fixtures/lookup_first/promotion-gate-v1.json \
   --namespace acme \
   --target ./data/sekai.sock
