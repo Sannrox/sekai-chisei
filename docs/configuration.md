@@ -31,6 +31,9 @@ template.
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
 | `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup (`http://127.0.0.1:50051`) |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
+| `SEKAI_ASSERTION_ISSUER` | unset | Audience-bound assertion issuer (#888). All three assertion variables must be set together; partial config is refused |
+| `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |
+| `SEKAI_ASSERTION_HMAC_KEY` | unset | HMAC key for audience-bound assertions; treat as a secret |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. MCP Preview that may fill uses `LLM_HTTP_REQUEST_TIMEOUT_SECS` (default 120s), not a hard 5s deadline; Submit stays at 5s. |
@@ -163,6 +166,7 @@ value to stdout.
 | `CHISEI_ANTHROPIC_BASE_URL` | Anthropic API | Anthropic-compatible upstream; include `/v1` |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models |
 | `GATEWAY_KEYS` | empty | Explicit `key=agent:project` development/compose allowlist (required when the bind is non-loopback) |
+| `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` | unset | Loopback-only. Set `1` to let the gateway forward caller auth unchanged. Non-loopback binds refuse this flag |
 | `GATEWAY_DEFAULT_PROJECT` | `default` | Attribution fallback when a key omits a project |
 | `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | Enables cache refresh; must be at least 32 bytes |
 | `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `33554432` | Maximum buffered request body |

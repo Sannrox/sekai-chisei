@@ -108,8 +108,8 @@ pub(crate) fn chain_head(conn: &Connection) -> Result<(i64, String), String> {
 }
 
 /// Insert a decision as the next entry of the hash chain. The caller must
-/// hold the connection for the whole call (the shared `Mutex<Connection>` in
-/// `SekaiDb` guarantees head read and insert are not interleaved).
+/// hold the same pooled connection for the whole call so the head read and
+/// insert are not interleaved with another writer on that connection.
 pub(crate) fn insert_chained_decision(conn: &Connection, d: &Decision) -> Result<(), String> {
     let (head_seq, head_hash) = chain_head(conn)?;
     let seq = head_seq + 1;
@@ -239,7 +239,7 @@ impl SekaiDb {
     /// Walk the chain from the latest purge anchor (or genesis) and verify
     /// sequence contiguity, previous-hash linkage, and every entry hash.
     ///
-    /// Rows are read in batches and the shared connection lock is released
+    /// Rows are read in batches and the pooled connection is returned
     /// between batches, so a long verification does not stall audit writes.
     /// Entries appended mid-scan simply extend the walk.
     pub fn verify_ledger(&self) -> Result<LedgerVerification, String> {

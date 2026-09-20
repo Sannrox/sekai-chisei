@@ -20,8 +20,11 @@ sekaictl models list --json
 equivalent explicit options are `--namespace` and `--target`.
 
 Native clients call `ChiseiService.GetEffectivePolicySummary` with a namespace and an
-optional provider. The RPC requires an authenticated principal with read access
-to the namespace.
+optional provider. The RPC is classified `experimental` and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+It requires an authenticated principal with read access to the namespace.
+`sekaictl models list` is an admin CLI over that same gated RPC, not a stable
+SDK or host consumer.
 
 Gateway clients use `GET /v1/chisei/models`; an optional `provider` query
 parameter filters the result. This route uses the gateway's existing

@@ -161,7 +161,7 @@ pub enum LookupDecision {
     NotEligible,
 }
 
-/// Fixture case for the checked-in S1 suite.
+/// Fixture case for the checked-in S1/S2 lookup-first suites.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LookupFixtureCase {
     pub id: String,
@@ -195,7 +195,7 @@ pub struct LookupFixtureCaseResult {
     pub detail: Option<String>,
 }
 
-/// Aggregate report for the fixture suite (hit vs model) — S1 metrics surface.
+/// Aggregate report for the S1/S2 fixture suites (hit vs model).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LookupFixtureSuiteReport {
     pub suite: String,

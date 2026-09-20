@@ -5,9 +5,14 @@
 `ListObjects` and one-hop traverse paths already used by generic reads.
 
 The descriptor names a namespace, object kind, and the published definition
-digest it is bound to. It may include at most four equality or comparison
+digest it is bound to. v1 may include at most four equality or comparison
 property filters, one `order_by`, a documented limit, and optional one-hop
 traversal over one declared `link_type` with a far-side kind filter.
+
+`sekai.object-set/v2` is the multi-hop contract: extra hops, `aggregation`,
+and cost limits (`max_rows_scanned`, `max_depth`, `max_time_ms`). Hop-projection
+is the shipping default. See [object-type-index.md](object-type-index.md) for
+engine selection, reindex, and aggregation.
 
 ## Non-authority
 

@@ -135,5 +135,4 @@ These names appear in platform sequencing Issues. They are **not** integration
 contracts on current `main`:
 
 - first-class Action approval RPC (admission may persist `denied` instead; preview reports `require_approval` without granting it) ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
-- authorized object-change subscriptions ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
 - downloadable registry packages (publication records are not registry bytes).

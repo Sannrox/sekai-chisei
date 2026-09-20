@@ -162,7 +162,7 @@ pub fn record_deduplication(subsystem: Subsystem, event: DeduplicationEvent) {
     .increment(1);
 }
 
-/// Record a lookup-first answer path decision (#281 S1).
+/// Record a lookup-first answer path decision (#281).
 pub fn record_lookup_first(path: LookupFirstPath) {
     counter!(LOOKUP_FIRST_TOTAL, "path" => path.as_str()).increment(1);
 }

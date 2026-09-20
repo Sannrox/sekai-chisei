@@ -38,7 +38,7 @@ Receipt attributes (when applied):
 | `PlanExecution` / `resolve_model_for_run` | Enforces residency after final model/runtime resolution |
 | `ExecutePlanStream` | Re-checks residency so cached plans cannot outrun policy |
 | `DecideGatewayExecution` | Enforces residency as part of fat-decide route composition |
-| Gunshi `IssueGunshiRecommendations` | Evaluates aligned auto-dispatch decisions; forces advisory + denial reasons when selected model is residency-illegal and stamps receipt attributes |
+| Gunshi `IssueGunshiRecommendations` | Evaluates aligned auto-dispatch decisions; forces advisory + denial reasons when selected model is residency-illegal and stamps receipt attributes. Classified `remove`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature |
 
 ## Gunshi
 

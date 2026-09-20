@@ -27,23 +27,29 @@ lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 
 ## Development setup
 
-1. Install a recent stable Rust toolchain with Rust 2024 edition support.
+1. Install the compiler pinned in `rust-toolchain.toml` (Rust 2024 edition).
 2. Clone the repository.
 3. Copy `.env.example` to `.env` if you need local overrides.
 4. Run the standard checks:
 
 ```bash
-cargo build --locked
-cargo test --locked
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+cargo fmt-check
+cargo clippy-all
+cargo test-all
 ```
 
-Start a trusted local server with:
+Those aliases in `.cargo/config.toml` are what CI runs: `fmt --all -- --check`,
+`clippy --workspace --all-targets --locked -- -D warnings`, and
+`test --workspace --locked`.
+
+Start a trusted local combined server with:
 
 ```bash
 SEKAI_INSECURE=1 cargo run
 ```
+
+Combined mode is the default. Separate `sekai-plane` and `chisei-plane`
+processes are documented in [two-plane processes](docs/two-plane-processes.md).
 
 The build vendors `protoc`; a system installation is not required.
 
@@ -145,9 +151,9 @@ behavioral, security, and maintainability standards as human-only changes.
 Before requesting review, run:
 
 ```bash
-cargo fmt --check
-cargo test --locked
-cargo clippy --all-targets -- -D warnings
+cargo fmt-check
+cargo clippy-all
+cargo test-all
 ```
 
 Maintainers normally squash-merge PRs (`gh pr merge --squash --delete-branch`)

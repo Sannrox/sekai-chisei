@@ -232,7 +232,8 @@ receipt; reconciliation therefore uses `GetOperationReceipt`. Profile
 validators cannot grant execution authority or add arbitrary receipt
 attributes. See [Governed subject evaluation](governed-subjects.md).
 
-Operator clients may use `GetEffectivePolicySummary` to render a live,
+Operator clients may use `GetEffectivePolicySummary` (experimental;
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature) to render a live,
 read-only namespace projection of effective routing, configured budget limits,
 bounded action-rule counts, and governed worker concurrency. Each section
 reports its owning scope and revision or an explicit unconfigured state. The

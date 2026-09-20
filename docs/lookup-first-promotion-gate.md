@@ -27,11 +27,14 @@ It expects the reference `acme` graph from the lookup-first fixture seed. Run
 it against a trusted local control plane after loading the corresponding graph:
 
 ```bash
-sekaictl admin evaluation lookup-first-gate run \
+SEKAI_EXPERIMENTAL_RPCS=1 sekaictl admin evaluation lookup-first-gate run \
   tests/fixtures/lookup_first/promotion-gate-v1.json \
   --namespace acme \
   --target ./data/sekai.sock
 ```
+
+`RunLookupFirstPromotionGate` is classified `remove` and is rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
 
 The command exits `0` only for `allow` and exits `7` for `deny`. JSON output is
 available with `--json`. The response contains case paths, refusal reasons,

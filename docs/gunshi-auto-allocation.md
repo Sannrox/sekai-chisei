@@ -20,7 +20,9 @@ Envelope research: [279-gunshi-auto-allocation-envelope.md](research/279-gunshi-
 3. **Promote** a candidate revision when the gate passes (CAS on `expected_revision`).
 4. **Opt in** the namespace to live auto-dispatch.
 5. Read the aligned auto-dispatch decision and receipt attributes returned by
-   **IssueGunshiRecommendations** before dispatching.
+   **IssueGunshiRecommendations** (classified `remove`; requires
+   `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature) before
+   dispatching.
 6. **Kill switch** or **rollback** to return to advisory / prior revision.
 
 Promotion enforces a 60s cooldown per namespace to reduce thrash.

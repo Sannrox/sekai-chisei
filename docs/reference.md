@@ -21,8 +21,9 @@ lives in the separate [research index](research/README.md).
 - [Bounded content execution](content-execution.md) — separate native
   text/image/audio/document descriptors, transient payload verification, and
   provider capability behavior.
-- [Sample observation readback](sample-observation-readback.md) — authenticated,
-  redacted telemetry admission projection.
+- [Sample observation readback](sample-observation-readback.md) — gated
+  `GetSampleObservation` projection of internally admitted scoring samples
+  (no public write RPC).
 - [SDK facade](../sdk/README.md) — generated-client layering and capability
   code generation.
 - [Available models](available-models.md) — enumerate the governed routable
@@ -115,8 +116,8 @@ lives in the separate [research index](research/README.md).
 - [Authorized consumer impact](definition-consumer-impact.md) — registered
   definition-consumer bindings joined to revision comparison.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
-  `sekai.object-set/v1` descriptors evaluated through authorized list and
-  one-hop traverse.
+  `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
+  hops/aggregates, evaluated through authorized list and traverse.
 - [Evidence producer contract](action-evidence-producer-contract.md) —
   evidence submission with optional ActionInstance creation.
 - [Inbound object sync](object-sync.md) — authenticated source batches,

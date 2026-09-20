@@ -1,5 +1,9 @@
 # Generation-fenced leases
 
+Lease RPCs (`AcquireLease`, `GetLease`, and siblings) are classified
+`experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature is enabled.
+
 Sekai exposes namespace-scoped leases for coordinating one active owner of a
 logical key. Acquire returns both a monotonically increasing `generation` and
 a unique `fencing_token`. Release keeps the key and its audit history, so a

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the server, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Workspace crates include `chisei-gateway`, `sekai-proto`, `sekai-provider` (re-exported as `sekai_chisei::llm`), `sekai-admin-client`, `sekai-client`, and `sekai-ontology`. Canonical protocol files are in `proto/`; keep `crates/sekai-proto/proto/` in byte-for-byte sync. Integration tests live in `tests/`. Runtime SQLite data defaults to `data/sekai.db`; do not commit local databases or generated runtime state. `CLAUDE.md` is a compatibility copy of this file for Claude Code; keep them identical. Domain lifecycle maps live in `CONTEXT.md`.
+`sekai-chisei` is a Rust 2024 crate for a local-first gRPC control plane. Source code lives in `src/`: `src/main.rs` starts the combined server, `src/bin/sekai.rs` and `src/bin/chisei.rs` start the `sekai-plane` and `chisei-plane` processes, `src/lib.rs` exports modules, `src/grpc/` implements tonic services, `src/db/` handles SQLite and PostgreSQL community backends (`SEKAI_DB_BACKEND`), `src/sekai/` contains durable graph, audit, lineage, security, and coordination primitives, and `src/chisei/` contains policy, budget, routing, evaluation, and pipeline logic. Workspace crates include `chisei-gateway`, `sekai-proto`, `sekai-provider` (re-exported as `sekai_chisei::llm`), `sekai-admin-client`, `sekai-client`, and `sekai-ontology`. Canonical protocol files are in `proto/`; keep `crates/sekai-proto/proto/` in byte-for-byte sync. Integration tests live in `tests/`. Combined-mode SQLite defaults to dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH`; a single `DB_PATH` needs `SEKAI_SHARED_STORE=1`. Do not commit local databases or generated runtime state. `CLAUDE.md` is a compatibility copy of this file for Claude Code; keep them identical. Domain lifecycle maps live in `CONTEXT.md`.
 
 ## Build, Test, and Development Commands
 
@@ -14,14 +14,14 @@ cargo clippy-all
 cargo test-all
 ```
 
-Aliases in `.cargo/config.toml` pin `--workspace --all-targets --locked` and clippy `-D warnings`. Plain `cargo check` / `cargo test` stay the short developer loop.
+Aliases in `.cargo/config.toml`: `fmt-check` is `fmt --all -- --check`; `clippy-all` is `clippy --workspace --all-targets --locked -- -D warnings`; `test-all` is `test --workspace --locked`. Plain `cargo check` / `cargo test` stay the short developer loop.
 
 `SEKAI_INSECURE=1 cargo run` starts the local development server on `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default. Do not combine insecure mode with a non-loopback bind; the server does not reject that combination. `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
 Linux images: `./build/release-images.sh`. Push: `./build/release.sh` with
 `DOCKER_REGISTRY` set. Proto copies: `./scripts/update-proto.sh`.
 
-Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `SEKAI_BIND`, `SEKAI_SOCKET`, `DB_PATH`, `SEKAI_DB_BACKEND`, `DATABASE_URL`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
+Use `.env.example` as the configuration reference. Important variables include `GRPC_PORT`, `SEKAI_BIND`, `SEKAI_SOCKET`, `SEKAI_DB_PATH`, `CHISEI_DB_PATH`, `SEKAI_DB_BACKEND`, `DB_PATH`, `DATABASE_URL`, `SEKAI_INSECURE`, `SEKAI_CREDENTIAL`, `OLLAMA_URL`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY`.
 
 GitHub Issues are the planning source of truth. Read `docs/project-operating-system.md` for artifact routing, contribution lifecycles, review roles, and project-specific Skills under `.agents/skills/`.
 

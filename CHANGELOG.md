@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Align agent instructions, operator docs, and comments with landed
+  two-plane bins, dest-pair stores, and experimental RPC gates.
 - Admitted Action object apply appends through tagged mikura ingest when
   `SEKAI_OBJECT_LOG` is set; denied submits do not write the log (#943).
 - Dual-unstamped Split open auto-stamps only empty green-field stores;
