@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Product frontends stay in a separate repository; this crate remains the
+  control plane plus the thin `/console/` ops shell (ADR 0085, #1080).
 - Operator first-success, Docker/compose, and configuration pages name
   Combined dest-pair boot. `cargo run` does not load `.env`; a lone
   `DB_PATH` needs `SEKAI_SHARED_STORE=1`. Offline `sekaictl` report,

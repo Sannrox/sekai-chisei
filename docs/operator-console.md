@@ -13,6 +13,12 @@ The read-only shell is an operator convenience surface. Console mutations
 (kill switch, dry-run audit, promote, and rollback) are experimental in 1.0;
 `sekaictl` remains the canonical stable automation interface.
 
+Product frontends (Ontology Manager, Object Explorer, evals UI, approval
+queue and forms, Logic/Agent Studio-like chrome) are a separate repository.
+They consume stable public APIs only. See
+[ADR 0085](decisions/0085-product-frontends-separate-repository.md). Do not
+grow those surfaces in this crate.
+
 ## Local development
 
 1. Start the control plane with an ops port (default `9464`):

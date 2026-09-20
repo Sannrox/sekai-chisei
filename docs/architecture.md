@@ -2,7 +2,10 @@
 
 `sekai-chisei` is a governance control plane, not an agent runtime or workflow
 engine. Agent clients and domain executors stay replaceable; the control plane
-owns durable facts and the decisions that constrain an operation.
+owns durable facts and the decisions that constrain an operation. Product
+frontends are a separate repository on the public APIs; the in-process
+`/console/` shell stays a thin ops convenience
+([ADR 0085](decisions/0085-product-frontends-separate-repository.md)).
 
 ## Components
 

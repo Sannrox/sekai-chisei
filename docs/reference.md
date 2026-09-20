@@ -58,8 +58,8 @@ lives in the separate [research index](research/README.md).
   `chisei-plane` processes, wrong-plane rejection, and the authenticated hop.
 - [Docker](docker.md) — container dest-pair Combined boot, image `DB_PATH`
   hatch, and transport choices.
-- [Operator console](operator-console.md) — authenticated browser shell and
-  namespace context.
+- [Operator console](operator-console.md) — thin in-process ops shell.
+  Product frontends are a separate repository ([ADR 0085](decisions/0085-product-frontends-separate-repository.md)).
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan
   authoring, publication, inspection, dry-run resolution, and execution.
 - [Evaluation quality trends](evaluation-quality-trends.md) — authorized,

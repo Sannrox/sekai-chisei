@@ -174,7 +174,9 @@ The codebase already establishes the core direction:
   endpoints
 
 The next challenge is presenting and extending these primitives as one coherent,
-domain-neutral operating model.
+domain-neutral operating model. Product frontends that present that model are
+a separate repository; this project stays the control plane plus a thin ops
+shell ([ADR 0085](docs/decisions/0085-product-frontends-separate-repository.md)).
 
 ## Next Milestones
 
