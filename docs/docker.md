@@ -94,7 +94,10 @@ require TLS; the optional CA path only extends trust for a private test CA.
 | --- | --- | --- |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer used by the gateway for TCP gRPC; create it as a durable principal credential before switching transports |
 | `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` |
-| `DB_PATH` | `/data/sekai.db` | Database path in the shared data volume. File databases use SQLite WAL mode, so volume backups must include `-wal`/`-shm` sidecars or use `VACUUM INTO`. |
+| `SEKAI_DB_PATH` | unset in the image; compose sets `/data/sekai.db` | Combined Sekai SQLite dest. Must be paired with `CHISEI_DB_PATH`. |
+| `CHISEI_DB_PATH` | unset in the image; compose sets `/data/chisei.db` | Combined Chisei SQLite dest. Must be paired with `SEKAI_DB_PATH`. |
+| `DB_PATH` | `/data/sekai.db` (image) | Shared-store compatibility path. Combined refuses it unless `SEKAI_SHARED_STORE=1`. Dest-pair wins over this leftover when both are set. |
+| `SEKAI_SHARED_STORE` | unset | Set `1` to boot Combined on the image `DB_PATH` as one identity. Migration compatibility, not the compose default. |
 | `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
 | `CHISEI_GRPC_URL` | unset | Optional TCP override; when unset, the gateway uses the image's explicit `SEKAI_SOCKET=/data/sekai.sock` setting |
 | `OPENAI_API_KEY` | unset | API key for OpenAI upstream |
@@ -104,9 +107,18 @@ require TLS; the optional CA path only extends trust for a private test CA.
 
 ## UDS (default) vs TCP transport
 
+The image currently exports `DB_PATH=/data/sekai.db` and
+`SEKAI_SOCKET=/data/sekai.sock` only. Combined `sekai-chisei` refuses that
+shared file unless the runtime sets a dest-pair or `SEKAI_SHARED_STORE=1`.
+Checked-in compose sets `SEKAI_DB_PATH=/data/sekai.db` and
+`CHISEI_DB_PATH=/data/chisei.db` on the server. File databases use SQLite WAL
+mode, so volume backups must include both dest files plus `-wal`/`-shm`
+sidecars, or use `VACUUM INTO` on each.
+
 The default setup uses:
 
 - shared `sekai-data` volume mounted at `/data`
+- Combined dest-pair files at `/data/sekai.db` and `/data/chisei.db`
 - server socket at `/data/sekai.sock`
 - gateway target also set to `/data/sekai.sock` via `SEKAI_SOCKET`
 

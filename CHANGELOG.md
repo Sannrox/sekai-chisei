@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Operator first-success, Docker/compose, and configuration pages name
+  Combined dest-pair boot. `cargo run` does not load `.env`; a lone
+  `DB_PATH` needs `SEKAI_SHARED_STORE=1`. Offline `sekaictl` report,
+  compliance, and federation CLIs stay single-store readers (#1078).
 - Operator pages that name experimental or remove-classified RPCs now
   state the `SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs` gate.
 - Align agent instructions, operator docs, and comments with landed

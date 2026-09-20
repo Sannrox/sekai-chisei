@@ -120,9 +120,11 @@ recovery state.
 
 ## Persistence and backups
 
-SQLite file databases use WAL mode. A filesystem copy is not safe unless it
-includes the database plus its `-wal` and `-shm` sidecars from one consistent
-snapshot. Prefer SQLite's `VACUUM INTO` for an online logical backup.
+Combined SQLite dest-pair is two WAL databases (`SEKAI_DB_PATH` and
+`CHISEI_DB_PATH`). A filesystem copy is not safe unless it includes each
+database plus its `-wal` and `-shm` sidecars from one consistent snapshot.
+Prefer SQLite's `VACUUM INTO` for an online logical backup of each dest. A
+shared-compat `DB_PATH` exists only with `SEKAI_SHARED_STORE=1`.
 
 Also preserve state files configured for provider registry lifecycle, gateway
 usage recovery, and durable receipt, usage, and refusal recovery. Test

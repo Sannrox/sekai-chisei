@@ -89,7 +89,10 @@ eval sharing.
 
 ## Operator posture
 
-For multi-replica production, select a shared backend (`SEKAI_DB_BACKEND=postgres`
-and `DATABASE_URL`; see [configuration.md](configuration.md)). Do not run
-multiple writers against independent SQLite files and expect shared budgets or
-leases to converge. Process memory must not decide durable authorization.
+For multi-replica production, point every Combined replica at the same
+dest-pair (`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with
+`SEKAI_DB_BACKEND=postgres`; see [configuration.md](configuration.md)). A
+single `DATABASE_URL` is Combined shared-compat and needs
+`SEKAI_SHARED_STORE=1`. Do not run multiple writers against independent SQLite
+files and expect shared budgets or leases to converge. Process memory must not
+decide durable authorization.

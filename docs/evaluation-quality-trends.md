@@ -23,16 +23,20 @@ sekaictl report quality \
   --output reports/acme-quality.json
 ```
 
-The command reads the backend selected by `DB_PATH` or
-`SEKAI_DB_BACKEND=postgres`. With `SEKAI_CREDENTIAL`, the optional
-`--principal` or `SEKAI_PRINCIPAL` must match the authenticated principal.
-Without a credential, only the trusted local bootstrap principal is available.
-Namespace authorization is checked before receipts are listed.
+The command is a single-store reader: `DB_PATH` (default `./data/sekai.db`)
+or `SEKAI_DB_BACKEND=postgres` with `DATABASE_URL`. It does not read Combined
+dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH`. Receipts live in the Chisei store
+after relocate, so dest-pair Combined operators should call
+`GetQualityTrend` instead of pointing this CLI at one dest. Shared
+`SEKAI_SHARED_STORE=1` still matches the CLI. With `SEKAI_CREDENTIAL`, the
+optional `--principal` or `SEKAI_PRINCIPAL` must match the authenticated
+principal. Without a credential, only the trusted local bootstrap principal
+is available. Namespace authorization is checked before receipts are listed.
 
 Authenticated remote callers use the same window on `GetQualityTrend`.
 TypeScript `getQualityTrend` and Python `get_quality_trend` are thin facades
 over that RPC. They do not copy the reducer. CLI and RPC share one
-`semantic_digest` for the same authorized receipt set.
+`semantic_digest` only when they open the same Chisei identity.
 
 The window cannot exceed 366 days. More than 4,096 receipts fails the query
 instead of returning a partial dashboard. Open receipts remain harvestable

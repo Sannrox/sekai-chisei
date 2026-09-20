@@ -18,7 +18,7 @@ The read-only shell is an operator convenience surface. Console mutations
 1. Start the control plane with an ops port (default `9464`):
 
    ```bash
-   SEKAI_INSECURE=1 cargo run
+   SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
    ```
 
 2. Create a principal credential for authenticated access:
