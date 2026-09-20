@@ -141,11 +141,13 @@ Evidence is checked in as:
 
 ## Operator posture
 
-SQLite remains the default community backend. Select PostgreSQL with
-`SEKAI_DB_BACKEND=postgres` and `DATABASE_URL` for the reusable public control
-plane when you need shared multi-replica authority for the dual-backend
-surfaces above (see [configuration.md](configuration.md) and #238). Prefer
-SQLite when you need the SQLite-only paths listed under Outcome.
+SQLite remains the default community backend. Combined PostgreSQL opens
+`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
+A single `DATABASE_URL` is Combined shared-compat and needs
+`SEKAI_SHARED_STORE=1`. Use that dest-pair (or hatch) when you need shared
+multi-replica authority for the dual-backend surfaces above (see
+[configuration.md](configuration.md) and #238). Prefer SQLite when you need
+the SQLite-only paths listed under Outcome.
 
 Normal CI exercises the object-sync contract against SQLite. Run the ignored
 PostgreSQL conformance and concurrent exact-replay fixtures with an isolated TLS

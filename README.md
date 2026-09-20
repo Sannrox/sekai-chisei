@@ -69,13 +69,16 @@ cd sekai-chisei
 cp .env.example .env
 ```
 
-Start the control plane in one terminal:
+Start Combined in one terminal. `cargo run` reads the process environment
+only; it does not load `.env` (`sekaictl launch` does). Export the dest-pair
+from [`.env.example`](.env.example):
 
 ```bash
-SEKAI_INSECURE=1 cargo run
+SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 ```
 
-Combined mode is the default. To run the planes as separate processes, see
+A single `DB_PATH` is refused unless `SEKAI_SHARED_STORE=1`. To run the planes
+as separate processes, see
 [two-plane processes](docs/two-plane-processes.md).
 
 In another terminal, define a small service domain, seed facts, run a governed
@@ -269,7 +272,7 @@ cargo test-all
 Run an end-to-end example against a local server:
 
 ```bash
-SEKAI_INSECURE=1 cargo run
+SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 # in another terminal
 cargo run --example demo_client
 ```

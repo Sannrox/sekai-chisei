@@ -67,10 +67,11 @@ archives (`archive_lifecycle_records`), and reversible object reconciliation.
 PostgreSQL collectors serialize per namespace so concurrent release, hold,
 reconciliation, and archive attempts cannot double-delete a payload or lose a
 retaining obligation. The SQLite `run_retention` / `purge_old_records` /
-`archive_retained_records` helpers remain SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres`
-with a validated `DATABASE_URL` activates these reusable surfaces as the
-community runtime backend; it still does not add tenant, OIDC, OAuth, or
-identity capabilities.
+`archive_retained_records` helpers remain SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair
+`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` (or a single `DATABASE_URL` plus
+`SEKAI_SHARED_STORE=1`) activates these reusable surfaces as the community
+runtime backend; it still does not add tenant, OIDC, OAuth, or identity
+capabilities.
 
 Reusable coordination leases use a dedicated namespace-scoped API. Every
 acquisition receives a monotonically increasing generation and unique fencing
@@ -422,9 +423,11 @@ request idempotency, advance fencing generations monotonically, and record
 their audit row in the same transaction. Evidence identity, payload, lifecycle,
 projection, integrity, and audit records share their required transactions.
 
-PostgreSQL is a supported community runtime backend when `SEKAI_DB_BACKEND=postgres`
-and `DATABASE_URL` are set and migrations plus capability inventories validate
-before listeners bind. The reusable Sekai, Chisei, gateway governance, and
+PostgreSQL is a supported community runtime backend when
+`SEKAI_DB_BACKEND=postgres` and Combined dest-pair
+`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` are set (or a single
+`DATABASE_URL` with `SEKAI_SHARED_STORE=1`) and migrations plus capability
+inventories validate before listeners bind. The reusable Sekai, Chisei, gateway governance, and
 operations health surfaces advertise only after dual-backend conformance
 evidence is present (see [postgres-sekai-parity.md](postgres-sekai-parity.md)
 and [postgres-chisei-parity.md](postgres-chisei-parity.md)). Object-kind changes

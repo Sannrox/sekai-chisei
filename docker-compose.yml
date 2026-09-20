@@ -7,6 +7,10 @@ services:
       - ANTHROPIC_API_KEY
       - OPENAI_API_KEY
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      # Combined dest-pair. Image ENV still sets DB_PATH=/data/sekai.db;
+      # dest-pair wins for SQLite. A lone DB_PATH needs SEKAI_SHARED_STORE=1.
+      - SEKAI_DB_PATH=/data/sekai.db
+      - CHISEI_DB_PATH=/data/chisei.db
     # For Linux hosts without native host.docker.internal resolution,
     # use `extra_hosts` together with a reachable Ollama/socket target.
     extra_hosts:
@@ -39,7 +43,7 @@ services:
       #   CHISEI_GRPC_URL: http://server:50051
       #   SEKAI_SOCKET: ""
       #   SEKAI_CREDENTIAL: ${SEKAI_CREDENTIAL:?}
-      # On server (requires a principal credential already stored in DB_PATH):
+      # On server (credential rows live in the Sekai dest, SEKAI_DB_PATH):
       #   GRPC_PORT: 50051
       # Public 0.0.0.0 TCP also requires TLS certs/key, or SEKAI_ALLOW_PLAINTEXT=1
       # for an explicit trusted plaintext deployment, or SEKAI_BIND=127.0.0.1.

@@ -20,7 +20,10 @@ Contract id: `sekai.federation-profile/v1`.
 
 ## Operator workflow (two local processes)
 
-Assume process A uses `DB_PATH=data/site-a.db` and process B uses
+This walkthrough uses one Shared file per site (`SEKAI_SHARED_STORE=1`) so
+the Combined server and `sekaictl admin federation` open the same identity.
+The CLI reads `DB_PATH` / `DATABASE_URL` only; it does not follow Combined
+dest-pair. Assume process A uses `DB_PATH=data/site-a.db` and process B uses
 `DB_PATH=data/site-b.db`. Generate offline Ed25519 keys; only verifying keys
 enter the control plane.
 
@@ -210,7 +213,9 @@ sekaictl admin federation show-revocation-propagation ...
 ```
 
 Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as
-compliance export). A multi-tenant gRPC federation admin surface is a follow-up.
+compliance export). Combined dest-pair is a different process; this CLI still
+opens one Shared file. A multi-tenant gRPC federation admin surface is a
+follow-up.
 
 ## Runtime notes
 

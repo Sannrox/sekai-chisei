@@ -29,7 +29,10 @@ lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 
 1. Install the compiler pinned in `rust-toolchain.toml` (Rust 2024 edition).
 2. Clone the repository.
-3. Copy `.env.example` to `.env` if you need local overrides.
+3. Copy `.env.example` to `.env` if you need local overrides. Combined
+   `cargo run` does not load `.env`; export `SEKAI_DB_PATH` and
+   `CHISEI_DB_PATH` (or `SEKAI_SHARED_STORE=1` for a single file). See
+   [configuration](docs/configuration.md).
 4. Run the standard checks:
 
 ```bash
@@ -42,14 +45,19 @@ Those aliases in `.cargo/config.toml` are what CI runs: `fmt --all -- --check`,
 `clippy --workspace --all-targets --locked -- -D warnings`, and
 `test --workspace --locked`.
 
-Start a trusted local combined server with:
+Start a trusted local Combined server with the dest-pair:
 
 ```bash
-SEKAI_INSECURE=1 cargo run
+SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 ```
 
-Combined mode is the default. Separate `sekai-plane` and `chisei-plane`
-processes are documented in [two-plane processes](docs/two-plane-processes.md).
+Separate `sekai-plane` and `chisei-plane` processes are documented in
+[two-plane processes](docs/two-plane-processes.md).
+
+Each delivered Issue is one lane: claim with
+`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`
+before implementing, then work in `.worktrees/issue-<issue>`. See
+[Parallel delivery lanes](docs/project-operating-system.md#parallel-delivery-lanes).
 
 The build vendors `protoc`; a system installation is not required.
 

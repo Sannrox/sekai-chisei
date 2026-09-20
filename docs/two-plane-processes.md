@@ -11,7 +11,7 @@ and still opens the typed two-store contract. The ontology CLI keeps the
 | --- | --- | --- | --- |
 | `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL` (or legacy `DB_PATH` / `DATABASE_URL`) | Sekai store only | `SekaiService` |
 | `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL` | Chisei store only | `ChiseiService` |
-| `sekai-chisei` | dest-pair or shared compatibility | Sekai store (combined) | both |
+| `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs). Shared one-identity boot only with `SEKAI_SHARED_STORE=1` | Sekai store (combined) | both |
 
 A Sekai process refuses `CHISEI_DB_PATH` / `CHISEI_DATABASE_URL`. A Chisei
 process refuses `SEKAI_DB_PATH` / `SEKAI_DATABASE_URL`. Each physical store is

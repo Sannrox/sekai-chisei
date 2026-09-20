@@ -59,9 +59,10 @@ are copied again and re-validated.
 
 ## After the fence
 
-`DB_PATH` / `DATABASE_URL` alone refuse to start a writer, including
-`gateway-report`. Set `SEKAI_DB_PATH` and `CHISEI_DB_PATH` (or two
-PostgreSQL URLs) and start combined mode against the destination pair.
+Combined already refuses a lone `DB_PATH` / `DATABASE_URL` unless
+`SEKAI_SHARED_STORE=1`. After the fence, that hatch still cannot start a
+writer (including `gateway-report`). Set `SEKAI_DB_PATH` and `CHISEI_DB_PATH`
+(or two PostgreSQL URLs) and start Combined against the destination pair.
 
 Rollback after the fence is restore-both from the pre-fence snapshot, not a
 mixed pair.

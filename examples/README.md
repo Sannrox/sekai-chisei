@@ -51,10 +51,11 @@ local smoke test.
 
 ### Run it
 
-Start the server in one terminal:
+Start Combined in one terminal. `cargo run` does not load `.env`; export the
+dest-pair from [`.env.example`](../.env.example):
 
 ```bash
-SEKAI_INSECURE=1 cargo run
+SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 ```
 
 Run the demo in another:

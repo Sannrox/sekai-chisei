@@ -10,12 +10,12 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
+| `DB_PATH` | `./data/sekai.db` when the shared-store hatch is set and dest-pair is unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
 | `SEKAI_SHARED_STORE` | unset | Set `1` to boot Combined as one physical identity. Migration compatibility, not the default. |
 | `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
 | `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
 | `SEKAI_STORE_PEER` | unset | Read-only generation peer for an owned-plane or Shared open of a stamped dest |
-| `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; required when `SEKAI_DB_BACKEND=postgres` without destination URLs |
+| `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; Combined shared-compat also needs `SEKAI_SHARED_STORE=1` |
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
 | `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
 | `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | Process connection-pool budget. Shared uses the full value. Combined Split divides it across the two stores (16 → 8+8). Also sizes persistent SQLite pools opened through the runtime backend. |
@@ -74,10 +74,11 @@ provenance issuance; they never fall back to a wider activation window.
 refuses a pair that resolves to the same file, including hardlinks to one
 inode, or the same database. Partial destination
 configuration is refused; a second file is never invented from one path.
-`DB_PATH` and `DATABASE_URL` remain migration compatibility until
-[store relocation](store-relocation.md) copies Chisei families and raises
-the writer fence. After the fence a single-store writer refuses to start;
-set the destination pair instead.
+Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`.
+`DB_PATH` and `DATABASE_URL` with that hatch remain migration compatibility
+until [store relocation](store-relocation.md) copies Chisei families and
+raises the writer fence. After the fence even the hatch cannot start a
+shared writer; set the destination pair instead.
 
 The `sekai-plane` and `chisei-plane` binaries each open only their own store. See
 [two-plane processes](two-plane-processes.md). Combined mode still uses the
@@ -94,9 +95,10 @@ cannot be mixed with PostgreSQL destination URLs. The public
 supported reusable surfaces, and (for PostgreSQL) the applied migration version.
 PostgreSQL implements the reusable community surface set—Sekai, Chisei, gateway
 governance, and operations health—with shared SQLite/PostgreSQL conformance for
-the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts the
-public control plane against PostgreSQL when `DATABASE_URL` is set and
-migrations/capabilities validate. Some public paths remain SQLite-only and fail
+the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combined PostgreSQL on
+`SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL`. A single `DATABASE_URL` starts
+Combined only with `SEKAI_SHARED_STORE=1`, and only when migrations and
+capabilities validate. Some public paths remain SQLite-only and fail
 closed on community Postgres (audited ontology mutations, query-time ontology
 entailment, dataset row append/query through `RuntimeDb`, online permit
 redeem/reconcile, Gunshi allocation state, federation peer tables, and
