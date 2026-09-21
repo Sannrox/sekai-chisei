@@ -454,6 +454,7 @@ impl ChiseiServiceImpl {
             evidence_references: vec![],
             memory_references: vec![],
             memory_holdouts: vec![],
+            pinned_learning: None,
             memory_actor: context_actor,
             memory_assignment_id: String::new(),
             memory_token_budget: 512,

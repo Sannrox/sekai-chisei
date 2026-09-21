@@ -7611,6 +7611,364 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
     );
 }
 
+fn learning_pin_input(
+    request_id: &str,
+    namespace: &str,
+    pin: Option<(&str, &str)>,
+) -> PlanExecutionRequest {
+    PlanExecutionRequest {
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            spec: "review the retry path".into(),
+            preferred_model: "native-default".into(),
+            preferred_runtime: "kiro".into(),
+            user_id: "user-1".into(),
+            max_tokens: 512,
+            learning_pin: pin.map(|(learning_id, candidate_digest)| LearningPin {
+                learning_id: learning_id.into(),
+                candidate_digest: candidate_digest.into(),
+            }),
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    }
+}
+
+fn record_payments_learning(
+    svc: &ChiseiServiceImpl,
+    source_request_id: &str,
+    external_text_allowed: bool,
+) {
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "target-1".into(),
+            kind: "component".into(),
+            name: "checkout".into(),
+            namespace: "payments".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    crate::sekai::learning::record_learning(
+        svc.db.runtime(),
+        &crate::sekai::schema::SchemaRegistry::new(),
+        &std::collections::HashMap::from([
+            ("id".into(), "learning-1".into()),
+            ("target_id".into(), "target-1".into()),
+            ("title".into(), "Validate retries".into()),
+            ("prevention".into(), "Check the prior record first".into()),
+            (
+                "reasoning".into(),
+                "The retry repeated a side effect".into(),
+            ),
+            ("source_request_id".into(), source_request_id.into()),
+            ("score".into(), "72".into()),
+            ("passed".into(), "false".into()),
+            ("task_class".into(), "reasoning".into()),
+            ("model".into(), "judge-model".into()),
+            ("producer".into(), "scoring-job".into()),
+            ("status".into(), "candidate".into()),
+        ]),
+        "worker-1",
+    )
+    .unwrap();
+    if external_text_allowed {
+        // The operator-approved egress allowlist is part of the approved digest.
+        let mut learning = svc.db.runtime().get_object("learning-1").unwrap().unwrap();
+        learning.properties.insert(
+            crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
+            "title,prevention".into(),
+        );
+        svc.db.runtime().update_object(&learning).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
+    use crate::chisei::learning_change as learning;
+    use sha2::{Digest, Sha256};
+
+    let svc = memory_service();
+    let first = svc
+        .plan_execution(Request::new(learning_pin_input(
+            "verified-op",
+            "payments",
+            None,
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let first_receipt = svc
+        .db
+        .runtime()
+        .get_operation_receipt(&first.plan_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        first.learning_references.is_empty(),
+        "an unpinned plan cites no learning"
+    );
+    assert!(!first.enriched_spec.contains("Governed learning"));
+
+    // The first operation's receipt is the verification evidence the learning
+    // is bound to; its request is the learning's source.
+    let evidence = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&first_receipt).unwrap())
+    );
+    record_payments_learning(&svc, "verified-op", true);
+    let store = svc.db.clone();
+    learning::propose_change(
+        &store,
+        "operator",
+        &learning::ProposeLearningChange {
+            namespace: "payments".into(),
+            learning_id: "learning-1".into(),
+            evidence_digest: evidence.clone(),
+        },
+        1_000,
+    )
+    .unwrap();
+    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    let active =
+        learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+
+    let pin = ("learning-1", active.candidate_digest.as_str());
+    let second = svc
+        .plan_execution(Request::new(learning_pin_input(
+            "next-op",
+            "payments",
+            Some(pin),
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+
+    // Context only: the learning enriches the spec and changes nothing else.
+    assert!(second.enriched_spec.contains(
+        "[Governed learning - untrusted data]\nValidate retries: Check the prior record first"
+    ));
+    assert!(!second.enriched_spec.contains("side effect"));
+    assert_eq!(second.resolved_runtime, first.resolved_runtime);
+    assert_eq!(second.resolved_model, first.resolved_model);
+    assert_eq!(second.tools, first.tools);
+    assert_eq!(
+        second
+            .steps
+            .iter()
+            .find(|step| step.step == "learning_pin")
+            .map(|step| step.action.as_str()),
+        Some("enrich")
+    );
+    let reference = &second.learning_references[0];
+    assert_eq!(reference.learning_id, "learning-1");
+    assert_eq!(reference.candidate_digest, active.candidate_digest);
+    assert_eq!(reference.evidence_digest, evidence);
+    assert_eq!(reference.source_request_id, "verified-op");
+
+    // Receipt lineage: operation -> verification -> learning -> plan.
+    let receipt = svc
+        .db
+        .runtime()
+        .get_operation_receipt(&second.plan_id)
+        .unwrap()
+        .unwrap();
+    let context = receipt
+        .events
+        .iter()
+        .find(|event| event.attributes.contains_key("learning_id"))
+        .expect("the plan receipt cites the pinned learning");
+    assert_eq!(context.attributes["learning_change_id"], active.change_id);
+    assert_eq!(
+        context.attributes["learning_candidate_digest"],
+        active.candidate_digest
+    );
+    assert_eq!(context.attributes["learning_evidence_digest"], evidence);
+    assert_eq!(
+        context.attributes["learning_source_request_id"],
+        "verified-op"
+    );
+    let cited = |kind: &str| {
+        context
+            .references
+            .iter()
+            .find(|reference| reference.kind == kind)
+            .unwrap_or_else(|| panic!("missing {kind} reference"))
+    };
+    assert_eq!(
+        cited("governed_learning").reference,
+        format!("learning:learning-1@{}", active.candidate_digest)
+    );
+    assert_eq!(
+        cited("learning_verification_evidence").reference,
+        format!("evidence:{evidence}")
+    );
+    assert_eq!(
+        cited("learning_source_request").reference,
+        "request:verified-op"
+    );
+    assert_eq!(
+        receipt.completeness().errors,
+        first_receipt.completeness().errors,
+        "citing a learning adds no structural receipt problem beyond an unpinned plan"
+    );
+    let recorded = serde_json::to_string(&receipt).unwrap();
+    assert!(
+        !recorded.contains("Check the prior record first"),
+        "the receipt cites the learning by digest and never copies its text"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_learning_pin_fails_closed_with_one_error() {
+    use crate::chisei::learning_change as learning;
+
+    let svc = memory_service();
+    record_payments_learning(&svc, "verified-op", true);
+    let store = svc.db.clone();
+    let proposed = learning::propose_change(
+        &store,
+        "operator",
+        &learning::ProposeLearningChange {
+            namespace: "payments".into(),
+            learning_id: "learning-1".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+        },
+        1_000,
+    )
+    .unwrap();
+    let digest = proposed.candidate_digest.clone();
+    let plan = |namespace: &'static str, pin: Option<(&'static str, &str)>| {
+        svc.plan_execution(Request::new(learning_pin_input("req", namespace, pin)))
+    };
+    let unavailable = |error: Status| {
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "learning pin is unavailable");
+    };
+
+    // Proposed, then approved, but not active.
+    unavailable(
+        plan("payments", Some(("learning-1", &digest)))
+            .await
+            .unwrap_err(),
+    );
+    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    unavailable(
+        plan("payments", Some(("learning-1", &digest)))
+            .await
+            .unwrap_err(),
+    );
+    learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+    assert!(
+        plan("payments", Some(("learning-1", &digest)))
+            .await
+            .is_ok()
+    );
+
+    // Wrong digest, unknown learning, empty pin, and another namespace are
+    // indistinguishable.
+    let other = format!("sha256:{}", "b".repeat(64));
+    unavailable(
+        plan("payments", Some(("learning-1", &other)))
+            .await
+            .unwrap_err(),
+    );
+    unavailable(
+        plan("payments", Some(("missing", &digest)))
+            .await
+            .unwrap_err(),
+    );
+    unavailable(plan("payments", Some(("", ""))).await.unwrap_err());
+    unavailable(
+        plan("elsewhere", Some(("learning-1", &digest)))
+            .await
+            .unwrap_err(),
+    );
+
+    // Rollback disables it.
+    learning::rollback_change(&store, "operator", "payments", "learning-1", 4_000).unwrap();
+    unavailable(
+        plan("payments", Some(("learning-1", &digest)))
+            .await
+            .unwrap_err(),
+    );
+
+    // A principal without namespace access cannot inject a learning at all.
+    learning::propose_change(
+        &store,
+        "operator",
+        &learning::ProposeLearningChange {
+            namespace: "payments".into(),
+            learning_id: "learning-1".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+        },
+        5_000,
+    )
+    .unwrap();
+    learning::approve_change(&store, "reviewer", "payments", "learning-1", 6_000).unwrap();
+    learning::activate_change(&store, "operator", "payments", "learning-1", 7_000).unwrap();
+    let mut request = Request::new(learning_pin_input(
+        "req",
+        "payments",
+        Some(("learning-1", &digest)),
+    ));
+    request
+        .metadata_mut()
+        .insert("x-principal", "mallory".parse().unwrap());
+    let denied = svc.plan_execution(request).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert!(!denied.message().contains("learning"));
+}
+
+#[tokio::test]
+async fn a_pin_the_selected_route_may_not_receive_fails_closed() {
+    use crate::chisei::learning_change as learning;
+
+    let svc = memory_service();
+    record_payments_learning(&svc, "verified-op", false);
+    let store = svc.db.clone();
+    let proposed = learning::propose_change(
+        &store,
+        "operator",
+        &learning::ProposeLearningChange {
+            namespace: "payments".into(),
+            learning_id: "learning-1".into(),
+            evidence_digest: format!("sha256:{}", "a".repeat(64)),
+        },
+        1_000,
+    )
+    .unwrap();
+    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+
+    // The learning is active and correctly pinned, but its text has no
+    // external-egress allowlist and the default route is an external provider.
+    let error = svc
+        .plan_execution(Request::new(learning_pin_input(
+            "req",
+            "payments",
+            Some(("learning-1", &proposed.candidate_digest)),
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "learning pin is unavailable");
+    assert!(
+        svc.plan_execution(Request::new(learning_pin_input("req-2", "payments", None)))
+            .await
+            .is_ok(),
+        "the same request without a pin still plans"
+    );
+}
+
 #[tokio::test]
 async fn plan_execution_exposes_and_audits_egress_decisions() {
     let svc = memory_service();
