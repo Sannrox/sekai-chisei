@@ -4,6 +4,10 @@
 `EvaluateObjectSet` evaluates that descriptor through the same authorized
 `ListObjects` and one-hop traverse paths already used by generic reads.
 
+This RPC is `stable` on the wire and MCP-allowlisted. It is **not** part of
+the advertised `sekaictl ontology` / typed SDK product loop. See
+[integration-contract.md](integration-contract.md).
+
 The descriptor names a namespace, object kind, and the published definition
 digest it is bound to. v1 may include at most four equality or comparison
 property filters, one `order_by`, a documented limit, and optional one-hop

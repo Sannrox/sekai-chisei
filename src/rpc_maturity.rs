@@ -195,6 +195,42 @@ impl RpcMaturityTable {
     }
 }
 
+/// Public RPCs `sekaictl ontology apply|seed|run|first-run` actually invokes.
+/// This is the advertised define → seed → plan → receipt loop, not the full
+/// stable wire set.
+pub const ADVERTISED_PRODUCT_LOOP_RPCS: &[&str] = &[
+    "CreateSchemaType",
+    "CreateOntologyClass",
+    "CreateOntologyRelation",
+    "CreateObject",
+    "CreateLink",
+    "PlanExecution",
+    "ExecutePlanStream",
+    "GetOperationReceipt",
+];
+
+/// Additional typed SDK helpers that are not part of `sekaictl ontology` but
+/// are called by `sdk/` facades.
+pub const ADVERTISED_SDK_TYPED_RPCS: &[&str] = &["GetQualityTrend"];
+
+/// Community PostgreSQL fails closed for these product-loop RPCs (audited
+/// ontology mutations). They stay in the advertised SQLite loop and join
+/// the product-loop Postgres Issue rather than the dual-backend set.
+pub const POSTGRES_FAIL_CLOSED_PRODUCT_LOOP_RPCS: &[&str] =
+    &["CreateOntologyClass", "CreateOntologyRelation"];
+
+pub fn advertised_product_loop_rpcs() -> &'static [&'static str] {
+    ADVERTISED_PRODUCT_LOOP_RPCS
+}
+
+pub fn advertised_sdk_typed_rpcs() -> &'static [&'static str] {
+    ADVERTISED_SDK_TYPED_RPCS
+}
+
+pub fn postgres_fail_closed_product_loop_rpcs() -> &'static [&'static str] {
+    POSTGRES_FAIL_CLOSED_PRODUCT_LOOP_RPCS
+}
+
 fn rpc_key(service: &str, rpc: &str) -> String {
     format!("{service}.{rpc}")
 }
@@ -456,6 +492,27 @@ mod tests {
             .collect();
         assert_eq!(docs, fixture);
         assert_eq!(docs, proto_rpc_keys().expect("proto keys"));
+    }
+
+    #[test]
+    fn advertised_product_loop_rpcs_are_stable() {
+        let table = RpcMaturityTable::load().expect("maturity table");
+        for rpc in advertised_product_loop_rpcs()
+            .iter()
+            .chain(advertised_sdk_typed_rpcs())
+        {
+            assert_eq!(
+                table.classification_of(rpc),
+                Some(RpcClassification::Stable),
+                "advertised loop rpc {rpc} must stay invokable on the default build"
+            );
+        }
+        for rpc in postgres_fail_closed_product_loop_rpcs() {
+            assert!(
+                advertised_product_loop_rpcs().contains(rpc),
+                "{rpc} is listed fail-closed on Postgres but is not in the advertised loop"
+            );
+        }
     }
 
     #[test]

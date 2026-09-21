@@ -1,10 +1,20 @@
-//! Supported integration-contract map (#834).
+//! Supported integration-contract map (#834 / #1095).
 
+use sekai_chisei::rpc_maturity::{
+    RpcClassification, RpcMaturityTable, advertised_product_loop_rpcs, advertised_sdk_typed_rpcs,
+    postgres_fail_closed_product_loop_rpcs,
+};
+use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 
 const DOC: &str = include_str!("../docs/integration-contract.md");
 const SEKAI_PROTO: &str = include_str!("../proto/sekai.proto");
 const CHISEI_PROTO: &str = include_str!("../proto/chisei.proto");
+const ONTOLOGY_CLI: &str = include_str!("../src/ontology_product_cli.rs");
+const SDK_TS: &str = include_str!("../sdk/typescript/client.ts");
+const SDK_PY: &str = include_str!("../sdk/python/sekai_client.py");
+const RUNTIME_DB: &str = include_str!("../src/db/runtime_db.rs");
 
 fn rows() -> Vec<Vec<String>> {
     let start = DOC
@@ -123,12 +133,154 @@ fn gaps_are_named_and_not_claimed_as_shipped() {
 
 #[test]
 fn define_query_invoke_receipt_path_is_documented() {
-    for step in [
-        "CreateOntologyClass",
-        "ListObjects",
-        "SubmitActionInstance",
-        "GetOperationReceipt",
+    for step in advertised_product_loop_rpcs() {
+        assert!(DOC.contains(step), "advertised loop missing {step}");
+    }
+}
+
+fn contract_rpc_name(rpc: &str) -> Option<&str> {
+    let trimmed = rpc.trim_matches('`');
+    if trimmed == "—" || trimmed.contains("sekaictl") || trimmed.contains("sekai-mcp") {
+        return None;
+    }
+    if trimmed.starts_with("HTTP ") || trimmed.contains("POST /") || trimmed.contains("goldens") {
+        return None;
+    }
+    if !trimmed.contains("Service.") {
+        return None;
+    }
+    trimmed.rsplit('.').next()
+}
+
+fn source_calls_rpc(source: &str, rpc: &str) -> bool {
+    let snake = rpc
+        .chars()
+        .enumerate()
+        .flat_map(|(i, ch)| {
+            if i > 0 && ch.is_uppercase() {
+                vec!['_', ch.to_ascii_lowercase()]
+            } else {
+                vec![ch.to_ascii_lowercase()]
+            }
+        })
+        .collect::<String>();
+    source.contains(rpc) || source.contains(&snake) || source.contains(&format!("\"{rpc}\""))
+}
+
+#[test]
+fn supported_rpc_rows_match_maturity_and_cli_sdk_greps() {
+    let table = RpcMaturityTable::load().expect("maturity table");
+    let loop_rpcs: BTreeSet<&str> = advertised_product_loop_rpcs().iter().copied().collect();
+    let sdk_extra: BTreeSet<&str> = advertised_sdk_typed_rpcs().iter().copied().collect();
+    let mut advertised = BTreeSet::new();
+    for row in rows() {
+        let status = row[1].clone();
+        let Some(rpc) = contract_rpc_name(&row[3]).map(str::to_string) else {
+            continue;
+        };
+        let entry = table
+            .entries
+            .iter()
+            .find(|entry| entry.rpc == rpc)
+            .unwrap_or_else(|| panic!("contract RPC {rpc} missing from maturity table"));
+        match status.as_str() {
+            "supported" => {
+                assert_eq!(
+                    entry.classification,
+                    RpcClassification::Stable,
+                    "supported contract row {rpc} must be classified stable"
+                );
+                if loop_rpcs.contains(rpc.as_str()) || sdk_extra.contains(rpc.as_str()) {
+                    advertised.insert(rpc);
+                    continue;
+                }
+                assert!(
+                    rpc == "DiscoverCapabilities",
+                    "supported contract RPC {rpc} is not in the sekaictl/SDK advertised loop"
+                );
+            }
+            "experimental" => {
+                assert_eq!(
+                    entry.classification,
+                    RpcClassification::Experimental,
+                    "experimental contract row {rpc} must be classified experimental"
+                );
+            }
+            _ => {}
+        }
+    }
+    for rpc in advertised_product_loop_rpcs() {
+        assert!(
+            advertised.contains(*rpc),
+            "advertised loop rpc {rpc} missing from supported contract rows"
+        );
+        let in_cli = source_calls_rpc(ONTOLOGY_CLI, rpc);
+        let in_sdk = source_calls_rpc(SDK_TS, rpc) || source_calls_rpc(SDK_PY, rpc);
+        assert!(
+            in_cli || in_sdk,
+            "advertised loop rpc {rpc} is not called by sekaictl ontology or typed SDK helpers"
+        );
+        let consumer = table
+            .entries
+            .iter()
+            .find(|entry| entry.rpc == *rpc)
+            .map(|entry| entry.consumer.as_str())
+            .unwrap_or("");
+        if in_cli {
+            assert!(
+                consumer.split(',').any(|part| part.trim() == "cli"),
+                "{rpc} is called by sekaictl but maturity consumer is {consumer:?}"
+            );
+        }
+        if in_sdk {
+            assert!(
+                consumer.split(',').any(|part| part.trim() == "sdk"),
+                "{rpc} is called by the typed SDK but maturity consumer is {consumer:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn postgres_fail_closed_loop_rpcs_leave_the_dual_backend_set() {
+    for rpc in postgres_fail_closed_product_loop_rpcs() {
+        let needle = match *rpc {
+            "CreateOntologyClass" => {
+                "upsert_ontology_class_with_audit is unavailable on the PostgreSQL community runtime"
+            }
+            "CreateOntologyRelation" => {
+                "upsert_ontology_relation_with_audit is unavailable on the PostgreSQL community runtime"
+            }
+            other => panic!("unmapped fail-closed loop rpc {other}"),
+        };
+        assert!(
+            RUNTIME_DB.contains(needle),
+            "RuntimeDb must fail closed for {rpc}: missing {needle}"
+        );
+    }
+    let coverage_start = DOC
+        .find("## Language and backend coverage")
+        .expect("coverage section");
+    let coverage = &DOC[coverage_start..];
+    assert!(
+        coverage.contains("Ontology apply (class / relation)") && coverage.contains("fail-closed"),
+        "integration-contract must not advertise PostgreSQL yes for ontology apply"
+    );
+    assert!(
+        !coverage.contains("| Object read / list |"),
+        "integration-contract must not advertise Object read/list as the product-loop query"
+    );
+}
+
+#[test]
+fn advertised_loop_sources_exist() {
+    for rel in [
+        "src/ontology_product_cli.rs",
+        "sdk/typescript/client.ts",
+        "sdk/python/sekai_client.py",
+        "src/db/runtime_db.rs",
     ] {
-        assert!(DOC.contains(step), "loop missing {step}");
+        assert!(Path::new(rel).exists(), "missing {rel}");
+        assert!(!fs::read_to_string(rel).unwrap().is_empty(), "{rel} empty");
     }
 }

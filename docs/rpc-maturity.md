@@ -5,6 +5,18 @@ public `SekaiService` and `ChiseiService` RPC. It does not invent invocation
 authority. Live authorization, receipts, and dual-backend inventories remain
 the system of record.
 
+The **advertised** product catalog is the define → seed → plan → receipt loop
+that `sekaictl ontology` and the typed SDK helpers actually call
+(`CreateSchemaType`, `CreateOntologyClass`, `CreateOntologyRelation`,
+`CreateObject`, `CreateLink`, `PlanExecution`, `ExecutePlanStream`,
+`GetOperationReceipt`). Other `stable` RPCs stay invokable on the default
+build; they are not “supported” integration sentences unless those callers
+exist. Experimental and `remove` RPCs stay behind
+`SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs`. Community PostgreSQL fails
+closed for audited ontology mutations (`CreateOntologyClass`,
+`CreateOntologyRelation`); those stay in the SQLite loop and join the
+product-loop Postgres Issue rather than the dual-backend set.
+
 Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures/rpc_maturity/v1.json)
 (`sekai.rpc-maturity/v1`). A test compares this page and that fixture with
 `proto/sekai.proto` and `proto/chisei.proto`.
@@ -71,7 +83,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.ClassifyDefinitionRevisionCompatibility` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExecuteDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.CreateObject` | `sekai.graph` | yes | sdk, host | `stable` |
+| `SekaiService.CreateObject` | `sekai.graph` | yes | sdk, host, cli | `stable` |
 | `SekaiService.GetObject` | `sekai.graph` | yes | host, example | `stable` |
 | `SekaiService.UpdateObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.DeleteObject` | `sekai.graph` | yes | none | `stable` |
@@ -97,7 +109,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.FindByProperty` | `sekai.graph` | yes | none | `stable` |
-| `SekaiService.CreateLink` | `sekai.graph` | yes | sdk | `stable` |
+| `SekaiService.CreateLink` | `sekai.graph` | yes | sdk, cli | `stable` |
 | `SekaiService.DeleteLink` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinks` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinkedObjects` | `sekai.graph` | yes | none | `experimental` |
@@ -109,14 +121,14 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.GetGovernedFactVersion` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ResolveInvariantSet` | `sekai.graph, sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.ListSchemaTypes` | `sekai.graph` | yes | none | `stable` |
-| `SekaiService.CreateSchemaType` | `sekai.graph` | yes | sdk | `stable` |
+| `SekaiService.CreateSchemaType` | `sekai.graph` | yes | sdk, cli | `stable` |
 | `SekaiService.ListOntologyClasses` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | none | `experimental` |
-| `SekaiService.CreateOntologyClass` | `sekai.ontology-definitions` | yes | none | `stable` |
+| `SekaiService.CreateOntologyClass` | `sekai.ontology-definitions` | yes | cli | `stable` |
 | `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.ListOntologyRelations` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.GetOntologyRelation` | `sekai.ontology-definitions` | yes | none | `experimental` |
-| `SekaiService.CreateOntologyRelation` | `sekai.ontology-definitions` | yes | none | `stable` |
+| `SekaiService.CreateOntologyRelation` | `sekai.ontology-definitions` | yes | cli | `stable` |
 | `SekaiService.DeleteOntologyRelation` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
@@ -199,12 +211,12 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
-| `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |
-| `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk | `stable` |
+| `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk, cli | `stable` |
+| `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.PlanContentExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ExecuteContentPlanStream` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ReportOperationEvent` | `chisei.execution` | yes | sdk | `stable` |
-| `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host | `stable` |
+| `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host, cli | `stable` |
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ListKiokuCandidates` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ReviewKiokuMemory` | `chisei.learning` | yes | none | `remove` |
