@@ -24,7 +24,7 @@ pub const MATURITY_DOCS: &str = include_str!("../docs/rpc-maturity.md");
 pub const EXPERIMENTAL_ENV: &str = "SEKAI_EXPERIMENTAL_RPCS";
 pub const EXPERIMENTAL_FEATURE: &str = "experimental-rpcs";
 pub const EXPERIMENTAL_CAPABILITY: &str = "sekai.rpc.experimental";
-pub const STABLE_LIMIT: usize = 60;
+pub const STABLE_LIMIT: usize = 63;
 
 const EXPERIMENTAL_MESSAGE: &str =
     "rpc is experimental; enable SEKAI_EXPERIMENTAL_RPCS=1 or the experimental-rpcs build feature";
@@ -441,7 +441,7 @@ mod tests {
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
         assert_eq!(table.entries.len(), 171);
-        assert_eq!(table.stable_rpcs().len(), 60);
+        assert_eq!(table.stable_rpcs().len(), 63);
         assert!(
             table
                 .entries

@@ -115,8 +115,8 @@ Freshness comes from receipt start/completion times and the manifest's exact
 evaluation time. The report does not replace those timestamps with query time.
 
 Execution replay, restart recovery, and durable cancellation remain owned by
-`ExecuteEvaluationManifest` and `CancelEvaluationExecution` (classified
-`experimental`; require `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
+`ExecuteEvaluationManifest` (`stable`) and `CancelEvaluationExecution`
+(`experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
 feature; see [rpc-maturity.md](rpc-maturity.md)). The report only
 reconstructs their current canonical receipts. A restarted execution can add
 the missing immutable step and terminal events; a later query then projects

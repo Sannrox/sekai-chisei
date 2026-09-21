@@ -22,7 +22,7 @@ backend and consumer evidence. The table in [rpc-maturity.md](../rpc-maturity.md
 is a projection, not a second authority.
 
 - `stable` requires a real (non-fixture) backend. The default public loop and
-  its required siblings stay at most 60 RPCs.
+  its required siblings stay at most 63 RPCs (see Amendments).
 - `experimental` RPCs keep their wire contract, authorization, and receipts.
   Invocation requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
   Cargo feature. Both are off by default.
@@ -53,5 +53,20 @@ Security review and SDK generation shrink to the stable set.
 ## Validation
 
 A deterministic test compares the checked-in table and `docs/rpc-maturity.md`
-with both proto services, asserts at most 60 stable RPCs, and proves the
+with both proto services, asserts at most 63 stable RPCs, and proves the
 default gate cannot reach an experimental RPC.
+
+## Amendments
+
+- 2026-09-21, Issue [#1090](https://github.com/Sannrox/sekai-chisei/issues/1090):
+  the stable ceiling moves from 60 to 63. `PutEvaluationPlan`,
+  `ResolveEvaluationPlan`, and `ExecuteEvaluationManifest` become `stable`
+  because `sekaictl admin evaluation plan` is a real consumer that publishes,
+  resolves, executes, and compares receipted evaluations. The ceiling is a
+  ratchet, not a target: it rises only in the change that adds a consumer
+  proof for each promoted RPC and only by the number promoted, so a stable RPC
+  still needs a real backend plus a consumer or a required-sibling reason.
+  `CancelEvaluationExecution` and `GetGovernedFactVersion` stay `experimental`:
+  no default verb cancels, and `validate` reads exact invariant versions
+  through `GetGovernedFactVersion` only without `--offline`, while `apply`
+  remains the authoritative publication check.

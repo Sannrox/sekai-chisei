@@ -1025,19 +1025,22 @@ pub fn cancellation_requested(receipt: &OperationReceipt) -> bool {
     })
 }
 
-/// Reconstruct one execution exclusively from its canonical receipt and
-/// immutable manifest/index bindings.
-pub fn projection_from_receipt(
-    manifest: &ResolvedEvaluationManifest,
-    index: &EvaluationExecutionIndex,
+/// Deterministic operation identity of the one execution a manifest digest
+/// can have. The digest is the execution idempotency key.
+pub fn execution_operation_id(manifest_digest: &str) -> String {
+    format!(
+        "evaluation-execution:{}",
+        manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_digest)
+    )
+}
+
+/// Step receipts (ordered by node) and the terminal gate decision recorded on
+/// one evaluation execution receipt. The decision is absent while running.
+pub fn step_and_gate_evidence(
     receipt: &OperationReceipt,
-) -> Result<EvaluationExecutionProjection, String> {
-    if receipt.operation_id != index.operation_id
-        || receipt.namespace != index.namespace
-        || receipt.operation_class != EXECUTION_OPERATION_CLASS
-    {
-        return Err("evaluation execution receipt binding is invalid".into());
-    }
+) -> Result<(Vec<EvaluationStepReceipt>, Option<EvaluationGateDecision>), String> {
     let mut steps = receipt
         .events
         .iter()
@@ -1057,6 +1060,23 @@ pub fn projection_from_receipt(
                 .map_err(|error| format!("invalid evaluation gate decision: {error}"))
         })
         .transpose()?;
+    Ok((steps, decision))
+}
+
+/// Reconstruct one execution exclusively from its canonical receipt and
+/// immutable manifest/index bindings.
+pub fn projection_from_receipt(
+    manifest: &ResolvedEvaluationManifest,
+    index: &EvaluationExecutionIndex,
+    receipt: &OperationReceipt,
+) -> Result<EvaluationExecutionProjection, String> {
+    if receipt.operation_id != index.operation_id
+        || receipt.namespace != index.namespace
+        || receipt.operation_class != EXECUTION_OPERATION_CLASS
+    {
+        return Err("evaluation execution receipt binding is invalid".into());
+    }
+    let (steps, decision) = step_and_gate_evidence(receipt)?;
     let cancellation_requested = cancellation_requested(receipt);
     if let Some(decision) = &decision
         && (decision.reason_code == REASON_EXECUTION_CANCELLED) != cancellation_requested

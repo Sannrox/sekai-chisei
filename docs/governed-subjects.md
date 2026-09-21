@@ -3,8 +3,7 @@
 `EvaluateGovernedSubject` evaluates an externally owned immutable subject
 without sending its payload to Chisei. It is classified `experimental` and is
 rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo
-feature is enabled, as are `ExportGovernedSubjectProvenance`,
-`ResolveEvaluationPlan`, and `ExecuteEvaluationManifest` on this path. See
+feature is enabled, as is `ExportGovernedSubjectProvenance`. See
 [rpc-maturity.md](rpc-maturity.md). The authenticated caller supplies a
 versioned profile, opaque identity, canonical SHA-256 content digest, bounded
 opaque evidence references, and a registered evaluation profile. Chisei

@@ -2,8 +2,8 @@
 
 `ResolveEvaluationPlan` freezes one situation-specific evaluation into an
 immutable `chisei.resolved-evaluation-manifest/v1` document. It is classified
-`experimental` and is rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature is enabled. See
+`stable`; its consumer is
+[`sekaictl admin evaluation plan`](evaluation-operator-cli.md). See
 [rpc-maturity.md](rpc-maturity.md). It resolves exact inputs only. It does not
 run evaluators, collect evidence, create waivers, make a gate decision, or
 grant action authority.

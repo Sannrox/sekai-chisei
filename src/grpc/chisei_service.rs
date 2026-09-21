@@ -391,8 +391,10 @@ impl ChiseiServiceImpl {
         ));
         let policy = Arc::new(PolicyResolver::new());
         load_namespace_policies(db.runtime(), &policy);
-        let evaluator_registry =
-            Arc::new(evaluation_execution_domain::DeterministicEvaluatorRegistry::default());
+        let evaluator_registry = Arc::new(
+            evaluation_execution_domain::production_evaluator_registry()
+                .expect("compiled production evaluator registry must be valid"),
+        );
         let stochastic_evaluator_registry = Arc::new(
             crate::chisei::stochastic_evaluation::production_stochastic_evaluator_registry(
                 config.clone(),

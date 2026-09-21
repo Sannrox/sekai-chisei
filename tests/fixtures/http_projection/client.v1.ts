@@ -48,6 +48,7 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "ListCredentials" },
   { service: "sekai.SekaiService", rpc: "RegisterEvidenceSchema" },
   { service: "sekai.SekaiService", rpc: "SubmitEvidence" },
+  { service: "chisei.ChiseiService", rpc: "ExecuteEvaluationManifest" },
   { service: "chisei.ChiseiService", rpc: "AuthorizeExternalAction" },
   { service: "chisei.ChiseiService", rpc: "TransitionExternalAction" },
   { service: "chisei.ChiseiService", rpc: "RedeemExternalActionPermit" },
@@ -61,6 +62,8 @@ export const HTTP_UNARY_METHODS = [
   { service: "chisei.ChiseiService", rpc: "GetOperationReceipt" },
   { service: "chisei.ChiseiService", rpc: "GetQualityTrend" },
   { service: "chisei.ChiseiService", rpc: "ClaimGatewayDispatch" },
+  { service: "chisei.ChiseiService", rpc: "PutEvaluationPlan" },
+  { service: "chisei.ChiseiService", rpc: "ResolveEvaluationPlan" },
 ] as const;
 
 export async function invokeHttpJson<T>(

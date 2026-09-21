@@ -11,6 +11,7 @@ pub mod entitlements;
 pub mod epistemic_descriptor;
 pub mod epistemic_eval;
 pub mod eval;
+pub mod evaluation_compare;
 pub mod evaluation_execution;
 pub mod evaluation_manifest;
 pub mod evaluation_plan;
