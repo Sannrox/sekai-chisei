@@ -226,7 +226,7 @@
       "rpc": "CreateObject",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
-      "consumer": "sdk, host",
+      "consumer": "sdk, host, cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -460,7 +460,7 @@
       "rpc": "CreateLink",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
-      "consumer": "sdk",
+      "consumer": "sdk, cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -568,7 +568,7 @@
       "rpc": "CreateSchemaType",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
-      "consumer": "sdk",
+      "consumer": "sdk, cli",
       "classification": "stable",
       "product_tier": "advanced"
     },
@@ -595,7 +595,7 @@
       "rpc": "CreateOntologyClass",
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -631,7 +631,7 @@
       "rpc": "CreateOntologyRelation",
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -1378,7 +1378,7 @@
       "rpc": "PlanExecution",
       "storage_path": "chisei.policy, chisei.budget, chisei.execution",
       "real_backend": "yes",
-      "consumer": "sdk",
+      "consumer": "sdk, cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -1387,7 +1387,7 @@
       "rpc": "ExecutePlanStream",
       "storage_path": "chisei.execution",
       "real_backend": "yes",
-      "consumer": "sdk",
+      "consumer": "sdk, cli",
       "classification": "stable",
       "product_tier": "core"
     },
@@ -1423,7 +1423,7 @@
       "rpc": "GetOperationReceipt",
       "storage_path": "chisei.execution",
       "real_backend": "yes",
-      "consumer": "sdk, host",
+      "consumer": "sdk, host, cli",
       "classification": "stable",
       "product_tier": "core"
     },
