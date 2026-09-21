@@ -561,6 +561,24 @@ where
             })
             .await
         }
+        ("chisei.ChiseiService", "PutEvaluationPlan") => {
+            invoke_chisei(state, headers, body, |svc, req| async move {
+                ChiseiService::put_evaluation_plan(&*svc, req).await
+            })
+            .await
+        }
+        ("chisei.ChiseiService", "ResolveEvaluationPlan") => {
+            invoke_chisei(state, headers, body, |svc, req| async move {
+                ChiseiService::resolve_evaluation_plan(&*svc, req).await
+            })
+            .await
+        }
+        ("chisei.ChiseiService", "ExecuteEvaluationManifest") => {
+            invoke_chisei(state, headers, body, |svc, req| async move {
+                ChiseiService::execute_evaluation_manifest(&*svc, req).await
+            })
+            .await
+        }
         ("chisei.ChiseiService", "ClaimGatewayDispatch") => {
             invoke_chisei(state, headers, body, |svc, req| async move {
                 ChiseiService::claim_gateway_dispatch(&*svc, req).await
@@ -1009,6 +1027,30 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(payload["code"], "unauthenticated");
         let _ = token;
+    }
+
+    #[tokio::test]
+    async fn promoted_evaluation_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in [
+            "PutEvaluationPlan",
+            "ResolveEvaluationPlan",
+            "ExecuteEvaluationManifest",
+        ] {
+            let path = format!("/chisei.ChiseiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
     }
 
     #[tokio::test]

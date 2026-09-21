@@ -1576,12 +1576,7 @@ pub(super) fn to_proto_evaluation_execution_projection(
     }
 }
 pub(super) fn evaluation_operation_id(manifest_digest: &str) -> String {
-    format!(
-        "evaluation-execution:{}",
-        manifest_digest
-            .strip_prefix("sha256:")
-            .unwrap_or(manifest_digest)
-    )
+    evaluation_execution_domain::execution_operation_id(manifest_digest)
 }
 pub(super) fn evaluation_manifest_reference(manifest_digest: &str) -> GovernedReference {
     GovernedReference {

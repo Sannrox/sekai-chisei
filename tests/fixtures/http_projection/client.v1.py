@@ -54,6 +54,7 @@ HTTP_UNARY_METHODS = (
     ("sekai.SekaiService", "ListCredentials"),
     ("sekai.SekaiService", "RegisterEvidenceSchema"),
     ("sekai.SekaiService", "SubmitEvidence"),
+    ("chisei.ChiseiService", "ExecuteEvaluationManifest"),
     ("chisei.ChiseiService", "AuthorizeExternalAction"),
     ("chisei.ChiseiService", "TransitionExternalAction"),
     ("chisei.ChiseiService", "RedeemExternalActionPermit"),
@@ -67,6 +68,8 @@ HTTP_UNARY_METHODS = (
     ("chisei.ChiseiService", "GetOperationReceipt"),
     ("chisei.ChiseiService", "GetQualityTrend"),
     ("chisei.ChiseiService", "ClaimGatewayDispatch"),
+    ("chisei.ChiseiService", "PutEvaluationPlan"),
+    ("chisei.ChiseiService", "ResolveEvaluationPlan"),
 )
 
 

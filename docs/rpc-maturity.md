@@ -25,7 +25,7 @@ Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures
 
 | Class | Meaning | Default build |
 | --- | --- | --- |
-| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 60 RPCs. | Invokable. |
+| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 63 RPCs. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
 | `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
 
@@ -200,7 +200,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.RevokeHandoff` | `sekai.handoffs` | yes | none | `experimental` |
 | `ChiseiService.EvaluateGovernedSubject` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ExportGovernedSubjectProvenance` | `chisei.execution` | yes | none | `experimental` |
-| `ChiseiService.ExecuteEvaluationManifest` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.ExecuteEvaluationManifest` | `chisei.evaluation` | yes | cli | `stable` |
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |
@@ -225,8 +225,8 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
-| `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | none | `experimental` |
-| `ChiseiService.ResolveEvaluationPlan` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
+| `ChiseiService.ResolveEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
 | `ChiseiService.GetEvaluationGateEvidence` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.RunLookupFirstPromotionGate` | `chisei.evaluation` | yes | none | `remove` |
 | `ChiseiService.GetSampleObservation` | `chisei.observations` | yes | none | `remove` |

@@ -1,10 +1,13 @@
 # Evaluation plans and evaluator definitions
 
-Evaluation plans are an experimental Chisei evaluation-selection contract in
-1.0. `PutEvaluatorDefinition`, `PutEvaluationPlan`, and `ResolveEvaluationPlan`
-are classified `experimental` and are rejected unless
+Evaluation plans are a Chisei evaluation-selection contract in 1.0.
+`PutEvaluationPlan` and `ResolveEvaluationPlan` are classified `stable`; their
+consumer is [`sekaictl admin evaluation plan`](evaluation-operator-cli.md).
+`PutEvaluatorDefinition` stays `experimental` and is rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
-enabled. See [rpc-maturity.md](rpc-maturity.md). They are separate from
+enabled, because evaluator definitions are operator-owned deployment
+metadata rather than something the CLI publishes. See
+[rpc-maturity.md](rpc-maturity.md). Plans are separate from
 `EvalSuite`: suites remain reusable test cases, while plans bind exact governed
 invariants to trusted deterministic implementations or explicitly bounded
 stochastic model evaluators.

@@ -5,8 +5,12 @@
 //! parameters, evidence identifiers, evidence payloads, source references, or
 //! subject identities.
 
+use crate::chisei::evaluation_compare::{
+    ComparisonError, EvaluationComparison, FinishedExecution, NodeSide, Outcome, compare,
+};
 use crate::chisei::evaluation_execution::{
     EXECUTION_REQUEST_CONTRACT, EXECUTOR_VERSION, EvaluationExecutionRequest as DomainExecution,
+    execution_operation_id,
 };
 use crate::chisei::evaluation_manifest::{
     EvaluationResolutionRequest as DomainResolution, RESOLUTION_REQUEST_CONTRACT,
@@ -17,13 +21,14 @@ use crate::chisei::evaluation_plan::{
     EvaluationInputBinding as DomainInputBinding, EvaluationPlan as DomainPlan,
     EvaluationPlanNode as DomainPlanNode, prepare_plan,
 };
-use crate::grpc::client::connect_sekai;
+use crate::chisei::receipt::OperationReceipt;
+use crate::grpc::client::{GatewayClient, connect_sekai};
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::{
     EvaluationExecutionProjection, EvaluationExecutionRequest, EvaluationInputBinding,
     EvaluationPlan, EvaluationPlanNode, EvaluationResolutionRequest,
-    ExecuteEvaluationManifestRequest, PutEvaluationPlanRequest, ResolveEvaluationPlanRequest,
-    ResolvedEvaluationManifest,
+    ExecuteEvaluationManifestRequest, GetOperationReceiptRequest, PutEvaluationPlanRequest,
+    ResolveEvaluationPlanRequest, ResolvedEvaluationManifest,
 };
 use crate::grpc::pb::sekai::GetGovernedFactVersionRequest;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
@@ -41,6 +46,7 @@ pub const EXIT_UNKNOWN: i32 = 4;
 pub const EXIT_UNAVAILABLE: i32 = 5;
 pub const EXIT_COMPATIBILITY: i32 = 6;
 pub const EXIT_DENIED: i32 = 7;
+pub const EXIT_REGRESSION: i32 = 8;
 
 const OUTPUT_SCHEMA: &str = "sekaictl.evaluation-plan-output/v1";
 
@@ -52,11 +58,14 @@ pub fn usage() -> &'static str {
        apply <plan.json> [--target <url-or-socket>] [--json]\n\
        resolve <resolution.json> [--target <url-or-socket>] [--json]\n\
        execute <namespace> <manifest-digest> --yes [--max-duration-ms <ms>] [--target <url-or-socket>] [--json]\n\
+       compare <namespace> <baseline-manifest-digest> <candidate-manifest-digest> [--target <url-or-socket>] [--json]\n\
      \n\
      validate is read-only. It checks exact live invariant versions unless\n\
      --offline is supplied; apply performs authoritative evaluator validation.\n\
      resolve never executes evaluators. execute\n\
-     accepts only an already resolved manifest digest and requires --yes."
+     accepts only an already resolved manifest digest and requires --yes.\n\
+     compare only reads the receipts of two finished executions; it never\n\
+     executes, resolves, or waits."
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +76,7 @@ enum ErrorKind {
     Unavailable,
     Compatibility,
     Denied,
+    Regression,
 }
 
 #[derive(Debug)]
@@ -95,6 +105,7 @@ impl EvaluationCliError {
             ErrorKind::Unavailable => EXIT_UNAVAILABLE,
             ErrorKind::Compatibility => EXIT_COMPATIBILITY,
             ErrorKind::Denied => EXIT_DENIED,
+            ErrorKind::Regression => EXIT_REGRESSION,
         }
     }
 }
@@ -269,6 +280,7 @@ pub async fn run(args: Vec<String>) -> Result<(), EvaluationCliError> {
         "apply" => apply_command(parsed).await,
         "resolve" => resolve_command(parsed).await,
         "execute" => execute_command(parsed).await,
+        "compare" => compare_command(parsed).await,
         _ => Err(EvaluationCliError::validation(usage())),
     }
 }
@@ -419,6 +431,146 @@ async fn execute_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
             "server returned an unsupported evaluation execution status",
         )),
     }
+}
+
+async fn compare_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
+    args.validate_options(&["--target"], &["--json"])?;
+    let [namespace, baseline_digest, candidate_digest] = args.positionals.as_slice() else {
+        return Err(EvaluationCliError::validation(
+            "compare requires <namespace> <baseline-manifest-digest> <candidate-manifest-digest>",
+        ));
+    };
+    validate_digest("baseline_manifest_digest", baseline_digest)?;
+    validate_digest("candidate_manifest_digest", candidate_digest)?;
+    if baseline_digest == candidate_digest {
+        return Err(EvaluationCliError::validation(
+            "compare requires two different manifest digests",
+        ));
+    }
+    let channel = connect_sekai(&args.target())
+        .await
+        .map_err(|error| transport_error("connect to evaluation service", error))?;
+    let mut client = ChiseiServiceClient::new(channel);
+    let baseline = finished_execution(&mut client, namespace, baseline_digest).await?;
+    let candidate = finished_execution(&mut client, namespace, candidate_digest).await?;
+    let comparison = compare(&baseline, &candidate).map_err(comparison_error)?;
+    print_comparison_output(&comparison, args.json())?;
+    match comparison.outcome {
+        Outcome::Regressed => Err(EvaluationCliError::new(
+            ErrorKind::Regression,
+            "candidate regressed against baseline",
+        )),
+        Outcome::Improved | Outcome::Unchanged => Ok(()),
+    }
+}
+
+async fn finished_execution(
+    client: &mut ChiseiServiceClient<GatewayClient>,
+    namespace: &str,
+    manifest_digest: &str,
+) -> Result<FinishedExecution, EvaluationCliError> {
+    let response = client
+        .get_operation_receipt(GetOperationReceiptRequest {
+            operation_id: execution_operation_id(manifest_digest),
+            ..Default::default()
+        })
+        .await
+        .map_err(|status| rpc_error("read evaluation execution receipt", status))?
+        .into_inner();
+    let receipt: OperationReceipt = serde_json::from_str(&response.receipt_json)
+        .map_err(|_| compatibility_error("evaluation execution receipt is not readable"))?;
+    if !response.complete {
+        return Err(EvaluationCliError::new(
+            ErrorKind::Unavailable,
+            "evaluation execution receipt is incomplete",
+        ));
+    }
+    FinishedExecution::from_receipt(namespace, manifest_digest, &receipt).map_err(comparison_error)
+}
+
+fn comparison_error(error: ComparisonError) -> EvaluationCliError {
+    match error {
+        ComparisonError::Unbound => EvaluationCliError::new(
+            ErrorKind::Authorization,
+            "read evaluation execution receipt: resource not found or not authorized",
+        ),
+        ComparisonError::NotFinished(state) => EvaluationCliError::new(
+            ErrorKind::Unavailable,
+            format!("evaluation execution is {state}; compare needs finished executions"),
+        ),
+        ComparisonError::Invalid(_) => EvaluationCliError::new(
+            ErrorKind::Unavailable,
+            "evaluation execution receipt is not trustworthy terminal evidence",
+        ),
+    }
+}
+
+fn print_comparison_output(
+    comparison: &EvaluationComparison,
+    as_json: bool,
+) -> Result<(), EvaluationCliError> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": OUTPUT_SCHEMA,
+                "command": "compare",
+                "status": comparison.outcome,
+                "comparison": comparison,
+            }))
+            .map_err(json_error)?
+        );
+        return Ok(());
+    }
+    println!("Comparison: {}", label(&comparison.outcome));
+    println!("Baseline: {}", comparison.baseline.manifest_digest);
+    println!("Candidate: {}", comparison.candidate.manifest_digest);
+    println!(
+        "Gate: {} -> {} ({})",
+        comparison.gate.baseline_verdict,
+        comparison.gate.candidate_verdict,
+        label(&comparison.gate.change)
+    );
+    for node in &comparison.nodes {
+        println!(
+            "  {} {} -> {} ({})",
+            node.node_id,
+            side_label(node.baseline.as_ref()),
+            side_label(node.candidate.as_ref()),
+            label(&node.change)
+        );
+    }
+    let summary = &comparison.summary;
+    println!(
+        "Nodes: {} unchanged, {} improved, {} regressed, {} changed, {} added, {} removed",
+        summary.unchanged,
+        summary.improved,
+        summary.regressed,
+        summary.changed,
+        summary.added,
+        summary.removed
+    );
+    if summary.advisory_regressions > 0 || summary.advisory_improvements > 0 {
+        println!(
+            "Advisory movement observed: {} regressed, {} improved (they do not decide the outcome)",
+            summary.advisory_regressions, summary.advisory_improvements
+        );
+    }
+    Ok(())
+}
+
+fn side_label(side: Option<&NodeSide>) -> String {
+    side.map_or_else(
+        || "absent".into(),
+        |side| format!("[{}] {}", side.classification, side.status),
+    )
+}
+
+fn label<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
 fn one_path(positionals: &[String], command: &str) -> Result<PathBuf, EvaluationCliError> {

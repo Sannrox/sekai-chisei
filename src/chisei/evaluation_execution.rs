@@ -1025,19 +1025,22 @@ pub fn cancellation_requested(receipt: &OperationReceipt) -> bool {
     })
 }
 
-/// Reconstruct one execution exclusively from its canonical receipt and
-/// immutable manifest/index bindings.
-pub fn projection_from_receipt(
-    manifest: &ResolvedEvaluationManifest,
-    index: &EvaluationExecutionIndex,
+/// Deterministic operation identity of the one execution a manifest digest
+/// can have. The digest is the execution idempotency key.
+pub fn execution_operation_id(manifest_digest: &str) -> String {
+    format!(
+        "evaluation-execution:{}",
+        manifest_digest
+            .strip_prefix("sha256:")
+            .unwrap_or(manifest_digest)
+    )
+}
+
+/// Step receipts (ordered by node) and the terminal gate decision recorded on
+/// one evaluation execution receipt. The decision is absent while running.
+pub fn step_and_gate_evidence(
     receipt: &OperationReceipt,
-) -> Result<EvaluationExecutionProjection, String> {
-    if receipt.operation_id != index.operation_id
-        || receipt.namespace != index.namespace
-        || receipt.operation_class != EXECUTION_OPERATION_CLASS
-    {
-        return Err("evaluation execution receipt binding is invalid".into());
-    }
+) -> Result<(Vec<EvaluationStepReceipt>, Option<EvaluationGateDecision>), String> {
     let mut steps = receipt
         .events
         .iter()
@@ -1057,6 +1060,23 @@ pub fn projection_from_receipt(
                 .map_err(|error| format!("invalid evaluation gate decision: {error}"))
         })
         .transpose()?;
+    Ok((steps, decision))
+}
+
+/// Reconstruct one execution exclusively from its canonical receipt and
+/// immutable manifest/index bindings.
+pub fn projection_from_receipt(
+    manifest: &ResolvedEvaluationManifest,
+    index: &EvaluationExecutionIndex,
+    receipt: &OperationReceipt,
+) -> Result<EvaluationExecutionProjection, String> {
+    if receipt.operation_id != index.operation_id
+        || receipt.namespace != index.namespace
+        || receipt.operation_class != EXECUTION_OPERATION_CLASS
+    {
+        return Err("evaluation execution receipt binding is invalid".into());
+    }
+    let (steps, decision) = step_and_gate_evidence(receipt)?;
     let cancellation_requested = cancellation_requested(receipt);
     if let Some(decision) = &decision
         && (decision.reason_code == REASON_EXECUTION_CANCELLED) != cancellation_requested
@@ -3268,6 +3288,34 @@ mod tests {
         assert_eq!(output.status, STATUS_PASS);
         assert_eq!(output.reason_code, "fixture_pass");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn external_adapter_without_the_shared_secret_fails_closed_before_any_request() {
+        if external_adapter_secret_configured() {
+            // The operator environment supplies a secret; the unset case is
+            // not observable without mutating process state.
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let evaluator = ExternalHttpEvaluator::new(
+            "acme",
+            &digest('e'),
+            &format!("https://{}/evaluate", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let manifest = manifest(vec![node("check", NODE_REQUIRED, &[])]);
+        let evaluator_input = input(&manifest, &manifest.nodes[0]);
+        assert_eq!(
+            evaluator.evaluate(&evaluator_input).unwrap_err(),
+            REASON_EVALUATOR_UNAVAILABLE
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no shared secret means the adapter is never contacted, not even unsigned"
+        );
     }
 
     #[test]

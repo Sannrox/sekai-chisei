@@ -1,7 +1,7 @@
 {
   "version": "sekai.rpc-maturity/v1",
   "issue": 871,
-  "stable_limit": 60,
+  "stable_limit": 63,
   "experimental_env": "SEKAI_EXPERIMENTAL_RPCS",
   "experimental_feature": "experimental-rpcs",
   "entries": [
@@ -1279,9 +1279,9 @@
       "rpc": "ExecuteEvaluationManifest",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "cli",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",
@@ -1504,18 +1504,18 @@
       "rpc": "PutEvaluationPlan",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "cli",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",
       "rpc": "ResolveEvaluationPlan",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "cli",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "ChiseiService",

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `sekaictl admin evaluation plan compare` diffs two finished evaluation
+  executions of one namespace from their operation receipts: per-node and
+  gate-verdict changes, required-versus-advisory regressions, and exit `8`
+  when the candidate regressed. It reads only and never executes. The
+  `PutEvaluationPlan`, `ResolveEvaluationPlan`, and `ExecuteEvaluationManifest`
+  RPCs are now `stable` with the CLI as consumer and join the HTTP/JSON
+  projection; the stable ceiling moves from 60 to 63 ([ADR 0071](docs/decisions/0071-rpc-maturity.md), #1090).
+- Fix: the shipped server registered no compiled deterministic evaluator, so
+  every deterministic evaluation node executed as `evaluator_unavailable`; the
+  production registry (`subject_content_digest_equals.v1`) is now registered
+  on the server path (#1090).
 - Operator first-success, Docker/compose, and configuration pages name
   Combined dest-pair boot. `cargo run` does not load `.env`; a lone
   `DB_PATH` needs `SEKAI_SHARED_STORE=1`. Offline `sekaictl` report,

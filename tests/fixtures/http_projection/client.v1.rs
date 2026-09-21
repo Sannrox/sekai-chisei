@@ -47,6 +47,7 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("sekai.SekaiService", "ListCredentials"),
         ("sekai.SekaiService", "RegisterEvidenceSchema"),
         ("sekai.SekaiService", "SubmitEvidence"),
+        ("chisei.ChiseiService", "ExecuteEvaluationManifest"),
         ("chisei.ChiseiService", "AuthorizeExternalAction"),
         ("chisei.ChiseiService", "TransitionExternalAction"),
         ("chisei.ChiseiService", "RedeemExternalActionPermit"),
@@ -60,6 +61,8 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("chisei.ChiseiService", "GetOperationReceipt"),
         ("chisei.ChiseiService", "GetQualityTrend"),
         ("chisei.ChiseiService", "ClaimGatewayDispatch"),
+        ("chisei.ChiseiService", "PutEvaluationPlan"),
+        ("chisei.ChiseiService", "ResolveEvaluationPlan"),
 ];
 
 pub fn http_path(service: &str, rpc: &str) -> Option<String> {

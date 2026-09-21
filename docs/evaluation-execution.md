@@ -1,15 +1,18 @@
 # Evaluation execution
 
-`ExecuteEvaluationManifest` is an experimental 1.0 capability (classified
-`experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
-Cargo feature; see [rpc-maturity.md](rpc-maturity.md)) that executes one exact
+`ExecuteEvaluationManifest` is a `stable` RPC (consumer:
+[`sekaictl admin evaluation plan`](evaluation-operator-cli.md); see
+[rpc-maturity.md](rpc-maturity.md)) that executes one exact
 `chisei.resolved-evaluation-manifest/v1` through the
 established `chisei.deterministic-evaluation-executor/v1` request protocol.
 The frozen node execution class selects a separate deterministic or stochastic
 registry and execution path; the request identifier is retained for persisted
 execution and client compatibility. The manifest digest is the
 idempotency identity. `GetOperationReceipt` returns the authoritative
-projection, and `CancelEvaluationExecution` durably requests cancellation.
+projection, and `CancelEvaluationExecution` (still `experimental`; it needs
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature) durably
+requests cancellation. `sekaictl admin evaluation plan compare` diffs two
+finished executions from those receipts without executing anything.
 
 This is situation-specific evaluation, not a generic workflow engine. A plan
 still chooses different evaluator definitions, schemas, parameters, inputs,

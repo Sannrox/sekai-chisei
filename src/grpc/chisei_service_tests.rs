@@ -3301,6 +3301,264 @@ async fn evaluation_execution_authorizes_namespace_before_manifest_lookup() {
     assert!(!error.message().contains("manifest"));
 }
 
+async fn execute_plan_version(
+    svc: &ChiseiServiceImpl,
+    definition_id: &str,
+    invariant_id: &str,
+    version: &str,
+    parameters_json: &str,
+) -> (ResolvedEvaluationManifest, EvaluationExecutionProjection) {
+    let mut request = evaluation_plan_request("acme", definition_id, invariant_id, version);
+    request.plan.as_mut().unwrap().nodes[0].parameters_json = parameters_json.into();
+    let plan = svc
+        .put_evaluation_plan(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let manifest = svc
+        .resolve_evaluation_plan(Request::new(evaluation_resolution_request(
+            "acme",
+            &format!("compare-resolve-{version}"),
+            &plan.plan_version_id,
+            10,
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .manifest
+        .unwrap();
+    let execution = svc
+        .execute_evaluation_manifest(Request::new(ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest.clone(),
+                max_total_duration_ms: 1_000,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    (manifest, execution)
+}
+
+async fn execution_receipt(
+    svc: &ChiseiServiceImpl,
+    manifest_digest: &str,
+    principal: Option<&str>,
+) -> Result<OperationReceipt, Status> {
+    let mut request = Request::new(GetOperationReceiptRequest {
+        operation_id: evaluation_execution_domain::execution_operation_id(manifest_digest),
+        ..Default::default()
+    });
+    if let Some(principal) = principal {
+        request
+            .metadata_mut()
+            .insert("x-principal", principal.parse().unwrap());
+    }
+    let response = svc.get_operation_receipt(request).await?.into_inner();
+    Ok(serde_json::from_str(&response.receipt_json).unwrap())
+}
+
+#[tokio::test]
+async fn evaluation_comparison_diffs_two_receipted_executions_without_executing() {
+    use crate::chisei::evaluation_compare as compare_domain;
+
+    let svc = evaluation_execution_service(0);
+    let invariant_id = install_invariant(&svc, "acme");
+    let definition = svc
+        .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap()
+        .definition
+        .unwrap();
+    let (baseline_manifest, baseline_run) = execute_plan_version(
+        &svc,
+        &definition.definition_id,
+        &invariant_id,
+        "1.0.0",
+        r#"{"strict":true}"#,
+    )
+    .await;
+    let (candidate_manifest, candidate_run) = execute_plan_version(
+        &svc,
+        &definition.definition_id,
+        &invariant_id,
+        "2.0.0",
+        r#"{"strict":false}"#,
+    )
+    .await;
+    assert_eq!(
+        baseline_run.status,
+        evaluation_execution_domain::VERDICT_ALLOW
+    );
+    assert_eq!(
+        candidate_run.status,
+        evaluation_execution_domain::VERDICT_DENY
+    );
+
+    let baseline_receipt = execution_receipt(&svc, &baseline_manifest.manifest_digest, None)
+        .await
+        .unwrap();
+    let candidate_receipt = execution_receipt(&svc, &candidate_manifest.manifest_digest, None)
+        .await
+        .unwrap();
+    let baseline = compare_domain::FinishedExecution::from_receipt(
+        "acme",
+        &baseline_manifest.manifest_digest,
+        &baseline_receipt,
+    )
+    .unwrap();
+    let candidate = compare_domain::FinishedExecution::from_receipt(
+        "acme",
+        &candidate_manifest.manifest_digest,
+        &candidate_receipt,
+    )
+    .unwrap();
+    let comparison = compare_domain::compare(&baseline, &candidate).unwrap();
+
+    assert_eq!(comparison.outcome, compare_domain::Outcome::Regressed);
+    assert_eq!(comparison.gate.baseline_verdict, "allow");
+    assert_eq!(comparison.gate.candidate_verdict, "deny");
+    assert_eq!(comparison.nodes.len(), 1);
+    let node = &comparison.nodes[0];
+    assert_eq!(node.node_id, "schema");
+    assert_eq!(node.change, compare_domain::Change::Regressed);
+    assert!(
+        node.differs_in.contains(&"parameters"),
+        "{:?}",
+        node.differs_in
+    );
+    assert_eq!(
+        comparison.baseline.decision_digest,
+        baseline_run.decision.as_ref().unwrap().decision_digest,
+        "the diff cites the receipted gate decision, not a recomputation"
+    );
+    assert_eq!(
+        node_step_digest(&baseline, "schema"),
+        baseline_run.steps[0].step_receipt_digest
+    );
+
+    let after_compare = execution_receipt(&svc, &candidate_manifest.manifest_digest, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_compare, candidate_receipt,
+        "reading receipts for a comparison never appends evidence or re-executes"
+    );
+
+    let reversed = compare_domain::compare(&candidate, &baseline).unwrap();
+    assert_eq!(reversed.outcome, compare_domain::Outcome::Improved);
+    assert_eq!(reversed.nodes[0].change, compare_domain::Change::Improved);
+}
+
+fn node_step_digest(
+    execution: &crate::chisei::evaluation_compare::FinishedExecution,
+    node_id: &str,
+) -> String {
+    execution
+        .steps
+        .iter()
+        .find(|step| step.node_id == node_id)
+        .unwrap()
+        .step_receipt_digest
+        .clone()
+}
+
+#[tokio::test]
+async fn evaluation_comparison_receipts_stay_authorized_and_namespace_bound() {
+    use crate::chisei::evaluation_compare as compare_domain;
+
+    let svc = evaluation_execution_service(0);
+    let invariant_id = install_invariant(&svc, "acme");
+    let definition = svc
+        .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap()
+        .definition
+        .unwrap();
+    let (manifest, _) = execute_plan_version(
+        &svc,
+        &definition.definition_id,
+        &invariant_id,
+        "1.0.0",
+        r#"{"strict":true}"#,
+    )
+    .await;
+
+    let error = execution_receipt(&svc, &manifest.manifest_digest, Some("mallory"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+
+    let receipt = execution_receipt(&svc, &manifest.manifest_digest, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        compare_domain::FinishedExecution::from_receipt(
+            "other",
+            &manifest.manifest_digest,
+            &receipt
+        ),
+        Err(compare_domain::ComparisonError::Unbound),
+        "a receipt from another namespace is indistinguishable from an absent one"
+    );
+    assert_eq!(
+        compare_domain::FinishedExecution::from_receipt(
+            "acme",
+            &format!("sha256:{}", "9".repeat(64)),
+            &receipt
+        ),
+        Err(compare_domain::ComparisonError::Unbound),
+        "a receipt for another manifest digest is not accepted"
+    );
+
+    let missing = execution_receipt(&svc, &format!("sha256:{}", "8".repeat(64)), None)
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn evaluation_comparison_refuses_an_unfinished_execution() {
+    use crate::chisei::evaluation_compare as compare_domain;
+
+    let svc = evaluation_execution_service(0);
+    let manifest = resolved_execution_fixture(&svc, "compare-unfinished-resolve").await;
+    let stored = svc
+        .db
+        .runtime()
+        .get_evaluation_manifest(&manifest.manifest_digest)
+        .unwrap()
+        .unwrap();
+    svc.evaluation_execution_lifecycle
+        .ensure_execution_for_test(&stored, "starter", 1_000)
+        .unwrap();
+
+    let receipt = execution_receipt(&svc, &manifest.manifest_digest, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        compare_domain::FinishedExecution::from_receipt(
+            "acme",
+            &manifest.manifest_digest,
+            &receipt
+        ),
+        Err(compare_domain::ComparisonError::NotFinished("running"))
+    );
+}
+
 #[tokio::test]
 async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
     let svc = evaluation_execution_service(0);
