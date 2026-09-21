@@ -11,6 +11,8 @@
 use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
+const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
+
 impl ChiseiServiceImpl {
     pub(super) async fn plan_from_input(
         &self,
@@ -38,6 +40,7 @@ impl ChiseiServiceImpl {
         let safe_only = !crate::chisei::privacy::external_allowed(data_class, task_class);
         let template_only =
             data_class == DataClass::Sensitive && task_class == TaskClass::TemplateOnly;
+        let pinned_learning = self.resolve_learning_pin(&input, template_only)?;
         let mut pipeline_req = pipe::PipelineRequest {
             request_id: input.request_id.clone(),
             namespace: input.namespace.clone(),
@@ -56,6 +59,7 @@ impl ChiseiServiceImpl {
             evidence_references: vec![],
             memory_references: vec![],
             memory_holdouts: vec![],
+            pinned_learning: pinned_learning.clone(),
             memory_actor: authenticated_actor.into(),
             memory_assignment_id: plan_id.clone(),
             memory_token_budget: 512,
@@ -139,6 +143,7 @@ impl ChiseiServiceImpl {
                 evidence_references: vec![],
                 memory_references: vec![],
                 memory_holdouts: vec![],
+                pinned_learning: pinned_learning.clone(),
                 memory_actor: authenticated_actor.into(),
                 memory_assignment_id: plan_id.clone(),
                 memory_token_budget: 512,
@@ -192,6 +197,11 @@ impl ChiseiServiceImpl {
                 )
             }
         };
+        // An explicit pin is never silently dropped: when the selected route
+        // may not receive the learning, planning fails closed.
+        if input.learning_pin.is_some() && run.pinned_learning.is_none() {
+            return Err(Status::failed_precondition(LEARNING_PIN_UNAVAILABLE));
+        }
         self.record_context_expansion_gate(
             &input.request_id,
             &input.namespace,
@@ -474,6 +484,17 @@ impl ChiseiServiceImpl {
                 .map(memory_context_reference)
                 .collect(),
             planning_actor: authenticated_actor.into(),
+            learning_references: run
+                .pinned_learning
+                .iter()
+                .map(|learning| LearningContextReference {
+                    change_id: learning.change_id.clone(),
+                    learning_id: learning.learning_id.clone(),
+                    candidate_digest: learning.candidate_digest.clone(),
+                    evidence_digest: learning.evidence_digest.clone(),
+                    source_request_id: learning.source_request_id.clone(),
+                })
+                .collect(),
             memory_holdouts: run
                 .memory_holdouts
                 .iter()
@@ -504,6 +525,34 @@ impl ChiseiServiceImpl {
             gunshi_max_attempts: 0,
             gunshi_human_review_required: false,
         })
+    }
+
+    /// Resolve the caller's learning pin, if any, before planning starts. A pin
+    /// is an explicit, operator-approved input rather than automatic retrieval,
+    /// so the eval-owned context-expansion gate does not apply; its approval
+    /// and activation bound to an exact digest are the gate. It is never
+    /// silently dropped: every cause of unusability, including the template-only
+    /// sanitization contract, is one non-disclosing refusal.
+    fn resolve_learning_pin(
+        &self,
+        input: &ExecutionInput,
+        template_only: bool,
+    ) -> Result<Option<crate::chisei::learning_change::PinnedLearning>, Status> {
+        let Some(pin) = input.learning_pin.as_ref() else {
+            return Ok(None);
+        };
+        let unavailable = || Status::failed_precondition(LEARNING_PIN_UNAVAILABLE);
+        if template_only {
+            return Err(unavailable());
+        }
+        crate::chisei::learning_change::resolve_pin(
+            &self.db,
+            input.namespace.trim(),
+            &pin.learning_id,
+            &pin.candidate_digest,
+        )
+        .map(Some)
+        .map_err(|_| unavailable())
     }
 
     pub(super) fn record_planned_operation(
@@ -761,6 +810,53 @@ impl ChiseiServiceImpl {
                         omission_reason: None,
                     }),
             );
+        for learning in &plan.learning_references {
+            events[1].references.extend([
+                GovernedReference {
+                    kind: "governed_learning".into(),
+                    reference: format!(
+                        "learning:{}@{}",
+                        learning.learning_id, learning.candidate_digest
+                    ),
+                    content_hash: Some(learning.candidate_digest.clone()),
+                    disclosed_fields: vec!["prevention".into(), "title".into()],
+                    omitted: false,
+                    omission_reason: None,
+                },
+                GovernedReference {
+                    kind: "learning_verification_evidence".into(),
+                    reference: format!("evidence:{}", learning.evidence_digest),
+                    content_hash: Some(learning.evidence_digest.clone()),
+                    disclosed_fields: vec![],
+                    omitted: false,
+                    omission_reason: None,
+                },
+                GovernedReference {
+                    kind: "learning_source_request".into(),
+                    reference: format!("request:{}", learning.source_request_id),
+                    content_hash: None,
+                    disclosed_fields: vec![],
+                    omitted: false,
+                    omission_reason: None,
+                },
+            ]);
+            events[1].attributes.extend([
+                ("learning_change_id".into(), learning.change_id.clone()),
+                ("learning_id".into(), learning.learning_id.clone()),
+                (
+                    "learning_candidate_digest".into(),
+                    learning.candidate_digest.clone(),
+                ),
+                (
+                    "learning_evidence_digest".into(),
+                    learning.evidence_digest.clone(),
+                ),
+                (
+                    "learning_source_request_id".into(),
+                    learning.source_request_id.clone(),
+                ),
+            ]);
+        }
         if !plan.egress_decisions.is_empty() {
             events.push(receipt_event(
                 &operation_id,

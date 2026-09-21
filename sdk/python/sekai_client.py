@@ -110,6 +110,11 @@ class FactLink(TypedDict, total=False):
     created: int
 
 
+class LearningPin(TypedDict):
+    learning_id: str
+    candidate_digest: str
+
+
 class ExecutionInput(TypedDict, total=False):
     request_id: str
     namespace: str
@@ -128,6 +133,8 @@ class ExecutionInput(TypedDict, total=False):
     logical_operation_id: str
     attempt_id: str
     route_override: str
+    # An active governed learning pinned as context for this one plan.
+    learning_pin: LearningPin
 
 
 class ExecutionPlan(TypedDict, total=False):

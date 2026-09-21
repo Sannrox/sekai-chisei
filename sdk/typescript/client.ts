@@ -134,7 +134,14 @@ export interface ExecutionInput {
   logical_operation_id?: string;
   attempt_id?: string;
   route_override?: string;
+  /** An active governed learning pinned as context for this one plan. */
+  learning_pin?: LearningPin;
   [key: string]: unknown;
+}
+
+export interface LearningPin {
+  learning_id: string;
+  candidate_digest: string;
 }
 
 export interface ExecutionPlan {

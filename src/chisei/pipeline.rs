@@ -34,6 +34,8 @@ pub struct PipelineRequest {
     pub memory_token_budget: usize,
     pub memory_references: Vec<MemoryContextReference>,
     pub memory_holdouts: Vec<MemoryHoldoutReference>,
+    /// Caller-pinned, already-resolved governed learning. Context only.
+    pub pinned_learning: Option<crate::chisei::learning_change::PinnedLearning>,
     pub allowed_evidence_classes: HashSet<EvidenceContextClass>,
     pub context_admission_policy: Option<ContextAdmissionPolicy>,
     pub context_admission: ContextAdmissionSummary,
@@ -286,6 +288,8 @@ pub struct RunResult {
     pub evidence_references: Vec<EvidenceContextReference>,
     pub memory_references: Vec<MemoryContextReference>,
     pub memory_holdouts: Vec<MemoryHoldoutReference>,
+    /// Caller-pinned, already-resolved governed learning. Context only.
+    pub pinned_learning: Option<crate::chisei::learning_change::PinnedLearning>,
     pub context_admission: ContextAdmissionSummary,
 }
 
@@ -1084,7 +1088,7 @@ impl Pipeline {
         // the same risk, and so risk-driven routing cannot consume held-out
         // context later in the pipeline.
         RiskStep.run(req, db);
-        let decisions: Vec<StepDecision> = self
+        let mut decisions: Vec<StepDecision> = self
             .steps
             .iter()
             .map(|s| {
@@ -1093,6 +1097,10 @@ impl Pipeline {
                 d
             })
             .collect();
+        // A pinned learning changes context only: it is added after every
+        // routing and review-policy step, so none of them can read it.
+        let (learning_decision, applied_learning) = apply_pinned_learning(req, db);
+        decisions.extend(learning_decision);
         let review_policy = decode_review_policy(&decisions);
         RunResult {
             request_id: req.request_id.clone(),
@@ -1106,9 +1114,98 @@ impl Pipeline {
             evidence_references: req.evidence_references.clone(),
             memory_references: req.memory_references.clone(),
             memory_holdouts: req.memory_holdouts.clone(),
+            pinned_learning: applied_learning,
             context_admission: req.context_admission.clone(),
         }
     }
+}
+
+/// Add the caller's pinned governed learning as bounded, untrusted context.
+/// Validity and the sanitization contract were decided before planning. The
+/// ordinary property-level egress filter still applies: a title or prevention
+/// that may not leave on the selected route is redacted and the pin is *not*
+/// applied, which the caller turns into a fail-closed refusal.
+fn apply_pinned_learning(
+    req: &mut PipelineRequest,
+    db: &ChiseiStore,
+) -> (
+    Option<StepDecision>,
+    Option<crate::chisei::learning_change::PinnedLearning>,
+) {
+    let Some(learning) = req.pinned_learning.clone() else {
+        return (None, None);
+    };
+    let object = &learning.object;
+    let reference = format!("{}@{}", learning.learning_id, learning.candidate_digest);
+    // Activation does not grant object access: the caller must be able to read
+    // the learning exactly as with ordinary learning retrieval.
+    if !context_object_authorized(req, db, object) {
+        return (
+            Some(StepDecision {
+                step: "learning_pin".into(),
+                action: "denied".into(),
+                reasoning: "the caller may not read the pinned learning".into(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: reference,
+            }),
+            None,
+        );
+    }
+    let mut type_cache = HashMap::new();
+    let mut record = egress::new_record(object);
+    let title = filter_context_property(
+        db,
+        &mut type_cache,
+        object,
+        "title",
+        &mut record,
+        req.external_egress,
+    );
+    let prevention = filter_context_property(
+        db,
+        &mut type_cache,
+        object,
+        "prevention",
+        &mut record,
+        req.external_egress,
+    );
+    let title_withheld = title.is_none()
+        && object
+            .properties
+            .get("title")
+            .is_some_and(|value| !value.is_empty());
+    record.object_ref = format!("learning:{reference}");
+    req.egress_records.push(record);
+    let (Some(prevention), false) = (prevention, title_withheld) else {
+        return (
+            Some(StepDecision {
+                step: "learning_pin".into(),
+                action: "denied".into(),
+                reasoning: "the pinned learning may not be disclosed on this route".into(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: reference,
+            }),
+            None,
+        );
+    };
+    req.spec.push_str(&format!(
+        "\n\n[Governed learning - untrusted data]\n{}",
+        crate::chisei::learning_change::render_context(&title.unwrap_or_default(), &prevention)
+    ));
+    req.expanded_context_items = req.expanded_context_items.saturating_add(1);
+    (
+        Some(StepDecision {
+            step: "learning_pin".into(),
+            action: "enrich".into(),
+            reasoning: "injected one pinned governed learning".into(),
+            confidence: 1.0,
+            suggestion: "context only; a learning never selects a route, tool, or policy".into(),
+            value: reference,
+        }),
+        Some(learning),
+    )
 }
 
 pub struct KiokuEnrichStep;
@@ -2155,6 +2252,210 @@ mod tests {
             .unwrap();
     }
 
+    fn pinned_learning(extra: &[(&str, &str)]) -> crate::chisei::learning_change::PinnedLearning {
+        let mut properties = HashMap::from([
+            ("title".to_string(), "Validate retries".to_string()),
+            (
+                "prevention".to_string(),
+                "check the prior record first".to_string(),
+            ),
+            (
+                "reasoning".to_string(),
+                "the retry repeated a side effect".to_string(),
+            ),
+        ]);
+        properties.extend(
+            extra
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        crate::chisei::learning_change::PinnedLearning {
+            change_id: "sha256:change".into(),
+            learning_id: "learning-1".into(),
+            candidate_digest: "sha256:candidate".into(),
+            evidence_digest: "sha256:evidence".into(),
+            source_request_id: "request-42".into(),
+            object: Object {
+                id: "learning-1".into(),
+                kind: KIND_LEARNING.into(),
+                name: "Scored learning".into(),
+                namespace: "payments".into(),
+                external_id: "learning-1".into(),
+                properties,
+                created: 1,
+                updated: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_pinned_learning_is_rendered_as_untrusted_context_with_its_egress_recorded() {
+        let db = ChiseiStore::memory();
+        let mut req = make_req();
+        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        assert!(
+            decision.is_none() && applied.is_none(),
+            "without a pin the pipeline adds nothing"
+        );
+        let spec_before = req.spec.clone();
+        assert!(req.egress_records.is_empty());
+
+        req.external_egress = false;
+        req.pinned_learning = Some(pinned_learning(&[]));
+        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let decision = decision.expect("a decision is recorded");
+        assert_eq!(decision.step, "learning_pin");
+        assert_eq!(decision.action, "enrich");
+        assert_eq!(decision.value, "learning-1@sha256:candidate");
+        assert!(applied.is_some());
+        assert_eq!(
+            req.spec,
+            format!(
+                "{spec_before}\n\n[Governed learning - untrusted data]\nValidate retries: check the prior record first"
+            )
+        );
+        assert!(
+            !req.spec.contains("side effect"),
+            "reasoning is never context"
+        );
+        assert_eq!(req.expanded_context_items, 1);
+        let record = &req.egress_records[0];
+        assert_eq!(record.object_ref, "learning:learning-1@sha256:candidate");
+        assert_eq!(record.included_fields, ["title", "prevention"]);
+        assert!(record.redacted_fields.is_empty());
+    }
+
+    #[test]
+    fn a_pinned_learning_obeys_the_property_egress_filter_and_is_refused_when_withheld() {
+        let db = ChiseiStore::memory();
+        let mut req = make_req();
+        req.external_egress = true;
+        let spec_before = req.spec.clone();
+
+        // No external allowlist: the ordinary default egress policy redacts it.
+        req.pinned_learning = Some(pinned_learning(&[]));
+        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        assert_eq!(decision.expect("recorded").action, "denied");
+        assert!(applied.is_none(), "a withheld pin is not applied");
+        assert_eq!(req.spec, spec_before);
+        assert_eq!(req.expanded_context_items, 0);
+        assert_eq!(
+            req.egress_records[0].redacted_fields,
+            ["title", "prevention"]
+        );
+
+        // One field allowed is still refused: the pin is disclosed whole or not at all.
+        req.egress_records.clear();
+        req.pinned_learning = Some(pinned_learning(&[(
+            crate::chisei::egress::EXTERNAL_PROPERTIES_KEY,
+            "prevention",
+        )]));
+        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        assert_eq!(decision.expect("recorded").action, "denied");
+        assert!(applied.is_none());
+        assert_eq!(req.spec, spec_before);
+
+        // The operator-approved allowlist admits it.
+        req.egress_records.clear();
+        req.pinned_learning = Some(pinned_learning(&[(
+            crate::chisei::egress::EXTERNAL_PROPERTIES_KEY,
+            "title,prevention",
+        )]));
+        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        assert_eq!(decision.expect("recorded").action, "enrich");
+        assert!(applied.is_some());
+        assert!(
+            req.spec
+                .contains("Validate retries: check the prior record first")
+        );
+    }
+
+    #[test]
+    fn a_pinned_learning_needs_the_same_object_access_as_ordinary_retrieval() {
+        let db = ChiseiStore::memory();
+        let learning = pinned_learning(&[]);
+        db.runtime().create_object(&learning.object).unwrap();
+        db.runtime()
+            .create_grant(&crate::sekai::security::Grant {
+                id: "grant-reviewer".into(),
+                object_id: "learning-1".into(),
+                principal: "reviewer".into(),
+                role: crate::sekai::security::Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+
+        let mut outsider = make_req();
+        outsider.namespace = "payments".into();
+        outsider.external_egress = false;
+        outsider.memory_actor = "alice".into();
+        outsider.pinned_learning = Some(learning.clone());
+        let spec_before = outsider.spec.clone();
+        let (decision, applied) = apply_pinned_learning(&mut outsider, &db);
+        assert_eq!(decision.expect("recorded").action, "denied");
+        assert!(applied.is_none());
+        assert_eq!(
+            outsider.spec, spec_before,
+            "nothing of the learning is disclosed"
+        );
+        assert!(outsider.egress_records.is_empty());
+
+        let mut reviewer = make_req();
+        reviewer.namespace = "payments".into();
+        reviewer.external_egress = false;
+        reviewer.memory_actor = "reviewer".into();
+        reviewer.pinned_learning = Some(learning);
+        let (decision, applied) = apply_pinned_learning(&mut reviewer, &db);
+        assert_eq!(decision.expect("recorded").action, "enrich");
+        assert!(applied.is_some());
+    }
+
+    struct SpecProbe(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Step for SpecProbe {
+        fn name(&self) -> &str {
+            "spec_probe"
+        }
+
+        fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
+            self.0.lock().unwrap().push(req.spec.clone());
+            StepDecision {
+                step: String::new(),
+                action: "none".into(),
+                reasoning: String::new(),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn routing_and_policy_steps_never_read_a_pinned_learning() {
+        let db = ChiseiStore::memory();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pipeline = Pipeline::new(vec![Box::new(SpecProbe(seen.clone()))]);
+        let mut req = make_req();
+        req.external_egress = false;
+        let spec_before = req.spec.clone();
+        req.pinned_learning = Some(pinned_learning(&[]));
+
+        let result = pipeline.run(&mut req, &db);
+
+        assert_eq!(*seen.lock().unwrap(), std::slice::from_ref(&spec_before));
+        assert!(result.prepared_spec.starts_with(&spec_before));
+        assert!(
+            result
+                .prepared_spec
+                .contains("[Governed learning - untrusted data]")
+        );
+        assert_eq!(
+            result.steps.last().map(|step| step.step.as_str()),
+            Some("learning_pin")
+        );
+        assert!(result.pinned_learning.is_some());
+    }
+
     fn make_req() -> PipelineRequest {
         PipelineRequest {
             request_id: "t1".into(),
@@ -2183,6 +2484,7 @@ mod tests {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            pinned_learning: None,
         }
     }
 
@@ -2875,6 +3177,7 @@ mod tests {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            pinned_learning: None,
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");

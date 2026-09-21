@@ -212,6 +212,29 @@ message ExecutionInput {
   string attempt_id = 17;
   // Optional canonical provider/model pinned for this one governed execution.
   string route_override = 18;
+  // Optional active governed learning pinned as context for this one plan.
+  // A learning changes context only and never selects a route, tool, or policy.
+  // A missing, cross-namespace, inactive, rolled-back, changed, or otherwise
+  // unusable pin fails closed with one non-disclosing error.
+  LearningPin learning_pin = 19;
+}
+
+// Exact identity of a `chisei.learning-change/v1` learning: its ID and the
+// candidate digest the operator approved and activated.
+message LearningPin {
+  string learning_id = 1;
+  string candidate_digest = 2;
+}
+
+// Receipt-cited lineage of one pinned learning: the change record, the exact
+// approved content digest, the verification evidence digest it was bound to,
+// and the request the learning was recorded from.
+message LearningContextReference {
+  string change_id = 1;
+  string learning_id = 2;
+  string candidate_digest = 3;
+  string evidence_digest = 4;
+  string source_request_id = 5;
 }
 
 message ExecutionPlan {
@@ -264,6 +287,7 @@ message ExecutionPlan {
   int64 gunshi_budget_ceiling_usd_micros = 46;
   uint32 gunshi_max_attempts = 47;
   bool gunshi_human_review_required = 48;
+  repeated LearningContextReference learning_references = 49;
 }
 
 message EgressDecision {

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- A `PlanExecution` can pin one active governed learning with
+  `ExecutionInput.learning_pin`. The pin changes context only, requires an
+  approved and activated learning whose digest matches, fails closed with one
+  non-disclosing error, and is cited on the plan receipt with its
+  verification lineage (`ExecutionPlan.learning_references`, additive proto
+  fields; [ADR 0085](docs/decisions/0085-governed-learning-changes-context-only.md), #1091).
 - `sekaictl admin evaluation plan compare` diffs two finished evaluation
   executions of one namespace from their operation receipts: per-node and
   gate-verdict changes, required-versus-advisory regressions, and exit `8`
