@@ -26,6 +26,12 @@ static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static TEST_LOG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static FAIL_NEXT_INGEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn fail_next_ingest() {
+    FAIL_NEXT_INGEST.with(|flag| flag.set(true));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -321,16 +327,33 @@ pub fn compare_sql_to_log_path(
     })
 }
 
-/// Append an admitted object mutation through tagged mikura ingest.
+/// Append an admitted object through tagged mikura ingest when the log lacks
+/// this identity at the current property map. A receipted retry of the same
+/// mutation does not bump generation. An update whose properties differ from
+/// the stored record is appended.
 ///
 /// Clerk admission and receipts stay here. The log owns identity generations.
-/// Missing `SEKAI_OBJECT_LOG` skips ingest so SQL-only fixtures keep working
-/// until an operator points Combined at a log.
-pub fn apply_admitted_object_to_configured_log(object: &Object) -> Result<Option<u64>, String> {
+/// Missing `SEKAI_OBJECT_LOG` skips ingest so SQL-only fixtures keep working.
+pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Option<u64>, String> {
     let path = configured_log_path();
     let Some(path) = path else {
         return Ok(None);
     };
+    #[cfg(test)]
+    if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
+        return Err("injected object-log ingest failure".into());
+    }
+    if path.exists()
+        && let Ok(store) = Store::open(&path)
+        && let Some(record) = store
+            .visible_of_kind(&object.kind)
+            .into_iter()
+            .find(|record| record.key == object.id)
+        && record.props == object.properties
+        && !record.hidden
+    {
+        return Ok(Some(record.r#gen));
+    }
     apply_admitted_object_to_log(&path, object).map(Some)
 }
 
@@ -434,6 +457,37 @@ mod tests {
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
         let store = Store::open(&log).unwrap();
         assert_eq!(identity_generation(&store, "Customer", "c1").unwrap(), 2);
+    }
+
+    #[test]
+    fn ensure_skips_matching_identity_and_appends_property_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let mut object = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "Acme".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        with_test_log_path(&log, || {
+            assert_eq!(
+                ensure_admitted_object_in_configured_log(&object).unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                ensure_admitted_object_in_configured_log(&object).unwrap(),
+                Some(1)
+            );
+            object.properties.insert("region".into(), "us".into());
+            assert_eq!(
+                ensure_admitted_object_in_configured_log(&object).unwrap(),
+                Some(2)
+            );
+        });
     }
 
     #[test]
