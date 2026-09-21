@@ -23,8 +23,21 @@ use crate::sekai::action_type_criteria::{
     CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
-use crate::sekai::{action_effect, action_object_mutation, action_policy, audit};
+use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
 use std::collections::{BTreeMap, HashMap};
+
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_RECORD_ADMISSION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_record_admission() {
+    FAIL_NEXT_RECORD_ADMISSION.with(|flag| flag.set(true));
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ActionInstanceAdmissionRequest {
@@ -395,6 +408,13 @@ impl<'a> ActionInstanceAdmission<'a> {
                 "action instance admission is still in progress".into(),
             ));
         }
+        if existing.status == STATUS_ADMITTED
+            && let Some(object) = object_for_admitted_instance(self.db, &existing)?
+        {
+            // Clerk admission is already durable. Log catch-up is best-effort so
+            // a transient object-log error cannot fail an idempotent replay.
+            let _ = object_log::ensure_admitted_object_in_configured_log(&object);
+        }
         Ok(ActionInstanceAdmissionOutcome {
             instance: existing,
             replay: true,
@@ -415,6 +435,12 @@ impl<'a> ActionInstanceAdmission<'a> {
         budget_already_reserved: bool,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
+        #[cfg(test)]
+        if FAIL_NEXT_RECORD_ADMISSION.with(|flag| flag.replace(false)) {
+            return Err(ActionInstanceAdmissionError::Internal(
+                "injected record_admission failure".into(),
+            ));
+        }
         let operation_id = &stored.operation_id;
         let mut intent_attributes = BTreeMap::from([
             ("instance_id".into(), stored.instance_id.clone()),
@@ -587,9 +613,33 @@ impl<'a> ActionInstanceAdmission<'a> {
             self.db
                 .put_action_effects(effects)
                 .map_err(ActionInstanceAdmissionError::Internal)?;
+            if let Some(applied) = applied_object {
+                object_log::ensure_admitted_object_in_configured_log(&applied.object)
+                    .map_err(ActionInstanceAdmissionError::Internal)?;
+            }
         }
         Ok(())
     }
+}
+
+fn object_for_admitted_instance(
+    db: &RuntimeDb,
+    instance: &ActionInstance,
+) -> Result<Option<crate::domain::Object>, ActionInstanceAdmissionError> {
+    let object_id = serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("object_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if object_id.trim().is_empty() {
+        return Ok(None);
+    }
+    db.get_object(&object_id)
+        .map_err(ActionInstanceAdmissionError::Internal)
 }
 
 fn load_criterion_object(
@@ -1305,6 +1355,92 @@ mod tests {
             assert_eq!(
                 crate::sekai::object_log::identity_generation(&store, "customer_record", "rec-log")
                     .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn failed_record_admission_does_not_ingest_so_retry_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            fail_next_record_admission();
+            let mut request = record_request(
+                "customer.record.create",
+                r#"{"object_id":"rec-retry","name":"Retry"}"#,
+            );
+            request.idempotency_key = "record-retry-log".into();
+            request.request_id = "operation-retry-log".into();
+            assert!(admission.admit(request.clone(), "alice", 10).is_err());
+            assert!(db.get_object("rec-retry").unwrap().is_none());
+            assert!(
+                db.get_operation_receipt("operation-retry-log")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !log.exists(),
+                "object-log ingest must wait for a durable admission receipt"
+            );
+
+            let admitted = admission.admit(request, "alice", 20).unwrap();
+            assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+            assert!(db.get_object("rec-retry").unwrap().is_some());
+            let store = mikura::Store::open(&log).unwrap();
+            assert_eq!(
+                crate::sekai::object_log::identity_generation(
+                    &store,
+                    "customer_record",
+                    "rec-retry"
+                )
+                .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn ingest_failure_after_receipt_is_caught_up_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            crate::sekai::object_log::fail_next_ingest();
+            let mut request = record_request(
+                "customer.record.create",
+                r#"{"object_id":"rec-catchup","name":"Catchup"}"#,
+            );
+            request.idempotency_key = "record-catchup-log".into();
+            request.request_id = "operation-catchup-log".into();
+            assert!(admission.admit(request.clone(), "alice", 10).is_err());
+            assert!(db.get_object("rec-catchup").unwrap().is_some());
+            assert!(
+                db.get_operation_receipt("operation-catchup-log")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(!log.exists());
+
+            let replay = admission.admit(request, "alice", 20).unwrap();
+            assert!(replay.replay);
+            let store = mikura::Store::open(&log).unwrap();
+            assert_eq!(
+                crate::sekai::object_log::identity_generation(
+                    &store,
+                    "customer_record",
+                    "rec-catchup"
+                )
+                .unwrap(),
                 1
             );
         });

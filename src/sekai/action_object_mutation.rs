@@ -12,7 +12,6 @@ use crate::sekai::governed_action_type::{
 };
 use crate::sekai::governed_facts;
 use crate::sekai::markings::PRINCIPAL_PROFILE_KIND;
-use crate::sekai::object_log;
 use crate::sekai::schema::SchemaRegistry;
 use std::collections::HashMap;
 
@@ -46,6 +45,7 @@ pub(crate) struct AppliedObjectMutation {
     pub object_kind: String,
     pub mutation: String,
     pub created: bool,
+    pub object: Object,
     previous: Option<Object>,
     applied_updated: i64,
 }
@@ -207,6 +207,7 @@ pub(crate) fn apply(
     object.updated = now_ms;
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
+    let applied_updated = object.updated;
     let previous = if created {
         db.create_object_with_audit(&object, actor)
             .map_err(ActionObjectMutationError::Internal)?;
@@ -222,19 +223,15 @@ pub(crate) fn apply(
                 })?,
         )
     };
-    let applied = AppliedObjectMutation {
+    Ok(AppliedObjectMutation {
         object_id,
         object_kind,
         mutation,
         created,
+        object,
         previous,
-        applied_updated: object.updated,
-    };
-    if let Err(error) = object_log::apply_admitted_object_to_configured_log(&object) {
-        compensate(db, &applied, actor);
-        return Err(ActionObjectMutationError::Internal(error));
-    }
-    Ok(applied)
+        applied_updated,
+    })
 }
 
 pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) {
