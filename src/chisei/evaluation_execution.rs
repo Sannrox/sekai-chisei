@@ -3291,6 +3291,34 @@ mod tests {
     }
 
     #[test]
+    fn external_adapter_without_the_shared_secret_fails_closed_before_any_request() {
+        if external_adapter_secret_configured() {
+            // The operator environment supplies a secret; the unset case is
+            // not observable without mutating process state.
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let evaluator = ExternalHttpEvaluator::new(
+            "acme",
+            &digest('e'),
+            &format!("https://{}/evaluate", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let manifest = manifest(vec![node("check", NODE_REQUIRED, &[])]);
+        let evaluator_input = input(&manifest, &manifest.nodes[0]);
+        assert_eq!(
+            evaluator.evaluate(&evaluator_input).unwrap_err(),
+            REASON_EVALUATOR_UNAVAILABLE
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no shared secret means the adapter is never contacted, not even unsigned"
+        );
+    }
+
+    #[test]
     fn deterministic_evaluator_result_rejects_unknown_fields() {
         let result = serde_json::from_value::<DeterministicEvaluatorOutput>(serde_json::json!({
             "contract_version": EVALUATOR_RESULT_CONTRACT,
