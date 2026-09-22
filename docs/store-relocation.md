@@ -6,14 +6,16 @@ store as Sekai facts. Combined mode can already open two files
 copies Chisei-owned families into the Chisei destination, then raises a
 writer fence so the old single-store process cannot become a writer again.
 
-Do not dual-write production traffic across two stores. Quiesce writers
-before copy.
+Do not dual-write production traffic across two stores. Relocation runs
+online: the historical process may keep writing during the bulk copy, and
+writers are refused only for the short fenced catch-up at the end.
 
-## Quiesce
+## Before you start
 
-Stop every `sekai-chisei` process that has the historical file or URL open
-for writes. Take a copy of the pre-relocate files. That copy is the rollback
-point until the fence is raised.
+Take a copy of the pre-relocate files. That copy is the rollback point:
+relocate changes the source from the moment it starts (capture tables and
+triggers), so the live source is not a clean rollback copy. Writers do not
+need to be stopped first.
 
 ## Relocate
 
@@ -39,15 +41,31 @@ sekaictl admin store relocate \
 The command:
 
 1. Initializes missing destination schema.
-2. Copies each Chisei family (`budget`, `evaluation`, `portfolio`, …) from
-   `--source` into `--chisei`.
-3. Validates row counts per table and fails closed on mismatch.
-4. Records completed families in `chisei_relocate_families` so a crash can
-   resume from the last completed family.
-5. Stamps `sekai_store_cutover` on the source, Sekai store, and Chisei
-   store and raises the writer fence. PostgreSQL takes a `REPEATABLE READ`
-   `COPY` snapshot, then fences, then loads the Chisei destination from
-   that snapshot.
+2. Installs write capture on every Chisei table of `--source`: a trigger
+   records which tables were written (`sekai_relocate_dirty`) and checks a
+   one-row gate (`sekai_relocate_capture`).
+3. Snapshots the source (SQLite `VACUUM INTO`, PostgreSQL one
+   `REPEATABLE READ` `COPY` pass) and copies each Chisei family (`budget`,
+   `evaluation`, `portfolio`, …) from that snapshot into `--chisei` while
+   writers keep running. Row counts are validated per table and fail closed
+   on mismatch. Completed families are recorded in
+   `chisei_relocate_families` so a crash can resume from the last completed
+   family.
+4. Raises the writer fence: closes the capture gate and stamps
+   `sekai_store_cutover` on the source in one transaction. From then on the
+   source database itself refuses every Chisei write with
+   `writer fence raised`, including writes from a process that was already
+   running. On PostgreSQL the gate waits for in-flight writer transactions
+   to commit first.
+5. Copies again only the families written since capture began (plus any
+   Chisei table created during the copy), clears the dirty set, and stamps
+   the Sekai and Chisei stores.
+
+The JSON report lists the bulk copy in `families`, the fenced catch-up in
+`recopied`, and the refuse window in `fence_window_ms`. Writers are refused
+only for that window, not for the full family load. The catch-up reloads each
+dirty family in full, so the window grows with the size of the families
+written during the copy, not with the number of rows changed.
 
 Sekai-owned tables stay in place. Source Chisei rows are left for rollback
 until an operator archives the pre-fence snapshot.
@@ -55,14 +73,20 @@ until an operator archives the pre-fence snapshot.
 ## Resume
 
 Re-run the same command. Completed families are skipped. Incomplete families
-are copied again and re-validated.
+are copied again and re-validated. A run interrupted after the fence keeps its
+dirty set, so the re-run copies those families again before stamping. Once the
+fence is raised, the source refuses Chisei writes until a re-run stamps both
+destinations; recover a failure in that window by re-running, not by
+reopening the source as a Shared writer.
 
 ## After the fence
 
 Combined already refuses a lone `DB_PATH` / `DATABASE_URL` unless
 `SEKAI_SHARED_STORE=1`. After the fence, that hatch still cannot start a
-writer (including `gateway-report`). Set `SEKAI_DB_PATH` and `CHISEI_DB_PATH`
-(or two PostgreSQL URLs) and start Combined against the destination pair.
+writer (including `gateway-report`). Stop the historical process, set
+`SEKAI_DB_PATH` and `CHISEI_DB_PATH` (or two PostgreSQL URLs), and start
+Combined against the destination pair. The capture triggers stay on the
+source's Chisei tables, which remain as rollback data and refuse writes.
 
 Rollback after the fence is restore-both from the pre-fence snapshot, not a
 mixed pair.

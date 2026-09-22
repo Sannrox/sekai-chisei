@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `sekaictl admin store relocate` runs online. Triggers on the source's
+  Chisei tables record writes, families are bulk-copied from a snapshot while
+  writers run, and the writer fence is then enforced in the source database
+  itself. Only families written during the copy are copied again under the
+  fence, so writers are refused for that catch-up rather than the full family
+  load. The report adds `recopied` and `fence_window_ms` (#1107).
 - A `PlanExecution` can pin one active governed learning with
   `ExecutionInput.learning_pin`. The pin changes context only, requires an
   approved and activated learning whose digest matches, fails closed with one
