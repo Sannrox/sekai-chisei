@@ -2068,7 +2068,7 @@ mod tests {
             .map(|family| family.family.as_str())
             .collect();
         assert_eq!(recopied, ["budget"]);
-        assert!(report.families.len() > 1, "{:?}", report.families);
+        assert!(report.families.len() > 1);
     }
 
     #[test]
@@ -2082,7 +2082,7 @@ mod tests {
             .set_limit("quiet-user", 2_000, PeriodType::Daily)
             .unwrap();
         let report = relocate_sqlite(source_s, source_s, chisei.to_str().unwrap()).unwrap();
-        assert!(report.recopied.is_empty(), "{:?}", report.recopied);
+        assert!(report.recopied.is_empty());
     }
 
     #[test]
@@ -2107,7 +2107,7 @@ mod tests {
             .set_limit("split-writer", 1_000, PeriodType::Daily)
             .unwrap();
         let rerun = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
-        assert!(rerun.recopied.is_empty(), "{:?}", rerun.recopied);
+        assert!(rerun.recopied.is_empty());
         assert_eq!(budget_limit(chisei_s, "split-writer"), 1_000);
     }
 
@@ -2900,7 +2900,7 @@ mod tests {
         let stale = stale_writer.unwrap().join().unwrap().unwrap_err();
         assert!(
             format!("{stale:?}").contains("could not serialize"),
-            "a stale-snapshot writer must not pass the closed gate: {stale:?}"
+            "a stale-snapshot writer must not pass the closed gate"
         );
 
         let amount = |db: &PostgresDb, scope: &str| -> Option<i64> {
@@ -2937,16 +2937,10 @@ mod tests {
             Some(&budget),
         )
         .unwrap_err();
-        assert!(
-            mismatch.contains("relocate validation failed"),
-            "{mismatch}"
-        );
+        assert!(mismatch.contains("relocate validation failed"));
 
         let err = insert_limit(&mut *source.connection().unwrap(), "after-fence", 3).unwrap_err();
-        assert!(
-            format!("{err:?}").contains("writer fence raised"),
-            "{err:?}"
-        );
+        assert!(format!("{err:?}").contains("writer fence raised"));
         assert!(postgres_writer_fence_raised(&source).unwrap());
     }
 
