@@ -692,7 +692,9 @@ fn postgres_writer_fence_raised(db: &PostgresDb) -> Result<bool, String> {
         "SELECT fence_raised FROM sekai_store_cutover WHERE id = 1",
         &[],
     ) {
-        Ok(Some(row)) => Ok(row.get::<_, i64>(0) == 1),
+        // fence_raised is INTEGER (int4); the postgres crate does not widen
+        // an int4 column into an i64 read.
+        Ok(Some(row)) => Ok(row.get::<_, i32>(0) == 1),
         Ok(None) => Ok(false),
         Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => {
             Ok(false)
@@ -717,8 +719,11 @@ fn raise_postgres_writer_fence_with_generation(
             id INTEGER PRIMARY KEY CHECK (id = 1),
             generation BIGINT NOT NULL,
             fence_raised INTEGER NOT NULL,
-            raised_at_ms BIGINT NOT NULL
-        );",
+            raised_at_ms BIGINT NOT NULL,
+            pairing_epoch BIGINT NOT NULL DEFAULT 0
+        );
+        ALTER TABLE sekai_store_cutover
+            ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
     )
     .map_err(|error| error.to_string())?;
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1176,7 +1181,9 @@ fn write_postgres_generation(db: &PostgresDb, generation: i64) -> Result<(), Str
             ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
     )
     .map_err(|error| error.to_string())?;
-    let fence_raised: i64 = match conn.query_opt(
+    // fence_raised is INTEGER (int4); the postgres crate does not widen an
+    // int4 column into an i64 read, so this must stay i32.
+    let fence_raised: i32 = match conn.query_opt(
         "SELECT fence_raised FROM sekai_store_cutover WHERE id = 1",
         &[],
     ) {
@@ -2144,5 +2151,50 @@ mod tests {
         );
         assert!(compare_split_generations(Some(42), Some(41)).refuses_mutations());
         assert!(!compare_split_generations(Some(42), Some(42)).refuses_mutations());
+    }
+
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    #[test]
+    fn greenfield_postgres_fence_then_generation_stamp_succeeds() {
+        // #1105: raise_postgres_writer_fence's CREATE previously omitted
+        // pairing_epoch while its INSERT named it, so a truly greenfield
+        // database (fence raised before any generation write ever created the
+        // table) failed the INSERT with "column pairing_epoch does not
+        // exist". Explicitly drop first: another test in this binary may have
+        // already created the table against the same SEKAI_TEST_POSTGRES_URL.
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let pem = std::fs::read(&path).expect("read PostgreSQL test CA certificate");
+            PostgresDb::connect_with_ca_certificate(&url, 4, &pem).unwrap()
+        } else {
+            PostgresDb::connect(&url, 4).unwrap()
+        };
+        db.connection()
+            .unwrap()
+            .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+            .unwrap();
+
+        raise_postgres_writer_fence_with_generation(&db, 7).unwrap();
+        assert!(postgres_writer_fence_raised(&db).unwrap());
+
+        let runtime = RuntimeDb::Postgres(std::sync::Arc::new(db));
+        write_runtime_generation(&runtime, 7).unwrap();
+        assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(7));
+        assert_eq!(read_runtime_pairing_epoch(&runtime).unwrap(), 0);
+
+        // Leave a clean greenfield state: this test and
+        // postgres_generation_roundtrip_covers_the_fence share one
+        // SEKAI_TEST_POSTGRES_URL singleton cutover row and can run in either
+        // order, so raising the fence here must not leak into a sibling test's
+        // unfenced assertion.
+        match &runtime {
+            RuntimeDb::Postgres(db) => db
+                .connection()
+                .unwrap()
+                .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+                .unwrap(),
+            RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+        }
     }
 }
