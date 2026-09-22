@@ -823,7 +823,7 @@ const OPERATOR_FACT_TABLES: &[&str] = &[
     "sekai_objects",
     "sekai_grants",
     "sekai_links",
-    "sekai_governed_action_instances",
+    "sekai_action_instances",
     "sekai_decisions",
 ];
 
@@ -1456,6 +1456,7 @@ mod tests {
     use super::*;
     use crate::chisei::budget::{BudgetTracker, PeriodType};
     use crate::db::store::ChiseiStore;
+    use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
 
     #[test]
     fn relocate_copies_budget_family_and_fences_the_source() {
@@ -1767,6 +1768,31 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_action_instance(layout: &CombinedStoreLayout, instance_id: &str) {
+        layout
+            .sekai_runtime()
+            .put_action_instance(&ActionInstance {
+                instance_id: instance_id.into(),
+                namespace: "ns".into(),
+                type_id: "type-1043".into(),
+                version: "1".into(),
+                principal: "root".into(),
+                parameters_json: "{}".into(),
+                request_digest: format!("digest-{instance_id}"),
+                idempotency_key: format!("idem-{instance_id}"),
+                operation_id: format!("op-{instance_id}"),
+                status: STATUS_ADMITTED.into(),
+                deny_reason: String::new(),
+                evidence_submission_ids: vec![],
+                policy_decision: String::new(),
+                budget_decision: String::new(),
+                created_at_ms: 1,
+                decided_at_ms: 1,
+                system_one_fill_json: String::new(),
+            })
+            .unwrap();
+    }
+
     fn wipe_cutover(layout: &CombinedStoreLayout) {
         for runtime in [layout.sekai_runtime(), layout.chisei_runtime()] {
             runtime
@@ -1828,6 +1854,33 @@ mod tests {
             read_runtime_generation(&layout.sekai_runtime())
                 .unwrap()
                 .is_none()
+        );
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("operator facts"), "{err}");
+        assert!(err.contains("restamp"), "{err}");
+        restamp_split_generation(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn dual_unstamped_with_only_action_instance_facts_refuses_until_restamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        // No sekai_objects/grants/links/decisions rows: only a live action
+        // instance. The pre-#1103 misspelled table name counted zero facts
+        // here and Matched despite this live row.
+        insert_action_instance(&layout, "instance-1103");
+        wipe_cutover(&layout);
+
+        assert_eq!(
+            split_generation_state(&layout).unwrap(),
+            SplitGenerationState::Unattested
+        );
+        assert_eq!(
+            align_split_generations(&layout).unwrap(),
+            SplitGenerationState::Unattested
         );
         let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
         assert!(err.contains("operator facts"), "{err}");
