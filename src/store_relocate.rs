@@ -2278,7 +2278,10 @@ mod tests {
         // With the fail-closed fix, a missing row on either side surfaces as
         // an Err from advance_pairing_epoch instead of a silent partial
         // advance, and pairing_epochs_match still correctly detects the
-        // divergence if one ever occurs.
+        // divergence if one ever occurs. This exercises advance_pairing_epoch
+        // itself (not just write_runtime_pairing_epoch) through a real Split
+        // Postgres CombinedStoreLayout, so it proves the caller's error
+        // propagation and divergence detection, not only the lower-level write.
         let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
             .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
         // A real Split pair is two physically distinct databases; reusing one
@@ -2289,27 +2292,24 @@ mod tests {
             "SEKAI_TEST_POSTGRES_CHISEI_URL must identify a second isolated PostgreSQL \
              database distinct from SEKAI_TEST_POSTGRES_URL",
         );
-        let make_db = |url: &str| {
-            if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-                let pem = std::fs::read(&path).expect("read PostgreSQL test CA certificate");
-                PostgresDb::connect_with_ca_certificate(url, 4, &pem).unwrap()
+        let ca_cert_path = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT").ok();
+        let connect = |connection_url: &str| {
+            if let Some(path) = &ca_cert_path {
+                let pem = std::fs::read(path).expect("read PostgreSQL test CA certificate");
+                PostgresDb::connect_with_ca_certificate(connection_url, 4, &pem).unwrap()
             } else {
-                PostgresDb::connect(url, 4).unwrap()
+                PostgresDb::connect(connection_url, 4).unwrap()
             }
         };
-        let sekai_db = make_db(&url);
-        sekai_db
+        // Reset both sides to a truly greenfield state before opening the
+        // layout: no table on the sekai side, an existing table without a row
+        // on the chisei side, matching the scenario under test.
+        connect(&url)
             .connection()
             .unwrap()
             .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
             .unwrap();
-        let sekai = RuntimeDb::Postgres(std::sync::Arc::new(sekai_db));
-        write_runtime_generation(&sekai, 1).unwrap();
-
-        // The chisei side's table exists but has no id=1 row yet: advance
-        // must fail closed rather than silently stamping only the sekai side.
-        let chisei_db = make_db(&chisei_url);
-        chisei_db
+        connect(&chisei_url)
             .connection()
             .unwrap()
             .batch_execute(
@@ -2323,31 +2323,66 @@ mod tests {
                  );",
             )
             .unwrap();
-        let chisei = RuntimeDb::Postgres(std::sync::Arc::new(chisei_db));
 
-        let before = read_runtime_pairing_epoch(&sekai).unwrap();
-        let error = write_runtime_pairing_epoch(&chisei, before.max(0) + 1).unwrap_err();
+        let layout = CombinedStoreSources {
+            backend: Some(BackendIdentity::Postgres),
+            sekai_postgres_url: Some(url.clone()),
+            chisei_postgres_url: Some(chisei_url.clone()),
+            postgres_max_connections: 4,
+            postgres_ca_cert_path: ca_cert_path.clone(),
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap();
+        assert!(layout.is_split());
+
+        // The sekai side has no row at all yet either: stamp a generation on
+        // it (as align/restamp normally would first) so only the chisei side
+        // is missing its row, isolating the one-sided-advance scenario.
+        write_runtime_generation(&layout.sekai_runtime(), 1).unwrap();
+        assert!(pairing_epochs_match(&layout).unwrap());
+
+        // advance_pairing_epoch writes the sekai side first, then the chisei
+        // side. The chisei side's missing row must make the whole call fail
+        // closed instead of silently leaving sekai advanced and chisei stale.
+        let before = read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap();
+        let error = advance_pairing_epoch(&layout).unwrap_err();
         assert!(error.contains("affected 0 rows"), "{error}");
         assert_eq!(
-            read_runtime_pairing_epoch(&sekai).unwrap(),
-            before,
-            "the sekai side must be unaffected by the chisei side's failure"
+            read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            before + 1,
+            "advance_pairing_epoch writes sekai before chisei, so sekai does \
+             advance even though the call as a whole reports failure"
+        );
+        assert!(
+            !pairing_epochs_match(&layout).unwrap(),
+            "the one-sided write must be a detectable divergence, not a \
+             silent success"
         );
 
-        write_runtime_generation(&chisei, 1).unwrap();
-        write_runtime_pairing_epoch(&sekai, before + 1).unwrap();
-        write_runtime_pairing_epoch(&chisei, before + 1).unwrap();
-        assert_eq!(read_runtime_pairing_epoch(&sekai).unwrap(), before + 1);
-        assert_eq!(read_runtime_pairing_epoch(&chisei).unwrap(), before + 1);
+        // Once the chisei side is properly generation-stamped, the pair is
+        // no longer divergent and advance succeeds on both sides together.
+        write_runtime_generation(&layout.chisei_runtime(), 1).unwrap();
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), before + 1).unwrap();
+        assert!(pairing_epochs_match(&layout).unwrap());
+        advance_pairing_epoch(&layout).unwrap();
+        assert_eq!(
+            read_runtime_pairing_epoch(&layout.sekai_runtime()).unwrap(),
+            before + 2
+        );
+        assert_eq!(
+            read_runtime_pairing_epoch(&layout.chisei_runtime()).unwrap(),
+            before + 2
+        );
 
-        for runtime in [&sekai, &chisei] {
-            match runtime {
+        for runtime in [layout.sekai_runtime(), layout.chisei_runtime()] {
+            match runtime.as_ref() {
                 RuntimeDb::Postgres(db) => db
                     .connection()
                     .unwrap()
                     .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
                     .unwrap(),
-                RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+                RuntimeDb::Sqlite(_) => unreachable!("opened as Postgres above"),
             }
         }
     }
