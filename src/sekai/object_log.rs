@@ -31,20 +31,48 @@ static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 /// Keyed by path rather than a bare `Option<Store>` so a changed
 /// `SEKAI_OBJECT_LOG` (or, in tests, a new `with_test_log_path` override)
 /// transparently reopens instead of silently serving state read from a
-/// different log. Safe to keep reusing otherwise: [`ensure_admitted_object_in_configured_log`]
-/// and [`apply_admitted_object_to_log`] are the only production writers of
-/// a configured object-log path (nothing else in this process, or any
-/// other process, appends to it), so this handle's in-memory state can
-/// never go stale relative to the file it wraps. That single-writer
-/// funnel is exactly what a read-only comparator against a log an
-/// *external* writer also appends to would not have, which is why the
-/// same "keep the handle" approach is not safe for the dual-read canary
-/// path (#1110).
+/// different log. [`ensure_admitted_object_in_configured_log`] and
+/// [`apply_admitted_object_to_log`] are the only production writers of a
+/// configured object-log path, and they write through this handle, so its
+/// in-memory state tracks the file. #1110: the dual-read canary reads the
+/// same `SEKAI_OBJECT_LOG` through this handle instead of a `Store::open`
+/// per sample. The handle also records the file's length, modification
+/// time, and superblock digest after each use and reopens when any differs,
+/// so a committed write that did not go through it (an operator tool, a test
+/// fixture) is never served from stale memory.
 static OBJECT_LOG_STORE: OnceLock<Mutex<Option<CachedObjectLogStore>>> = OnceLock::new();
 
 struct CachedObjectLogStore {
     path: PathBuf,
     store: Store,
+    stamp: Option<LogStamp>,
+}
+
+/// Bytes at the head of the log that hold mikura's superblock. The pinned
+/// tag writes a 4096-byte superblock at offset 0 carrying the committed page
+/// count, rewritten on every commit.
+const SUPERBLOCK_BYTES: usize = 4096;
+
+/// Length, modification time, and a digest of the superblock. The superblock
+/// digest changes on every commit, so a write that reuses a torn tail page's
+/// length within one coarse modification-time tick is still detected.
+/// Modification time is optional: a filesystem without it keeps the cache
+/// on length and superblock digest instead of reopening on every call.
+type LogStamp = (u64, Option<std::time::SystemTime>, u64);
+
+fn log_stamp(path: &Path) -> Option<LogStamp> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let mut head = Vec::with_capacity(SUPERBLOCK_BYTES);
+    file.by_ref()
+        .take(SUPERBLOCK_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    head.hash(&mut hasher);
+    Some((metadata.len(), metadata.modified().ok(), hasher.finish()))
 }
 
 /// Runs `body` against a `Store` for `path`, reusing the cached handle when
@@ -69,7 +97,9 @@ fn with_object_log_store_cache<R>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let stale = match guard.as_ref() {
-        Some(cached) => cached.path != path,
+        Some(cached) => {
+            cached.path != path || cached.stamp.is_none() || cached.stamp != log_stamp(path)
+        }
         None => true,
     };
     if stale {
@@ -88,12 +118,15 @@ fn with_object_log_store_cache<R>(
         *guard = Some(CachedObjectLogStore {
             path: path.to_path_buf(),
             store,
+            stamp: None,
         });
     }
     let cached = guard.as_mut().expect("cache populated above");
     let result = body(&mut cached.store);
     if result.is_err() {
         *guard = None;
+    } else {
+        cached.stamp = log_stamp(path);
     }
     result
 }
@@ -157,7 +190,7 @@ impl ObjectLogDualRead {
 /// object-log Store.
 ///
 /// Sample first so unsampled requests pay neither cost. After a hit, skip
-/// unexpressible grammar before any policy fetch. Store open stays inside
+/// unexpressible grammar before any policy fetch. The Store read stays inside
 /// [`compare_sql_to_log_path`] on the canary only.
 pub fn should_fetch_canary_policies(
     config: &ObjectLogDualRead,
@@ -391,14 +424,29 @@ pub fn compare_sql_to_log_path(
     sql_paths: &[Vec<&ObjectTypeIndexMember>],
     acl: PropertyAcl,
 ) -> Result<(), ObjectLogCompareError> {
+    let cache = OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None));
+    compare_sql_to_log_with_cache(cache, path, descriptor, hops, aggregation, sql_paths, acl)
+}
+
+fn compare_sql_to_log_with_cache(
+    cache: &Mutex<Option<CachedObjectLogStore>>,
+    path: &Path,
+    descriptor: &ObjectSetDescriptor,
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    aggregation: &ObjectSetAggregation,
+    sql_paths: &[Vec<&ObjectTypeIndexMember>],
+    acl: PropertyAcl,
+) -> Result<(), ObjectLogCompareError> {
     if !path.exists() {
         return Err(ObjectLogCompareError::MissingLog);
     }
     let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
-    let store = Store::open(path).map_err(ObjectLogCompareError::Evaluate)?;
-    let log = ObjectSet::new(LocalCompute)
-        .evaluate(&store, &request)
-        .map_err(|error| ObjectLogCompareError::Evaluate(format!("{error:?}")))?;
+    let log = with_object_log_store_cache(cache, path, |store| {
+        ObjectSet::new(LocalCompute)
+            .evaluate(store, &request)
+            .map_err(|error| format!("{error:?}"))
+    })
+    .map_err(ObjectLogCompareError::Evaluate)?;
     let (sql_roots, sql_sum) = sql_compare_signature(sql_paths, aggregation)?;
     let sum_matches = request.sum_property.is_empty() || sql_sum == log.sum_amount;
     if sql_roots == log.two_hop_count && sum_matches {
@@ -605,6 +653,57 @@ mod tests {
     }
 
     #[test]
+    fn log_stamp_detects_a_superblock_rewrite_at_the_same_length_and_mtime() {
+        // A commit that reuses a torn tail page's length inside one coarse
+        // modification-time tick still rewrites the superblock.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        std::fs::write(&log, vec![1u8; 2 * SUPERBLOCK_BYTES]).unwrap();
+        let before = log_stamp(&log).unwrap();
+        let mut rewritten = vec![1u8; 2 * SUPERBLOCK_BYTES];
+        rewritten[8] = 2;
+        std::fs::write(&log, rewritten).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_modified(before.1.unwrap())
+            .unwrap();
+        let after = log_stamp(&log).unwrap();
+        assert_eq!((after.0, after.1), (before.0, before.1));
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn every_mikura_commit_rewrites_the_superblock_the_stamp_digests() {
+        // Contract with the pinned mikura tag: a dependency bump that moves
+        // the superblock or stops rewriting it on commit fails here.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let mut store = Store::create(&log).unwrap();
+        let mut previous = log_stamp(&log).unwrap().2;
+        for generation in 1..=3u64 {
+            BatchIngest::run(
+                &mut store,
+                vec![ObjectRecord {
+                    r#gen: generation,
+                    kind: "Customer".into(),
+                    key: "c1".into(),
+                    hidden: false,
+                    props: HashMap::from([("n".into(), generation.to_string())]),
+                }],
+            )
+            .unwrap();
+            let digest = log_stamp(&log).unwrap().2;
+            assert_ne!(
+                digest, previous,
+                "commit {generation} left the superblock unchanged"
+            );
+            previous = digest;
+        }
+    }
+
+    #[test]
     fn ensure_skips_matching_identity_and_appends_property_change() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
@@ -705,15 +804,26 @@ mod tests {
         let order = member("Order", "o1", "customer_id", "c1");
         let shipment = member("Shipment", "s1", "amount", "10");
         let paths = vec![vec![&customer, &order, &shipment]];
-        compare_sql_to_log_path(
-            &log,
-            &descriptor,
-            &hops,
-            &aggregation,
-            &paths,
-            PropertyAcl::allow_all(),
-        )
-        .unwrap();
+        // #1110: an owned cache (not the shared static) keeps open counts
+        // deterministic under the parallel test runner.
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let compare = || {
+            compare_sql_to_log_with_cache(
+                &cache,
+                &log,
+                &descriptor,
+                &hops,
+                &aggregation,
+                &paths,
+                PropertyAcl::allow_all(),
+            )
+        };
+        OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(0));
+        for _ in 0..4 {
+            compare().unwrap();
+        }
+        // Canary samples share one handle instead of a Store::open each.
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 1);
 
         BatchIngest::run(
             &mut store,
@@ -729,16 +839,13 @@ mod tests {
             }],
         )
         .unwrap();
-        let err = compare_sql_to_log_path(
-            &log,
-            &descriptor,
-            &hops,
-            &aggregation,
-            &paths,
-            PropertyAcl::allow_all(),
-        )
-        .unwrap_err();
+        // A write that bypassed the cached handle changes the file, so the
+        // next sample reopens and sees it rather than serving stale memory.
+        let err = compare().unwrap_err();
         assert!(matches!(err, ObjectLogCompareError::Mismatch { .. }));
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 2);
+        assert!(compare().is_err());
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 2);
     }
 
     #[test]
