@@ -27,8 +27,16 @@
   state the `SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs` gate.
 - Align agent instructions, operator docs, and comments with landed
   two-plane bins, dest-pair stores, and experimental RPC gates.
-- Admitted Action object apply appends through tagged mikura ingest when
-  `SEKAI_OBJECT_LOG` is set; denied submits do not write the log (#943).
+- Admitted Action object apply no longer appends to the tagged mikura object
+  log inline: SQL apply is the durable admission receipt's success signal,
+  and ingest into the configured `SEKAI_OBJECT_LOG` runs only after that
+  receipt, effects, and audit are durable. A pre-receipt failure leaves no
+  log identity, so retry cannot double-apply; replay catch-up is best-effort
+  and skips a matching property map so the same mutation does not bump
+  generation. Denied submits still never write the log. A receipted admission
+  can transiently show as absent from the log until catch-up runs; see
+  [ADR 0081](docs/decisions/0081-evaluate-reads-mikura-library.md) (#943,
+  #1102, #1114).
 - Dual-unstamped Split open auto-stamps only empty green-field stores;
   operator facts without cutover stay refused until restamp (#1043).
 - Split pairing epoch advances on both stores at mutating admit so a

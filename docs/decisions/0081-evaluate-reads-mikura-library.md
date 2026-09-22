@@ -98,3 +98,35 @@ gates until #942 documents a distinct object-log comparison.
 - Clerk storage selection remains `SEKAI_DB_BACKEND=sqlite|postgres`.
 - Revisit a hosted profile only after mikura publishes a hosted tag or API
   that preserves fail-closed property absence on the wire.
+
+## Amendments
+
+- 2026-09-22, Issue [#1116](https://github.com/Sannrox/sekai-chisei/issues/1116):
+  records the #943/#1102 write ordering as landed in
+  [#1114](https://github.com/Sannrox/sekai-chisei/issues/1114) (`423edf4a`),
+  which this ADR's Decision item 8 and Consequences section still described
+  by the pre-#1114 "apply through `mikura-ingest`" wording.
+  - **Receipt before ingest.** SQL apply is no longer coupled to the mikura
+    append. `record_admission`'s durable operation receipt, effects, and
+    audit are the success signal; ingest into the configured
+    `SEKAI_OBJECT_LOG` runs only after that receipt is durable, not inside
+    `apply`.
+  - **The log stays a rebuildable projection.** This ADR's read-path rule is
+    unchanged: object identity and generations belong to the tagged mikura
+    `Store`. Post-receipt ingest ordering does not move authority into the
+    log; a lost or delayed ingest is recoverable by replay, never by treating
+    the log as the source of truth for an admission that already receipted.
+  - **Replay catch-up is best-effort and idempotent.** A pre-receipt ingest
+    failure leaves no log identity, so retry cannot double-apply. Catch-up
+    (`ensure_admitted_object_in_configured_log`) skips a matching property
+    map so replaying an already-ingested mutation does not bump generation.
+  - **Receipted-without-log is an allowed interim consumer state.** Between a
+    durable receipt and successful ingest (or catch-up), dual-read and
+    `EvaluateObjectSet` can observe an admitted object as absent from the
+    configured log. That gap is expected, not a correctness violation of this
+    ADR's fail-closed dual-read rule (Decision item 4), which governs
+    mismatches between a *populated* SQL projection and mikura, not a pending
+    ingest. Closing that gap with a bounded catch-up guarantee or an
+    operator-visible pending signal is tracked separately in
+    [#1115](https://github.com/Sannrox/sekai-chisei/issues/1115) and is not
+    decided by this amendment.
