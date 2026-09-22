@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 pub const DUAL_READ_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ";
 pub const LOG_PATH_ENV: &str = "SEKAI_OBJECT_LOG";
@@ -23,10 +24,93 @@ const DEFAULT_SAMPLE_N: u32 = 32;
 
 static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 
+/// #1106: one process-scoped `Store` handle reused for every admit instead
+/// of a fresh `Store::open` — a full read of the on-disk log plus a replay
+/// of every record into memory — on every single admitted mutation.
+///
+/// Keyed by path rather than a bare `Option<Store>` so a changed
+/// `SEKAI_OBJECT_LOG` (or, in tests, a new `with_test_log_path` override)
+/// transparently reopens instead of silently serving state read from a
+/// different log. Safe to keep reusing otherwise: [`ensure_admitted_object_in_configured_log`]
+/// and [`apply_admitted_object_to_log`] are the only production writers of
+/// a configured object-log path (nothing else in this process, or any
+/// other process, appends to it), so this handle's in-memory state can
+/// never go stale relative to the file it wraps. That single-writer
+/// funnel is exactly what a read-only comparator against a log an
+/// *external* writer also appends to would not have, which is why the
+/// same "keep the handle" approach is not safe for the dual-read canary
+/// path (#1110).
+static OBJECT_LOG_STORE: OnceLock<Mutex<Option<CachedObjectLogStore>>> = OnceLock::new();
+
+struct CachedObjectLogStore {
+    path: PathBuf,
+    store: Store,
+}
+
+/// Runs `body` against a `Store` for `path`, reusing the cached handle when
+/// it already wraps `path` and opening (creating the log and its parent
+/// directory if `path` does not exist yet) otherwise. Holds the cache lock
+/// for the whole check-then-use sequence so a concurrent caller can never
+/// observe a handle for the wrong path.
+///
+/// Evicts the cache whenever `body` returns `Err`: mikura's writer is not
+/// failure-atomic (a partial page or superblock write on error can leave
+/// its cursor inconsistent with what actually landed on disk), so a failed
+/// operation must not leave that handle cached for a later call to keep
+/// writing through. The next call reopens and re-derives the correct
+/// cursor from disk instead, exactly as every call did before this cache
+/// existed.
+fn with_object_log_store_cache<R>(
+    cache: &Mutex<Option<CachedObjectLogStore>>,
+    path: &Path,
+    body: impl FnOnce(&mut Store) -> Result<R, String>,
+) -> Result<R, String> {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stale = match guard.as_ref() {
+        Some(cached) => cached.path != path,
+        None => true,
+    };
+    if stale {
+        #[cfg(test)]
+        OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
+        let store = if path.exists() {
+            Store::open(path)?
+        } else {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            Store::create(path)?
+        };
+        *guard = Some(CachedObjectLogStore {
+            path: path.to_path_buf(),
+            store,
+        });
+    }
+    let cached = guard.as_mut().expect("cache populated above");
+    let result = body(&mut cached.store);
+    if result.is_err() {
+        *guard = None;
+    }
+    result
+}
+
+fn with_cached_object_log_store<R>(
+    path: &Path,
+    body: impl FnOnce(&mut Store) -> Result<R, String>,
+) -> Result<R, String> {
+    let cache = OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None));
+    with_object_log_store_cache(cache, path, body)
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_LOG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_INGEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OBJECT_LOG_STORE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -343,16 +427,22 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
     if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
         return Err("injected object-log ingest failure".into());
     }
-    if path.exists()
-        && let Ok(store) = Store::open(&path)
-        && let Some(record) = store
-            .visible_of_kind(&object.kind)
-            .into_iter()
-            .find(|record| record.key == object.id)
-        && record.props == object.properties
-        && !record.hidden
-    {
-        return Ok(Some(record.r#gen));
+    if path.exists() {
+        // #1106: an open/read failure here falls through to apply, exactly
+        // as the pre-cache `if let Ok(store) = Store::open(&path)` guard
+        // did — an unreadable log is "couldn't verify the check", not a
+        // reason to fail the admission.
+        let existing = with_cached_object_log_store(&path, |store| {
+            Ok(store
+                .visible_of_kind(&object.kind)
+                .into_iter()
+                .find(|record| record.key == object.id)
+                .filter(|record| record.props == object.properties && !record.hidden)
+                .map(|record| record.r#gen))
+        });
+        if let Ok(Some(generation)) = existing {
+            return Ok(Some(generation));
+        }
     }
     apply_admitted_object_to_log(&path, object).map(Some)
 }
@@ -390,18 +480,10 @@ pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
 }
 
 pub fn apply_admitted_object_to_log(path: &Path, object: &Object) -> Result<u64, String> {
-    let mut store = if path.exists() {
-        Store::open(path)?
-    } else if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        Store::create(path)?
-    } else {
-        Store::create(path)?
-    };
-    BatchIngest::run(&mut store, vec![object_record(object)])?;
-    identity_generation(&store, &object.kind, &object.id)
+    with_cached_object_log_store(path, |store| {
+        BatchIngest::run(store, vec![object_record(object)])?;
+        identity_generation(store, &object.kind, &object.id)
+    })
 }
 
 fn object_record(object: &Object) -> ObjectRecord {
@@ -457,6 +539,69 @@ mod tests {
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
         let store = Store::open(&log).unwrap();
         assert_eq!(identity_generation(&store, "Customer", "c1").unwrap(), 2);
+    }
+
+    #[test]
+    fn object_log_store_cache_reuses_evicts_on_path_change_and_evicts_on_error() {
+        // #1106: exercises `with_object_log_store_cache` directly against a
+        // cache instance this test owns, not the process-wide
+        // `OBJECT_LOG_STORE` static. That static is shared with every other
+        // test in this binary; asserting exact open counts against it would
+        // be a real race under the default parallel test runner (an
+        // unrelated concurrently-running test using a different path would
+        // evict this test's cached handle between iterations). An owned
+        // cache instance makes the count deterministic while still proving
+        // the real, shared code path's behavior.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let other_log = dir.path().join("other.mikura");
+        let object = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "Acme".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let ingest_and_read = |cache: &Mutex<Option<CachedObjectLogStore>>, path: &Path| {
+            with_object_log_store_cache(cache, path, |store| {
+                BatchIngest::run(store, vec![object_record(&object)])?;
+                identity_generation(store, &object.kind, &object.id)
+            })
+        };
+
+        OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(0));
+        for generation in 1..=5u64 {
+            assert_eq!(ingest_and_read(&cache, &log).unwrap(), generation);
+        }
+        // `Store::open`/`Store::create` reads and replays the whole on-disk
+        // log into memory; five admits to the same path pay that cost once.
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 1);
+
+        // A different path is a genuinely different log: it must still
+        // open fresh rather than silently reuse the first path's handle.
+        assert_eq!(ingest_and_read(&cache, &other_log).unwrap(), 1);
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 2);
+
+        // Switching back to the first path also reopens (its in-memory
+        // state was evicted by the switch above) rather than serving the
+        // second path's now-cached handle.
+        assert_eq!(ingest_and_read(&cache, &log).unwrap(), 6);
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 3);
+
+        // A failed operation must evict the cache rather than leave a
+        // handle with possibly-inconsistent writer state cached for the
+        // next call to keep writing through.
+        let failing = with_object_log_store_cache(&cache, &log, |_store| {
+            Err::<(), _>("injected failure".to_string())
+        });
+        assert!(failing.is_err());
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 3);
+        assert_eq!(ingest_and_read(&cache, &log).unwrap(), 7);
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 4);
     }
 
     #[test]
