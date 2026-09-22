@@ -1287,17 +1287,33 @@ fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(),
         })?,
         RuntimeDb::Postgres(db) => {
             let mut conn = db.connection()?;
+            // A missing schema/column failure must not be silently discarded:
+            // it would surface later only as a confusing "column does not
+            // exist" on the UPDATE below, or not at all if the column already
+            // existed for an unrelated reason.
             conn.batch_execute(
                 "ALTER TABLE IF EXISTS sekai_store_cutover
                  ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
             )
-            .ok();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            conn.execute(
-                "UPDATE sekai_store_cutover SET pairing_epoch = $1, raised_at_ms = $2 WHERE id = 1",
-                &[&pairing_epoch, &now_ms],
-            )
             .map_err(|error| error.to_string())?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let updated = conn
+                .execute(
+                    "UPDATE sekai_store_cutover SET pairing_epoch = $1, raised_at_ms = $2 WHERE id = 1",
+                    &[&pairing_epoch, &now_ms],
+                )
+                .map_err(|error| error.to_string())?;
+            // An UPDATE that matches no row returns Ok with an affected count
+            // of 0, not an error. Silently accepting that would let one side
+            // of a split pair advance while the other no-ops, leaving the
+            // pairing epoch one-sided and stale with no signal to the caller.
+            if updated != 1 {
+                return Err(format!(
+                    "pairing epoch stamp affected {updated} rows, expected exactly 1; \
+                     sekai_store_cutover has no id=1 row on this store (it has not been \
+                     generation-stamped yet). Failing closed instead of a silent no-op"
+                ));
+            }
             Ok(())
         }
     }
@@ -2195,6 +2211,144 @@ mod tests {
                 .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
                 .unwrap(),
             RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+        }
+    }
+
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    #[test]
+    fn postgres_pairing_epoch_stamp_fails_closed_on_a_missing_row() {
+        // #1104: write_runtime_pairing_epoch's Postgres branch ran a plain
+        // UPDATE and discarded the affected-row count. An UPDATE that matches
+        // no row returns Ok, not an error, so a store whose cutover table
+        // exists but has no id=1 row (a corrupted or incompletely
+        // initialized store; the normal write paths always create the table
+        // and its row together) silently no-opped: the caller believed the
+        // stamp succeeded while nothing was persisted. Create the schema
+        // directly, without ever inserting the row, to reproduce that state.
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let pem = std::fs::read(&path).expect("read PostgreSQL test CA certificate");
+            PostgresDb::connect_with_ca_certificate(&url, 4, &pem).unwrap()
+        } else {
+            PostgresDb::connect(&url, 4).unwrap()
+        };
+        db.connection()
+            .unwrap()
+            .batch_execute(
+                "DROP TABLE IF EXISTS sekai_store_cutover;
+                 CREATE TABLE sekai_store_cutover (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation BIGINT NOT NULL,
+                    fence_raised INTEGER NOT NULL,
+                    raised_at_ms BIGINT NOT NULL,
+                    pairing_epoch BIGINT NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+        let runtime = RuntimeDb::Postgres(std::sync::Arc::new(db));
+
+        let error = write_runtime_pairing_epoch(&runtime, 5).unwrap_err();
+        assert!(error.contains("affected 0 rows"), "{error}");
+
+        // A store that was properly generation-stamped first has a row, and
+        // the stamp succeeds normally.
+        write_runtime_generation(&runtime, 1).unwrap();
+        write_runtime_pairing_epoch(&runtime, 5).unwrap();
+        assert_eq!(read_runtime_pairing_epoch(&runtime).unwrap(), 5);
+
+        match &runtime {
+            RuntimeDb::Postgres(db) => db
+                .connection()
+                .unwrap()
+                .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+                .unwrap(),
+            RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+        }
+    }
+
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL and SEKAI_TEST_POSTGRES_CHISEI_URL, two \
+                isolated TLS PostgreSQL databases simulating a Split pair"]
+    #[test]
+    fn postgres_pairing_epoch_advance_is_never_one_sided_on_a_fresh_pair() {
+        // #1104: advance_pairing_epoch writes both stores sequentially with
+        // no cross-store transaction. If a store's row is missing, the write
+        // used to silently no-op instead of erroring, so the pair could end
+        // up one-sided (one side advanced, the other stale) with no signal.
+        // With the fail-closed fix, a missing row on either side surfaces as
+        // an Err from advance_pairing_epoch instead of a silent partial
+        // advance, and pairing_epochs_match still correctly detects the
+        // divergence if one ever occurs.
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        // A real Split pair is two physically distinct databases; reusing one
+        // URL for both sides would make them share a single table/row and
+        // could not exercise "the other side's row is missing" at all. The
+        // second, sibling database name is fixed and only used by this test.
+        let chisei_url = std::env::var("SEKAI_TEST_POSTGRES_CHISEI_URL").expect(
+            "SEKAI_TEST_POSTGRES_CHISEI_URL must identify a second isolated PostgreSQL \
+             database distinct from SEKAI_TEST_POSTGRES_URL",
+        );
+        let make_db = |url: &str| {
+            if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+                let pem = std::fs::read(&path).expect("read PostgreSQL test CA certificate");
+                PostgresDb::connect_with_ca_certificate(url, 4, &pem).unwrap()
+            } else {
+                PostgresDb::connect(url, 4).unwrap()
+            }
+        };
+        let sekai_db = make_db(&url);
+        sekai_db
+            .connection()
+            .unwrap()
+            .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+            .unwrap();
+        let sekai = RuntimeDb::Postgres(std::sync::Arc::new(sekai_db));
+        write_runtime_generation(&sekai, 1).unwrap();
+
+        // The chisei side's table exists but has no id=1 row yet: advance
+        // must fail closed rather than silently stamping only the sekai side.
+        let chisei_db = make_db(&chisei_url);
+        chisei_db
+            .connection()
+            .unwrap()
+            .batch_execute(
+                "DROP TABLE IF EXISTS sekai_store_cutover;
+                 CREATE TABLE sekai_store_cutover (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation BIGINT NOT NULL,
+                    fence_raised INTEGER NOT NULL,
+                    raised_at_ms BIGINT NOT NULL,
+                    pairing_epoch BIGINT NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+        let chisei = RuntimeDb::Postgres(std::sync::Arc::new(chisei_db));
+
+        let before = read_runtime_pairing_epoch(&sekai).unwrap();
+        let error = write_runtime_pairing_epoch(&chisei, before.max(0) + 1).unwrap_err();
+        assert!(error.contains("affected 0 rows"), "{error}");
+        assert_eq!(
+            read_runtime_pairing_epoch(&sekai).unwrap(),
+            before,
+            "the sekai side must be unaffected by the chisei side's failure"
+        );
+
+        write_runtime_generation(&chisei, 1).unwrap();
+        write_runtime_pairing_epoch(&sekai, before + 1).unwrap();
+        write_runtime_pairing_epoch(&chisei, before + 1).unwrap();
+        assert_eq!(read_runtime_pairing_epoch(&sekai).unwrap(), before + 1);
+        assert_eq!(read_runtime_pairing_epoch(&chisei).unwrap(), before + 1);
+
+        for runtime in [&sekai, &chisei] {
+            match runtime {
+                RuntimeDb::Postgres(db) => db
+                    .connection()
+                    .unwrap()
+                    .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+                    .unwrap(),
+                RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+            }
         }
     }
 }
