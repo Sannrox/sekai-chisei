@@ -2182,5 +2182,19 @@ mod tests {
         write_runtime_generation(&runtime, 7).unwrap();
         assert_eq!(read_runtime_generation(&runtime).unwrap(), Some(7));
         assert_eq!(read_runtime_pairing_epoch(&runtime).unwrap(), 0);
+
+        // Leave a clean greenfield state: this test and
+        // postgres_generation_roundtrip_covers_the_fence share one
+        // SEKAI_TEST_POSTGRES_URL singleton cutover row and can run in either
+        // order, so raising the fence here must not leak into a sibling test's
+        // unfenced assertion.
+        match &runtime {
+            RuntimeDb::Postgres(db) => db
+                .connection()
+                .unwrap()
+                .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
+                .unwrap(),
+            RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
+        }
     }
 }
