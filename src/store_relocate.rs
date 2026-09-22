@@ -1,9 +1,13 @@
-//! Offline, restartable Chisei-family relocation and writer fence.
+//! Online, restartable Chisei-family relocation and writer fence.
 //!
-//! Take a short exclusive `VACUUM INTO` snapshot of the historical source,
-//! raise the writer fence, then copy each Chisei-owned family from that
-//! snapshot. The live source is not ATTACH'd for the family copy. Rollback
-//! before the snapshot keeps the pre-copy files.
+//! Install write capture on every Chisei table of the historical source,
+//! snapshot it, and bulk-copy each Chisei-owned family from that snapshot
+//! while writers keep running. Then raise the writer fence in the source
+//! database itself (capture triggers refuse Chisei writes from then on),
+//! re-copy only the families written since the capture began, and stamp the
+//! destinations. The refuse window covers the dirty families, not the full
+//! family load. Capture changes the source from the start, so the rollback
+//! point is a copy taken before the run.
 //!
 //! Destination pairs also carry a split generation. Combined split open
 //! compares the pair. Dual-unstamped stores auto-stamp only when both are
@@ -12,7 +16,7 @@
 //! `SEKAI_STORE_PEER` (read-only) or refuses mutations until an operator
 //! restamp. Independent backups are not a paired restore set.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -24,6 +28,12 @@ use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConf
 
 const CUTOVER_TABLE: &str = "sekai_store_cutover";
 const JOURNAL_TABLE: &str = "chisei_relocate_families";
+/// Single-row gate on the source that capture triggers read on every Chisei
+/// write; `fenced = 1` makes the triggers refuse the write.
+const CAPTURE_GATE_TABLE: &str = "sekai_relocate_capture";
+/// Source Chisei tables written since capture was installed.
+const CAPTURE_DIRTY_TABLE: &str = "sekai_relocate_dirty";
+const FENCED_WRITE_MESSAGE: &str = "writer fence raised: Chisei families moved to the Chisei store";
 
 #[cfg(test)]
 thread_local! {
@@ -35,8 +45,13 @@ thread_local! {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelocateReport {
     pub families: Vec<FamilyReport>,
+    /// Families copied again under the fence because a writer touched them
+    /// after capture began.
+    pub recopied: Vec<FamilyReport>,
     pub generation: i64,
     pub fence_raised: bool,
+    /// Wall time from raising the source fence to stamping both destinations.
+    pub fence_window_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,7 +64,7 @@ pub struct FamilyReport {
 }
 
 pub fn usage() -> &'static str {
-    "sekaictl admin store relocate --source <path-or-url> --sekai <path-or-url> --chisei <path-or-url>\n  Offline copy of Chisei families from the historical single store into the Chisei destination. Three SQLite paths or three PostgreSQL URLs. --sekai must be the same physical identity as --source. Snapshots the source, fences writers, then copies families from the snapshot. Restartable per family. Quiesce writers first. Rollback before the snapshot keeps the pre-copy files.\n\
+    "sekaictl admin store relocate --source <path-or-url> --sekai <path-or-url> --chisei <path-or-url>\n  Online copy of Chisei families from the historical single store into the Chisei destination. Three SQLite paths or three PostgreSQL URLs. --sekai must be the same physical identity as --source. Captures source writes, bulk-copies families from a snapshot while writers run, then fences Chisei writes in the source database and re-copies only the families written during the copy. Restartable per family. Capture changes the source from the start; roll back from a copy taken before the run.\n\
 sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>\n  Operator reconcile after a one-sided restore. Writes the same split generation on both destination stores so mutating RPCs may resume. Independent backups are not a paired restore set."
 }
 
@@ -212,19 +227,185 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         None,
     )?)?;
 
+    relocate_sqlite_online(source, sekai, chisei, || Ok(()))
+}
+
+/// `before_fence` runs between the unfenced bulk copy and the fence, where
+/// live writers may still land on the source.
+fn relocate_sqlite_online(
+    source: &str,
+    sekai: &str,
+    chisei: &str,
+    before_fence: impl FnOnce() -> Result<(), String>,
+) -> Result<RelocateReport, String> {
+    let _lock = lock_relocate_destination(chisei)?;
+    let captured = install_sqlite_change_capture(source)?;
     let snapshot = relocate_snapshot_path(chisei);
     snapshot_sqlite(source, &snapshot)?;
-    let generation = raise_writer_fence(source)?;
-    let reports = copy_chisei_families_from_snapshot(&snapshot, chisei)?;
+    let families = copy_chisei_families_from_snapshot(&snapshot, chisei)?;
     remove_sqlite_sidecar(&snapshot);
+    before_fence()?;
+
+    let fenced_at = std::time::Instant::now();
+    let generation = raise_sqlite_source_fence(source, chisei)?;
+    let dirty = sqlite_dirty_families(source, &captured)?;
+    // Reads the live source: safe only because the gate is closed, so the
+    // capture triggers refuse every Chisei write while this copy and its
+    // row-count validation run.
+    let recopied = if dirty.is_empty() {
+        Vec::new()
+    } else {
+        copy_chisei_families(source, chisei, Some(&dirty))?
+    };
+    clear_sqlite_dirty(source)?;
     raise_writer_fence_with_generation(sekai, generation)?;
     raise_writer_fence_with_generation(chisei, generation)?;
 
     Ok(RelocateReport {
-        families: reports,
+        families,
+        recopied,
         generation,
         fence_raised: true,
+        fence_window_ms: elapsed_ms(fenced_at),
     })
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Opens the live source with a busy timeout: capture and fence DDL wait for
+/// running writers instead of failing on the first lock conflict.
+fn open_live_sqlite(path: &str) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|error| error.to_string())?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))
+        .map_err(|error| error.to_string())?;
+    Ok(conn)
+}
+
+fn checked_table_name(table: &str) -> Result<&str, String> {
+    if !table.is_empty()
+        && table
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Ok(table)
+    } else {
+        Err(format!("refusing unexpected table name {table}"))
+    }
+}
+
+/// Installs capture triggers on every Chisei table of the SQLite source and
+/// returns the captured tables. Idempotent: a restart keeps the gate state
+/// and the dirty set of the interrupted run.
+fn install_sqlite_change_capture(source: &str) -> Result<Vec<String>, String> {
+    let conn = open_live_sqlite(source)?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {CAPTURE_GATE_TABLE} (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            fenced INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO {CAPTURE_GATE_TABLE} (id, fenced) VALUES (1, 0);
+        CREATE TABLE IF NOT EXISTS {CAPTURE_DIRTY_TABLE} (tbl TEXT PRIMARY KEY);"
+    ))
+    .map_err(|error| format!("install relocate capture: {error}"))?;
+    let tables = list_chisei_tables(&conn, "main")?;
+    for table in &tables {
+        let table = checked_table_name(table)?;
+        for (suffix, event) in [("ins", "INSERT"), ("upd", "UPDATE"), ("del", "DELETE")] {
+            // The dirty mark avoids an OR IGNORE clause: an outer statement's
+            // conflict policy would override it inside the trigger.
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS sekai_relocate_capture_{table}_{suffix}
+                 BEFORE {event} ON {table}
+                 BEGIN
+                    SELECT RAISE(ABORT, '{FENCED_WRITE_MESSAGE}')
+                    WHERE (SELECT fenced FROM {CAPTURE_GATE_TABLE} WHERE id = 1) = 1;
+                    INSERT INTO {CAPTURE_DIRTY_TABLE} (tbl)
+                    SELECT '{table}'
+                    WHERE NOT EXISTS (SELECT 1 FROM {CAPTURE_DIRTY_TABLE} WHERE tbl = '{table}');
+                 END;"
+            ))
+            .map_err(|error| format!("capture {table}: {error}"))?;
+        }
+    }
+    Ok(tables)
+}
+
+/// Closes the capture gate and raises the cutover fence in one write
+/// transaction, so every Chisei write either committed its dirty mark before
+/// the fence or is refused by the capture triggers after it.
+///
+/// Refuses to fence when the destination lacks a source Chisei table, so a
+/// table created during the copy fails the run while writers are unfenced.
+/// The check holds the write lock `CREATE TABLE` also needs, so no table can
+/// appear between the check and the fence.
+fn raise_sqlite_source_fence(source: &str, chisei: &str) -> Result<i64, String> {
+    let mut conn = open_live_sqlite(source)?;
+    ensure_sqlite_cutover(&conn)?;
+    let generation = chrono::Utc::now().timestamp_millis();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("begin source fence: {error}"))?;
+    let dest = Connection::open(chisei).map_err(|error| error.to_string())?;
+    for table in list_chisei_tables(&tx, "main")? {
+        ensure_dest_table(&dest, &table)?;
+    }
+    tx.execute(
+        &format!("UPDATE {CAPTURE_GATE_TABLE} SET fenced = 1 WHERE id = 1"),
+        [],
+    )
+    .map_err(|error| format!("close capture gate: {error}"))?;
+    tx.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {CUTOVER_TABLE}
+             (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+             VALUES (1, ?1, 1, ?2, 0)"
+        ),
+        params![generation, chrono::Utc::now().timestamp_millis()],
+    )
+    .map_err(|error| format!("raise source fence: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("commit source fence: {error}"))?;
+    Ok(generation)
+}
+
+/// Families to copy again under the fence: tables marked dirty since capture
+/// began, plus Chisei tables created after it (no trigger saw their writes).
+fn sqlite_dirty_families(source: &str, captured: &[String]) -> Result<BTreeSet<String>, String> {
+    let current = install_sqlite_change_capture(source)?;
+    let conn = open_live_sqlite(source)?;
+    let mut stmt = conn
+        .prepare(&format!("SELECT tbl FROM {CAPTURE_DIRTY_TABLE}"))
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut dirty = Vec::new();
+    for row in rows {
+        dirty.push(row.map_err(|error| error.to_string())?);
+    }
+    Ok(dirty_families(dirty, &current, captured))
+}
+
+fn dirty_families(dirty: Vec<String>, current: &[String], captured: &[String]) -> BTreeSet<String> {
+    dirty
+        .into_iter()
+        .chain(
+            current
+                .iter()
+                .filter(|table| !captured.contains(table))
+                .cloned(),
+        )
+        .map(|table| family_for(&table).to_string())
+        .collect()
+}
+
+fn clear_sqlite_dirty(source: &str) -> Result<(), String> {
+    open_live_sqlite(source)?
+        .execute(&format!("DELETE FROM {CAPTURE_DIRTY_TABLE}"), [])
+        .map(|_| ())
+        .map_err(|error| format!("clear relocate dirty set: {error}"))
 }
 
 pub fn relocate_postgres(
@@ -277,21 +458,169 @@ pub fn relocate_postgres(
         ca.as_deref(),
     )?)?;
 
+    relocate_postgres_online(source, sekai, chisei, || Ok(()))
+}
+
+/// `before_fence` runs between the unfenced bulk copy and the fence, where
+/// live writers may still land on the source.
+fn relocate_postgres_online(
+    source: &str,
+    sekai: &str,
+    chisei: &str,
+    before_fence: impl FnOnce() -> Result<(), String>,
+) -> Result<RelocateReport, String> {
+    let _lock = lock_relocate_destination(chisei)?;
     let source_db = connect_postgres(source)?;
     let chisei_db = connect_postgres(chisei)?;
+    let captured = install_postgres_change_capture(&source_db)?;
     let snapshot_dir = relocate_postgres_snapshot_dir(chisei);
-    snapshot_postgres(&source_db, &snapshot_dir)?;
-    let generation = raise_postgres_writer_fence(&source_db)?;
-    let reports = copy_chisei_families_from_postgres_snapshot(&snapshot_dir, &chisei_db)?;
+    snapshot_postgres(&source_db, &snapshot_dir, None)?;
+    let families = copy_chisei_families_from_postgres_snapshot(&snapshot_dir, &chisei_db, None)?;
     let _ = std::fs::remove_dir_all(&snapshot_dir);
+    before_fence()?;
+
+    let fenced_at = std::time::Instant::now();
+    let generation = raise_postgres_source_fence(&source_db, &chisei_db)?;
+    let dirty = postgres_dirty_families(&source_db, &captured)?;
+    let recopied = if dirty.is_empty() {
+        Vec::new()
+    } else {
+        let fenced_dir = format!("{snapshot_dir}-fenced");
+        snapshot_postgres(&source_db, &fenced_dir, Some(&dirty))?;
+        let recopied =
+            copy_chisei_families_from_postgres_snapshot(&fenced_dir, &chisei_db, Some(&dirty))?;
+        let _ = std::fs::remove_dir_all(&fenced_dir);
+        recopied
+    };
+    source_db
+        .connection()?
+        .execute(&format!("DELETE FROM {CAPTURE_DIRTY_TABLE}"), &[])
+        .map_err(|error| format!("clear relocate dirty set: {error}"))?;
     raise_postgres_writer_fence_with_generation(&connect_postgres(sekai)?, generation)?;
     raise_postgres_writer_fence_with_generation(&chisei_db, generation)?;
 
     Ok(RelocateReport {
-        families: reports,
+        families,
+        recopied,
         generation,
         fence_raised: true,
+        fence_window_ms: elapsed_ms(fenced_at),
     })
+}
+
+/// Installs one statement-level capture trigger per Chisei table of the
+/// PostgreSQL source and returns the captured tables. Each trigger takes a
+/// share lock on the gate row for the rest of the writer's transaction, so
+/// closing the gate waits for in-flight writers and every later write sees
+/// the closed gate (READ COMMITTED) or fails to serialize (REPEATABLE READ).
+fn install_postgres_change_capture(source: &PostgresDb) -> Result<Vec<String>, String> {
+    let mut conn = source.connection()?;
+    conn.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {CAPTURE_GATE_TABLE} (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            fenced INTEGER NOT NULL
+        );
+        INSERT INTO {CAPTURE_GATE_TABLE} (id, fenced) VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
+        CREATE TABLE IF NOT EXISTS {CAPTURE_DIRTY_TABLE} (tbl TEXT PRIMARY KEY);
+        CREATE OR REPLACE FUNCTION sekai_relocate_capture_write() RETURNS trigger
+        LANGUAGE plpgsql AS $capture$
+        DECLARE
+            gate INTEGER;
+        BEGIN
+            SELECT fenced INTO gate FROM {CAPTURE_GATE_TABLE} WHERE id = 1 FOR SHARE;
+            IF gate = 1 THEN
+                RAISE EXCEPTION '{FENCED_WRITE_MESSAGE}' USING ERRCODE = 'object_not_in_prerequisite_state';
+            END IF;
+            -- Read first: once a mark is committed, writers skip the row lock.
+            IF NOT EXISTS (SELECT 1 FROM {CAPTURE_DIRTY_TABLE} WHERE tbl = TG_TABLE_NAME) THEN
+                INSERT INTO {CAPTURE_DIRTY_TABLE} (tbl) VALUES (TG_TABLE_NAME)
+                ON CONFLICT (tbl) DO NOTHING;
+            END IF;
+            RETURN NULL;
+        END
+        $capture$;"
+    ))
+    .map_err(|error| format!("install relocate capture: {error}"))?;
+    let tables = list_postgres_chisei_tables(&mut *conn)?;
+    for table in &tables {
+        conn.batch_execute(&format!(
+            "CREATE OR REPLACE TRIGGER sekai_relocate_capture
+             BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON {table}
+             FOR EACH STATEMENT EXECUTE FUNCTION sekai_relocate_capture_write();"
+        ))
+        .map_err(|error| format!("capture {table}: {error}"))?;
+    }
+    Ok(tables)
+}
+
+fn ensure_postgres_cutover(conn: &mut postgres::Client) -> Result<(), String> {
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS sekai_store_cutover (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation BIGINT NOT NULL,
+            fence_raised INTEGER NOT NULL,
+            raised_at_ms BIGINT NOT NULL,
+            pairing_epoch BIGINT NOT NULL DEFAULT 0
+        );
+        ALTER TABLE sekai_store_cutover
+            ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
+    )
+    .map_err(|error| error.to_string())
+}
+
+const POSTGRES_FENCE_UPSERT: &str =
+    "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms, pairing_epoch)
+     VALUES (1, $1, 1, $2, 0)
+     ON CONFLICT (id) DO UPDATE SET
+        generation = EXCLUDED.generation,
+        fence_raised = 1,
+        raised_at_ms = EXCLUDED.raised_at_ms,
+        pairing_epoch = 0";
+
+/// Closes the capture gate and raises the cutover fence in one transaction,
+/// refusing to fence when the destination lacks a source Chisei table. A
+/// table created concurrently with this check fails the fenced catch-up
+/// instead; the kept dirty set lets a re-run finish after the destination
+/// schema is initialized.
+fn raise_postgres_source_fence(source: &PostgresDb, chisei: &PostgresDb) -> Result<i64, String> {
+    let mut conn = source.connection()?;
+    ensure_postgres_cutover(&mut conn)?;
+    let generation = chrono::Utc::now().timestamp_millis();
+    let mut tx = conn
+        .transaction()
+        .map_err(|error| format!("begin source fence: {error}"))?;
+    let mut dest = chisei.connection()?;
+    for table in list_postgres_chisei_tables(&mut tx)? {
+        ensure_postgres_dest_table(&mut dest, &table)?;
+    }
+    tx.execute(
+        &format!("UPDATE {CAPTURE_GATE_TABLE} SET fenced = 1 WHERE id = 1"),
+        &[],
+    )
+    .map_err(|error| format!("close capture gate: {error}"))?;
+    tx.execute(
+        POSTGRES_FENCE_UPSERT,
+        &[&generation, &chrono::Utc::now().timestamp_millis()],
+    )
+    .map_err(|error| format!("raise source fence: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("commit source fence: {error}"))?;
+    Ok(generation)
+}
+
+fn postgres_dirty_families(
+    source: &PostgresDb,
+    captured: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let current = install_postgres_change_capture(source)?;
+    let dirty = source
+        .connection()?
+        .query(&format!("SELECT tbl FROM {CAPTURE_DIRTY_TABLE}"), &[])
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    Ok(dirty_families(dirty, &current, captured))
 }
 
 fn postgres_ca_cert_path() -> Option<String> {
@@ -316,6 +645,30 @@ fn relocate_postgres_snapshot_dir(chisei: &str) -> String {
         .into_owned()
 }
 
+/// Held for a whole relocate run. The OS releases it when the process exits,
+/// so a crashed run never blocks its resume (which reuses and cleans the same
+/// snapshot path), while a concurrent run against the same destination is
+/// refused before it can remove this run's snapshot.
+fn lock_relocate_destination(chisei: &str) -> Result<std::fs::File, String> {
+    let digest = format!("{:x}", md5_ish(chisei));
+    let path = std::env::temp_dir().join(format!("sekai-relocate-{digest}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("open relocate lock: {error}"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("another relocate is running against this Chisei destination".into())
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(format!("lock relocate destination: {error}"))
+        }
+    }
+}
+
 fn md5_ish(value: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -323,14 +676,26 @@ fn md5_ish(value: &str) -> u64 {
     hasher.finish()
 }
 
-fn snapshot_postgres(source: &PostgresDb, snapshot_dir: &str) -> Result<(), String> {
+/// Writes one `COPY` file per Chisei table from a single `REPEATABLE READ`
+/// snapshot. `only` restricts the snapshot to those families.
+fn snapshot_postgres(
+    source: &PostgresDb,
+    snapshot_dir: &str,
+    only: Option<&BTreeSet<String>>,
+) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(snapshot_dir);
     std::fs::create_dir_all(snapshot_dir).map_err(|error| error.to_string())?;
     let mut conn = source.connection()?;
     conn.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         .map_err(|error| format!("begin postgres snapshot: {error}"))?;
-    let tables = list_postgres_chisei_tables(&mut conn)?;
+    let mut tables = list_postgres_chisei_tables(&mut *conn)?;
+    if let Some(only) = only {
+        tables.retain(|table| only.contains(family_for(table)));
+    }
+    let mut listing = Vec::new();
     for table in &tables {
+        // Counted inside the same snapshot so the load can fail closed.
+        let source_count = postgres_table_count(&mut conn, table)?;
         let path = std::path::Path::new(snapshot_dir).join(table);
         let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
         let mut reader = conn
@@ -338,18 +703,21 @@ fn snapshot_postgres(source: &PostgresDb, snapshot_dir: &str) -> Result<(), Stri
             .map_err(|error| format!("snapshot {table}: {error}"))?;
         std::io::copy(&mut reader, &mut file)
             .map_err(|error| format!("write {table} snapshot: {error}"))?;
+        listing.push(format!("{table}\t{source_count}"));
     }
     conn.batch_execute("COMMIT")
         .map_err(|error| format!("commit postgres snapshot: {error}"))?;
     std::fs::write(
         std::path::Path::new(snapshot_dir).join("tables.txt"),
-        tables.join("\n"),
+        listing.join("\n"),
     )
     .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn list_postgres_chisei_tables(conn: &mut postgres::Client) -> Result<Vec<String>, String> {
+fn list_postgres_chisei_tables(
+    conn: &mut impl postgres::GenericClient,
+) -> Result<Vec<String>, String> {
     let rows = conn
         .query(
             "SELECT tablename FROM pg_tables
@@ -374,9 +742,12 @@ fn list_postgres_chisei_tables(conn: &mut postgres::Client) -> Result<Vec<String
     Ok(tables)
 }
 
+/// `only` restricts the copy to those families and re-copies them even when
+/// the journal already records them as completed.
 fn copy_chisei_families_from_postgres_snapshot(
     snapshot_dir: &str,
     dest: &PostgresDb,
+    only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<FamilyReport>, String> {
     let mut conn = dest.connection()?;
     conn.batch_execute(&format!(
@@ -392,15 +763,24 @@ fn copy_chisei_families_from_postgres_snapshot(
     .map_err(|error| error.to_string())?;
     let listing = std::fs::read_to_string(std::path::Path::new(snapshot_dir).join("tables.txt"))
         .map_err(|error| error.to_string())?;
-    let tables: Vec<String> = listing
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut source_counts = BTreeMap::new();
+    for line in listing.lines().filter(|line| !line.is_empty()) {
+        let (table, count) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("malformed relocate snapshot listing line {line}"))?;
+        let count: i64 = count
+            .parse()
+            .map_err(|_| format!("malformed relocate snapshot count for {table}"))?;
+        source_counts.insert(table.to_string(), count);
+    }
+    let tables: Vec<String> = source_counts.keys().cloned().collect();
     let families = group_families(&tables);
     let mut reports = Vec::new();
     for (family, family_tables) in families {
-        if postgres_family_completed(&mut conn, &family)? {
+        if only.is_some_and(|only| !only.contains(&family)) {
+            continue;
+        }
+        if only.is_none() && postgres_family_completed(&mut conn, &family)? {
             reports.push(FamilyReport {
                 family,
                 skipped: true,
@@ -427,6 +807,12 @@ fn copy_chisei_families_from_postgres_snapshot(
                 .finish()
                 .map_err(|error| format!("finish {table}: {error}"))?;
             let dest_count = postgres_table_count(&mut conn, table)?;
+            let source_count = source_counts[table];
+            if source_count != dest_count {
+                return Err(format!(
+                    "relocate validation failed for {table}: source count {source_count} != destination count {dest_count}"
+                ));
+            }
             row_count += dest_count;
             digest_parts.push(format!("{table}={dest_count}"));
         }
@@ -509,7 +895,7 @@ fn relocate_snapshot_path(chisei: &str) -> String {
 
 fn snapshot_sqlite(source: &str, snapshot: &str) -> Result<(), String> {
     remove_sqlite_sidecar(snapshot);
-    let conn = Connection::open(source).map_err(|error| error.to_string())?;
+    let conn = open_live_sqlite(source)?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .map_err(|error| format!("checkpoint source before snapshot: {error}"))?;
     let escaped = snapshot.replace('\'', "''");
@@ -521,6 +907,17 @@ fn snapshot_sqlite(source: &str, snapshot: &str) -> Result<(), String> {
 fn copy_chisei_families_from_snapshot(
     snapshot: &str,
     chisei: &str,
+) -> Result<Vec<FamilyReport>, String> {
+    copy_chisei_families(snapshot, chisei, None)
+}
+
+/// Copies Chisei families from the SQLite file at `origin` into `chisei`.
+/// `only` restricts the copy to those families and re-copies them even when
+/// the journal already records them as completed.
+fn copy_chisei_families(
+    origin: &str,
+    chisei: &str,
+    only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<FamilyReport>, String> {
     let dest = Connection::open(chisei).map_err(|error| error.to_string())?;
     dest.execute_batch(&format!(
@@ -534,14 +931,17 @@ fn copy_chisei_families_from_snapshot(
         );"
     ))
     .map_err(|error| error.to_string())?;
-    dest.execute("ATTACH DATABASE ?1 AS src", params![snapshot])
+    dest.execute("ATTACH DATABASE ?1 AS src", params![origin])
         .map_err(|error| error.to_string())?;
 
     let tables = list_chisei_tables(&dest, "src")?;
     let families = group_families(&tables);
     let mut reports = Vec::new();
     for (family, family_tables) in families {
-        if family_completed(&dest, &family)? {
+        if only.is_some_and(|only| !only.contains(&family)) {
+            continue;
+        }
+        if only.is_none() && family_completed(&dest, &family)? {
             reports.push(FamilyReport {
                 family,
                 skipped: true,
@@ -705,41 +1105,15 @@ fn postgres_writer_fence_raised(db: &PostgresDb) -> Result<bool, String> {
     }
 }
 
-fn raise_postgres_writer_fence(db: &PostgresDb) -> Result<i64, String> {
-    let generation = chrono::Utc::now().timestamp_millis();
-    raise_postgres_writer_fence_with_generation(db, generation)?;
-    Ok(generation)
-}
-
 fn raise_postgres_writer_fence_with_generation(
     db: &PostgresDb,
     generation: i64,
 ) -> Result<(), String> {
     let mut conn = db.connection()?;
-    conn.batch_execute(
-        "CREATE TABLE IF NOT EXISTS sekai_store_cutover (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            generation BIGINT NOT NULL,
-            fence_raised INTEGER NOT NULL,
-            raised_at_ms BIGINT NOT NULL,
-            pairing_epoch BIGINT NOT NULL DEFAULT 0
-        );
-        ALTER TABLE sekai_store_cutover
-            ADD COLUMN IF NOT EXISTS pairing_epoch BIGINT NOT NULL DEFAULT 0;",
-    )
-    .map_err(|error| error.to_string())?;
+    ensure_postgres_cutover(&mut conn)?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    conn.execute(
-        "INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms, pairing_epoch)
-         VALUES (1, $1, 1, $2, 0)
-         ON CONFLICT (id) DO UPDATE SET
-            generation = EXCLUDED.generation,
-            fence_raised = 1,
-            raised_at_ms = EXCLUDED.raised_at_ms,
-            pairing_epoch = 0",
-        &[&generation, &now_ms],
-    )
-    .map_err(|error| error.to_string())?;
+    conn.execute(POSTGRES_FENCE_UPSERT, &[&generation, &now_ms])
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1468,14 +1842,8 @@ fn table_count(conn: &Connection, schema: &str, table: &str) -> Result<i64, Stri
     .map_err(|error| format!("count {schema}.{table}: {error}"))
 }
 
-fn raise_writer_fence(path: &str) -> Result<i64, String> {
-    let generation = chrono::Utc::now().timestamp_millis();
-    raise_writer_fence_with_generation(path, generation)?;
-    Ok(generation)
-}
-
 fn raise_writer_fence_with_generation(path: &str, generation: i64) -> Result<(), String> {
-    let conn = Connection::open(path).map_err(|error| error.to_string())?;
+    let conn = open_live_sqlite(path)?;
     ensure_sqlite_cutover(&conn)?;
     conn.execute(
         &format!(
@@ -1492,10 +1860,12 @@ fn raise_writer_fence_with_generation(path: &str, generation: i64) -> Result<(),
 impl serde::Serialize for RelocateReport {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("RelocateReport", 3)?;
+        let mut state = serializer.serialize_struct("RelocateReport", 5)?;
         state.serialize_field("families", &self.families)?;
+        state.serialize_field("recopied", &self.recopied)?;
         state.serialize_field("generation", &self.generation)?;
         state.serialize_field("fence_raised", &self.fence_raised)?;
+        state.serialize_field("fence_window_ms", &self.fence_window_ms)?;
         state.end()
     }
 }
@@ -1645,80 +2015,157 @@ mod tests {
         assert!(!Path::new(&relocate_snapshot_path(chisei_s)).exists());
     }
 
+    fn init_sqlite(path: &str) {
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(path),
+                path,
+                None,
+                16,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn budget_limit(path: &str, user: &str) -> i32 {
+        BudgetTracker::new(ChiseiStore::open_sqlite(path))
+            .get_usage(user)
+            .max_tokens
+    }
+
     #[test]
-    fn relocate_snapshots_source_and_fences_before_family_copy() {
+    fn relocate_recopies_only_families_written_during_the_bulk_copy() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let sekai = dir.path().join("sekai.db");
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
-        let sekai_s = sekai.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
-        RuntimeBackend::initialize(
-            RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(source_s),
-                source_s,
-                None,
-                16,
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        init_sqlite(source_s);
+        init_sqlite(chisei_s);
         BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
-            .set_limit("snapshot-user", 3_000, PeriodType::Daily)
+            .set_limit("before-copy", 3_000, PeriodType::Daily)
             .unwrap();
-        RuntimeBackend::initialize(
-            RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(sekai_s),
-                sekai_s,
-                None,
-                16,
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        RuntimeBackend::initialize(
-            RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(chisei_s),
-                chisei_s,
-                None,
-                16,
-                None,
-            )
-            .unwrap(),
-        )
+
+        let report = relocate_sqlite_online(source_s, source_s, chisei_s, || {
+            // A live writer lands after the snapshot the bulk copy read.
+            BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+                .set_limit("during-copy", 5_000, PeriodType::Daily)
+                .map_err(|error| error.to_string())?;
+            assert_eq!(budget_limit(chisei_s, "before-copy"), 3_000);
+            assert_eq!(budget_limit(chisei_s, "during-copy"), 0);
+            Ok(())
+        })
         .unwrap();
 
-        let snapshot = relocate_snapshot_path(chisei_s);
-        snapshot_sqlite(source_s, &snapshot).unwrap();
-        let generation = raise_writer_fence(source_s).unwrap();
-        assert!(writer_fence_raised(source_s).unwrap());
-        assert_eq!(
-            BudgetTracker::new(ChiseiStore::open_sqlite(chisei_s))
-                .get_usage("snapshot-user")
-                .max_tokens,
-            0
-        );
+        assert_eq!(budget_limit(chisei_s, "before-copy"), 3_000);
+        assert_eq!(budget_limit(chisei_s, "during-copy"), 5_000);
+        let recopied: Vec<&str> = report
+            .recopied
+            .iter()
+            .map(|family| family.family.as_str())
+            .collect();
+        assert_eq!(recopied, ["budget"]);
+        assert!(report.families.len() > 1, "{:?}", report.families);
+    }
 
-        let reports = copy_chisei_families_from_snapshot(&snapshot, chisei_s).unwrap();
-        assert!(
-            reports
-                .iter()
-                .any(|family| family.family == "budget" && family.row_count > 0)
-        );
-        raise_writer_fence_with_generation(sekai_s, generation).unwrap();
-        raise_writer_fence_with_generation(chisei_s, generation).unwrap();
-        remove_sqlite_sidecar(&snapshot);
+    #[test]
+    fn relocate_without_concurrent_writes_recopies_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        init_sqlite(source_s);
+        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            .set_limit("quiet-user", 2_000, PeriodType::Daily)
+            .unwrap();
+        let report = relocate_sqlite(source_s, source_s, chisei.to_str().unwrap()).unwrap();
+        assert!(report.recopied.is_empty(), "{:?}", report.recopied);
+    }
+
+    #[test]
+    fn the_source_database_refuses_chisei_writes_after_the_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        init_sqlite(source_s);
+        relocate_sqlite(source_s, source_s, chisei_s).unwrap();
+
+        // A Shared writer that was already running when the fence rose.
+        let err = BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            .set_limit("late-writer", 1_000, PeriodType::Daily)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("writer fence raised"), "{err}");
+
+        // The destination and restarted relocates stay writable.
+        BudgetTracker::new(ChiseiStore::open_sqlite(chisei_s))
+            .set_limit("split-writer", 1_000, PeriodType::Daily)
+            .unwrap();
+        let rerun = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
+        assert!(rerun.recopied.is_empty(), "{:?}", rerun.recopied);
+        assert_eq!(budget_limit(chisei_s, "split-writer"), 1_000);
+    }
+
+    #[test]
+    fn a_chisei_table_missing_from_the_destination_fails_before_the_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        init_sqlite(source_s);
+        init_sqlite(chisei_s);
+        let err = relocate_sqlite_online(source_s, source_s, chisei_s, || {
+            Connection::open(source_s)
+                .unwrap()
+                .execute_batch("CREATE TABLE chisei_budget_added_mid_copy (id INTEGER);")
+                .map_err(|error| error.to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("chisei_budget_added_mid_copy"), "{err}");
+        assert!(!writer_fence_raised(source_s).unwrap());
+        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            .set_limit("still-unfenced", 1_000, PeriodType::Daily)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_concurrent_relocate_to_the_same_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let chisei = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        init_sqlite(source_s);
+        let held = lock_relocate_destination(chisei_s).unwrap();
+        let err = relocate_sqlite(source_s, source_s, chisei_s).unwrap_err();
+        assert!(err.contains("another relocate"), "{err}");
+        assert!(!writer_fence_raised(source_s).unwrap());
+        drop(held);
+        relocate_sqlite(source_s, source_s, chisei_s).unwrap();
+    }
+
+    #[test]
+    fn dirty_families_include_tables_created_after_capture() {
+        let captured = vec!["chisei_budget_limits".to_string()];
+        let current = vec![
+            "chisei_budget_limits".to_string(),
+            "chisei_portfolio_new".to_string(),
+        ];
+        let families = dirty_families(Vec::new(), &current, &captured);
         assert_eq!(
-            BudgetTracker::new(ChiseiStore::open_sqlite(chisei_s))
-                .get_usage("snapshot-user")
-                .max_tokens,
-            3_000
+            families.into_iter().collect::<Vec<_>>(),
+            ["portfolio".to_string()]
+        );
+        let families = dirty_families(vec!["chisei_eval_runs".into()], &captured, &captured);
+        assert_eq!(
+            families.into_iter().collect::<Vec<_>>(),
+            ["evaluation".to_string()]
         );
     }
 
@@ -2253,7 +2700,7 @@ mod tests {
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     #[test]
     fn greenfield_postgres_fence_then_generation_stamp_succeeds() {
-        // #1105: raise_postgres_writer_fence's CREATE previously omitted
+        // #1105: the fence write's CREATE previously omitted
         // pairing_epoch while its INSERT named it, so a truly greenfield
         // database (fence raised before any generation write ever created the
         // table) failed the INSERT with "column pairing_epoch does not
@@ -2346,6 +2793,161 @@ mod tests {
                 .unwrap(),
             RuntimeDb::Sqlite(_) => unreachable!("constructed as RuntimeDb::Postgres above"),
         }
+    }
+
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL and SEKAI_TEST_POSTGRES_CHISEI_URL, two \
+                isolated TLS PostgreSQL databases whose public schema this test resets; \
+                a private CA also needs SEKAI_POSTGRES_CA_CERT for the relocate connections"]
+    #[test]
+    fn postgres_relocate_waits_for_in_flight_writers_and_recopies_them() {
+        // #1107: the fence must wait for a writer transaction that already
+        // wrote a Chisei row, and the fenced catch-up must carry that row.
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let chisei_url = std::env::var("SEKAI_TEST_POSTGRES_CHISEI_URL").expect(
+            "SEKAI_TEST_POSTGRES_CHISEI_URL must identify a second isolated PostgreSQL database",
+        );
+        let ca_cert_path = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT").ok();
+        let connect = |connection_url: &str| {
+            if let Some(path) = &ca_cert_path {
+                let pem = std::fs::read(path).expect("read PostgreSQL test CA certificate");
+                PostgresDb::connect_with_ca_certificate(connection_url, 4, &pem).unwrap()
+            } else {
+                PostgresDb::connect(connection_url, 4).unwrap()
+            }
+        };
+        let (source, chisei) = (connect(&url), connect(&chisei_url));
+        for db in [&source, &chisei] {
+            db.connection()
+                .unwrap()
+                .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                .unwrap();
+        }
+        for target in [&url, &chisei_url] {
+            RuntimeBackend::initialize(
+                RuntimeBackendConfig::from_sources(
+                    BackendIdentity::Postgres,
+                    None,
+                    "unused.db",
+                    Some(target),
+                    4,
+                    ca_cert_path.as_deref(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        fn insert_limit(
+            client: &mut impl postgres::GenericClient,
+            scope: &str,
+            amount: i64,
+        ) -> Result<(), postgres::Error> {
+            client
+                .execute(
+                    "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                     VALUES ($1, $2, 'daily')",
+                    &[&scope, &amount],
+                )
+                .map(|_| ())
+        }
+        insert_limit(&mut *source.connection().unwrap(), "before-copy", 1).unwrap();
+
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let in_flight = connect(&url);
+        let (stale_db, watcher) = (connect(&url), connect(&url));
+        let mut stale_writer = None;
+        let report = relocate_postgres_online(&url, &url, &chisei_url, || {
+            std::thread::spawn(move || {
+                let mut conn = in_flight.connection().unwrap();
+                let mut tx = conn.transaction().unwrap();
+                insert_limit(&mut tx, "in-flight", 2).unwrap();
+                written_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                tx.commit().unwrap();
+            });
+            written_rx.recv().map_err(|error| error.to_string())?;
+            // A REPEATABLE READ writer whose snapshot predates the fence and
+            // writes only after the gate closed.
+            let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+            stale_writer = Some(std::thread::spawn(move || {
+                let mut conn = stale_db.connection().unwrap();
+                let mut tx = conn
+                    .build_transaction()
+                    .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                    .start()
+                    .unwrap();
+                tx.query_one("SELECT 1", &[]).unwrap();
+                snapshot_tx.send(()).unwrap();
+                let gate_closed = |db: &PostgresDb| {
+                    db.connection()
+                        .unwrap()
+                        .query_one(
+                            &format!("SELECT fenced FROM {CAPTURE_GATE_TABLE} WHERE id = 1"),
+                            &[],
+                        )
+                        .unwrap()
+                        .get::<_, i32>(0)
+                        == 1
+                };
+                while !gate_closed(&watcher) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                insert_limit(&mut tx, "stale-snapshot", 4).and_then(|()| tx.commit())
+            }));
+            snapshot_rx.recv().map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let stale = stale_writer.unwrap().join().unwrap().unwrap_err();
+        assert!(
+            format!("{stale:?}").contains("could not serialize"),
+            "a stale-snapshot writer must not pass the closed gate: {stale:?}"
+        );
+
+        let amount = |db: &PostgresDb, scope: &str| -> Option<i64> {
+            db.connection()
+                .unwrap()
+                .query_opt(
+                    "SELECT max_amount FROM chisei_budget_limits WHERE scope_id = $1",
+                    &[&scope],
+                )
+                .unwrap()
+                .map(|row| row.get(0))
+        };
+        assert_eq!(amount(&chisei, "before-copy"), Some(1));
+        assert_eq!(amount(&chisei, "in-flight"), Some(2));
+        let recopied: Vec<&str> = report
+            .recopied
+            .iter()
+            .map(|family| family.family.as_str())
+            .collect();
+        assert_eq!(recopied, ["budget"]);
+
+        // A load short of the snapshot's own count fails closed.
+        let tampered = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tampered.path().join("tables.txt"),
+            "chisei_budget_limits\t99",
+        )
+        .unwrap();
+        std::fs::write(tampered.path().join("chisei_budget_limits"), "").unwrap();
+        let budget = BTreeSet::from(["budget".to_string()]);
+        let mismatch = copy_chisei_families_from_postgres_snapshot(
+            tampered.path().to_str().unwrap(),
+            &chisei,
+            Some(&budget),
+        )
+        .unwrap_err();
+        assert!(
+            mismatch.contains("relocate validation failed"),
+            "{mismatch}"
+        );
+
+        let err = insert_limit(&mut *source.connection().unwrap(), "after-fence", 3).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("writer fence raised"),
+            "{err:?}"
+        );
+        assert!(postgres_writer_fence_raised(&source).unwrap());
     }
 
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL and SEKAI_TEST_POSTGRES_CHISEI_URL, two \
