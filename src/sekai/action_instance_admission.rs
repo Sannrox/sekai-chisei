@@ -413,7 +413,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         {
             // Clerk admission is already durable. Log catch-up is best-effort so
             // a transient object-log error cannot fail an idempotent replay.
-            let _ = object_log::ensure_admitted_object_in_configured_log(&object);
+            catch_up_object_log(&existing.operation_id, &object.id, &object.kind, &object);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: existing,
@@ -614,11 +614,46 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .put_action_effects(effects)
                 .map_err(ActionInstanceAdmissionError::Internal)?;
             if let Some(applied) = applied_object {
-                object_log::ensure_admitted_object_in_configured_log(&applied.object)
-                    .map_err(ActionInstanceAdmissionError::Internal)?;
+                // #1115: the operation receipt above is already durable, so a
+                // transient object-log failure here must not fail this
+                // already-succeeded admission back to the caller — that was
+                // the bug: this path used `?` while the replay catch-up path
+                // (completed_replay) already treated the identical failure as
+                // best-effort. Both now go through the same helper.
+                catch_up_object_log(
+                    operation_id,
+                    &applied.object_id,
+                    &applied.object_kind,
+                    &applied.object,
+                );
             }
         }
         Ok(())
+    }
+}
+
+/// #1115: post-receipt object-log ingest is best-effort by design (ADR
+/// 0081) — once the operation receipt is durable, a transient ingest
+/// failure must never fail an already-succeeded admission back to the
+/// caller. It must not go silent either: an operator or a dual-read
+/// consumer has no other signal that this identity is missing from the
+/// configured log until catch-up succeeds, so log one structured,
+/// greppable event instead of swallowing the error outright.
+fn catch_up_object_log(
+    operation_id: &str,
+    object_id: &str,
+    object_kind: &str,
+    object: &crate::domain::Object,
+) {
+    if let Err(error) = object_log::ensure_admitted_object_in_configured_log(object) {
+        tracing::error!(
+            operation_id = %operation_id,
+            object_id = %object_id,
+            object_kind = %object_kind,
+            error = %error,
+            "post-receipt object-log ingest failed; admission is durable but the \
+             configured object log is missing this identity until catch-up succeeds"
+        );
     }
 }
 
@@ -1406,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_failure_after_receipt_is_caught_up_on_replay() {
+    fn ingest_failure_after_receipt_never_fails_the_admission_and_is_caught_up_on_replay() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
         let db = setup();
@@ -1422,7 +1457,12 @@ mod tests {
             );
             request.idempotency_key = "record-catchup-log".into();
             request.request_id = "operation-catchup-log".into();
-            assert!(admission.admit(request.clone(), "alice", 10).is_err());
+            // #1115: the receipt, object mutation, and effects are already
+            // durable by the time ingest runs, so a transient ingest
+            // failure must not fail this first, already-succeeded
+            // admission back to the caller.
+            let first = admission.admit(request.clone(), "alice", 10).unwrap();
+            assert!(!first.replay);
             assert!(db.get_object("rec-catchup").unwrap().is_some());
             assert!(
                 db.get_operation_receipt("operation-catchup-log")
@@ -1444,6 +1484,65 @@ mod tests {
                 1
             );
         });
+    }
+
+    #[test]
+    fn ingest_failure_after_receipt_logs_a_structured_catch_up_signal() {
+        // #1115: swallowing the ingest error must not make the gap silent.
+        // An operator or a dual-read consumer needs some other signal that
+        // this identity is missing from the configured log until catch-up
+        // succeeds; assert the structured log line actually fires with the
+        // operation and object identity attached.
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("log buffer").write(data)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            crate::sekai::object_log::fail_next_ingest();
+            let mut request = record_request(
+                "customer.record.create",
+                r#"{"object_id":"rec-signal","name":"Signal"}"#,
+            );
+            request.idempotency_key = "record-signal-log".into();
+            request.request_id = "operation-signal-log".into();
+            tracing::subscriber::with_default(subscriber, || {
+                admission.admit(request, "alice", 10).unwrap();
+            });
+        });
+
+        let logs = String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs");
+        assert!(
+            logs.contains("post-receipt object-log ingest failed"),
+            "{logs}"
+        );
+        assert!(logs.contains("operation-signal-log"), "{logs}");
+        assert!(logs.contains("rec-signal"), "{logs}");
     }
 
     #[test]
