@@ -28,6 +28,8 @@ const JOURNAL_TABLE: &str = "chisei_relocate_families";
 #[cfg(test)]
 thread_local! {
     static GENERATION_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAIRING_EPOCH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAIRING_EPOCH_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -932,25 +934,34 @@ pub fn align_split_generations(
 
 pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> Result<(), String> {
     if layout.cached_matched_generation().is_some() {
-        if pairing_epochs_match(layout)? {
-            advance_pairing_epoch(layout)?;
-            return Ok(());
+        // #1108: on a matched-generation cache hit this still dual-reads the
+        // pairing epoch on every mutating RPC — it is the only check left
+        // that can still catch a one-sided restore while the coarser
+        // generation recheck is skipped from cache, so the read stays. What
+        // is avoidable is `advance_pairing_epoch` re-reading both stores a
+        // second time just to recompute the value `matched_pairing_epoch`
+        // already read: reuse it instead.
+        match matched_pairing_epoch(layout)? {
+            Some(current) => {
+                advance_pairing_epoch_from(layout, current)?;
+                return Ok(());
+            }
+            None => layout.invalidate_matched_generation(),
         }
-        layout.invalidate_matched_generation();
     }
     match split_generation_state(layout)? {
         SplitGenerationState::Mismatched { sekai, chisei } => {
             Err(generation_mismatch_guidance(sekai, chisei))
         }
         SplitGenerationState::Unattested => Err(unattested_guidance()),
-        SplitGenerationState::Matched { generation } => {
-            if !pairing_epochs_match(layout)? {
-                return Err(pairing_epoch_guidance());
+        SplitGenerationState::Matched { generation } => match matched_pairing_epoch(layout)? {
+            Some(current) => {
+                layout.cache_matched_generation(generation);
+                advance_pairing_epoch_from(layout, current)?;
+                Ok(())
             }
-            layout.cache_matched_generation(generation);
-            advance_pairing_epoch(layout)?;
-            Ok(())
-        }
+            None => Err(pairing_epoch_guidance()),
+        },
         _ => Ok(()),
     }
 }
@@ -963,6 +974,12 @@ fn unattested_guidance() -> String {
     "split stores hold operator facts without a cutover generation; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Dual-unstamped is not a green-field pair".into()
 }
 
+/// #1108: kept for the ignored Postgres regression tests that call this
+/// exact pair of functions directly to exercise `advance_pairing_epoch`'s
+/// own read-then-write. Production code now goes through
+/// [`matched_pairing_epoch`] / [`advance_pairing_epoch_from`] instead, which
+/// skip the redundant second read.
+#[cfg(test)]
 fn pairing_epochs_match(layout: &CombinedStoreLayout) -> Result<bool, String> {
     if !layout.is_split() {
         return Ok(true);
@@ -971,6 +988,7 @@ fn pairing_epochs_match(layout: &CombinedStoreLayout) -> Result<bool, String> {
         == read_runtime_pairing_epoch(&layout.chisei_runtime())?)
 }
 
+#[cfg(test)]
 fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
     if !layout.is_split() {
         return Ok(());
@@ -978,6 +996,35 @@ fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
     let next = read_runtime_pairing_epoch(&layout.sekai_runtime())?
         .max(read_runtime_pairing_epoch(&layout.chisei_runtime())?)
         .saturating_add(1);
+    write_runtime_pairing_epoch(&layout.sekai_runtime(), next)?;
+    write_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
+    Ok(())
+}
+
+/// #1108: like [`pairing_epochs_match`], but returns the matched value
+/// itself so a caller that is about to advance can reuse it instead of
+/// paying [`advance_pairing_epoch`]'s own dual read to recompute the same
+/// number. `Ok(None)` means the epochs disagree. Shared layouts have no
+/// pairing epoch to disagree on — matching `pairing_epochs_match`, this
+/// reports a trivial match; the placeholder value is never written, since
+/// [`advance_pairing_epoch_from`] no-ops on a Shared layout too.
+fn matched_pairing_epoch(layout: &CombinedStoreLayout) -> Result<Option<i64>, String> {
+    if !layout.is_split() {
+        return Ok(Some(0));
+    }
+    let sekai = read_runtime_pairing_epoch(&layout.sekai_runtime())?;
+    let chisei = read_runtime_pairing_epoch(&layout.chisei_runtime())?;
+    Ok((sekai == chisei).then_some(sekai))
+}
+
+/// Advance from an already-known matched epoch (see [`matched_pairing_epoch`]).
+/// Semantically identical to [`advance_pairing_epoch`] — same next value,
+/// same two writes — it only skips recomputing `current` from a fresh read.
+fn advance_pairing_epoch_from(layout: &CombinedStoreLayout, current: i64) -> Result<(), String> {
+    if !layout.is_split() {
+        return Ok(());
+    }
+    let next = current.saturating_add(1);
     write_runtime_pairing_epoch(&layout.sekai_runtime(), next)?;
     write_runtime_pairing_epoch(&layout.chisei_runtime(), next)?;
     Ok(())
@@ -1214,6 +1261,8 @@ fn write_postgres_generation(db: &PostgresDb, generation: i64) -> Result<(), Str
 }
 
 fn read_runtime_pairing_epoch(db: &RuntimeDb) -> Result<i64, String> {
+    #[cfg(test)]
+    PAIRING_EPOCH_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     match db {
         RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
             ensure_sqlite_cutover(conn)?;
@@ -1248,6 +1297,8 @@ fn read_runtime_pairing_epoch(db: &RuntimeDb) -> Result<i64, String> {
 }
 
 fn write_runtime_pairing_epoch(db: &RuntimeDb, pairing_epoch: i64) -> Result<(), String> {
+    #[cfg(test)]
+    PAIRING_EPOCH_WRITES.with(|writes| writes.set(writes.get().saturating_add(1)));
     match db {
         RuntimeDb::Sqlite(_) => db.with_sqlite_conn(|conn| {
             ensure_sqlite_cutover(conn)?;
@@ -1910,6 +1961,36 @@ mod tests {
         assert!(err.contains("restamp"), "{err}");
         restamp_split_generation(&layout).unwrap();
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn pairing_epoch_check_and_advance_read_each_store_once_per_admit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = open_dest_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        align_split_generations(&layout).unwrap();
+
+        PAIRING_EPOCH_READS.with(|reads| reads.set(0));
+        PAIRING_EPOCH_WRITES.with(|writes| writes.set(0));
+        for _ in 0..5 {
+            refuse_mutating_if_generation_mismatch(&layout).unwrap();
+        }
+        // #1108: `advance_pairing_epoch` used to re-read both stores to
+        // recompute the value the match check had already just read; each
+        // of the 5 admits now reads each store exactly once instead of
+        // twice.
+        assert_eq!(PAIRING_EPOCH_READS.with(|reads| reads.get()), 5 * 2);
+        // Every admit still advances the epoch on both stores — nothing is
+        // ever skipped, so a one-sided restore stays detectable on the
+        // very next admit regardless of timing.
+        assert_eq!(PAIRING_EPOCH_WRITES.with(|writes| writes.get()), 5 * 2);
+
+        // The optimization never trades away detection: a divergence
+        // introduced between admits is still caught immediately.
+        write_runtime_pairing_epoch(&layout.chisei_runtime(), 999).unwrap();
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("pairing epochs"), "{err}");
     }
 
     #[test]
