@@ -609,20 +609,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             force_notify_fail,
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
-        let applied_object = match plan_object_mutation(
+        let planned_object = plan_object_mutation(
             self.db,
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
         )
-        .map_err(map_object_mutation_error)?
-        {
-            Some(planned) => Some(
-                action_object_mutation::apply(self.db, planned, &instance.principal, now)
-                    .map_err(map_object_mutation_error)?,
-            ),
-            None => None,
-        };
+        .map_err(map_object_mutation_error)?;
         let mut granted = instance.clone();
         granted.status = STATUS_ADMITTED.into();
         granted.deny_reason.clear();
@@ -635,18 +628,29 @@ impl<'a> ActionInstanceAdmission<'a> {
         granted.decided_at_ms = now;
         granted.decided_by = decider.to_string();
         granted.approval_decision = DECISION_GRANT.into();
-        if !self
-            .db
-            .decide_parked_action_instance(&granted)
-            .map_err(ActionInstanceAdmissionError::Internal)?
+        // The object write and the parked-to-admitted transition commit
+        // together, with the target re-digested under the same lock (#1139).
+        let applied_object = match action_object_mutation::grant_parked(
+            self.db,
+            planned_object,
+            &granted,
+            &target_object_id(&instance.parameters_json),
+            &instance.parked_object_digest,
+            &instance.principal,
+            now,
+        )
+        .map_err(map_object_mutation_error)?
         {
-            // Another decision won the race: undo this grant's object write
-            // and answer with whatever was recorded.
-            if let Some(applied) = &applied_object {
-                action_object_mutation::compensate(self.db, applied, &instance.principal);
+            action_object_mutation::ParkedGrant::Granted(applied) => {
+                applied.map(|applied| *applied)
             }
-            return self.replay_decided(&instance.instance_id, decision);
-        }
+            action_object_mutation::ParkedGrant::NotParked => {
+                return self.replay_decided(&instance.instance_id, decision);
+            }
+            action_object_mutation::ParkedGrant::Stale => {
+                return self.finish_denied(instance, "stale_on_resume", &approval, now);
+            }
+        };
         let ontology_digest = self
             .db
             .get_operation_receipt(&instance.operation_id)
@@ -1082,12 +1086,9 @@ fn object_for_admitted_instance(
 /// Digest of the object named by `object_id` in the parameters, taken when an
 /// instance parks. Any change to that object before a grant denies the
 /// instance instead of applying against state the submitter never saw.
-fn target_object_digest(
-    db: &RuntimeDb,
-    parameters_json: &str,
-) -> Result<String, ActionInstanceAdmissionError> {
-    use sha2::{Digest, Sha256};
-    let object_id = serde_json::from_str::<serde_json::Value>(parameters_json)
+/// The `object_id` parameter an instance targets, or empty when it has none.
+fn target_object_id(parameters_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(parameters_json)
         .ok()
         .and_then(|value| {
             value
@@ -1095,31 +1096,23 @@ fn target_object_digest(
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
         })
-        .unwrap_or_default();
-    if object_id.trim().is_empty() {
+        .filter(|object_id| !object_id.trim().is_empty())
+        .unwrap_or_default()
+}
+
+fn target_object_digest(
+    db: &RuntimeDb,
+    parameters_json: &str,
+) -> Result<String, ActionInstanceAdmissionError> {
+    let object_id = target_object_id(parameters_json);
+    if object_id.is_empty() {
         return Ok(String::new());
     }
-    let Some(object) = db
+    let object = db
         .get_object(&object_id)
-        .map_err(ActionInstanceAdmissionError::Internal)?
-    else {
-        return Ok("absent".into());
-    };
-    // Canonical form: properties sorted, so an unchanged object always
-    // digests the same regardless of map iteration order.
-    let properties: BTreeMap<&String, &String> = object.properties.iter().collect();
-    let body = serde_json::to_vec(&(
-        &object.id,
-        &object.kind,
-        &object.name,
-        &object.namespace,
-        &object.external_id,
-        properties,
-        object.created,
-        object.updated,
-    ))
-    .map_err(|error| ActionInstanceAdmissionError::Internal(error.to_string()))?;
-    Ok(format!("sha256:{:x}", Sha256::digest(body)))
+        .map_err(ActionInstanceAdmissionError::Internal)?;
+    crate::sekai::action_instance::object_state_digest(object.as_ref())
+        .map_err(ActionInstanceAdmissionError::Internal)
 }
 
 fn load_criterion_object(
@@ -2383,6 +2376,157 @@ mod tests {
             .unwrap()
             .instance;
         assert_eq!(granted.status, STATUS_ADMITTED, "{}", granted.deny_reason);
+    }
+
+    /// Parks an update of `object_id` that bob may grant.
+    fn parked_update(db: &RuntimeDb, object_id: &str) -> ActionInstance {
+        ensure_record_kind(db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(db, None);
+        admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    &format!(r#"{{"object_id":"{object_id}","title":"v1"}}"#),
+                ),
+                "alice",
+                5,
+            )
+            .unwrap();
+        let mut update_type = record_type("update");
+        update_type.approvers = vec!["bob".into(), "carol".into()];
+        db.put_governed_action_type(update_type, "operator", 6)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut update = record_request(
+            "customer.record.update",
+            &format!(r#"{{"object_id":"{object_id}","title":"v2"}}"#),
+        );
+        update.idempotency_key = format!("{object_id}-update");
+        update.request_id = format!("operation-{object_id}-update");
+        let parked = admission.admit(update, "alice", 10).unwrap().instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        parked
+    }
+
+    fn change_count(db: &RuntimeDb, object_id: &str) -> usize {
+        db.list_object_changes(object_id, 1000, 0).unwrap().len()
+    }
+
+    #[test]
+    fn the_grant_transaction_writes_nothing_unless_the_transition_commits() {
+        // #1139: the staleness check, object write, and parked-to-admitted
+        // transition share one transaction.
+        use crate::sekai::action_instance::{ParkedGrantOutcome, ParkedGrantWrite};
+        let db = setup();
+        let parked = parked_update(&db, "rec-21");
+        let mut granted = parked.clone();
+        granted.status = STATUS_ADMITTED.into();
+        let mut planned = db.get_object("rec-21").unwrap().unwrap();
+        planned.properties.insert("title".into(), "v2".into());
+        planned.updated = 30;
+        let write = ParkedGrantWrite::Update(planned);
+
+        // Changed after the pre-check: the transaction re-digests and refuses.
+        let mut changed = db.get_object("rec-21").unwrap().unwrap();
+        changed
+            .properties
+            .insert("title".into(), "elsewhere".into());
+        db.update_object(&changed).unwrap();
+        assert!(matches!(
+            db.grant_parked_action_instance(
+                &granted,
+                "rec-21",
+                &parked.parked_object_digest,
+                Some(&write),
+                "alice",
+            )
+            .unwrap(),
+            ParkedGrantOutcome::Stale
+        ));
+        let object = db.get_object("rec-21").unwrap().unwrap();
+        assert_eq!(object.properties["title"], "elsewhere");
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+
+        // Already decided elsewhere: no write lands.
+        let current_digest =
+            crate::sekai::action_instance::object_state_digest(Some(&object)).unwrap();
+        let mut denied = parked.clone();
+        denied.status = STATUS_DENIED.into();
+        assert!(db.decide_parked_action_instance(&denied).unwrap());
+        assert!(matches!(
+            db.grant_parked_action_instance(
+                &granted,
+                "rec-21",
+                &current_digest,
+                Some(&write),
+                "alice",
+            )
+            .unwrap(),
+            ParkedGrantOutcome::NotParked
+        ));
+        assert_eq!(
+            db.get_object("rec-21").unwrap().unwrap().properties["title"],
+            "elsewhere"
+        );
+    }
+
+    #[test]
+    fn concurrent_grants_apply_the_object_write_exactly_once() {
+        // Baseline: the audit rows one uncontended grant writes.
+        let sequential = setup();
+        let alone = parked_update(&sequential, "rec-22");
+        let unchanged = change_count(&sequential, "rec-22");
+        ActionInstanceAdmission::new(&sequential, None)
+            .decide(
+                decision(&alone.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap();
+        let one_grant = change_count(&sequential, "rec-22") - unchanged;
+
+        let db = std::sync::Arc::new(setup());
+        let parked = parked_update(&db, "rec-22");
+        let before = change_count(&db, "rec-22");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = ["bob", "carol"].map(|approver| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let instance_id = parked.instance_id.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                ActionInstanceAdmission::new(&db, None)
+                    .decide(
+                        decision(&instance_id, DECISION_GRANT, approver),
+                        approver,
+                        20,
+                    )
+                    .unwrap()
+            })
+        });
+        let outcomes = handles.map(|handle| handle.join().unwrap());
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.instance.status == STATUS_ADMITTED)
+        );
+        assert_eq!(outcomes.iter().filter(|outcome| !outcome.replay).count(), 1);
+        // One write, and no compensating restore from a losing grant.
+        assert_eq!(change_count(&db, "rec-22"), before + one_grant);
+        assert_eq!(
+            db.get_object("rec-22").unwrap().unwrap().properties["title"],
+            "v2"
+        );
     }
 
     #[test]
