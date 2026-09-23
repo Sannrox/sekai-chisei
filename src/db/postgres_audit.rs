@@ -301,7 +301,7 @@ impl PostgresDb {
         after_seq: u64,
         limit: i32,
     ) -> Result<Vec<(ObjectChange, u64, String, String)>, String> {
-        let limit = if limit > 0 { limit } else { 64 };
+        let limit = i64::from(if limit > 0 { limit } else { 64 });
         let after = i64::try_from(after_seq).map_err(|error| error.to_string())?;
         self.connection()?
             .query(
@@ -352,13 +352,14 @@ impl PostgresDb {
         limit: i32,
         offset: i32,
     ) -> Result<Vec<ObjectChange>, String> {
-        let limit = if limit > 0 { limit } else { 100 };
+        let limit = i64::from(if limit > 0 { limit } else { 100 });
+        let offset = i64::from(offset.max(0));
         self.connection()?
             .query(
                 "SELECT id, object_id, field, old_value, new_value, changed_by, timestamp
                  FROM sekai_object_changes WHERE object_id = $1
                  ORDER BY timestamp DESC, audit_seq DESC LIMIT $2 OFFSET $3",
-                &[&object_id, &limit, &offset.max(0)],
+                &[&object_id, &limit, &offset],
             )
             .map(|rows| rows.into_iter().map(row_to_change).collect())
             .map_err(|error| error.to_string())

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Barrier};
 
-use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{Direction, KIND_CAPABILITY, Link, ListFilter, Object, PropertyFilter};
@@ -18,6 +17,10 @@ use sekai_chisei::sekai::purpose_authorization::{
     PURPOSE_AUTHORIZATION_VERSION, PurposeAuthorization,
 };
 use sekai_chisei::sekai::query::{self, GraphQuery};
+
+#[path = "support/postgres_scratch.rs"]
+mod postgres_scratch;
+use postgres_scratch::ScratchDatabase;
 
 fn policy(
     namespace: &str,
@@ -1528,9 +1531,10 @@ fn sqlite_value_instance_grants_omit_hidden_cells() {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_value_instance_grants_omit_hidden_cells() {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    let db = RuntimeDb::Postgres(Arc::new(PostgresDb::connect(&url, 4).unwrap()));
+    // Unscoped property queries check every activated namespace, so this
+    // scenario needs a database no other test has activated policies in.
+    let scratch = ScratchDatabase::create();
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
     exercise_value_instance_access(
         &db,
         &format!("cell-grants-{}", uuid::Uuid::new_v4().simple()),
@@ -1540,9 +1544,8 @@ fn postgres_value_instance_grants_omit_hidden_cells() {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_object_security_conformance() {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    let postgres = Arc::new(PostgresDb::connect(&url, 4).unwrap());
+    let scratch = ScratchDatabase::create();
+    let postgres = Arc::new(scratch.connect(4));
     let db = RuntimeDb::Postgres(postgres.clone());
     exercise(
         db.clone(),
@@ -1578,6 +1581,9 @@ fn postgres_object_security_conformance() {
                 )
             })
         })
+        // Spawn both writers before joining either; the barrier needs both.
+        .collect::<Vec<_>>()
+        .into_iter()
         .map(|handle| handle.join().unwrap().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(results[0], results[1]);

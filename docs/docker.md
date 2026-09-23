@@ -83,6 +83,20 @@ cargo test --locked 'db::postgres::tests::' -- --ignored --nocapture
 cargo test --locked 'db::postgres_portfolio::tests::' -- --ignored --nocapture
 ```
 
+To run every PostgreSQL conformance suite, including the spawned-binary
+product loop and the store-relocate tests, point both URLs at disposable
+databases on the same server. The test role must be allowed to create
+databases: suites whose scenarios read across namespaces create and drop their
+own scratch database.
+
+```bash
+export SEKAI_TEST_POSTGRES_CHISEI_URL='postgresql://user:password@localhost/sekai_test_chisei'
+cargo test --locked --no-fail-fast \
+  $(for t in tests/*backend_conformance.rs tests/*postgres*.rs; do printf -- '--test %s ' "$(basename "$t" .rs)"; done) \
+  -- --ignored --test-threads=1
+cargo test --locked --lib -- --ignored --test-threads=1 postgres
+```
+
 The configured database must not contain valuable data: migration fixtures
 drop and recreate its `public` schema. CI must allocate a database exclusively
 to this test process. Production PostgreSQL connections and these fixtures both

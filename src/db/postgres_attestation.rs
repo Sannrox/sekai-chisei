@@ -54,8 +54,8 @@ impl PostgresDb {
                 &[
                     &decision_id,
                     &policy_scope,
-                    &if limit > 0 { limit.min(500) } else { 100 },
-                    &offset.max(0),
+                    &i64::from(if limit > 0 { limit.min(500) } else { 100 }),
+                    &i64::from(offset.max(0)),
                 ],
             )
             .map_err(|error| error.to_string())?

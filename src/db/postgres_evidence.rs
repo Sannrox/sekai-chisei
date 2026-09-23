@@ -542,12 +542,12 @@ impl PostgresDb {
                     &lifecycle,
                     &filter.target_external_id,
                     &filter.evidence_type,
-                    &if filter.limit > 0 {
+                    &i64::from(if filter.limit > 0 {
                         filter.limit.min(500)
                     } else {
                         100
-                    },
-                    &filter.offset.max(0),
+                    }),
+                    &i64::from(filter.offset.max(0)),
                 ],
             )
             .map_err(|error| error.to_string())?

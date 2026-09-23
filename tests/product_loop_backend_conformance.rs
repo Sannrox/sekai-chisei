@@ -28,6 +28,10 @@ use sekai_chisei::grpc::pb::sekai::{
 };
 use tonic::{Code, Request};
 
+#[path = "support/postgres_scratch.rs"]
+mod postgres_scratch;
+use postgres_scratch::ScratchDatabase;
+
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
 
 enum Backend {
@@ -418,64 +422,4 @@ async fn postgres_runs_the_product_loop() {
         ca_cert: scratch.ca_cert.clone(),
     });
     exercise_product_loop(&server).await;
-}
-
-/// A throwaway database on the conformance server so reruns start clean.
-struct ScratchDatabase {
-    admin_url: String,
-    ca_cert: Option<String>,
-    name: String,
-    url: String,
-}
-
-impl ScratchDatabase {
-    fn create() -> Self {
-        let admin_url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-            .expect("SEKAI_TEST_POSTGRES_URL must identify a PostgreSQL test server");
-        let ca_cert = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT").ok();
-        let name = format!("sekai_loop_{}", uuid::Uuid::new_v4().simple());
-        let (base, query) = match admin_url.split_once('?') {
-            Some((base, query)) => (base, format!("?{query}")),
-            None => (admin_url.as_str(), String::new()),
-        };
-        let prefix = base.rsplit_once('/').expect("database URL path").0;
-        let url = format!("{prefix}/{name}{query}");
-        let scratch = Self {
-            admin_url,
-            ca_cert,
-            name,
-            url,
-        };
-        // The synchronous client runs its own runtime; keep it off this one.
-        tokio::task::block_in_place(|| {
-            scratch
-                .client()
-                .batch_execute(&format!("CREATE DATABASE {}", scratch.name))
-                .expect("create scratch database")
-        });
-        scratch
-    }
-
-    fn client(&self) -> postgres::Client {
-        let mut builder = native_tls::TlsConnector::builder();
-        if let Some(path) = &self.ca_cert {
-            let pem = std::fs::read(path).expect("read CA certificate");
-            builder.add_root_certificate(
-                native_tls::Certificate::from_pem(&pem).expect("parse CA certificate"),
-            );
-        }
-        let tls = postgres_native_tls::MakeTlsConnector::new(builder.build().expect("tls"));
-        postgres::Client::connect(&self.admin_url, tls).expect("connect admin database")
-    }
-}
-
-impl Drop for ScratchDatabase {
-    fn drop(&mut self) {
-        tokio::task::block_in_place(|| {
-            let _ = self.client().batch_execute(&format!(
-                "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-                self.name
-            ));
-        });
-    }
 }
