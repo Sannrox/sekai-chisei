@@ -174,15 +174,21 @@ be deleted while another class or relation references it. A relation cannot be
 deleted while another relation names it as an inverse.
 
 Mapped relation domain and range constraints are enforced on new links and
-relevant object-kind updates. Existing links are not rewritten. Cardinality is
-advisory metadata in the 1.x contract: its declaration shape is validated, but
-it does not reject links or relation-definition updates, count graph state, or
-synthesize, repair, or delete facts. See [ADR 0018](decisions/0018-ontology-relation-cardinality.md).
-[ADR 0087](decisions/0087-enforce-relation-cardinality-maximum.md) accepts
-enforcing the maximum bound at link admission, counted as distinct targets
-per source and relation, on both backends. The minimum stays advisory. Until
-[#1132](https://github.com/Sannrox/sekai-chisei/issues/1132) ships that
-enforcement, both bounds remain advisory.
+relevant object-kind updates. Existing links are not rewritten.
+
+A relation's maximum cardinality is enforced when a link is admitted, on
+SQLite and PostgreSQL alike ([ADR 0087](decisions/0087-enforce-relation-cardinality-maximum.md)).
+The count is the number of distinct target objects a source reaches over the
+mapped relation, so a duplicate link to an existing target does not count
+twice. The count and the insert run in one transaction, so concurrent
+admissions cannot exceed the bound. A link over the bound fails with
+`FAILED_PRECONDITION` and the reason `relation_cardinality_exceeded`, which
+names no counts or hidden links. Publishing a relation whose maximum is below
+the existing graph is refused with the number of sources over the bound;
+nothing is rewritten, and a source already over the bound cannot gain another
+target. The minimum stays advisory metadata: its declaration shape is
+validated, but no link admission can prove it. See
+[ADR 0018](decisions/0018-ontology-relation-cardinality.md).
 Inverse and transitivity metadata do not synthesize links or facts.
 
 ## Read-only inspection artifact

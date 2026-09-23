@@ -468,37 +468,17 @@ impl PostgresDb {
     }
 
     pub fn create_link(&self, link: &Link) -> Result<(), String> {
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
-                &[
-                    &link.id,
-                    &link.from_id,
-                    &link.to_id,
-                    &link.relation,
-                    &link.created,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.create_link_once(link).map(|_| ())
     }
 
     pub fn create_link_once(&self, link: &Link) -> Result<bool, String> {
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
-                &[
-                    &link.id,
-                    &link.from_id,
-                    &link.to_id,
-                    &link.relation,
-                    &link.created,
-                ],
-            )
-            .map(|inserted| inserted == 1)
-            .map_err(|error| error.to_string())
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let inserted = insert_link_within_maximum(&mut transaction, link)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(inserted)
     }
 
     pub fn create_link_with_authorized_endpoints(
@@ -521,21 +501,9 @@ impl PostgresDb {
             from_generation,
             to_generation,
         )?;
-        let inserted = transaction
-            .execute(
-                "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
-                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
-                &[
-                    &link.id,
-                    &link.from_id,
-                    &link.to_id,
-                    &link.relation,
-                    &link.created,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        let inserted = insert_link_within_maximum(&mut transaction, link)?;
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(if fail_if_exists { inserted == 1 } else { true })
+        Ok(if fail_if_exists { inserted } else { true })
     }
 
     pub fn delete_link(&self, id: &str) -> Result<(), String> {
@@ -1016,6 +984,144 @@ fn is_lineage_relation(relation: &str) -> bool {
     )
 }
 
+/// The one PostgreSQL insert path for `sekai_links`: inserts `link` unless its
+/// id already exists, refusing a link that would exceed the relation's
+/// declared maximum (ADR 0087). Every link writer goes through here.
+pub(crate) fn insert_link_within_maximum(
+    transaction: &mut postgres::Transaction<'_>,
+    link: &Link,
+) -> Result<bool, String> {
+    let exists: bool = transaction
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = $1)",
+            &[&link.id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    if exists {
+        return Ok(false);
+    }
+    enforce_postgres_link_maximum(transaction, &link.from_id, &link.to_id, &link.relation)?;
+    transaction
+        .execute(
+            "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+            &[
+                &link.id,
+                &link.from_id,
+                &link.to_id,
+                &link.relation,
+                &link.created,
+            ],
+        )
+        .map(|inserted| inserted == 1)
+        .map_err(|error| error.to_string())
+}
+
+/// PostgreSQL side of ADR 0087. A transaction-scoped advisory lock on
+/// `(from_id, relation)` serializes concurrent admissions for one source, so
+/// the count and the insert that follows cannot both pass a maximum.
+fn enforce_postgres_link_maximum(
+    client: &mut impl postgres::GenericClient,
+    from_id: &str,
+    to_id: &str,
+    relation: &str,
+) -> Result<(), String> {
+    if relation.is_empty() {
+        return Ok(());
+    }
+    // Shared with other admissions, exclusive against a publication of this
+    // relation's maximum, so the bound read below cannot go stale.
+    relation_maximum_lock(client, relation, false)?;
+    let mut maximum: Option<u32> = None;
+    for row in client
+        .query(
+            "SELECT cardinality_json FROM sekai_ontology_relations WHERE mapped_relation = $1",
+            &[&relation],
+        )
+        .map_err(|error| error.to_string())?
+    {
+        let cardinality: crate::sekai::ontology::Cardinality =
+            serde_json::from_str(row.get::<_, String>(0).as_str())
+                .map_err(|error| error.to_string())?;
+        if let Some(max) = cardinality.max {
+            maximum = Some(maximum.map_or(max, |current| current.min(max)));
+        }
+    }
+    let Some(maximum) = maximum else {
+        return Ok(());
+    };
+    transaction_advisory_lock(
+        client,
+        &format!("sekai-link-max\u{1f}{from_id}\u{1f}{relation}"),
+    )?;
+    let row = client
+        .query_one(
+            "SELECT
+                EXISTS(SELECT 1 FROM sekai_links WHERE from_id = $1 AND relation = $2 AND to_id = $3),
+                (SELECT COUNT(DISTINCT to_id) FROM sekai_links WHERE from_id = $1 AND relation = $2)",
+            &[&from_id, &relation, &to_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let (already_linked, distinct_targets): (bool, i64) = (row.get(0), row.get(1));
+    if !already_linked && distinct_targets >= i64::from(maximum) {
+        return Err(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED.into());
+    }
+    Ok(())
+}
+
+/// Transaction-scoped lock on one mapped relation's maximum: shared for link
+/// admissions, exclusive for a relation publication that recounts the graph.
+pub(crate) fn relation_maximum_lock(
+    client: &mut impl postgres::GenericClient,
+    relation: &str,
+    exclusive: bool,
+) -> Result<(), String> {
+    let statement = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+    };
+    client
+        .execute(
+            statement,
+            &[&format!("sekai-link-relation\u{1f}{relation}")],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn transaction_advisory_lock(
+    client: &mut impl postgres::GenericClient,
+    key: &str,
+) -> Result<(), String> {
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&key],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Sources whose distinct targets over `relation` already exceed `maximum`.
+pub(crate) fn postgres_sources_over_link_maximum(
+    client: &mut impl postgres::GenericClient,
+    relation: &str,
+    maximum: u32,
+) -> Result<i64, String> {
+    client
+        .query_one(
+            "SELECT COUNT(*) FROM (
+                SELECT from_id FROM sekai_links WHERE relation = $1
+                GROUP BY from_id HAVING COUNT(DISTINCT to_id) > $2
+             ) AS over_bound",
+            &[&relation, &i64::from(maximum)],
+        )
+        .map(|row| row.get(0))
+        .map_err(|error| error.to_string())
+}
+
 fn require_postgres_authorized_link_endpoints(
     transaction: &mut postgres::Transaction<'_>,
     expected_from: &Object,
@@ -1104,5 +1210,121 @@ mod tests {
         let result = PostgresDb::connect("", 1).unwrap_err();
         assert!(result.contains("must not be empty"));
         assert!(!is_valid_property_key("name') OR TRUE --"));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database; set SEKAI_TEST_POSTGRES_CA_CERT for a private CA"]
+    fn postgres_link_maximum_matches_the_sqlite_contract() {
+        // ADR 0087 parity: distinct targets, duplicates count once, concurrent
+        // admissions admit at most the maximum, tightening publications refuse.
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let connect = || match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).expect("read PostgreSQL test CA certificate"),
+            )
+            .unwrap(),
+            Err(_) => PostgresDb::connect(&url, 4).unwrap(),
+        };
+        let db = std::sync::Arc::new(connect());
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mapped = format!("employed_by_{run}");
+        let (person_kind, company_kind) = (format!("person_{run}"), format!("company_{run}"));
+        for (name, kind) in [
+            (format!("Person{run}"), &person_kind),
+            (format!("Company{run}"), &company_kind),
+        ] {
+            db.upsert_ontology_class(&crate::sekai::ontology::OntologyClass {
+                name,
+                description: String::new(),
+                superclasses: Vec::new(),
+                equivalent_classes: Vec::new(),
+                disjoint_classes: Vec::new(),
+                properties: Vec::new(),
+                is_builtin: false,
+                mapped_kind: kind.clone(),
+            })
+            .unwrap();
+        }
+        let mut works_for = crate::sekai::ontology::OntologyRelation {
+            name: format!("works_for_{run}"),
+            description: String::new(),
+            domain: format!("Person{run}"),
+            range: format!("Company{run}"),
+            cardinality: crate::sekai::ontology::Cardinality {
+                min: 0,
+                max: Some(1),
+            },
+            inverse: String::new(),
+            transitive: false,
+            is_builtin: false,
+            mapped_relation: mapped.clone(),
+        };
+        db.upsert_ontology_relation(&works_for).unwrap();
+        let object = |id: &str, kind: &str| Object {
+            id: format!("{id}-{run}"),
+            kind: kind.into(),
+            name: id.into(),
+            namespace: "default".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        for (id, kind) in [
+            ("p1", &person_kind),
+            ("p2", &person_kind),
+            ("c1", &company_kind),
+            ("c2", &company_kind),
+        ] {
+            db.create_object(&object(id, kind)).unwrap();
+        }
+        let link = |id: &str, from: &str, to: &str| Link {
+            id: format!("{id}-{run}"),
+            from_id: format!("{from}-{run}"),
+            to_id: format!("{to}-{run}"),
+            relation: mapped.clone(),
+            created: 1,
+        };
+
+        db.create_link(&link("l1", "p1", "c1")).unwrap();
+        db.create_link(&link("l1-again", "p1", "c1")).unwrap();
+        assert_eq!(
+            db.create_link(&link("l2", "p1", "c2")).unwrap_err(),
+            crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = [("race-1", "c1"), ("race-2", "c2")]
+            .into_iter()
+            .map(|(id, to)| {
+                let (db, barrier, link) = (
+                    std::sync::Arc::clone(&db),
+                    std::sync::Arc::clone(&barrier),
+                    link(id, "p2", to),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.create_link(&link)
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+
+        works_for.cardinality.max = None;
+        db.upsert_ontology_relation(&works_for).unwrap();
+        db.create_link(&link("l2", "p1", "c2")).unwrap();
+        works_for.cardinality.max = Some(1);
+        let refused = db.upsert_ontology_relation(&works_for).unwrap_err();
+        assert!(
+            refused.starts_with(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED),
+            "{refused}"
+        );
     }
 }

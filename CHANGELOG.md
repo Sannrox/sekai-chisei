@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A relation's maximum cardinality is now enforced when a link is admitted, on
+  SQLite and PostgreSQL. Distinct targets per source count toward the bound,
+  duplicates count once, and concurrent admissions cannot exceed it. A link
+  over the bound fails `FAILED_PRECONDITION` with
+  `relation_cardinality_exceeded`. Publishing a relation whose maximum is
+  below existing links is refused; existing links are never rewritten. The
+  minimum stays advisory (ADR 0087, #1132). **Breaking** for callers that
+  relied on over-bound writes.
 - Combined Split pools can be sized per plane with
   `SEKAI_POSTGRES_SEKAI_CONNECTIONS` and `SEKAI_POSTGRES_CHISEI_CONNECTIONS`,
   carved out of `SEKAI_POSTGRES_MAX_CONNECTIONS`; sizes over the budget refuse
