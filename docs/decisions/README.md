@@ -110,3 +110,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0086: An ObjectSet is its descriptor; members are not stored](0086-object-set-is-its-descriptor.md)
 - [ADR 0087: Enforce ontology relation maximum cardinality; keep the minimum advisory](0087-enforce-relation-cardinality-maximum.md)
 - [ADR 0088: One object-log host owns identity; clerk processes are its clients](0088-one-object-log-host-many-clerk-clients.md)
+- [ADR 0089: Park approval-gated Action instances and decide them explicitly](0089-park-and-decide-action-instances.md)

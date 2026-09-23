@@ -65,6 +65,8 @@ already stores a supported contract.
 7. **Policy** via existing ActionPolicy resolution; action name
    `submit_action_instance`, risk class write. Deny → durable instance with
    `status=denied` (not a hard gRPC error so clients can inspect the receipt).
+   `require_approval` → durable instance with `status=parked`: no object
+   write, no effects, and an open receipt. See [Approval](#approval).
 8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
    when a `BudgetTracker` is configured. Exhausted → `status=denied`.
 9. When the type binds `object_kind` and `object_mutation`, plan one
@@ -134,6 +136,35 @@ admission. Parameter values stay out of audit and receipt evidence. See
   not auto-admit an ActionInstance.
 - Prefer stable idempotency keys derived from the external event identity so
   retries are safe.
+
+## Approval
+
+A parked instance waits for one decision through `DecideActionInstance`
+(experimental, gated by `SEKAI_EXPERIMENTAL_RPCS=1`; [ADR 0089](decisions/0089-park-and-decide-action-instances.md)).
+Describe and preview still never grant.
+
+- **Who decides.** A principal listed in the type's `approvers`, or, when the
+  type declares none, a namespace administrator. The submitter never decides
+  their own instance. Every refusal, including an unknown instance, answers
+  `PERMISSION_DENIED` with `access denied`.
+- **Grant** resumes the same instance against current state. It re-checks
+  the type, parameters, submission criteria, and policy (the approval
+  satisfies only `require_approval`), and the target object: if it changed
+  since the park, the instance ends `denied` with `stale_on_resume` and
+  nothing is written. Otherwise the object write, effects, and receipt
+  match a direct admit.
+- **Deny** is terminal (`denied_by_approver`).
+- **Idempotency.** Repeating a decision returns the recorded outcome
+  (`replay=true`); a conflicting decision fails `FAILED_PRECONDITION`.
+  Replaying the submit returns the same instance, never a second one.
+- The decision completes the instance's own receipt with an
+  `approval_decided` event naming the approver, so `GetOperationReceipt`
+  closes the loop. The audit log records `decide_action_instance`.
+- Combined Split reserves one budget unit at submit. A grant does not charge
+  again, and a denied approval keeps the unit, as submit-time denials do.
+
+Community PostgreSQL parks but does not decide yet: `DecideActionInstance`
+answers `UNAVAILABLE` there and is not advertised.
 
 ## Dual-backend
 

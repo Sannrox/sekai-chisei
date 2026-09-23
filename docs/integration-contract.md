@@ -122,6 +122,6 @@ advertised sekaictl/SDK loop on current `main`:
 - ObjectSet query as a typed sekaictl/SDK helper ([#835](https://github.com/Sannrox/sekai-chisei/issues/835)); `EvaluateObjectSet` stays MCP-allowlisted and stable on the wire;
 - application Action describe/preview as typed SDK helpers (`PreviewObjectAction` is MCP-allowlisted);
 - object-change subscription as a sekaictl/SDK loop step ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
-- first-class Action approval RPC (admission may persist `denied` instead; preview reports `require_approval` without granting it) ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
+- a typed sekaictl/SDK helper for Action approval: `require_approval` now parks the instance and `DecideActionInstance` grants or denies it, but that RPC is experimental until a sekaictl or SDK consumer ships ([#1084](https://github.com/Sannrox/sekai-chisei/issues/1084)); preview still reports `require_approval` without granting it ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
 - product-loop ontology apply on community PostgreSQL without fail-closed ([#1086](https://github.com/Sannrox/sekai-chisei/issues/1086));
 - downloadable registry packages (publication records are not registry bytes).

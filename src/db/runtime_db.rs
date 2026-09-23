@@ -91,6 +91,9 @@ impl std::fmt::Debug for RuntimeDb {
     }
 }
 
+pub(crate) const DECIDE_ACTION_INSTANCE_UNAVAILABLE: &str =
+    "deciding a parked action instance is unavailable on the PostgreSQL community runtime";
+
 impl RuntimeDb {
     /// Labels this store's connection-pool signals with the plane it serves.
     pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
@@ -3278,6 +3281,31 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.put_action_instance(instance),
             Self::Postgres(db) => db.put_action_instance(instance),
+        }
+    }
+
+    /// SQLite only: community PostgreSQL does not decide parked instances
+    /// yet and is not advertised for it (#1084).
+    pub fn decide_parked_action_instance(
+        &self,
+        decided: &crate::sekai::action_instance::ActionInstance,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.decide_parked_action_instance(decided),
+            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+        }
+    }
+
+    /// Returns a granted instance to `parked` when its grant could not be
+    /// recorded, so the decision can be retried.
+    pub fn repark_action_instance(
+        &self,
+        parked: &crate::sekai::action_instance::ActionInstance,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db
+                .transition_action_instance(crate::sekai::action_instance::STATUS_ADMITTED, parked),
+            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
         }
     }
 

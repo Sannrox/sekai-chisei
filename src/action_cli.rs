@@ -95,6 +95,9 @@ struct TypeFile {
     submission_criteria: Vec<crate::sekai::action_type_criteria::ActionSubmissionCriterion>,
     #[serde(default)]
     declared_effect_kinds: Vec<String>,
+    /// Principals who may decide a parked instance (#1084).
+    #[serde(default)]
+    approvers: Vec<String>,
     #[serde(default)]
     system_one: Option<Value>,
     #[serde(default = "default_enabled")]
@@ -196,6 +199,7 @@ fn type_from_file(parsed: TypeFile) -> Result<(GovernedActionType, String), BoxE
                 .map(serde_json::to_string)
                 .transpose()?
                 .unwrap_or_default(),
+            approvers: parsed.approvers,
             enabled: parsed.enabled,
             created_by: String::new(),
             created_at_ms: 0,

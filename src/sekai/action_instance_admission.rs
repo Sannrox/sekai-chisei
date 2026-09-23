@@ -13,8 +13,9 @@ use crate::chisei::receipt::{
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
-    ActionInstance, STATUS_ADMITTED, STATUS_DENIED, SUBMIT_POLICY_ACTION,
-    compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
+    ActionInstance, DECISION_DENY, DECISION_GRANT, STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED,
+    SUBMIT_POLICY_ACTION, compute_request_digest_with_envelope, submit_budget_subject,
+    validate_parameters_json,
 };
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
@@ -54,6 +55,22 @@ pub(crate) struct ActionInstanceAdmissionRequest {
     pub budget_already_reserved: bool,
 }
 
+/// Grant or deny of a parked instance (#1084). The transport adapter
+/// authenticates the decider and states which principals they present and
+/// whether they administer the instance namespace.
+#[derive(Debug, Clone)]
+pub(crate) struct ActionInstanceDecisionRequest {
+    pub instance_id: String,
+    pub decision: String,
+    pub reason: String,
+    pub decider_principals: Vec<String>,
+    pub decider_is_namespace_admin: bool,
+}
+
+/// One bounded answer for every refused or unknown decision target, so a
+/// caller learns nothing about instances or types it may not decide.
+pub(crate) const DECISION_ACCESS_DENIED: &str = "access denied";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActionInstanceAdmissionOutcome {
     pub instance: ActionInstance,
@@ -65,7 +82,15 @@ pub(crate) enum ActionInstanceAdmissionError {
     InvalidArgument(String),
     FailedPrecondition(String),
     AlreadyExists(String),
+    PermissionDenied(String),
     Internal(String),
+}
+
+/// Recorded on the parked instance's receipt when an approver decides.
+struct ApprovalRecord<'r> {
+    decider: &'r str,
+    decision: &'r str,
+    reason: &'r str,
 }
 
 pub(crate) struct ActionInstanceAdmission<'a> {
@@ -250,9 +275,11 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else if status == STATUS_ADMITTED
             && policy_decision == action_policy::ActionDecision::RequireApproval
         {
-            status = STATUS_DENIED.into();
-            deny_reason = "submit_action_instance requires approval (not yet supported)".into();
+            // Parked, not denied: an approver decides later, and a grant
+            // resumes this same instance against the state it finds then.
+            status = STATUS_PARKED.into();
             policy_decision_text = "require_approval".into();
+            budget_decision = "deferred".into();
         }
 
         let budget_subject = submit_budget_subject(&namespace, actor, &type_def.budget_scope);
@@ -271,6 +298,11 @@ impl<'a> ActionInstanceAdmission<'a> {
             &request.parameters_json,
         )
         .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let parked_object_digest = if status == STATUS_PARKED {
+            target_object_digest(self.db, &request.parameters_json)?
+        } else {
+            String::new()
+        };
         let instance = ActionInstance {
             instance_id: instance_id.clone(),
             namespace: namespace.clone(),
@@ -289,6 +321,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             created_at_ms: now,
             decided_at_ms: now,
             system_one_fill_json,
+            parked_object_digest,
+            decided_by: String::new(),
+            approval_decision: String::new(),
+            autonomous_envelope_id: envelope_id.clone(),
         };
         let planned_effects = if status == STATUS_ADMITTED {
             let force_notify_fail =
@@ -372,6 +408,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             applied_object.as_ref(),
             ontology_digest,
             budget_already_reserved,
+            None,
             now,
         ) {
             let receipt_exists = self
@@ -392,6 +429,340 @@ impl<'a> ActionInstanceAdmission<'a> {
             instance: stored,
             replay,
         })
+    }
+
+    /// Grants or denies a parked instance (#1084). Authorization comes first
+    /// and answers every refusal the same way. A repeated decision replays;
+    /// a conflicting one fails. A grant resumes admission against current
+    /// state; anything that changed since the park denies the instance
+    /// terminally instead of writing part of it.
+    pub(crate) fn decide(
+        &self,
+        request: ActionInstanceDecisionRequest,
+        decider: &str,
+        now: i64,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let decision = request.decision.trim();
+        if decision != DECISION_GRANT && decision != DECISION_DENY {
+            return Err(ActionInstanceAdmissionError::InvalidArgument(
+                "decision must be grant or deny".into(),
+            ));
+        }
+        require_value("instance_id", request.instance_id.trim())?;
+        let access_denied =
+            || ActionInstanceAdmissionError::PermissionDenied(DECISION_ACCESS_DENIED.into());
+        let instance = self
+            .db
+            .get_action_instance(request.instance_id.trim())
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(access_denied)?;
+        let type_def = self
+            .db
+            .get_governed_action_type(&instance.namespace, &instance.type_id, &instance.version)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(access_denied)?;
+        let is_submitter = decider == instance.principal
+            || request
+                .decider_principals
+                .iter()
+                .any(|principal| principal == &instance.principal);
+        let entitled = if type_def.approvers.is_empty() {
+            request.decider_is_namespace_admin
+        } else {
+            request
+                .decider_principals
+                .iter()
+                .chain(std::iter::once(&decider.to_string()))
+                .any(|principal| type_def.approvers.contains(principal))
+        };
+        if is_submitter || !entitled {
+            return Err(access_denied());
+        }
+
+        if instance.status != STATUS_PARKED {
+            if instance.approval_decision == decision {
+                return Ok(ActionInstanceAdmissionOutcome {
+                    instance,
+                    replay: true,
+                });
+            }
+            return Err(ActionInstanceAdmissionError::FailedPrecondition(
+                "action instance is not awaiting a decision".into(),
+            ));
+        }
+        let approval = ApprovalRecord {
+            decider,
+            decision,
+            reason: &request.reason,
+        };
+        if decision == DECISION_DENY {
+            return self.finish_denied(instance, "denied_by_approver", &approval, now);
+        }
+
+        if !type_def.enabled {
+            return self.finish_denied(instance, "type_unavailable_on_resume", &approval, now);
+        }
+        // The same autonomy fence as submit: a stopped or rolled-back
+        // envelope cannot be resumed by an approval.
+        if (instance.type_id.starts_with("autonomous.")
+            || !instance.autonomous_envelope_id.is_empty())
+            && crate::sekai::autonomous_envelope::require_live_envelope(
+                self.db,
+                &instance.principal,
+                &instance.namespace,
+                &instance.autonomous_envelope_id,
+            )
+            .is_err()
+        {
+            return self.finish_denied(instance, "envelope_not_live_on_resume", &approval, now);
+        }
+        if target_object_digest(self.db, &instance.parameters_json)?
+            != instance.parked_object_digest
+        {
+            return self.finish_denied(instance, "stale_on_resume", &approval, now);
+        }
+        if crate::chisei::evaluation_plan::validate_parameters(
+            &type_def.parameter_schema_json,
+            &instance.parameters_json,
+        )
+        .is_err()
+        {
+            return self.finish_denied(instance, "parameters_invalid_on_resume", &approval, now);
+        }
+        let criterion_object = load_criterion_object(
+            self.db,
+            &instance.namespace,
+            &type_def,
+            &instance.parameters_json,
+        )?;
+        let criterion_policy = match &criterion_object {
+            Some(object) => self
+                .db
+                .active_object_policy(&object.namespace, &object.kind)
+                .map_err(|_| {
+                    ActionInstanceAdmissionError::FailedPrecondition(
+                        "object action unavailable".into(),
+                    )
+                })?,
+            None => None,
+        };
+        match evaluate_submission_criteria(
+            &type_def.submission_criteria,
+            criterion_object.as_ref(),
+            criterion_policy.as_ref(),
+            &invoker_context(&instance.principal, None),
+        ) {
+            CriterionDecision::Pass => {}
+            CriterionDecision::Fail { criterion_id } => {
+                return self.finish_denied(instance, &criterion_id, &approval, now);
+            }
+            CriterionDecision::Unavailable => {
+                return self.finish_denied(instance, CRITERION_UNAVAILABLE, &approval, now);
+            }
+        }
+        let policy_project = if type_def.policy_scope.trim().is_empty() {
+            instance.namespace.clone()
+        } else {
+            type_def.policy_scope.clone()
+        };
+        let resolved_policy = self
+            .db
+            .resolve_action_policy(&instance.principal, &instance.namespace, &policy_project)
+            .map_err(ActionInstanceAdmissionError::Internal)?;
+        let policy_scope_label = resolved_policy
+            .as_ref()
+            .map(|policy| policy.scope.clone())
+            .unwrap_or_default();
+        // The approval satisfies only `require_approval`; a policy that now
+        // denies still denies.
+        if resolved_policy.as_ref().is_some_and(|policy| {
+            policy.decide(SUBMIT_POLICY_ACTION, RiskClass::Write)
+                == action_policy::ActionDecision::Deny
+        }) {
+            return self.finish_denied(instance, "policy_denied_on_resume", &approval, now);
+        }
+        let budget_subject = submit_budget_subject(
+            &instance.namespace,
+            &instance.principal,
+            &type_def.budget_scope,
+        );
+        // A decision never charges budget: the submit already accounted for
+        // this instance (Combined Split reserves one unit at submit).
+
+        let force_notify_fail =
+            serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("notify_delivery")
+                        .and_then(|delivery| delivery.as_str())
+                        .map(|delivery| delivery == "fail")
+                })
+                .unwrap_or(false);
+        let planned_effects = action_effect::plan_effects_for_admit(
+            &instance.instance_id,
+            &instance.namespace,
+            &instance.operation_id,
+            type_def.effect_kinds_to_materialize(),
+            &instance.parameters_json,
+            now,
+            force_notify_fail,
+        )
+        .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let applied_object = match plan_object_mutation(
+            self.db,
+            &type_def,
+            &instance.namespace,
+            &instance.parameters_json,
+        )
+        .map_err(map_object_mutation_error)?
+        {
+            Some(planned) => Some(
+                action_object_mutation::apply(self.db, planned, &instance.principal, now)
+                    .map_err(map_object_mutation_error)?,
+            ),
+            None => None,
+        };
+        let mut granted = instance.clone();
+        granted.status = STATUS_ADMITTED.into();
+        granted.deny_reason.clear();
+        granted.policy_decision = "require_approval:granted".into();
+        granted.budget_decision = if self.budget.is_some() {
+            "allow".into()
+        } else {
+            "not_configured".into()
+        };
+        granted.decided_at_ms = now;
+        granted.decided_by = decider.to_string();
+        granted.approval_decision = DECISION_GRANT.into();
+        if !self
+            .db
+            .decide_parked_action_instance(&granted)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            // Another decision won the race: undo this grant's object write
+            // and answer with whatever was recorded.
+            if let Some(applied) = &applied_object {
+                action_object_mutation::compensate(self.db, applied, &instance.principal);
+            }
+            return self.replay_decided(&instance.instance_id, decision);
+        }
+        let ontology_digest = self
+            .db
+            .get_operation_receipt(&instance.operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .and_then(|receipt| receipt.ontology_digest);
+        if let Err(error) = self.record_admission(
+            &granted,
+            &instance.principal,
+            &policy_scope_label,
+            &budget_subject,
+            &granted.evidence_submission_ids,
+            Some(&planned_effects),
+            applied_object.as_ref(),
+            ontology_digest,
+            false,
+            Some(&approval),
+            now,
+        ) {
+            // Mirror admission: once the receipt records the approval the
+            // grant stands; before that, undo the object write and park the
+            // instance again so the decision can be retried.
+            let recorded = self
+                .db
+                .get_operation_receipt(&instance.operation_id)
+                .ok()
+                .flatten()
+                .is_some_and(|receipt| {
+                    receipt
+                        .events
+                        .iter()
+                        .any(|event| event.kind == ReceiptEventKind::ApprovalDecided)
+                });
+            if !recorded {
+                if let Some(applied) = &applied_object {
+                    action_object_mutation::compensate(self.db, applied, &instance.principal);
+                }
+                let _ = self.db.repark_action_instance(&instance);
+            }
+            return Err(error);
+        }
+        Ok(ActionInstanceAdmissionOutcome {
+            instance: granted,
+            replay: false,
+        })
+    }
+
+    fn finish_denied(
+        &self,
+        instance: ActionInstance,
+        reason: &str,
+        approval: &ApprovalRecord<'_>,
+        now: i64,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let mut denied = instance;
+        denied.status = STATUS_DENIED.into();
+        denied.deny_reason = reason.into();
+        denied.decided_at_ms = now;
+        denied.decided_by = approval.decider.to_string();
+        denied.approval_decision = approval.decision.to_string();
+        if denied.budget_decision == "deferred" {
+            denied.budget_decision = "not_applicable".into();
+        }
+        if !self
+            .db
+            .decide_parked_action_instance(&denied)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+        {
+            return self.replay_decided(&denied.instance_id, approval.decision);
+        }
+        let ontology_digest = self
+            .db
+            .get_operation_receipt(&denied.operation_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .and_then(|receipt| receipt.ontology_digest);
+        let budget_subject = submit_budget_subject(&denied.namespace, &denied.principal, "");
+        self.record_admission(
+            &denied,
+            &denied.principal,
+            "",
+            &budget_subject,
+            &denied.evidence_submission_ids,
+            None,
+            None,
+            ontology_digest,
+            false,
+            Some(approval),
+            now,
+        )?;
+        Ok(ActionInstanceAdmissionOutcome {
+            instance: denied,
+            replay: false,
+        })
+    }
+
+    fn replay_decided(
+        &self,
+        instance_id: &str,
+        decision: &str,
+    ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
+        let current = self
+            .db
+            .get_action_instance(instance_id)
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .ok_or_else(|| {
+                ActionInstanceAdmissionError::Internal("decided instance vanished".into())
+            })?;
+        if current.approval_decision == decision {
+            Ok(ActionInstanceAdmissionOutcome {
+                instance: current,
+                replay: true,
+            })
+        } else {
+            Err(ActionInstanceAdmissionError::FailedPrecondition(
+                "action instance is not awaiting a decision".into(),
+            ))
+        }
     }
 
     fn completed_replay(
@@ -433,6 +804,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         applied_object: Option<&AppliedObjectMutation>,
         ontology_digest: Option<String>,
         budget_already_reserved: bool,
+        approval: Option<&ApprovalRecord<'_>>,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
         #[cfg(test)]
@@ -472,22 +844,17 @@ impl<'a> ActionInstanceAdmission<'a> {
                 references: Vec::new(),
                 attributes,
             };
-        let mut outcome_attributes = BTreeMap::from([(
-            "outcome".into(),
-            if stored.status == STATUS_ADMITTED {
-                "admitted".into()
-            } else {
-                "denied".into()
-            },
-        )]);
+        let mut outcome_attributes = BTreeMap::from([("outcome".into(), stored.status.clone())]);
         if !stored.deny_reason.is_empty() {
             outcome_attributes.insert("deny_reason".into(), stored.deny_reason.clone());
         }
         // Denied admits never plan effects. Gate on admitted status so a
         // terminal denial cannot stay incomplete if a planner later passes
         // leftover pending dispatch.
-        let await_runtime_dispatch =
-            stored.status == STATUS_ADMITTED && has_pending_runtime_dispatch(planned_effects);
+        // A parked instance awaits its approver: the receipt stays open until
+        // the decision completes it.
+        let await_runtime_dispatch = stored.status == STATUS_PARKED
+            || (stored.status == STATUS_ADMITTED && has_pending_runtime_dispatch(planned_effects));
         let mut events = vec![
             event(
                 "intent",
@@ -526,12 +893,31 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ]),
             ),
         ];
+        let mut outcome_parent = format!("{operation_id}:budget");
+        if let Some(approval) = approval {
+            let mut attributes = BTreeMap::from([
+                ("decision".into(), approval.decision.to_string()),
+                ("approver".into(), approval.decider.to_string()),
+            ]);
+            if !approval.reason.trim().is_empty() {
+                attributes.insert("reason".into(), approval.reason.trim().to_string());
+            }
+            let mut decided = event(
+                "approval",
+                Some(outcome_parent.clone()),
+                ReceiptEventKind::ApprovalDecided,
+                attributes,
+            );
+            decided.actor = approval.decider.to_string();
+            events.push(decided);
+            outcome_parent = format!("{operation_id}:approval");
+        }
         let completed_at_ms = if await_runtime_dispatch {
             None
         } else {
             events.push(event(
                 "outcome",
-                Some(format!("{operation_id}:budget")),
+                Some(outcome_parent),
                 ReceiptEventKind::OutcomeRecorded,
                 outcome_attributes,
             ));
@@ -550,7 +936,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             } else {
                 policy_scope.into()
             },
-            started_at_ms: now,
+            // The submit time: a decision completes the receipt but does not
+            // restart it. Equal to `now` on a fresh admit.
+            started_at_ms: stored.created_at_ms,
             completed_at_ms,
             events,
             uncovered_surfaces: Vec::new(),
@@ -582,14 +970,28 @@ impl<'a> ActionInstanceAdmission<'a> {
         if !stored.deny_reason.is_empty() {
             evidence.insert("deny_reason".into(), stored.deny_reason.clone());
         }
+        if let Some(approval) = approval {
+            evidence.insert("approver".into(), approval.decider.to_string());
+            evidence.insert("approval_decision".into(), approval.decision.to_string());
+        }
         self.db
             .record_decision(&audit::Decision {
                 id: uuid::Uuid::new_v4().to_string(),
                 timestamp: now,
-                actor: actor.to_string(),
-                action: "submit_action_instance".into(),
-                reason: if stored.status == STATUS_ADMITTED {
+                actor: approval
+                    .map_or(actor, |approval| approval.decider)
+                    .to_string(),
+                action: if approval.is_some() {
+                    "decide_action_instance".into()
+                } else {
+                    "submit_action_instance".into()
+                },
+                reason: if stored.status == STATUS_PARKED {
+                    "action_instance_parked".into()
+                } else if stored.status == STATUS_ADMITTED {
                     "action_instance_admitted".into()
+                } else if approval.is_some_and(|approval| approval.decision == DECISION_DENY) {
+                    "action_instance_approver_denied".into()
                 } else if stored.budget_decision == "budget_exceeded" {
                     "action_instance_budget_denied".into()
                 } else {
@@ -675,6 +1077,49 @@ fn object_for_admitted_instance(
     }
     db.get_object(&object_id)
         .map_err(ActionInstanceAdmissionError::Internal)
+}
+
+/// Digest of the object named by `object_id` in the parameters, taken when an
+/// instance parks. Any change to that object before a grant denies the
+/// instance instead of applying against state the submitter never saw.
+fn target_object_digest(
+    db: &RuntimeDb,
+    parameters_json: &str,
+) -> Result<String, ActionInstanceAdmissionError> {
+    use sha2::{Digest, Sha256};
+    let object_id = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("object_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if object_id.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let Some(object) = db
+        .get_object(&object_id)
+        .map_err(ActionInstanceAdmissionError::Internal)?
+    else {
+        return Ok("absent".into());
+    };
+    // Canonical form: properties sorted, so an unchanged object always
+    // digests the same regardless of map iteration order.
+    let properties: BTreeMap<&String, &String> = object.properties.iter().collect();
+    let body = serde_json::to_vec(&(
+        &object.id,
+        &object.kind,
+        &object.name,
+        &object.namespace,
+        &object.external_id,
+        properties,
+        object.created,
+        object.updated,
+    ))
+    .map_err(|error| ActionInstanceAdmissionError::Internal(error.to_string()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(body)))
 }
 
 fn load_criterion_object(
@@ -1058,9 +1503,37 @@ mod tests {
             Err(ActionInstanceAdmissionError::AlreadyExists(_))
         ));
 
+        // An approval-gated submit parks while the envelope is live...
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut gated = live.clone();
+        gated.idempotency_key = "auto-gated".into();
+        let parked = admission.admit(gated, "alice", 26).unwrap().instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        assert_eq!(parked.autonomous_envelope_id, "auto:sim");
+
         stop_envelope(&db, "alice", "acme", "auto:sim", 30).unwrap();
         let replayed = admission.admit(live, "alice", 40).unwrap();
         assert!(replayed.replay);
+
+        // ...and an approval after the envelope stopped cannot resume it.
+        let resumed = admission
+            .decide(
+                ActionInstanceDecisionRequest {
+                    instance_id: parked.instance_id.clone(),
+                    decision: DECISION_GRANT.into(),
+                    reason: String::new(),
+                    decider_principals: vec!["ops-admin".into()],
+                    decider_is_namespace_admin: true,
+                },
+                "ops-admin",
+                45,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(resumed.status, STATUS_DENIED);
+        assert_eq!(resumed.deny_reason, "envelope_not_live_on_resume");
 
         let mut stopped = request(r#"{"runtime":"shikigami"}"#);
         stopped.type_id = "autonomous.simulate".into();
@@ -1639,6 +2112,339 @@ mod tests {
         );
     }
 
+    fn approval_setup(mutation: &str, approvers: &[&str]) -> RuntimeDb {
+        let db = setup();
+        ensure_record_kind(&db);
+        let mut type_def = record_type(mutation);
+        type_def.approvers = approvers
+            .iter()
+            .map(|approver| approver.to_string())
+            .collect();
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        db
+    }
+
+    fn decision(
+        instance_id: &str,
+        decision: &str,
+        principal: &str,
+    ) -> ActionInstanceDecisionRequest {
+        ActionInstanceDecisionRequest {
+            instance_id: instance_id.into(),
+            decision: decision.into(),
+            reason: "reviewed".into(),
+            decider_principals: vec![principal.into()],
+            decider_is_namespace_admin: false,
+        }
+    }
+
+    #[test]
+    fn require_approval_parks_and_an_approver_grant_resumes_the_same_instance() {
+        let db = approval_setup("create", &["bob"]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-9","title":"t"}"#,
+        );
+        let parked = admission
+            .admit(request.clone(), "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        assert!(parked.deny_reason.is_empty());
+        assert!(db.get_object("rec-9").unwrap().is_none());
+        let open = db
+            .get_operation_receipt("operation-record")
+            .unwrap()
+            .unwrap();
+        assert_eq!(open.completed_at_ms, None, "a parked receipt stays open");
+
+        // Replaying the submit returns the parked instance, never a second one.
+        let replayed = admission.admit(request.clone(), "alice", 11).unwrap();
+        assert!(replayed.replay);
+        assert_eq!(replayed.instance.instance_id, parked.instance_id);
+
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap();
+        assert!(!granted.replay);
+        assert_eq!(granted.instance.instance_id, parked.instance_id);
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+        assert_eq!(granted.instance.decided_by, "bob");
+        assert!(db.get_object("rec-9").unwrap().is_some());
+        let receipt = db
+            .get_operation_receipt("operation-record")
+            .unwrap()
+            .unwrap();
+        assert!(receipt.completed_at_ms.is_some());
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::ApprovalDecided && event.actor == "bob"
+        }));
+        assert!(
+            receipt.completeness().complete,
+            "{:?}",
+            receipt.completeness()
+        );
+
+        // The same decision replays; a conflicting one fails.
+        let again = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                30,
+            )
+            .unwrap();
+        assert!(again.replay);
+        assert!(matches!(
+            admission.decide(
+                decision(&parked.instance_id, DECISION_DENY, "bob"),
+                "bob",
+                31
+            ),
+            Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_submitter_and_foreign_principals_cannot_decide() {
+        let db = approval_setup("create", &["bob"]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-10"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        for (principal, instance_id) in [
+            ("alice", parked.instance_id.as_str()),
+            ("carol", parked.instance_id.as_str()),
+            ("bob", "gai-unknown"),
+        ] {
+            let error = admission
+                .decide(
+                    decision(instance_id, DECISION_GRANT, principal),
+                    principal,
+                    20,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ActionInstanceAdmissionError::PermissionDenied(DECISION_ACCESS_DENIED.into())
+            );
+        }
+        // Even a namespace administrator cannot approve their own submit.
+        let mut self_approval = decision(&parked.instance_id, DECISION_GRANT, "bob");
+        self_approval.decider_principals = vec!["alice".into()];
+        self_approval.decider_is_namespace_admin = true;
+        assert!(matches!(
+            admission.decide(self_approval, "alice", 21),
+            Err(ActionInstanceAdmissionError::PermissionDenied(_))
+        ));
+        assert_eq!(
+            db.get_action_instance(&parked.instance_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_PARKED
+        );
+        assert!(db.get_object("rec-10").unwrap().is_none());
+    }
+
+    #[test]
+    fn without_declared_approvers_only_a_namespace_admin_decides() {
+        let db = approval_setup("create", &[]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-11"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert!(matches!(
+            admission.decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20
+            ),
+            Err(ActionInstanceAdmissionError::PermissionDenied(_))
+        ));
+        let mut admin = decision(&parked.instance_id, DECISION_GRANT, "bob");
+        admin.decider_is_namespace_admin = true;
+        assert_eq!(
+            admission.decide(admin, "bob", 21).unwrap().instance.status,
+            STATUS_ADMITTED
+        );
+    }
+
+    #[test]
+    fn deny_is_terminal_and_a_replayed_submit_does_not_mint_a_second_instance() {
+        let db = approval_setup("create", &["bob"]);
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let request = record_request("customer.record.create", r#"{"object_id":"rec-12"}"#);
+        let parked = admission
+            .admit(request.clone(), "alice", 10)
+            .unwrap()
+            .instance;
+        let denied = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_DENY, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(denied.status, STATUS_DENIED);
+        assert_eq!(denied.deny_reason, "denied_by_approver");
+        assert!(db.get_object("rec-12").unwrap().is_none());
+        let replayed = admission.admit(request, "alice", 30).unwrap();
+        assert!(replayed.replay);
+        assert_eq!(replayed.instance.status, STATUS_DENIED);
+        assert!(matches!(
+            admission.decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                31
+            ),
+            Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+        ));
+        assert_eq!(
+            db.list_action_instances("acme", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unchanged_object_with_many_properties_grants_without_a_stale_denial() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        db.create_object(&crate::domain::Object {
+            id: "rec-14".into(),
+            kind: "customer_record".into(),
+            name: "rec-14".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: ["title", "owner", "tier", "region", "segment", "note"]
+                .into_iter()
+                .map(|key| (key.to_string(), format!("{key}-value")))
+                .collect(),
+            created: 5,
+            updated: 5,
+        })
+        .unwrap();
+        let mut update_type = record_type("update");
+        update_type.approvers = vec!["bob".into()];
+        db.put_governed_action_type(update_type, "operator", 6)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut update = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-14","title":"t2"}"#,
+        );
+        update.idempotency_key = "record-14-update".into();
+        update.request_id = "operation-record-14-update".into();
+        let parked = admission.admit(update, "alice", 10).unwrap().instance;
+        for _ in 0..8 {
+            assert_eq!(
+                target_object_digest(&db, &parked.parameters_json).unwrap(),
+                parked.parked_object_digest
+            );
+        }
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(granted.status, STATUS_ADMITTED, "{}", granted.deny_reason);
+    }
+
+    #[test]
+    fn a_grant_after_the_object_changed_fails_closed_without_writing() {
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        admission
+            .admit(
+                record_request(
+                    "customer.record.create",
+                    r#"{"object_id":"rec-13","title":"v1"}"#,
+                ),
+                "alice",
+                5,
+            )
+            .unwrap();
+        let mut update_type = record_type("update");
+        update_type.approvers = vec!["bob".into()];
+        db.put_governed_action_type(update_type, "operator", 6)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all("acme");
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let mut update = record_request(
+            "customer.record.update",
+            r#"{"object_id":"rec-13","title":"v2"}"#,
+        );
+        update.idempotency_key = "record-13-update".into();
+        update.request_id = "operation-record-13-update".into();
+        let parked = admission.admit(update, "alice", 10).unwrap().instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+
+        let mut changed = db.get_object("rec-13").unwrap().unwrap();
+        changed
+            .properties
+            .insert("title".into(), "changed elsewhere".into());
+        db.update_object(&changed).unwrap();
+
+        let outcome = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                20,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(outcome.status, STATUS_DENIED);
+        assert_eq!(outcome.deny_reason, "stale_on_resume");
+        assert_eq!(
+            db.get_object("rec-13")
+                .unwrap()
+                .unwrap()
+                .properties
+                .get("title")
+                .map(String::as_str),
+            Some("changed elsewhere")
+        );
+    }
+
     #[test]
     fn policy_deny_does_not_write_the_record() {
         let db = setup();
@@ -1700,6 +2506,10 @@ mod tests {
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
         let reserved = crate::sekai::action_instance::ActionInstance {
+            autonomous_envelope_id: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
             instance_id: "gai-incomplete".into(),
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),

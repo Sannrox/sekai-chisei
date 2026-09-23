@@ -880,6 +880,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "DecideActionInstance",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "DescribeObjectAction",
       "storage_path": "sekai.audit",
       "real_backend": "yes",

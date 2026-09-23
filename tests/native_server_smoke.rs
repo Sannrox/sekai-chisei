@@ -33,9 +33,11 @@ use sekai_chisei::grpc::pb::chisei::{
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    AcquireLeaseRequest, CreateObjectRequest, EnsureTeamNamespaceRequest, GetLeaseRequest,
-    GetLinkedObjectsRequest, GetObjectRequest, GraphQuery, ListFilter, ListObjectsRequest, Object,
-    ReleaseLeaseRequest, TraverseRequest,
+    AcquireLeaseRequest, CreateObjectRequest, DecideActionInstanceRequest,
+    EnsureTeamNamespaceRequest, GetActionInstanceRequest, GetLeaseRequest, GetLinkedObjectsRequest,
+    GetObjectRequest, GovernedActionType, GraphQuery, ListFilter, ListObjectsRequest, Object,
+    PutGovernedActionTypeRequest, ReleaseLeaseRequest, SubmitActionInstanceRequest,
+    TraverseRequest,
 };
 use sekai_chisei::sekai::semantic::CAPABILITY_RESOLVE_REF;
 use serde_json::{Value, json};
@@ -913,6 +915,136 @@ async fn spawned_binary_sets_action_policy() {
         stdout(&get_policy).contains("default_decision: allow"),
         "action policy should round-trip\n{}",
         stdout(&get_policy)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
+    // #1084: submit parks under require_approval, the submitter and a
+    // foreign principal cannot decide, the named approver grants, and the
+    // receipt closes the loop.
+    let (_fake, mut server) = mocked_server().await;
+    let submitter = server.create_principal_token("alice-agent");
+    let approver = server.create_principal_token("bob-approver");
+    let foreign = server.create_principal_token("carol-agent");
+    for principal in ["alice-agent", "bob-approver", "carol-agent"] {
+        server.grant_namespace("demo", principal, "editor").await;
+    }
+    let set_policy = server.sekaictl(&[
+        "admin",
+        "governance",
+        "action",
+        "policy",
+        "set",
+        "--scope",
+        "demo",
+        "--default",
+        "require_approval",
+    ]);
+    assert_success(&set_policy, "action policy set", &server.logs());
+    let mut sekai = server.sekai().await;
+    sekai
+        .put_governed_action_type(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "incident.acknowledge".into(),
+                version: "1".into(),
+                description: "Acknowledge an incident".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"note":{"type":"string"}},"required":["note"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                approvers: vec!["bob-approver".into()],
+                enabled: true,
+                ..Default::default()
+            }),
+            request_id: String::new(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put type: {error}\n{}", server.logs()));
+
+    let parked = sekai
+        .submit_action_instance(bearer(
+            &submitter,
+            SubmitActionInstanceRequest {
+                namespace: "demo".into(),
+                type_id: "incident.acknowledge".into(),
+                version: "1".into(),
+                parameters_json: r#"{"note":"on it"}"#.into(),
+                idempotency_key: "ack-1".into(),
+                request_id: "operation-ack-1".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("submit: {error}\n{}", server.logs()))
+        .into_inner()
+        .instance
+        .expect("instance");
+    assert_eq!(parked.status, "parked");
+
+    for token in [&submitter, &foreign] {
+        let refused = sekai
+            .decide_action_instance(bearer(
+                token,
+                DecideActionInstanceRequest {
+                    instance_id: parked.instance_id.clone(),
+                    decision: "grant".into(),
+                    reason: String::new(),
+                },
+            ))
+            .await
+            .expect_err("only the named approver decides");
+        assert_eq!(refused.code(), Code::PermissionDenied);
+        assert_eq!(refused.message(), "access denied");
+    }
+
+    let granted = sekai
+        .decide_action_instance(bearer(
+            &approver,
+            DecideActionInstanceRequest {
+                instance_id: parked.instance_id.clone(),
+                decision: "grant".into(),
+                reason: "verified".into(),
+            },
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("grant: {error}\n{}", server.logs()))
+        .into_inner();
+    let admitted = granted.instance.expect("instance");
+    assert!(!granted.replay);
+    assert_eq!(admitted.status, "admitted");
+    assert_eq!(admitted.decided_by, "bob-approver");
+    assert_eq!(admitted.instance_id, parked.instance_id);
+
+    let stored = sekai
+        .get_action_instance(bearer(
+            &approver,
+            GetActionInstanceRequest {
+                instance_id: parked.instance_id.clone(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("get instance: {error}\n{}", server.logs()))
+        .into_inner()
+        .instance
+        .expect("instance");
+    assert_eq!(stored.status, "admitted");
+    assert_eq!(stored.approval_decision, "grant");
+
+    let receipt = server
+        .chisei()
+        .await
+        .get_operation_receipt(GetOperationReceiptRequest {
+            operation_id: parked.operation_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("receipt: {error}\n{}", server.logs()))
+        .into_inner();
+    let receipt_json = format!("{receipt:?}");
+    assert!(
+        receipt_json.contains("approval_decided") || receipt_json.contains("ApprovalDecided"),
+        "{receipt_json}"
     );
 }
 

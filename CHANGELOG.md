@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A `require_approval` Action policy now parks the instance (`status=parked`)
+  instead of denying it. The experimental `DecideActionInstance` RPC lets a
+  principal named in the type's new `approvers` field (or a namespace admin
+  when none are declared) grant or deny it. The submitter can never decide
+  their own instance. A grant resumes the same instance against current state
+  and fails closed with `stale_on_resume` if the target object changed. The
+  decision completes the instance's receipt with an `approval_decided` event.
+  SQLite only; community PostgreSQL answers `UNAVAILABLE` (ADR 0089, #1084).
 - A relation's maximum cardinality is now enforced when a link is admitted, on
   SQLite and PostgreSQL. Distinct targets per source count toward the bound,
   duplicates count once, and concurrent admissions cannot exceed it. A link
