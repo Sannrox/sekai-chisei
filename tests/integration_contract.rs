@@ -205,6 +205,9 @@ fn supported_rpc_rows_match_maturity_and_cli_sdk_greps() {
                     "experimental contract row {rpc} must be classified experimental"
                 );
             }
+            "unavailable" => {
+                panic!("unavailable contract row names {rpc}, which the maturity table classifies")
+            }
             _ => {}
         }
     }
@@ -281,4 +284,27 @@ fn advertised_loop_sources_exist() {
         assert!(Path::new(rel).exists(), "missing {rel}");
         assert!(!fs::read_to_string(rel).unwrap().is_empty(), "{rel} empty");
     }
+}
+
+#[test]
+fn action_approval_row_tracks_decide_maturity() {
+    // #1151: the park-and-decide surface is on the wire, so the contract
+    // must name it at its maturity rather than report it unavailable.
+    let row = rows()
+        .into_iter()
+        .find(|row| row[0].starts_with("Action approval"))
+        .expect("action approval coverage row");
+    assert_eq!(contract_rpc_name(&row[3]), Some("DecideActionInstance"));
+    let entry = RpcMaturityTable::load()
+        .expect("maturity table")
+        .entries
+        .into_iter()
+        .find(|entry| entry.rpc == "DecideActionInstance")
+        .expect("DecideActionInstance maturity");
+    let expected = match entry.classification {
+        RpcClassification::Stable => "supported",
+        RpcClassification::Experimental => "experimental",
+        RpcClassification::Remove => "remove",
+    };
+    assert_eq!(row[1], expected);
 }

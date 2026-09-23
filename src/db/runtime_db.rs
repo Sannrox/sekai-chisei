@@ -3592,6 +3592,26 @@ impl RuntimeDb {
         }
     }
 
+    pub fn grant_parked_action_instance(
+        &self,
+        granted: &crate::sekai::action_instance::ActionInstance,
+        target_object_id: &str,
+        parked_object_digest: &str,
+        write: Option<&crate::sekai::action_instance::ParkedGrantWrite>,
+        actor: &str,
+    ) -> Result<crate::sekai::action_instance::ParkedGrantOutcome, String> {
+        match self {
+            Self::Sqlite(db) => db.grant_parked_action_instance(
+                granted,
+                target_object_id,
+                parked_object_digest,
+                write,
+                actor,
+            ),
+            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+        }
+    }
+
     /// Returns a granted instance to `parked` when its grant could not be
     /// recorded, so the decision can be retried.
     pub fn repark_action_instance(

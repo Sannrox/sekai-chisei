@@ -63,7 +63,7 @@ Coverage:
 | Compatibility matrix (#873) | supported | Interface | `compatibility.json` via `sekaictl admin compatibility` | [sdk-packages.md](sdk-packages.md) | `src/compatibility_matrix.rs` |
 | Public RPC maturity (#871) | supported | Interface | `SekaiService.DiscoverCapabilities` | [rpc-maturity.md](rpc-maturity.md) | `src/rpc_maturity.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
-| Action approval RPC | unavailable | Sekai | — | [governed-action-instances.md](governed-action-instances.md) | `src/sekai/action_instance_admission.rs` |
+| Action approval (park and decide) | experimental | Sekai | `SekaiService.DecideActionInstance` | [governed-action-instances.md](governed-action-instances.md) | `tests/native_server_smoke.rs` |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
 | HTTP/JSON ontology projection (#875) | supported | Interface | `POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
 | HTTP MCP projection (#875) | supported | Interface | `POST /mcp` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
