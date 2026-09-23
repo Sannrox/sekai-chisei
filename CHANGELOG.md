@@ -7,6 +7,10 @@
   binding's subscription, together with a marker that no subscription existed.
   The next run rewinds the new subscription to its pin and delivers the page
   again (#1141).
+- The RPC maturity ledger marks `DecideActionInstance`, `PutActionBinding`, and
+  `RunActionBinding` as `sqlite only`: community PostgreSQL answers
+  `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
+  runtimes may be `stable` (#1150).
 - `DiscoverCapabilities` now reports `supports_entailment=0` for
   `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
   PostgreSQL, where those RPCs serve asserted-only reasoning and fail
