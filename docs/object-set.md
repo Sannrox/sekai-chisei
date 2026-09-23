@@ -18,6 +18,16 @@ and cost limits (`max_rows_scanned`, `max_depth`, `max_time_ms`). Hop-projection
 is the shipping default. See [object-type-index.md](object-type-index.md) for
 engine selection, reindex, and aggregation.
 
+## Evaluate-once
+
+The server keeps no ObjectSet. Each `EvaluateObjectSet` call resolves
+members from live authorized rows. There is no stored member list, page, or
+set identity. The descriptor, including its pinned `definition_digest`, is
+the durable form of a set: a client that wants to reuse a set stores the
+descriptor and evaluates it again. After a definition publish the pin goes
+stale; regenerate the descriptor against the new revision. See
+[ADR 0086](decisions/0086-object-set-is-its-descriptor.md).
+
 ## Non-authority
 
 The descriptor, a returned page, a continuation token, and any client-cached
@@ -42,5 +52,6 @@ ObjectSet adds no store. SQLite and PostgreSQL share the existing graph
 list and link surfaces. Isolated PostgreSQL proof is the same graph
 conformance already required for those surfaces.
 
-See [ADR 0066](decisions/0066-object-set-evaluate.md) and Discussion
-[862](https://github.com/Sannrox/sekai-chisei/discussions/862).
+See [ADR 0066](decisions/0066-object-set-evaluate.md), Discussion
+[862](https://github.com/Sannrox/sekai-chisei/discussions/862), and
+[ADR 0086](decisions/0086-object-set-is-its-descriptor.md).
