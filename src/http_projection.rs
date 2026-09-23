@@ -267,6 +267,24 @@ where
             })
             .await
         }
+        ("sekai.SekaiService", "RetrieveContext") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::retrieve_context(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ExpandRelations") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::expand_relations(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ExplainDerivation") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::explain_derivation(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "EvaluateObjectSet") => {
             invoke_sekai(state, headers, body, |svc, req| async move {
                 SekaiService::evaluate_object_set(&*svc, req).await
@@ -1027,6 +1045,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(payload["code"], "unauthenticated");
         let _ = token;
+    }
+
+    #[tokio::test]
+    async fn promoted_semantic_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in ["RetrieveContext", "ExpandRelations", "ExplainDerivation"] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
     }
 
     #[tokio::test]

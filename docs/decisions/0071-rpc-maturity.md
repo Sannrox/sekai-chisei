@@ -22,7 +22,7 @@ backend and consumer evidence. The table in [rpc-maturity.md](../rpc-maturity.md
 is a projection, not a second authority.
 
 - `stable` requires a real (non-fixture) backend. The default public loop and
-  its required siblings stay at most 63 RPCs (see Amendments).
+  its required siblings stay at most 66 RPCs (see Amendments).
 - `experimental` RPCs keep their wire contract, authorization, and receipts.
   Invocation requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
   Cargo feature. Both are off by default.
@@ -53,7 +53,7 @@ Security review and SDK generation shrink to the stable set.
 ## Validation
 
 A deterministic test compares the checked-in table and `docs/rpc-maturity.md`
-with both proto services, asserts at most 63 stable RPCs, and proves the
+with both proto services, asserts at most 66 stable RPCs, and proves the
 default gate cannot reach an experimental RPC.
 
 ## Amendments
@@ -70,3 +70,13 @@ default gate cannot reach an experimental RPC.
   no default verb cancels, and `validate` reads exact invariant versions
   through `GetGovernedFactVersion` only without `--offline`, while `apply`
   remains the authoritative publication check.
+- 2026-09-23, Issue [#1087](https://github.com/Sannrox/sekai-chisei/issues/1087):
+  the stable ceiling moves from 63 to 66. `RetrieveContext`,
+  `ExpandRelations`, and `ExplainDerivation` become `stable` because
+  `sekaictl ontology context`, `expand`, and `explain` are real consumers
+  on the product-loop fixtures, and the generated TypeScript and Python
+  HTTP facades carry the three methods. Availability is backend-scoped:
+  query-time entailment is SQLite-only, community PostgreSQL keeps failing
+  closed, and the integration contract says so rather than implying
+  dual-backend support. Authorization, namespace, and object security are
+  rechecked on every call, and computed properties stay query-time overlays.

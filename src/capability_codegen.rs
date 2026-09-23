@@ -455,7 +455,8 @@ mod tests {
         )
         .unwrap();
         assert!(scope_allows(&generated.scope, "sekai.action.assign_color"));
-        assert!(!scope_allows(
+        // Stable since #1087; experimental capabilities stay out.
+        assert!(scope_allows(
             &generated.scope,
             "sekai.semantic.expand_relations"
         ));
@@ -464,7 +465,6 @@ mod tests {
             "chisei.kioku.candidates.list"
         ));
         assert!(generated.typescript.contains("sekaiActionAssignColor"));
-        assert!(!generated.typescript.contains("expand_relations"));
         assert!(!generated.typescript.contains("kioku"));
     }
 }

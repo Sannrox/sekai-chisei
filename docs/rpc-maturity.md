@@ -25,7 +25,7 @@ Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures
 
 | Class | Meaning | Default build |
 | --- | --- | --- |
-| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 63 RPCs. | Invokable. |
+| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 66 RPCs. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
 | `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
 
@@ -114,9 +114,9 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.GetLinks` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinkedObjects` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.Traverse` | `sekai.graph` | yes | none | `stable` |
-| `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | none | `experimental` |
-| `SekaiService.ExpandRelations` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | none | `experimental` |
-| `SekaiService.ExplainDerivation` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
+| `SekaiService.ExpandRelations` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
+| `SekaiService.ExplainDerivation` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
 | `SekaiService.DiscoverCapabilities` | `sekai.graph, sekai.authorization` | yes | host | `stable` |
 | `SekaiService.GetGovernedFactVersion` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ResolveInvariantSet` | `sekai.graph, sekai.authorization` | yes | none | `experimental` |

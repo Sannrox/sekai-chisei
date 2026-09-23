@@ -9180,6 +9180,68 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
     assert!(denied_root.candidates.is_empty());
     assert_eq!(denied_root.denied_objects, 0);
     assert_eq!(denied_root.unresolved_roots, 1);
+
+    // #1087: the promoted expand and explain paths inherit the same
+    // visibility. A hidden object never appears, and a path to it is not
+    // explained, so its existence is not disclosed.
+    let expanded = svc
+        .expand_relations(with_named_principal(
+            ExpandRelationsRequest {
+                namespace: "widgets".into(),
+                root: Some(ContextRoot {
+                    object_id: "context-root".into(),
+                    ..Default::default()
+                }),
+                relations: vec!["contains".into()],
+                direction: "outgoing".into(),
+                max_depth: 3,
+                ..Default::default()
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let expanded_ids = expanded
+        .candidates
+        .iter()
+        .map(|candidate| candidate.object.as_ref().unwrap().id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(expanded_ids, vec!["context-root", "context-allowed"]);
+    assert!(
+        expanded
+            .links
+            .iter()
+            .all(|link| link.id == "context-visible-link")
+    );
+    for (target, visible) in [("context-allowed", true), ("context-denied", false)] {
+        let explained = svc
+            .explain_derivation(with_named_principal(
+                ExplainDerivationRequest {
+                    namespace: "widgets".into(),
+                    from: Some(ContextRoot {
+                        object_id: "context-root".into(),
+                        ..Default::default()
+                    }),
+                    to: Some(ContextRoot {
+                        object_id: target.into(),
+                        ..Default::default()
+                    }),
+                    relations: vec!["contains".into()],
+                    direction: "outgoing".into(),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(explained.found, visible, "{target}");
+        if !visible {
+            assert!(explained.explanation.is_none());
+            assert!(explained.evidence_refs.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

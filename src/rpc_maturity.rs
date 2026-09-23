@@ -24,7 +24,7 @@ pub const MATURITY_DOCS: &str = include_str!("../docs/rpc-maturity.md");
 pub const EXPERIMENTAL_ENV: &str = "SEKAI_EXPERIMENTAL_RPCS";
 pub const EXPERIMENTAL_FEATURE: &str = "experimental-rpcs";
 pub const EXPERIMENTAL_CAPABILITY: &str = "sekai.rpc.experimental";
-pub const STABLE_LIMIT: usize = 63;
+pub const STABLE_LIMIT: usize = 66;
 
 const EXPERIMENTAL_MESSAGE: &str =
     "rpc is experimental; enable SEKAI_EXPERIMENTAL_RPCS=1 or the experimental-rpcs build feature";
@@ -207,6 +207,9 @@ pub const ADVERTISED_PRODUCT_LOOP_RPCS: &[&str] = &[
     "PlanExecution",
     "ExecutePlanStream",
     "GetOperationReceipt",
+    "RetrieveContext",
+    "ExpandRelations",
+    "ExplainDerivation",
 ];
 
 /// Additional typed SDK helpers that are not part of `sekaictl ontology` but
@@ -441,7 +444,7 @@ mod tests {
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
         assert_eq!(table.entries.len(), 174);
-        assert_eq!(table.stable_rpcs().len(), 63);
+        assert_eq!(table.stable_rpcs().len(), 66);
         assert!(
             table
                 .entries
@@ -538,7 +541,7 @@ mod tests {
     fn stable_capabilities_need_no_denylist() {
         assert!(capability_is_stable("sekai.objects.query.Widget"));
         assert!(capability_is_stable("sekai.action.assign_color"));
-        assert!(!capability_is_stable("sekai.semantic.expand_relations"));
+        assert!(capability_is_stable("sekai.semantic.expand_relations"));
         assert!(!capability_is_stable("chisei.kioku.candidates.list"));
         assert!(!capability_is_stable(EXPERIMENTAL_CAPABILITY));
     }
