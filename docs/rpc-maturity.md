@@ -12,10 +12,8 @@ that `sekaictl ontology` and the typed SDK helpers actually call
 `GetOperationReceipt`). Other `stable` RPCs stay invokable on the default
 build; they are not “supported” integration sentences unless those callers
 exist. Experimental and `remove` RPCs stay behind
-`SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs`. Community PostgreSQL fails
-closed for audited ontology mutations (`CreateOntologyClass`,
-`CreateOntologyRelation`); those stay in the SQLite loop and join the
-product-loop Postgres Issue rather than the dual-backend set.
+`SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs`. The ontology apply and
+seed steps run on both community backends.
 
 Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures/rpc_maturity/v1.json)
 (`sekai.rpc-maturity/v1`). A test compares this page and that fixture with

@@ -2,7 +2,6 @@
 
 use sekai_chisei::rpc_maturity::{
     RpcClassification, RpcMaturityTable, advertised_product_loop_rpcs, advertised_sdk_typed_rpcs,
-    postgres_fail_closed_product_loop_rpcs,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -242,20 +241,19 @@ fn supported_rpc_rows_match_maturity_and_cli_sdk_greps() {
 }
 
 #[test]
-fn postgres_fail_closed_loop_rpcs_leave_the_dual_backend_set() {
-    for rpc in postgres_fail_closed_product_loop_rpcs() {
-        let needle = match *rpc {
-            "CreateOntologyClass" => {
-                "upsert_ontology_class_with_audit is unavailable on the PostgreSQL community runtime"
-            }
-            "CreateOntologyRelation" => {
-                "upsert_ontology_relation_with_audit is unavailable on the PostgreSQL community runtime"
-            }
-            other => panic!("unmapped fail-closed loop rpc {other}"),
-        };
+fn product_loop_mutations_do_not_fail_closed_on_postgres() {
+    // #1086: audited ontology writes, namespace roles, and credential
+    // creation back the product loop on both community backends.
+    for method in [
+        "upsert_ontology_class_with_audit",
+        "upsert_ontology_relation_with_audit",
+        "list_namespace_roles_for_principal",
+        "list_unbound_credentials",
+    ] {
+        let needle = format!("{method} is unavailable on the PostgreSQL community runtime");
         assert!(
-            RUNTIME_DB.contains(needle),
-            "RuntimeDb must fail closed for {rpc}: missing {needle}"
+            !RUNTIME_DB.contains(&needle),
+            "RuntimeDb still fails closed for {method}"
         );
     }
     let coverage_start = DOC
@@ -263,8 +261,8 @@ fn postgres_fail_closed_loop_rpcs_leave_the_dual_backend_set() {
         .expect("coverage section");
     let coverage = &DOC[coverage_start..];
     assert!(
-        coverage.contains("Ontology apply (class / relation)") && coverage.contains("fail-closed"),
-        "integration-contract must not advertise PostgreSQL yes for ontology apply"
+        !coverage.contains("fail-closed"),
+        "integration-contract coverage must not list product-loop rows as fail-closed"
     );
     assert!(
         !coverage.contains("| Object read / list |"),

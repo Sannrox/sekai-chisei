@@ -63,6 +63,38 @@ impl PostgresDb {
         )
     }
 
+    /// Namespace roles held by one principal, keyed by namespace name.
+    pub fn list_namespace_roles_for_principal(
+        &self,
+        principal: &str,
+    ) -> Result<Vec<(String, Role)>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT o.external_id, g.role
+                 FROM sekai_grants g
+                 JOIN sekai_objects o ON o.id = g.object_id
+                 WHERE g.principal = $1 AND o.kind = 'namespace'
+                 ORDER BY o.external_id",
+                &[&principal],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let external_id: String = row.get(0);
+                let role: String = row.get(1);
+                (
+                    external_id
+                        .strip_prefix("namespace:")
+                        .unwrap_or(&external_id)
+                        .to_string(),
+                    Role::parse(&role).unwrap_or(Role::Viewer),
+                )
+            })
+            .collect())
+    }
+
     fn query_grants(
         &self,
         sql: &str,

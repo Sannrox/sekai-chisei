@@ -101,7 +101,7 @@ the dual-backend inventory. Selecting `SEKAI_DB_BACKEND=postgres` starts Combine
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL`. A single `DATABASE_URL` starts
 Combined only with `SEKAI_SHARED_STORE=1`, and only when migrations and
 capabilities validate. Some public paths remain SQLite-only and fail
-closed on community Postgres (audited ontology mutations, query-time ontology
+closed on community Postgres (query-time ontology
 entailment, dataset row append/query through `RuntimeDb`, online permit
 redeem/reconcile, Gunshi allocation state, federation peer tables, and
 `GetEffectivePolicySummary` budget-limit projection). See

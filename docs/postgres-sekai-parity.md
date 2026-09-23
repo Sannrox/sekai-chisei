@@ -56,10 +56,21 @@ lock; the CAS predicates remain the commit rule. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test. See
 [ADR 0064](decisions/0064-event-stream-postgres-parity.md).
 
+The product loop (ontology apply, seed, object reads, object-set evaluate,
+governed Action submit and read, operation receipt, and object-security
+activation with a denied read) runs on community PostgreSQL with SQLite
+semantics. Audited ontology writes commit the definition and its chained
+audit decision in one transaction; the relation write keeps the maximum
+cardinality lock and tightening check. Synchronous PostgreSQL calls leave the
+async worker through `RuntimeDb` before touching the pool, so gRPC handlers
+never start a nested runtime. `tests/product_loop_backend_conformance.rs`
+drives the loop through the shipped binary on both backends; the PostgreSQL
+case is ignored and needs `SEKAI_TEST_POSTGRES_URL` for a server the test may
+create a scratch database on.
+
 **Known SQLite-only public paths** (community Postgres fails closed; do not
 treat inventory “complete” as dual-backend for these RPCs):
 
-- audited ontology mutations (`upsert_*_with_audit`);
 - query-time ontology entailment (`RetrieveContext`, `ExpandRelations`, and
   lookup-first expansion in `entailment` mode; those RPCs are classified
   `experimental` and require `SEKAI_EXPERIMENTAL_RPCS=1` or the

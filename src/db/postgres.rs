@@ -320,6 +320,22 @@ const MIGRATIONS: &[Migration] = &[
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
+/// Runs `work` where the synchronous PostgreSQL client may block.
+///
+/// That client drives its own runtime and panics when used inside a Tokio
+/// runtime context, which is where gRPC handlers run. On the server's
+/// multi-threaded runtime, `block_in_place` leaves the runtime context for
+/// the duration of `work`. Elsewhere (blocking tasks, tests, the CLI) `work`
+/// runs directly.
+pub(crate) fn off_runtime<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 /// Shared PostgreSQL connection pool used by the HA storage backend.
 ///
 /// Construction verifies connectivity and runs forward-only migrations while
@@ -707,6 +723,75 @@ fn secure_config(database_url: &str) -> Result<PostgresConfig, String> {
     let mut config = PostgresConfig::from_str(database_url).map_err(|error| error.to_string())?;
     config.ssl_mode(SslMode::Require);
     Ok(config)
+}
+
+/// A throwaway database on the conformance server named by
+/// `SEKAI_TEST_POSTGRES_URL`, dropped when the guard goes out of scope.
+#[cfg(test)]
+pub(crate) struct ScratchDatabase {
+    admin_url: String,
+    ca_certificate: Option<Vec<u8>>,
+    name: String,
+    url: String,
+}
+
+#[cfg(test)]
+impl ScratchDatabase {
+    pub(crate) fn create() -> Self {
+        let admin_url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify a PostgreSQL test server");
+        let ca_certificate = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT")
+            .ok()
+            .map(|path| std::fs::read(path).expect("read PostgreSQL test CA certificate"));
+        let name = format!("sekai_scratch_{}", uuid::Uuid::new_v4().simple());
+        let (base, query) = match admin_url.split_once('?') {
+            Some((base, query)) => (base, format!("?{query}")),
+            None => (admin_url.as_str(), String::new()),
+        };
+        let prefix = base.rsplit_once('/').expect("database URL path").0;
+        let url = format!("{prefix}/{name}{query}");
+        let scratch = Self {
+            admin_url,
+            ca_certificate,
+            name,
+            url,
+        };
+        scratch.admin(&format!("CREATE DATABASE {}", scratch.name));
+        scratch
+    }
+
+    pub(crate) fn connect(&self) -> PostgresDb {
+        off_runtime(|| match &self.ca_certificate {
+            Some(pem) => PostgresDb::connect_with_ca_certificate(&self.url, 4, pem),
+            None => PostgresDb::connect(&self.url, 4),
+        })
+        .expect("connect scratch database")
+    }
+
+    fn admin(&self, statement: &str) {
+        off_runtime(|| {
+            let admin = match &self.ca_certificate {
+                Some(pem) => PostgresDb::connect_with_ca_certificate(&self.admin_url, 1, pem),
+                None => PostgresDb::connect(&self.admin_url, 1),
+            }
+            .expect("connect PostgreSQL test server");
+            admin
+                .connection()
+                .expect("admin connection")
+                .batch_execute(statement)
+                .expect("scratch database statement");
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        self.admin(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
 }
 
 #[cfg(test)]

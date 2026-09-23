@@ -28,9 +28,10 @@ Coverage:
 - **SQLite** is the default community runtime.
 - **PostgreSQL** means the reusable dual-backend path documented in
   [postgres-sekai-parity.md](postgres-sekai-parity.md) /
-  [postgres-chisei-parity.md](postgres-chisei-parity.md). Fail-closed
-  community Postgres surfaces (audited ontology mutations) stay out of this
-  dual-backend set and join [#1086](https://github.com/Sannrox/sekai-chisei/issues/1086).
+  [postgres-chisei-parity.md](postgres-chisei-parity.md). The define → seed
+  → Action → receipt → object-security loop runs on both backends; the
+  `product_loop_backend_conformance` test drives it through the shipped
+  binary ([#1086](https://github.com/Sannrox/sekai-chisei/issues/1086)).
 - **Rust** means `sekaictl`, examples, or the crate API.
 - **TypeScript / Python** means the thin facades under [`sdk/`](../sdk/README.md).
   Those facades do not bundle a second proto snapshot. Generated HTTP clients
@@ -76,8 +77,8 @@ Coverage:
 1. **Define.** Apply a domain document with
    `sekaictl ontology apply` ([ontology.md](ontology.md)) or call
    `CreateSchemaType` / `CreateOntologyClass` / `CreateOntologyRelation`.
-   Community PostgreSQL fails closed for the audited class and relation
-   mutations; SQLite is the advertised apply runtime until [#1086](https://github.com/Sannrox/sekai-chisei/issues/1086).
+   Both community backends write the class or relation and its chained audit
+   decision in one transaction.
 2. **Seed.** `sekaictl ontology seed` and SDK `seedFacts` call
    `CreateObject` / `CreateLink`. Typed SDK helpers do not call
    `ListObjects`, `GetObject`, or `EvaluateObjectSet`.
@@ -112,7 +113,7 @@ The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
 | Surface | Rust | TypeScript | Python | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- | --- |
 | Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | unavailable (query-time entailment is SQLite-only; discovery reports `backend_postgres_entailment=0`) |
-| Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | fail-closed |
+| Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | yes |
 | Object / link seed | `sekaictl ontology seed` | `runCoreLoop` | `run_core_loop` | yes | yes |
 | Plan / receipt | `sekaictl ontology run` | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |
 | Client-package records | `sekaictl admin sdk-packages` | publication metadata only | publication metadata only | yes | unavailable |
@@ -127,5 +128,4 @@ advertised sekaictl/SDK loop on current `main`:
 - application Action describe/preview as typed SDK helpers (`PreviewObjectAction` is MCP-allowlisted);
 - object-change subscription as a sekaictl/SDK loop step ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
 - a typed sekaictl/SDK helper for Action approval: `require_approval` now parks the instance and `DecideActionInstance` grants or denies it, but that RPC is experimental until a sekaictl or SDK consumer ships ([#1084](https://github.com/Sannrox/sekai-chisei/issues/1084)); preview still reports `require_approval` without granting it ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
-- product-loop ontology apply on community PostgreSQL without fail-closed ([#1086](https://github.com/Sannrox/sekai-chisei/issues/1086));
 - downloadable registry packages (publication records are not registry bytes).

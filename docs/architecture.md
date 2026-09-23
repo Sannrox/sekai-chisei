@@ -396,8 +396,7 @@ definitions, function definitions, generation-fenced leases and guarded object
 mutations, team-namespace bootstrap, principal credentials, coordination and
 work admission, external evidence admission and
 projection, policy attestations, handoffs, retention, scoped content, and
-reconciliation. Known community Postgres fail-closed exceptions include public
-audited ontology mutation RPCs (`upsert_*_with_audit`), query-time ontology
+reconciliation. Known community Postgres fail-closed exceptions include query-time ontology
 entailment, federation peer tables, registered Iceberg/Parquet snapshot projections,
 governed documents and renditions,
 governed images, renditions, and annotations,
