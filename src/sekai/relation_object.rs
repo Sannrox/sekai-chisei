@@ -87,7 +87,11 @@ pub fn create_relationship_object(
     let props =
         serde_json::to_string(&relationship.properties).map_err(|error| error.to_string())?;
     let mut conn = db.conn();
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    // IMMEDIATE takes the write lock before the existence reads and the
+    // link-bound count, as on the primary link path (ADR 0087, #1148).
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
     if object_exists(&tx, &relationship.id)? {
         return Err("relationship object already exists".into());
     }
@@ -285,6 +289,56 @@ mod tests {
             created: 1,
             updated: 1,
         }
+    }
+
+    #[test]
+    fn concurrent_relationship_objects_serialize_without_busy_failures() {
+        // #1148: deferred link writers count links for their bound under the
+        // write lock, so contending writers wait instead of failing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relationships.db");
+        let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        db.create_object(&object("source", "component")).unwrap();
+        db.create_object(&object("target", "model")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|worker| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..10)
+                        .map(|index| {
+                            create_relationship_object(
+                                &db,
+                                RelationshipObjectSpec {
+                                    id: format!("rel-{worker}-{index}"),
+                                    relation: REL_TOUCHES.into(),
+                                    source_id: "source".into(),
+                                    target_id: "target".into(),
+                                    status: String::new(),
+                                    role: String::new(),
+                                    confidence: None,
+                                    valid_from: String::new(),
+                                    valid_to: String::new(),
+                                    properties: HashMap::new(),
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            for result in handle.join().unwrap() {
+                result.unwrap();
+            }
+        }
+        let relationships =
+            relationship_objects_for_endpoint(&db, "source", EndpointRole::Source, None).unwrap();
+        assert_eq!(relationships.len(), 80);
     }
 
     #[test]
