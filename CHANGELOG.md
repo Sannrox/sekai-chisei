@@ -6,6 +6,11 @@
   mapped relation maximum in one statement after taking the shared relation
   lock. An uncapped insert now costs three statements instead of four, and a
   capped one five instead of six. The ADR 0087 locking order is unchanged (#1144).
+- `DiscoverCapabilities` now reports `supports_entailment=0` for
+  `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
+  PostgreSQL, where those RPCs serve asserted-only reasoning and fail
+  entailment closed. The integration contract lists the PostgreSQL surface as
+  asserted-only instead of unavailable (#1149).
 - Granting a parked Action now commits the object write and the
   parked-to-admitted transition in one SQLite transaction, re-checking the
   target object under the same lock. A crash can no longer leave an object
