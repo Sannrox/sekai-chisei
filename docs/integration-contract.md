@@ -112,7 +112,7 @@ The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
 
 | Surface | Rust | TypeScript | Python | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- | --- |
-| Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | unavailable (query-time entailment is SQLite-only; discovery reports `backend_postgres_entailment=0`) |
+| Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | asserted-only (entailment fails `FAILED_PRECONDITION`; discovery reports `supports_entailment=0`) |
 | Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | yes |
 | Object / link seed | `sekaictl ontology seed` | `runCoreLoop` | `run_core_loop` | yes | yes |
 | Plan / receipt | `sekaictl ontology run` | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |

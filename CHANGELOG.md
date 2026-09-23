@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `DiscoverCapabilities` now reports `supports_entailment=0` for
+  `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
+  PostgreSQL, where those RPCs serve asserted-only reasoning and fail
+  entailment closed. The integration contract lists the PostgreSQL surface as
+  asserted-only instead of unavailable (#1149).
 - Learning records, relationship objects, capability authorizations, and team
   namespace bootstrap now take the SQLite write lock before their existence and
   link-bound reads, as the primary link path does. Concurrent writers wait for
