@@ -120,9 +120,12 @@ impl RpcMaturityTable {
             if !matches!(entry.service.as_str(), "SekaiService" | "ChiseiService") {
                 return Err(format!("unknown maturity service {}", entry.service));
             }
-            if !matches!(entry.real_backend.as_str(), "yes" | "fixture only") {
+            if !matches!(
+                entry.real_backend.as_str(),
+                "yes" | "sqlite only" | "fixture only"
+            ) {
                 return Err(format!(
-                    "rpc {} real_backend must be yes or fixture only",
+                    "rpc {} real_backend must be yes, sqlite only, or fixture only",
                     entry.rpc
                 ));
             }
@@ -142,7 +145,10 @@ impl RpcMaturityTable {
             if entry.classification == RpcClassification::Stable {
                 stable += 1;
                 if entry.real_backend != "yes" {
-                    return Err(format!("stable rpc {} cannot be fixture-only", entry.rpc));
+                    return Err(format!(
+                        "stable rpc {} needs a real backend on every community runtime",
+                        entry.rpc
+                    ));
                 }
             }
             if entry.real_backend == "fixture only"
