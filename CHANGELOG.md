@@ -6,6 +6,16 @@
   namespace bootstrap now take the SQLite write lock before their existence and
   link-bound reads, as the primary link path does. Concurrent writers wait for
   each other instead of failing with `database is locked` (#1148).
+- `DecideActionInstance` now binds an approval to the one subject a bearer or
+  enterprise credential established. Self-asserted identities from the local
+  socket or insecure transport, comma-listed `x-principal` values, and the
+  reserved `root` / `local` names can no longer decide, and namespace-admin
+  standing is checked for that single subject only (#1140).
+- `ExpandRelations`, `ExplainDerivation`, and `RetrieveContext` now apply the
+  enterprise tenant gate like object reads: a request without an authenticated
+  context fails `UNAUTHENTICATED` when an identity extension is installed, a
+  foreign namespace fails `PERMISSION_DENIED`, and retrieval drops objects in
+  namespaces the tenant cannot read (#1147).
 - Community PostgreSQL no longer fails with `INTERNAL` on audit-decision
   listing, object-change history and feed, evidence submissions, policy
   attestations, object-type index pages, and work-unit heartbeats. Those
