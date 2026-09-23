@@ -91,6 +91,9 @@ impl std::fmt::Debug for RuntimeDb {
     }
 }
 
+pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
+    "action bindings are unavailable on the PostgreSQL community runtime";
+
 pub(crate) const DECIDE_ACTION_INSTANCE_UNAVAILABLE: &str =
     "deciding a parked action instance is unavailable on the PostgreSQL community runtime";
 
@@ -3281,6 +3284,47 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db.put_action_instance(instance),
             Self::Postgres(db) => db.put_action_instance(instance),
+        }
+    }
+
+    pub fn put_action_binding(
+        &self,
+        binding: &crate::sekai::action_binding::ActionBinding,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<crate::sekai::action_binding::ActionBinding, String> {
+        match self {
+            Self::Sqlite(db) => db.put_action_binding(binding, actor, now_ms),
+            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn get_action_binding(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+    ) -> Result<
+        Option<(
+            crate::sekai::action_binding::ActionBinding,
+            crate::sekai::action_binding::ActionBindingCursor,
+        )>,
+        String,
+    > {
+        match self {
+            Self::Sqlite(db) => db.get_action_binding(namespace, binding_id),
+            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
+        }
+    }
+
+    pub fn advance_action_binding_cursor(
+        &self,
+        binding: &crate::sekai::action_binding::ActionBinding,
+        cursor: &crate::sekai::action_binding::ActionBindingCursor,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.advance_action_binding_cursor(binding, cursor, now_ms),
+            Self::Postgres(_) => Err(ACTION_BINDINGS_UNAVAILABLE.into()),
         }
     }
 

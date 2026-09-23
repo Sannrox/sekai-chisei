@@ -1117,6 +1117,44 @@ message DecideActionInstanceResponse {
   // True when this decision was already recorded; nothing changed.
   bool replay = 2;
 }
+// Object-change automation binding (#1092, ADR 0090). binding_json is the
+// sekai.action-binding/v1 document: namespace, kind, ops, pinned type and
+// version, run_as service principal, and a closed parameter mapping.
+message PutActionBindingRequest {
+  string binding_json = 1;
+}
+message PutActionBindingResponse {
+  string binding_json = 1;
+  uint64 revision = 2;
+}
+message RunActionBindingRequest {
+  string namespace = 1;
+  string binding_id = 2;
+  // Maximum events read from the subscription in this run.
+  int32 limit = 3;
+}
+message ActionBindingSubmission {
+  string event_id = 1;
+  string object_id = 2;
+  string op = 3;
+  // Empty when the event was skipped.
+  string instance_id = 4;
+  string status = 5;
+  bool replay = 6;
+  // Bounded reason when the event did not submit or admission refused it.
+  string skipped_reason = 7;
+}
+message RunActionBindingResponse {
+  // The subscription outcome: page, replayed, resnapshot_required,
+  // disconnected, or revoked.
+  string outcome = 1;
+  string disconnect_reason = 2;
+  string page_digest = 3;
+  repeated ActionBindingSubmission submissions = 4;
+  uint64 binding_revision = 5;
+  // Always false: the subscription and the binding grant nothing.
+  bool authority = 6;
+}
 
 // Observational object-bound Action describe/preview (#836).
 // Preview is not a permit. Submit remains SubmitActionInstance.
@@ -2382,6 +2420,8 @@ service SekaiService {
   // Governed ActionInstance admission (#397).
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
   rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
+  rpc PutActionBinding(PutActionBindingRequest) returns (PutActionBindingResponse);
+  rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);

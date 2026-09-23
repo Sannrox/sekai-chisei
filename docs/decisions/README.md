@@ -111,3 +111,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0087: Enforce ontology relation maximum cardinality; keep the minimum advisory](0087-enforce-relation-cardinality-maximum.md)
 - [ADR 0088: One object-log host owns identity; clerk processes are its clients](0088-one-object-log-host-many-clerk-clients.md)
 - [ADR 0089: Park approval-gated Action instances and decide them explicitly](0089-park-and-decide-action-instances.md)
+- [ADR 0090: Bind object changes to governed Actions through a plane-owned binding](0090-object-change-action-bindings.md)

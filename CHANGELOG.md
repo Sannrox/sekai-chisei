@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Object-change automation bindings (`sekai.action-binding/v1`, experimental
+  `PutActionBinding` / `RunActionBinding`). A namespace administrator binds a
+  kind's changes to one pinned governed Action type through a closed parameter
+  mapping. Runs read the subscription as the binding's `run_as` principal and
+  submit one idempotent Action per event through normal admission, so hidden
+  fields never become parameters and `require_approval` parks. Community
+  PostgreSQL answers `UNAVAILABLE` (ADR 0090, #1092).
 - A `require_approval` Action policy now parks the instance (`status=parked`)
   instead of denying it. The experimental `DecideActionInstance` RPC lets a
   principal named in the type's new `approvers` field (or a namespace admin
