@@ -40,17 +40,20 @@ impl SekaiServiceImpl {
                 &binding.version,
             )
             .map_err(|_| Status::failed_precondition("bound action type unavailable"))?;
-        let declared = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
+        let schema = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
             .ok()
-            .and_then(|schema| {
+            .filter(|schema| {
                 schema
                     .get("properties")
-                    .and_then(|properties| properties.as_object())
-                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                    .is_some_and(|value| value.is_object())
             })
             .ok_or_else(|| {
                 Status::failed_precondition("bound action type parameter schema unavailable")
             })?;
+        let declared = schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         if let Some(name) = binding
             .parameters
             .keys()
@@ -58,6 +61,20 @@ impl SekaiServiceImpl {
         {
             return Err(Status::invalid_argument(format!(
                 "parameter {name:?} is not declared by the bound action type"
+            )));
+        }
+        // An unmapped required parameter would make every event fail schema
+        // validation and be skipped for good, so refuse it at install (#1142).
+        if let Some(name) = schema
+            .get("required")
+            .and_then(|required| required.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str())
+            .find(|name| !binding.parameters.contains_key(*name))
+        {
+            return Err(Status::invalid_argument(format!(
+                "required parameter {name:?} of the bound action type is not mapped"
             )));
         }
         check_team_namespace(
