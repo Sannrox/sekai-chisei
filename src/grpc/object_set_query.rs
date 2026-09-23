@@ -1181,7 +1181,31 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_object_set_filters_pages_and_traverses_without_client_join() {
-        let svc = service();
+        exercise_evaluate_filters_pages_and_traverses(service()).await;
+    }
+
+    /// #1086: the product loop evaluates object sets on community PostgreSQL
+    /// with the same members, order, and paging as SQLite.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_evaluate_object_set_matches_sqlite() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        // The last pool handle drops outside the runtime: closing a
+        // synchronous client from an async worker panics.
+        let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_evaluate_filters_pages_and_traverses(
+                SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+                    db.clone(),
+                )),
+            ));
+        drop(db);
+    }
+
+    async fn exercise_evaluate_filters_pages_and_traverses(svc: SekaiServiceImpl) {
         grant_namespace(&svc, "sales", "alice");
         let digest = seed_sales_definition(&svc);
         seed_customers_and_orders(&svc);

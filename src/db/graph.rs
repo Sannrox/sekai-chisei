@@ -319,7 +319,7 @@ impl GraphBackend for PostgresDb {
         filter: &ListFilter,
         principals: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
-        self.list_objects_with_total_for_principals(filter, principals)
+        self.list_objects_with_total_for_principals(filter, principals, &[])
     }
     fn create_link(&self, link: &Link) -> Result<bool, String> {
         self.create_link_once(link)

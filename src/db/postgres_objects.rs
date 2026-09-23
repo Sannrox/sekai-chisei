@@ -243,8 +243,9 @@ impl PostgresDb {
         &self,
         filter: &ListFilter,
         principals: &[&str],
+        excluded_kinds: &[&str],
     ) -> Result<(Vec<Object>, i32), String> {
-        self.list_objects_query(filter, Some(principals), None, &[])
+        self.list_objects_query(filter, Some(principals), None, excluded_kinds)
     }
 
     pub fn list_objects_with_total_for_policy_context(
@@ -401,9 +402,10 @@ impl PostgresDb {
         } else {
             filter.limit.min(MAX_LIST_LIMIT)
         };
-        params.push(Box::new(limit));
+        // LIMIT and OFFSET parameters are inferred as bigint.
+        params.push(Box::new(i64::from(limit)));
         let limit_parameter = format!("${}", params.len());
-        params.push(Box::new(filter.offset.max(0)));
+        params.push(Box::new(i64::from(filter.offset.max(0))));
         let offset_parameter = format!("${}", params.len());
         let refs = params
             .iter()

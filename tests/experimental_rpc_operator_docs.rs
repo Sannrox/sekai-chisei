@@ -1,10 +1,8 @@
 //! Operator docs that name gated RPCs must name the experimental invocation gate.
 //! #1095: advertised "supported" / dual-backend sentences must not cover gated
-//! or Postgres-fail-closed product-loop RPCs.
+//! RPCs. #1086: the product loop is dual-backend, so its PostgreSQL cells say so.
 
-use sekai_chisei::rpc_maturity::{
-    RpcClassification, RpcMaturityTable, postgres_fail_closed_product_loop_rpcs,
-};
+use sekai_chisei::rpc_maturity::{RpcClassification, RpcMaturityTable};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -110,7 +108,7 @@ fn operator_docs_do_not_claim_supported_for_gated_rpcs() {
 }
 
 #[test]
-fn operator_docs_do_not_advertise_postgres_yes_for_fail_closed_loop_rpcs() {
+fn operator_docs_advertise_postgres_for_ontology_apply() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let contract = root.join("docs/integration-contract.md");
     let text = fs::read_to_string(&contract).expect("integration-contract");
@@ -118,26 +116,14 @@ fn operator_docs_do_not_advertise_postgres_yes_for_fail_closed_loop_rpcs() {
         .split("## Language and backend coverage")
         .nth(1)
         .expect("coverage section");
-    for rpc in postgres_fail_closed_product_loop_rpcs() {
-        assert!(
-            text.contains(rpc),
-            "integration-contract must still name fail-closed loop rpc {rpc}"
-        );
-    }
-    assert!(
-        coverage.contains("fail-closed"),
-        "integration-contract coverage must say PostgreSQL fail-closed for ontology apply"
+    let row = coverage
+        .lines()
+        .find(|line| line.contains("Ontology apply"))
+        .expect("ontology apply row");
+    let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+    assert_eq!(
+        cells.get(6).copied(),
+        Some("yes"),
+        "ontology apply runs on PostgreSQL (#1086): {row}"
     );
-    for line in coverage.lines() {
-        if !line.contains("Ontology apply") {
-            continue;
-        }
-        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-        let postgres = cells.get(6).copied().unwrap_or("");
-        assert!(
-            postgres.contains("fail-closed"),
-            "ontology apply PostgreSQL cell must be fail-closed, got {postgres:?}"
-        );
-        assert_ne!(postgres, "yes");
-    }
 }

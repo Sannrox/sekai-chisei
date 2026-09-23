@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The product loop now runs on community PostgreSQL: `sekaictl ontology
+  apply`, seed, object reads, `EvaluateObjectSet`, governed Action submit and
+  read, `GetOperationReceipt`, and object-security activation with a denied
+  read. Audited ontology class and relation writes, namespace-role lookup, and
+  credential creation no longer fail closed. gRPC handlers on PostgreSQL no
+  longer panic by starting a nested runtime, policy-scoped object listing binds
+  its page window with the right integer width, and principal-scoped listing
+  hides reserved governance kinds as SQLite does. A spawned-binary conformance
+  test runs the loop on both backends (#1086).
 - `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` are now
   `stable` with `sekaictl ontology context`, `expand`, and `explain` as
   consumers, and they join the generated TypeScript and Python HTTP clients.

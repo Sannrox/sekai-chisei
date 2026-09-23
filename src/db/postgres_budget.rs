@@ -410,7 +410,7 @@ impl PostgresDb {
                 .execute(
                     "INSERT INTO chisei_budget_usage
                         (scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, GREATEST($4, 0))
+                     VALUES ($1, $2, $3, GREATEST($4::bigint, 0))
                      ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
                         amount_used = GREATEST(chisei_budget_usage.amount_used + $4, 0)",
                     &[&scope, &metric, &period_start, &delta],
@@ -420,7 +420,7 @@ impl PostgresDb {
                 .execute(
                     "INSERT INTO chisei_budget_attributions
                         (source_scope_id, applied_scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, $4, GREATEST($5, 0))
+                     VALUES ($1, $2, $3, $4, GREATEST($5::bigint, 0))
                      ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
                      DO UPDATE SET
                         amount_used = GREATEST(
@@ -511,7 +511,7 @@ impl PostgresDb {
                 .execute(
                     "INSERT INTO chisei_budget_usage
                         (scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, GREATEST($4, 0))
+                     VALUES ($1, $2, $3, GREATEST($4::bigint, 0))
                      ON CONFLICT(scope_id, metric, period_start) DO UPDATE SET
                         amount_used = GREATEST(chisei_budget_usage.amount_used + $4, 0)",
                     &[&scope, &metric, &period_start, &amount],
@@ -521,7 +521,7 @@ impl PostgresDb {
                 .execute(
                     "INSERT INTO chisei_budget_attributions
                         (source_scope_id, applied_scope_id, metric, period_start, amount_used)
-                     VALUES ($1, $2, $3, $4, GREATEST($5, 0))
+                     VALUES ($1, $2, $3, $4, GREATEST($5::bigint, 0))
                      ON CONFLICT (source_scope_id, applied_scope_id, metric, period_start)
                      DO UPDATE SET
                         amount_used = GREATEST(
