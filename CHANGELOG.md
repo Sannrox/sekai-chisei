@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `RunActionBinding` no longer loses a page when it crashes during a binding's
+  first pinned read. The pin is stored before the read that creates the
+  binding's subscription, together with a marker that no subscription existed.
+  The next run rewinds the new subscription to its pin and delivers the page
+  again (#1141).
 - `PutActionBinding` now refuses a binding that leaves a `required` parameter
   of the bound Action type unmapped (`INVALID_ARGUMENT` naming the parameter).
   Such a binding used to install and then skip every event for good (#1142).
