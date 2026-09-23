@@ -37,9 +37,15 @@ impl SekaiServiceImpl {
         entries.push(evaluate_object_set_capability());
         entries.push(object_change_subscription_capability());
         entries.push(traverse_capability());
-        entries.push(expand_relations_capability());
-        entries.push(retrieve_context_capability());
-        entries.push(explain_derivation_capability());
+        // Query-time entailment runs only on the SQLite runtime; PostgreSQL
+        // serves the asserted-only mode and says so (#1149).
+        let entailment = matches!(
+            self.db.runtime(),
+            crate::db::runtime_db::RuntimeDb::Sqlite(_)
+        );
+        entries.push(expand_relations_capability(entailment));
+        entries.push(retrieve_context_capability(entailment));
+        entries.push(explain_derivation_capability(entailment));
         entries.push(kioku_candidates_capability());
         entries.push(experimental_rpc_capability(
             crate::rpc_maturity::experimental_rpcs_enabled(),
@@ -179,7 +185,7 @@ fn traverse_capability() -> CapabilityEntry {
     entry
 }
 
-fn semantic_reasoning_limits() -> Vec<CapabilityLimit> {
+fn semantic_reasoning_limits(entailment: bool) -> Vec<CapabilityLimit> {
     vec![
         CapabilityLimit {
             name: "max_depth".into(),
@@ -227,7 +233,7 @@ fn semantic_reasoning_limits() -> Vec<CapabilityLimit> {
         },
         CapabilityLimit {
             name: "supports_entailment".into(),
-            value: 1,
+            value: u64::from(entailment),
         },
     ]
 }
@@ -261,7 +267,7 @@ fn epistemic_projection_limits() -> [CapabilityLimit; 6] {
     ]
 }
 
-fn expand_relations_capability() -> CapabilityEntry {
+fn expand_relations_capability(entailment: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_EXPAND_RELATIONS.into(),
         "Expand authorized relations from a root in asserted or entailment mode.".into(),
@@ -276,7 +282,7 @@ fn expand_relations_capability() -> CapabilityEntry {
         "classification".into(),
         "ontology_acl".into(),
     ];
-    entry.limits = semantic_reasoning_limits();
+    entry.limits = semantic_reasoning_limits(entailment);
     entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),
@@ -288,7 +294,7 @@ fn expand_relations_capability() -> CapabilityEntry {
     entry
 }
 
-fn retrieve_context_capability() -> CapabilityEntry {
+fn retrieve_context_capability(entailment: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_RETRIEVE_CONTEXT.into(),
         "Retrieve bounded, authorized context candidates with provenance.".into(),
@@ -303,7 +309,7 @@ fn retrieve_context_capability() -> CapabilityEntry {
         "classification".into(),
         "ontology_acl".into(),
     ];
-    entry.limits = semantic_reasoning_limits();
+    entry.limits = semantic_reasoning_limits(entailment);
     entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),
@@ -315,7 +321,7 @@ fn retrieve_context_capability() -> CapabilityEntry {
     entry
 }
 
-fn explain_derivation_capability() -> CapabilityEntry {
+fn explain_derivation_capability(entailment: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         semantic::CAPABILITY_EXPLAIN_DERIVATION.into(),
         "Explain an authorized derivation path without hidden policy inputs.".into(),
@@ -330,7 +336,7 @@ fn explain_derivation_capability() -> CapabilityEntry {
         "classification".into(),
         "ontology_acl".into(),
     ];
-    entry.limits = semantic_reasoning_limits();
+    entry.limits = semantic_reasoning_limits(entailment);
     entry.limits.extend(epistemic_projection_limits());
     entry.evidence_requirements = vec![
         "derivation_steps".into(),

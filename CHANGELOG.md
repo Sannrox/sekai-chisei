@@ -7,6 +7,11 @@
   binding's subscription, together with a marker that no subscription existed.
   The next run rewinds the new subscription to its pin and delivers the page
   again (#1141).
+- `DiscoverCapabilities` now reports `supports_entailment=0` for
+  `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
+  PostgreSQL, where those RPCs serve asserted-only reasoning and fail
+  entailment closed. The integration contract lists the PostgreSQL surface as
+  asserted-only instead of unavailable (#1149).
 - Granting a parked Action now commits the object write and the
   parked-to-admitted transition in one SQLite transaction, re-checking the
   target object under the same lock. A crash can no longer leave an object
