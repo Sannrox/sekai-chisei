@@ -64,15 +64,62 @@ pub enum CombinedStoreLayout {
 
 const UNCACHED_MATCHED_GENERATION: i64 = i64::MIN;
 
+pub const SEKAI_POOL_ENV: &str = "SEKAI_POSTGRES_SEKAI_CONNECTIONS";
+pub const CHISEI_POOL_ENV: &str = "SEKAI_POSTGRES_CHISEI_CONNECTIONS";
+
 /// Divide one process connection budget across two Split backends.
 ///
-/// A one-connection budget still opens one connection per store.
-pub(crate) fn split_connection_pool_budget(total: u32) -> (u32, u32) {
-    let half = total / 2;
-    if half == 0 {
-        (1, 1)
-    } else {
-        (total - half, half)
+/// Without per-plane sizes the budget splits in half; a one-connection
+/// budget still opens one connection per store. An operator who has measured
+/// one plane waiting on its pool (`sekai_db_pool_checkout_seconds`) sizes it
+/// explicitly: one size takes that many connections and leaves the rest to
+/// the other plane; two sizes must fit the budget together. Sizes that exceed
+/// the budget or leave a plane without a connection refuse to start.
+/// Pool size of a single-plane process: its own plane's size when set, else
+/// the whole process budget.
+pub(crate) fn owned_plane_pool_size(total: u32, own: Option<u32>) -> Result<u32, String> {
+    match own {
+        None => Ok(total),
+        Some(0) => Err(format!(
+            "{SEKAI_POOL_ENV} / {CHISEI_POOL_ENV} must give the store at least one connection"
+        )),
+        Some(own) if own > total => Err(format!(
+            "plane pool size ({own}) exceeds SEKAI_POSTGRES_MAX_CONNECTIONS ({total})"
+        )),
+        Some(own) => Ok(own),
+    }
+}
+
+pub(crate) fn split_connection_pool_budget(
+    total: u32,
+    sekai: Option<u32>,
+    chisei: Option<u32>,
+) -> Result<(u32, u32), String> {
+    let fits = |sekai: u32, chisei: u32| {
+        if sekai == 0 || chisei == 0 {
+            Err(format!(
+                "{SEKAI_POOL_ENV} and {CHISEI_POOL_ENV} must leave each Split store at least one connection"
+            ))
+        } else if u64::from(sekai) + u64::from(chisei) > u64::from(total) {
+            Err(format!(
+                "{SEKAI_POOL_ENV} ({sekai}) + {CHISEI_POOL_ENV} ({chisei}) exceed SEKAI_POSTGRES_MAX_CONNECTIONS ({total})"
+            ))
+        } else {
+            Ok((sekai, chisei))
+        }
+    };
+    match (sekai, chisei) {
+        (None, None) => {
+            let half = total / 2;
+            Ok(if half == 0 {
+                (1, 1)
+            } else {
+                (total - half, half)
+            })
+        }
+        (Some(sekai), Some(chisei)) => fits(sekai, chisei),
+        (Some(sekai), None) => fits(sekai, total.saturating_sub(sekai)),
+        (None, Some(chisei)) => fits(total.saturating_sub(chisei), chisei),
     }
 }
 
@@ -92,6 +139,9 @@ pub struct CombinedStoreSources {
     pub sekai_postgres_url: Option<String>,
     pub chisei_postgres_url: Option<String>,
     pub postgres_max_connections: u32,
+    /// Split-only pool sizes carved out of `postgres_max_connections`.
+    pub sekai_pool_connections: Option<u32>,
+    pub chisei_pool_connections: Option<u32>,
     pub postgres_ca_cert_path: Option<String>,
     /// Constructed fixtures keep Shared. `from_env` sets this only when
     /// `SEKAI_SHARED_STORE=1` so Combined does not silently boot one identity.
@@ -110,6 +160,8 @@ impl Default for CombinedStoreSources {
             sekai_postgres_url: None,
             chisei_postgres_url: None,
             postgres_max_connections: 0,
+            sekai_pool_connections: None,
+            chisei_pool_connections: None,
             postgres_ca_cert_path: None,
             allow_shared_compatibility: true,
         }
@@ -121,16 +173,19 @@ impl CombinedStoreSources {
         let backend = BackendIdentity::parse(
             &std::env::var("SEKAI_DB_BACKEND").unwrap_or_else(|_| "sqlite".into()),
         )?;
-        let postgres_max_connections = std::env::var("SEKAI_POSTGRES_MAX_CONNECTIONS")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                value
-                    .parse::<u32>()
-                    .map_err(|error| format!("SEKAI_POSTGRES_MAX_CONNECTIONS: {error}"))
-            })
-            .transpose()?
-            .unwrap_or(16);
+        let connections = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|error| format!("{name}: {error}"))
+                })
+                .transpose()
+        };
+        let postgres_max_connections = connections("SEKAI_POSTGRES_MAX_CONNECTIONS")?.unwrap_or(16);
         Ok(Self {
             backend: Some(backend),
             default_sqlite_path: default_sqlite_path.to_string(),
@@ -141,10 +196,20 @@ impl CombinedStoreSources {
             sekai_postgres_url: optional_trimmed_env("SEKAI_DATABASE_URL"),
             chisei_postgres_url: optional_trimmed_env("CHISEI_DATABASE_URL"),
             postgres_max_connections,
+            sekai_pool_connections: connections(SEKAI_POOL_ENV)?,
+            chisei_pool_connections: connections(CHISEI_POOL_ENV)?,
             postgres_ca_cert_path: optional_trimmed_env("SEKAI_POSTGRES_CA_CERT"),
             allow_shared_compatibility: std::env::var("SEKAI_SHARED_STORE").unwrap_or_default()
                 == "1",
         })
+    }
+
+    fn split_pool_budget(&self) -> Result<(u32, u32), String> {
+        split_connection_pool_budget(
+            self.postgres_max_connections,
+            self.sekai_pool_connections,
+            self.chisei_pool_connections,
+        )
     }
 
     pub fn open(self) -> Result<CombinedStoreLayout, String> {
@@ -177,7 +242,7 @@ impl CombinedStoreSources {
                 open_split_sqlite(
                     sekai,
                     chisei,
-                    self.postgres_max_connections,
+                    self.split_pool_budget()?,
                     self.postgres_ca_cert_path.as_deref(),
                 )
             }
@@ -194,7 +259,7 @@ impl CombinedStoreSources {
                 open_split_postgres(
                     sekai,
                     chisei,
-                    self.postgres_max_connections,
+                    self.split_pool_budget()?,
                     self.postgres_ca_cert_path.as_deref(),
                 )
             }
@@ -202,6 +267,12 @@ impl CombinedStoreSources {
                 "SEKAI_DATABASE_URL / CHISEI_DATABASE_URL require SEKAI_DB_BACKEND=postgres".into(),
             ),
             ((None, None), (None, None), _) => {
+                if self.sekai_pool_connections.is_some() || self.chisei_pool_connections.is_some()
+                {
+                    return Err(format!(
+                        "{SEKAI_POOL_ENV} and {CHISEI_POOL_ENV} size Split store pools; a shared store uses SEKAI_POSTGRES_MAX_CONNECTIONS"
+                    ));
+                }
                 if !self.allow_shared_compatibility {
                     return Err(
                         "combined mode refuses a shared store unless SEKAI_SHARED_STORE=1; set SEKAI_DB_PATH and CHISEI_DB_PATH, or SEKAI_DATABASE_URL and CHISEI_DATABASE_URL"
@@ -397,13 +468,12 @@ pub fn registry_db_anchor(default_sqlite_path: &str) -> String {
 fn open_split_sqlite(
     sekai_path: &str,
     chisei_path: &str,
-    postgres_max_connections: u32,
+    (sekai_pool, chisei_pool): (u32, u32),
     postgres_ca_cert_path: Option<&str>,
 ) -> Result<CombinedStoreLayout, String> {
     let sekai_identity = sqlite_identity(sekai_path)?;
     let chisei_identity = sqlite_identity(chisei_path)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
-    let (sekai_pool, chisei_pool) = split_connection_pool_budget(postgres_max_connections);
     let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
         BackendIdentity::Sqlite,
         Some(sekai_path),
@@ -423,6 +493,12 @@ fn open_split_sqlite(
     let sekai_identity = sqlite_identity(sekai_path)?;
     let chisei_identity = sqlite_identity(chisei_path)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
+    sekai
+        .database()
+        .set_pool_plane(crate::obs::labels::PoolPlane::Sekai);
+    chisei
+        .database()
+        .set_pool_plane(crate::obs::labels::PoolPlane::Chisei);
     Ok(CombinedStoreLayout::Split {
         sekai,
         chisei,
@@ -435,13 +511,12 @@ fn open_split_sqlite(
 fn open_split_postgres(
     sekai_url: &str,
     chisei_url: &str,
-    postgres_max_connections: u32,
+    (sekai_pool, chisei_pool): (u32, u32),
     postgres_ca_cert_path: Option<&str>,
 ) -> Result<CombinedStoreLayout, String> {
     let sekai_identity = postgres_identity(sekai_url)?;
     let chisei_identity = postgres_identity(chisei_url)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
-    let (sekai_pool, chisei_pool) = split_connection_pool_budget(postgres_max_connections);
     let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
         BackendIdentity::Postgres,
         None,
@@ -458,6 +533,12 @@ fn open_split_postgres(
         chisei_pool,
         postgres_ca_cert_path,
     )?)?;
+    sekai
+        .database()
+        .set_pool_plane(crate::obs::labels::PoolPlane::Sekai);
+    chisei
+        .database()
+        .set_pool_plane(crate::obs::labels::PoolPlane::Chisei);
     Ok(CombinedStoreLayout::Split {
         sekai,
         chisei,
@@ -679,9 +760,58 @@ mod tests {
 
     #[test]
     fn split_connection_pool_budget_divides_the_process_ceiling() {
-        assert_eq!(split_connection_pool_budget(16), (8, 8));
-        assert_eq!(split_connection_pool_budget(15), (8, 7));
-        assert_eq!(split_connection_pool_budget(1), (1, 1));
+        assert_eq!(split_connection_pool_budget(16, None, None), Ok((8, 8)));
+        assert_eq!(split_connection_pool_budget(15, None, None), Ok((8, 7)));
+        assert_eq!(split_connection_pool_budget(1, None, None), Ok((1, 1)));
+    }
+
+    #[test]
+    fn a_single_plane_process_takes_its_own_plane_size_within_the_budget() {
+        assert_eq!(owned_plane_pool_size(16, None), Ok(16));
+        assert_eq!(owned_plane_pool_size(16, Some(12)), Ok(12));
+        assert!(owned_plane_pool_size(16, Some(20)).is_err());
+        assert!(owned_plane_pool_size(16, Some(0)).is_err());
+    }
+
+    #[test]
+    fn a_shared_store_refuses_per_plane_pool_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let err = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: path.to_str().unwrap().into(),
+            postgres_max_connections: 16,
+            sekai_pool_connections: Some(12),
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap_err();
+        assert!(err.contains("size Split store pools"), "{err}");
+    }
+
+    #[test]
+    fn per_plane_pool_sizes_fit_the_process_ceiling_or_refuse() {
+        // One size takes its share and leaves the rest to the other plane.
+        assert_eq!(
+            split_connection_pool_budget(16, Some(12), None),
+            Ok((12, 4))
+        );
+        assert_eq!(split_connection_pool_budget(16, None, Some(4)), Ok((12, 4)));
+        // Two sizes may leave headroom under the ceiling.
+        assert_eq!(
+            split_connection_pool_budget(16, Some(10), Some(4)),
+            Ok((10, 4))
+        );
+        // Over the ceiling, or a plane left without a connection, refuses.
+        let over = split_connection_pool_budget(16, Some(12), Some(8)).unwrap_err();
+        assert!(
+            over.contains("exceed SEKAI_POSTGRES_MAX_CONNECTIONS (16)"),
+            "{over}"
+        );
+        for (sekai, chisei) in [(Some(16), None), (None, Some(16)), (Some(0), Some(4))] {
+            let starved = split_connection_pool_budget(16, sekai, chisei).unwrap_err();
+            assert!(starved.contains("at least one connection"), "{starved}");
+        }
     }
 
     #[test]

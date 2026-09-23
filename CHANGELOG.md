@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Combined Split pools can be sized per plane with
+  `SEKAI_POSTGRES_SEKAI_CONNECTIONS` and `SEKAI_POSTGRES_CHISEI_CONNECTIONS`,
+  carved out of `SEKAI_POSTGRES_MAX_CONNECTIONS`; sizes over the budget refuse
+  to start. Pool checkouts report per plane (`sekai_db_pool_checkout_seconds`,
+  `sekai_db_pool_in_use_ratio`, label `plane` = `shared`, `sekai`, `chisei`)
+  so a starved plane is measurable against Shared. The default half split is
+  unchanged (#1109).
 - `sekaictl admin store relocate` runs online. Triggers on the source's
   Chisei tables record writes, families are bulk-copied from a snapshot while
   writers run, and the writer fence is then enforced in the source database
