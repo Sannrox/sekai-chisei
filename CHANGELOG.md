@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Granting a parked Action now commits the object write and the
+  parked-to-admitted transition in one SQLite transaction, re-checking the
+  target object under the same lock. A crash can no longer leave an object
+  write without its grant, a stale target is denied `stale_on_resume` with no
+  write, and concurrent grants apply the write once with no compensating
+  restore (#1139).
 - `DecideActionInstance` now binds an approval to the one subject a bearer or
   enterprise credential established. Self-asserted identities from the local
   socket or insecure transport, comma-listed `x-principal` values, and the
