@@ -993,17 +993,38 @@ pub(crate) fn insert_link_within_maximum(
     transaction: &mut postgres::Transaction<'_>,
     link: &Link,
 ) -> Result<bool, String> {
-    let exists: bool = transaction
+    // Shared with other admissions, exclusive against a publication of this
+    // relation's maximum. The lock is its own statement: a statement's
+    // snapshot predates any lock wait inside it, so the bound read below must
+    // start after the lock is held (ADR 0087).
+    if !link.relation.is_empty() {
+        relation_maximum_lock(transaction, &link.relation, false)?;
+    }
+    // One read for the id's existence and the tightest mapped maximum, so an
+    // uncapped insert costs lock, read, insert (#1144).
+    let row = transaction
         .query_one(
-            "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = $1)",
-            &[&link.id],
+            "SELECT
+                EXISTS(SELECT 1 FROM sekai_links WHERE id = $1),
+                (SELECT MIN((cardinality_json::jsonb ->> 'max')::bigint)
+                   FROM sekai_ontology_relations
+                  WHERE $2 <> '' AND mapped_relation = $2)",
+            &[&link.id, &link.relation],
         )
-        .map_err(|error| error.to_string())?
-        .get(0);
+        .map_err(|error| error.to_string())?;
+    let (exists, maximum): (bool, Option<i64>) = (row.get(0), row.get(1));
     if exists {
         return Ok(false);
     }
-    enforce_postgres_link_maximum(transaction, &link.from_id, &link.to_id, &link.relation)?;
+    if let Some(maximum) = maximum {
+        enforce_postgres_link_maximum(
+            transaction,
+            &link.from_id,
+            &link.to_id,
+            &link.relation,
+            maximum,
+        )?;
+    }
     transaction
         .execute(
             "INSERT INTO sekai_links (id, from_id, to_id, relation, created)
@@ -1020,39 +1041,17 @@ pub(crate) fn insert_link_within_maximum(
         .map_err(|error| error.to_string())
 }
 
-/// PostgreSQL side of ADR 0087. A transaction-scoped advisory lock on
-/// `(from_id, relation)` serializes concurrent admissions for one source, so
-/// the count and the insert that follows cannot both pass a maximum.
+/// PostgreSQL side of ADR 0087 for a capped relation. A transaction-scoped
+/// advisory lock on `(from_id, relation)` serializes concurrent admissions for
+/// one source, so the count and the insert that follows cannot both pass the
+/// maximum. The caller holds the shared relation lock.
 fn enforce_postgres_link_maximum(
     client: &mut impl postgres::GenericClient,
     from_id: &str,
     to_id: &str,
     relation: &str,
+    maximum: i64,
 ) -> Result<(), String> {
-    if relation.is_empty() {
-        return Ok(());
-    }
-    // Shared with other admissions, exclusive against a publication of this
-    // relation's maximum, so the bound read below cannot go stale.
-    relation_maximum_lock(client, relation, false)?;
-    let mut maximum: Option<u32> = None;
-    for row in client
-        .query(
-            "SELECT cardinality_json FROM sekai_ontology_relations WHERE mapped_relation = $1",
-            &[&relation],
-        )
-        .map_err(|error| error.to_string())?
-    {
-        let cardinality: crate::sekai::ontology::Cardinality =
-            serde_json::from_str(row.get::<_, String>(0).as_str())
-                .map_err(|error| error.to_string())?;
-        if let Some(max) = cardinality.max {
-            maximum = Some(maximum.map_or(max, |current| current.min(max)));
-        }
-    }
-    let Some(maximum) = maximum else {
-        return Ok(());
-    };
     transaction_advisory_lock(
         client,
         &format!("sekai-link-max\u{1f}{from_id}\u{1f}{relation}"),
@@ -1066,7 +1065,7 @@ fn enforce_postgres_link_maximum(
         )
         .map_err(|error| error.to_string())?;
     let (already_linked, distinct_targets): (bool, i64) = (row.get(0), row.get(1));
-    if !already_linked && distinct_targets >= i64::from(maximum) {
+    if !already_linked && distinct_targets >= maximum {
         return Err(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED.into());
     }
     Ok(())
@@ -1328,5 +1327,18 @@ mod tests {
             refused.starts_with(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED),
             "{refused}"
         );
+
+        // #1144: the tightest maximum among relations mapped to one link
+        // relation applies, and an unbounded mapping lifts no other bound.
+        let mut affiliated = works_for.clone();
+        affiliated.name = format!("affiliated_with_{run}");
+        affiliated.cardinality.max = Some(2);
+        db.upsert_ontology_relation(&affiliated).unwrap();
+        db.create_object(&object("c3", &company_kind)).unwrap();
+        assert_eq!(
+            db.create_link(&link("l3", "p1", "c3")).unwrap_err(),
+            crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED
+        );
+        db.create_link(&link("l4", "p2", "c3")).unwrap();
     }
 }

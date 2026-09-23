@@ -6,6 +6,10 @@
   `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
   with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
   locally with Docker or Apple `container` (#1153).
+- Link admission on community PostgreSQL reads the link id and the tightest
+  mapped relation maximum in one statement after taking the shared relation
+  lock. An uncapped insert now costs three statements instead of four, and a
+  capped one five instead of six. The ADR 0087 locking order is unchanged (#1144).
 - SQLite link admission no longer loads every ontology class and relation
   under the write lock for links whose relation no ontology relation maps. An
   indexed lookup on `mapped_relation` answers that first. Mapped relations are
