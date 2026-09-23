@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `RunActionBinding` no longer loses a page when it crashes during a binding's
+  first pinned read. The pin is stored before the read that creates the
+  binding's subscription, together with a marker that no subscription existed.
+  The next run rewinds the new subscription to its pin and delivers the page
+  again (#1141).
 - The integration contract lists Action approval (park and decide) as
   `experimental` through `DecideActionInstance` instead of `unavailable`, and
   the governed Action instance guide tells consumers how to move from the old

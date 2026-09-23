@@ -178,8 +178,19 @@ pub struct ActionBindingCursor {
     /// between reading a page and persisting its events: a run that finds it
     /// restores the subscription to it, so the page is delivered again
     /// instead of lost.
-    pub read_marker: Option<crate::sekai::event_subscription::EventSubscription>,
+    pub read_marker: Option<ReadMarker>,
 }
+
+/// Subscription state recorded before a page read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadMarker {
+    /// No subscription existed yet (the first pin): recovery rewinds
+    /// the one the read created to its pin, so the page is delivered again.
+    Absent,
+    Subscription(Box<crate::sekai::event_subscription::EventSubscription>),
+}
+
+const READ_MARKER_ABSENT: &str = "absent";
 
 impl SekaiDb {
     fn migrate_action_bindings(&self) -> Result<(), String> {
@@ -285,14 +296,15 @@ impl SekaiDb {
                         .map_err(|error| format!("corrupt action binding: {error}"))?;
                     let pending_events = serde_json::from_str(&pending)
                         .map_err(|error| format!("corrupt action binding cursor: {error}"))?;
-                    let read_marker =
-                        if marker.is_empty() {
-                            None
-                        } else {
-                            Some(serde_json::from_str(&marker).map_err(|error| {
+                    let read_marker = match marker.as_str() {
+                        "" => None,
+                        READ_MARKER_ABSENT => Some(ReadMarker::Absent),
+                        json => Some(ReadMarker::Subscription(Box::new(
+                            serde_json::from_str(json).map_err(|error| {
                                 format!("corrupt action binding cursor: {error}")
-                            })?)
-                        };
+                            })?,
+                        ))),
+                    };
                     Ok((
                         binding,
                         ActionBindingCursor {
@@ -318,13 +330,13 @@ impl SekaiDb {
         self.migrate_action_bindings()?;
         let pending =
             serde_json::to_string(&cursor.pending_events).map_err(|error| error.to_string())?;
-        let marker = cursor
-            .read_marker
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default();
+        let marker = match &cursor.read_marker {
+            None => String::new(),
+            Some(ReadMarker::Absent) => READ_MARKER_ABSENT.into(),
+            Some(ReadMarker::Subscription(subscription)) => {
+                serde_json::to_string(subscription).map_err(|error| error.to_string())?
+            }
+        };
         self.conn()
             .execute(
                 "UPDATE sekai_action_bindings
@@ -350,6 +362,54 @@ impl SekaiDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_markers_round_trip_through_storage() {
+        // #1141: an absent marker, a recorded subscription, and no marker
+        // each read back as written.
+        let db = SekaiDb::new(":memory:").unwrap();
+        let stored = db.put_action_binding(&binding(), "admin", 1).unwrap();
+        let subscription = crate::sekai::event_subscription::EventSubscription {
+            contract_version: "sekai.event-subscription/v1".into(),
+            subscription_id: "action-binding.escalate-on-update".into(),
+            namespace: "acme".into(),
+            owner: "svc".into(),
+            stream_id: "stream-1".into(),
+            schema_revision: "1".into(),
+            type_digest: "sha256:type".into(),
+            definition_digest: "sha256:definition".into(),
+            columns: Vec::new(),
+            retention_ms: 0,
+            status: "active".into(),
+            cursor: crate::sekai::event_subscription::EventSubscriptionCursor {
+                generation: 1,
+                feed_epoch: "epoch".into(),
+                committed_offset: 7,
+                last_page_digest: "sha256:page".into(),
+                admitted_at_ms: 1,
+            },
+            registered_by: "svc".into(),
+            registered_at_ms: 1,
+        };
+        for marker in [
+            None,
+            Some(ReadMarker::Absent),
+            Some(ReadMarker::Subscription(Box::new(subscription))),
+        ] {
+            let cursor = ActionBindingCursor {
+                snapshot_revision: "pin".into(),
+                read_marker: marker.clone(),
+                ..Default::default()
+            };
+            db.advance_action_binding_cursor(&stored, &cursor, 2)
+                .unwrap();
+            let (_, loaded) = db
+                .get_action_binding("acme", "escalate-on-update")
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.read_marker, marker);
+        }
+    }
 
     pub(crate) fn binding() -> ActionBinding {
         ActionBinding {
