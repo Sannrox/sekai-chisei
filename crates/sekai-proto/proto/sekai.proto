@@ -1037,6 +1037,9 @@ message GovernedActionType {
   repeated string declared_effect_kinds = 17;
   // Additive System One Function bind. Empty means preview does not fill.
   string system_one_json = 18;
+  // Principals who may grant or deny a parked instance. Empty means namespace
+  // administrators. A submitter never decides their own instance (#1084).
+  repeated string approvers = 19;
 }
 message PutGovernedActionTypeRequest { GovernedActionType type = 1; string request_id = 2; }
 message PutGovernedActionTypeResponse { GovernedActionType type = 1; }
@@ -1070,7 +1073,7 @@ message ActionInstance {
   string idempotency_key = 8;
   // Bound operation correlation spine for receipts/harvest.
   string operation_id = 9;
-  // admitted | denied
+  // admitted | denied | parked (awaiting an approver decision)
   string status = 10;
   string deny_reason = 11;
   repeated string evidence_submission_ids = 12;
@@ -1080,6 +1083,9 @@ message ActionInstance {
   int64 decided_at_ms = 16;
   // Bind + admitted parameter-body provenance. Empty when the type has no bind.
   string system_one_fill_json = 17;
+  // Approver who decided a parked instance, and their decision (grant | deny).
+  string decided_by = 18;
+  string approval_decision = 19;
 }
 message SubmitActionInstanceRequest {
   string namespace = 1;
@@ -1095,6 +1101,20 @@ message SubmitActionInstanceRequest {
 }
 message SubmitActionInstanceResponse {
   ActionInstance instance = 1;
+  bool replay = 2;
+}
+// Grant or deny a parked ActionInstance (#1084). Grant resumes the same
+// instance through admission against current state; deny is terminal.
+message DecideActionInstanceRequest {
+  string instance_id = 1;
+  // grant | deny
+  string decision = 2;
+  // Optional approver note, recorded in audit. Not parameter data.
+  string reason = 3;
+}
+message DecideActionInstanceResponse {
+  ActionInstance instance = 1;
+  // True when this decision was already recorded; nothing changed.
   bool replay = 2;
 }
 
@@ -2361,6 +2381,7 @@ service SekaiService {
   rpc SetGovernedActionTypeEnabled(SetGovernedActionTypeEnabledRequest) returns (SetGovernedActionTypeEnabledResponse);
   // Governed ActionInstance admission (#397).
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
+  rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);

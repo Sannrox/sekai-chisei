@@ -814,6 +814,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_actions::submit_action_instance(self, req).await
     }
 
+    async fn decide_action_instance(
+        &self,
+        req: Request<DecideActionInstanceRequest>,
+    ) -> Result<Response<DecideActionInstanceResponse>, Status> {
+        rpc_actions::decide_action_instance(self, req).await
+    }
+
     async fn describe_object_action(
         &self,
         req: Request<DescribeObjectActionRequest>,

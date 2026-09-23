@@ -156,6 +156,7 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.ListGovernedActionTypes` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
+| `SekaiService.DecideActionInstance` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |

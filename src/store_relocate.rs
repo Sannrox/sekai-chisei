@@ -2293,6 +2293,10 @@ mod tests {
         layout
             .sekai_runtime()
             .put_action_instance(&ActionInstance {
+                autonomous_envelope_id: String::new(),
+                parked_object_digest: String::new(),
+                decided_by: String::new(),
+                approval_decision: String::new(),
                 instance_id: instance_id.into(),
                 namespace: "ns".into(),
                 type_id: "type-1043".into(),

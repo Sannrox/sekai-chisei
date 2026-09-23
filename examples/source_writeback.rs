@@ -657,6 +657,7 @@ async fn bootstrap_types(sekai: &SekaiServiceImpl) -> Result<(), String> {
         .put_governed_action_type(with_principal(
             PutGovernedActionTypeRequest {
                 r#type: Some(GovernedActionType {
+                    approvers: Vec::new(),
                     namespace: NAMESPACE.into(),
                     type_id: ACTION_TYPE_ID.into(),
                     version: ACTION_TYPE_VERSION.into(),

@@ -4724,6 +4724,7 @@ async fn governed_action_type_registry_put_get_list_disable() {
     let svc = service();
     grant_action_admin(&svc);
     let type_def = GovernedActionType {
+        approvers: Vec::new(),
         namespace: "acme".into(),
         type_id: "review.intake".into(),
         version: "1.0.0".into(),
@@ -4860,6 +4861,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
     grant_action_admin(&svc);
 
     let type_def = GovernedActionType {
+        approvers: Vec::new(),
         namespace: "acme".into(),
         type_id: "review.intake".into(),
         version: "1.0.0".into(),
@@ -5047,6 +5049,7 @@ async fn submit_rejects_parameters_outside_governed_action_schema() {
     grant_action_admin(&svc);
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "validated.action".into(),
             version: "1.0.0".into(),
@@ -5203,6 +5206,7 @@ async fn submit_rejects_invalid_materialized_effect_before_admit() {
     grant_action_admin(&svc);
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "dispatch.nul".into(),
             version: "1.0.0".into(),
@@ -5428,6 +5432,7 @@ async fn submit_action_instance_creates_record_of_ensured_kind() {
 
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),
             version: "1".into(),
@@ -5505,6 +5510,7 @@ async fn submit_action_instance_propagates_one_operation_identity() {
     .unwrap();
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "customer.record.create".into(),
             version: "1".into(),
@@ -5638,6 +5644,7 @@ async fn describe_and_preview_object_action_are_observational() {
     svc.db.runtime().create_object(&object).unwrap();
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "customer.record.update".into(),
             version: "1".into(),
@@ -5807,6 +5814,7 @@ async fn preview_does_not_fill_system_one_when_stale_or_denied() {
     put_system_one_ticket_type(&svc);
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "support.triage".into(),
             version: "1".into(),
@@ -5929,6 +5937,7 @@ async fn preview_records_typesafe_egress_after_admission() {
     put_system_one_ticket_type(&svc);
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "support.triage".into(),
             version: "1".into(),
@@ -6041,6 +6050,7 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
     put_system_one_ticket_type(&svc);
     svc.put_governed_action_type(with_principal(PutGovernedActionTypeRequest {
         r#type: Some(GovernedActionType {
+            approvers: Vec::new(),
             namespace: "acme".into(),
             type_id: "support.triage".into(),
             version: "1".into(),

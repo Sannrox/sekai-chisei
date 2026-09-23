@@ -199,6 +199,9 @@ pub(super) async fn submit_action_instance(
                 Status::failed_precondition(message)
             }
             ActionInstanceAdmissionError::AlreadyExists(message) => Status::already_exists(message),
+            ActionInstanceAdmissionError::PermissionDenied(message) => {
+                Status::permission_denied(message)
+            }
             ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
         })
     })?;
@@ -207,6 +210,85 @@ pub(super) async fn submit_action_instance(
         replay: outcome.replay,
     }))
 }
+/// Grant or deny a parked instance (#1084). Every refusal, including an
+/// unknown instance, answers `access denied`, so the RPC discloses nothing
+/// about instances the caller may not decide.
+pub(super) async fn decide_action_instance(
+    service: &SekaiServiceImpl,
+    req: Request<DecideActionInstanceRequest>,
+) -> Result<Response<DecideActionInstanceResponse>, Status> {
+    use crate::sekai::action_instance_admission::{
+        ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceDecisionRequest,
+        DECISION_ACCESS_DENIED,
+    };
+
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    // Before any lookup, so the answer never depends on whether an
+    // instance exists.
+    if matches!(
+        service.db.runtime(),
+        crate::db::runtime_db::RuntimeDb::Postgres(_)
+    ) {
+        return Err(Status::unavailable(
+            crate::db::runtime_db::DECIDE_ACTION_INSTANCE_UNAVAILABLE,
+        ));
+    }
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let inner = req.into_inner();
+    let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
+    let instance = service
+        .db
+        .runtime()
+        .get_action_instance(inner.instance_id.trim())
+        .map_err(Status::internal)?
+        .ok_or_else(access_denied)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &instance.namespace,
+        true,
+    )
+    .map_err(|_| access_denied())?;
+    check_team_namespace(service.db.runtime(), &principals, &instance.namespace, true)
+        .map_err(|_| access_denied())?;
+    let decider_is_namespace_admin =
+        authorize_source_type_namespace_admin(service, &principals, &instance.namespace).is_ok();
+    let decider = principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    let outcome = ActionInstanceAdmission::new(service.db.runtime(), None)
+        .decide(
+            ActionInstanceDecisionRequest {
+                instance_id: inner.instance_id,
+                decision: inner.decision,
+                reason: inner.reason,
+                decider_principals: principals,
+                decider_is_namespace_admin,
+            },
+            &decider,
+            now_millis(),
+        )
+        .map_err(|error| match error {
+            ActionInstanceAdmissionError::InvalidArgument(message) => {
+                Status::invalid_argument(message)
+            }
+            ActionInstanceAdmissionError::FailedPrecondition(message) => {
+                Status::failed_precondition(message)
+            }
+            ActionInstanceAdmissionError::AlreadyExists(message) => Status::already_exists(message),
+            ActionInstanceAdmissionError::PermissionDenied(message) => {
+                Status::permission_denied(message)
+            }
+            ActionInstanceAdmissionError::Internal(message) => Status::internal(message),
+        })?;
+    Ok(Response::new(DecideActionInstanceResponse {
+        instance: Some(to_proto_action_instance(&outcome.instance)),
+        replay: outcome.replay,
+    }))
+}
+
 pub(super) async fn describe_object_action(
     service: &SekaiServiceImpl,
     req: Request<DescribeObjectActionRequest>,

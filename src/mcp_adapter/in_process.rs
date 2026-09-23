@@ -137,6 +137,7 @@ impl InProcessSurface {
                         description: "Admit review".into(),
                         parameter_schema_json: r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}"#.into(),
                         allowed_effect_kinds: vec!["runtime_dispatch".into()],
+                        approvers: Vec::new(),
                         policy_scope: String::new(),
                         budget_scope: String::new(),
                         enabled: true,

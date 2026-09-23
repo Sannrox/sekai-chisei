@@ -1229,6 +1229,18 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "DecideActionInstance",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/sekai/action_instance_admission.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DescribeObjectAction",
       "kind": "query",
       "surfaces": [],

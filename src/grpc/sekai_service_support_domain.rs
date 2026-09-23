@@ -387,6 +387,7 @@ pub(super) fn from_proto_governed_action_type(
             .collect(),
         declared_effect_kinds: proto.declared_effect_kinds,
         system_one: parse_system_one_json(&proto.system_one_json)?,
+        approvers: proto.approvers,
         enabled: proto.enabled,
         created_by: proto.created_by,
         created_at_ms: proto.created_at_ms,
@@ -421,6 +422,7 @@ pub(super) fn to_proto_governed_action_type(
             .filter(|bind| !bind.is_empty())
             .map(|bind| serde_json::to_string(bind).unwrap_or_default())
             .unwrap_or_default(),
+        approvers: domain.approvers.clone(),
         enabled: domain.enabled,
         created_by: domain.created_by.clone(),
         created_at_ms: domain.created_at_ms,
@@ -469,6 +471,8 @@ pub(super) fn to_proto_action_instance(
         created_at_ms: domain.created_at_ms,
         decided_at_ms: domain.decided_at_ms,
         system_one_fill_json: domain.system_one_fill_json.clone(),
+        decided_by: domain.decided_by.clone(),
+        approval_decision: domain.approval_decision.clone(),
     }
 }
 pub(super) fn to_proto_action_effect(

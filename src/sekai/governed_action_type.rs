@@ -50,6 +50,11 @@ pub struct GovernedActionType {
     /// Optional System One Function bind. Empty means preview does not fill.
     #[serde(default)]
     pub system_one: Option<sekai_provider::system_one::SystemOneBind>,
+    /// Principals who may grant or deny a parked instance of this type.
+    /// Empty means namespace administrators decide. A submitter never
+    /// decides their own instance (#1084).
+    #[serde(default)]
+    pub approvers: Vec<String>,
     pub enabled: bool,
     pub created_by: String,
     pub created_at_ms: i64,
@@ -64,6 +69,13 @@ impl GovernedActionType {
         }
         if self.type_id.trim().is_empty() {
             return Err("type_id required".into());
+        }
+        if self
+            .approvers
+            .iter()
+            .any(|approver| approver.trim().is_empty() || approver.chars().any(char::is_whitespace))
+        {
+            return Err("approvers must be non-empty principals without whitespace".into());
         }
         if self.version.trim().is_empty() {
             return Err("version required".into());

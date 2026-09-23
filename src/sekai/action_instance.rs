@@ -10,6 +10,11 @@ use sha2::{Digest, Sha256};
 
 pub const STATUS_ADMITTED: &str = "admitted";
 pub const STATUS_DENIED: &str = "denied";
+/// Admitted to wait for an approver: the policy decided `require_approval`.
+/// A decision moves it to `admitted` or `denied` exactly once (#1084).
+pub const STATUS_PARKED: &str = "parked";
+pub const DECISION_GRANT: &str = "grant";
+pub const DECISION_DENY: &str = "deny";
 
 /// Policy action name used when resolving ActionPolicy for submits.
 pub const SUBMIT_POLICY_ACTION: &str = "submit_action_instance";
@@ -30,7 +35,7 @@ pub struct ActionInstance {
     pub idempotency_key: String,
     /// Bound operation correlation spine for receipts/harvest (#400).
     pub operation_id: String,
-    /// `admitted` or `denied`.
+    /// `admitted`, `denied`, or `parked` awaiting an approver decision.
     pub status: String,
     pub deny_reason: String,
     pub evidence_submission_ids: Vec<String>,
@@ -41,6 +46,19 @@ pub struct ActionInstance {
     /// Bind + parameter-body provenance when the type has a System One bind.
     #[serde(default)]
     pub system_one_fill_json: String,
+    /// Digest of the target object when the instance parked; a grant fails
+    /// closed if the object changed since. Empty when no object is bound.
+    #[serde(default)]
+    pub parked_object_digest: String,
+    /// Approver who decided a parked instance, and their decision.
+    #[serde(default)]
+    pub decided_by: String,
+    #[serde(default)]
+    pub approval_decision: String,
+    /// Autonomous envelope the submit was bound to, so a later grant can
+    /// require it to still be live.
+    #[serde(default)]
+    pub autonomous_envelope_id: String,
 }
 
 impl ActionInstance {
@@ -61,7 +79,10 @@ impl ActionInstance {
             return Err("idempotency_key must not contain whitespace".into());
         }
         validate_parameters_json(&self.parameters_json)?;
-        if self.status != STATUS_ADMITTED && self.status != STATUS_DENIED {
+        if self.status != STATUS_ADMITTED
+            && self.status != STATUS_DENIED
+            && self.status != STATUS_PARKED
+        {
             return Err(format!("invalid status {:?}", self.status));
         }
         Ok(())
@@ -419,6 +440,42 @@ impl SekaiDb {
         }
     }
 
+    /// Moves a parked instance to its decided state. Returns false when the
+    /// instance is no longer parked, so the first decision wins.
+    pub fn decide_parked_action_instance(&self, decided: &ActionInstance) -> Result<bool, String> {
+        self.transition_action_instance(STATUS_PARKED, decided)
+    }
+
+    /// Replaces an instance only while it still has `expected_status`.
+    pub fn transition_action_instance(
+        &self,
+        expected_status: &str,
+        decided: &ActionInstance,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        decided.validate_fields()?;
+        let body_json = serde_json::to_string(decided).map_err(|e| e.to_string())?;
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE sekai_action_instances
+             SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
+                 decided_at_ms = ?6, body_json = ?7
+             WHERE instance_id = ?1 AND status = ?8",
+            params![
+                decided.instance_id,
+                decided.status,
+                decided.deny_reason,
+                decided.policy_decision,
+                decided.budget_decision,
+                decided.decided_at_ms,
+                body_json,
+                expected_status,
+            ],
+        )
+        .map(|updated| updated == 1)
+        .map_err(|error| error.to_string())
+    }
+
     pub fn delete_action_instance(&self, instance_id: &str) -> Result<(), String> {
         self.migrate_action_instances()?;
         let conn = self.conn();
@@ -437,6 +494,10 @@ mod tests {
 
     fn sample(status: &str) -> ActionInstance {
         ActionInstance {
+            autonomous_envelope_id: String::new(),
+            parked_object_digest: String::new(),
+            decided_by: String::new(),
+            approval_decision: String::new(),
             instance_id: "ai-1".into(),
             namespace: "acme".into(),
             type_id: "review.intake".into(),
