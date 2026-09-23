@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- SQLite link admission no longer loads every ontology class and relation
+  under the write lock for links whose relation no ontology relation maps. An
+  indexed lookup on `mapped_relation` answers that first. Mapped relations are
+  still checked and bounded as before (ADR 0087, #1143).
 - `RunActionBinding` no longer loses a page when it crashes during a binding's
   first pinned read. The pin is stored before the read that creates the
   binding's subscription, together with a marker that no subscription existed.
