@@ -483,7 +483,7 @@ impl PostgresDb {
         tx.execute(
             "UPDATE sekai_reservations AS reservation
              SET expires_at=$2 + (
-                CASE WHEN $3 > 0 THEN $3 ELSE scope.heartbeat_ttl_seconds END
+                CASE WHEN $3::bigint > 0 THEN $3::bigint ELSE scope.heartbeat_ttl_seconds END
              ) * 1000
              FROM sekai_contention_scopes AS scope
              WHERE reservation.scope_id=scope.id

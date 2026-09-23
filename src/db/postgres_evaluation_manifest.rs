@@ -50,10 +50,11 @@ pub(crate) fn put_evaluation_manifest_in_transaction(
     request_id: &str,
     request_digest: &str,
 ) -> Result<ResolvedEvaluationManifest, String> {
-    let lock_key = format!(
-        "{}\0{}\0{}",
-        manifest.namespace, manifest.resolved_by, request_id
-    );
+    let lock_key = crate::db::postgres::advisory_lock_key(&[
+        &manifest.namespace,
+        &manifest.resolved_by,
+        request_id,
+    ]);
     transaction
         .query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",

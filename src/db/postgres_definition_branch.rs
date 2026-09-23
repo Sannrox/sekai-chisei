@@ -2,7 +2,7 @@
 
 use postgres::{GenericClient, Transaction};
 
-use crate::db::postgres::PostgresDb;
+use crate::db::postgres::{PostgresDb, advisory_lock_key};
 use crate::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionBranch,
     DefinitionBranchEditResult, DefinitionMember, DefinitionRevision, DefinitionWriteResult,
@@ -639,12 +639,17 @@ fn lock_write<T: serde::Serialize>(
     let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
     let namespace = string_field(&value, "namespace")?;
     let idempotency_key = string_field(&value, "idempotency_key")?;
-    let mut keys = vec![format!("{namespace}\0{actor}\0{idempotency_key}")];
+    let mut keys = vec![advisory_lock_key(&[
+        namespace,
+        "request",
+        actor,
+        idempotency_key,
+    ])];
     if let Some(branch_id) = optional_string_field(&value, "branch_id") {
-        keys.push(format!("{namespace}\0{branch_id}"));
+        keys.push(advisory_lock_key(&[namespace, "branch", branch_id]));
     }
     if let Some(proposal_id) = optional_string_field(&value, "proposal_id") {
-        keys.push(format!("{namespace}\0proposal\0{proposal_id}"));
+        keys.push(advisory_lock_key(&[namespace, "proposal", proposal_id]));
     }
     for key in keys {
         transaction
@@ -658,7 +663,7 @@ fn lock_write<T: serde::Serialize>(
 }
 
 fn lock_published_head(transaction: &mut Transaction<'_>, namespace: &str) -> Result<(), String> {
-    let key = format!("{namespace}\0published_head");
+    let key = advisory_lock_key(&[namespace, "published_head"]);
     transaction
         .query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 666))",

@@ -83,12 +83,13 @@ impl PostgresDb {
         let action = filter.action.as_deref();
         let target_id = filter.target_id.as_deref();
         let after = filter.after;
-        let limit = if filter.limit > 0 {
+        // LIMIT and OFFSET parameters are inferred as bigint.
+        let limit = i64::from(if filter.limit > 0 {
             filter.limit
         } else {
             i32::MAX
-        };
-        let offset = filter.offset.max(0);
+        });
+        let offset = i64::from(filter.offset.max(0));
         self.connection()?
             .query(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome
