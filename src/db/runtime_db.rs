@@ -92,6 +92,14 @@ impl std::fmt::Debug for RuntimeDb {
 }
 
 impl RuntimeDb {
+    /// Labels this store's connection-pool signals with the plane it serves.
+    pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
+        match self {
+            RuntimeDb::Sqlite(db) => db.set_pool_plane(plane),
+            RuntimeDb::Postgres(db) => db.set_pool_plane(plane),
+        }
+    }
+
     pub fn put_object_security_policy(
         &self,
         policy: &ObjectSecurityPolicy,

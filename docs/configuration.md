@@ -19,6 +19,8 @@ template.
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
 | `CHISEI_DATABASE_URL` | unset | Combined-mode Chisei PostgreSQL URL; must be paired with `SEKAI_DATABASE_URL` |
 | `SEKAI_POSTGRES_MAX_CONNECTIONS` | `16` | Process connection-pool budget. Shared uses the full value. Combined Split divides it across the two stores (16 → 8+8). Also sizes persistent SQLite pools opened through the runtime backend. |
+| `SEKAI_POSTGRES_SEKAI_CONNECTIONS` | unset | Combined Split only: Sekai store pool size, carved out of `SEKAI_POSTGRES_MAX_CONNECTIONS`. Set alone, the Chisei store gets the remainder. Size a plane after `sekai_db_pool_checkout_seconds{plane}` shows it waiting. |
+| `SEKAI_POSTGRES_CHISEI_CONNECTIONS` | unset | Combined Split only: Chisei store pool size. With both set, the sum must fit the budget; sizes that exceed it or leave a store without a connection refuse to start. A `sekai-plane` or `chisei-plane` process uses its own plane's size (at most the budget); a shared store refuses either variable. |
 | `SEKAI_POSTGRES_CA_CERT` | unset | Optional PEM CA certificate path for TLS trust |
 | `GRPC_PORT` | `50051` | TCP gRPC port |
 | `SEKAI_BIND` | inferred | TCP bind address; see [transport modes](operations.md#transport-modes) |

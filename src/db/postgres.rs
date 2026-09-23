@@ -328,6 +328,7 @@ type Manager = PostgresConnectionManager<MakeTlsConnector>;
 /// schema before serving requests.
 pub struct PostgresDb {
     pool: Pool<Manager>,
+    plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
 }
 
 impl std::fmt::Debug for PostgresDb {
@@ -399,7 +400,10 @@ impl PostgresDb {
             );
         }
         drop(prewarmed);
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            plane: std::sync::OnceLock::new(),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -569,10 +573,38 @@ impl PostgresDb {
         self.list_credentials(None, Some("active"))
     }
 
+    /// Labels this pool's checkout signals with the store plane it serves.
+    /// Unlabeled pools report as Shared.
+    pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
+        let _ = self.plane.set(plane);
+    }
+
     pub(crate) fn connection(&self) -> Result<PooledConnection<Manager>, String> {
-        self.pool
-            .get()
-            .map_err(|error| format!("acquire PostgreSQL connection: {error}"))
+        use crate::obs::labels::{Outcome, PoolPlane};
+        let started = std::time::Instant::now();
+        let plane = self.plane.get().copied().unwrap_or(PoolPlane::Shared);
+        match self.pool.get() {
+            Ok(connection) => {
+                let state = self.pool.state();
+                let in_use = state.connections.saturating_sub(state.idle_connections);
+                crate::obs::signals::record_pool_checkout(
+                    plane,
+                    Outcome::Ok,
+                    started.elapsed(),
+                    f64::from(in_use) / f64::from(self.pool.max_size().max(1)),
+                );
+                Ok(connection)
+            }
+            Err(error) => {
+                crate::obs::signals::record_pool_checkout(
+                    plane,
+                    Outcome::Timeout,
+                    started.elapsed(),
+                    1.0,
+                );
+                Err(format!("acquire PostgreSQL connection: {error}"))
+            }
+        }
     }
 
     fn migrate(&self) -> Result<(), String> {
