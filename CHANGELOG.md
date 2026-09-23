@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `PutActionBinding` now refuses a binding that leaves a `required` parameter
+  of the bound Action type unmapped (`INVALID_ARGUMENT` naming the parameter).
+  Such a binding used to install and then skip every event for good (#1142).
 - A principal named in a governed Action type's `approvers` can now decide a
   parked instance with read-only namespace membership. `DecideActionInstance`
   no longer requires namespace Write before checking the approver entitlement,

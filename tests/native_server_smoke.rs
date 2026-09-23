@@ -1139,6 +1139,20 @@ async fn spawned_binary_admits_one_action_per_bound_object_change() {
         .await
         .expect_err("a namespace editor cannot install unattended writes");
     assert_eq!(refused.code(), Code::PermissionDenied);
+    // #1142: leaving a required parameter unmapped would skip every event.
+    let mut incomplete: Value = serde_json::from_str(&binding_json).unwrap();
+    incomplete["parameters"]
+        .as_object_mut()
+        .unwrap()
+        .remove("severity");
+    let unmapped = sekai
+        .put_action_binding(PutActionBindingRequest {
+            binding_json: incomplete.to_string(),
+        })
+        .await
+        .expect_err("an unmapped required parameter is refused at install");
+    assert_eq!(unmapped.code(), Code::InvalidArgument);
+    assert!(unmapped.message().contains("severity"), "{unmapped:?}");
     let installed = sekai
         .put_action_binding(PutActionBindingRequest { binding_json })
         .await
