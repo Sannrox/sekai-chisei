@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `DecideActionInstance` now binds an approval to the one subject a bearer or
+  enterprise credential established. Self-asserted identities from the local
+  socket or insecure transport, comma-listed `x-principal` values, and the
+  reserved `root` / `local` names can no longer decide, and namespace-admin
+  standing is checked for that single subject only (#1140).
 - Community PostgreSQL no longer fails with `INTERNAL` on audit-decision
   listing, object-change history and feed, evidence submissions, policy
   attestations, object-type index pages, and work-unit heartbeats. Those
