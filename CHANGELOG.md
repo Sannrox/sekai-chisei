@@ -8,6 +8,11 @@
   write without its grant, a stale target is denied `stale_on_resume` with no
   write, and concurrent grants apply the write once with no compensating
   restore (#1139).
+- A principal named in a governed Action type's `approvers` can now decide a
+  parked instance with read-only namespace membership. `DecideActionInstance`
+  no longer requires namespace Write before checking the approver entitlement,
+  matching ADR 0089. The namespace-admin fallback still requires admin
+  standing (#1146).
 - Learning records, relationship objects, capability authorizations, and team
   namespace bootstrap now take the SQLite write lock before their existence and
   link-bound reads, as the primary link path does. Concurrent writers wait for

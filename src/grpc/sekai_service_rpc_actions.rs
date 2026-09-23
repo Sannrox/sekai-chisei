@@ -255,8 +255,9 @@ pub(super) async fn decide_action_instance(
         true,
     )
     .map_err(|_| access_denied())?;
-    check_team_namespace(service.db.runtime(), &principals, &instance.namespace, true)
-        .map_err(|_| access_denied())?;
+    // ADR 0089: a named approver decides on authentication, tenant, and
+    // entitlement alone; namespace Write is not required (#1146). The
+    // namespace-admin fallback checks its own standing below.
     let decider_is_namespace_admin =
         authorize_source_type_namespace_admin(service, &principals, &instance.namespace).is_ok();
     let outcome = ActionInstanceAdmission::new(service.db.runtime(), None)
