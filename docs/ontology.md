@@ -178,6 +178,11 @@ relevant object-kind updates. Existing links are not rewritten. Cardinality is
 advisory metadata in the 1.x contract: its declaration shape is validated, but
 it does not reject links or relation-definition updates, count graph state, or
 synthesize, repair, or delete facts. See [ADR 0018](decisions/0018-ontology-relation-cardinality.md).
+[ADR 0087](decisions/0087-enforce-relation-cardinality-maximum.md) accepts
+enforcing the maximum bound at link admission, counted as distinct targets
+per source and relation, on both backends. The minimum stays advisory. Until
+[#1132](https://github.com/Sannrox/sekai-chisei/issues/1132) ships that
+enforcement, both bounds remain advisory.
 Inverse and transitivity metadata do not synthesize links or facts.
 
 ## Read-only inspection artifact

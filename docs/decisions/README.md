@@ -108,3 +108,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0084: Bind System One as an Action-filling Function](0084-system-one-action-function.md)
 - [ADR 0085: A pinned governed learning changes context only](0085-governed-learning-changes-context-only.md)
 - [ADR 0086: An ObjectSet is its descriptor; members are not stored](0086-object-set-is-its-descriptor.md)
+- [ADR 0087: Enforce ontology relation maximum cardinality; keep the minimum advisory](0087-enforce-relation-cardinality-maximum.md)

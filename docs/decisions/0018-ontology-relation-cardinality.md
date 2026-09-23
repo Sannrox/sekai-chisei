@@ -5,7 +5,7 @@
 - Owners: @Sannrox
 - Discussion: https://github.com/Sannrox/sekai-chisei/issues/542
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0087](0087-enforce-relation-cardinality-maximum.md) for the maximum bound only, effective when #1132 lands
 
 ## Context
 
