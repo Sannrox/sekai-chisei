@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` are now
+  `stable` with `sekaictl ontology context`, `expand`, and `explain` as
+  consumers, and they join the generated TypeScript and Python HTTP clients.
+  Query-time entailment stays SQLite-only: community PostgreSQL fails closed,
+  and the integration contract and capability catalog say so. The stable
+  ceiling moves from 63 to 66 ([ADR 0071](docs/decisions/0071-rpc-maturity.md), #1087).
 - Object-change automation bindings (`sekai.action-binding/v1`, experimental
   `PutActionBinding` / `RunActionBinding`). A namespace administrator binds a
   kind's changes to one pinned governed Action type through a closed parameter

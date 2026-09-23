@@ -53,6 +53,9 @@ Coverage:
 | Plan execution | supported | Chisei | `ChiseiService.PlanExecution` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |
 | Streamed execution | supported | Chisei | `ChiseiService.ExecutePlanStream` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |
 | Operation receipt | supported | Chisei | `ChiseiService.GetOperationReceipt` | [ontology.md](ontology.md) | `sdk/typescript/client.test.ts` |
+| Context retrieval | supported | Sekai | `SekaiService.RetrieveContext` | [ontology.md](ontology.md) | `tests/sekaictl_semantic_reads.rs` |
+| Relation expansion | supported | Sekai | `SekaiService.ExpandRelations` | [ontology.md](ontology.md) | `tests/sekaictl_semantic_reads.rs` |
+| Derivation explanation | supported | Sekai | `SekaiService.ExplainDerivation` | [ontology.md](ontology.md) | `tests/sekaictl_semantic_reads.rs` |
 | Quality-trend report | supported | Chisei | `ChiseiService.GetQualityTrend` | [evaluation-quality-trends.md](evaluation-quality-trends.md) | `sdk/typescript/client.ts` |
 | Native capability catalog | supported | Sekai | `SekaiService.DiscoverCapabilities` | [capability-catalog.md](capability-catalog.md) | `src/capability_codegen.rs` |
 | Client-package record | supported | Sekai | `SekaiService` via `sekaictl admin sdk-packages` | [sdk-packages.md](sdk-packages.md) | `src/sekai/client_package.rs` |
@@ -108,6 +111,7 @@ The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
 
 | Surface | Rust | TypeScript | Python | SQLite | PostgreSQL |
 | --- | --- | --- | --- | --- | --- |
+| Context / expand / explain | `sekaictl ontology context`, `expand`, `explain` | generated HTTP client | generated HTTP client | yes | unavailable (query-time entailment is SQLite-only; discovery reports `backend_postgres_entailment=0`) |
 | Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | fail-closed |
 | Object / link seed | `sekaictl ontology seed` | `runCoreLoop` | `run_core_loop` | yes | yes |
 | Plan / receipt | `sekaictl ontology run` | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |

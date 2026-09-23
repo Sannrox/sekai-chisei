@@ -23,9 +23,10 @@ use crate::grpc::pb::chisei::{
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
-    Cardinality as ProtoCardinality, CreateLinkRequest, CreateObjectRequest,
-    CreateOntologyClassRequest, CreateOntologyRelationRequest, CreateSchemaTypeRequest, Link,
-    Object, ObjectType, OntologyClass, OntologyProperty, OntologyRelation,
+    Cardinality as ProtoCardinality, ContextCandidate, ContextRoot, CreateLinkRequest,
+    CreateObjectRequest, CreateOntologyClassRequest, CreateOntologyRelationRequest,
+    CreateSchemaTypeRequest, ExpandRelationsRequest, ExplainDerivationRequest, Link, Object,
+    ObjectType, OntologyClass, OntologyProperty, OntologyRelation, RetrieveContextRequest,
 };
 use crate::sekai::schema::is_builtin_schema_kind;
 use crate::sekai::semantic;
@@ -36,11 +37,14 @@ pub const DOMAIN_DOC_VERSION: &str = "sekai.ontology-product/v1";
 pub const SEED_DOC_VERSION: &str = "sekai.seed/v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl ontology <inspect|apply|seed|run|first-run> ...\n  \
+    "sekaictl ontology <inspect|apply|seed|run|first-run|context|expand|explain> ...\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
      sekaictl ontology first-run --domain <domain.json> --seed <seed.json> [--resolve-object <id>] [--target ...]\n  \
+     sekaictl ontology context --object <id> [--object <id> ...] [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
+     sekaictl ontology expand --namespace <ns> --object <id> [--relation <r>] [--depth <n>] [--entailment] [--target ...]\n  \
+     sekaictl ontology explain --namespace <ns> --from <id> --to <id> [--relation <r>] [--entailment] [--target ...]\n  \
      sekaictl ontology inspect ...  (see inspect --help path)"
 }
 
@@ -721,6 +725,160 @@ pub async fn fetch_receipt_json(target: &str, request_id: &str) -> Result<String
     Ok(response.receipt_json)
 }
 
+// --- Semantic reads -------------------------------------------------------------
+
+fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+        .collect()
+}
+
+fn reasoning_mode(args: &[String]) -> String {
+    if args.iter().any(|arg| arg == "--entailment") {
+        "entailment".into()
+    } else {
+        String::new()
+    }
+}
+
+fn depth(args: &[String]) -> Result<u32, String> {
+    flag_value(args, "--depth")
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|error| format!("--depth: {error}"))
+        })
+        .transpose()
+        .map(|depth| depth.unwrap_or(1))
+}
+
+fn object_root(object_id: String) -> ContextRoot {
+    ContextRoot {
+        object_id,
+        external_id: String::new(),
+        link_id: String::new(),
+    }
+}
+
+fn print_candidates(candidates: &[ContextCandidate]) {
+    for candidate in candidates {
+        let object = candidate.object.clone().unwrap_or_default();
+        println!(
+            "  object: {} kind={} depth={} via={} derived={}",
+            object.id,
+            object.kind,
+            candidate.depth,
+            if candidate.via_relation.is_empty() {
+                "-"
+            } else {
+                candidate.via_relation.as_str()
+            },
+            candidate
+                .explanation
+                .as_ref()
+                .is_some_and(|explanation| explanation.derived)
+        );
+    }
+}
+
+fn print_links(links: &[Link]) {
+    for link in links {
+        println!(
+            "  link: {} -[{}]-> {}",
+            link.from_id, link.relation, link.to_id
+        );
+    }
+}
+
+async fn retrieve_context(target: &str, args: &[String]) -> Result<(), BoxErr> {
+    let roots = flag_values(args, "--object");
+    if roots.is_empty() {
+        return Err(std::io::Error::other("--object is required").into());
+    }
+    let response = SekaiServiceClient::new(connect_sekai(target).await?)
+        .retrieve_context(RetrieveContextRequest {
+            roots: roots.into_iter().map(object_root).collect(),
+            relations: flag_values(args, "--relation"),
+            max_depth: depth(args).map_err(std::io::Error::other)?,
+            reasoning_mode: reasoning_mode(args),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    println!(
+        "context: candidates={} links={} truncated={} revision={}",
+        response.candidates.len(),
+        response.links.len(),
+        response.truncated,
+        response.ontology_revision
+    );
+    print_candidates(&response.candidates);
+    print_links(&response.links);
+    Ok(())
+}
+
+async fn expand_relations(target: &str, args: &[String]) -> Result<(), BoxErr> {
+    let namespace = require_flag(args, "--namespace").map_err(std::io::Error::other)?;
+    let object = require_flag(args, "--object").map_err(std::io::Error::other)?;
+    let response = SekaiServiceClient::new(connect_sekai(target).await?)
+        .expand_relations(ExpandRelationsRequest {
+            namespace,
+            root: Some(object_root(object)),
+            relations: flag_values(args, "--relation"),
+            reasoning_mode: reasoning_mode(args),
+            max_depth: depth(args).map_err(std::io::Error::other)?,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    println!(
+        "expand: candidates={} links={} truncated={} mode={} revision={}",
+        response.candidates.len(),
+        response.links.len(),
+        response.truncated,
+        if response.reasoning_mode.is_empty() {
+            "asserted_only"
+        } else {
+            response.reasoning_mode.as_str()
+        },
+        response.ontology_revision
+    );
+    print_candidates(&response.candidates);
+    print_links(&response.links);
+    Ok(())
+}
+
+async fn explain_derivation(target: &str, args: &[String]) -> Result<(), BoxErr> {
+    let namespace = require_flag(args, "--namespace").map_err(std::io::Error::other)?;
+    let from = require_flag(args, "--from").map_err(std::io::Error::other)?;
+    let to = require_flag(args, "--to").map_err(std::io::Error::other)?;
+    let response = SekaiServiceClient::new(connect_sekai(target).await?)
+        .explain_derivation(ExplainDerivationRequest {
+            namespace,
+            from: Some(object_root(from)),
+            to: Some(object_root(to)),
+            relations: flag_values(args, "--relation"),
+            reasoning_mode: reasoning_mode(args),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let explanation = response.explanation.unwrap_or_default();
+    println!(
+        "explain: found={} derived={} steps={} truncated={} revision={}",
+        response.found,
+        explanation.derived,
+        explanation.steps.len(),
+        response.truncated,
+        response.ontology_revision
+    );
+    for evidence in &response.evidence_refs {
+        println!("  evidence: {evidence}");
+    }
+    Ok(())
+}
+
 // --- CLI entry ----------------------------------------------------------------
 
 pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -864,6 +1022,9 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
             }
             Ok(())
         }
+        "context" => retrieve_context(&target_from_args(&args[1..]), &args[1..]).await,
+        "expand" => expand_relations(&target_from_args(&args[1..]), &args[1..]).await,
+        "explain" => explain_derivation(&target_from_args(&args[1..]), &args[1..]).await,
         "inspect" => Err(std::io::Error::other(
             "use sekaictl ontology inspect via the main dispatcher",
         )

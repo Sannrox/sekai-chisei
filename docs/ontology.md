@@ -166,6 +166,23 @@ mutation RPCs fail closed until dual-backend audit parity lands (see
 [architecture.md](architecture.md#persistence) and
 [postgres-sekai-parity.md](postgres-sekai-parity.md)).
 
+## Semantic reads
+
+`sekaictl ontology context --object <id>` (`RetrieveContext`),
+`sekaictl ontology expand --namespace <ns> --object <id>` (`ExpandRelations`),
+and `sekaictl ontology explain --namespace <ns> --from <id> --to <id>`
+(`ExplainDerivation`) read bounded, authorized context over declared
+relations. Add `--relation <r>` to narrow the relations, `--depth <n>` to
+bound traversal, and `--entailment` for query-time ontology entailment. Every
+call rechecks namespace, object ACL, object security, and ontology visibility,
+so hidden classes, relations, and properties do not appear. Computed
+properties stay query-time overlays and are never persisted.
+
+These RPCs are `stable` on SQLite. Query-time entailment is SQLite-only:
+community PostgreSQL fails closed, and `DiscoverCapabilities` reports
+`backend_postgres_entailment=0`. See
+[integration-contract.md](integration-contract.md).
+
 ## Validation and deletion
 
 Definitions reject missing references, inheritance cycles, invalid

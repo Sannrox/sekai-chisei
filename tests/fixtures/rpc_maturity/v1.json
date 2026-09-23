@@ -1,7 +1,7 @@
 {
   "version": "sekai.rpc-maturity/v1",
   "issue": 871,
-  "stable_limit": 63,
+  "stable_limit": 66,
   "experimental_env": "SEKAI_EXPERIMENTAL_RPCS",
   "experimental_feature": "experimental-rpcs",
   "entries": [
@@ -505,8 +505,8 @@
       "rpc": "RetrieveContext",
       "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "cli, sdk",
+      "classification": "stable",
       "product_tier": "core"
     },
     {
@@ -514,8 +514,8 @@
       "rpc": "ExpandRelations",
       "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "cli, sdk",
+      "classification": "stable",
       "product_tier": "core"
     },
     {
@@ -523,8 +523,8 @@
       "rpc": "ExplainDerivation",
       "storage_path": "sekai.graph, sekai.authorization, sekai.ontology-definitions",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "cli, sdk",
+      "classification": "stable",
       "product_tier": "core"
     },
     {
