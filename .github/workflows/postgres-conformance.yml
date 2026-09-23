@@ -1,0 +1,42 @@
+name: PostgreSQL conformance
+
+# Runs the ignored PostgreSQL conformance suites against an ephemeral TLS-only
+# PostgreSQL (#1153). Community PostgreSQL defects do not show up in the
+# default SQLite test run, so changes to persistence and the RPC layers above
+# it run these too.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "src/db/**"
+      - "src/grpc/**"
+      - "src/sekai/**"
+      - "src/chisei/**"
+      - "src/store_relocate.rs"
+      - "tests/*backend_conformance.rs"
+      - "tests/*postgres*.rs"
+      - "tests/support/**"
+      - "scripts/postgres-conformance.sh"
+      - ".github/workflows/postgres-conformance.yml"
+      - "Cargo.lock"
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  postgres-conformance:
+    name: PostgreSQL conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/postgres-conformance.sh

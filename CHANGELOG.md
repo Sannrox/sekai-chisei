@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- CI now runs every ignored PostgreSQL conformance suite in a
+  `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
+  with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
+  locally with Docker or Apple `container` (#1153).
 - Link admission on community PostgreSQL reads the link id and the tightest
   mapped relation maximum in one statement after taking the shared relation
   lock. An uncapped insert now costs three statements instead of four, and a
