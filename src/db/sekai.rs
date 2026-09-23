@@ -21,6 +21,7 @@ pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
     enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
     persistent: bool,
+    plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
 }
 
 #[derive(Debug)]
@@ -134,6 +135,7 @@ impl SekaiDb {
             pool,
             enterprise_extension,
             persistent,
+            plane: std::sync::OnceLock::new(),
         };
         db.migrate_all()?;
         Ok(db)
@@ -142,6 +144,19 @@ impl SekaiDb {
     #[cfg(test)]
     pub(crate) fn pool_max_size(&self) -> u32 {
         self.pool.max_size()
+    }
+
+    /// Labels this pool's checkout signals with the store plane it serves.
+    /// Unlabeled pools report as Shared.
+    pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
+        let _ = self.plane.set(plane);
+    }
+
+    fn pool_plane(&self) -> crate::obs::labels::PoolPlane {
+        self.plane
+            .get()
+            .copied()
+            .unwrap_or(crate::obs::labels::PoolPlane::Shared)
     }
 
     pub(crate) fn conn(&self) -> PooledConnection<SqliteConnectionManager> {
@@ -154,7 +169,7 @@ impl SekaiDb {
                         Outcome::Ok,
                         started.elapsed(),
                     );
-                    self.observe_pool_saturation();
+                    self.observe_pool_saturation(started.elapsed());
                     return conn;
                 }
                 Err(error) => {
@@ -165,6 +180,12 @@ impl SekaiDb {
                         WaitKind::ConnectionAcquire,
                         Outcome::Timeout,
                         started.elapsed(),
+                    );
+                    signals::record_pool_checkout(
+                        self.pool_plane(),
+                        Outcome::Timeout,
+                        started.elapsed(),
+                        1.0,
                     );
                     tracing::error!(%error, "database connection pool unavailable; retrying");
                 }
@@ -188,17 +209,16 @@ impl SekaiDb {
     ///
     /// Sampling here rather than on a timer keeps the gauge tied to real demand
     /// and avoids a background task for a value nobody reads while idle.
-    fn observe_pool_saturation(&self) {
+    fn observe_pool_saturation(&self, waited: std::time::Duration) {
         let state = self.pool.state();
         let max_size = self.pool.max_size();
         if max_size == 0 {
             return;
         }
         let in_use = state.connections.saturating_sub(state.idle_connections);
-        signals::set_saturation(
-            Subsystem::Persistence,
-            f64::from(in_use) / f64::from(max_size),
-        );
+        let ratio = f64::from(in_use) / f64::from(max_size);
+        signals::set_saturation(Subsystem::Persistence, ratio);
+        signals::record_pool_checkout(self.pool_plane(), Outcome::Ok, waited, ratio);
     }
 
     pub fn db_lock_poisoned_total(&self) -> u64 {
