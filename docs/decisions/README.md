@@ -107,3 +107,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0083: Two-store cutover and recovery contract](0083-two-store-cutover-and-recovery.md)
 - [ADR 0084: Bind System One as an Action-filling Function](0084-system-one-action-function.md)
 - [ADR 0085: A pinned governed learning changes context only](0085-governed-learning-changes-context-only.md)
+- [ADR 0088: One object-log host owns identity; clerk processes are its clients](0088-one-object-log-host-many-clerk-clients.md)
