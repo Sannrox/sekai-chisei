@@ -982,6 +982,18 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
         .expect("instance");
     assert_eq!(parked.status, "parked");
 
+    // The operator socket's self-asserted identity cannot approve (#1140).
+    let local = sekai
+        .decide_action_instance(DecideActionInstanceRequest {
+            instance_id: parked.instance_id.clone(),
+            decision: "grant".into(),
+            reason: String::new(),
+        })
+        .await
+        .expect_err("the local socket identity is not a credentialed approver");
+    assert_eq!(local.code(), Code::PermissionDenied);
+    assert_eq!(local.message(), "access denied");
+
     for token in [&submitter, &foreign] {
         let refused = sekai
             .decide_action_instance(bearer(

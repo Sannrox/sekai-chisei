@@ -235,8 +235,13 @@ pub(super) async fn decide_action_instance(
         ));
     }
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let inner = req.into_inner();
     let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
+    // An approval binds to one credentialed subject (#1140). Self-asserted
+    // identities from the local or insecure transport, comma-listed
+    // principals, and the reserved operator names cannot decide.
+    let decider = credentialed_decider(&req, &principals).ok_or_else(access_denied)?;
+    let principals = vec![decider.clone()];
+    let inner = req.into_inner();
     let instance = service
         .db
         .runtime()
@@ -254,10 +259,6 @@ pub(super) async fn decide_action_instance(
         .map_err(|_| access_denied())?;
     let decider_is_namespace_admin =
         authorize_source_type_namespace_admin(service, &principals, &instance.namespace).is_ok();
-    let decider = principals
-        .first()
-        .cloned()
-        .ok_or_else(|| Status::unauthenticated("principal required"))?;
     let outcome = ActionInstanceAdmission::new(service.db.runtime(), None)
         .decide(
             ActionInstanceDecisionRequest {
@@ -852,4 +853,74 @@ pub(super) async fn get_lineage(
     req: Request<GetLineageRequest>,
 ) -> Result<Response<GetLineageResponse>, Status> {
     service.get_visible_lineage(req).await
+}
+
+/// The single subject a token or enterprise credential established for this
+/// request, or `None` when the identity is self-asserted or ambiguous.
+fn credentialed_decider<T>(req: &Request<T>, principals: &[String]) -> Option<String> {
+    let enterprise = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .is_some();
+    let credentialed = enterprise
+        || matches!(
+            req.metadata()
+                .get("x-sekai-auth-source")
+                .and_then(|value| value.to_str().ok()),
+            Some("token" | "enterprise")
+        );
+    match principals {
+        [subject]
+            if credentialed && !matches!(subject.as_str(), "root" | "local" | "anonymous") =>
+        {
+            Some(subject.clone())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod credentialed_decider_tests {
+    use super::credentialed_decider;
+    use tonic::Request;
+
+    fn request(source: Option<&str>) -> Request<()> {
+        let mut request = Request::new(());
+        if let Some(source) = source {
+            request
+                .metadata_mut()
+                .insert("x-sekai-auth-source", source.parse().unwrap());
+        }
+        request
+    }
+
+    fn principals(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn only_one_credentialed_subject_may_decide() {
+        assert_eq!(
+            credentialed_decider(&request(Some("token")), &principals(&["bob"])).as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            credentialed_decider(&request(Some("enterprise")), &principals(&["bob"])).as_deref(),
+            Some("bob")
+        );
+        // Self-asserted identities: local socket, insecure transport, none.
+        for source in [Some("local"), None] {
+            assert!(credentialed_decider(&request(source), &principals(&["bob"])).is_none());
+        }
+        // A comma-listed x-principal never becomes any-of.
+        assert!(
+            credentialed_decider(&request(Some("token")), &principals(&["mallory", "bob"]))
+                .is_none()
+        );
+        for reserved in ["root", "local", "anonymous"] {
+            assert!(
+                credentialed_decider(&request(Some("token")), &principals(&[reserved])).is_none()
+            );
+        }
+    }
 }

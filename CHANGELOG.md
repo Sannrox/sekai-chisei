@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `DecideActionInstance` now binds an approval to the one subject a bearer or
+  enterprise credential established. Self-asserted identities from the local
+  socket or insecure transport, comma-listed `x-principal` values, and the
+  reserved `root` / `local` names can no longer decide, and namespace-admin
+  standing is checked for that single subject only (#1140).
 - `ExpandRelations`, `ExplainDerivation`, and `RetrieveContext` now apply the
   enterprise tenant gate like object reads: a request without an authenticated
   context fails `UNAUTHENTICATED` when an identity extension is installed, a
