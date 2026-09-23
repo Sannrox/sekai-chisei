@@ -6,6 +6,22 @@
   mapped relation maximum in one statement after taking the shared relation
   lock. An uncapped insert now costs three statements instead of four, and a
   capped one five instead of six. The ADR 0087 locking order is unchanged (#1144).
+- SQLite link admission no longer loads every ontology class and relation
+  under the write lock for links whose relation no ontology relation maps. An
+  indexed lookup on `mapped_relation` answers that first. Mapped relations are
+  still checked and bounded as before (ADR 0087, #1143).
+- `RunActionBinding` no longer loses a page when it crashes during a binding's
+  first pinned read. The pin is stored before the read that creates the
+  binding's subscription, together with a marker that no subscription existed.
+  The next run rewinds the new subscription to its pin and delivers the page
+  again (#1141).
+- `PutActionBinding` now refuses a binding that leaves a `required` parameter
+  of the bound Action type unmapped (`INVALID_ARGUMENT` naming the parameter).
+  Such a binding used to install and then skip every event for good (#1142).
+- The RPC maturity ledger marks `DecideActionInstance`, `PutActionBinding`, and
+  `RunActionBinding` as `sqlite only`: community PostgreSQL answers
+  `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
+  runtimes may be `stable` (#1150).
 - `DiscoverCapabilities` now reports `supports_entailment=0` for
   `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
   PostgreSQL, where those RPCs serve asserted-only reasoning and fail

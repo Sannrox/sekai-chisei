@@ -1,7 +1,7 @@
 //! Install and run object-change automation bindings (#1092, ADR 0090).
 
 use super::*;
-use crate::sekai::action_binding::ActionBinding;
+use crate::sekai::action_binding::{ActionBinding, ReadMarker};
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
 };
@@ -40,17 +40,20 @@ impl SekaiServiceImpl {
                 &binding.version,
             )
             .map_err(|_| Status::failed_precondition("bound action type unavailable"))?;
-        let declared = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
+        let schema = serde_json::from_str::<serde_json::Value>(&type_def.parameter_schema_json)
             .ok()
-            .and_then(|schema| {
+            .filter(|schema| {
                 schema
                     .get("properties")
-                    .and_then(|properties| properties.as_object())
-                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                    .is_some_and(|value| value.is_object())
             })
             .ok_or_else(|| {
                 Status::failed_precondition("bound action type parameter schema unavailable")
             })?;
+        let declared = schema["properties"]
+            .as_object()
+            .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
         if let Some(name) = binding
             .parameters
             .keys()
@@ -58,6 +61,20 @@ impl SekaiServiceImpl {
         {
             return Err(Status::invalid_argument(format!(
                 "parameter {name:?} is not declared by the bound action type"
+            )));
+        }
+        // An unmapped required parameter would make every event fail schema
+        // validation and be skipped for good, so refuse it at install (#1142).
+        if let Some(name) = schema
+            .get("required")
+            .and_then(|required| required.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str())
+            .find(|name| !binding.parameters.contains_key(*name))
+        {
+            return Err(Status::invalid_argument(format!(
+                "required parameter {name:?} of the bound action type is not mapped"
             )));
         }
         check_team_namespace(
@@ -194,18 +211,35 @@ impl SekaiServiceImpl {
             // A marker with no pending events means an earlier run read a page
             // (committing the subscription cursor) but never persisted its
             // events. Put the subscription back so the page is delivered again.
-            if let Some(marker) = cursor.read_marker.take()
-                && let Some(current) = inspect()
-                && current != marker
-            {
+            // An `Absent` marker means the read created the subscription; rewind
+            // it to its pin, where an empty cursor restarts delivery (#1141).
+            let restore = match (cursor.read_marker.take(), inspect()) {
+                (Some(ReadMarker::Subscription(marker)), Some(current)) if current != *marker => {
+                    Some((*marker, current))
+                }
+                (Some(ReadMarker::Absent), Some(current))
+                    if current.cursor.committed_offset > 0
+                        || !current.cursor.last_page_digest.is_empty() =>
+                {
+                    let mut pinned = current.clone();
+                    pinned.cursor.committed_offset = 0;
+                    pinned.cursor.last_page_digest.clear();
+                    Some((pinned, current))
+                }
+                _ => None,
+            };
+            if let Some((restored, current)) = restore {
                 self.db
                     .runtime()
-                    .advance_event_subscription_cursor(&marker, &current)
+                    .advance_event_subscription_cursor(&restored, &current)
                     .map_err(|error| {
                         Status::failed_precondition(format!("subscription: {error}"))
                     })?;
             }
-            cursor.read_marker = inspect();
+            cursor.read_marker = Some(match inspect() {
+                Some(subscription) => ReadMarker::Subscription(Box::new(subscription)),
+                None => ReadMarker::Absent,
+            });
             self.db
                 .runtime()
                 .advance_action_binding_cursor(&binding, &cursor, now_millis())
@@ -216,6 +250,13 @@ impl SekaiServiceImpl {
                 let first_pin = cursor.snapshot_revision.is_empty();
                 cursor.snapshot_revision = page.snapshot_revision.clone();
                 if first_pin {
+                    // Durable before the read creates the subscription, so a
+                    // crash rewinds to this pin instead of re-pinning past the
+                    // page's events (#1141).
+                    self.db
+                        .runtime()
+                        .advance_action_binding_cursor(&binding, &cursor, now_millis())
+                        .map_err(map_binding_store_error)?;
                     page = read(&cursor.snapshot_revision)?;
                 }
             }
@@ -335,5 +376,166 @@ fn map_binding_store_error(error: String) -> Status {
         Status::invalid_argument(error)
     } else {
         Status::internal(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sekai::action_binding::{
+        ACTION_BINDING_CONTRACT, ActionBindingCursor, ParameterSource,
+    };
+    use std::collections::{BTreeMap, HashMap};
+    use tonic::metadata::MetadataValue;
+
+    fn local<T>(payload: T) -> Request<T> {
+        let mut request = Request::new(payload);
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("local"));
+        request
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_the_first_pinned_read_redelivers_the_page() {
+        // #1141: the first pin creates the subscription inside the read, so
+        // the marker records its absence; a run that finds the page read but
+        // unpersisted rewinds the new subscription to its pin.
+        let db = Arc::new(RuntimeDb::memory());
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            db.clone(),
+        ));
+        let (_, grants) = db
+            .ensure_team_namespace("demo", "svc-escalator", security::Role::Editor, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                description: "Escalate a degraded component".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"component":{"type":"string"},"severity":{"type":"string"}},"required":["component","severity"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            },
+            "local",
+            1,
+        )
+        .unwrap();
+        db.upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+            "demo",
+        ))
+        .unwrap();
+        let mut object = domain::Object {
+            id: "billing-api".into(),
+            kind: "component".into(),
+            name: "billing-api".into(),
+            namespace: "demo".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("severity".into(), "low".into())]),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object_with_audit(&object, "local").unwrap();
+        let binding = db
+            .put_action_binding(
+                &ActionBinding {
+                    contract_version: ACTION_BINDING_CONTRACT.into(),
+                    binding_id: "escalate".into(),
+                    namespace: "demo".into(),
+                    kind: "component".into(),
+                    property_filters: Vec::new(),
+                    ops: vec!["update".into()],
+                    type_id: "component.escalate".into(),
+                    version: "1".into(),
+                    run_as: "svc-escalator".into(),
+                    parameters: BTreeMap::from([
+                        ("component".into(), ParameterSource::ObjectId),
+                        (
+                            "severity".into(),
+                            ParameterSource::Property("severity".into()),
+                        ),
+                    ]),
+                    enabled: true,
+                    revision: 0,
+                    created_by: String::new(),
+                    updated_at_ms: 0,
+                },
+                "local",
+                2,
+            )
+            .unwrap();
+
+        // The crashed run: it pinned (durably, with the marker), a change
+        // landed, and its read created the subscription and committed the
+        // page before the events were persisted.
+        let run_as = vec!["svc-escalator".to_string()];
+        let pin = authorization_pin("legacy", &run_as).unwrap();
+        let request = |snapshot_revision: &str| ObjectChangeReadRequest {
+            subscription_id: "action-binding.escalate".into(),
+            scope: ObjectChangeScope {
+                namespace: "demo".into(),
+                kind: "component".into(),
+                object_ids: Vec::new(),
+                property_filters: Vec::new(),
+            },
+            snapshot_revision: snapshot_revision.into(),
+            limit: 16,
+            retention_ms: 0,
+            last_page_digest: String::new(),
+            revoke: false,
+        };
+        let now = now_millis();
+        let pinned =
+            read_object_change_subscription(&db, "svc-escalator", &request(""), now, &[], &pin)
+                .unwrap();
+        assert_eq!(pinned.outcome, OUTCOME_RESNAPSHOT);
+        db.advance_action_binding_cursor(
+            &binding,
+            &ActionBindingCursor {
+                snapshot_revision: pinned.snapshot_revision.clone(),
+                read_marker: Some(ReadMarker::Absent),
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+        object.properties.insert("severity".into(), "high".into());
+        object.updated = 3;
+        db.update_object_with_audit(&object, "local").unwrap();
+        let lost = read_object_change_subscription(
+            &db,
+            "svc-escalator",
+            &request(&pinned.snapshot_revision),
+            now_millis(),
+            std::slice::from_ref(&object),
+            &pin,
+        )
+        .unwrap();
+        assert_eq!(lost.outcome, OUTCOME_PAGE);
+        assert_eq!(lost.events.len(), 1);
+
+        let run = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(run.submissions.len(), 1);
+        assert!(
+            db.get_action_binding("demo", "escalate")
+                .unwrap()
+                .unwrap()
+                .1
+                .read_marker
+                .is_none()
+        );
     }
 }
