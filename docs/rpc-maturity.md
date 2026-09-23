@@ -53,6 +53,13 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 
 ## Table
 
+**Real backend** is `yes` when the RPC runs on both community runtimes,
+`sqlite only` when community PostgreSQL answers `UNAVAILABLE` before doing any
+work, and `fixture only` when no production backend exists. Only `yes` may be
+`stable`. On community PostgreSQL a `require_approval` policy still parks an
+Action, but `DecideActionInstance` is `sqlite only`, so an instance parked
+there cannot be decided on that runtime.
+
 <!-- rpc-maturity-rows -->
 
 | RPC | Storage path | Real backend | Known consumer | Classification |
@@ -154,9 +161,9 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 | `SekaiService.ListGovernedActionTypes` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.DecideActionInstance` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.PutActionBinding` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RunActionBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.DecideActionInstance` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.PutActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.RunActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
