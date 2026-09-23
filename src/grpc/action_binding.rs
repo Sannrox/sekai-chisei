@@ -500,7 +500,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lost.outcome, OUTCOME_PAGE);
-        assert_eq!(lost.events.len(), 1, "{lost:?}");
+        assert_eq!(lost.events.len(), 1);
 
         let run = svc
             .run_action_binding(local(RunActionBindingRequest {
@@ -511,7 +511,7 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(run.submissions.len(), 1, "{run:?}");
+        assert_eq!(run.submissions.len(), 1);
         assert!(
             db.get_action_binding("demo", "escalate")
                 .unwrap()
