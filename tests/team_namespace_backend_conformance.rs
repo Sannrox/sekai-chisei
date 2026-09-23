@@ -79,11 +79,14 @@ fn exercise(db: &dyn TeamNamespaceHarness, prefix: &str) {
             .any(|grant| grant.principal == principal && grant.role == Role::Admin)
     );
 
-    // duplicate canonical namespace identities fail closed
+    // duplicate canonical namespace identities fail closed: PostgreSQL's
+    // unique canonical-namespace index refuses the second boundary at write,
+    // and SQLite refuses to bootstrap over the ambiguous pair.
     let conflict_namespace = format!("{prefix}-conflict");
     let conflict_external = format!("namespace:{conflict_namespace}");
+    let mut admitted = 0;
     for suffix in ["a", "b"] {
-        GraphBackend::create_object(
+        let created = GraphBackend::create_object(
             db,
             &Object {
                 id: format!("{prefix}-dup-{suffix}"),
@@ -96,19 +99,24 @@ fn exercise(db: &dyn TeamNamespaceHarness, prefix: &str) {
                 updated: 1,
             },
             "local",
-        )
-        .unwrap();
+        );
+        match created {
+            Ok(()) => admitted += 1,
+            Err(_) => assert_eq!(suffix, "b", "the first boundary must be admitted"),
+        }
     }
-    assert!(
-        db.ensure_team_namespace(
-            &conflict_namespace,
-            &format!("{prefix}-bob"),
-            Role::Viewer,
-            "local"
-        )
-        .unwrap_err()
-        .contains("not uniquely held")
-    );
+    if admitted == 2 {
+        assert!(
+            db.ensure_team_namespace(
+                &conflict_namespace,
+                &format!("{prefix}-bob"),
+                Role::Viewer,
+                "local"
+            )
+            .unwrap_err()
+            .contains("not uniquely held")
+        );
+    }
 
     // adopt legacy namespace boundary without grants
     let legacy = format!("{prefix}-legacy");

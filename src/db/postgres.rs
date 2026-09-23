@@ -336,6 +336,16 @@ pub(crate) fn off_runtime<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 
+/// Unambiguous text identity for a transaction advisory lock. PostgreSQL
+/// text rejects NUL, so parts are length-prefixed rather than NUL-joined.
+pub(crate) fn advisory_lock_key(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| format!("{}:{part}", part.len()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Shared PostgreSQL connection pool used by the HA storage backend.
 ///
 /// Construction verifies connectivity and runs forward-only migrations while
@@ -861,6 +871,20 @@ mod tests {
     fn migration_lock_id_is_stable_and_nonzero() {
         assert_ne!(MIGRATION_LOCK_ID, 0);
         assert_eq!(MIGRATION_LOCK_ID, 0x5345_4b41_4948_4101);
+    }
+
+    #[test]
+    fn advisory_lock_keys_are_nul_free_and_unambiguous() {
+        let key = advisory_lock_key(&["ns", "request", "alice", "k-1"]);
+        assert!(!key.contains('\0'));
+        assert_ne!(
+            advisory_lock_key(&["a,1:b", "c"]),
+            advisory_lock_key(&["a", "b,1:c"])
+        );
+        assert_ne!(
+            advisory_lock_key(&["ns", "branch", "published_head"]),
+            advisory_lock_key(&["ns", "published_head"])
+        );
     }
 
     #[test]

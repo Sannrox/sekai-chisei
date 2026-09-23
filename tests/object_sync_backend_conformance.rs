@@ -18,6 +18,10 @@ use sekai_chisei::sekai::object_sync::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "support/postgres_scratch.rs"]
+mod postgres_scratch;
+use postgres_scratch::ScratchDatabase;
+
 const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
 const SOURCE_INSTANCE: &str = "sekai-project/sekai-chisei";
 const SOURCE_ID: &str = "github:sekai-project/sekai-chisei#12";
@@ -712,29 +716,23 @@ fn sqlite_ordered_open_resumes_after_restart() {
     );
 }
 
-fn postgres() -> PostgresDb {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
-    } else {
-        PostgresDb::connect(&url, 8).unwrap()
-    }
-}
-
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_object_sync_backend_conformance() {
+    // Graph object IDs derive from the type digest and source identity, not
+    // the namespace, so each scenario gets its own database as on SQLite.
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
-    let db = postgres();
-    exercise_object_sync(&db, &prefix);
-    exercise_ordered_feed(&db, &format!("{prefix}-ordered"));
+    let scratch = ScratchDatabase::create();
+    exercise_object_sync(&scratch.connect(8), &prefix);
+    let ordered = ScratchDatabase::create();
+    exercise_ordered_feed(&ordered.connect(8), &format!("{prefix}-ordered"));
 }
 
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_concurrent_exact_replay_has_one_committed_result() {
-    let db = Arc::new(postgres());
+    let scratch = ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
     let prefix = format!("race-{}", uuid::Uuid::new_v4().simple());
     let producer = format!("connector/{prefix}");
     let source_batch = batch(&prefix, "", "cursor:1", "batch-1");

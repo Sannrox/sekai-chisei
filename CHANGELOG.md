@@ -7,6 +7,14 @@
   context fails `UNAUTHENTICATED` when an identity extension is installed, a
   foreign namespace fails `PERMISSION_DENIED`, and retrieval drops objects in
   namespaces the tenant cannot read (#1147).
+- Community PostgreSQL no longer fails with `INTERNAL` on audit-decision
+  listing, object-change history and feed, evidence submissions, policy
+  attestations, object-type index pages, and work-unit heartbeats. Those
+  statements bound integers at a narrower width than PostgreSQL inferred.
+  Definition branch and proposal writes, and evaluation manifest resolution,
+  no longer send NUL-joined advisory-lock keys, which PostgreSQL text rejects.
+  Every ignored PostgreSQL conformance suite now passes against an isolated TLS
+  server, and a source guard keeps these bind shapes out (#1155).
 - The product loop now runs on community PostgreSQL: `sekaictl ontology
   apply`, seed, object reads, `EvaluateObjectSet`, governed Action submit and
   read, `GetOperationReceipt`, and object-security activation with a denied

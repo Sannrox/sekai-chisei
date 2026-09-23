@@ -140,7 +140,11 @@ fn sqlite_coordination_conformance() {
 fn postgres() -> PostgresDb {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    PostgresDb::connect(&url, 8).unwrap()
+    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
+    } else {
+        PostgresDb::connect(&url, 8).unwrap()
+    }
 }
 
 #[test]

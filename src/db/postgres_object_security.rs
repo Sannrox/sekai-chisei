@@ -328,8 +328,8 @@ impl PostgresDb {
                  WHERE namespace=$1
                    AND ($2 = '' OR principal=$2)
                    AND ($3 = '' OR object_id=$3)
-                   AND ($4 <= 0 OR created_at_ms >= $4)
-                   AND ($5 <= 0 OR created_at_ms <= $5)
+                   AND ($4::bigint <= 0 OR created_at_ms >= $4)
+                   AND ($5::bigint <= 0 OR created_at_ms <= $5)
                  ORDER BY created_at_ms ASC, event_id ASC
                  LIMIT $6 OFFSET $7",
                 &[

@@ -150,7 +150,8 @@ pub fn member_page_sql(
     limit: i32,
     offset: i32,
     mut next_param: usize,
-) -> (String, Vec<i32>, usize) {
+) -> (String, Vec<i64>, usize) {
+    // PostgreSQL infers LIMIT and OFFSET parameters as bigint.
     let mut sql = String::new();
     let mut values = Vec::new();
     let offset = offset.max(0);
@@ -159,20 +160,20 @@ pub fn member_page_sql(
             IndexSqlDialect::Sqlite => format!(" LIMIT ?{next_param}"),
             IndexSqlDialect::Postgres => format!(" LIMIT ${next_param}"),
         });
-        values.push(limit);
+        values.push(i64::from(limit));
         next_param += 1;
         sql.push_str(&match dialect {
             IndexSqlDialect::Sqlite => format!(" OFFSET ?{next_param}"),
             IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
         });
-        values.push(offset);
+        values.push(i64::from(offset));
         next_param += 1;
     } else if offset > 0 {
         sql.push_str(&match dialect {
             IndexSqlDialect::Sqlite => format!(" LIMIT -1 OFFSET ?{next_param}"),
             IndexSqlDialect::Postgres => format!(" OFFSET ${next_param}"),
         });
-        values.push(offset);
+        values.push(i64::from(offset));
         next_param += 1;
     }
     (sql, values, next_param)
