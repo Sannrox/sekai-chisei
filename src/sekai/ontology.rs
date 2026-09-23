@@ -367,6 +367,20 @@ pub(crate) fn validate_link_constraint(
     if mapped_relation.is_empty() {
         return Ok(());
     }
+    // Most link relations carry no ontology mapping: answer that from the
+    // index before loading every class and relation under the write lock
+    // (#1143). The SQLite registry has no built-in relations, so an absent
+    // row means no constraint and no maximum.
+    let mapped = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sekai_ontology_relations WHERE mapped_relation = ?1)",
+            params![mapped_relation],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if !mapped {
+        return Ok(());
+    }
     let registry = load_ontology_registry_from_connection(conn)?;
     let constraints = registry.constraints_for_mapped_relation(mapped_relation);
     if constraints.is_empty() {
@@ -744,7 +758,9 @@ impl SekaiDb {
                 updated INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ontology_relations_domain ON sekai_ontology_relations(domain);
-            CREATE INDEX IF NOT EXISTS idx_ontology_relations_range ON sekai_ontology_relations(range);",
+            CREATE INDEX IF NOT EXISTS idx_ontology_relations_range ON sekai_ontology_relations(range);
+            CREATE INDEX IF NOT EXISTS idx_ontology_relations_mapped_relation
+                ON sekai_ontology_relations(mapped_relation);",
         )
         .map_err(|error| error.to_string())?;
         Ok(())
@@ -1530,6 +1546,31 @@ mod tests {
             relation: "employed_by".into(),
             created: 1,
         }
+    }
+
+    #[test]
+    fn unmapped_link_relations_skip_the_ontology_registry() {
+        // #1143: a link whose relation no ontology relation maps is admitted
+        // from the index alone. A corrupt row elsewhere proves the full
+        // registry is not loaded, while a mapped relation still reads it.
+        let db = employment_graph();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_ontology_relations
+                    (name, cardinality_json, mapped_relation, created, updated)
+                 VALUES ('broken', 'not json', 'employed_by', 1, 1)",
+                [],
+            )
+            .unwrap();
+        db.create_link(&crate::domain::Link {
+            id: "unmapped".into(),
+            from_id: "p1".into(),
+            to_id: "c1".into(),
+            relation: "mentions".into(),
+            created: 1,
+        })
+        .unwrap();
+        assert!(db.create_link(&employment("mapped", "c1")).is_err());
     }
 
     #[test]
