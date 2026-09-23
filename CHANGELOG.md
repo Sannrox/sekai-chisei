@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- SQLite link admission no longer loads every ontology class and relation
+  under the write lock for links whose relation no ontology relation maps. An
+  indexed lookup on `mapped_relation` answers that first. Mapped relations are
+  still checked and bounded as before (ADR 0087, #1143).
 - The integration contract lists Action approval (park and decide) as
   `experimental` through `DecideActionInstance` instead of `unavailable`, and
   the governed Action instance guide tells consumers how to move from the old
