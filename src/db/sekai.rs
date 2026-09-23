@@ -1287,7 +1287,11 @@ impl SekaiDb {
 
     pub fn create_link(&self, l: &Link) -> Result<(), String> {
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let exists = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sekai_links WHERE id = ?1)",
@@ -1316,7 +1320,11 @@ impl SekaiDb {
 
     pub fn create_link_once(&self, l: &Link) -> Result<bool, String> {
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         crate::sekai::ontology::validate_link_constraint(
             &transaction,
             &l.from_id,
@@ -1344,7 +1352,11 @@ impl SekaiDb {
         fail_if_exists: bool,
     ) -> Result<bool, String> {
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock before the ontology check counts
+        // links, so concurrent admissions cannot both pass a maximum (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         require_authorized_link_endpoints(
             &transaction,
             expected_from,

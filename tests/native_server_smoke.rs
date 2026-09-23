@@ -702,6 +702,103 @@ async fn spawned_binary_follows_links() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_enforces_relation_maximum_cardinality() {
+    // ADR 0087 (#1132): an incident may affect at most one service.
+    let (_fake, mut server) = mocked_server().await;
+    let socket = server.socket_str();
+    let domain = server.dir.path().join("domain-max.json");
+    std::fs::write(
+        &domain,
+        serde_json::json!({
+            "version": "sekai.ontology-product/v1",
+            "classes": [
+                {"name": "Service", "mapped_kind": "component"},
+                {"name": "Incident", "mapped_kind": "incident", "ensure_kind": true,
+                 "kind_description": "Incident object kind"}
+            ],
+            "relations": [
+                {"name": "affects", "domain": "Incident", "range": "Service",
+                 "cardinality": {"min": 0, "max": 1}}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write domain");
+    let seed = server.dir.path().join("seed-max.json");
+    std::fs::write(
+        &seed,
+        serde_json::json!({
+            "version": "sekai.seed/v1",
+            "namespace": "demo",
+            "objects": [
+                {"id": "svc-a", "kind": "component", "name": "billing-api"},
+                {"id": "svc-b", "kind": "component", "name": "ledger-api"},
+                {"id": "inc-1", "kind": "incident", "name": "elevated latency"}
+            ],
+            "links": [
+                {"from": "inc-1", "to": "svc-a", "relation": "affects"},
+                {"from": "inc-1", "to": "svc-b", "relation": "affects"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write seed");
+    let apply = server.sekaictl_retry(
+        &[
+            "ontology",
+            "apply",
+            "--file",
+            domain.to_str().unwrap(),
+            "--target",
+            &socket,
+        ],
+        "ontology apply",
+    );
+    assert_success(&apply, "ontology apply", &server.logs());
+    let seeded = server.sekaictl_retry(
+        &[
+            "ontology",
+            "seed",
+            "--file",
+            seed.to_str().unwrap(),
+            "--target",
+            &socket,
+        ],
+        "ontology seed",
+    );
+    assert!(
+        !seeded.status.success(),
+        "a second distinct target must be refused\n{}",
+        stdout(&seeded)
+    );
+    let refusal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    assert!(
+        refusal.contains("relation_cardinality_exceeded"),
+        "{refusal}"
+    );
+
+    let linked = server
+        .sekai()
+        .await
+        .get_linked_objects(GetLinkedObjectsRequest {
+            object_id: "inc-1".into(),
+            relation: "affects".into(),
+            direction: "out".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("get linked objects: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(
+        linked.objects.len() <= 1,
+        "the incident must reach at most one service\n{linked:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn spawned_binary_traverses_graph() {
     let (_fake, server) = seeded_server().await;
     let traversed = server

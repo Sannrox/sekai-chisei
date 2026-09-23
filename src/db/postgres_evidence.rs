@@ -871,20 +871,19 @@ impl PostgresDb {
                 "derived_from",
             )?;
             let link_hash = format!("{:x}", Sha256::digest(source_relation.as_bytes()));
-            tx.execute(
-                "INSERT INTO sekai_links(id,from_id,to_id,relation,created)
-                 VALUES($1,$2,$3,'derived_from',$4)",
-                &[
-                    &format!(
+            crate::db::postgres_objects::insert_link_within_maximum(
+                &mut tx,
+                &crate::domain::Link {
+                    id: format!(
                         "evidence-lineage-{id}-{related_submission_id}-{}",
                         &link_hash[..16]
                     ),
-                    &object_id,
-                    &related_object_id,
-                    &now,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+                    from_id: object_id.clone(),
+                    to_id: related_object_id.clone(),
+                    relation: "derived_from".into(),
+                    created: now,
+                },
+            )?;
             tx.execute(
                 "INSERT INTO sekai_evidence_relationship_projections
                  (submission_id,related_submission_id,source_relation) VALUES($1,$2,$3)",
@@ -898,17 +897,16 @@ impl PostgresDb {
             &envelope.target.object_kind,
             "evidence_for",
         )?;
-        tx.execute(
-            "INSERT INTO sekai_links(id,from_id,to_id,relation,created)
-             VALUES($1,$2,$3,'evidence_for',$4)",
-            &[
-                &format!("evidence-target-{id}"),
-                &object_id,
-                &target_id,
-                &now,
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        crate::db::postgres_objects::insert_link_within_maximum(
+            &mut tx,
+            &crate::domain::Link {
+                id: format!("evidence-target-{id}"),
+                from_id: object_id.clone(),
+                to_id: target_id.clone(),
+                relation: "evidence_for".into(),
+                created: now,
+            },
+        )?;
         tx.execute(
             "INSERT INTO sekai_evidence_observations
              (submission_id,evidence_object_id,signal,confidence_bps,observed_at_ms,

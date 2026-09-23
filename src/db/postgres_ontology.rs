@@ -81,7 +81,32 @@ impl PostgresDb {
             serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
         let transitive = i64::from(relation.transitive);
         let now = chrono::Utc::now().timestamp_millis();
-        self.connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if !relation.mapped_relation.is_empty() {
+            crate::db::postgres_objects::relation_maximum_lock(
+                &mut transaction,
+                &relation.mapped_relation,
+                true,
+            )?;
+        }
+        if let Some(maximum) = relation.cardinality.max
+            && !relation.mapped_relation.is_empty()
+        {
+            let violating = crate::db::postgres_objects::postgres_sources_over_link_maximum(
+                &mut transaction,
+                &relation.mapped_relation,
+                maximum,
+            )?;
+            if violating > 0 {
+                return Err(crate::sekai::ontology::tightened_maximum_error(
+                    violating, maximum,
+                ));
+            }
+        }
+        transaction
             .execute(
                 "INSERT INTO sekai_ontology_relations
                     (name,description,domain,range,cardinality_json,inverse,transitive,
@@ -108,8 +133,8 @@ impl PostgresDb {
                     &now,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn delete_ontology_relation(&self, name: &str) -> Result<bool, String> {

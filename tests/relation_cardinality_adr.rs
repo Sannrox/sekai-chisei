@@ -14,11 +14,11 @@ fn adr_0087_is_indexed_and_supersedes_only_the_maximum() {
     assert!(ADR_0087.contains("#1089"));
     assert!(ADR_0087.contains("relation_cardinality_exceeded"));
     assert!(ADR_0087.contains("Count distinct target objects per"));
-    assert!(ADR_0018.contains("for the maximum bound only, effective when #1132 lands"));
+    assert!(ADR_0018.contains("for the maximum bound only, enforced since #1132"));
 }
 
 #[test]
-fn operator_page_keeps_both_bounds_advisory_until_enforcement_ships() {
-    assert!(OPERATOR.contains("advisory metadata in the 1.x contract"));
-    assert!(OPERATOR.contains("both bounds remain advisory"));
+fn operator_page_states_the_enforced_maximum_and_advisory_minimum() {
+    assert!(OPERATOR.contains("relation_cardinality_exceeded"));
+    assert!(OPERATOR.contains("The minimum stays advisory metadata"));
 }

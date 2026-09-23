@@ -538,6 +538,7 @@ pub(super) fn check_ontology_relation_read(
 pub(super) fn map_graph_mutation_error(error: String) -> Status {
     if error == "link endpoints violate ontology constraint"
         || error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION
+        || error == crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED
     {
         Status::failed_precondition(error)
     } else {

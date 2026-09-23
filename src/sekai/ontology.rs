@@ -25,9 +25,10 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Cardinality bound for the range side of a relation. `max = None` means
-/// unbounded. Inference does not act on these bounds; in the 1.x contract they
-/// remain advisory metadata. Declaration validation rejects malformed ranges,
-/// but link writes and relation updates do not enforce cardinality.
+/// unbounded. Link admission enforces `max` as distinct targets per source,
+/// and a relation update below existing graph state is refused (ADR 0087).
+/// `min` stays advisory metadata. Declaration validation rejects malformed
+/// ranges. Inference does not act on either bound.
 ///
 /// The default (`min = 0`, `max = None`) is the least restrictive bound, so
 /// projecting or importing existing relations never tightens behavior.
@@ -272,6 +273,15 @@ impl OntologyRegistry {
         None
     }
 
+    /// The tightest declared maximum over every ontology relation mapped to
+    /// `mapped_relation` (ADR 0087). `None` means no mapped relation bounds it.
+    pub fn mapped_relation_maximum(&self, mapped_relation: &str) -> Option<u32> {
+        self.constraints_for_mapped_relation(mapped_relation)
+            .into_iter()
+            .filter_map(|relation| relation.cardinality.max)
+            .min()
+    }
+
     pub fn constraints_for_mapped_relation(&self, mapped_relation: &str) -> Vec<&OntologyRelation> {
         if mapped_relation.is_empty() {
             return Vec::new();
@@ -293,6 +303,59 @@ pub(crate) fn load_ontology_registry_from_connection(
         select_classes(conn)?,
         select_relations(conn)?,
     ))
+}
+
+/// Bounded refusal when a link would give its source more distinct targets
+/// than the relation's declared maximum (ADR 0087). Carries no counts.
+pub const RELATION_CARDINALITY_EXCEEDED: &str = "relation_cardinality_exceeded";
+
+/// Refuses a new link that would give `from_id` more distinct targets over
+/// `mapped_relation` than `maximum`. A link to a target the source already
+/// reaches does not count twice. Runs inside the writer's transaction.
+pub(crate) fn enforce_sqlite_link_maximum(
+    conn: &rusqlite::Connection,
+    from_id: &str,
+    to_id: &str,
+    mapped_relation: &str,
+    maximum: u32,
+) -> Result<(), String> {
+    let (already_linked, distinct_targets): (bool, i64) = conn
+        .query_row(
+            "SELECT
+                EXISTS(SELECT 1 FROM sekai_links WHERE from_id = ?1 AND relation = ?2 AND to_id = ?3),
+                (SELECT COUNT(DISTINCT to_id) FROM sekai_links WHERE from_id = ?1 AND relation = ?2)",
+            params![from_id, mapped_relation, to_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    if !already_linked && distinct_targets >= i64::from(maximum) {
+        return Err(RELATION_CARDINALITY_EXCEEDED.into());
+    }
+    Ok(())
+}
+
+/// Sources whose distinct targets over `mapped_relation` already exceed
+/// `maximum`, so a relation publishing that bound would misdescribe the graph.
+pub(crate) fn sqlite_sources_over_link_maximum(
+    conn: &rusqlite::Connection,
+    mapped_relation: &str,
+    maximum: u32,
+) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+            SELECT from_id FROM sekai_links WHERE relation = ?1
+            GROUP BY from_id HAVING COUNT(DISTINCT to_id) > ?2
+         )",
+        params![mapped_relation, i64::from(maximum)],
+        |row| row.get(0),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn tightened_maximum_error(violating_sources: i64, maximum: u32) -> String {
+    format!(
+        "{RELATION_CARDINALITY_EXCEEDED}: {violating_sources} existing source(s) exceed the declared maximum of {maximum}; existing links are not rewritten"
+    )
 }
 
 pub(crate) fn validate_link_constraint(
@@ -332,6 +395,9 @@ pub(crate) fn validate_link_constraint(
             || !registry.kind_satisfies_class(&to_kind, &constraint.range)
     }) {
         return Err("link endpoints violate ontology constraint".into());
+    }
+    if let Some(maximum) = registry.mapped_relation_maximum(mapped_relation) {
+        enforce_sqlite_link_maximum(conn, from_id, to_id, mapped_relation, maximum)?;
     }
     Ok(())
 }
@@ -847,7 +913,14 @@ impl SekaiDb {
 
     pub fn upsert_ontology_relation(&self, relation: &OntologyRelation) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        upsert_relation_row(&self.conn(), relation, now)
+        let mut conn = self.conn();
+        // IMMEDIATE serializes the over-bound count with link admissions,
+        // which also write under IMMEDIATE (ADR 0087).
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        upsert_relation_row(&transaction, relation, now)?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     pub fn upsert_ontology_relation_with_audit(
@@ -857,7 +930,9 @@ impl SekaiDb {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let existed = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sekai_ontology_relations WHERE name = ?1)",
@@ -1115,6 +1190,14 @@ fn upsert_relation_row(
 ) -> Result<(), String> {
     let cardinality_json =
         serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
+    if let Some(maximum) = relation.cardinality.max
+        && !relation.mapped_relation.is_empty()
+    {
+        let violating = sqlite_sources_over_link_maximum(conn, &relation.mapped_relation, maximum)?;
+        if violating > 0 {
+            return Err(tightened_maximum_error(violating, maximum));
+        }
+    }
     conn.execute(
         "INSERT INTO sekai_ontology_relations
             (name, description, domain, range, cardinality_json, inverse, transitive, mapped_relation, created, updated)
@@ -1407,6 +1490,127 @@ mod tests {
 
         assert!(db.delete_ontology_relation("works_for").unwrap());
         assert!(db.get_ontology_relation("works_for").unwrap().is_none());
+    }
+
+    fn employment_graph() -> SekaiDb {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for (name, kind) in [("Person", "person"), ("Company", "company")] {
+            let mut class = class(name);
+            class.mapped_kind = kind.into();
+            db.upsert_ontology_class(&class).unwrap();
+        }
+        let mut works_for = relation("works_for", "Person", "Company");
+        works_for.cardinality = Cardinality {
+            min: 0,
+            max: Some(1),
+        };
+        works_for.mapped_relation = "employed_by".into();
+        db.upsert_ontology_relation(&works_for).unwrap();
+        for (id, kind) in [("p1", "person"), ("c1", "company"), ("c2", "company")] {
+            db.create_object(&crate::domain::Object {
+                id: id.into(),
+                kind: kind.into(),
+                name: id.into(),
+                namespace: "default".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        }
+        db
+    }
+
+    fn employment(id: &str, to: &str) -> crate::domain::Link {
+        crate::domain::Link {
+            id: id.into(),
+            from_id: "p1".into(),
+            to_id: to.into(),
+            relation: "employed_by".into(),
+            created: 1,
+        }
+    }
+
+    #[test]
+    fn link_maximum_counts_distinct_targets_and_refuses_one_more() {
+        let db = employment_graph();
+        db.create_link(&employment("l1", "c1")).unwrap();
+        // A duplicate of an existing target does not count twice.
+        db.create_link(&employment("l1-again", "c1")).unwrap();
+        let error = db.create_link(&employment("l2", "c2")).unwrap_err();
+        assert_eq!(error, RELATION_CARDINALITY_EXCEEDED);
+        assert!(db.get_link("l2").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_links_to_distinct_targets_admit_at_most_the_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.db");
+        let db = std::sync::Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let seeded = employment_graph();
+        for class in seeded.list_ontology_classes().unwrap() {
+            db.upsert_ontology_class(&class).unwrap();
+        }
+        for relation in seeded.list_ontology_relations().unwrap() {
+            db.upsert_ontology_relation(&relation).unwrap();
+        }
+        for id in ["p1", "c1", "c2"] {
+            db.create_object(&seeded.get_object(id).unwrap().unwrap())
+                .unwrap();
+        }
+        for _ in 0..20 {
+            for id in ["race-1", "race-2"] {
+                db.delete_link(id).unwrap();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = [("race-1", "c1"), ("race-2", "c2")]
+                .into_iter()
+                .map(|(id, to)| {
+                    let db = std::sync::Arc::clone(&db);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        db.create_link(&employment(id, to))
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            assert!(
+                results
+                    .iter()
+                    .filter_map(|result| result.as_ref().err())
+                    .all(|error| error == RELATION_CARDINALITY_EXCEEDED),
+                "{results:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_publication_below_existing_state_is_refused_without_rewriting_links() {
+        let db = employment_graph();
+        let mut works_for = db.get_ontology_relation("works_for").unwrap().unwrap();
+        works_for.cardinality.max = None;
+        db.upsert_ontology_relation(&works_for).unwrap();
+        db.create_link(&employment("l1", "c1")).unwrap();
+        db.create_link(&employment("l2", "c2")).unwrap();
+
+        works_for.cardinality.max = Some(1);
+        let error = db
+            .upsert_ontology_relation_with_audit(&works_for, "tester")
+            .unwrap_err();
+        assert!(error.starts_with(RELATION_CARDINALITY_EXCEEDED), "{error}");
+        assert!(error.contains("1 existing source(s)"), "{error}");
+        assert_eq!(
+            db.get_ontology_relation("works_for")
+                .unwrap()
+                .unwrap()
+                .cardinality
+                .max,
+            None
+        );
+        assert!(db.get_link("l2").unwrap().is_some());
     }
 
     #[test]

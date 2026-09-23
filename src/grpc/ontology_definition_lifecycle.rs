@@ -148,7 +148,13 @@ impl SekaiServiceImpl {
         self.db
             .runtime()
             .upsert_ontology_relation_with_audit(&parsed, actor(principals))
-            .map_err(Status::internal)?;
+            .map_err(|error| {
+                if error.starts_with(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED) {
+                    Status::failed_precondition(error)
+                } else {
+                    Status::internal(error)
+                }
+            })?;
         Ok(parsed)
     }
 
