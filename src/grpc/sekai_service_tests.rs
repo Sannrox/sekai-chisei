@@ -332,6 +332,95 @@ async fn get_lineage_filters_nodes_outside_tenant_namespace() {
     assert!(result.edges.is_empty());
 }
 
+#[tokio::test]
+async fn semantic_reads_apply_the_enterprise_tenant_gate() {
+    // #1147: expand, explain, and retrieve apply the same tenant gate as
+    // object reads before capability or ACL work.
+    let svc = enterprise_service();
+    seed_lineage_object(&svc, "semantic-root", "allowed");
+    seed_lineage_object(&svc, "other-tenant-leaf", "denied");
+    svc.db
+        .runtime()
+        .create_link(&domain::Link {
+            id: "semantic-edge".into(),
+            from_id: "semantic-root".into(),
+            to_id: "other-tenant-leaf".into(),
+            relation: "contains".into(),
+            created: 0,
+        })
+        .unwrap();
+    let expand = |namespace: &str| ExpandRelationsRequest {
+        namespace: namespace.into(),
+        root: Some(ContextRoot {
+            object_id: "semantic-root".into(),
+            ..Default::default()
+        }),
+        relations: vec!["contains".into()],
+        direction: "outgoing".into(),
+        max_depth: 2,
+        ..Default::default()
+    };
+
+    let missing = svc
+        .expand_relations(with_named_principal(expand("allowed"), "subject-a"))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+    let foreign = svc
+        .expand_relations(with_tenant_context(expand("denied")))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    let explain = svc
+        .explain_derivation(with_tenant_context(ExplainDerivationRequest {
+            namespace: "denied".into(),
+            from: Some(ContextRoot {
+                object_id: "semantic-root".into(),
+                ..Default::default()
+            }),
+            to: Some(ContextRoot {
+                object_id: "other-tenant-leaf".into(),
+                ..Default::default()
+            }),
+            relations: vec!["contains".into()],
+            direction: "outgoing".into(),
+            max_depth: 2,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(explain.code(), tonic::Code::PermissionDenied);
+
+    let retrieve = RetrieveContextRequest {
+        roots: vec![ContextRoot {
+            object_id: "semantic-root".into(),
+            ..Default::default()
+        }],
+        relations: vec!["contains".into()],
+        direction: "outgoing".into(),
+        max_depth: 2,
+        max_objects: 20,
+        ..Default::default()
+    };
+    let missing = svc
+        .retrieve_context(with_named_principal(retrieve.clone(), "subject-a"))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::Unauthenticated);
+    let retrieved = svc
+        .retrieve_context(with_tenant_context(retrieve))
+        .await
+        .unwrap()
+        .into_inner();
+    let ids = retrieved
+        .candidates
+        .iter()
+        .filter_map(|candidate| candidate.object.as_ref().map(|object| object.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["semantic-root"]);
+    assert!(!format!("{retrieved:?}").contains("other-tenant-leaf"));
+}
+
 fn with_principal<T>(payload: T) -> Request<T> {
     with_named_principal(payload, "tester")
 }

@@ -7,6 +7,11 @@
   socket or insecure transport, comma-listed `x-principal` values, and the
   reserved `root` / `local` names can no longer decide, and namespace-admin
   standing is checked for that single subject only (#1140).
+- `ExpandRelations`, `ExplainDerivation`, and `RetrieveContext` now apply the
+  enterprise tenant gate like object reads: a request without an authenticated
+  context fails `UNAUTHENTICATED` when an identity extension is installed, a
+  foreign namespace fails `PERMISSION_DENIED`, and retrieval drops objects in
+  namespaces the tenant cannot read (#1147).
 - Community PostgreSQL no longer fails with `INTERNAL` on audit-decision
   listing, object-change history and feed, evidence submissions, policy
   attestations, object-type index pages, and work-unit heartbeats. Those
