@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- CI now runs every ignored PostgreSQL conformance suite in a
+  `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
+  with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
+  locally with Docker or Apple `container` (#1153).
 - Granting a parked Action now commits the object write and the
   parked-to-admitted transition in one SQLite transaction, re-checking the
   target object under the same lock. A crash can no longer leave an object

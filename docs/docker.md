@@ -83,19 +83,25 @@ cargo test --locked 'db::postgres::tests::' -- --ignored --nocapture
 cargo test --locked 'db::postgres_portfolio::tests::' -- --ignored --nocapture
 ```
 
-To run every PostgreSQL conformance suite, including the spawned-binary
-product loop and the store-relocate tests, point both URLs at disposable
-databases on the same server. The test role must be allowed to create
-databases: suites whose scenarios read across namespaces create and drop their
-own scratch database.
+To run every PostgreSQL conformance suite the way CI does, including the
+spawned-binary product loop and the store-relocate tests, let the script start
+an ephemeral TLS-only PostgreSQL with a throwaway CA:
 
 ```bash
-export SEKAI_TEST_POSTGRES_CHISEI_URL='postgresql://user:password@localhost/sekai_test_chisei'
-cargo test --locked --no-fail-fast \
-  $(for t in tests/*backend_conformance.rs tests/*postgres*.rs; do printf -- '--test %s ' "$(basename "$t" .rs)"; done) \
-  -- --ignored --test-threads=1
-cargo test --locked --lib -- --ignored --test-threads=1 postgres
+scripts/postgres-conformance.sh                                  # Docker
+SEKAI_CONTAINER_CLI=container scripts/postgres-conformance.sh    # Apple container
 ```
+
+It creates separate databases for the in-crate tests (which reset their
+schema), the integration suites, and the relocate target, and the server
+accepts only `hostssl` connections. The `PostgreSQL conformance` workflow runs
+the same script on pull requests that touch persistence or the RPC layers,
+on `main`, and weekly. Against your own server, export
+`SEKAI_TEST_POSTGRES_URL`, `SEKAI_TEST_POSTGRES_CA_CERT`, and
+`SEKAI_TEST_POSTGRES_CHISEI_URL` (a second database) and run the two `cargo
+test` commands at the end of the script. The test role must be allowed to
+create databases: suites whose scenarios read across namespaces create and drop
+their own scratch database.
 
 The configured database must not contain valuable data: migration fixtures
 drop and recreate its `public` schema. CI must allocate a database exclusively
