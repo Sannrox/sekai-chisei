@@ -8,6 +8,10 @@
   write without its grant, a stale target is denied `stale_on_resume` with no
   write, and concurrent grants apply the write once with no compensating
   restore (#1139).
+- The integration contract lists Action approval (park and decide) as
+  `experimental` through `DecideActionInstance` instead of `unavailable`, and
+  the governed Action instance guide tells consumers how to move from the old
+  `require_approval` denial to `parked` plus a decision (#1151).
 - A principal named in a governed Action type's `approvers` can now decide a
   parked instance with read-only namespace membership. `DecideActionInstance`
   no longer requires namespace Write before checking the approver entitlement,
