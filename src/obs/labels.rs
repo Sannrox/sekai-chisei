@@ -144,6 +144,27 @@ impl WaitKind {
     }
 }
 
+/// Store plane a connection pool serves. Shared is the single historical
+/// store; Split pools serve the Sekai or the Chisei store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PoolPlane {
+    Shared,
+    Sekai,
+    Chisei,
+}
+
+impl PoolPlane {
+    pub const ALL: &'static [PoolPlane] = &[PoolPlane::Shared, PoolPlane::Sekai, PoolPlane::Chisei];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PoolPlane::Shared => "shared",
+            PoolPlane::Sekai => "sekai",
+            PoolPlane::Chisei => "chisei",
+        }
+    }
+}
+
 /// Named cache within the control plane.
 ///
 /// These are the caches that actually exist, both in the gateway runtime. An
@@ -301,7 +322,7 @@ mod tests {
 
     /// Upper bound on distinct label values across the whole vocabulary. A
     /// change here is a deliberate cardinality decision, not an accident.
-    const MAX_TOTAL_LABEL_VALUES: usize = 42;
+    const MAX_TOTAL_LABEL_VALUES: usize = 45;
 
     fn rendered<T: Copy>(all: &[T], render: fn(T) -> &'static str) -> Vec<&'static str> {
         all.iter().copied().map(render).collect()
@@ -314,6 +335,7 @@ mod tests {
             rendered(Outcome::ALL, Outcome::as_str),
             rendered(RejectionReason::ALL, RejectionReason::as_str),
             rendered(WaitKind::ALL, WaitKind::as_str),
+            rendered(PoolPlane::ALL, PoolPlane::as_str),
             rendered(Cache::ALL, Cache::as_str),
             rendered(CacheOutcome::ALL, CacheOutcome::as_str),
             rendered(LagSurface::ALL, LagSurface::as_str),

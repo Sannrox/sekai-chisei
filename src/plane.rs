@@ -123,6 +123,13 @@ fn open_owned_layout(
         },
     };
 
+    let pool_size = crate::combined_stores::owned_plane_pool_size(
+        sources.postgres_max_connections,
+        match role {
+            StorePlaneRole::Sekai => sources.sekai_pool_connections,
+            StorePlaneRole::Chisei => sources.chisei_pool_connections,
+        },
+    )?;
     let layout = match (backend, url) {
         (BackendIdentity::Postgres, Some(url)) => {
             let identity = crate::combined_stores::postgres_identity(url)?;
@@ -131,7 +138,7 @@ fn open_owned_layout(
                 None,
                 "unused.db",
                 Some(url),
-                sources.postgres_max_connections,
+                pool_size,
                 sources.postgres_ca_cert_path.as_deref(),
             )?)?;
             backend
@@ -158,7 +165,7 @@ fn open_owned_layout(
                 Some(path),
                 path,
                 None,
-                sources.postgres_max_connections,
+                pool_size,
                 sources.postgres_ca_cert_path.as_deref(),
             )?)?;
             backend
@@ -168,6 +175,10 @@ fn open_owned_layout(
         }
     };
     ensure_store_plane(&layout.sekai_runtime(), role)?;
+    layout.sekai_runtime().set_pool_plane(match role {
+        StorePlaneRole::Sekai => crate::obs::labels::PoolPlane::Sekai,
+        StorePlaneRole::Chisei => crate::obs::labels::PoolPlane::Chisei,
+    });
     Ok(layout)
 }
 
