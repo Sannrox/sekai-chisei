@@ -29,6 +29,13 @@ appended through tagged mikura ingest so the log owns identity
 generations. A denied or unadmitted Action does not append. SQL index
 writes continue until the later retirement ADR.
 
+One process at a time may set `SEKAI_OBJECT_LOG` to a given path: the
+in-process log handle is a single writer. Several clerk processes, such as
+replicas sharing PostgreSQL or separate Sekai and Chisei planes, share
+object identity through the SQL index. The target is one object-log host
+that every clerk process calls, and it waits on a mikura release with that
+host. See [ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
+
 `EvaluateObjectSet` reads the index when a datasource is registered. Set
 `required_freshness_ms` to fail closed when the index is stale or lagging.
 Hidden rows never appear in members, counts, order, errors, or continuation
