@@ -166,6 +166,15 @@ Describe and preview still never grant.
 Community PostgreSQL parks but does not decide yet: `DecideActionInstance`
 answers `UNAVAILABLE` there and is not advertised.
 
+**Migrating consumers.** Before ADR 0089, `require_approval` returned
+`status=denied` with a "requires approval" deny reason. It now returns
+`status=parked` with an empty deny reason and an open receipt. A client that
+treated that denial as final should treat `parked` as pending, surface it to
+the type's approvers, and read the outcome from `GetActionInstance` or the
+receipt's `approval_decided` event after `DecideActionInstance`. A denied
+approval ends `denied` with `denied_by_approver`. The old denial is not
+emitted anymore.
+
 ## Dual-backend
 
 SQLite migrate-on-use and PostgreSQL migration
