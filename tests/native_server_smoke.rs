@@ -928,9 +928,14 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
     let submitter = server.create_principal_token("alice-agent");
     let approver = server.create_principal_token("bob-approver");
     let foreign = server.create_principal_token("carol-agent");
-    for principal in ["alice-agent", "bob-approver", "carol-agent"] {
+    for principal in ["alice-agent", "carol-agent"] {
         server.grant_namespace("demo", principal, "editor").await;
     }
+    // The named approver only reads the namespace: deciding needs the
+    // approver entitlement, not namespace Write (#1146).
+    server
+        .grant_namespace("demo", "bob-approver", "viewer")
+        .await;
     let set_policy = server.sekaictl(&[
         "admin",
         "governance",
