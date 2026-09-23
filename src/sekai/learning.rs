@@ -196,7 +196,11 @@ pub(crate) fn record_learning(
     }
 
     let mut conn = db.conn();
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    // IMMEDIATE takes the write lock before the retry and link-bound reads,
+    // as on the primary link path (ADR 0087, #1148).
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
     let target = tx
         .query_row(
             "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
@@ -432,6 +436,44 @@ mod tests {
             ("producer".into(), "scoring-job".into()),
             ("status".into(), "candidate".into()),
         ])
+    }
+
+    #[test]
+    fn concurrent_learning_records_wait_for_the_write_lock() {
+        // #1148: the retry and link-bound reads run under the write lock, so
+        // contending recorders wait instead of failing with "database is locked".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("learning.db");
+        let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        db.create_object(&target("target-1")).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|worker| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..10)
+                        .map(|index| {
+                            let mut params = record_params();
+                            params.insert("id".into(), format!("learning-{worker}-{index}"));
+                            record_learning(&db, &SchemaRegistry::new(), &params, "worker-1")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            for result in handle.join().unwrap() {
+                result.unwrap();
+            }
+        }
+        let links = db
+            .get_links("target-1", REL_TOUCHES, &Direction::Incoming)
+            .unwrap();
+        assert_eq!(links.len(), 80);
     }
 
     #[test]

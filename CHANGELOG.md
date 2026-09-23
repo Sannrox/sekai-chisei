@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Learning records, relationship objects, capability authorizations, and team
+  namespace bootstrap now take the SQLite write lock before their existence and
+  link-bound reads, as the primary link path does. Concurrent writers wait for
+  each other instead of failing with `database is locked` (#1148).
 - `DecideActionInstance` now binds an approval to the one subject a bearer or
   enterprise credential established. Self-asserted identities from the local
   socket or insecure transport, comma-listed `x-principal` values, and the
