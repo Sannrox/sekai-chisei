@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Link admission on community PostgreSQL reads the link id and the tightest
+  mapped relation maximum in one statement after taking the shared relation
+  lock. An uncapped insert now costs three statements instead of four, and a
+  capped one five instead of six. The ADR 0087 locking order is unchanged (#1144).
 - The integration contract lists Action approval (park and decide) as
   `experimental` through `DecideActionInstance` instead of `unavailable`, and
   the governed Action instance guide tells consumers how to move from the old
