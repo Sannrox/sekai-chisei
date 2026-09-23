@@ -39,4 +39,4 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: ./scripts/postgres-conformance.sh
+      - run: bash scripts/postgres-conformance.sh

@@ -2,8 +2,8 @@
 # Runs every ignored PostgreSQL conformance test against an ephemeral,
 # TLS-only PostgreSQL with a throwaway CA (#1153).
 #
-#   scripts/postgres-conformance.sh            # Docker (CI default)
-#   SEKAI_CONTAINER_CLI=container scripts/postgres-conformance.sh   # Apple container
+#   bash scripts/postgres-conformance.sh            # Docker (CI default)
+#   SEKAI_CONTAINER_CLI=container bash scripts/postgres-conformance.sh   # Apple container
 #
 # Overrides: SEKAI_TEST_POSTGRES_PORT, SEKAI_TEST_POSTGRES_IMAGE.
 set -euo pipefail

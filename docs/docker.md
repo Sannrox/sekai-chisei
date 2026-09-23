@@ -88,8 +88,8 @@ spawned-binary product loop and the store-relocate tests, let the script start
 an ephemeral TLS-only PostgreSQL with a throwaway CA:
 
 ```bash
-scripts/postgres-conformance.sh                                  # Docker
-SEKAI_CONTAINER_CLI=container scripts/postgres-conformance.sh    # Apple container
+bash scripts/postgres-conformance.sh                               # Docker
+SEKAI_CONTAINER_CLI=container bash scripts/postgres-conformance.sh  # Apple container
 ```
 
 It creates separate databases for the in-crate tests (which reset their
