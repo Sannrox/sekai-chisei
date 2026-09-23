@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The RPC maturity ledger marks `DecideActionInstance`, `PutActionBinding`, and
+  `RunActionBinding` as `sqlite only`: community PostgreSQL answers
+  `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
+  runtimes may be `stable` (#1150).
 - A principal named in a governed Action type's `approvers` can now decide a
   parked instance with read-only namespace membership. `DecideActionInstance`
   no longer requires namespace Write before checking the approver entitlement,

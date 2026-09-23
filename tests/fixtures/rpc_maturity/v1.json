@@ -882,7 +882,7 @@
       "service": "SekaiService",
       "rpc": "DecideActionInstance",
       "storage_path": "sekai.audit",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -891,7 +891,7 @@
       "service": "SekaiService",
       "rpc": "PutActionBinding",
       "storage_path": "sekai.audit",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -900,7 +900,7 @@
       "service": "SekaiService",
       "rpc": "RunActionBinding",
       "storage_path": "sekai.audit",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
