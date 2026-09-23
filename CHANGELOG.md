@@ -6,6 +6,12 @@
   mapped relation maximum in one statement after taking the shared relation
   lock. An uncapped insert now costs three statements instead of four, and a
   capped one five instead of six. The ADR 0087 locking order is unchanged (#1144).
+- Granting a parked Action now commits the object write and the
+  parked-to-admitted transition in one SQLite transaction, re-checking the
+  target object under the same lock. A crash can no longer leave an object
+  write without its grant, a stale target is denied `stale_on_resume` with no
+  write, and concurrent grants apply the write once with no compensating
+  restore (#1139).
 - The integration contract lists Action approval (park and decide) as
   `experimental` through `DecideActionInstance` instead of `unavailable`, and
   the governed Action instance guide tells consumers how to move from the old

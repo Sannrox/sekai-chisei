@@ -184,6 +184,47 @@ pub fn submit_budget_subject(namespace: &str, actor: &str, budget_scope: &str) -
     format!("{root}/project:{}/agent:{}", namespace.trim(), actor.trim())
 }
 
+/// The object write a parked grant commits with its transition.
+pub enum ParkedGrantWrite {
+    Create(crate::domain::Object),
+    Update(crate::domain::Object),
+}
+
+/// Result of [`SekaiDb::grant_parked_action_instance`].
+pub enum ParkedGrantOutcome {
+    /// The write and the transition committed; `previous` is the prior
+    /// object state for an update.
+    Granted {
+        previous: Option<crate::domain::Object>,
+    },
+    /// Another decision already moved the instance.
+    NotParked,
+    /// The target object changed since the instance parked.
+    Stale,
+}
+
+/// Canonical digest of an object's persisted state; `"absent"` when missing.
+/// Properties are sorted, so an unchanged object always digests the same.
+pub fn object_state_digest(object: Option<&crate::domain::Object>) -> Result<String, String> {
+    let Some(object) = object else {
+        return Ok("absent".into());
+    };
+    let properties: std::collections::BTreeMap<&String, &String> =
+        object.properties.iter().collect();
+    let body = serde_json::to_vec(&(
+        &object.id,
+        &object.kind,
+        &object.name,
+        &object.namespace,
+        &object.external_id,
+        properties,
+        object.created,
+        object.updated,
+    ))
+    .map_err(|error| error.to_string())?;
+    Ok(format!("sha256:{:x}", Sha256::digest(body)))
+}
+
 impl SekaiDb {
     pub fn migrate_action_instances(&self) -> Result<(), String> {
         let conn = self.conn();
@@ -438,6 +479,82 @@ impl SekaiDb {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Grants a parked instance and applies its object write in one
+    /// transaction (#1139). The target object is re-digested under the write
+    /// lock, so a grant either commits both the write and the transition or
+    /// neither: no orphan write, and no concurrent grant can apply twice.
+    pub fn grant_parked_action_instance(
+        &self,
+        granted: &ActionInstance,
+        target_object_id: &str,
+        parked_object_digest: &str,
+        write: Option<&ParkedGrantWrite>,
+        actor: &str,
+    ) -> Result<ParkedGrantOutcome, String> {
+        self.migrate_action_instances()?;
+        granted.validate_fields()?;
+        let body_json = serde_json::to_string(granted).map_err(|e| e.to_string())?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let status: Option<String> = tx
+            .query_row(
+                "SELECT status FROM sekai_action_instances WHERE instance_id = ?1",
+                params![granted.instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if status.as_deref() != Some(STATUS_PARKED) {
+            return Ok(ParkedGrantOutcome::NotParked);
+        }
+        if !target_object_id.is_empty() {
+            let current = tx
+                .query_row(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id = ?1",
+                    params![target_object_id],
+                    crate::db::sekai::row_to_object,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if object_state_digest(current.as_ref())? != parked_object_digest {
+                return Ok(ParkedGrantOutcome::Stale);
+            }
+        }
+        let previous = match write {
+            Some(ParkedGrantWrite::Create(object)) => {
+                crate::sekai::audit::insert_created_object_in(&tx, object, actor, None)?;
+                None
+            }
+            Some(ParkedGrantWrite::Update(object)) => Some(
+                crate::sekai::audit::update_object_in(&tx, object, None, actor, None)?
+                    .ok_or_else(|| format!("object {} not found", object.id))?,
+            ),
+            None => None,
+        };
+        tx.execute(
+            "UPDATE sekai_action_instances
+             SET status = ?2, deny_reason = ?3, policy_decision = ?4, budget_decision = ?5,
+                 decided_at_ms = ?6, body_json = ?7
+             WHERE instance_id = ?1 AND status = ?8",
+            params![
+                granted.instance_id,
+                granted.status,
+                granted.deny_reason,
+                granted.policy_decision,
+                granted.budget_decision,
+                granted.decided_at_ms,
+                body_json,
+                STATUS_PARKED,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(ParkedGrantOutcome::Granted { previous })
     }
 
     /// Moves a parked instance to its decided state. Returns false when the

@@ -940,35 +940,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(behavior)
             .map_err(|e| e.to_string())?;
-        require_sqlite_policy_generation(&tx, &object.namespace, expected_policy_generation)?;
-        let historical_changes: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
-                params![object.id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if historical_changes > 0 {
-            return Err("object IDs with audit history cannot be reused".into());
-        }
-        let props = crate::domain::storage_properties_json(&object.properties)?;
-        tx.execute(
-            "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![
-                object.id,
-                object.kind,
-                object.name,
-                object.namespace,
-                object.external_id,
-                props,
-                object.created,
-                object.updated
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let changes = object_diff_changes(actor, None, Some(object), now);
-        insert_object_changes(&tx, &changes)?;
+        insert_created_object_in(&tx, object, actor, expected_policy_generation)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -993,53 +965,9 @@ impl SekaiDb {
         }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let before = tx
-            .query_row(
-                "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
-                params![object.id],
-                crate::db::sekai::row_to_object,
-            )
-            .optional()
-            .map_err(|e| e.to_string())?;
-        let Some(before_object) = before else {
-            tx.commit().map_err(|e| e.to_string())?;
-            return Ok(None);
-        };
-        require_sqlite_policy_generation(
-            &tx,
-            &before_object.namespace,
-            expected_policy_generation,
-        )?;
-        if let Some(expected) = expected
-            && !before_object.persisted_state_matches(expected)
-        {
-            return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
-        }
-        if before_object.namespace != object.namespace {
-            return Err("object namespace is immutable".into());
-        }
-        if before_object.kind != object.kind {
-            crate::sekai::ontology::validate_object_kind_change(&tx, &object.id, &object.kind)?;
-        }
-        let props = crate::domain::storage_properties_json(&object.properties)?;
-        tx.execute(
-            "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
-            params![
-                object.id,
-                object.kind,
-                object.name,
-                object.namespace,
-                object.external_id,
-                props,
-                object.updated
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let changes = object_diff_changes(actor, Some(&before_object), Some(object), now);
-        insert_object_changes(&tx, &changes)?;
+        let before = update_object_in(&tx, object, expected, actor, expected_policy_generation)?;
         tx.commit().map_err(|e| e.to_string())?;
-        Ok(Some(before_object))
+        Ok(before)
     }
 
     pub fn delete_object_with_audit(
@@ -1370,6 +1298,97 @@ pub(crate) fn insert_object_changes(
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Inserts `object` with its creation audit inside the caller's transaction.
+pub(crate) fn insert_created_object_in(
+    tx: &rusqlite::Transaction<'_>,
+    object: &Object,
+    actor: &str,
+    expected_policy_generation: Option<&str>,
+) -> Result<(), String> {
+    require_sqlite_policy_generation(tx, &object.namespace, expected_policy_generation)?;
+    let historical_changes: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sekai_object_changes WHERE object_id = ?1",
+            params![object.id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if historical_changes > 0 {
+        return Err("object IDs with audit history cannot be reused".into());
+    }
+    let props = crate::domain::storage_properties_json(&object.properties)?;
+    tx.execute(
+        "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            object.id,
+            object.kind,
+            object.name,
+            object.namespace,
+            object.external_id,
+            props,
+            object.created,
+            object.updated
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let changes = object_diff_changes(actor, None, Some(object), now);
+    insert_object_changes(tx, &changes)?;
+    Ok(())
+}
+
+/// Updates `object` with its change audit inside the caller's transaction and
+/// returns the prior state, or `None` when the object does not exist.
+pub(crate) fn update_object_in(
+    tx: &rusqlite::Transaction<'_>,
+    object: &Object,
+    expected: Option<&Object>,
+    actor: &str,
+    expected_policy_generation: Option<&str>,
+) -> Result<Option<Object>, String> {
+    let before = tx
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated FROM sekai_objects WHERE id = ?1",
+            params![object.id],
+            crate::db::sekai::row_to_object,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(before_object) = before else {
+        return Ok(None);
+    };
+    require_sqlite_policy_generation(tx, &before_object.namespace, expected_policy_generation)?;
+    if let Some(expected) = expected
+        && !before_object.persisted_state_matches(expected)
+    {
+        return Err(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION.into());
+    }
+    if before_object.namespace != object.namespace {
+        return Err("object namespace is immutable".into());
+    }
+    if before_object.kind != object.kind {
+        crate::sekai::ontology::validate_object_kind_change(tx, &object.id, &object.kind)?;
+    }
+    let props = crate::domain::storage_properties_json(&object.properties)?;
+    tx.execute(
+        "UPDATE sekai_objects SET kind=?2, name=?3, namespace=?4, external_id=?5, properties=?6, updated=?7 WHERE id=?1",
+        params![
+            object.id,
+            object.kind,
+            object.name,
+            object.namespace,
+            object.external_id,
+            props,
+            object.updated
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let changes = object_diff_changes(actor, Some(&before_object), Some(object), now);
+    insert_object_changes(tx, &changes)?;
+    Ok(Some(before_object))
 }
 
 #[cfg(test)]

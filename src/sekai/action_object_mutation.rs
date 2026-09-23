@@ -234,6 +234,73 @@ pub(crate) fn apply(
     })
 }
 
+/// Outcome of committing a parked grant with its object write.
+pub(crate) enum ParkedGrant {
+    Granted(Option<Box<AppliedObjectMutation>>),
+    NotParked,
+    Stale,
+}
+
+/// Applies the planned write and moves the parked instance to `granted` in
+/// one transaction, so a crash or a concurrent decision can never leave the
+/// write without the grant (#1139).
+pub(crate) fn grant_parked(
+    db: &RuntimeDb,
+    planned: Option<PlannedObjectMutation>,
+    granted: &crate::sekai::action_instance::ActionInstance,
+    target_object_id: &str,
+    parked_object_digest: &str,
+    actor: &str,
+    now_ms: i64,
+) -> Result<ParkedGrant, ActionObjectMutationError> {
+    use crate::sekai::action_instance::{ParkedGrantOutcome, ParkedGrantWrite};
+    let prepared = planned.map(|planned| {
+        let mutation = planned.mutation().to_string();
+        let created = mutation == OBJECT_MUTATION_CREATE;
+        let mut object = match planned {
+            PlannedObjectMutation::Create(object) | PlannedObjectMutation::Update(object) => object,
+        };
+        if created {
+            object.created = now_ms;
+        }
+        object.updated = now_ms;
+        (mutation, created, object)
+    });
+    let write = prepared.as_ref().map(|(_, created, object)| {
+        if *created {
+            ParkedGrantWrite::Create(object.clone())
+        } else {
+            ParkedGrantWrite::Update(object.clone())
+        }
+    });
+    let outcome = db
+        .grant_parked_action_instance(
+            granted,
+            target_object_id,
+            parked_object_digest,
+            write.as_ref(),
+            actor,
+        )
+        .map_err(ActionObjectMutationError::Internal)?;
+    Ok(match outcome {
+        ParkedGrantOutcome::NotParked => ParkedGrant::NotParked,
+        ParkedGrantOutcome::Stale => ParkedGrant::Stale,
+        ParkedGrantOutcome::Granted { previous } => {
+            ParkedGrant::Granted(prepared.map(|(mutation, created, object)| {
+                Box::new(AppliedObjectMutation {
+                    object_id: object.id.clone(),
+                    object_kind: object.kind.clone(),
+                    mutation,
+                    created,
+                    applied_updated: object.updated,
+                    object,
+                    previous,
+                })
+            }))
+        }
+    })
+}
+
 pub(crate) fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) {
     if applied.created {
         // Only abort the original create. If another writer already mutated
