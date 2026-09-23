@@ -11,7 +11,7 @@
 
 use crate::obs::labels::{
     Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, LookupFirstPath, Outcome,
-    RejectionReason, Subsystem, WaitKind,
+    PoolPlane, RejectionReason, Subsystem, WaitKind,
 };
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -21,6 +21,8 @@ use std::time::Duration;
 pub const CONTROL_PLANE_OVERHEAD: &str = "sekai_control_plane_overhead_seconds";
 pub const SATURATION_RATIO: &str = "sekai_saturation_ratio";
 pub const DB_WAIT: &str = "sekai_db_wait_seconds";
+pub const POOL_CHECKOUT: &str = "sekai_db_pool_checkout_seconds";
+pub const POOL_IN_USE_RATIO: &str = "sekai_db_pool_in_use_ratio";
 pub const QUEUE_DEPTH: &str = "sekai_queue_depth";
 pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
 pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
@@ -49,6 +51,15 @@ pub fn describe_all() {
         DB_WAIT,
         Unit::Seconds,
         "Time waiting on database work before progress"
+    );
+    describe_histogram!(
+        POOL_CHECKOUT,
+        Unit::Seconds,
+        "Time waiting to check a connection out of a store plane's pool"
+    );
+    describe_gauge!(
+        POOL_IN_USE_RATIO,
+        "Share of a store plane's pool checked out at the last checkout, 0.0 to 1.0"
     );
     describe_gauge!(QUEUE_DEPTH, "Items currently admitted and awaiting work");
     describe_counter!(CACHE_EVENTS, "Cache lookups by outcome");
@@ -110,6 +121,26 @@ pub fn record_db_wait(kind: WaitKind, outcome: Outcome, waited: Duration) {
         "outcome" => outcome.as_str(),
     )
     .record(waited.as_secs_f64());
+}
+
+/// Record one connection checkout from a store plane's pool and the share of
+/// that pool in use right after it. Split pools report per plane so a starved
+/// plane is visible against the Shared baseline.
+pub fn record_pool_checkout(plane: PoolPlane, outcome: Outcome, waited: Duration, in_use: f64) {
+    histogram!(
+        POOL_CHECKOUT,
+        "plane" => plane.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(waited.as_secs_f64());
+    if outcome == Outcome::Ok {
+        let clamped = if in_use.is_finite() {
+            in_use.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        gauge!(POOL_IN_USE_RATIO, "plane" => plane.as_str()).set(clamped);
+    }
 }
 
 /// Set current queue depth for a subsystem.
