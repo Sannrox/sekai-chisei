@@ -6,6 +6,21 @@
   `RunActionBinding` as `sqlite only`: community PostgreSQL answers
   `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
   runtimes may be `stable` (#1150).
+- `DiscoverCapabilities` now reports `supports_entailment=0` for
+  `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
+  PostgreSQL, where those RPCs serve asserted-only reasoning and fail
+  entailment closed. The integration contract lists the PostgreSQL surface as
+  asserted-only instead of unavailable (#1149).
+- Granting a parked Action now commits the object write and the
+  parked-to-admitted transition in one SQLite transaction, re-checking the
+  target object under the same lock. A crash can no longer leave an object
+  write without its grant, a stale target is denied `stale_on_resume` with no
+  write, and concurrent grants apply the write once with no compensating
+  restore (#1139).
+- The integration contract lists Action approval (park and decide) as
+  `experimental` through `DecideActionInstance` instead of `unavailable`, and
+  the governed Action instance guide tells consumers how to move from the old
+  `require_approval` denial to `parked` plus a decision (#1151).
 - A principal named in a governed Action type's `approvers` can now decide a
   parked instance with read-only namespace membership. `DecideActionInstance`
   no longer requires namespace Write before checking the approver entitlement,

@@ -9789,6 +9789,85 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
     .unwrap();
 }
 
+/// #1149: community PostgreSQL advertises no query-time entailment, serves
+/// the asserted-only mode, and fails the entailment mode closed.
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_semantic_discovery_is_honest_about_entailment() {
+    let scratch = crate::db::postgres::ScratchDatabase::create();
+    let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+                db.clone(),
+            ));
+            seed_semantic_catalog_graph(&svc).await;
+            let discovered = svc
+                .discover_capabilities(with_named_principal(
+                    DiscoverCapabilitiesRequest {
+                        namespace: "acme".into(),
+                        page_size: 200,
+                        product_tier_filter: "all".into(),
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            for name in [
+                semantic::CAPABILITY_EXPAND_RELATIONS,
+                semantic::CAPABILITY_RETRIEVE_CONTEXT,
+                semantic::CAPABILITY_EXPLAIN_DERIVATION,
+            ] {
+                let entry = discovered
+                    .capabilities
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .unwrap_or_else(|| panic!("missing semantic capability {name}"));
+                let limits = entry
+                    .limits
+                    .iter()
+                    .map(|limit| (limit.name.as_str(), limit.value))
+                    .collect::<HashMap<_, _>>();
+                assert_eq!(limits.get("supports_entailment"), Some(&0), "{name}");
+                assert_eq!(limits.get("supports_asserted_only"), Some(&1), "{name}");
+            }
+            let expand = |mode: &str| ExpandRelationsRequest {
+                namespace: "acme".into(),
+                root: Some(ContextRoot {
+                    object_id: "sem-root".into(),
+                    ..Default::default()
+                }),
+                relations: vec!["contains".into()],
+                direction: "outgoing".into(),
+                max_depth: 2,
+                reasoning_mode: mode.into(),
+                ..Default::default()
+            };
+            let asserted = svc
+                .expand_relations(with_named_principal(expand("asserted_only"), "alice"))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(
+                asserted
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.object.as_ref().unwrap().id == "sem-root")
+            );
+            let entailment = svc
+                .expand_relations(with_named_principal(expand("entailment"), "alice"))
+                .await
+                .unwrap_err();
+            assert_eq!(entailment.code(), tonic::Code::FailedPrecondition);
+        });
+    drop(db);
+}
+
 #[tokio::test]
 async fn semantic_capabilities_are_discoverable_with_bounds_and_versions() {
     let svc = service();
