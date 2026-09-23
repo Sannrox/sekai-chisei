@@ -7,6 +7,12 @@
   binding's subscription, together with a marker that no subscription existed.
   The next run rewinds the new subscription to its pin and delivers the page
   again (#1141).
+- Granting a parked Action now commits the object write and the
+  parked-to-admitted transition in one SQLite transaction, re-checking the
+  target object under the same lock. A crash can no longer leave an object
+  write without its grant, a stale target is denied `stale_on_resume` with no
+  write, and concurrent grants apply the write once with no compensating
+  restore (#1139).
 - The integration contract lists Action approval (park and decide) as
   `experimental` through `DecideActionInstance` instead of `unavailable`, and
   the governed Action instance guide tells consumers how to move from the old
