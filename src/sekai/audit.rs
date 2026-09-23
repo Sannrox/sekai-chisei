@@ -315,7 +315,11 @@ impl SekaiDb {
         let external_id = format!("namespace:{namespace}");
         let now = chrono::Utc::now().timestamp_millis();
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // IMMEDIATE takes the write lock before the boundary lookup, so
+        // concurrent bootstraps wait instead of failing to upgrade (#1148).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let objects = {
             let mut statement = tx
                 .prepare(
@@ -1374,6 +1378,42 @@ mod tests {
 
     fn setup() -> RuntimeDb {
         RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()))
+    }
+
+    #[test]
+    fn concurrent_team_namespace_bootstraps_wait_for_the_write_lock() {
+        // #1148: bootstrap reads the boundary under the write lock, so
+        // contending members wait instead of failing with "database is locked".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("namespaces.db");
+        let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|worker| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..10)
+                        .map(|index| {
+                            db.ensure_team_namespace(
+                                &format!("team-{}", index % 3),
+                                &format!("member-{worker}-{index}"),
+                                Role::Viewer,
+                                "local",
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            for result in handle.join().unwrap() {
+                result.unwrap();
+            }
+        }
     }
 
     fn object(

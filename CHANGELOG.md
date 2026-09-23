@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Learning records, relationship objects, capability authorizations, and team
+  namespace bootstrap now take the SQLite write lock before their existence and
+  link-bound reads, as the primary link path does. Concurrent writers wait for
+  each other instead of failing with `database is locked` (#1148).
 - Community PostgreSQL no longer fails with `INTERNAL` on audit-decision
   listing, object-change history and feed, evidence submissions, policy
   attestations, object-type index pages, and work-unit heartbeats. Those

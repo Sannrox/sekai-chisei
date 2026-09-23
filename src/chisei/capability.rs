@@ -647,7 +647,11 @@ pub fn register_capability(
         .require_sqlite_arc()
         .map_err(CapabilityRegistryError::Storage)?
         .conn();
-    let tx = conn.transaction().map_err(registry_storage)?;
+    // IMMEDIATE takes the write lock before the active-version and link-bound
+    // reads, as on the primary link path (ADR 0087, #1148).
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(registry_storage)?;
     let mut existing = {
         let mut statement = tx
             .prepare(
