@@ -61,3 +61,30 @@ async fn default_server_layer_rejects_experimental_rpc_paths() {
         "default-build integration tests cannot reach experimental RPCs"
     );
 }
+
+/// #1150: an RPC whose handler answers `UNAVAILABLE` on community PostgreSQL
+/// before any work must not claim a real backend on every runtime.
+#[test]
+fn postgres_unavailable_rpcs_are_classified_sqlite_only() {
+    const RUNTIME_DB: &str = include_str!("../src/db/runtime_db.rs");
+    let table = RpcMaturityTable::load().expect("maturity table");
+    for (rpc, constant) in [
+        ("DecideActionInstance", "DECIDE_ACTION_INSTANCE_UNAVAILABLE"),
+        ("PutActionBinding", "ACTION_BINDINGS_UNAVAILABLE"),
+        ("RunActionBinding", "ACTION_BINDINGS_UNAVAILABLE"),
+    ] {
+        if !RUNTIME_DB.contains(&format!("pub(crate) const {constant}")) {
+            continue;
+        }
+        let entry = table
+            .entries
+            .iter()
+            .find(|entry| entry.rpc == rpc)
+            .unwrap_or_else(|| panic!("{rpc} missing from the maturity table"));
+        assert_eq!(
+            entry.real_backend, "sqlite only",
+            "{rpc} fails closed on PostgreSQL ({constant})"
+        );
+        assert_ne!(entry.classification, RpcClassification::Stable);
+    }
+}

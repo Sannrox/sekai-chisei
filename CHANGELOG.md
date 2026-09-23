@@ -6,6 +6,10 @@
   `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
   with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
   locally with Docker or Apple `container` (#1153).
+- The RPC maturity ledger marks `DecideActionInstance`, `PutActionBinding`, and
+  `RunActionBinding` as `sqlite only`: community PostgreSQL answers
+  `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
+  runtimes may be `stable` (#1150).
 - `DiscoverCapabilities` now reports `supports_entailment=0` for
   `RetrieveContext`, `ExpandRelations`, and `ExplainDerivation` on community
   PostgreSQL, where those RPCs serve asserted-only reasoning and fail
