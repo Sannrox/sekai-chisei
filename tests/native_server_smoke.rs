@@ -35,9 +35,10 @@ use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
     AcquireLeaseRequest, CreateObjectRequest, DecideActionInstanceRequest,
     EnsureTeamNamespaceRequest, GetActionInstanceRequest, GetLeaseRequest, GetLinkedObjectsRequest,
-    GetObjectRequest, GovernedActionType, GraphQuery, ListFilter, ListObjectsRequest, Object,
-    PutGovernedActionTypeRequest, ReleaseLeaseRequest, SubmitActionInstanceRequest,
-    TraverseRequest,
+    GetObjectRequest, GovernedActionType, GraphQuery, ListActionInstancesRequest, ListFilter,
+    ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
+    ReleaseLeaseRequest, RunActionBindingRequest, SubmitActionInstanceRequest, TraverseRequest,
+    UpdateObjectRequest,
 };
 use sekai_chisei::sekai::semantic::CAPABILITY_RESOLVE_REF;
 use serde_json::{Value, json};
@@ -1046,6 +1047,173 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
         receipt_json.contains("approval_decided") || receipt_json.contains("ApprovalDecided"),
         "{receipt_json}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_admits_one_action_per_bound_object_change() {
+    // #1092: a namespace-admin-installed binding turns one object update into
+    // exactly one Action instance, a rerun admits nothing new, require_approval
+    // parks instead of auto-granting, and a non-admin cannot install.
+    let (_fake, mut server) = mocked_server().await;
+    server
+        .grant_namespace("demo", "svc-escalator", "editor")
+        .await;
+    let editor = server.create_principal_token("carol-agent");
+    server
+        .grant_namespace("demo", "carol-agent", "editor")
+        .await;
+    let mut sekai = server.sekai().await;
+    sekai
+        .put_governed_action_type(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                description: "Escalate a degraded component".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"component":{"type":"string"},"severity":{"type":"string"}},"required":["component","severity"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            }),
+            request_id: String::new(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put type: {error}\n{}", server.logs()));
+    let object = Object {
+        id: "billing-api".into(),
+        kind: "component".into(),
+        name: "billing-api".into(),
+        namespace: "demo".into(),
+        external_id: String::new(),
+        properties: HashMap::from([("severity".into(), "low".into())]),
+        created: 0,
+        updated: 0,
+    };
+    sekai
+        .create_object(CreateObjectRequest {
+            object: Some(object.clone()),
+            lease_precondition: None,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create object: {error}\n{}", server.logs()));
+    let binding_json = json!({
+        "contract_version": "sekai.action-binding/v1",
+        "binding_id": "escalate-degraded",
+        "namespace": "demo",
+        "kind": "component",
+        "ops": ["update"],
+        "type_id": "component.escalate",
+        "version": "1",
+        "run_as": "svc-escalator",
+        "parameters": {
+            "component": {"source": "object_id"},
+            "severity": {"source": "property", "value": "severity"}
+        },
+        "enabled": true
+    })
+    .to_string();
+    let refused = sekai
+        .put_action_binding(bearer(
+            &editor,
+            PutActionBindingRequest {
+                binding_json: binding_json.clone(),
+            },
+        ))
+        .await
+        .expect_err("a namespace editor cannot install unattended writes");
+    assert_eq!(refused.code(), Code::PermissionDenied);
+    let installed = sekai
+        .put_action_binding(PutActionBindingRequest { binding_json })
+        .await
+        .unwrap_or_else(|error| panic!("put binding: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(installed.revision, 1);
+
+    let run = |sekai: &mut SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient>| {
+        let mut sekai = sekai.clone();
+        async move {
+            sekai
+                .run_action_binding(RunActionBindingRequest {
+                    namespace: "demo".into(),
+                    binding_id: "escalate-degraded".into(),
+                    limit: 16,
+                })
+                .await
+                .map(|response| response.into_inner())
+        }
+    };
+    let pinned = run(&mut sekai)
+        .await
+        .expect("first run pins the subscription");
+    assert!(pinned.submissions.is_empty(), "no backfill: {pinned:?}");
+    assert!(!pinned.authority);
+
+    let update = |severity: &str| {
+        let mut changed = object.clone();
+        changed
+            .properties
+            .insert("severity".into(), severity.into());
+        UpdateObjectRequest {
+            object: Some(changed),
+            lease_precondition: None,
+        }
+    };
+    sekai
+        .update_object(update("high"))
+        .await
+        .unwrap_or_else(|error| panic!("update object: {error}\n{}", server.logs()));
+    let admitted = run(&mut sekai).await.expect("run after update");
+    let submitted: Vec<_> = admitted
+        .submissions
+        .iter()
+        .filter(|submission| !submission.instance_id.is_empty())
+        .collect();
+    assert_eq!(submitted.len(), 1, "{admitted:?}");
+    assert_eq!(submitted[0].status, "admitted", "{admitted:?}");
+
+    let rerun = run(&mut sekai).await.expect("rerun");
+    assert!(
+        rerun
+            .submissions
+            .iter()
+            .all(|submission| submission.instance_id.is_empty() || submission.replay),
+        "a rerun must not admit a second instance: {rerun:?}"
+    );
+    let instances = sekai
+        .list_action_instances(ListActionInstancesRequest {
+            namespace: "demo".into(),
+            type_id: "component.escalate".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list instances: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(instances.instances.len(), 1);
+
+    let set_policy = server.sekaictl(&[
+        "admin",
+        "governance",
+        "action",
+        "policy",
+        "set",
+        "--scope",
+        "demo",
+        "--default",
+        "require_approval",
+    ]);
+    assert_success(&set_policy, "action policy set", &server.logs());
+    sekai
+        .update_object(update("critical"))
+        .await
+        .unwrap_or_else(|error| panic!("update object: {error}\n{}", server.logs()));
+    let gated = run(&mut sekai).await.expect("run under require_approval");
+    let parked: Vec<_> = gated
+        .submissions
+        .iter()
+        .filter(|submission| !submission.instance_id.is_empty())
+        .collect();
+    assert_eq!(parked.len(), 1, "{gated:?}");
+    assert_eq!(parked[0].status, "parked", "never auto-granted: {gated:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

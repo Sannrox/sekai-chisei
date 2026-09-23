@@ -30,6 +30,17 @@ A page is bounded. A consumer that falls more than the documented backlog
 behind committed mutations is disconnected with `disconnect_reason =
 slow_consumer`.
 
+## Action bindings
+
+A namespace administrator can bind a subscription scope to one governed
+Action type with `PutActionBinding` (experimental, gated by
+`SEKAI_EXPERIMENTAL_RPCS=1`). `RunActionBinding` reads
+the binding's own subscription as its `run_as` service principal and submits
+one Action per bound event, checked through normal admission. Properties are
+read as that principal sees them, so hidden fields never become parameters.
+A rerun admits nothing new, and `require_approval` parks. See
+[ADR 0090](decisions/0090-object-change-action-bindings.md).
+
 ## Backends
 
 SQLite and PostgreSQL read the same `sekai_object_changes` log and the same

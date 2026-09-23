@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 
+#[path = "action_binding.rs"]
+mod action_binding;
 #[path = "authorized_link_mutation.rs"]
 mod authorized_link_mutation;
 #[path = "authorized_query_lifecycle.rs"]
@@ -819,6 +821,20 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DecideActionInstanceRequest>,
     ) -> Result<Response<DecideActionInstanceResponse>, Status> {
         rpc_actions::decide_action_instance(self, req).await
+    }
+
+    async fn put_action_binding(
+        &self,
+        req: Request<PutActionBindingRequest>,
+    ) -> Result<Response<PutActionBindingResponse>, Status> {
+        self.put_action_binding_definition(req).await
+    }
+
+    async fn run_action_binding(
+        &self,
+        req: Request<RunActionBindingRequest>,
+    ) -> Result<Response<RunActionBindingResponse>, Status> {
+        self.run_action_binding_once(req).await
     }
 
     async fn describe_object_action(

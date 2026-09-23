@@ -1011,6 +1011,45 @@ mod tests {
     }
 
     #[test]
+    fn restoring_a_recorded_subscription_redelivers_the_same_page() {
+        // #1092: an action binding records the subscription before reading and
+        // restores it when a crash lost the page between read and persist.
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision = read(&runtime, "", &["c-eu"], 20, false, "").snapshot_revision;
+        read(&runtime, &revision, &["c-eu"], 21, false, "");
+        let mut updated = customer("c-eu", "North", "eu", 10);
+        updated.properties.insert("region".into(), "apac".into());
+        updated.updated = 22;
+        runtime.update_object_with_audit(&updated, "alice").unwrap();
+
+        let before = crate::sekai::event_subscription::inspect_event_subscription(
+            &runtime,
+            "alice",
+            "sales",
+            "sales-customers",
+        )
+        .unwrap();
+        let lost = read(&runtime, &revision, &["c-eu"], 23, false, "");
+        assert!(!lost.events.is_empty());
+        let after = crate::sekai::event_subscription::inspect_event_subscription(
+            &runtime,
+            "alice",
+            "sales",
+            "sales-customers",
+        )
+        .unwrap();
+        runtime
+            .advance_event_subscription_cursor(&before, &after)
+            .unwrap();
+
+        let redelivered = read(&runtime, &revision, &["c-eu"], 24, false, "");
+        assert_eq!(redelivered.events, lost.events);
+    }
+
+    #[test]
     fn expired_retention_and_authorization_change_require_resnapshot() {
         let runtime = db();
         runtime
