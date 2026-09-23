@@ -12,8 +12,17 @@ pub(super) async fn retrieve_context(
 ) -> Result<Response<RetrieveContextResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let namespace =
         SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace").unwrap_or_default();
+    if !namespace.is_empty() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            tenant_context.as_ref(),
+            &namespace,
+            false,
+        )?;
+    }
     let mut receipt_guard = service.begin_semantic_catalog_invocation(
         &req,
         semantic::CAPABILITY_RETRIEVE_CONTEXT,
@@ -24,7 +33,12 @@ pub(super) async fn retrieve_context(
         .as_ref()
         .map(|(operation_id, _)| operation_id.clone());
     let purpose = request_purpose_presentation(&req, &principals);
-    let result = service.execute_retrieve_context(&principals, purpose.as_ref(), req.into_inner());
+    let result = service.execute_retrieve_context(
+        &principals,
+        tenant_context.as_ref(),
+        purpose.as_ref(),
+        req.into_inner(),
+    );
     match result {
         Ok(response) => {
             if let Some((_, guard)) = receipt_guard.as_mut() {
@@ -54,6 +68,13 @@ pub(super) async fn expand_relations(
     if namespace.is_empty() || namespace != req.get_ref().namespace {
         return Err(Status::invalid_argument("canonical namespace required"));
     }
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &namespace,
+        false,
+    )?;
     check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let mut receipt_guard = service.begin_semantic_catalog_invocation(
         &req,
@@ -73,6 +94,7 @@ pub(super) async fn expand_relations(
         retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
     let retrieved = service.execute_retrieve_context(
         &principals,
+        tenant_context.as_ref(),
         purpose.as_ref(),
         RetrieveContextRequest {
             roots: vec![root],
@@ -150,6 +172,13 @@ pub(super) async fn explain_derivation(
     if namespace.is_empty() || namespace != req.get_ref().namespace {
         return Err(Status::invalid_argument("canonical namespace required"));
     }
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &namespace,
+        false,
+    )?;
     check_team_namespace(service.db.runtime(), &principals, &namespace, false)?;
     let mut receipt_guard = service.begin_semantic_catalog_invocation(
         &req,
@@ -173,6 +202,7 @@ pub(super) async fn explain_derivation(
         retrieval::ReasoningMode::parse(&inner.reasoning_mode).map_err(map_retrieval_error)?;
     let retrieved = service.execute_retrieve_context(
         &principals,
+        tenant_context.as_ref(),
         purpose.as_ref(),
         RetrieveContextRequest {
             roots: vec![from],

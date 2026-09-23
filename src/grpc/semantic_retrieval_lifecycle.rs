@@ -12,6 +12,7 @@ impl SekaiServiceImpl {
     pub(super) fn execute_retrieve_context(
         &self,
         principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
         purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
         inner: RetrieveContextRequest,
     ) -> Result<RetrieveContextResponse, Status> {
@@ -190,6 +191,13 @@ impl SekaiServiceImpl {
                     }
                 };
                 self.security.can_access(&object.id, &principal_refs)
+                    && enforce_namespace_tenant_context(
+                        self.db.runtime(),
+                        tenant_context,
+                        &object.namespace,
+                        false,
+                    )
+                    .is_ok()
                     && check_team_namespace(self.db.runtime(), principals, &object.namespace, false)
                         .is_ok()
                     && object_passes_marking(self.db.runtime(), object, principals).unwrap_or(false)
@@ -222,7 +230,7 @@ impl SekaiServiceImpl {
                 candidate.object.clone(),
                 principals,
                 None,
-                None,
+                tenant_context,
                 purpose,
             )?;
         }
