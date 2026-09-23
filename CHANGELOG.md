@@ -6,6 +6,9 @@
   `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
   with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
   locally with Docker or Apple `container` (#1153).
+- `PutActionBinding` now refuses a binding that leaves a `required` parameter
+  of the bound Action type unmapped (`INVALID_ARGUMENT` naming the parameter).
+  Such a binding used to install and then skip every event for good (#1142).
 - The RPC maturity ledger marks `DecideActionInstance`, `PutActionBinding`, and
   `RunActionBinding` as `sqlite only`: community PostgreSQL answers
   `UNAVAILABLE` for them before any work. Only RPCs with a real backend on both
