@@ -952,6 +952,26 @@ message GunshiAllocationBinding {
 message PlanExecutionRequest {
   ExecutionInput input = 1;
   GunshiAllocationBinding gunshi_allocation = 2;
+  // Optional pin to a routing profile from ListRoutingProfiles. An unknown,
+  // unavailable, or non-matching profile fails the plan closed.
+  string routing_profile_id = 3;
+}
+
+// One admitted model route. Listing a profile is not a grant: policy is
+// rechecked when a plan pins it.
+message RoutingProfile {
+  string profile_id = 1;
+  // "local" or "proxied" (customer-hosted profiles arrive with #1171).
+  string mode = 2;
+  // Provider runtime that serves the profile.
+  string runtime = 3;
+  repeated string model_patterns = 4;
+  string lifecycle = 5;
+}
+message ListRoutingProfilesRequest { string namespace = 1; }
+message ListRoutingProfilesResponse {
+  repeated RoutingProfile profiles = 1;
+  string contract_version = 2;
 }
 message PlanExecutionResponse { ExecutionPlan plan = 1; }
 message ExecutePlanRequest { ExecutionPlan plan = 1; }
@@ -1555,6 +1575,7 @@ service ChiseiService {
   // Native governed entry path. Planning resolves policy, context, routing,
   // budget, and evaluation state before a provider call is allowed.
   rpc PlanExecution(PlanExecutionRequest) returns (PlanExecutionResponse);
+  rpc ListRoutingProfiles(ListRoutingProfilesRequest) returns (ListRoutingProfilesResponse);
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   // Parallel fail-closed content path. Older servers return UNIMPLEMENTED.

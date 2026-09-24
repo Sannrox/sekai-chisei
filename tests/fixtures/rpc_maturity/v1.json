@@ -1402,6 +1402,15 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "ListRoutingProfiles",
+      "storage_path": "chisei.provider_registry",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "PlanExecution",
       "storage_path": "chisei.policy, chisei.budget, chisei.execution",
       "real_backend": "yes",

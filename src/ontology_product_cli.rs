@@ -659,6 +659,7 @@ pub async fn plan_and_execute(
 
     let plan = client
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(input),
             gunshi_allocation: None,
         }))

@@ -286,6 +286,7 @@ async fn grpc_chat_round_trip_with_local_ollama() {
 
     let plan = client
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "ollama-e2e".into(),
                 namespace: "default".into(),
@@ -418,6 +419,7 @@ async fn delegation_chain_keeps_private_context_local() {
     let mut client = connect_with_retry(addr).await;
     let local_plan = client
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "delegation-local".into(),
                 namespace: "alpha".into(),
@@ -466,6 +468,7 @@ async fn delegation_chain_keeps_private_context_local() {
 
     let template_plan = client
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "delegation-template".into(),
                 namespace: "alpha".into(),

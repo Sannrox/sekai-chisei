@@ -32,6 +32,7 @@ fn main() {
 
 fn local_private_plan() -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "delegation-local-plan".into(),
             namespace: "alpha".into(),
@@ -56,6 +57,7 @@ fn local_private_plan() -> PlanExecutionRequest {
 
 fn frontier_template_request() -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "delegation-frontier-template".into(),
             namespace: "alpha".into(),
@@ -79,6 +81,7 @@ fn frontier_template_request() -> PlanExecutionRequest {
 
 fn local_private_compose_request(template: &str) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "delegation-local-compose".into(),
             namespace: "alpha".into(),
@@ -107,6 +110,7 @@ fn local_private_compose_request(template: &str) -> PlanExecutionRequest {
 
 fn frontier_polish_request(scrubbed_draft: &str) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "delegation-frontier-polish".into(),
             namespace: "alpha".into(),

@@ -204,6 +204,29 @@ permit and delegation-chain contracts documented in
 `external-action-execution.md`; catalog discovery does not mint or extend
 either form of authority.
 
+## Routing profiles (#1094)
+
+`ChiseiService.ListRoutingProfiles` (experimental; requires
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature) lists the model
+routes a namespace may pin, under contract `chisei.routing-profiles/v1`. Each
+profile is one admitted provider from the provider registry:
+
+- `profile_id` is `provider:<runtime>`.
+- `mode` is `local` when the runtime serves from this host (a loopback
+  endpoint or the native runtime) and `proxied` when the control plane forwards
+  to a remote provider. Customer-hosted endpoints are admitted separately
+  (#1171).
+- `model_patterns` and `lifecycle` come from the registry profile.
+
+The caller needs execution access to the namespace. Listing is not a grant.
+`PlanExecutionRequest.routing_profile_id` optionally pins a profile. After
+planning, the pin must name an admitted profile, and that profile must serve
+the planned route; otherwise the plan fails `FAILED_PRECONDITION`. Every
+planned receipt's `route` event records `routing_profile_id`, `routing_mode`,
+and `routing_profile_pinned`, so an unpinned plan still records the route it
+took. This catalog is not the gateway's `chisei.provider-capabilities/v1`
+matrix, and the two are not interchangeable.
+
 ## Related capability surfaces
 
 ### Source adapter profile

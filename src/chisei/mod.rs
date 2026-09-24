@@ -45,6 +45,7 @@ pub mod privacy;
 pub mod promotion;
 pub use sekai_provider::receipt;
 pub mod residency;
+pub mod routing_profiles;
 pub mod sampling;
 pub mod scoring;
 pub mod stochastic_evaluation;

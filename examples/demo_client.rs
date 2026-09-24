@@ -352,6 +352,7 @@ async fn execute_demo(chisei: &mut Chisei, namespace_id: &str) {
     // Step 1: plan the execution (budget + policy + enrichment, no model call yet).
     let plan = match chisei
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(input),
             gunshi_allocation: None,
         })
