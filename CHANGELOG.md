@@ -5,6 +5,11 @@
 - Updated `rustls` to 0.23.45 (with `aws-lc-rs` 1.18.1 and `rustls-webpki`
   0.103.15) for RUSTSEC-2026-0285, a TLS 1.3 handshake-boundary flaw. `cargo
   audit` passes again (#1177).
+- The object-log dual-read canary projects clerk property grants into mikura
+  `v0.2.0`'s multi-deny ACL instead of skipping every grant-narrowed kind. It
+  still skips when the evaluate reads an ungranted property or a narrowed kind
+  has no schema, rather than comparing against a view wider than the grants
+  (#1112).
 - Combined now pins mikura `v0.2.0` (and its `mikura-ingest` crate) instead of
   `v0.1.0`. Object-log ingest, evaluate, and dual-read keep their `v0.1.0`
   semantics through an adapter. Identity lookups use a direct `Store::load`

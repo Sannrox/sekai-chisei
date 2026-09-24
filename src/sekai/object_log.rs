@@ -11,7 +11,7 @@ use mikura::{
     Aggregate, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord, ObjectSet,
     PropertyAcl, Store,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -377,24 +377,61 @@ pub fn sql_compare_signature(
     Ok((roots.len(), sum))
 }
 
-/// Project clerk property grants into the tagged deny-list.
+/// One evaluated kind as the dual-read canary sees it: its active policy, the
+/// properties its schema declares (`None` when the kind has no schema), and
+/// the properties this evaluate reads on it (filters, grouping, sum, joins).
+pub struct ObjectLogAclKind<'a> {
+    pub kind: &'a str,
+    pub policy: Option<&'a ObjectSecurityPolicy>,
+    pub schema_properties: Option<Vec<String>>,
+    pub read_properties: BTreeSet<String>,
+}
+
+/// Project clerk property grants into the tagged multi-deny ACL (#1112).
 ///
-/// The tagged `PropertyAcl` public API is allow-all or a single deny. A
-/// non-empty grant allow-list therefore cannot be witnessed without a false
-/// allow-all compare. Callers skip the canary and keep the SQL answer.
+/// A kind with a grant allow-list denies every declared property that is
+/// neither granted nor read by this evaluate, so the canary witnesses the
+/// narrowed view instead of a false allow-all. When the evaluate reads an
+/// ungranted property (a join), or a narrowed kind has no schema to bound the
+/// deny list, the SQL answer is wider than the ACL: the canary is skipped
+/// rather than compared against a pretended view.
 pub fn project_object_log_acl<'a>(
-    policies: impl IntoIterator<Item = Option<&'a ObjectSecurityPolicy>>,
+    kinds: impl IntoIterator<Item = ObjectLogAclKind<'a>>,
 ) -> Result<PropertyAcl, ObjectLogCompareError> {
-    for policy in policies.into_iter().flatten() {
-        if policy
-            .property_grants
-            .as_ref()
-            .is_some_and(|grants| !grants.is_empty())
+    let mut acl = PropertyAcl::allow_all();
+    let mut denied = BTreeSet::new();
+    for kind in kinds {
+        let Some(grants) = kind
+            .policy
+            .and_then(|policy| policy.property_grants.as_ref())
+            .filter(|grants| !grants.is_empty())
+        else {
+            continue;
+        };
+        let granted = grants
+            .iter()
+            .map(|grant| grant.property.as_str())
+            .collect::<BTreeSet<_>>();
+        if kind
+            .read_properties
+            .iter()
+            .any(|property| !granted.contains(property.as_str()))
         {
             return Err(ObjectLogCompareError::GrantNarrowed);
         }
+        let Some(declared) = kind.schema_properties else {
+            return Err(ObjectLogCompareError::GrantNarrowed);
+        };
+        for property in declared {
+            if !granted.contains(property.as_str())
+                && denied.insert((kind.kind.to_string(), property.clone()))
+            {
+                acl.insert_deny(kind.kind, &property)
+                    .map_err(|_| ObjectLogCompareError::GrantNarrowed)?;
+            }
+        }
     }
-    Ok(PropertyAcl::allow_all())
+    Ok(acl)
 }
 
 pub fn compare_sql_to_log(
@@ -1112,10 +1149,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn project_object_log_acl_skips_when_grants_narrow() {
-        project_object_log_acl([None]).unwrap();
-        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+    fn granted_customer_policy(
+        granted: &[&str],
+    ) -> crate::sekai::object_security::ObjectSecurityPolicy {
+        crate::sekai::object_security::ObjectSecurityPolicy {
             contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
             namespace: "sales".into(),
             kind: "Customer".into(),
@@ -1123,14 +1160,201 @@ mod tests {
                 operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
                 predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
             }],
-            property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
-                property: "region".into(),
-                access: crate::sekai::object_security::PropertyGrantAccess::Read,
-            }]),
+            property_grants: Some(
+                granted
+                    .iter()
+                    .map(|property| crate::sekai::object_security::PropertyGrant {
+                        property: (*property).into(),
+                        access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                    })
+                    .collect(),
+            ),
             value_instance_grants: None,
             required_purpose: None,
+        }
+    }
+
+    fn customer_kind<'a>(
+        policy: Option<&'a crate::sekai::object_security::ObjectSecurityPolicy>,
+        schema: Option<&[&str]>,
+        read: &[&str],
+    ) -> ObjectLogAclKind<'a> {
+        ObjectLogAclKind {
+            kind: "Customer",
+            policy,
+            schema_properties: schema.map(|properties| {
+                properties
+                    .iter()
+                    .map(|property| (*property).into())
+                    .collect()
+            }),
+            read_properties: read.iter().map(|property| (*property).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn grant_allow_lists_project_into_a_multi_deny_view() {
+        // #1112: a narrowed kind denies every declared property it neither
+        // grants nor reads, so the canary sees the narrowed view.
+        let policy = granted_customer_policy(&["region", "tier"]);
+        let acl = project_object_log_acl([customer_kind(
+            Some(&policy),
+            Some(&["region", "tier", "secret", "email"]),
+            &["region"],
+        )])
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.log");
+        let mut store = Store::create(&log).unwrap();
+        mikura_ingest::BatchIngest::run(
+            &mut store,
+            vec![ObjectRecord {
+                r#gen: 0,
+                kind: "Customer".into(),
+                key: "c1".into(),
+                hidden: false,
+                action_id: None,
+                props: HashMap::from([
+                    ("region".into(), "eu".into()),
+                    ("tier".into(), "2".into()),
+                    ("secret".into(), "s".into()),
+                    ("email".into(), "e".into()),
+                ]),
+            }],
+        )
+        .unwrap();
+        let visible = store.load("Customer", "c1", &acl).unwrap();
+        let mut keys = visible.props.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["region", "tier"]);
+    }
+
+    #[test]
+    fn a_grant_narrowed_canary_compares_and_still_fails_closed() {
+        // #1112: with Customer narrowed to `region`, the projected view hides
+        // `secret`, the count and sum still match SQL, and a diverging log
+        // still fails the canary instead of being skipped.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let mut store = Store::create(&log).unwrap();
+        let record = |kind: &str, key: &str, props: &[(&str, &str)]| ObjectRecord {
+            action_id: None,
+            r#gen: 1,
+            kind: kind.into(),
+            key: key.into(),
+            hidden: false,
+            props: props
+                .iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
         };
-        let err = project_object_log_acl([Some(&policy)]).unwrap_err();
-        assert!(matches!(err, ObjectLogCompareError::GrantNarrowed));
+        BatchIngest::run(
+            &mut store,
+            vec![
+                record("Customer", "c1", &[("region", "eu"), ("secret", "s")]),
+                record("Order", "o1", &[("customer_id", "c1")]),
+                record("Shipment", "s1", &[("order_id", "o1"), ("amount", "10")]),
+            ],
+        )
+        .unwrap();
+        let policy = granted_customer_policy(&["region"]);
+        let acl = project_object_log_acl([
+            customer_kind(Some(&policy), Some(&["region", "secret"]), &[]),
+            ObjectLogAclKind {
+                kind: "Order",
+                policy: None,
+                schema_properties: None,
+                read_properties: BTreeSet::from(["customer_id".to_string()]),
+            },
+            ObjectLogAclKind {
+                kind: "Shipment",
+                policy: None,
+                schema_properties: None,
+                read_properties: BTreeSet::from(["order_id".to_string(), "amount".to_string()]),
+            },
+        ])
+        .unwrap();
+        assert!(
+            !store
+                .load("Customer", "c1", &acl)
+                .unwrap()
+                .props
+                .contains_key("secret")
+        );
+        let descriptor = ObjectSetDescriptor {
+            kind: "Customer".into(),
+            ..ObjectSetDescriptor::default()
+        };
+        let hops = vec![
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+                ..Default::default()
+            },
+            crate::sekai::object_set::ObjectSetTraversal {
+                far_kind: "Shipment".into(),
+                join_property: "order_id".into(),
+                ..Default::default()
+            },
+        ];
+        let aggregation = ObjectSetAggregation {
+            function: "sum".into(),
+            property: "amount".into(),
+            group_by: String::new(),
+        };
+        let customer = member("Customer", "c1", "region", "eu");
+        let order = member("Order", "o1", "customer_id", "c1");
+        let shipment = member("Shipment", "s1", "amount", "10");
+        let paths = vec![vec![&customer, &order, &shipment]];
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let compare = || {
+            compare_sql_to_log_with_cache(
+                &cache,
+                &log,
+                &descriptor,
+                &hops,
+                &aggregation,
+                &paths,
+                acl.clone(),
+            )
+        };
+        compare().unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![record(
+                "Shipment",
+                "s2",
+                &[("order_id", "o1"), ("amount", "5")],
+            )],
+        )
+        .unwrap();
+        assert!(matches!(
+            compare().unwrap_err(),
+            ObjectLogCompareError::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_wider_sql_read_or_unknown_schema_keeps_the_canary_skipped() {
+        let policy = granted_customer_policy(&["region"]);
+        // The evaluate joins on an ungranted property: SQL is wider than the ACL.
+        assert!(matches!(
+            project_object_log_acl([customer_kind(
+                Some(&policy),
+                Some(&["region", "account_id"]),
+                &["account_id"],
+            )]),
+            Err(ObjectLogCompareError::GrantNarrowed)
+        ));
+        // No schema bounds the deny list.
+        assert!(matches!(
+            project_object_log_acl([customer_kind(Some(&policy), None, &["region"])]),
+            Err(ObjectLogCompareError::GrantNarrowed)
+        ));
+        // No policy or no grants: the open view.
+        assert_eq!(
+            project_object_log_acl([customer_kind(None, None, &["anything"])]).unwrap(),
+            PropertyAcl::allow_all()
+        );
     }
 }

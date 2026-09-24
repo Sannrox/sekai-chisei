@@ -147,5 +147,11 @@ the `v0.1.0` behavior this ADR decided:
   `visible_of_kind` scan. Hidden identities read as absent, as before. This
   removes the per-lookup kind scan noted in #1127.
 - Incoming hops, hop predicates, and hide lists in `v0.2.0` stay unmapped
-  until their consumers land (#1112 projects clerk visibility into the tagged
-  ACL).
+  until their consumers land.
+- Clerk property grants project into the tagged multi-deny ACL (#1112). A
+  kind with a grant allow-list denies every declared property that the
+  evaluate neither reads nor is granted. When the evaluate reads an ungranted
+  property, or a narrowed kind has no schema, the SQL answer is wider than the
+  ACL and the canary skips instead of comparing against a pretended view. The
+  aggregated evaluate path does not filter by caller, so there is no per-caller
+  object hiding for `hide_kinds` / `hide_identities` to witness yet.
