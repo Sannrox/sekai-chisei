@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Clerk processes can share one mikura object-log host (ADR 0088). `SEKAI_OBJECT_LOG_HOST`, exclusive with a local `SEKAI_OBJECT_LOG`, routes object-log admits and generation reads through `mikura-host`'s wire contract. A non-loopback host requires `SEKAI_OBJECT_LOG_HOST_BEARER`, and host or wire failures fail the ingest closed with no local fallback (#1196).
 - New warehouse table ingest profile (`adapters/warehouse_table_ingest.rs`) that hydrates typed objects from a committed table snapshot through a connector outside the plane. It uses registered-source `ApplySourceBatch` batches with the snapshot id as the checkpoint. Restricted columns never leave the connector. Declared schema drift is refused until the new revision is registered, and undeclared drift is quarantined without clobbering the last consistent objects. SQLite-only, like source-type descriptors (#1085).
 - Hardened customer-hosted routing:
   - A hosted-shaped model id (`hosted.<name>/…`) is classified as hosted without consulting any registry. When it doesn't resolve, it fails closed instead of reading as an unknown provider that generic routing could replace (#1184).
