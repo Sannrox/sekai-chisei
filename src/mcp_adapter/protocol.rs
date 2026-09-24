@@ -13,6 +13,9 @@ pub const DESCRIBE_ACTION_TOOL: &str = "sekai.actions.describe";
 pub const PREVIEW_ACTION_TOOL: &str = "sekai.actions.preview";
 pub const SUBMIT_ACTION_TOOL: &str = "sekai.actions.submit";
 pub const GET_RECEIPT_TOOL: &str = "chisei.receipt.read";
+/// Link read and create (#1093). Both back onto stable RPCs.
+pub const GET_LINKS_TOOL: &str = "sekai.links.get";
+pub const CREATE_LINK_TOOL: &str = "sekai.links.create";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "authorization",
@@ -26,7 +29,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 6] {
+pub fn well_known_tools() -> [&'static str; 8] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -34,6 +37,8 @@ pub fn well_known_tools() -> [&'static str; 6] {
         PREVIEW_ACTION_TOOL,
         SUBMIT_ACTION_TOOL,
         GET_RECEIPT_TOOL,
+        GET_LINKS_TOOL,
+        CREATE_LINK_TOOL,
     ]
 }
 
@@ -45,6 +50,8 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         PREVIEW_ACTION_TOOL => Some(NativeRpc::PreviewObjectAction),
         SUBMIT_ACTION_TOOL => Some(NativeRpc::SubmitActionInstance),
         GET_RECEIPT_TOOL => Some(NativeRpc::GetOperationReceipt),
+        GET_LINKS_TOOL => Some(NativeRpc::GetLinks),
+        CREATE_LINK_TOOL => Some(NativeRpc::CreateLink),
         _ => None,
     }
 }
@@ -96,7 +103,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, and GetOperationReceipt. Discovery is not a grant."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, and CreateLink. Discovery is not a grant."
     }))
 }
 
@@ -254,6 +261,30 @@ fn bind_session_input(
                 }));
             }
         }
+        NativeRpc::GetLinks => {
+            let object_id = session_string(object, "object_id")?.ok_or_else(
+                || json!({"code":-32602,"message":"GetLinks requires input.object_id"}),
+            )?;
+            let mut bound = serde_json::Map::from_iter([("object_id".into(), json!(object_id))]);
+            for key in ["relation", "direction"] {
+                if let Some(value) = session_string(object, key)? {
+                    bound.insert(key.into(), json!(value));
+                }
+            }
+            *object = bound;
+        }
+        NativeRpc::CreateLink => {
+            // Only the endpoints and the relation cross the adapter; the
+            // server assigns the link id and timestamp.
+            let mut bound = serde_json::Map::new();
+            for key in ["from_id", "to_id", "relation"] {
+                let value = session_string(object, key)?.ok_or_else(
+                    || json!({"code":-32602,"message": format!("CreateLink requires input.{key}")}),
+                )?;
+                bound.insert(key.into(), json!(value));
+            }
+            *object = bound;
+        }
         NativeRpc::DescribeObjectAction | NativeRpc::PreviewObjectAction => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
                 && namespace != context.namespace
@@ -267,6 +298,21 @@ fn bind_session_input(
         }
     }
     Ok(input)
+}
+
+/// A trimmed, non-empty string field, `None` when absent, and an error when
+/// present with any other type.
+fn session_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, Value> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            Ok(Some(value.trim().to_string()).filter(|value| !value.is_empty()))
+        }
+        Some(_) => Err(json!({"code":-32602,"message": format!("input.{key} must be a string")})),
+    }
 }
 
 fn contains_reserved_metadata(value: &Value) -> bool {
@@ -329,6 +375,22 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "chisei.GetOperationReceiptRequest",
             "chisei.GetOperationReceiptResponse",
             "read",
+        ),
+        capability_entry(
+            GET_LINKS_TOOL,
+            "Read the authorized links of one object.",
+            "query",
+            "sekai.GetLinksRequest",
+            "sekai.GetLinksResponse",
+            "read",
+        ),
+        capability_entry(
+            CREATE_LINK_TOOL,
+            "Create one link between two authorized objects.",
+            "action",
+            "sekai.CreateLinkRequest",
+            "sekai.CreateLinkResponse",
+            "write",
         ),
     ]
 }
@@ -489,6 +551,8 @@ mod tests {
                 PREVIEW_ACTION_TOOL,
                 SUBMIT_ACTION_TOOL,
                 GET_RECEIPT_TOOL,
+                GET_LINKS_TOOL,
+                CREATE_LINK_TOOL,
             ]
         );
         assert_eq!(

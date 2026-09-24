@@ -339,8 +339,14 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 `sekai.objects.get` → `GetObject`, `sekai.objects.evaluate_set` →
 `EvaluateObjectSet`, `sekai.actions.describe` → `DescribeObjectAction`,
 `sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
-`SubmitActionInstance`, and `chisei.receipt.read` → `GetOperationReceipt`.
+`SubmitActionInstance`, `chisei.receipt.read` → `GetOperationReceipt`,
+`sekai.links.get` → `GetLinks`, and `sekai.links.create` → `CreateLink`.
+The link tools are listed because both RPCs are `stable` (#1093). Evaluation
+tools stay off the list while their RPCs are experimental.
 `SubmitActionInstance` uses the caller `operation_id` as `request_id`.
+`sekai.links.get` requires `object_id` and accepts `relation` and `direction`.
+`sekai.links.create` passes only `from_id`, `to_id`, and `relation`; the server
+assigns the link id.
 Preview that may fill uses the Function host request timeout
 (`LLM_HTTP_REQUEST_TIMEOUT_SECS`, default 120s) instead of a hard 5s
 deadline; Submit stays at 5s. Unknown
