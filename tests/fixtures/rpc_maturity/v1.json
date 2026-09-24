@@ -1411,6 +1411,24 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "PutRoutingProfile",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "RevokeRoutingProfile",
+      "storage_path": "chisei.policy",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "PlanExecution",
       "storage_path": "chisei.policy, chisei.budget, chisei.execution",
       "real_backend": "yes",

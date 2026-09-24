@@ -214,8 +214,7 @@ profile is one admitted provider from the provider registry:
 - `profile_id` is `provider:<runtime>`.
 - `mode` is `local` when the runtime serves from this host (a loopback
   endpoint or the native runtime) and `proxied` when the control plane forwards
-  to a remote provider. Customer-hosted endpoints are admitted separately
-  (#1171).
+  to a remote provider. Customer-hosted profiles use `customer_hosted` (below).
 - `model_patterns` and `lifecycle` come from the registry profile.
 
 The caller needs execution access to the namespace. Listing is not a grant.
@@ -226,6 +225,30 @@ planned receipt's `route` event records `routing_profile_id`, `routing_mode`,
 and `routing_profile_pinned`, so an unpinned plan still records the route it
 took. This catalog is not the gateway's `chisei.provider-capabilities/v1`
 matrix, and the two are not interchangeable.
+
+### Customer-hosted profiles (#1171)
+
+`ChiseiService.PutRoutingProfile` and `RevokeRoutingProfile` (experimental)
+let a namespace administrator register an OpenAI-compatible endpoint the
+customer operates. The caller needs the `Admin` role on the namespace;
+enterprise credentials are refused until tenant credential resolution is
+wired for hosted routes.
+
+- The profile id is `hosted:<name>` and its mode is `customer_hosted`, with
+  runtime `openai-compatible`.
+- The endpoint must be `https` (or a loopback `http` origin), must not embed
+  credentials, a query, or a fragment, and its origin must be in the
+  operator-owned `SEKAI_ROUTING_ENDPOINT_ALLOWLIST`. No tenant-facing RPC
+  can change that list.
+- `credential_ref` is a name, never a secret. On community it resolves to
+  the operator-set `SEKAI_ROUTING_CREDENTIAL_<REF>` variable. Registration
+  fails `FAILED_PRECONDITION` when the reference does not resolve.
+- Only the owning namespace lists or pins the profile. Other namespaces get
+  `routing profile unavailable`, the same as for an unknown id. A revoked
+  profile, or one whose origin leaves the allowlist, disappears from the list
+  and fails later pins closed.
+- Hosted execution is not wired yet. A plan that pins a hosted profile fails
+  `FAILED_PRECONDITION` as not serving the planned route.
 
 ## Related capability surfaces
 

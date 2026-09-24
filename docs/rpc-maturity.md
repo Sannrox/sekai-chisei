@@ -220,6 +220,8 @@ there cannot be decided on that runtime.
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
+| `ChiseiService.PutRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.RevokeRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.PlanContentExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |

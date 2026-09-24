@@ -591,6 +591,41 @@ pub(super) fn require_namespace_write_access(
         Err(Status::permission_denied("namespace write access denied"))
     }
 }
+/// Namespace administration: the `Admin` role on the namespace boundary.
+/// Enterprise contexts carry no namespace-admin action yet, so they fail
+/// closed here.
+pub(super) fn require_namespace_admin_access(
+    db: &RuntimeDb,
+    actor: &str,
+    context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
+) -> Result<(), Status> {
+    let namespace = canonical_namespace(namespace)?;
+    if context.is_some() {
+        return Err(Status::permission_denied(
+            "namespace administration is unavailable for enterprise credentials",
+        ));
+    }
+    if matches!(actor, "root" | "local") {
+        return Ok(());
+    }
+    let boundary = db
+        .find_namespace_boundary(namespace)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied("namespace administration denied"))?;
+    let granted = db
+        .list_grants(&boundary.id)
+        .map_err(Status::internal)?
+        .into_iter()
+        .any(|grant| {
+            grant.principal == actor && matches!(grant.role, crate::sekai::security::Role::Admin)
+        });
+    if granted {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("namespace administration denied"))
+    }
+}
 pub(super) fn require_external_project_access(
     db: &RuntimeDb,
     actor: &str,

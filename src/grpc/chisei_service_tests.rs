@@ -1113,6 +1113,8 @@ fn config(db_path: &str) -> Config {
         default_data_class: "unclassified".into(),
         safe_egress_providers: vec![],
         gateway_provided_providers: vec![],
+        routing_endpoint_allowlist: vec![],
+        routing_credential_refs: vec![],
         gateway_receipt_principals: vec![],
         leak_review_model: None,
         tls_cert: None,
@@ -9988,4 +9990,286 @@ async fn routing_profiles_list_pin_and_record_the_route_mode() {
         route.attributes.get("routing_mode").map(String::as_str),
         Some("proxied" | "local")
     ));
+}
+
+#[tokio::test]
+async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed() {
+    // #1171: a namespace administrator registers a customer-hosted route that
+    // must stay inside the operator allowlist and resolve its credential
+    // reference; only its own namespace sees it, and a pin never routes to it
+    // before hosted execution exists.
+    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.gateway_provided_providers = vec!["openai".into()];
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config.clone(),
+    );
+    for (id, namespace, principal, role) in [
+        ("support", "support", "alice", Role::Admin),
+        ("support", "support", "bob", Role::Editor),
+        ("ops", "ops", "carol", Role::Admin),
+    ] {
+        let object_id = format!("routing-namespace-{id}");
+        if service
+            .db
+            .runtime()
+            .find_by_external_id(&format!("namespace:{namespace}"))
+            .unwrap()
+            .is_none()
+        {
+            service
+                .db
+                .runtime()
+                .create_object(&Object {
+                    id: object_id.clone(),
+                    kind: "namespace".into(),
+                    name: namespace.into(),
+                    namespace: String::new(),
+                    external_id: format!("namespace:{namespace}"),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        service
+            .db
+            .runtime()
+            .create_grant(&Grant {
+                id: format!("routing-{principal}"),
+                object_id,
+                principal: principal.into(),
+                role,
+                created: 1,
+            })
+            .unwrap();
+    }
+    fn as_principal<T>(principal: &str, request: T) -> Request<T> {
+        let mut request = Request::new(request);
+        request
+            .metadata_mut()
+            .insert("x-principal", principal.parse().unwrap());
+        request
+    }
+    let put =
+        |namespace: &str, endpoint_url: &str, credential_ref: &str| PutRoutingProfileRequest {
+            namespace: namespace.into(),
+            name: "acme-llm".into(),
+            endpoint_url: endpoint_url.into(),
+            model_patterns: vec!["acme-*".into()],
+            credential_ref: credential_ref.into(),
+        };
+
+    // Registration refusals: not an admin, egress outside the allowlist, a
+    // plain-http origin, a credential reference that does not resolve.
+    let refused = |status: Status| status.code();
+    assert_eq!(
+        refused(
+            service
+                .put_routing_profile(as_principal(
+                    "bob",
+                    put("support", "https://models.example.com", "ACME")
+                ))
+                .await
+                .unwrap_err()
+        ),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        refused(
+            service
+                .put_routing_profile(as_principal(
+                    "alice",
+                    put("support", "https://exfil.example.com", "ACME")
+                ))
+                .await
+                .unwrap_err()
+        ),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        refused(
+            service
+                .put_routing_profile(as_principal(
+                    "alice",
+                    put("support", "http://models.example.com", "ACME")
+                ))
+                .await
+                .unwrap_err()
+        ),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        refused(
+            service
+                .put_routing_profile(as_principal(
+                    "alice",
+                    put("support", "https://models.example.com", "MISSING")
+                ))
+                .await
+                .unwrap_err()
+        ),
+        tonic::Code::FailedPrecondition
+    );
+
+    let registered = service
+        .put_routing_profile(as_principal(
+            "alice",
+            put("support", "https://models.example.com/v1", "ACME"),
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+    assert_eq!(registered.profile_id, "hosted:acme-llm");
+    assert_eq!(registered.mode, "customer_hosted");
+    assert_eq!(registered.endpoint_origin, "https://models.example.com");
+
+    let listed = |namespace: &'static str, principal: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .list_routing_profiles(as_principal(
+                    principal,
+                    ListRoutingProfilesRequest {
+                        namespace: namespace.into(),
+                    },
+                ))
+                .await
+                .map(|response| {
+                    response
+                        .into_inner()
+                        .profiles
+                        .into_iter()
+                        .filter(|profile| profile.mode == "customer_hosted")
+                        .map(|profile| profile.profile_id)
+                        .collect::<Vec<_>>()
+                })
+        }
+    };
+    assert_eq!(
+        listed("support", "local").await.unwrap(),
+        ["hosted:acme-llm"]
+    );
+    assert!(listed("ops", "local").await.unwrap().is_empty());
+
+    service.policy.set_namespace_policy(
+        "support",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        },
+    );
+    service.policy.set_namespace_policy(
+        "ops",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        },
+    );
+    let pin = |request_id: &str, namespace: &str| PlanExecutionRequest {
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            spec: "Summarize the incident.".into(),
+            max_tokens: 64,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+        routing_profile_id: "hosted:acme-llm".into(),
+    };
+    let own = service
+        .plan_execution(Request::new(pin("request:hosted-own", "support")))
+        .await
+        .unwrap_err();
+    assert_eq!(own.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        own.message(),
+        "routing profile does not serve the planned route"
+    );
+    let foreign = service
+        .plan_execution(Request::new(pin("request:hosted-foreign", "ops")))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(foreign.message(), "routing profile unavailable");
+
+    // Another namespace's admin cannot revoke it; its own admin can.
+    let revoke = |namespace: &str| RevokeRoutingProfileRequest {
+        namespace: namespace.into(),
+        profile_id: "hosted:acme-llm".into(),
+    };
+    assert_eq!(
+        refused(
+            service
+                .revoke_routing_profile(as_principal("carol", revoke("support")))
+                .await
+                .unwrap_err()
+        ),
+        tonic::Code::PermissionDenied
+    );
+    assert!(
+        !service
+            .revoke_routing_profile(as_principal("carol", revoke("ops")))
+            .await
+            .unwrap()
+            .into_inner()
+            .revoked
+    );
+    assert!(
+        service
+            .revoke_routing_profile(as_principal("alice", revoke("support")))
+            .await
+            .unwrap()
+            .into_inner()
+            .revoked
+    );
+    assert!(listed("support", "local").await.unwrap().is_empty());
+    let revoked = service
+        .plan_execution(Request::new(pin("request:hosted-revoked", "support")))
+        .await
+        .unwrap_err();
+    assert_eq!(revoked.message(), "routing profile unavailable");
+
+    // Dropping the origin from the operator allowlist hides a registered
+    // profile without touching its row.
+    service
+        .put_routing_profile(as_principal(
+            "alice",
+            put("support", "https://models.example.com", "ACME"),
+        ))
+        .await
+        .unwrap();
+    let mut narrowed = config;
+    narrowed.routing_endpoint_allowlist = Vec::new();
+    let narrowed = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(service.db.runtime_arc()),
+        narrowed,
+    );
+    let visible = narrowed
+        .list_routing_profiles(Request::new(ListRoutingProfilesRequest {
+            namespace: "support".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+    assert!(
+        visible
+            .iter()
+            .all(|profile| profile.mode != "customer_hosted")
+    );
 }

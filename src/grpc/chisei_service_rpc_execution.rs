@@ -33,13 +33,16 @@ pub(super) async fn plan_execution(
         } else {
             None
         };
+        let plan_namespace = input.namespace.clone();
         let mut plan = service.plan_from_input(input, &actor).await?;
         // A pin is checked against the live catalog after planning, so the
         // listing never acts as a grant (#1094).
         let pinned = request.routing_profile_id.trim();
         if !pinned.is_empty() {
+            let hosted = hosted_profiles_for(service, &plan_namespace)?;
             crate::chisei::routing_profiles::check_pin(
                 &crate::provider_profile::provider_registry_snapshot(),
+                &hosted,
                 pinned,
                 &plan.resolved_runtime,
             )
@@ -1102,18 +1105,128 @@ pub(super) async fn list_routing_profiles(
         context.as_ref(),
         &namespace,
     )?;
+    let hosted = hosted_profiles_for(service, &namespace)?;
     let profiles = crate::chisei::routing_profiles::list_routing_profiles(&registry)
         .into_iter()
-        .map(|profile| RoutingProfile {
-            profile_id: profile.profile_id,
-            mode: profile.mode,
-            runtime: profile.runtime,
-            model_patterns: profile.model_patterns,
-            lifecycle: profile.lifecycle,
-        })
+        .map(|profile| routing_profile_to_proto(profile, String::new()))
+        .chain(hosted.into_iter().map(|profile| {
+            let origin = profile.endpoint_origin.clone();
+            routing_profile_to_proto(profile.entry(), origin)
+        }))
         .collect();
     Ok(Response::new(ListRoutingProfilesResponse {
         profiles,
         contract_version: crate::chisei::routing_profiles::ROUTING_PROFILES_CONTRACT.into(),
     }))
+}
+
+fn routing_profile_to_proto(
+    profile: crate::chisei::routing_profiles::RoutingProfileEntry,
+    endpoint_origin: String,
+) -> RoutingProfile {
+    RoutingProfile {
+        profile_id: profile.profile_id,
+        mode: profile.mode,
+        runtime: profile.runtime,
+        model_patterns: profile.model_patterns,
+        lifecycle: profile.lifecycle,
+        endpoint_origin,
+    }
+}
+
+/// The namespace's hosted profiles whose origin the operator still allows.
+fn hosted_profiles_for(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, Status> {
+    let stored = service
+        .db
+        .runtime()
+        .list_hosted_routing_profiles(namespace)
+        .map_err(|_| Status::internal("routing profiles unavailable"))?;
+    Ok(crate::chisei::routing_profiles::admissible_hosted_profiles(
+        stored,
+        &service.config.routing_endpoint_allowlist,
+    ))
+}
+
+fn routing_profile_admission_status(error: String) -> Status {
+    let (code, message) = error.split_once(": ").unwrap_or(("internal", &error));
+    match code {
+        "invalid_argument" => Status::invalid_argument(message),
+        "permission_denied" => Status::permission_denied(message),
+        "failed_precondition" => Status::failed_precondition(message),
+        _ => Status::internal("routing profile unavailable"),
+    }
+}
+
+/// Registers a customer-hosted routing profile in one namespace (#1171).
+pub(super) async fn put_routing_profile(
+    service: &ChiseiServiceImpl,
+    req: Request<PutRoutingProfileRequest>,
+) -> Result<Response<PutRoutingProfileResponse>, Status> {
+    let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
+    let request = req.into_inner();
+    require_namespace_admin_access(
+        service.db.runtime(),
+        &actor,
+        context.as_ref(),
+        &request.namespace,
+    )?;
+    let profile = crate::chisei::routing_profiles::admit_hosted_profile(
+        crate::chisei::routing_profiles::HostedRoutingProfileInput {
+            namespace: request.namespace,
+            name: request.name,
+            endpoint_url: request.endpoint_url,
+            model_patterns: request.model_patterns,
+            credential_ref: request.credential_ref,
+        },
+        &service.config.routing_endpoint_allowlist,
+        |reference| {
+            service
+                .config
+                .routing_credential_refs
+                .iter()
+                .any(|known| known == reference)
+        },
+        &actor,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(routing_profile_admission_status)?;
+    service
+        .db
+        .runtime()
+        .put_hosted_routing_profile(&profile)
+        .map_err(|_| Status::internal("routing profile unavailable"))?;
+    let origin = profile.endpoint_origin.clone();
+    Ok(Response::new(PutRoutingProfileResponse {
+        profile: Some(routing_profile_to_proto(profile.entry(), origin)),
+    }))
+}
+
+/// Revokes a customer-hosted routing profile; later pins fail closed.
+pub(super) async fn revoke_routing_profile(
+    service: &ChiseiServiceImpl,
+    req: Request<RevokeRoutingProfileRequest>,
+) -> Result<Response<RevokeRoutingProfileResponse>, Status> {
+    let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
+    let request = req.into_inner();
+    require_namespace_admin_access(
+        service.db.runtime(),
+        &actor,
+        context.as_ref(),
+        &request.namespace,
+    )?;
+    let revoked = service
+        .db
+        .runtime()
+        .revoke_hosted_routing_profile(
+            &request.namespace,
+            &request.profile_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|_| Status::internal("routing profile unavailable"))?;
+    Ok(Response::new(RevokeRoutingProfileResponse { revoked }))
 }

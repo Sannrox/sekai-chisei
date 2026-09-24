@@ -4831,6 +4831,52 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_hosted_routing_profile(
+        &self,
+        profile: &crate::chisei::routing_profiles::HostedRoutingProfile,
+    ) -> Result<(), String> {
+        use crate::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+        match self {
+            Self::Sqlite(db) => db.put_hosted_routing_profile(profile),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiRoutingProfileBackend::put_hosted_routing_profile(db.as_ref(), profile)
+            }),
+        }
+    }
+
+    pub fn list_hosted_routing_profiles(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
+        use crate::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+        match self {
+            Self::Sqlite(db) => db.list_hosted_routing_profiles(namespace),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiRoutingProfileBackend::list_hosted_routing_profiles(db.as_ref(), namespace)
+            }),
+        }
+    }
+
+    pub fn revoke_hosted_routing_profile(
+        &self,
+        namespace: &str,
+        profile_id: &str,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        use crate::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+        match self {
+            Self::Sqlite(db) => db.revoke_hosted_routing_profile(namespace, profile_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                ChiseiRoutingProfileBackend::revoke_hosted_routing_profile(
+                    db.as_ref(),
+                    namespace,
+                    profile_id,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
     pub fn put_permit(
         &self,
         permit: &Permit,
