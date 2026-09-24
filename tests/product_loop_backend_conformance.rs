@@ -1,7 +1,7 @@
 //! Product-loop conformance for the shipped binary on both community backends (#1086).
 //!
 //! One scenario drives the stable loop through the public operator and gRPC
-//! surfaces: define the ontology, seed facts, read them, submit a
+//! surfaces: define the ontology, seed facts, read and evaluate them, submit a
 //! governed Action, inspect its receipt, then activate an object-security
 //! policy and observe a denied read. SQLite runs by default; PostgreSQL runs
 //! the identical scenario when `SEKAI_TEST_POSTGRES_URL` names a TLS server
@@ -21,10 +21,13 @@ use sekai_chisei::grpc::pb::chisei::GetOperationReceiptRequest;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ActivateObjectSecurityPoliciesRequest, EnsureTeamNamespaceRequest, GetActionInstanceRequest,
-    GetObjectRequest, GovernedActionType, ListFilter, ListObjectsRequest,
-    ObjectSecurityPolicyBinding, PutGovernedActionTypeRequest,
-    PutObjectSecurityPolicyRevisionRequest, SubmitActionInstanceRequest,
+    ActivateObjectSecurityPoliciesRequest, ApplyDefinitionBranchEditRequest,
+    ApproveDefinitionProposalRequest, CreateDefinitionBranchRequest,
+    CreateDefinitionProposalRequest, DefinitionMemberInput, EnsureTeamNamespaceRequest,
+    EvaluateObjectSetRequest, GetActionInstanceRequest, GetObjectRequest, GovernedActionType,
+    ListFilter, ListObjectsRequest, MergeDefinitionProposalRequest, ObjectSecurityPolicyBinding,
+    ObjectSetDescriptor, PutGovernedActionTypeRequest, PutObjectSecurityPolicyRevisionRequest,
+    SubmitActionInstanceRequest,
 };
 use tonic::{Code, Request};
 
@@ -243,9 +246,105 @@ async fn exercise_product_loop(server: &LoopServer) {
         .into_inner();
     assert!(listed.objects.iter().any(|object| object.id == "svc-api"));
 
-    // EvaluateObjectSet needs a published definition revision, which no
-    // public RPC can create from an empty namespace yet (#1152); the in-process
-    // `postgres_evaluate_object_set_matches_sqlite` test covers it.
+    // Publish the namespace's first definition revision from genesis through
+    // the reviewed proposal flow (#1152), then evaluate against it.
+    let branch = sekai
+        .create_definition_branch(CreateDefinitionBranchRequest {
+            namespace: "demo".into(),
+            branch_id: "loop".into(),
+            parent_revision_digest: String::new(),
+            idempotency_key: "loop-branch".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create branch: {error}\n{}", logs()))
+        .into_inner()
+        .branch
+        .expect("branch");
+    let genesis = branch.head_revision_digest.clone();
+    let edited = sekai
+        .apply_definition_branch_edit(ApplyDefinitionBranchEditRequest {
+            namespace: "demo".into(),
+            branch_id: "loop".into(),
+            expected_head_digest: genesis.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: "incident".into(),
+                definition_json: r#"{"name":"incident"}"#.into(),
+                member_digest: String::new(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: "loop-edit".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("edit branch: {error}\n{}", logs()))
+        .into_inner();
+    let candidate = edited.revision.expect("candidate").revision_digest;
+    sekai
+        .create_definition_proposal(CreateDefinitionProposalRequest {
+            namespace: "demo".into(),
+            branch_id: "loop".into(),
+            proposal_id: "loop-proposal".into(),
+            base_digest: genesis.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "loop-propose".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("propose: {error}\n{}", logs()));
+    sekai
+        .approve_definition_proposal(ApproveDefinitionProposalRequest {
+            namespace: "demo".into(),
+            proposal_id: "loop-proposal".into(),
+            idempotency_key: "loop-approve".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("approve: {error}\n{}", logs()));
+    let merged = sekai
+        .merge_definition_proposal(MergeDefinitionProposalRequest {
+            namespace: "demo".into(),
+            proposal_id: "loop-proposal".into(),
+            idempotency_key: "loop-merge".into(),
+            expected_published_digest: genesis,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("merge: {error}\n{}", logs()))
+        .into_inner();
+    let published = merged
+        .published_revision
+        .expect("published")
+        .revision_digest;
+    assert_eq!(published, candidate);
+    // Genesis is only a starting point: once published, new branches start
+    // from the published head.
+    let second_genesis = sekai
+        .create_definition_branch(CreateDefinitionBranchRequest {
+            namespace: "demo".into(),
+            branch_id: "late".into(),
+            parent_revision_digest: String::new(),
+            idempotency_key: "late-branch".into(),
+        })
+        .await
+        .expect_err("genesis only while nothing else is published");
+    assert_eq!(second_genesis.code(), Code::FailedPrecondition);
+    let evaluated = sekai
+        .evaluate_object_set(EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: sekai_chisei::sekai::object_set::CONTRACT_VERSION.into(),
+                namespace: "demo".into(),
+                kind: "incident".into(),
+                definition_digest: published,
+                limit: 10,
+                ..Default::default()
+            }),
+            page_token: String::new(),
+            required_freshness_ms: 0,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("evaluate: {error}\n{}", logs()))
+        .into_inner();
+    assert_eq!(evaluated.total, 1);
+    assert_eq!(evaluated.members[0].id, "inc-1");
 
     // Principals for the governed reads and the Action.
     let agent = server.token("loop-agent");

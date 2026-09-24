@@ -24,6 +24,16 @@ authorized published revision. The request supplies:
 The new branch initially has the parent as both its base and head. Creation
 does not update the namespace's published head.
 
+**Genesis.** Every namespace starts from a deterministic, empty, published
+genesis revision (no members, no parent). An empty `parent_revision_digest`
+means "branch from genesis". It is accepted only while the namespace has
+published nothing else: the caller needs namespace write authority, genesis is
+seeded idempotently as the published head, and the branch starts there. The
+first real revision then follows the normal edit, proposal, approval, and merge
+flow, with `expected_published_digest` set to the genesis digest. Once a
+namespace has published anything else, an empty parent fails
+`FAILED_PRECONDITION`; branch from the published head instead.
+
 `GetDefinitionBranch` returns the current authorized branch head and a
 content-addressed `pin_digest` bound to the branch contract, namespace,
 branch id, and head revision. A delivery consumer verifies the pin against
@@ -168,9 +178,8 @@ its immutable revision and audit evidence.
 
 ## Current limits
 
-- Branch creation still requires an existing published parent. Tests and
-  adoption paths seed that parent; there is no implicit snapshot of legacy
-  mutable schema or ontology rows.
+- Branch creation starts from a published parent or from genesis. There is no
+  implicit snapshot of legacy mutable schema or ontology rows.
 - A branch cannot yet be rebased, previewed, archived, or used to migrate
   runtime facts.
 - `CompareDefinitionRevisions` reports deterministic added, removed, and

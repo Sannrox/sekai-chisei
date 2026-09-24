@@ -8,6 +8,13 @@
   unavailable, or does not serve the planned route fails the plan closed. Each
   planned receipt's route event records the routing profile, mode, and whether
   it was pinned. Customer-hosted profiles follow in #1171 (#1094).
+- A namespace can now publish its first definition revision through the public
+  surface. `CreateDefinitionBranch` with an empty `parent_revision_digest`
+  branches from a deterministic, empty genesis revision, which is seeded while
+  the namespace has published nothing else. The first revision then goes
+  through the usual proposal, approval, and merge. The spawned-binary product
+  loop now evaluates an object set against a revision published this way, on
+  SQLite and PostgreSQL (#1152).
 - CI now runs every ignored PostgreSQL conformance suite in a
   `PostgreSQL conformance` workflow against an ephemeral TLS-only PostgreSQL
   with a throwaway CA. `scripts/postgres-conformance.sh` runs the same thing
