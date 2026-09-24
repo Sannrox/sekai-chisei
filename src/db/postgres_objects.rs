@@ -118,6 +118,91 @@ impl PostgresDb {
             .transpose()
     }
 
+    /// Loads a bounded set of caller-visible objects selected by a change feed.
+    pub fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        let mut ids = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params: Vec<Box<dyn postgres::types::ToSql + Sync>> = vec![Box::new(ids)];
+        let mut where_parts = vec!["o.id = ANY($1)".to_string()];
+        let privileged = principals
+            .iter()
+            .any(|principal| matches!(*principal, "root" | "local"));
+        let effective = principals
+            .iter()
+            .filter(|principal| !principal.is_empty() && **principal != "anonymous")
+            .map(|principal| (*principal).to_string())
+            .collect::<Vec<_>>();
+        params.push(Box::new(effective));
+        let principals_param = format!("${}", params.len());
+        where_parts.push(format!(
+            "(NOT EXISTS (
+                SELECT 1 FROM sekai_grants g WHERE g.object_id = o.id
+             ) OR EXISTS (
+                SELECT 1 FROM sekai_grants g
+                WHERE g.object_id = o.id AND g.principal = ANY({principals_param})
+             ))"
+        ));
+        if !privileged {
+            where_parts.push(format!(
+                "(NOT EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                ) OR EXISTS (
+                    SELECT 1 FROM sekai_objects boundary
+                    JOIN sekai_grants namespace_grant
+                      ON namespace_grant.object_id = boundary.id
+                    WHERE boundary.kind = 'namespace'
+                      AND boundary.external_id = 'namespace:' || o.namespace
+                      AND boundary.properties::jsonb ->> 'team_managed' = 'true'
+                      AND namespace_grant.principal = ANY({principals_param})
+                ))"
+            ));
+        }
+        let context = context.clone().normalized();
+        params.push(Box::new(context.subjects));
+        let subjects = format!("${}", params.len());
+        params.push(Box::new(context.scopes));
+        let scopes = format!("${}", params.len());
+        where_parts.push(
+            postgres_object_security_filter(&subjects, &scopes)
+                .trim_start_matches(" AND ")
+                .to_string(),
+        );
+        let refs = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn postgres::types::ToSql + Sync))
+            .collect::<Vec<_>>();
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {OBJECT_COLUMNS} FROM sekai_objects o
+                     WHERE {} ORDER BY o.id ASC",
+                    where_parts.join(" AND ")
+                ),
+                &refs,
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
+    }
+
     pub fn update_object(&self, object: &Object) -> Result<(), String> {
         if self.update_object_with_existing(object)?.is_none() {
             return Err("not found".into());

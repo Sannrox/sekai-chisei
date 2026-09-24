@@ -1398,6 +1398,32 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                crate::db::graph::GraphBackend::list_objects_by_ids_with_policy_context(
+                    db.as_ref(),
+                    ids,
+                    principals,
+                    context,
+                )
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                crate::db::graph::GraphBackend::list_objects_by_ids_with_policy_context(
+                    db.as_ref(),
+                    ids,
+                    principals,
+                    context,
+                )
+            }),
+        }
+    }
+
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_operation_receipt(receipt),

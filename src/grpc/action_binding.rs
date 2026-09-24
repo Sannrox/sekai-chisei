@@ -1,14 +1,15 @@
 //! Install and run object-change automation bindings (#1092, ADR 0090).
 
 use super::*;
-use crate::sekai::action_binding::{ActionBinding, ReadMarker};
+use crate::sekai::action_binding::{ActionBinding, ParameterSource, ReadMarker};
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
 };
 use crate::sekai::object_change_subscription::{
-    OUTCOME_DISCONNECTED, OUTCOME_PAGE, OUTCOME_RESNAPSHOT, ObjectChangeReadRequest,
-    ObjectChangeScope, authorization_pin, read_object_change_subscription,
+    OP_DELETE, OUTCOME_DISCONNECTED, OUTCOME_PAGE, OUTCOME_RESNAPSHOT, ObjectChangeReadRequest,
+    ObjectChangeScope, authorization_pin, read_object_change_subscription_with_resolved_objects,
 };
+use std::collections::{HashMap, HashSet};
 
 const BINDING_UNAVAILABLE: &str = "action binding unavailable";
 
@@ -143,25 +144,22 @@ impl SekaiServiceImpl {
             object_ids: Vec::new(),
             property_filters: binding.property_filters.clone(),
         };
-        let (visible, _) = list_objects_with_marking(
-            self.db.runtime(),
-            &domain::ListFilter {
-                kind: Some(scope.kind.clone()),
-                name: None,
-                namespace: Some(scope.namespace.clone()),
-                property_filters: scope.property_filters.clone(),
-                interface_filter: Vec::new(),
-                limit: domain::MAX_LIST_LIMIT,
-                offset: 0,
-                order_by: "name".into(),
-                descending: false,
-            },
-            &run_as,
-            &crate::sekai::object_security::PrincipalPolicyContext::default(),
-            None,
-            None,
-            |objects, _, _| Ok(objects),
-        )?;
+        let mut event_property_keys = binding
+            .property_filters
+            .iter()
+            .map(|filter| filter.key.clone())
+            .collect::<HashSet<_>>();
+        event_property_keys.extend(
+            binding
+                .parameters
+                .values()
+                .filter_map(|source| match source {
+                    ParameterSource::Property(property) => Some(property.clone()),
+                    _ => None,
+                }),
+        );
+        let mut visible_objects = Vec::new();
+        let mut objects_resolved = false;
 
         let mut response = RunActionBindingResponse {
             outcome: OUTCOME_PAGE.into(),
@@ -180,8 +178,13 @@ impl SekaiServiceImpl {
             let pin = authorization_pin(&activation_id, &run_as)
                 .map_err(|_| Status::internal("object-change authorization pin unavailable"))?;
             let subscription_id = format!("action-binding.{}", binding.binding_id);
-            let read = |snapshot_revision: &str| {
-                read_object_change_subscription(
+            let read = |snapshot_revision: &str,
+                        visible_objects: &mut Vec<domain::Object>,
+                        objects_resolved: &mut bool|
+             -> Result<_, Status> {
+                *objects_resolved = false;
+                let mut resolver_error = None;
+                let result = read_object_change_subscription_with_resolved_objects(
                     self.db.runtime(),
                     &binding.run_as,
                     &ObjectChangeReadRequest {
@@ -194,10 +197,28 @@ impl SekaiServiceImpl {
                         revoke: false,
                     },
                     now_millis(),
-                    &visible,
+                    visible_objects,
+                    |object_ids| {
+                        *objects_resolved = true;
+                        load_action_binding_objects(
+                            self,
+                            &binding,
+                            object_ids,
+                            &run_as,
+                            &event_property_keys,
+                        )
+                        .map_err(|status| {
+                            resolver_error = Some(status);
+                            "action binding event objects unavailable".to_string()
+                        })
+                    },
                     &pin,
-                )
-                .map_err(|error| Status::failed_precondition(format!("subscription: {error}")))
+                );
+                if let Some(status) = resolver_error {
+                    return Err(status);
+                }
+                result
+                    .map_err(|error| Status::failed_precondition(format!("subscription: {error}")))
             };
             let inspect = || {
                 crate::sekai::event_subscription::inspect_event_subscription(
@@ -244,7 +265,11 @@ impl SekaiServiceImpl {
                 .runtime()
                 .advance_action_binding_cursor(&binding, &cursor, now_millis())
                 .map_err(map_binding_store_error)?;
-            let mut page = read(&cursor.snapshot_revision)?;
+            let mut page = read(
+                &cursor.snapshot_revision,
+                &mut visible_objects,
+                &mut objects_resolved,
+            )?;
             if page.outcome == OUTCOME_RESNAPSHOT {
                 // No backfill: the binding acts on changes after its pin.
                 let first_pin = cursor.snapshot_revision.is_empty();
@@ -257,7 +282,11 @@ impl SekaiServiceImpl {
                         .runtime()
                         .advance_action_binding_cursor(&binding, &cursor, now_millis())
                         .map_err(map_binding_store_error)?;
-                    page = read(&cursor.snapshot_revision)?;
+                    page = read(
+                        &cursor.snapshot_revision,
+                        &mut visible_objects,
+                        &mut objects_resolved,
+                    )?;
                 }
             }
             response.outcome = page.outcome.clone();
@@ -278,10 +307,33 @@ impl SekaiServiceImpl {
                 .map_err(map_binding_store_error)?;
         }
 
+        if !objects_resolved && !cursor.pending_events.is_empty() {
+            let pending_ids = cursor
+                .pending_events
+                .iter()
+                .filter(|event| event.op != OP_DELETE)
+                .map(|event| event.object_id.clone())
+                .collect::<Vec<_>>();
+            visible_objects = load_action_binding_objects(
+                self,
+                &binding,
+                &pending_ids,
+                &run_as,
+                &event_property_keys,
+            )?;
+        }
+
+        let visible_by_id = visible_objects
+            .into_iter()
+            .map(|object| (object.id.clone(), object))
+            .collect::<HashMap<_, _>>();
+
         for event in std::mem::take(&mut cursor.pending_events) {
-            response
-                .submissions
-                .push(self.submit_bound_event(&binding, &event, &visible));
+            response.submissions.push(self.submit_bound_event(
+                &binding,
+                &event,
+                visible_by_id.get(&event.object_id),
+            ));
         }
         self.db
             .runtime()
@@ -294,7 +346,7 @@ impl SekaiServiceImpl {
         &self,
         binding: &ActionBinding,
         event: &crate::sekai::object_change_subscription::ObjectChangeEvent,
-        visible: &[domain::Object],
+        object: Option<&domain::Object>,
     ) -> ActionBindingSubmission {
         let mut submission = ActionBindingSubmission {
             event_id: event.event_id.clone(),
@@ -306,7 +358,6 @@ impl SekaiServiceImpl {
             submission.skipped_reason = "op_not_bound".into();
             return submission;
         }
-        let object = visible.iter().find(|object| object.id == event.object_id);
         let parameters_json = match binding.parameters_for(event, object) {
             Ok(parameters) => parameters,
             Err(reason) => {
@@ -369,6 +420,39 @@ impl SekaiServiceImpl {
     }
 }
 
+fn load_action_binding_objects(
+    service: &SekaiServiceImpl,
+    binding: &ActionBinding,
+    object_ids: &[String],
+    principals: &[String],
+    property_keys: &HashSet<String>,
+) -> Result<Vec<domain::Object>, Status> {
+    let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+    let context = crate::sekai::object_security::PrincipalPolicyContext::default();
+    let objects = service
+        .db
+        .runtime()
+        .list_objects_by_ids_with_policy_context(object_ids, &principal_refs, &context)
+        .map_err(Status::internal)?;
+    Ok(objects
+        .into_iter()
+        .filter_map(|mut object| {
+            if object.namespace != binding.namespace
+                || object.kind != binding.kind
+                || RESERVED_GOVERNANCE_KINDS.contains(&object.kind.as_str())
+                || !object_passes_marking(service.db.runtime(), &object, principals)
+                    .unwrap_or(false)
+            {
+                return None;
+            }
+            object
+                .properties
+                .retain(|key, _| property_keys.contains(key));
+            Some(object)
+        })
+        .collect())
+}
+
 fn map_binding_store_error(error: String) -> Status {
     if error == crate::db::runtime_db::ACTION_BINDINGS_UNAVAILABLE {
         Status::unavailable(error)
@@ -385,6 +469,7 @@ mod tests {
     use crate::sekai::action_binding::{
         ACTION_BINDING_CONTRACT, ActionBindingCursor, ParameterSource,
     };
+    use crate::sekai::object_change_subscription::read_object_change_subscription;
     use std::collections::{BTreeMap, HashMap};
     use tonic::metadata::MetadataValue;
 

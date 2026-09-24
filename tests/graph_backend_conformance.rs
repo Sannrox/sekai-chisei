@@ -2,6 +2,7 @@ use sekai_chisei::db::graph::GraphBackend;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{Direction, Link, ListFilter, Object, PropertyFilter};
+use sekai_chisei::sekai::object_security::PrincipalPolicyContext;
 use sekai_chisei::sekai::schema::{InterfaceDef, ObjectType};
 use sekai_chisei::sekai::security::{Grant, Role};
 use std::collections::HashMap;
@@ -220,10 +221,48 @@ fn exercise_graph_backend(db: &dyn GraphBackend, prefix: &str) {
     );
 }
 
+fn exercise_batch_object_read(db: &dyn GraphBackend, prefix: &str) {
+    let namespace = format!("{prefix}-batch-ns");
+    let visible = object(prefix, "batch-visible", "component", &namespace, 10);
+    let restricted = object(prefix, "batch-restricted", "component", &namespace, 10);
+    db.create_object(&visible, "conformance").unwrap();
+    db.create_object(&restricted, "conformance").unwrap();
+    db.create_grant(&Grant {
+        id: format!("{prefix}-batch-grant"),
+        object_id: restricted.id.clone(),
+        principal: "batch-owner".into(),
+        role: Role::Viewer,
+        created: 11,
+    })
+    .unwrap();
+
+    let ids = vec![
+        visible.id.clone(),
+        restricted.id,
+        format!("{prefix}-batch-missing"),
+        visible.id.clone(),
+    ];
+    let listed = db
+        .list_objects_by_ids_with_policy_context(
+            &ids,
+            &["batch-reader"],
+            &PrincipalPolicyContext::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![visible.id.as_str()]
+    );
+}
+
 #[test]
 fn sqlite_core_graph_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();
     exercise_graph_backend(&db, "sqlite");
+    exercise_batch_object_read(&db, "sqlite");
 }
 
 fn postgres_test_database() -> PostgresDb {
@@ -240,7 +279,9 @@ fn postgres_test_database() -> PostgresDb {
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_core_graph_conformance() {
     let db = postgres_test_database();
-    exercise_graph_backend(&db, &format!("pg-{}", uuid::Uuid::new_v4().simple()));
+    let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
+    exercise_graph_backend(&db, &prefix);
+    exercise_batch_object_read(&db, &prefix);
 }
 
 #[test]
