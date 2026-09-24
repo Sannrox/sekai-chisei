@@ -9,6 +9,7 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Link, ListFilter, Object};
 use crate::sekai::audit::ObjectChange;
 use crate::sekai::lineage::LineageResult;
+use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::schema::{InterfaceDef, ObjectType};
 use crate::sekai::security::Grant;
 use rusqlite::{OptionalExtension, params};
@@ -34,6 +35,12 @@ pub fn postgres_graph_capabilities() -> crate::runtime_backend::BackendCapabilit
 pub trait GraphBackend: Send + Sync {
     fn create_object(&self, object: &Object, actor: &str) -> Result<(), String>;
     fn get_object(&self, id: &str) -> Result<Option<Object>, String>;
+    fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String>;
     fn update_object(
         &self,
         object: &Object,
@@ -87,6 +94,14 @@ impl GraphBackend for SekaiDb {
     }
     fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
         self.get_object(id)
+    }
+    fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        SekaiDb::list_objects_by_ids_with_policy_context(self, ids, principals, context)
     }
     fn update_object(
         &self,
@@ -299,6 +314,14 @@ impl GraphBackend for PostgresDb {
     }
     fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
         self.get_object(id)
+    }
+    fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        PostgresDb::list_objects_by_ids_with_policy_context(self, ids, principals, context)
     }
     fn update_object(
         &self,

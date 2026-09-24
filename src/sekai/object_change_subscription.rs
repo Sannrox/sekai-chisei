@@ -166,6 +166,41 @@ pub fn read_object_change_subscription(
     visible: &[Object],
     authorization_pin: &str,
 ) -> Result<ObjectChangePage, String> {
+    let mut resolved_visible = Vec::new();
+    read_object_change_subscription_with_resolved_objects(
+        db,
+        actor,
+        request,
+        now_ms,
+        &mut resolved_visible,
+        |object_ids| {
+            let object_ids = object_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            Ok(visible
+                .iter()
+                .filter(|object| object_ids.contains(object.id.as_str()))
+                .cloned()
+                .collect())
+        },
+        authorization_pin,
+    )
+}
+
+pub fn read_object_change_subscription_with_resolved_objects<F>(
+    db: &RuntimeDb,
+    actor: &str,
+    request: &ObjectChangeReadRequest,
+    now_ms: i64,
+    resolved_visible: &mut Vec<Object>,
+    resolve_visible: F,
+    authorization_pin: &str,
+) -> Result<ObjectChangePage, String>
+where
+    F: FnOnce(&[String]) -> Result<Vec<Object>, String>,
+{
+    resolved_visible.clear();
     required("actor", actor)?;
     if now_ms < 0 {
         return Err("read timestamp must be non-negative".into());
@@ -272,9 +307,11 @@ pub fn read_object_change_subscription(
             .map(|mutation| mutation.change.object_id.clone())
             .collect(),
     )?;
+    let object_ids = object_ids_for_projection(&scope, &raw);
+    *resolved_visible = resolve_visible(&object_ids)?;
     let events = project_events(
         &scope,
-        visible,
+        resolved_visible,
         &raw,
         subscription.cursor.committed_offset,
         &operation_ids,
@@ -605,6 +642,29 @@ fn project_events(
         });
     }
     Ok(events)
+}
+
+fn object_ids_for_projection(
+    scope: &ObjectChangeScope,
+    mutations: &[CommittedObjectMutation],
+) -> Vec<String> {
+    let pinned: BTreeSet<&str> = scope.object_ids.iter().map(String::as_str).collect();
+    let mut object_ids = mutations
+        .iter()
+        .filter(|mutation| {
+            mutation_kind(mutation) == scope.kind
+                && mutation.change.field != "_deleted"
+                && !SKIPPED_FIELDS
+                    .iter()
+                    .any(|field| mutation.change.field == *field)
+                && !mutation.change.field.starts_with("_security_property.")
+                && (pinned.is_empty() || pinned.contains(mutation.change.object_id.as_str()))
+        })
+        .map(|mutation| mutation.change.object_id.clone())
+        .collect::<Vec<_>>();
+    object_ids.sort_unstable();
+    object_ids.dedup();
+    object_ids
 }
 
 fn mutation_kind(mutation: &CommittedObjectMutation) -> String {

@@ -1115,6 +1115,40 @@ async fn spawned_binary_admits_one_action_per_bound_object_change() {
         })
         .await
         .unwrap_or_else(|error| panic!("create object: {error}\n{}", server.logs()));
+    let dense_kind_objects = (0..=1000)
+        .map(|index| {
+            json!({
+                "id": format!("unrelated-component-{index:04}"),
+                "kind": "component",
+                "name": format!("aaa-{index:04}"),
+                "properties": {"severity": "low"}
+            })
+        })
+        .collect::<Vec<_>>();
+    let seed = server.dir.path().join("many-components.json");
+    std::fs::write(
+        &seed,
+        json!({
+            "version": "sekai.seed/v1",
+            "namespace": "demo",
+            "objects": dense_kind_objects,
+            "links": []
+        })
+        .to_string(),
+    )
+    .expect("write many component seed");
+    let seeded = server.sekaictl_retry(
+        &[
+            "ontology",
+            "seed",
+            "--file",
+            seed.to_str().unwrap(),
+            "--target",
+            &server.socket_str(),
+        ],
+        "seed many components",
+    );
+    assert_success(&seeded, "seed many components", &server.logs());
     let binding_json = json!({
         "contract_version": "sekai.action-binding/v1",
         "binding_id": "escalate-degraded",

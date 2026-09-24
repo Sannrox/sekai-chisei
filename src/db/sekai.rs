@@ -801,6 +801,73 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    /// Loads a bounded set of caller-visible objects selected by a change feed.
+    pub fn list_objects_by_ids_with_policy_context(
+        &self,
+        ids: &[String],
+        principals: &[&str],
+        context: &PrincipalPolicyContext,
+    ) -> Result<Vec<Object>, String> {
+        const MAX_IDS_PER_QUERY: usize = 500;
+        let mut ids = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = MAX_IDS_PER_QUERY.min(
+            999usize
+                .saturating_sub(principals.len())
+                .saturating_sub(2)
+                .max(1),
+        );
+        let mut objects = Vec::with_capacity(ids.len());
+        for batch in ids.chunks(batch_size) {
+            let id_placeholders = (1..=batch.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let (visibility_filter, visibility_params) =
+                build_visibility_filter(principals, batch.len());
+            let (policy_filter, policy_params) = build_sqlite_object_security_filter(
+                Some(context),
+                batch.len() + visibility_params.len(),
+            )?;
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = batch
+                .iter()
+                .cloned()
+                .map(|id| Box::new(id) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            params.extend(visibility_params);
+            params.extend(policy_params);
+            let params = params
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<&dyn rusqlite::types::ToSql>>();
+            let sql = format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects
+                 WHERE id IN ({id_placeholders}){visibility_filter}{policy_filter}
+                 ORDER BY id ASC"
+            );
+            let conn = self.conn();
+            let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params.as_slice(), row_to_object)
+                .map_err(|error| error.to_string())?;
+            objects.extend(
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(objects)
+    }
+
     pub fn update_object(&self, o: &Object) -> Result<(), String> {
         if self.update_object_with_existing(o)?.is_none() {
             return Err("not found".into());
