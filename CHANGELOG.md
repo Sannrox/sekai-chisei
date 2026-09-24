@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New warehouse table ingest profile (`adapters/warehouse_table_ingest.rs`) that hydrates typed objects from a committed table snapshot through a connector outside the plane. It uses registered-source `ApplySourceBatch` batches with the snapshot id as the checkpoint. Restricted columns never leave the connector. Declared schema drift is refused until the new revision is registered, and undeclared drift is quarantined without clobbering the last consistent objects. SQLite-only, like source-type descriptors (#1085).
 - Hardened customer-hosted routing:
   - A hosted-shaped model id (`hosted.<name>/…`) is classified as hosted without consulting any registry. When it doesn't resolve, it fails closed instead of reading as an unknown provider that generic routing could replace (#1184).
   - Planning reads a namespace's hosted catalog only after the caller passes the namespace access check (#1187), and only when the request can reach a hosted runtime: a hosted pin, model, or runtime, or a policy that allows one (#1185).
