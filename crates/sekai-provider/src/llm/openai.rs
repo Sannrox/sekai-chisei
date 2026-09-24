@@ -759,6 +759,58 @@ mod tests {
         }))
     }
 
+    #[tokio::test]
+    async fn provider_calls_never_follow_redirects_off_the_admitted_origin() {
+        // #1188: an admitted origin answering 302 must not move the request,
+        // or its bearer credential, to another URL.
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_hits = hits.clone();
+        let target = Router::new().fallback(move || {
+            let hits = target_hits.clone();
+            async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(json!({
+                    "choices": [{"message": {"content": "redirected"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }
+        });
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}", target_listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(target_listener, target).await.unwrap();
+        });
+        let location = format!("{target_url}/v1/chat/completions");
+        let admitted = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let location = location.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(302)
+                        .header("location", location)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+        let admitted_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admitted_url = format!("http://{}", admitted_listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(admitted_listener, admitted).await.unwrap();
+        });
+
+        let provider = OpenAI::with_timeouts("hosted-secret", Some(&admitted_url), test_timeouts());
+        assert!(provider.chat(&test_chat_request("acme-1")).await.is_err());
+        assert!(
+            provider
+                .chat_stream(&test_chat_request("acme-1"))
+                .await
+                .is_err()
+        );
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     async fn spawn_delayed_openai() -> String {
         let app = Router::new().route("/v1/chat/completions", post(delayed_chat_response));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

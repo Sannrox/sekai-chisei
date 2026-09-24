@@ -118,6 +118,9 @@ impl HttpTimeouts {
         }
     }
 
+    /// Provider HTTP client. It never follows redirects: a provider origin,
+    /// including an operator-allowlisted customer-hosted one, cannot bounce
+    /// control-plane traffic or its bearer credential to another URL (#1188).
     pub fn client(self) -> reqwest::Client {
         self.client_builder()
             .build()
@@ -125,10 +128,7 @@ impl HttpTimeouts {
     }
 
     pub fn gateway_client(self) -> reqwest::Client {
-        self.client_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("valid reqwest timeout configuration")
+        self.client()
     }
 
     fn client_builder(self) -> reqwest::ClientBuilder {
@@ -136,6 +136,7 @@ impl HttpTimeouts {
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
             .pool_idle_timeout(self.pool_idle_timeout)
+            .redirect(reqwest::redirect::Policy::none())
     }
 }
 
