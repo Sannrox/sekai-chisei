@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Provider HTTP clients no longer follow redirects. An operator-allowlisted
+  customer-hosted origin (or any provider endpoint) answering with a redirect
+  now fails the call instead of moving the request and its bearer credential
+  to another URL, the same rule the gateway client already applied (#1188).
 - `PlanContentExecution` and `ExecuteContentPlanStream` now route to
   customer-hosted profiles under the same rules as native execution. Only the
   namespace's profiles are added, the policy must name the runtime, the route
