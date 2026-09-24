@@ -10297,6 +10297,14 @@ async fn hosted_endpoint_chat(
         .lock()
         .unwrap()
         .push(request["model"].as_str().unwrap_or_default().to_string());
+    if request["stream"].as_bool() != Some(true) {
+        return AxumResponse::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"choices":[{"message":{"content":"hosted answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+            ))
+            .unwrap();
+    }
     let body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"hosted answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
         "data: [DONE]\n\n"
@@ -10496,6 +10504,189 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         .await
     {
         Ok(_) => panic!("revoked hosted route unexpectedly executed"),
+        Err(error) => error,
+    };
+    assert_eq!(revoked.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn customer_hosted_routes_serve_content_execution_from_live_state() {
+    // #1183: the content-execution RPCs route to a namespace's hosted profile
+    // under the same rules as native execution.
+    use sha2::Digest as _;
+    let observed = HostedEndpointObservations::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hosted_endpoint_chat))
+        .with_state(observed.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::native_execution_lifecycle::HOSTED_CREDENTIAL_OVERRIDE
+        .with(|value| *value.borrow_mut() = Some("hosted-secret".into()));
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config,
+    );
+    for namespace in ["support", "open"] {
+        service
+            .put_routing_profile(Request::new(PutRoutingProfileRequest {
+                namespace: namespace.into(),
+                name: "acme-llm".into(),
+                endpoint_url: origin.clone(),
+                model_patterns: vec!["acme-*".into()],
+                credential_ref: "ACME".into(),
+            }))
+            .await
+            .unwrap();
+    }
+    let hosted_policy = crate::chisei::policy::Policy {
+        allowed_runtimes: vec!["hosted.acme-llm".into()],
+        allowed_models: vec!["hosted.acme-llm/acme-1".into()],
+        default_runtime: "hosted.acme-llm".into(),
+        default_model: "hosted.acme-llm/acme-1".into(),
+        data_class: "unclassified".into(),
+    };
+    service
+        .policy
+        .set_namespace_policy("support", hosted_policy.clone());
+    service.policy.set_namespace_policy("ops", hosted_policy);
+
+    let payload = b"Summarize the incident.";
+    let descriptor = ContentPartDescriptorV1 {
+        part_id: "text-1".into(),
+        kind: 1,
+        media_type: "text/plain".into(),
+        byte_length: payload.len() as u64,
+        sha256_digest: format!("sha256:{:x}", sha2::Sha256::digest(payload)),
+        reference: "fixture:text-1".into(),
+        provenance: Some(ContentProvenanceV1 {
+            source: "fixture".into(),
+            source_id: "hosted-content".into(),
+            source_version: "v1".into(),
+            observed_at_ms: 1,
+        }),
+        disclosure_state: 1,
+        disclosure_reason: String::new(),
+    };
+    let content_request = |request_id: &str, namespace: &str| PlanContentExecutionRequest {
+        input: Some(ContentExecutionInputV1 {
+            execution: Some(ExecutionInput {
+                request_id: request_id.into(),
+                namespace: namespace.into(),
+                spec: "Summarize the incident.".into(),
+                preferred_model: "hosted.acme-llm/acme-1".into(),
+                max_tokens: 64,
+                ..Default::default()
+            }),
+            content_messages: vec![ContentMessageV1 {
+                role: "user".into(),
+                parts: vec![descriptor.clone()],
+                ..Default::default()
+            }],
+            requested_capabilities: Some(ContentCapabilitiesV1 {
+                contract_version: crate::content::CONTENT_CONTRACT_VERSION.into(),
+                input_kinds: vec![1],
+                output_kinds: vec![1],
+                media_types: vec!["text/plain".into()],
+                reference_modes: vec!["opaque".into()],
+                max_parts: 1,
+                max_part_bytes: 1024,
+                max_aggregate_bytes: 1024,
+                streaming: true,
+            }),
+            disclosure_authority: "chisei.policy/v1".into(),
+        }),
+        gunshi_allocation: None,
+    };
+    let resolved = vec![ResolvedContentPartV1 {
+        descriptor: Some(descriptor.clone()),
+        payload: Some(resolved_content_part_v1::Payload::Text(
+            String::from_utf8(payload.to_vec()).unwrap(),
+        )),
+    }];
+
+    let plan = service
+        .plan_content_execution(Request::new(content_request(
+            "request:content-hosted",
+            "support",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let execution = plan.execution.as_ref().unwrap();
+    assert_eq!(execution.resolved_runtime, "hosted.acme-llm");
+    assert_eq!(execution.resolved_model, "hosted.acme-llm/acme-1");
+
+    let mut stream = service
+        .execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(plan),
+            resolved_parts: resolved.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        text.push_str(&event.unwrap().text_delta);
+    }
+    assert_eq!(text, "hosted answer");
+    assert_eq!(
+        *observed.authorizations.lock().unwrap(),
+        ["Bearer hosted-secret"]
+    );
+    assert_eq!(*observed.models.lock().unwrap(), ["acme-1"]);
+
+    for (request_id, namespace) in [
+        ("request:content-foreign", "ops"),
+        ("request:content-unpoliced", "open"),
+    ] {
+        assert!(
+            service
+                .plan_content_execution(Request::new(content_request(request_id, namespace)))
+                .await
+                .is_err(),
+            "{namespace}"
+        );
+    }
+
+    let before_revocation = service
+        .plan_content_execution(Request::new(content_request(
+            "request:content-before-revoke",
+            "support",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    service
+        .revoke_routing_profile(Request::new(RevokeRoutingProfileRequest {
+            namespace: "support".into(),
+            profile_id: "hosted:acme-llm".into(),
+        }))
+        .await
+        .unwrap();
+    let revoked = match service
+        .execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(before_revocation),
+            resolved_parts: resolved,
+        }))
+        .await
+    {
+        Ok(_) => panic!("revoked hosted route unexpectedly executed content"),
         Err(error) => error,
     };
     assert_eq!(revoked.code(), tonic::Code::FailedPrecondition);
