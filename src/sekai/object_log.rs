@@ -568,11 +568,234 @@ pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
     body()
 }
 
+/// One admit waiting for its record's commit (#1127).
+struct IngestTicket {
+    object: Object,
+    outcome: Mutex<Option<Result<u64, String>>>,
+}
+
+impl IngestTicket {
+    fn finish(&self, outcome: Result<u64, String>) {
+        *self
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outcome);
+    }
+
+    fn take(&self) -> Option<Result<u64, String>> {
+        self.outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+/// Queued admits per log path, so admits to unrelated logs never scan or
+/// commit each other's records.
+type IngestQueue = Mutex<std::collections::HashMap<PathBuf, Vec<std::sync::Arc<IngestTicket>>>>;
+
+static INGEST_QUEUE: OnceLock<IngestQueue> = OnceLock::new();
+
+fn ingest_queue() -> &'static IngestQueue {
+    INGEST_QUEUE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum InjectedBatchFailure {
+    RolledBack,
+    CommittedThenFailed,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_BATCH: std::cell::Cell<Option<InjectedBatchFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn run_batch(store: &mut Store, records: Vec<ObjectRecord>) -> Result<(), String> {
+    #[cfg(test)]
+    match FAIL_NEXT_BATCH.with(|flag| flag.take()) {
+        Some(InjectedBatchFailure::RolledBack) => {
+            return Err("injected batch failure before the log commit".into());
+        }
+        Some(InjectedBatchFailure::CommittedThenFailed) => {
+            mikura_ingest::BatchIngest::run(store, records)?;
+            return Err("injected batch failure after the log commit".into());
+        }
+        None => {}
+    }
+    mikura_ingest::BatchIngest::run(store, records)
+}
+
+/// Appends one admitted object and returns its identity generation.
+///
+/// Group commit (#1127): concurrent admits enqueue their records, and the
+/// caller that holds the object-log handle commits every queued record for
+/// that log as one mikura batch, so they share one fsync. Each admit returns
+/// only after the commit that covers its record, so a returned admit is as
+/// durable as a single-record ingest.
 pub fn apply_admitted_object_to_log(path: &Path, object: &Object) -> Result<u64, String> {
-    with_cached_object_log_store(path, |store| {
-        mikura_ingest::BatchIngest::run(store, vec![object_record(object)])?;
-        identity_generation(store, &object.kind, &object.id)
-    })
+    let cache = OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None));
+    apply_through_queue(cache, ingest_queue(), path, object)
+}
+
+/// A leader finishes every ticket it drains before it releases the handle
+/// lock, so once this caller holds the lock its ticket is either finished or
+/// still queued. A ticket stays queued after a successful pass only while an
+/// older record for the same identity was ahead of it.
+fn apply_through_queue(
+    cache: &Mutex<Option<CachedObjectLogStore>>,
+    queue: &IngestQueue,
+    path: &Path,
+    object: &Object,
+) -> Result<u64, String> {
+    let ticket = std::sync::Arc::new(IngestTicket {
+        object: object.clone(),
+        outcome: Mutex::new(None),
+    });
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(path.to_path_buf())
+        .or_default()
+        .push(ticket.clone());
+    let error = loop {
+        let mut opened = false;
+        let led = with_object_log_store_cache(cache, path, |store| {
+            opened = true;
+            commit_queued(store, queue, path)
+        });
+        if let Some(outcome) = ticket.take() {
+            return outcome;
+        }
+        match led {
+            // An older record for the same identity went first; every pass
+            // commits the oldest queued record per identity, so lead again.
+            Ok(()) => continue,
+            // A leader finishes every record it drains, so this one was never
+            // attempted: another record's batch failed. That pass still
+            // finished the records it drained, so the queue ahead of this one
+            // shrank; lead again on a fresh handle.
+            Err(_) if opened => continue,
+            Err(error) => break error,
+        }
+    };
+    // The handle failed before this record was drained. Withdraw it so a
+    // later leader cannot ingest a record whose admit already saw the failure.
+    let withdrawn = {
+        let mut queued = queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match queued.get_mut(path) {
+            Some(pending) => {
+                let before = pending.len();
+                pending.retain(|entry| !std::sync::Arc::ptr_eq(entry, &ticket));
+                let withdrawn = pending.len() != before;
+                if pending.is_empty() {
+                    queued.remove(path);
+                }
+                withdrawn
+            }
+            None => false,
+        }
+    };
+    if withdrawn {
+        return Err(error);
+    }
+    // Another leader took it after this caller released the lock; that
+    // leader finishes it before releasing the lock this call now waits on.
+    let _ = with_object_log_store_cache(cache, path, |_| Ok(()));
+    ticket.take().unwrap_or(Err(error))
+}
+
+/// Drains the queued records for `path` and commits them together. A
+/// second record for an identity already in this batch waits for the next
+/// batch, so every admit keeps its own generation.
+fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<(), String> {
+    let batch = {
+        let mut queued = queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(pending) = queued.get_mut(path) else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        let mut batch = Vec::new();
+        pending.retain(|ticket| {
+            if !seen.insert((ticket.object.kind.clone(), ticket.object.id.clone())) {
+                return true;
+            }
+            batch.push(ticket.clone());
+            false
+        });
+        if pending.is_empty() {
+            queued.remove(path);
+        }
+        batch
+    };
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let generation = |store: &Store, ticket: &IngestTicket| {
+        identity_generation(store, &ticket.object.kind, &ticket.object.id)
+    };
+    let pages_before = store.committed_pages();
+    let records = batch
+        .iter()
+        .map(|ticket| object_record(&ticket.object))
+        .collect::<Vec<_>>();
+    let Err(error) = run_batch(store, records) else {
+        for ticket in &batch {
+            ticket.finish(generation(store, ticket));
+        }
+        return Ok(());
+    };
+    // The batch either rolled back as a unit or committed to the log and then
+    // failed afterwards. The log itself says which: reopen it from disk and
+    // compare its committed page count, which a batch commit advances and a
+    // rollback does not. The pinned mikura `Store::append_batch` holds page
+    // commits for the whole batch and publishes it with one superblock flush,
+    // so a batch is never partly committed. This reads neither the error text nor per-record
+    // state, so an idempotent re-admit is judged like any other record.
+    let reopened = match Store::open(path) {
+        Ok(reopened) => reopened,
+        Err(reopen) => {
+            for ticket in &batch {
+                ticket.finish(Err(format!("{error}; reopening the log failed: {reopen}")));
+            }
+            return Err(error);
+        }
+    };
+    let committed = reopened.committed_pages() > pages_before;
+    *store = reopened;
+    for (index, ticket) in batch.iter().enumerate() {
+        if committed {
+            ticket.finish(generation(store, ticket));
+            continue;
+        }
+        // A rolled-back batch retries each record alone, so one bad record
+        // cannot fail the rest. A failed retry reopens the handle before the
+        // next record, since a failed write can leave it inconsistent.
+        let outcome = mikura_ingest::BatchIngest::run(store, vec![object_record(&ticket.object)])
+            .and_then(|()| generation(store, ticket));
+        if outcome.is_err() {
+            match Store::open(path) {
+                Ok(reopened) => *store = reopened,
+                Err(reopen) => {
+                    ticket.finish(outcome);
+                    for rest in &batch[index + 1..] {
+                        rest.finish(Err(format!("{error}; reopening the log failed: {reopen}")));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        ticket.finish(outcome);
+    }
+    // Drop the handle after any failed batch, as a single-record failure
+    // always has.
+    Err(error)
 }
 
 fn object_record(object: &Object) -> ObjectRecord {
@@ -784,6 +1007,270 @@ mod tests {
                 Some(2)
             );
         });
+    }
+
+    #[test]
+    fn queued_admits_share_one_commit_and_keep_their_generations() {
+        // #1127: records queued while another admit holds the handle commit
+        // together, as one log page, and each gets its own generation.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group.mikura");
+        let object = |id: &str| Object {
+            id: id.into(),
+            kind: "Customer".into(),
+            name: id.into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("region".into(), id.into())]),
+            created: 1,
+            updated: 1,
+        };
+        // An owned queue and handle keep this test independent of the
+        // process-wide ones other tests share.
+        let queue: IngestQueue = Mutex::new(std::collections::HashMap::new());
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        apply_through_queue(&cache, &queue, &path, &object("seed")).unwrap();
+        let pages_before = Store::open(&path).unwrap().committed_pages();
+        let queued = ["q1", "q2", "q3", "q4"]
+            .into_iter()
+            .map(|id| {
+                let ticket = std::sync::Arc::new(IngestTicket {
+                    object: object(id),
+                    outcome: Mutex::new(None),
+                });
+                queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(path.clone())
+                    .or_default()
+                    .push(ticket.clone());
+                ticket
+            })
+            .collect::<Vec<_>>();
+        let leader = apply_through_queue(&cache, &queue, &path, &object("leader")).unwrap();
+        let mut generations = queued
+            .iter()
+            .map(|ticket| ticket.take().expect("drained by the leader").unwrap())
+            .collect::<Vec<_>>();
+        generations.push(leader);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.committed_pages(), pages_before + 1);
+        for (id, generation) in ["q1", "q2", "q3", "q4", "leader"].iter().zip(&generations) {
+            assert_eq!(
+                identity_generation(&store, "Customer", id).unwrap(),
+                *generation
+            );
+        }
+    }
+
+    fn queue_admits_and_fail_their_batch(
+        failure: InjectedBatchFailure,
+    ) -> (Vec<u64>, u32, u32, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failed-batch.mikura");
+        let object = |id: &str, region: &str| Object {
+            id: id.into(),
+            kind: "Customer".into(),
+            name: id.into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("region".into(), region.into())]),
+            created: 1,
+            updated: 1,
+        };
+        let queue: IngestQueue = Mutex::new(std::collections::HashMap::new());
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        apply_through_queue(&cache, &queue, &path, &object("same", "eu")).unwrap();
+        let pages_before = Store::open(&path).unwrap().committed_pages();
+        // An identical re-admit rides in the batch with two new records.
+        let queued = [object("same", "eu"), object("new-1", "us")]
+            .into_iter()
+            .map(|object| {
+                let ticket = std::sync::Arc::new(IngestTicket {
+                    object,
+                    outcome: Mutex::new(None),
+                });
+                queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .entry(path.clone())
+                    .or_default()
+                    .push(ticket.clone());
+                ticket
+            })
+            .collect::<Vec<_>>();
+        FAIL_NEXT_BATCH.with(|flag| flag.set(Some(failure)));
+        let leader = apply_through_queue(&cache, &queue, &path, &object("new-2", "ap"));
+        assert!(
+            leader.is_ok(),
+            "the leader's record is resolved: {leader:?}"
+        );
+        let mut generations = queued
+            .iter()
+            .map(|ticket| ticket.take().expect("drained by the leader").unwrap())
+            .collect::<Vec<_>>();
+        generations.push(leader.unwrap());
+        let pages_after = Store::open(&path).unwrap().committed_pages();
+        (generations, pages_before, pages_after, path, dir)
+    }
+
+    #[test]
+    fn a_batch_that_committed_before_failing_is_not_appended_again() {
+        let (generations, pages_before, pages_after, path, _dir) =
+            queue_admits_and_fail_their_batch(InjectedBatchFailure::CommittedThenFailed);
+        assert_eq!(pages_after, pages_before + 1, "no record is appended twice");
+        let store = Store::open(&path).unwrap();
+        for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
+            assert_eq!(
+                identity_generation(&store, "Customer", id).unwrap(),
+                *generation
+            );
+        }
+    }
+
+    #[test]
+    fn a_rolled_back_batch_retries_each_record_alone() {
+        let (generations, pages_before, pages_after, path, _dir) =
+            queue_admits_and_fail_their_batch(InjectedBatchFailure::RolledBack);
+        assert_eq!(pages_after, pages_before + 3, "each record commits alone");
+        let store = Store::open(&path).unwrap();
+        for (id, generation) in ["same", "new-1", "new-2"].iter().zip(&generations) {
+            assert_eq!(
+                identity_generation(&store, "Customer", id).unwrap(),
+                *generation
+            );
+        }
+    }
+
+    #[test]
+    fn an_admit_behind_a_failed_same_identity_batch_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twin.mikura");
+        let object = |region: &str| Object {
+            id: "twin".into(),
+            kind: "Customer".into(),
+            name: "twin".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("region".into(), region.into())]),
+            created: 1,
+            updated: 1,
+        };
+        let queue: IngestQueue = Mutex::new(std::collections::HashMap::new());
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let older = std::sync::Arc::new(IngestTicket {
+            object: object("eu"),
+            outcome: Mutex::new(None),
+        });
+        queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(path.clone())
+            .or_default()
+            .push(older.clone());
+        // The older record's batch fails; this admit was never in it.
+        FAIL_NEXT_BATCH.with(|flag| flag.set(Some(InjectedBatchFailure::RolledBack)));
+        let newer = apply_through_queue(&cache, &queue, &path, &object("us")).unwrap();
+        let older = older.take().expect("drained first").unwrap();
+        assert!(newer > older, "the newer admit commits after its twin");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            identity_generation(&store, "Customer", "twin").unwrap(),
+            newer
+        );
+    }
+
+    #[test]
+    fn concurrent_admits_for_one_identity_all_commit_in_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("same-identity.mikura"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let handles = (0..6)
+            .map(|worker| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..5)
+                        .map(|index| {
+                            let object = Object {
+                                id: "shared".into(),
+                                kind: "Customer".into(),
+                                name: "shared".into(),
+                                namespace: "sales".into(),
+                                external_id: String::new(),
+                                properties: std::collections::HashMap::from([(
+                                    "region".into(),
+                                    format!("r-{worker}-{index}"),
+                                )]),
+                                created: 1,
+                                updated: 1,
+                            };
+                            apply_admitted_object_to_log(&path, &object).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut generations = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        generations.dedup();
+        assert_eq!(
+            generations.len(),
+            30,
+            "every admit keeps its own generation"
+        );
+    }
+
+    #[test]
+    fn concurrent_admits_all_commit_with_matching_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join("concurrent.mikura"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|worker| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..10)
+                        .map(|index| {
+                            let id = format!("c-{worker}-{index}");
+                            let object = Object {
+                                id: id.clone(),
+                                kind: "Customer".into(),
+                                name: id.clone(),
+                                namespace: "sales".into(),
+                                external_id: String::new(),
+                                properties: std::collections::HashMap::from([(
+                                    "region".into(),
+                                    "eu".into(),
+                                )]),
+                                created: 1,
+                                updated: 1,
+                            };
+                            (id, apply_admitted_object_to_log(&path, &object).unwrap())
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(results.len(), 80);
+        for (id, generation) in &results {
+            assert_eq!(
+                identity_generation(&store, "Customer", id).unwrap(),
+                *generation
+            );
+        }
+        assert!(store.committed_pages() <= 80);
     }
 
     #[test]
