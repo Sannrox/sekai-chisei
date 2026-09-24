@@ -2665,10 +2665,11 @@ mod tests {
 
     fn seed_mikura_customer_order_shipment(path: &std::path::Path) {
         let mut store = mikura::Store::create(path).unwrap();
-        mikura::BatchIngest::run(
+        mikura_ingest::BatchIngest::run(
             &mut store,
             vec![
                 mikura::ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Customer".into(),
                     key: "c1".into(),
@@ -2676,6 +2677,7 @@ mod tests {
                     props: std::collections::HashMap::from([("region".into(), "eu".into())]),
                 },
                 mikura::ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Customer".into(),
                     key: "c-hidden".into(),
@@ -2683,6 +2685,7 @@ mod tests {
                     props: std::collections::HashMap::from([("region".into(), "eu".into())]),
                 },
                 mikura::ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Order".into(),
                     key: "o1".into(),
@@ -2690,6 +2693,7 @@ mod tests {
                     props: std::collections::HashMap::from([("customer_id".into(), "c1".into())]),
                 },
                 mikura::ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Shipment".into(),
                     key: "s1".into(),
@@ -2700,6 +2704,7 @@ mod tests {
                     ]),
                 },
                 mikura::ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Shipment".into(),
                     key: "s-hidden".into(),

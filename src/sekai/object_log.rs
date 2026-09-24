@@ -8,8 +8,8 @@ use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
 use mikura::{
-    Aggregate, BatchIngest, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
-    ObjectSet, PropertyAcl, Store,
+    Aggregate, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord, ObjectSet,
+    PropertyAcl, Store,
 };
 use std::collections::HashSet;
 use std::env;
@@ -316,12 +316,18 @@ pub fn map_evaluate_request(
             .map(|hop| Hop {
                 far_kind: hop.far_kind.clone(),
                 join_property: hop.join_property.clone(),
+                // v0.1 joined far rows whose join property names the frontier
+                // key; `incoming: false` keeps that direction.
+                ..Hop::default()
             })
             .collect(),
         sum_kind,
         sum_property,
         aggregate: Aggregate::CountAndSum,
         acl,
+        // No filter, predicate, object bound, sort, or cursor: count and sum
+        // only, as on the v0.1 contract.
+        ..EvaluateRequest::default()
     })
 }
 
@@ -480,12 +486,10 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
         // as the pre-cache `if let Ok(store) = Store::open(&path)` guard
         // did — an unreadable log is "couldn't verify the check", not a
         // reason to fail the admission.
+        // #1127: a direct identity lookup replaces the full-kind scan.
         let existing = with_cached_object_log_store(&path, |store| {
-            Ok(store
-                .visible_of_kind(&object.kind)
-                .into_iter()
-                .find(|record| record.key == object.id)
-                .filter(|record| record.props == object.properties && !record.hidden)
+            Ok(visible_record(store, &object.kind, &object.id)
+                .filter(|record| record.props == object.properties)
                 .map(|record| record.r#gen))
         });
         if let Ok(Some(generation)) = existing {
@@ -529,7 +533,7 @@ pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
 
 pub fn apply_admitted_object_to_log(path: &Path, object: &Object) -> Result<u64, String> {
     with_cached_object_log_store(path, |store| {
-        BatchIngest::run(store, vec![object_record(object)])?;
+        mikura_ingest::BatchIngest::run(store, vec![object_record(object)])?;
         identity_generation(store, &object.kind, &object.id)
     })
 }
@@ -540,23 +544,33 @@ fn object_record(object: &Object) -> ObjectRecord {
         kind: object.kind.clone(),
         key: object.id.clone(),
         hidden: false,
+        // Admission ingest carries no mikura Action id; ingest idempotency
+        // stays the receipted clerk admission.
+        action_id: None,
         props: object.properties.clone(),
     }
 }
 
 pub fn identity_generation(store: &Store, kind: &str, key: &str) -> Result<u64, String> {
-    store
-        .visible_of_kind(kind)
-        .into_iter()
-        .find(|record| record.key == key)
+    visible_record(store, kind, key)
         .map(|record| record.r#gen)
         .ok_or_else(|| format!("mikura identity missing for {kind}:{key}"))
+}
+
+/// The current visible record for one identity, by direct lookup. Missing or
+/// hidden identities read as absent, as the v0.1 visible-kind scan did.
+fn visible_record(store: &Store, kind: &str, key: &str) -> Option<ObjectRecord> {
+    store
+        .load(kind, key, &PropertyAcl::allow_all())
+        .ok()
+        .filter(|record| !record.hidden)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mikura::{BatchIngest, ObjectRecord};
+    use mikura::ObjectRecord;
+    use mikura_ingest::BatchIngest;
     use std::collections::{BTreeMap, HashMap};
 
     fn member(kind: &str, key: &str, property: &str, value: &str) -> ObjectTypeIndexMember {
@@ -686,6 +700,7 @@ mod tests {
             BatchIngest::run(
                 &mut store,
                 vec![ObjectRecord {
+                    action_id: None,
                     r#gen: generation,
                     kind: "Customer".into(),
                     key: "c1".into(),
@@ -743,6 +758,7 @@ mod tests {
             &mut store,
             vec![
                 ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Customer".into(),
                     key: "c1".into(),
@@ -750,6 +766,7 @@ mod tests {
                     props: HashMap::from([("region".into(), "eu".into())]),
                 },
                 ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Order".into(),
                     key: "o1".into(),
@@ -757,6 +774,7 @@ mod tests {
                     props: HashMap::from([("customer_id".into(), "c1".into())]),
                 },
                 ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Shipment".into(),
                     key: "s1".into(),
@@ -767,6 +785,7 @@ mod tests {
                     ]),
                 },
                 ObjectRecord {
+                    action_id: None,
                     r#gen: 1,
                     kind: "Shipment".into(),
                     key: "s-hidden".into(),
@@ -828,6 +847,7 @@ mod tests {
         BatchIngest::run(
             &mut store,
             vec![ObjectRecord {
+                action_id: None,
                 r#gen: 1,
                 kind: "Shipment".into(),
                 key: "s2".into(),

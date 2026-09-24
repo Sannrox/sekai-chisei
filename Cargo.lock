@@ -1394,12 +1394,19 @@ dependencies = [
 
 [[package]]
 name = "mikura"
-version = "0.1.0"
-source = "git+https://github.com/Sannrox/mikura?tag=v0.1.0#4620f8e3fe669f170cf113768195ef3808b739d8"
+version = "0.2.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.2.0#4ab09042a726e50426e6a0b0c4660c65b3c2383d"
 dependencies = [
  "crc32fast",
  "serde",
- "serde_json",
+]
+
+[[package]]
+name = "mikura-ingest"
+version = "0.2.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.2.0#4ab09042a726e50426e6a0b0c4660c65b3c2383d"
+dependencies = [
+ "mikura",
 ]
 
 [[package]]
@@ -2514,6 +2521,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mikura",
+ "mikura-ingest",
  "native-tls",
  "opentelemetry",
  "opentelemetry-otlp",

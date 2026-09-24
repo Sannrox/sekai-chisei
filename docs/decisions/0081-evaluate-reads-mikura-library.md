@@ -130,3 +130,22 @@ gates until #942 documents a distinct object-log comparison.
     operator-visible pending signal is tracked separately in
     [#1115](https://github.com/Sannrox/sekai-chisei/issues/1115) and is not
     decided by this amendment.
+
+## Amendment: pin mikura `v0.2.0` (#1111)
+
+Combined now depends on the published `v0.2.0` tag of `mikura` and of its
+`mikura-ingest` crate, which is where `BatchIngest` moved. The adapter keeps
+the `v0.1.0` behavior this ADR decided:
+
+- Hops map with `incoming: false` (far rows whose join property names the
+  frontier key) and no hop predicate. Evaluate requests set no filter,
+  predicate, object bound, sort, or cursor, so the log still answers count and
+  sum only.
+- Admission ingest carries no mikura Action id. Clerk admission and receipts
+  remain the idempotency authority.
+- Identity lookups use `Store::load` instead of the removed full-kind
+  `visible_of_kind` scan. Hidden identities read as absent, as before. This
+  removes the per-lookup kind scan noted in #1127.
+- Incoming hops, hop predicates, and hide lists in `v0.2.0` stay unmapped
+  until their consumers land (#1112 projects clerk visibility into the tagged
+  ACL).

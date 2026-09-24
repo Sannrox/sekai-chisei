@@ -89,7 +89,8 @@ sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
 sekai-proto = { version = "1.0.1", path = "crates/sekai-proto" }
 sekai-ontology = { version = "1.0.0", path = "crates/sekai-ontology" }
-mikura = { git = "https://github.com/Sannrox/mikura", tag = "v0.1.0" }
+mikura = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
+mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 fs2 = "0.4.3"
 
 [dev-dependencies]
