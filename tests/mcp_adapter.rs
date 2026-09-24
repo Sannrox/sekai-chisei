@@ -21,7 +21,9 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.actions.describe",
             "sekai.actions.preview",
             "sekai.actions.submit",
-            "chisei.receipt.read"
+            "chisei.receipt.read",
+            "sekai.links.get",
+            "sekai.links.create"
         ]
     );
     assert_eq!(report.object_id, "widget-1");
@@ -190,4 +192,86 @@ async fn revoked_discovery_and_hidden_object_fail_closed() {
         hidden["result"]["structuredContent"]["code"],
         "permission_denied"
     );
+}
+
+#[tokio::test]
+async fn link_tools_create_and_read_links_and_fail_closed() {
+    // #1093: link read/create join the allowlist because GetLinks and
+    // CreateLink are stable; forged or incomplete input fails closed.
+    let surface = InProcessSurface::synthetic().await.unwrap();
+    let call = |id: i64, name: &str, input: serde_json::Value| {
+        json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{"name":name,"arguments":{"operation_id":format!("op-link-{id}"),"input":input}}
+        })
+    };
+    let created = handle_message(
+        &surface,
+        call(
+            1,
+            "sekai.links.create",
+            json!({"from_id": surface.object_id, "to_id": surface.peer_object_id, "relation": "pairs_with", "id": "forged-id"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created["result"]["isError"], false, "{created}");
+    let link = &created["result"]["structuredContent"]["output"]["link"];
+    assert_eq!(link["from_id"], surface.object_id);
+    assert_eq!(link["to_id"], surface.peer_object_id);
+    assert_eq!(link["relation"], "pairs_with");
+    assert_ne!(
+        link["id"], "forged-id",
+        "the client cannot choose the link id"
+    );
+
+    let read = handle_message(
+        &surface,
+        call(
+            2,
+            "sekai.links.get",
+            json!({"object_id": surface.object_id, "relation": "pairs_with"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let links = read["result"]["structuredContent"]["output"]["links"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(links.len(), 1, "{read}");
+    assert_eq!(links[0]["id"], link["id"]);
+
+    for (id, input) in [
+        (
+            3,
+            json!({"from_id": surface.object_id, "to_id": surface.peer_object_id}),
+        ),
+        (
+            4,
+            json!({"from_id": surface.object_id, "to_id": "missing", "relation": "pairs_with"}),
+        ),
+        (
+            5,
+            json!({"from_id": surface.object_id, "to_id": surface.peer_object_id, "relation": "pairs_with", "x-principal": "root"}),
+        ),
+        (
+            6,
+            json!({"from_id": 7, "to_id": surface.peer_object_id, "relation": "pairs_with"}),
+        ),
+    ] {
+        let refused = handle_message(&surface, call(id, "sekai.links.create", input.clone()))
+            .await
+            .unwrap();
+        assert!(
+            refused.get("error").is_some() || refused["result"]["isError"] == true,
+            "{input} -> {refused}"
+        );
+    }
+    let unscoped = handle_message(&surface, call(7, "sekai.links.get", json!({})))
+        .await
+        .unwrap();
+    assert!(unscoped.get("error").is_some() || unscoped["result"]["isError"] == true);
 }

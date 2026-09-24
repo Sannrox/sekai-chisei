@@ -27,6 +27,8 @@ use super::surface::{AdapterError, CatalogSnapshot, NativeRpc, NativeSurface, st
 const PRINCIPAL: &str = "tester";
 const NAMESPACE: &str = "acme";
 const OBJECT_ID: &str = "widget-1";
+/// A second synthetic object, so link tools have two endpoints (#1093).
+const PEER_OBJECT_ID: &str = "widget-2";
 const ACTION_TYPE: &str = "review.intake";
 const ACTION_VERSION: &str = "1.0.0";
 
@@ -35,6 +37,7 @@ pub struct InProcessSurface {
     pub principal: String,
     pub namespace: String,
     pub object_id: String,
+    pub peer_object_id: String,
     pub action_type: String,
     pub action_version: String,
     sekai: SekaiServiceImpl,
@@ -78,6 +81,7 @@ impl InProcessSurface {
             principal: PRINCIPAL.into(),
             namespace: NAMESPACE.into(),
             object_id: OBJECT_ID.into(),
+            peer_object_id: PEER_OBJECT_ID.into(),
             action_type: ACTION_TYPE.into(),
             action_version: ACTION_VERSION.into(),
             sekai,
@@ -104,29 +108,34 @@ impl InProcessSurface {
             ))
             .await
             .map_err(|error| error.message().to_string())?;
-        self.sekai
-            .create_object(with_identity(
-                CreateObjectRequest {
-                    object: Some(Object {
-                        id: self.object_id.clone(),
-                        kind: "widget".into(),
-                        name: "spinner".into(),
-                        namespace: self.namespace.clone(),
-                        external_id: String::new(),
-                        properties: HashMap::from([
-                            ("name".into(), "spinner".into()),
-                            ("color".into(), "blue".into()),
-                        ]),
-                        created: 0,
-                        updated: 0,
-                    }),
-                    lease_precondition: None,
-                },
-                &self.principal,
-                &self.namespace,
-            ))
-            .await
-            .map_err(|error| error.message().to_string())?;
+        for (id, name, color) in [
+            (&self.object_id, "spinner", "blue"),
+            (&self.peer_object_id, "gear", "red"),
+        ] {
+            self.sekai
+                .create_object(with_identity(
+                    CreateObjectRequest {
+                        object: Some(Object {
+                            id: id.clone(),
+                            kind: "widget".into(),
+                            name: name.into(),
+                            namespace: self.namespace.clone(),
+                            external_id: String::new(),
+                            properties: HashMap::from([
+                                ("name".into(), name.into()),
+                                ("color".into(), color.into()),
+                            ]),
+                            created: 0,
+                            updated: 0,
+                        }),
+                        lease_precondition: None,
+                    },
+                    &self.principal,
+                    &self.namespace,
+                ))
+                .await
+                .map_err(|error| error.message().to_string())?;
+        }
         self.sekai
             .put_governed_action_type(with_identity(
                 PutGovernedActionTypeRequest {

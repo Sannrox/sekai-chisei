@@ -16,9 +16,9 @@ use crate::grpc::pb::chisei::{GetOperationReceiptRequest, GetOperationReceiptRes
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    DescribeObjectActionRequest, DiscoverCapabilitiesRequest, EvaluateObjectSetRequest,
-    GetObjectRequest, PreviewObjectActionRequest, SubmitActionInstanceRequest,
-    SubmitActionInstanceResponse,
+    CreateLinkRequest, DescribeObjectActionRequest, DiscoverCapabilitiesRequest,
+    EvaluateObjectSetRequest, GetLinksRequest, GetObjectRequest, Link, PreviewObjectActionRequest,
+    SubmitActionInstanceRequest, SubmitActionInstanceResponse,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::capability::CONTRACT_VERSION;
@@ -33,6 +33,8 @@ pub enum NativeRpc {
     PreviewObjectAction,
     SubmitActionInstance,
     GetOperationReceipt,
+    GetLinks,
+    CreateLink,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +108,31 @@ pub async fn dispatch_native(
                     "properties": object.properties,
                 }
             }))
+        }
+        NativeRpc::GetLinks => {
+            let request = invocation
+                .bind(get_links_request(&invocation)?)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = sekai
+                .get_links(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            Ok(json!({"links": response.links.iter().map(link_json).collect::<Vec<_>>()}))
+        }
+        NativeRpc::CreateLink => {
+            let request = invocation
+                .bind(create_link_request(&invocation)?)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = sekai
+                .create_link(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            let link = response
+                .link
+                .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
+            Ok(json!({"link": link_json(&link)}))
         }
         NativeRpc::EvaluateObjectSet => {
             let payload =
@@ -352,6 +379,24 @@ impl NativeSurface for FixtureSurface {
                     "missing_surfaces": []
                 }))
             }
+            NativeRpc::GetLinks => Ok(json!({
+                "links": [{
+                    "id": "link-fixture",
+                    "from_id": required_string(&invocation.input, "object_id")?,
+                    "to_id": "fixture-target",
+                    "relation": "affects",
+                    "created": 0,
+                }]
+            })),
+            NativeRpc::CreateLink => Ok(json!({
+                "link": {
+                    "id": "link-fixture",
+                    "from_id": required_string(&invocation.input, "from_id")?,
+                    "to_id": required_string(&invocation.input, "to_id")?,
+                    "relation": required_string(&invocation.input, "relation")?,
+                    "created": 0,
+                }
+            })),
             NativeRpc::EvaluateObjectSet => Ok(json!({
                 "members": [],
                 "total": 0,
@@ -501,6 +546,28 @@ impl NativeSurface for SdkSurface {
                         .await?;
                 Ok(receipt_output(response))
             }
+            NativeRpc::GetLinks => {
+                let request = invocation
+                    .bind(get_links_request(&invocation)?)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(self.config.timeout, client.get_links(request)).await?;
+                Ok(json!({"links": response.links.iter().map(link_json).collect::<Vec<_>>()}))
+            }
+            NativeRpc::CreateLink => {
+                let request = invocation
+                    .bind(create_link_request(&invocation)?)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.create_link(request)).await?;
+                let link = response
+                    .link
+                    .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
+                Ok(json!({"link": link_json(&link)}))
+            }
             NativeRpc::EvaluateObjectSet => {
                 let payload =
                     serde_json::from_value::<EvaluateObjectSetRequest>(invocation.input.clone())
@@ -549,6 +616,37 @@ impl NativeSurface for SdkSurface {
             }
         }
     }
+}
+
+fn get_links_request(invocation: &SdkInvocation) -> Result<GetLinksRequest, AdapterError> {
+    Ok(GetLinksRequest {
+        object_id: required_string(&invocation.input, "object_id")?,
+        relation: json_string(&invocation.input, "relation", "relation").unwrap_or_default(),
+        direction: json_string(&invocation.input, "direction", "direction").unwrap_or_default(),
+    })
+}
+
+fn create_link_request(invocation: &SdkInvocation) -> Result<CreateLinkRequest, AdapterError> {
+    Ok(CreateLinkRequest {
+        link: Some(Link {
+            id: String::new(),
+            from_id: required_string(&invocation.input, "from_id")?,
+            to_id: required_string(&invocation.input, "to_id")?,
+            relation: required_string(&invocation.input, "relation")?,
+            created: 0,
+        }),
+        fail_if_exists: false,
+    })
+}
+
+fn link_json(link: &Link) -> Value {
+    json!({
+        "id": link.id,
+        "from_id": link.from_id,
+        "to_id": link.to_id,
+        "relation": link.relation,
+        "created": link.created,
+    })
 }
 
 fn submit_request(invocation: &SdkInvocation) -> Result<SubmitActionInstanceRequest, AdapterError> {
