@@ -76,6 +76,13 @@ pub(crate) struct EvaluationManifestWrite {
     pub request_digest: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Hosted routing-profile catalog reads on this thread (#1185-#1187).
+    pub(crate) static HOSTED_PROFILE_LISTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone)]
 pub enum RuntimeDb {
     Sqlite(Arc<SekaiDb>),
@@ -4849,6 +4856,8 @@ impl RuntimeDb {
         namespace: &str,
     ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
         use crate::db::chisei_routing_profile::ChiseiRoutingProfileBackend;
+        #[cfg(test)]
+        HOSTED_PROFILE_LISTS.with(|lists| lists.set(lists.get() + 1));
         match self {
             Self::Sqlite(db) => db.list_hosted_routing_profiles(namespace),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {

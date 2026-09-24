@@ -691,6 +691,12 @@ fn openai_compatible_api_root(base_url: &str) -> &str {
 }
 
 pub fn provider_name(model: &str) -> &'static str {
+    // A hosted-shaped id is a hosted route whether or not this request's
+    // registry can resolve it, so it never reads as an unknown provider that
+    // generic routing may replace (#1184).
+    if crate::provider_profile::hosted_provider_of(model).is_some() {
+        return "hosted";
+    }
     match crate::provider_resolution::provider_id(model).as_deref() {
         Ok("anthropic") => "anthropic",
         Ok("openai") => "openai",
@@ -736,7 +742,9 @@ mod tests {
         };
         assert!(error.contains("credential unavailable"), "{error}");
         assert!(resolve(Some("hosted-secret")).is_ok());
-        assert_eq!(provider_name("hosted.acme/acme-1"), "unknown");
+        // Hosted-shaped ids classify structurally, even outside an extension.
+        assert_eq!(provider_name("hosted.acme/acme-1"), "hosted");
+        assert_eq!(provider_name("hosted.Bad/acme-1"), "unknown");
     }
 
     #[test]

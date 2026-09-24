@@ -10692,3 +10692,200 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
     assert_eq!(revoked.code(), tonic::Code::FailedPrecondition);
     assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized_and_needed() {
+    // #1184: a hosted-shaped model that does not resolve never falls back to
+    // another provider. #1185/#1186/#1187: the hosted catalog is read only
+    // for hosted-relevant requests, only after namespace access, and once
+    // per hosted execution.
+    use crate::db::runtime_db::HOSTED_PROFILE_LISTS;
+    let lists = || HOSTED_PROFILE_LISTS.with(std::cell::Cell::get);
+    let observed = HostedEndpointObservations::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hosted_endpoint_chat))
+        .with_state(observed.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::native_execution_lifecycle::HOSTED_CREDENTIAL_OVERRIDE
+        .with(|value| *value.borrow_mut() = Some("hosted-secret".into()));
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    // A live local provider the old code could silently fall back to.
+    config.ollama_url = spawn_synthetic_ollama_provider().await;
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config,
+    );
+    service
+        .put_routing_profile(Request::new(PutRoutingProfileRequest {
+            namespace: "support".into(),
+            name: "acme-llm".into(),
+            endpoint_url: origin.clone(),
+            model_patterns: vec!["acme-*".into()],
+            credential_ref: "ACME".into(),
+        }))
+        .await
+        .unwrap();
+    service.policy.set_namespace_policy(
+        "support",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec![
+                "hosted.acme-llm".into(),
+                "hosted.missing".into(),
+                "ollama".into(),
+            ],
+            allowed_models: vec![
+                "hosted.acme-llm/acme-1".into(),
+                "hosted.acme-llm/other-1".into(),
+                "hosted.missing/acme-1".into(),
+                "ollama/mistral".into(),
+            ],
+            default_runtime: "ollama".into(),
+            default_model: "ollama/mistral".into(),
+            data_class: "unclassified".into(),
+        },
+    );
+    service.policy.set_namespace_policy(
+        "plain",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["ollama".into()],
+            allowed_models: vec!["ollama/mistral".into()],
+            default_runtime: "ollama".into(),
+            default_model: "ollama/mistral".into(),
+            data_class: "unclassified".into(),
+        },
+    );
+    let request =
+        |request_id: &str, namespace: &str, model: &str, pin: &str| PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: request_id.into(),
+                namespace: namespace.into(),
+                spec: "Summarize the incident.".into(),
+                preferred_model: model.into(),
+                preferred_runtime: crate::provider_profile::hosted_provider_of(model)
+                    .unwrap_or_default()
+                    .into(),
+                max_tokens: 64,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+            routing_profile_id: pin.into(),
+        };
+
+    // #1184: in a namespace without a policy (which otherwise allows any
+    // route), pattern misses and unregistered hosted names fail closed
+    // instead of being re-routed to the live local provider.
+    service
+        .put_routing_profile(Request::new(PutRoutingProfileRequest {
+            namespace: "open".into(),
+            name: "acme-llm".into(),
+            endpoint_url: origin.clone(),
+            model_patterns: vec!["acme-*".into()],
+            credential_ref: "ACME".into(),
+        }))
+        .await
+        .unwrap();
+    for (request_id, model) in [
+        ("request:hosted-pattern-miss", "hosted.acme-llm/other-1"),
+        ("request:hosted-unregistered", "hosted.missing/acme-1"),
+    ] {
+        let mut unpinned = request(request_id, "open", model, "");
+        unpinned.input.as_mut().unwrap().preferred_runtime.clear();
+        let refused = service.plan_execution(Request::new(unpinned)).await;
+        assert!(
+            refused.is_err(),
+            "{model} must not fall back: {:?}",
+            refused.map(|response| response.into_inner().plan.map(|plan| plan.resolved_model))
+        );
+    }
+
+    // #1185: a request that cannot route to a hosted runtime never reads
+    // the catalog, when planning or executing.
+    let before = lists();
+    let plain = service
+        .plan_execution(Request::new(request(
+            "request:plain",
+            "plain",
+            "ollama/mistral",
+            "",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let mut stream = service
+        .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plain) }))
+        .await
+        .unwrap()
+        .into_inner();
+    while stream.next().await.is_some() {}
+    assert_eq!(
+        lists(),
+        before,
+        "a non-hosted request read the hosted catalog"
+    );
+
+    // #1187: an actor without namespace access is refused before the
+    // namespace's hosted catalog is read.
+    let before = lists();
+    let mut unauthorized = Request::new(request(
+        "request:hosted-unauthorized",
+        "support",
+        "hosted.acme-llm/acme-1",
+        "hosted:acme-llm",
+    ));
+    unauthorized
+        .metadata_mut()
+        .insert("x-principal", "mallory".parse().unwrap());
+    assert_eq!(
+        service
+            .plan_execution(unauthorized)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        lists(),
+        before,
+        "the catalog was read before access was checked"
+    );
+
+    // #1186: a hosted execution reads the catalog exactly once.
+    let plan = service
+        .plan_execution(Request::new(request(
+            "request:hosted-once",
+            "support",
+            "hosted.acme-llm/acme-1",
+            "hosted:acme-llm",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(plan.resolved_runtime, "hosted.acme-llm");
+    let before = lists();
+    let mut stream = service
+        .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+        .await
+        .unwrap()
+        .into_inner();
+    while stream.next().await.is_some() {}
+    assert_eq!(lists(), before + 1);
+    assert_eq!(
+        *observed.authorizations.lock().unwrap(),
+        ["Bearer hosted-secret"]
+    );
+}
