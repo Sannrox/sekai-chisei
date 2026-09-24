@@ -1402,6 +1402,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mikura-host"
+version = "0.2.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.2.0#4ab09042a726e50426e6a0b0c4660c65b3c2383d"
+dependencies = [
+ "mikura",
+ "mikura-ingest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mikura-ingest"
 version = "0.2.0"
 source = "git+https://github.com/Sannrox/mikura?tag=v0.2.0#4ab09042a726e50426e6a0b0c4660c65b3c2383d"
@@ -2521,6 +2532,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mikura",
+ "mikura-host",
  "mikura-ingest",
  "native-tls",
  "opentelemetry",

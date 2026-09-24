@@ -63,6 +63,7 @@ pub mod object_index_engine;
 pub mod object_index_envelope;
 pub mod object_lineage;
 pub mod object_log;
+pub mod object_log_host;
 pub mod object_mutation;
 pub mod object_security;
 pub mod object_set;

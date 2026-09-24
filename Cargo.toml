@@ -95,6 +95,8 @@ fs2 = "0.4.3"
 
 [dev-dependencies]
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
+# The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
+mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 tempfile = "3"
 
 [[bin]]

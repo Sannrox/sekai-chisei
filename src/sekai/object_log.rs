@@ -142,6 +142,8 @@ fn with_cached_object_log_store<R>(
 #[cfg(test)]
 thread_local! {
     static TEST_LOG_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+    static TEST_LOG_HOST: std::cell::RefCell<Option<crate::sekai::object_log_host::ObjectLogHost>> =
+        const { std::cell::RefCell::new(None) };
     static FAIL_NEXT_INGEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static OBJECT_LOG_STORE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -509,10 +511,21 @@ fn compare_sql_to_log_with_cache(
 ///
 /// Clerk admission and receipts stay here. The log owns identity generations.
 /// Missing `SEKAI_OBJECT_LOG` skips ingest so SQL-only fixtures keep working.
+/// A configured object-log host (`SEKAI_OBJECT_LOG_HOST`, ADR 0088) owns the
+/// log instead: admits go through it, and it is exclusive with a local log.
 pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Option<u64>, String> {
+    let host = configured_log_host()?;
     let path = configured_log_path();
-    let Some(path) = path else {
-        return Ok(None);
+    let path = match (host, path) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{LOG_PATH_ENV} and {} are mutually exclusive",
+                crate::sekai::object_log_host::HOST_ENV
+            ));
+        }
+        (Some(host), None) => return host.admit(object_record(object)).map(Some),
+        (None, None) => return Ok(None),
+        (None, Some(path)) => path,
     };
     #[cfg(test)]
     if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
@@ -534,6 +547,37 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
         }
     }
     apply_admitted_object_to_log(&path, object).map(Some)
+}
+
+fn configured_log_host() -> Result<Option<crate::sekai::object_log_host::ObjectLogHost>, String> {
+    #[cfg(test)]
+    {
+        let override_host = TEST_LOG_HOST.with(|slot| slot.borrow().clone());
+        if override_host.is_some() {
+            return Ok(override_host);
+        }
+    }
+    crate::sekai::object_log_host::ObjectLogHost::from_env()
+}
+
+#[cfg(test)]
+pub fn with_test_log_host<R>(
+    host: crate::sekai::object_log_host::ObjectLogHost,
+    body: impl FnOnce() -> R,
+) -> R {
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            TEST_LOG_HOST.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+    }
+    TEST_LOG_HOST.with(|slot| {
+        *slot.borrow_mut() = Some(host);
+    });
+    let _clear = ClearOnDrop;
+    body()
 }
 
 fn configured_log_path() -> Option<PathBuf> {

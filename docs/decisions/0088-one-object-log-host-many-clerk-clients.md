@@ -88,3 +88,22 @@ Documentation-only decision. Proof that clerk processes share identity
 through the host belongs to the adapter Issue that follows the mikura
 release: write once through one clerk process, read the same generation
 from a second, and fail closed on mismatch.
+
+## Amendment: host released and adapted (#1196)
+
+mikura `v0.2.0` (pinned by #1111) ships `mikura-host` with its versioned
+JSON-lines wire contract, which satisfies the release prerequisite above. The
+clerk adapter (`src/sekai/object_log_host.rs`) is its client:
+
+- `SEKAI_OBJECT_LOG_HOST` routes object-log admits (append plus generation
+  read) through the host.
+- It is exclusive with a local `SEKAI_OBJECT_LOG`.
+- A non-loopback host requires `SEKAI_OBJECT_LOG_HOST_BEARER`.
+- Every host or wire failure fails the ingest closed, with no local
+  fallback.
+
+The validation above now runs as a test against a real host on loopback: one
+client writes, a second reads the same generation, and a committed record
+that does not carry the admitted properties fails closed. The SQL object-type
+index is still the evaluate authority. Retiring it remains #944, which now
+waits only on dual-read soak evidence.
