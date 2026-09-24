@@ -1,0 +1,52 @@
+{
+  "table": "lake.sales.orders",
+  "snapshot_id": "4082",
+  "schema_revision": "v1",
+  "record_kind": "Order",
+  "key_column": "order_id",
+  "display_column": "summary",
+  "version_column": "row_version",
+  "columns": [
+    {
+      "name": "order_id"
+    },
+    {
+      "name": "row_version"
+    },
+    {
+      "name": "summary"
+    },
+    {
+      "name": "status"
+    },
+    {
+      "name": "region"
+    },
+    {
+      "name": "customer_email",
+      "hidden": true
+    }
+  ],
+  "rows": [
+    {
+      "order_id": "1001",
+      "summary": "Order 1001",
+      "status": "shipped",
+      "region": "eu",
+      "customer_email": "a@example.com",
+      "row_version": "2"
+    },
+    {
+      "order_id": "1002",
+      "summary": "Order 1002",
+      "status": "open",
+      "region": "us",
+      "customer_email": "b@example.com",
+      "row_version": "1"
+    }
+  ],
+  "deleted_keys": [
+    "1003"
+  ],
+  "committed_at_ms": 2000
+}

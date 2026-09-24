@@ -1,0 +1,41 @@
+{
+  "table": "lake.sales.orders",
+  "snapshot_id": "4083",
+  "schema_revision": "v2",
+  "record_kind": "Order",
+  "key_column": "order_id",
+  "display_column": "summary",
+  "version_column": "row_version",
+  "columns": [
+    {
+      "name": "order_id"
+    },
+    {
+      "name": "row_version"
+    },
+    {
+      "name": "summary"
+    },
+    {
+      "name": "state"
+    },
+    {
+      "name": "region"
+    },
+    {
+      "name": "customer_email",
+      "hidden": true
+    }
+  ],
+  "rows": [
+    {
+      "order_id": "1001",
+      "summary": "Order 1001 (renamed status)",
+      "state": "cancelled",
+      "region": "eu",
+      "customer_email": "a@example.com",
+      "row_version": "3"
+    }
+  ],
+  "committed_at_ms": 3000
+}

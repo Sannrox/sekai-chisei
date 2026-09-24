@@ -297,6 +297,29 @@ closed. Offline conformance:
 cargo test --test warehouse_projection_adapters
 ```
 
+## Warehouse table ingest profile
+
+`warehouse_table_ingest.rs` hydrates typed objects from one warehouse table
+(#1085). Unlike the projection adapters above, it mints objects. The
+connector runs outside the control plane, reads a committed table snapshot
+with its own credentials, and submits a registered-source `ApplySourceBatch`
+batch. The plane never opens the warehouse: its authority is the admitted
+batch, and the table snapshot id is only the checkpoint cursor (ADR 0036).
+
+- **Descriptors.** One registered source-type descriptor (`warehouse.table`) covers one record kind and one schema revision.
+- **Object-type definition.** `object_type_definition` derives the definition from the visible columns, so the published definition can filter on them.
+- **Row versions.** Each row's source version is the warehouse row version, so an unchanged row is a no-op refresh.
+- **Restricted columns.** Hidden columns never leave the connector. They appear in no properties, digests, display names, or definitions.
+- **Declared schema drift** (a new revision) is refused before any write until an operator registers that revision.
+- **Undeclared drift** (rows rewritten under the same revision and row version) is quarantined. It appears in `GetSourceSyncState`, and the last consistent objects and checkpoint stay.
+- **Backend support.** Source-type descriptors are SQLite-only, so the profile is SQLite-only. PostgreSQL fails closed at descriptor registration.
+
+Offline end to end (register, ingest, evaluate, drift, and foreign producer):
+
+```sh
+cargo test --test warehouse_table_ingest
+```
+
 ## Lakehouse snapshot adapters
 
 `lakehouse_events.rs` and `lakehouse_metrics.rs` map domain-neutral
