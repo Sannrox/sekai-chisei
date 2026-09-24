@@ -47,23 +47,7 @@ pub(super) async fn plan_execution(
         };
         let plan_namespace = input.namespace.clone();
         let mut plan = service.plan_from_input(input, &actor).await?;
-        // Registering an endpoint grants nothing: a hosted route needs a
-        // namespace policy that names its runtime explicitly.
-        if crate::provider_profile::is_hosted_provider(&plan.resolved_runtime)
-            && !service
-                .policy
-                .effective_policy(&plan_namespace)
-                .is_some_and(|policy| {
-                    policy
-                        .allowed_runtimes
-                        .iter()
-                        .any(|runtime| runtime == &plan.resolved_runtime)
-                })
-        {
-            return Err(Status::failed_precondition(
-                "hosted route requires a namespace policy that allows its runtime",
-            ));
-        }
+        require_hosted_route_policy(service, &plan_namespace, &plan.resolved_runtime)?;
         // A pin is checked against the live catalog after planning, so the
         // listing never acts as a grant (#1094).
         let pinned = request.routing_profile_id.trim();
@@ -162,6 +146,19 @@ pub(super) async fn plan_content_execution(
     req: Request<PlanContentExecutionRequest>,
 ) -> Result<Response<PlanContentExecutionResponse>, Status> {
     let registry = service.refresh_provider_registry_for_resolution().await?;
+    let hosted_namespace = req
+        .get_ref()
+        .input
+        .as_ref()
+        .and_then(|input| input.execution.as_ref())
+        .map(|execution| execution.namespace.clone())
+        .unwrap_or_default();
+    let registry = with_namespace_hosted_routes(
+        service,
+        registry,
+        &hosted_namespace,
+        enterprise_authenticated_context(&req)?.is_some(),
+    )?;
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let actor = authenticated_actor(&req);
         let context = enterprise_authenticated_context(&req)?.cloned();
@@ -200,6 +197,7 @@ pub(super) async fn plan_content_execution(
             .execution
             .as_mut()
             .ok_or_else(|| Status::internal("content execution plan missing"))?;
+        require_hosted_route_policy(service, &hosted_namespace, &execution_plan.resolved_runtime)?;
         if let Some(allocation) = bound_allocation {
             let live_policy_version = service
                 .policy
@@ -268,9 +266,28 @@ pub(super) async fn execute_content_plan_stream(
     let requested_plan = request
         .plan
         .ok_or_else(|| Status::invalid_argument("content execution plan required"))?;
-    let stream = service
-        .execute_content_planned_stream(actor, context, requested_plan, request.resolved_parts)
-        .await?;
+    let namespace = requested_plan
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.input.as_ref())
+        .map(|input| input.namespace.clone())
+        .unwrap_or_default();
+    let registry = with_namespace_hosted_routes(
+        service,
+        service.refresh_provider_registry_for_resolution().await?,
+        &namespace,
+        context.is_some(),
+    )?;
+    let stream = crate::provider_profile::with_provider_registry_snapshot(
+        registry,
+        service.execute_content_planned_stream(
+            actor,
+            context,
+            requested_plan,
+            request.resolved_parts,
+        ),
+    )
+    .await?;
     Ok(Response::new(stream))
 }
 pub(super) async fn list_kioku_candidates(
@@ -1291,4 +1308,29 @@ fn with_namespace_hosted_routes(
         return Ok(registry);
     }
     Ok(registry.with_hosted_endpoints(&crate::chisei::routing_profiles::hosted_endpoints(&hosted)))
+}
+
+/// Registering an endpoint grants nothing: a hosted route needs a namespace
+/// policy that names its runtime explicitly (#1171).
+fn require_hosted_route_policy(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+    runtime: &str,
+) -> Result<(), Status> {
+    if crate::provider_profile::is_hosted_provider(runtime)
+        && !service
+            .policy
+            .effective_policy(namespace)
+            .is_some_and(|policy| {
+                policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == runtime)
+            })
+    {
+        return Err(Status::failed_precondition(
+            "hosted route requires a namespace policy that allows its runtime",
+        ));
+    }
+    Ok(())
 }
