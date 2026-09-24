@@ -649,6 +649,36 @@ impl SekaiServiceImpl {
         {
             let mut kinds = vec![bound.descriptor.kind.as_str()];
             kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
+            // What this evaluate reads on each kind: root filters and
+            // grouping, each hop's join property on its far kind, and the sum
+            // property on the leaf.
+            let mut read =
+                std::collections::BTreeMap::<&str, std::collections::BTreeSet<String>>::new();
+            let root_read = read.entry(bound.descriptor.kind.as_str()).or_default();
+            root_read.extend(
+                bound
+                    .descriptor
+                    .property_filters
+                    .iter()
+                    .map(|filter| filter.key.clone()),
+            );
+            if !aggregation.group_by.is_empty() {
+                root_read.insert(aggregation.group_by.clone());
+            }
+            for hop in hops {
+                read.entry(hop.far_kind.as_str())
+                    .or_default()
+                    .insert(hop.join_property.clone());
+            }
+            if !aggregation.property.is_empty() {
+                read.entry(kinds[kinds.len() - 1])
+                    .or_default()
+                    .insert(aggregation.property.clone());
+            }
+            let schema = self
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
             let mut policies = Vec::new();
             for kind in &kinds {
                 policies.push(
@@ -659,7 +689,20 @@ impl SekaiServiceImpl {
                 );
             }
             match crate::sekai::object_log::project_object_log_acl(
-                policies.iter().map(|policy| policy.as_ref()),
+                kinds.iter().zip(policies.iter()).map(|(kind, policy)| {
+                    crate::sekai::object_log::ObjectLogAclKind {
+                        kind,
+                        policy: policy.as_ref(),
+                        schema_properties: schema.get(kind).map(|object_type| {
+                            object_type
+                                .properties
+                                .iter()
+                                .map(|property| property.name.clone())
+                                .collect()
+                        }),
+                        read_properties: read.get(kind).cloned().unwrap_or_default(),
+                    }
+                }),
             ) {
                 Ok(acl) => {
                     let sql_paths: Vec<
