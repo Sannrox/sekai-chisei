@@ -72,6 +72,8 @@ const CHISEI_OPERATION_RESERVATIONS_SCHEMA: &str =
     include_str!("postgres/0046_chisei_operation_reservations.sql");
 const STORE_CUTOVER_SCHEMA: &str = include_str!("postgres/0047_store_cutover.sql");
 const STORE_CUTOVER_PAIRING_SCHEMA: &str = include_str!("postgres/0048_store_cutover_pairing.sql");
+const CHISEI_ROUTING_PROFILES_SCHEMA: &str =
+    include_str!("postgres/0049_chisei_routing_profiles.sql");
 
 #[derive(Clone, Copy)]
 struct Migration {
@@ -315,6 +317,12 @@ const MIGRATIONS: &[Migration] = &[
         version: 47,
         name: "store_cutover_pairing",
         sql: STORE_CUTOVER_PAIRING_SCHEMA,
+    },
+    // Versions run one behind the file prefixes: `0049_*.sql` is version 48.
+    Migration {
+        version: 48,
+        name: "chisei_routing_profiles",
+        sql: CHISEI_ROUTING_PROFILES_SCHEMA,
     },
 ];
 

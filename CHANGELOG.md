@@ -7,6 +7,14 @@
   seeds of the same genesis all succeed, and a different concurrent seed
   fails as a stale head (`FAILED_PRECONDITION`) instead of an internal error
   (#1174).
+- Experimental `PutRoutingProfile` and `RevokeRoutingProfile` let a namespace
+  administrator register a customer-hosted, OpenAI-compatible routing profile
+  (`hosted:<name>`, mode `customer_hosted`). The endpoint origin must be in the
+  operator-owned `SEKAI_ROUTING_ENDPOINT_ALLOWLIST`, and `credential_ref` must
+  resolve (`SEKAI_ROUTING_CREDENTIAL_<REF>` on community). Profiles store only
+  the reference. `ListRoutingProfiles` shows a hosted profile only to its own
+  namespace while its origin stays allowlisted. Hosted execution is a later
+  slice, so a pin on a hosted profile still fails closed (#1171).
 - Updated `rustls` to 0.23.45 (with `aws-lc-rs` 1.18.1 and `rustls-webpki`
   0.103.15) for RUSTSEC-2026-0285, a TLS 1.3 handshake-boundary flaw. `cargo
   audit` passes again (#1177).

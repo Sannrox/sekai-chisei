@@ -961,14 +961,33 @@ message PlanExecutionRequest {
 // rechecked when a plan pins it.
 message RoutingProfile {
   string profile_id = 1;
-  // "local" or "proxied" (customer-hosted profiles arrive with #1171).
+  // "local", "proxied", or "customer_hosted".
   string mode = 2;
   // Provider runtime that serves the profile.
   string runtime = 3;
   repeated string model_patterns = 4;
   string lifecycle = 5;
+  // Customer-hosted profiles only: the operator-allowlisted endpoint origin.
+  string endpoint_origin = 6;
 }
 message ListRoutingProfilesRequest { string namespace = 1; }
+// Registers or replaces a customer-hosted profile `hosted:<name>` in one
+// namespace. Requires namespace administration. The endpoint origin must be
+// in the operator's SEKAI_ROUTING_ENDPOINT_ALLOWLIST, and credential_ref must
+// resolve; the secret itself is never sent or stored.
+message PutRoutingProfileRequest {
+  string namespace = 1;
+  string name = 2;
+  string endpoint_url = 3;
+  repeated string model_patterns = 4;
+  string credential_ref = 5;
+}
+message PutRoutingProfileResponse { RoutingProfile profile = 1; }
+message RevokeRoutingProfileRequest {
+  string namespace = 1;
+  string profile_id = 2;
+}
+message RevokeRoutingProfileResponse { bool revoked = 1; }
 message ListRoutingProfilesResponse {
   repeated RoutingProfile profiles = 1;
   string contract_version = 2;
@@ -1576,6 +1595,8 @@ service ChiseiService {
   // budget, and evaluation state before a provider call is allowed.
   rpc PlanExecution(PlanExecutionRequest) returns (PlanExecutionResponse);
   rpc ListRoutingProfiles(ListRoutingProfilesRequest) returns (ListRoutingProfilesResponse);
+  rpc PutRoutingProfile(PutRoutingProfileRequest) returns (PutRoutingProfileResponse);
+  rpc RevokeRoutingProfile(RevokeRoutingProfileRequest) returns (RevokeRoutingProfileResponse);
   // Executes a previously governed plan through the selected provider adapter.
   rpc ExecutePlanStream(ExecutePlanRequest) returns (stream ExecutePlanStreamEvent);
   // Parallel fail-closed content path. Older servers return UNIMPLEMENTED.

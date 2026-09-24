@@ -282,6 +282,8 @@ fn fixture_config() -> Config {
         default_data_class: "unclassified".into(),
         safe_egress_providers: vec![],
         gateway_provided_providers: vec![],
+        routing_endpoint_allowlist: vec![],
+        routing_credential_refs: vec![],
         gateway_receipt_principals: vec![],
         leak_review_model: None,
         tls_cert: None,

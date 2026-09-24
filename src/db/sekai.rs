@@ -262,6 +262,7 @@ impl SekaiDb {
         self.migrate_action_effects()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
+        self.migrate_routing_profiles()?;
         self.migrate_usage_ledger()?;
         Ok(())
     }

@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.entries.len(), 175);
+        assert_eq!(table.entries.len(), 177);
         assert_eq!(table.stable_rpcs().len(), 66);
         assert!(
             table

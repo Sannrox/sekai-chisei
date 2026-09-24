@@ -294,6 +294,32 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutRoutingProfile",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_routing_profile_backend_conformance.rs",
+        "src/db/postgres_routing_profile.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "RevokeRoutingProfile",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.policy"
+      ],
+      "evidence": [
+        "tests/chisei_routing_profile_backend_conformance.rs",
+        "src/db/postgres_routing_profile.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "PlanExecution",
       "kind": "computed",
       "surfaces": [],

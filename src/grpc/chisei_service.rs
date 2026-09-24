@@ -682,6 +682,20 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::list_routing_profiles(self, req).await
     }
 
+    async fn put_routing_profile(
+        &self,
+        req: Request<PutRoutingProfileRequest>,
+    ) -> Result<Response<PutRoutingProfileResponse>, Status> {
+        rpc_execution::put_routing_profile(self, req).await
+    }
+
+    async fn revoke_routing_profile(
+        &self,
+        req: Request<RevokeRoutingProfileRequest>,
+    ) -> Result<Response<RevokeRoutingProfileResponse>, Status> {
+        rpc_execution::revoke_routing_profile(self, req).await
+    }
+
     async fn execute_plan_stream(
         &self,
         req: Request<ExecutePlanRequest>,
