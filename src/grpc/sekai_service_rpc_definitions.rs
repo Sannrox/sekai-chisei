@@ -15,13 +15,25 @@ pub(super) async fn create_definition_branch(
         &input.namespace,
         true,
     )?;
+    let from_genesis = input.parent_revision_digest.is_empty();
+    let parent_revision_digest = if from_genesis {
+        definition_genesis(&input.namespace)
+            .map_err(Status::invalid_argument)?
+            .revision_digest
+    } else {
+        input.parent_revision_digest
+    };
     let request = definition_branch_domain::CreateDefinitionBranch {
         namespace: input.namespace,
         branch_id: input.branch_id,
-        parent_revision_digest: input.parent_revision_digest,
+        parent_revision_digest,
         idempotency_key: input.idempotency_key,
     };
+    // The whole request is valid before genesis can become the published head.
     request.validate().map_err(Status::invalid_argument)?;
+    if from_genesis {
+        seed_definition_genesis(service, &request.namespace)?;
+    }
     authorize_definition_revision(
         service,
         &principals,
@@ -706,4 +718,33 @@ pub(super) async fn revoke_handoff(
     Ok(Response::new(RevokeHandoffResponse {
         manifest: Some(to_proto_handoff(&revoked)),
     }))
+}
+
+/// The empty genesis revision every namespace starts from (#1152). It is the
+/// same digest everywhere for a namespace, so seeding it is idempotent.
+pub(super) fn definition_genesis(
+    namespace: &str,
+) -> Result<definition_branch_domain::DefinitionRevision, String> {
+    definition_branch_domain::prepare_revision(namespace, "", [], true, "genesis", 1)
+}
+
+/// Seeds the genesis revision as the published head when the namespace has
+/// none. A namespace that already published anything
+/// else must branch from that head instead.
+fn seed_definition_genesis(service: &SekaiServiceImpl, namespace: &str) -> Result<(), Status> {
+    let genesis = definition_genesis(namespace).map_err(Status::invalid_argument)?;
+    service
+        .db
+        .runtime()
+        .seed_published_definition_revision(&genesis, &[])
+        .map_err(|error| {
+            if error.starts_with("stale_published_definition_head") {
+                Status::failed_precondition(
+                    "namespace already publishes a definition revision; branch from it",
+                )
+            } else {
+                Status::internal("definition revision unavailable")
+            }
+        })?;
+    Ok(())
 }
