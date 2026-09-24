@@ -219,6 +219,7 @@ there cannot be decided on that runtime.
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
 | `ChiseiService.PlanExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.ExecutePlanStream` | `chisei.execution` | yes | sdk, cli | `stable` |
 | `ChiseiService.PlanContentExecution` | `chisei.policy, chisei.budget, chisei.execution` | yes | sdk | `stable` |

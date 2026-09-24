@@ -560,6 +560,18 @@ impl ChiseiServiceImpl {
         plan: &ExecutionPlan,
         actor: &str,
     ) -> Result<(), String> {
+        self.record_planned_operation_with_routing(plan, actor, false)
+    }
+
+    /// Records the planned operation's receipt. The route event names the
+    /// routing profile and mode that served the plan and whether the caller
+    /// pinned it (#1094).
+    pub(super) fn record_planned_operation_with_routing(
+        &self,
+        plan: &ExecutionPlan,
+        actor: &str,
+        routing_pinned: bool,
+    ) -> Result<(), String> {
         let input = plan
             .input
             .as_ref()
@@ -717,6 +729,25 @@ impl ChiseiServiceImpl {
                             (!input.route_override.trim().is_empty()).to_string(),
                         ),
                     ]);
+                    if !plan.resolved_runtime.is_empty() {
+                        attributes.extend([
+                            (
+                                "routing_profile_id".into(),
+                                crate::chisei::routing_profiles::profile_id_for_runtime(
+                                    &plan.resolved_runtime,
+                                ),
+                            ),
+                            (
+                                "routing_mode".into(),
+                                crate::chisei::routing_profiles::mode_for_runtime(
+                                    &crate::provider_profile::provider_registry_snapshot(),
+                                    &plan.resolved_runtime,
+                                )
+                                .into(),
+                            ),
+                            ("routing_profile_pinned".into(), routing_pinned.to_string()),
+                        ]);
+                    }
                     if !plan.gunshi_allocation_id.is_empty() {
                         attributes.insert(
                             "gunshi_allocation_id".into(),

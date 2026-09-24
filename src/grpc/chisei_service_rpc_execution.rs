@@ -34,6 +34,17 @@ pub(super) async fn plan_execution(
             None
         };
         let mut plan = service.plan_from_input(input, &actor).await?;
+        // A pin is checked against the live catalog after planning, so the
+        // listing never acts as a grant (#1094).
+        let pinned = request.routing_profile_id.trim();
+        if !pinned.is_empty() {
+            crate::chisei::routing_profiles::check_pin(
+                &crate::provider_profile::provider_registry_snapshot(),
+                pinned,
+                &plan.resolved_runtime,
+            )
+            .map_err(Status::failed_precondition)?;
+        }
         if let Some(allocation) = bound_allocation {
             let live_policy_version = service
                 .policy
@@ -74,7 +85,7 @@ pub(super) async fn plan_execution(
                 .map_err(Status::internal)?;
         }
         service
-            .record_planned_operation(&plan, &actor)
+            .record_planned_operation_with_routing(&plan, &actor, !pinned.is_empty())
             .map_err(Status::internal)?;
         service.cache_plan_for_enterprise_authority(
             plan.clone(),
@@ -1068,5 +1079,41 @@ pub(super) async fn cancel_evaluation_execution(
         .await?;
     Ok(Response::new(CancelEvaluationExecutionResponse {
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
+    }))
+}
+
+/// Lists the routing profiles a namespace may pin. Namespace read access is
+/// required; visibility is not permission to route (#1094).
+pub(super) async fn list_routing_profiles(
+    service: &ChiseiServiceImpl,
+    req: Request<ListRoutingProfilesRequest>,
+) -> Result<Response<ListRoutingProfilesResponse>, Status> {
+    let registry = service.refresh_provider_registry_for_resolution().await?;
+    let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
+    let namespace = req.into_inner().namespace;
+    if namespace.trim().is_empty() || namespace.trim() != namespace {
+        return Err(Status::invalid_argument("canonical namespace required"));
+    }
+    require_execution_namespace_access_with_context(
+        service.db.runtime(),
+        &service.config,
+        &actor,
+        context.as_ref(),
+        &namespace,
+    )?;
+    let profiles = crate::chisei::routing_profiles::list_routing_profiles(&registry)
+        .into_iter()
+        .map(|profile| RoutingProfile {
+            profile_id: profile.profile_id,
+            mode: profile.mode,
+            runtime: profile.runtime,
+            model_patterns: profile.model_patterns,
+            lifecycle: profile.lifecycle,
+        })
+        .collect();
+    Ok(Response::new(ListRoutingProfilesResponse {
+        profiles,
+        contract_version: crate::chisei::routing_profiles::ROUTING_PROFILES_CONTRACT.into(),
     }))
 }

@@ -1335,6 +1335,7 @@ fn gunshi_plan_request(
     plan: &crate::chisei::gunshi::AllocationPlan,
 ) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "request:triage-1".into(),
             namespace: plan.namespace.clone(),
@@ -1624,6 +1625,7 @@ fn managed_execution_service() -> ChiseiServiceImpl {
 
 fn managed_plan_request(request_id: &str) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: request_id.into(),
             namespace: "managed-conformance".into(),
@@ -5407,6 +5409,7 @@ async fn cached_plan_execution_rechecks_namespace_membership() {
         })
         .unwrap();
     let mut planning = Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "revoked-plan".into(),
             namespace: "revocation".into(),
@@ -7064,6 +7067,7 @@ async fn sqlite_reload_restores_iterations_and_regression_gate() {
 
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-1".into(),
                 namespace: "context-a".into(),
@@ -7503,6 +7507,7 @@ async fn execute_plan_rechecks_regression_gate() {
 
     let mut plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-1".into(),
                 namespace: "context-a".into(),
@@ -7563,6 +7568,7 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
 
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-sample".into(),
                 namespace: "context-a".into(),
@@ -7617,6 +7623,7 @@ fn learning_pin_input(
     pin: Option<(&str, &str)>,
 ) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: request_id.into(),
             namespace: namespace.into(),
@@ -7995,6 +8002,7 @@ async fn plan_execution_exposes_and_audits_egress_decisions() {
 
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-egress".into(),
                 namespace: "asset:SECRET".into(),
@@ -8192,6 +8200,7 @@ async fn sensitive_private_rejects_unsafe_provider() {
 
     let err = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-sensitive-private".into(),
                 namespace: "alpha".into(),
@@ -8281,6 +8290,7 @@ async fn sensitive_template_only_skips_context_enrichment() {
 
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-template".into(),
                 namespace: "alpha".into(),
@@ -8363,6 +8373,7 @@ async fn template_only_plan_blocks_known_entity_leak() {
 
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-leak".into(),
                 namespace: "alpha".into(),
@@ -8430,6 +8441,7 @@ async fn execute_plan_rejects_after_policy_flips_sensitive() {
     let svc = memory_service();
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-stale-policy".into(),
                 namespace: "alpha".into(),
@@ -8499,6 +8511,7 @@ async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
     let svc = memory_service();
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-stale-stream-policy".into(),
                 namespace: "alpha".into(),
@@ -8794,6 +8807,7 @@ async fn sqlite_reload_backfills_legacy_iteration_context_gates() {
     let svc = file_service(&path);
     let plan = svc
         .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: "task-1".into(),
                 namespace: "context-a".into(),
@@ -9870,4 +9884,108 @@ fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
             other => panic!("expected {capability} lookup hit, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn routing_profiles_list_pin_and_record_the_route_mode() {
+    // #1094: the catalog lists admitted routes, a pin must match the planned
+    // route or the plan fails closed, and the receipt names mode and profile.
+    let service = gunshi_planning_service();
+    service.policy.set_namespace_policy(
+        "support",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["openai/gpt-5.5".into()],
+            default_runtime: "openai".into(),
+            default_model: "openai/gpt-5.5".into(),
+            data_class: String::new(),
+        },
+    );
+    let listed = service
+        .list_routing_profiles(Request::new(ListRoutingProfilesRequest {
+            namespace: "support".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed.contract_version,
+        crate::chisei::routing_profiles::ROUTING_PROFILES_CONTRACT
+    );
+    assert!(
+        listed
+            .profiles
+            .iter()
+            .any(|profile| profile.profile_id == "provider:openai" && profile.runtime == "openai")
+    );
+    let blank = service
+        .list_routing_profiles(Request::new(ListRoutingProfilesRequest {
+            namespace: String::new(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(blank.code(), tonic::Code::InvalidArgument);
+
+    let request = |request_id: &str, pin: &str| PlanExecutionRequest {
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: "support".into(),
+            spec: "Summarize the incident.".into(),
+            max_tokens: 64,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+        routing_profile_id: pin.into(),
+    };
+    for (request_id, pin) in [
+        ("request:route-mismatch", "provider:ollama"),
+        ("request:route-unknown", "provider:unknown"),
+    ] {
+        let refused = service
+            .plan_execution(Request::new(request(request_id, pin)))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition, "{pin}");
+    }
+
+    let plan = service
+        .plan_execution(Request::new(request(
+            "request:route-pinned",
+            "provider:openai",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(plan.resolved_runtime, "openai");
+    let receipt = service
+        .db
+        .runtime()
+        .get_operation_receipt(&plan.plan_id)
+        .unwrap()
+        .unwrap();
+    let route = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+        .unwrap();
+    assert_eq!(
+        route
+            .attributes
+            .get("routing_profile_id")
+            .map(String::as_str),
+        Some("provider:openai")
+    );
+    assert_eq!(
+        route
+            .attributes
+            .get("routing_profile_pinned")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(matches!(
+        route.attributes.get("routing_mode").map(String::as_str),
+        Some("proxied" | "local")
+    ));
 }

@@ -240,6 +240,7 @@ fn plan_request(
     pin: Option<(&str, &str)>,
 ) -> PlanExecutionRequest {
     PlanExecutionRequest {
+        routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: request_id.into(),
             namespace: namespace.into(),

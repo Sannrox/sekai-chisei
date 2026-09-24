@@ -282,6 +282,18 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ListRoutingProfiles",
+      "kind": "computed",
+      "surfaces": [],
+      "evidence": [
+        "src/chisei/routing_profiles.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.policy"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "PlanExecution",
       "kind": "computed",
       "surfaces": [],

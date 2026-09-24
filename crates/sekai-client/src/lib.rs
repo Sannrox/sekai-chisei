@@ -915,6 +915,7 @@ where
                 ServiceName::Chisei,
                 "PlanExecution",
                 PlanExecutionRequest {
+                    routing_profile_id: String::new(),
                     input: Some(input),
                     gunshi_allocation: None,
                 },

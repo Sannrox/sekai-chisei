@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Experimental `ListRoutingProfiles` lists the model routes a namespace may pin
+  (`provider:<runtime>`, mode `local` or `proxied`), and
+  `PlanExecutionRequest.routing_profile_id` pins one. A pin that is unknown,
+  unavailable, or does not serve the planned route fails the plan closed. Each
+  planned receipt's route event records the routing profile, mode, and whether
+  it was pinned. Customer-hosted profiles follow in #1171 (#1094).
 - A namespace can now publish its first definition revision through the public
   surface. `CreateDefinitionBranch` with an empty `parent_revision_digest`
   branches from a deterministic, empty genesis revision, which is seeded while

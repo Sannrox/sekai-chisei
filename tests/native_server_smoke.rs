@@ -28,8 +28,8 @@ use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
     ChatMessage, ExecutePlanRequest, ExecutionInput, GetEffectivePolicySummaryRequest,
-    GetOperationReceiptRequest, ListKiokuCandidatesRequest, PlanExecutionRequest,
-    RecordUsageRequest, SetBudgetLimitRequest,
+    GetOperationReceiptRequest, ListKiokuCandidatesRequest, ListRoutingProfilesRequest,
+    PlanExecutionRequest, RecordUsageRequest, SetBudgetLimitRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -481,6 +481,7 @@ async fn execute_mocked_plan(
     let request_id = format!("palette-{}", uuid::Uuid::new_v4().simple());
     let plan = chisei
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: request_id.clone(),
                 namespace: "demo".into(),
@@ -548,6 +549,7 @@ async fn plan_resolve_ref(
 ) -> sekai_chisei::grpc::pb::chisei::ExecutionPlan {
     chisei
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: format!("palette-lookup-{}", uuid::Uuid::new_v4().simple()),
                 namespace: "demo".into(),
@@ -1337,6 +1339,7 @@ async fn spawned_binary_enriches_prompt_with_object_facts() {
     let spec = "Inspect component:{palette-billing} for the outage";
     let plan = chisei
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: format!("palette-ctx-{}", uuid::Uuid::new_v4().simple()),
                 namespace: "demo".into(),
@@ -1520,6 +1523,7 @@ async fn spawned_binary_budget_denies_unaffordable_plan() {
         .unwrap_or_else(|error| panic!("set budget: {error}\n{}", server.logs()));
     let plan = chisei
         .plan_execution(PlanExecutionRequest {
+            routing_profile_id: String::new(),
             input: Some(ExecutionInput {
                 request_id: format!("palette-budget-{}", uuid::Uuid::new_v4().simple()),
                 namespace: "demo".into(),
@@ -1741,4 +1745,67 @@ async fn spawned_binary_rejects_invalid_bearer() {
         "invalid bearer should be unauthenticated, got {error}\n{}",
         server.logs()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_lists_and_pins_routing_profiles() {
+    // #1094: the catalog lists the local Ollama route, a matching pin plans
+    // and is recorded on the receipt, and a mismatched pin fails closed.
+    let (_fake, server) = mocked_server().await;
+    let mut chisei = server.chisei().await;
+    let listed = chisei
+        .list_routing_profiles(ListRoutingProfilesRequest {
+            namespace: "demo".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list routing profiles: {error}\n{}", server.logs()))
+        .into_inner();
+    let ollama = listed
+        .profiles
+        .iter()
+        .find(|profile| profile.profile_id == "provider:ollama")
+        .expect("ollama routing profile");
+    assert_eq!(ollama.mode, "local");
+
+    let request = |pin: &str| PlanExecutionRequest {
+        routing_profile_id: pin.into(),
+        input: Some(ExecutionInput {
+            request_id: format!("route-{}", uuid::Uuid::new_v4().simple()),
+            namespace: "demo".into(),
+            spec: "Reply with the mock phrase.".into(),
+            preferred_model: MOCK_MODEL.into(),
+            max_tokens: 32,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    };
+    let refused = chisei
+        .plan_execution(request("provider:openai"))
+        .await
+        .expect_err("a pin that does not serve the planned route fails closed");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    let plan = chisei
+        .plan_execution(request("provider:ollama"))
+        .await
+        .unwrap_or_else(|error| panic!("pinned plan: {error}\n{}", server.logs()))
+        .into_inner()
+        .plan
+        .expect("plan");
+    let receipt = chisei
+        .get_operation_receipt(GetOperationReceiptRequest {
+            operation_id: plan.plan_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("receipt: {error}\n{}", server.logs()))
+        .into_inner();
+    let receipt: Value = serde_json::from_str(&receipt.receipt_json).expect("receipt json");
+    let route = receipt["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["attributes"]["routing_profile_id"] == "provider:ollama")
+        .expect("route event names the pinned profile");
+    assert_eq!(route["attributes"]["routing_mode"], "local");
+    assert_eq!(route["attributes"]["routing_profile_pinned"], "true");
 }
