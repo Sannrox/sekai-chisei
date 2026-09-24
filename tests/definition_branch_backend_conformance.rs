@@ -546,6 +546,92 @@ fn exercise_concurrent_stale_head(db: Arc<dyn DefinitionBranchBackend>, namespac
     );
 }
 
+fn exercise_concurrent_genesis_seed(db: Arc<dyn DefinitionBranchBackend>, namespace: &str) {
+    // #1174: concurrent seeds of one genesis are idempotent, and a different
+    // concurrent seed loses as a stale head rather than an internal error.
+    let revision =
+        |created_by: &str| prepare_revision(namespace, "", [], true, created_by, 1).unwrap();
+    let seed_concurrently = |revisions: Vec<_>| {
+        let barrier = Arc::new(Barrier::new(revisions.len()));
+        revisions
+            .into_iter()
+            .map(|revision| {
+                let db = Arc::clone(&db);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.seed_published_definition_revision(&revision, &[])
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let genesis = revision("genesis");
+    let same = seed_concurrently(vec![genesis.clone(); 8]);
+    assert!(same.iter().all(Result::is_ok), "{same:?}");
+    assert_eq!(
+        db.get_definition_revision(namespace, &genesis.revision_digest)
+            .unwrap()
+            .map(|revision| revision.revision_digest),
+        Some(genesis.revision_digest.clone())
+    );
+
+    let contested = format!("{namespace}-contested");
+    let contested_seed = |member_id: &str| {
+        let prepared = member(
+            &contested,
+            member_id,
+            &format!(r#"{{"name":"{member_id}"}}"#),
+        )
+        .prepare(&contested)
+        .unwrap();
+        let revision = prepare_revision(
+            &contested,
+            "",
+            [DefinitionRevisionMember {
+                member_kind: prepared.member_kind.clone(),
+                member_id: prepared.member_id.clone(),
+                member_digest: prepared.member_digest.clone(),
+            }],
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        (revision, prepared)
+    };
+    let seeds = (0..8)
+        .map(|index| contested_seed(if index % 2 == 0 { "Ticket" } else { "Project" }))
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(seeds.len()));
+    let results = seeds
+        .into_iter()
+        .map(|(revision, prepared)| {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.seed_published_definition_revision(&revision, &[prepared])
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    // Two digests contend; every seed of the winning one is idempotent.
+    let winners = results.iter().filter(|result| result.is_ok()).count();
+    assert_eq!(winners, 4, "{results:?}");
+    assert!(
+        results.iter().all(|result| result
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.starts_with("stale_published_definition_head"))),
+        "{results:?}"
+    );
+}
+
 fn exercise_revision_diff(db: &dyn DefinitionBranchBackend, namespace: &str) {
     let (parent_digest, create) = seed(db, namespace);
     db.create_definition_branch(&create, "author", 2).unwrap();
@@ -974,6 +1060,10 @@ fn sqlite_definition_branch_backend_conformance() {
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
     );
+    exercise_concurrent_genesis_seed(
+        Arc::new(SekaiDb::new(":memory:").unwrap()),
+        "sqlite-definition-genesis",
+    );
 }
 
 fn postgres() -> PostgresDb {
@@ -997,5 +1087,6 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_revision_compatibility(db.as_ref(), &format!("{prefix}-compat"));
     exercise_coordinated_artifact_merge(db.as_ref(), &format!("{prefix}-four-kind"));
     exercise_named_compatibility_gate_refusal(db.as_ref(), &format!("{prefix}-gate"));
-    exercise_concurrent_stale_head(db, &format!("{prefix}-concurrent"));
+    exercise_concurrent_stale_head(db.clone(), &format!("{prefix}-concurrent"));
+    exercise_concurrent_genesis_seed(db, &format!("{prefix}-genesis"));
 }

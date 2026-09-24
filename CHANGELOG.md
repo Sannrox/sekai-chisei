@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Concurrent definition genesis seeds on community PostgreSQL no longer race
+  the published-head insert. They serialize on the namespace's head lock:
+  seeds of the same genesis all succeed, and a different concurrent seed
+  fails as a stale head (`FAILED_PRECONDITION`) instead of an internal error
+  (#1174).
 - Updated `rustls` to 0.23.45 (with `aws-lc-rs` 1.18.1 and `rustls-webpki`
   0.103.15) for RUSTSEC-2026-0285, a TLS 1.3 handshake-boundary flaw. `cargo
   audit` passes again (#1177).

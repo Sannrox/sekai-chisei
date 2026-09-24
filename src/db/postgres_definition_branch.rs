@@ -29,6 +29,10 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        // #1174: concurrent seeds for one namespace serialize on the head
+        // lock, so the second reads the first's head instead of racing it
+        // to the insert.
+        lock_published_head(&mut transaction, &revision.namespace)?;
         insert_members_postgres(&mut transaction, members)?;
         insert_revision_postgres(&mut transaction, revision)?;
         write_published_head_postgres(
@@ -786,23 +790,24 @@ fn write_published_head_postgres(
 ) -> Result<(), String> {
     match expected {
         None => {
-            let existing = load_published_head_postgres(transaction, namespace)?;
-            if let Some(existing) = existing {
-                if existing != revision_digest {
-                    return Err(
-                        "stale_published_definition_head: published head is already bound".into(),
-                    );
-                }
-                return Ok(());
-            }
+            // A head bound by any writer, including one that committed after
+            // this transaction started, wins: the same digest is an
+            // idempotent seed, anything else is a stale head.
             transaction
                 .execute(
                     "INSERT INTO sekai_definition_published_heads (
                         namespace, revision_digest, updated_at_ms
-                     ) VALUES ($1, $2, $3)",
+                     ) VALUES ($1, $2, $3)
+                     ON CONFLICT (namespace) DO NOTHING",
                     &[&namespace, &revision_digest, &now_ms],
                 )
                 .map_err(|error| error.to_string())?;
+            let existing = load_published_head_postgres(transaction, namespace)?;
+            if existing.as_deref() != Some(revision_digest) {
+                return Err(
+                    "stale_published_definition_head: published head is already bound".into(),
+                );
+            }
             Ok(())
         }
         Some(previous) => {
