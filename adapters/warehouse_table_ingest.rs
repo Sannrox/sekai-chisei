@@ -249,3 +249,93 @@ pub fn batch(
         .map_err(|error| format!("source batch is invalid: {error:?}"))?;
     Ok(batch)
 }
+
+/// The executor-side view of one table, holding the source credentials and
+/// current rows. Writes are conditional on a row's version, and every write
+/// commits a new snapshot the connector then ingests (#1085 writeback).
+pub struct TableStore {
+    snapshot: std::sync::Mutex<TableSnapshot>,
+}
+
+impl TableStore {
+    pub fn new(snapshot: TableSnapshot) -> Result<Self, String> {
+        validate(&snapshot)?;
+        Ok(Self {
+            snapshot: std::sync::Mutex::new(snapshot),
+        })
+    }
+
+    /// The latest committed snapshot.
+    pub fn snapshot(&self) -> TableSnapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Stable reference to one row, the same identity ingest admits.
+    pub fn resource(&self, key: &str) -> Result<String, String> {
+        let snapshot = self.snapshot();
+        registered_source_id(&descriptor(&snapshot)?, &snapshot.table, key)
+    }
+
+    pub fn row_version(&self, key: &str) -> Result<String, String> {
+        let snapshot = self.snapshot();
+        snapshot
+            .rows
+            .iter()
+            .find(|row| row.get(&snapshot.key_column).map(String::as_str) == Some(key))
+            .and_then(|row| row.get(&snapshot.version_column).cloned())
+            .ok_or_else(|| format!("row {key:?} does not exist"))
+    }
+
+    /// Applies `change` to row `key` while it is still at `expected_version`,
+    /// then commits the next snapshot. Only visible, non-identity columns can
+    /// change.
+    pub fn apply(
+        &self,
+        key: &str,
+        expected_version: &str,
+        change: &BTreeMap<String, String>,
+    ) -> Result<String, String> {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let writable = |name: &str| {
+            name != snapshot.key_column
+                && name != snapshot.version_column
+                && snapshot
+                    .columns
+                    .iter()
+                    .any(|column| column.name == name && !column.hidden)
+        };
+        if change.is_empty() || !change.keys().all(|name| writable(name)) {
+            return Err("the change names a column that cannot be written".into());
+        }
+        let key_column = snapshot.key_column.clone();
+        let version_column = snapshot.version_column.clone();
+        let row = snapshot
+            .rows
+            .iter_mut()
+            .find(|row| row.get(&key_column).map(String::as_str) == Some(key))
+            .ok_or_else(|| format!("row {key:?} does not exist"))?;
+        if row.get(&version_column).map(String::as_str) != Some(expected_version) {
+            return Err("record version changed since the writeback was decided".into());
+        }
+        let next = expected_version
+            .parse::<u64>()
+            .map(|version| (version + 1).to_string())
+            .map_err(|_| "row versions must be integers".to_string())?;
+        row.extend(change.clone());
+        row.insert(version_column, next.clone());
+        snapshot.snapshot_id = snapshot
+            .snapshot_id
+            .parse::<u64>()
+            .map(|id| (id + 1).to_string())
+            .map_err(|_| "snapshot ids must be integers".to_string())?;
+        snapshot.deleted_keys.clear();
+        snapshot.committed_at_ms += 1_000;
+        Ok(next)
+    }
+}

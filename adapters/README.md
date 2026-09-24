@@ -320,6 +320,28 @@ Offline end to end (register, ingest, evaluate, drift, and foreign producer):
 cargo test --test warehouse_table_ingest
 ```
 
+## Source writeback adapter
+
+`source_writeback.rs` writes an approved change back to a source system of
+record through the governed Action path, for any source the executor can
+address by key and record version (the `SourceSystem` trait). For one
+`WritebackIntent`, `WritebackProfile::run` does the following:
+
+1. Checks that the record is still at the version the change was decided against.
+2. Has Chisei authorize an external-action permit bound to the record, the version, and the exact change.
+3. Verifies the permit against the trusted issuer key.
+4. Submits the Action (`SubmitActionInstance`) and reads its pending `external_mutate` effect (`GetActionEffect`).
+5. Redeems the permit as the executor and applies the change conditionally on the record version.
+6. Records execution evidence. The operation receipt (`GetOperationReceipt`) carries the Action's identity.
+
+The executor holds the source credentials. Nothing credential-like enters Action parameters, permits, evidence, or objects. The plane learns the new record state from the next ingest batch.
+
+`warehouse_table_ingest::TableStore` is the warehouse implementation. Writes are conditional on the row version, only visible non-identity columns can change, and each write commits the next snapshot the connector ingests. End to end:
+
+```sh
+cargo test --test warehouse_table_writeback
+```
+
 ## Lakehouse snapshot adapters
 
 `lakehouse_events.rs` and `lakehouse_metrics.rs` map domain-neutral
