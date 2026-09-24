@@ -1,7 +1,7 @@
 {
   "contract_version": "sekai.compatibility-matrix/v1",
   "server_version": "1.0.1",
-  "proto_revision": "sha256:54dc6f5566337b58b81434eb63970101db853eea3ccbd9ef53119c004a90ff3b",
+  "proto_revision": "sha256:af887d7ba4ebadb246be2c59df90f14a5f516cc6fef0e66715d8120b3508669d",
   "minimum_compatible_server": "1.0.1",
   "identity_assertion_contract": "sekai.identity-assertion/v1",
   "packages": {

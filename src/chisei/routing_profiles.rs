@@ -18,8 +18,6 @@ pub const ROUTING_PROFILES_CONTRACT: &str = "chisei.routing-profiles/v1";
 pub const MODE_LOCAL: &str = "local";
 pub const MODE_PROXIED: &str = "proxied";
 pub const MODE_CUSTOMER_HOSTED: &str = "customer_hosted";
-/// Runtime every customer-hosted profile speaks.
-pub const HOSTED_RUNTIME: &str = "openai-compatible";
 /// Operator-owned, comma-separated `https://host[:port]` origins that
 /// customer-hosted profiles may use. Loopback `http` origins are admitted
 /// only when listed. Unset or empty admits none.
@@ -47,12 +45,21 @@ pub struct HostedRoutingProfile {
 }
 
 impl HostedRoutingProfile {
+    /// The catalog entry. Like a provider entry, `runtime` and the model
+    /// patterns are the keys a namespace policy and a plan use: runtime
+    /// `hosted.<name>` and models `hosted.<name>/<pattern>` (#1189). Every
+    /// hosted profile speaks the OpenAI-compatible API, which `mode` implies.
     pub fn entry(&self) -> RoutingProfileEntry {
+        let runtime = hosted_runtime(self);
         RoutingProfileEntry {
             profile_id: self.profile_id.clone(),
             mode: MODE_CUSTOMER_HOSTED.into(),
-            runtime: HOSTED_RUNTIME.into(),
-            model_patterns: self.model_patterns.clone(),
+            model_patterns: self
+                .model_patterns
+                .iter()
+                .map(|pattern| format!("{runtime}/{pattern}"))
+                .collect(),
+            runtime,
             lifecycle: "registered".into(),
         }
     }
@@ -468,7 +475,12 @@ mod tests {
         assert_eq!(admitted.profile_id, "hosted:acme-llm");
         assert_eq!(admitted.endpoint_origin, "https://models.example.com");
         assert_eq!(admitted.model_patterns, vec!["acme-*"]);
-        assert_eq!(admitted.entry().mode, MODE_CUSTOMER_HOSTED);
+        let entry = admitted.entry();
+        assert_eq!(entry.mode, MODE_CUSTOMER_HOSTED);
+        // The listed runtime and patterns are the policy and model keys.
+        assert_eq!(entry.runtime, hosted_runtime(&admitted));
+        assert_eq!(entry.runtime, "hosted.acme-llm");
+        assert_eq!(entry.model_patterns, vec!["hosted.acme-llm/acme-*"]);
 
         let egress = admit_hosted_profile(
             input("https://elsewhere.example.com", "ACME"),

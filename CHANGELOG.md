@@ -10,6 +10,7 @@
   customer-hosted origin (or any provider endpoint) answering with a redirect
   now fails the call instead of moving the request and its bearer credential
   to another URL, the same rule the gateway client already applied (#1188).
+- `ListRoutingProfiles` now reports a customer-hosted profile's `runtime` as `hosted.<name>` and its model patterns as `hosted.<name>/<pattern>`. Those are the keys namespace policy and plans use, so a policy mirrored from the list admits the route. The list previously reported the `openai-compatible` dialect and bare upstream patterns (#1189).
 - `PlanContentExecution` and `ExecuteContentPlanStream` now route to
   customer-hosted profiles under the same rules as native execution. Only the
   namespace's profiles are added, the policy must name the runtime, the route

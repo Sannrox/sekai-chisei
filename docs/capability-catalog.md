@@ -234,8 +234,11 @@ customer operates. The caller needs the `Admin` role on the namespace;
 enterprise credentials are refused until tenant credential resolution is
 wired for hosted routes.
 
-- The profile id is `hosted:<name>` and its mode is `customer_hosted`, with
-  runtime `openai-compatible`.
+- The profile id is `hosted:<name>` and its mode is `customer_hosted`. Every
+  hosted profile speaks the OpenAI-compatible API. As with provider entries,
+  the listed `runtime` (`hosted.<name>`) and `model_patterns`
+  (`hosted.<name>/<pattern>`) are the keys a namespace policy uses, so a
+  policy mirrored from the list admits the route.
 - The endpoint must be `https` (or a loopback `http` origin), must not embed
   credentials, a query, or a fragment, and its origin must be in the
   operator-owned `SEKAI_ROUTING_ENDPOINT_ALLOWLIST`. No tenant-facing RPC
