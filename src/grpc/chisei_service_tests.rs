@@ -10889,3 +10889,75 @@ async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized
         ["Bearer hosted-secret"]
     );
 }
+
+#[tokio::test]
+async fn a_policy_mirrored_from_the_routing_list_admits_the_hosted_route() {
+    // #1189: the listed runtime and model patterns are the keys a namespace
+    // policy uses, so copying them from ListRoutingProfiles unlocks the
+    // hosted route.
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config,
+    );
+    service
+        .put_routing_profile(Request::new(PutRoutingProfileRequest {
+            namespace: "support".into(),
+            name: "acme-llm".into(),
+            endpoint_url: "https://models.example.com".into(),
+            model_patterns: vec!["acme-*".into()],
+            credential_ref: "ACME".into(),
+        }))
+        .await
+        .unwrap();
+    let listed = service
+        .list_routing_profiles(Request::new(ListRoutingProfilesRequest {
+            namespace: "support".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles
+        .into_iter()
+        .find(|profile| profile.mode == "customer_hosted")
+        .expect("hosted profile listed");
+    assert_eq!(listed.runtime, "hosted.acme-llm");
+    assert_eq!(listed.model_patterns, ["hosted.acme-llm/acme-*"]);
+
+    let model = listed.model_patterns[0].replace('*', "1");
+    service.policy.set_namespace_policy(
+        "support",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec![listed.runtime.clone()],
+            allowed_models: vec![model.clone()],
+            default_runtime: listed.runtime.clone(),
+            default_model: model.clone(),
+            data_class: "unclassified".into(),
+        },
+    );
+    let plan = service
+        .plan_execution(Request::new(PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: "request:mirrored-policy".into(),
+                namespace: "support".into(),
+                spec: "Summarize the incident.".into(),
+                max_tokens: 64,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+            routing_profile_id: listed.profile_id.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(plan.resolved_runtime, listed.runtime);
+    assert_eq!(plan.resolved_model, model);
+}

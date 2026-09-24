@@ -963,7 +963,8 @@ message RoutingProfile {
   string profile_id = 1;
   // "local", "proxied", or "customer_hosted".
   string mode = 2;
-  // Provider runtime that serves the profile.
+  // Runtime that serves the profile, as namespace policy names it:
+  // `<provider>` or, for a customer-hosted profile, `hosted.<name>`.
   string runtime = 3;
   repeated string model_patterns = 4;
   string lifecycle = 5;
