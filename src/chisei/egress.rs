@@ -16,7 +16,7 @@ pub struct ContextEgressRecord {
 pub fn is_external_provider(provider: &str) -> bool {
     matches!(
         provider,
-        "openai" | "anthropic" | "xai" | "meta" | "native" | "typesafe"
+        "openai" | "anthropic" | "xai" | "meta" | "native" | "typesafe" | "hosted"
     )
 }
 
@@ -135,6 +135,8 @@ mod tests {
         assert!(is_external_provider("anthropic"));
         assert!(is_external_provider("native"));
         assert!(is_external_provider("typesafe"));
+        // A customer-hosted endpoint is external however it was registered.
+        assert!(is_external_provider("hosted"));
         assert!(!is_external_provider("ollama"));
     }
 

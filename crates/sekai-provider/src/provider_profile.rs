@@ -1215,6 +1215,57 @@ impl ProviderRegistry {
         }
     }
 
+    /// This registry plus one OpenAI-compatible profile per hosted endpoint.
+    /// The extension is request-scoped: it is never persisted, so a hosted
+    /// provider resolves only where the caller built it in.
+    pub fn with_hosted_endpoints(&self, endpoints: &[HostedEndpoint]) -> Self {
+        let mut registry = self.clone();
+        for endpoint in endpoints {
+            if !valid_hosted_name(&endpoint.name) {
+                continue;
+            }
+            let provider = format!("{HOSTED_PROVIDER_PREFIX}{}", endpoint.name);
+            registry
+                .profiles
+                .retain(|profile| profile.provider != provider);
+            let mut hosted = profile(
+                &provider,
+                "openai-compatible",
+                None,
+                ("", None, None),
+                &["chat_completions"],
+                &[],
+                ProviderCapabilities {
+                    responses: false,
+                    streaming: true,
+                    tools: false,
+                    parallel_tools: false,
+                    structured_output: false,
+                    reasoning_controls: false,
+                    modalities: vec!["text".into()],
+                    provider_continuation: false,
+                    reports_usage: true,
+                    partial_usage: false,
+                    // Conservative defaults; the endpoint enforces its own
+                    // limits beyond these.
+                    context_tokens: HOSTED_CONTEXT_TOKENS,
+                    output_tokens: Some(HOSTED_OUTPUT_TOKENS),
+                    built_in_tools: vec![],
+                },
+            );
+            hosted.profile_version = format!("{provider}.hosted/v1");
+            hosted.model_namespace = Some(format!("{provider}/"));
+            hosted.accepted_model_patterns = endpoint
+                .model_patterns
+                .iter()
+                .map(|pattern| format!("{provider}/{pattern}"))
+                .collect();
+            hosted.endpoint.default_base_url = Some(endpoint.origin.clone());
+            registry.profiles.push(hosted);
+        }
+        registry
+    }
+
     pub fn ensure_provider_available(&self, provider: &str) -> Result<(), String> {
         let profile = self
             .effective_profile(provider)
@@ -1353,12 +1404,48 @@ fn canonical_model_target(model: &str) -> Result<String, String> {
     Ok(format!("{provider}/{upstream_model}"))
 }
 
-pub fn resolve_provider_id(model: &str) -> Result<&'static str, String> {
+pub fn resolve_provider_id(model: &str) -> Result<&str, String> {
     validate_model_identifier(model)?;
     resolve_provider_model(model).map(|(provider, _)| provider)
 }
 
-fn resolve_provider_model(model: &str) -> Result<(&'static str, &str), String> {
+/// Provider-id prefix of a namespace-registered, customer-hosted endpoint.
+/// Such providers exist only in a request-scoped registry extension
+/// ([`ProviderRegistry::with_hosted_endpoints`]); elsewhere they resolve to
+/// an unregistered profile.
+pub const HOSTED_PROVIDER_PREFIX: &str = "hosted.";
+
+/// Capability ceilings planning assumes for a hosted endpoint.
+pub const HOSTED_CONTEXT_TOKENS: u64 = 128_000;
+pub const HOSTED_OUTPUT_TOKENS: u64 = 32_000;
+
+/// Whether `provider` names a customer-hosted endpoint.
+pub fn is_hosted_provider(provider: &str) -> bool {
+    provider
+        .strip_prefix(HOSTED_PROVIDER_PREFIX)
+        .is_some_and(valid_hosted_name)
+}
+
+fn valid_hosted_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+/// One customer-hosted OpenAI-compatible endpoint admitted for a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedEndpoint {
+    /// Profile name; the provider id is `hosted.<name>`.
+    pub name: String,
+    /// Canonical origin; the OpenAI-compatible API is served under `/v1`.
+    pub origin: String,
+    /// Upstream model patterns (`*` suffix for a prefix match).
+    pub model_patterns: Vec<String>,
+}
+
+fn resolve_provider_model(model: &str) -> Result<(&str, &str), String> {
     let identifier = model
         .split_once('/')
         .map(|(_, identifier)| identifier)
@@ -1369,6 +1456,9 @@ fn resolve_provider_model(model: &str) -> Result<(&'static str, &str), String> {
     if let Some((namespace, upstream_model)) = model.split_once('/') {
         if upstream_model.is_empty() {
             return Err("model namespace must include a model identifier".into());
+        }
+        if is_hosted_provider(namespace) {
+            return Ok((namespace, upstream_model));
         }
         return match namespace {
             "openai" => Ok(("openai", upstream_model)),
@@ -2315,6 +2405,51 @@ fn tool_choice_disables_tools(value: &serde_json::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hosted(name: &str) -> HostedEndpoint {
+        HostedEndpoint {
+            name: name.into(),
+            origin: "https://models.example.com".into(),
+            model_patterns: vec!["acme-*".into()],
+        }
+    }
+
+    #[test]
+    fn hosted_endpoints_resolve_only_inside_their_extension() {
+        let built_in = ProviderRegistry::built_in();
+        assert!(built_in.resolve_model("hosted.acme/acme-1").is_err());
+        let extended = built_in.with_hosted_endpoints(&[hosted("acme"), hosted("Bad Name")]);
+        let resolved = extended.resolve_model("hosted.acme/acme-1").unwrap();
+        assert_eq!(resolved.provider, "hosted.acme");
+        assert_eq!(resolved.upstream_model, "acme-1");
+        assert_eq!(resolved.canonical_model, "hosted.acme/acme-1");
+        assert_eq!(
+            extended
+                .effective_profile("hosted.acme")
+                .and_then(|profile| profile.endpoint.default_base_url),
+            Some("https://models.example.com".into())
+        );
+        assert!(extended.resolve_model("hosted.acme/other-1").is_err());
+        assert!(extended.resolve_model("hosted.other/acme-1").is_err());
+        assert!(!is_hosted_provider("hosted.Bad Name"));
+        assert!(!is_hosted_provider("hosted."));
+        assert!(
+            !extended
+                .profiles
+                .iter()
+                .any(|profile| profile.provider.contains("Bad"))
+        );
+        // Re-extending replaces rather than duplicates.
+        let twice = extended.with_hosted_endpoints(&[hosted("acme")]);
+        assert_eq!(
+            twice
+                .profiles
+                .iter()
+                .filter(|profile| profile.provider == "hosted.acme")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn derives_required_capabilities_from_responses_requests() {

@@ -215,9 +215,59 @@ pub struct RoutingProfileEntry {
     pub lifecycle: String,
 }
 
-/// The stable profile id for a provider runtime.
+/// The stable profile id for a provider runtime. A hosted runtime
+/// `hosted.<name>` is the profile `hosted:<name>`.
 pub fn profile_id_for_runtime(runtime: &str) -> String {
-    format!("provider:{runtime}")
+    match runtime.strip_prefix(crate::provider_profile::HOSTED_PROVIDER_PREFIX) {
+        Some(name) if crate::provider_profile::is_hosted_provider(runtime) => {
+            format!("{HOSTED_PROFILE_PREFIX}{name}")
+        }
+        _ => format!("provider:{runtime}"),
+    }
+}
+
+/// The exact runtime serving `model`: the provider name, or the full
+/// `hosted.<name>` id for a customer-hosted model.
+pub fn runtime_for_model(model: &str) -> String {
+    match crate::llm::provider_name(model) {
+        "hosted" => crate::provider_resolution::resolve_model(model)
+            .map(|resolved| resolved.provider)
+            .unwrap_or_else(|_| "unknown".into()),
+        provider => provider.into(),
+    }
+}
+
+/// The environment variable a community credential reference names.
+pub fn credential_env_name(credential_ref: &str) -> String {
+    format!("{CREDENTIAL_ENV_PREFIX}{credential_ref}")
+}
+
+/// The provider runtime a hosted profile serves, `hosted.<name>`.
+pub fn hosted_runtime(profile: &HostedRoutingProfile) -> String {
+    let name = profile
+        .profile_id
+        .strip_prefix(HOSTED_PROFILE_PREFIX)
+        .unwrap_or(&profile.profile_id);
+    format!("{}{name}", crate::provider_profile::HOSTED_PROVIDER_PREFIX)
+}
+
+/// Registry extension entries for a namespace's admissible hosted profiles.
+pub fn hosted_endpoints(
+    profiles: &[HostedRoutingProfile],
+) -> Vec<crate::provider_profile::HostedEndpoint> {
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            Some(crate::provider_profile::HostedEndpoint {
+                name: profile
+                    .profile_id
+                    .strip_prefix(HOSTED_PROFILE_PREFIX)?
+                    .to_string(),
+                origin: profile.endpoint_origin.clone(),
+                model_patterns: profile.model_patterns.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Profiles for every provider the registry admits right now, sorted by id.
@@ -247,6 +297,9 @@ pub fn list_routing_profiles(registry: &ProviderRegistry) -> Vec<RoutingProfileE
 /// native runtime, or an agent runtime outside the provider registry);
 /// `proxied` when the control plane forwards to a remote provider.
 pub fn mode_for_runtime(registry: &ProviderRegistry, runtime: &str) -> &'static str {
+    if crate::provider_profile::is_hosted_provider(runtime) {
+        return MODE_CUSTOMER_HOSTED;
+    }
     let Some(profile) = registry.effective_profile(runtime) else {
         return MODE_LOCAL;
     };
@@ -283,9 +336,7 @@ fn is_loopback_url(url: &str) -> bool {
 
 /// Checks a plan's pin against the live catalog: the pinned profile must be
 /// admitted (a provider route, or one of the namespace's admissible hosted
-/// profiles) and must be the one serving the planned runtime. Planning does
-/// not route to hosted profiles yet, so a hosted pin fails closed as not
-/// serving the planned route.
+/// profiles) and must be the one serving the planned runtime.
 pub fn check_pin(
     registry: &ProviderRegistry,
     hosted: &[HostedRoutingProfile],

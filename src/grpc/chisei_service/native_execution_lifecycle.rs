@@ -20,7 +20,84 @@ pub(super) enum ExecuteLookupFirst {
     ModelPath { lookup_refusal: Option<String> },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test stand-in for the operator's credential variable, so tests never
+    /// mutate the process environment.
+    pub(super) static HOSTED_CREDENTIAL_OVERRIDE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl ChiseiServiceImpl {
+    /// Re-admits the hosted route a plan resolved to, from live state: the
+    /// profile must still be registered in the namespace, its origin still
+    /// allowlisted, and its credential reference still resolvable. The
+    /// secret is read only here, for client construction (#1171).
+    pub(super) fn admit_hosted_execution(
+        &self,
+        namespace: &str,
+        model: &str,
+        enterprise: bool,
+    ) -> Result<HostedExecution, Status> {
+        use crate::chisei::routing_profiles as profiles;
+        if enterprise {
+            return Err(Status::failed_precondition(
+                "hosted routes are unavailable for enterprise credentials",
+            ));
+        }
+        let unavailable = || Status::failed_precondition("routing profile unavailable");
+        let runtime =
+            crate::provider_profile::resolve_provider_id(model).map_err(|_| unavailable())?;
+        let stored = self
+            .db
+            .runtime()
+            .list_hosted_routing_profiles(namespace)
+            .map_err(|_| Status::internal("routing profiles unavailable"))?;
+        let profile =
+            profiles::admissible_hosted_profiles(stored, &self.config.routing_endpoint_allowlist)
+                .into_iter()
+                .find(|profile| profiles::hosted_runtime(profile) == runtime)
+                .ok_or_else(unavailable)?;
+        if !self
+            .policy
+            .effective_policy(namespace)
+            .is_some_and(|policy| {
+                policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|allowed| allowed == runtime)
+            })
+        {
+            return Err(Status::failed_precondition(
+                "hosted route requires a namespace policy that allows its runtime",
+            ));
+        }
+        let credential_unavailable =
+            || Status::failed_precondition("hosted route credential unavailable");
+        if !self
+            .config
+            .routing_credential_refs
+            .contains(&profile.credential_ref)
+        {
+            return Err(credential_unavailable());
+        }
+        #[cfg(test)]
+        let overridden = HOSTED_CREDENTIAL_OVERRIDE.with(|value| value.borrow().clone());
+        #[cfg(not(test))]
+        let overridden: Option<String> = None;
+        let secret = overridden
+            .or_else(|| std::env::var(profiles::credential_env_name(&profile.credential_ref)).ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(credential_unavailable)?;
+        let endpoint = profiles::hosted_endpoints(std::slice::from_ref(&profile))
+            .pop()
+            .ok_or_else(unavailable)?;
+        Ok(HostedExecution {
+            endpoint,
+            credential: crate::enterprise::SecretValue::new(secret),
+        })
+    }
+
     pub(super) async fn execute_planned_stream(
         &self,
         actor: String,
@@ -189,6 +266,27 @@ impl ChiseiServiceImpl {
             &plan.resolved_model,
             &plan.egress_decisions,
         );
+        let hosted = if provider == "hosted" {
+            match self.admit_hosted_execution(
+                &input.namespace,
+                &plan.resolved_model,
+                context.is_some(),
+            ) {
+                Ok(hosted) => Some(hosted),
+                Err(status) => {
+                    record_failed_operation_on(
+                        self.db.runtime(),
+                        &plan,
+                        &actor,
+                        "hosted_route_unavailable",
+                    )
+                    .map_err(Status::internal)?;
+                    return Err(status);
+                }
+            }
+        } else {
+            None
+        };
         let llm_req = ProviderExecutionRequest {
             model: plan.resolved_model.clone(),
             system: plan.prepared_system.clone(),
@@ -196,6 +294,7 @@ impl ChiseiServiceImpl {
             tools: plan.tools.clone(),
             max_tokens: plan.max_tokens,
             user_id: Some(normalized_user_id),
+            hosted,
         };
         self.invalidate_ineligible_execution_memory_holdouts(
             &plan.plan_id,

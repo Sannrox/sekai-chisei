@@ -974,7 +974,9 @@ message ListRoutingProfilesRequest { string namespace = 1; }
 // Registers or replaces a customer-hosted profile `hosted:<name>` in one
 // namespace. Requires namespace administration. The endpoint origin must be
 // in the operator's SEKAI_ROUTING_ENDPOINT_ALLOWLIST, and credential_ref must
-// resolve; the secret itself is never sent or stored.
+// resolve; the secret itself is never sent or stored. Only the origin is kept;
+// it must serve the OpenAI-compatible API under /v1. The namespace routes to
+// it as runtime `hosted.<name>` once its policy allows that runtime.
 message PutRoutingProfileRequest {
   string namespace = 1;
   string name = 2;

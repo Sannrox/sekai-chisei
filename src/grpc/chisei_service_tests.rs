@@ -10273,3 +10273,231 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
             .all(|profile| profile.mode != "customer_hosted")
     );
 }
+
+#[derive(Clone, Default)]
+struct HostedEndpointObservations {
+    authorizations: Arc<Mutex<Vec<String>>>,
+    models: Arc<Mutex<Vec<String>>>,
+}
+
+async fn hosted_endpoint_chat(
+    State(observed): State<HostedEndpointObservations>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> AxumResponse {
+    observed.authorizations.lock().unwrap().push(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
+    );
+    observed
+        .models
+        .lock()
+        .unwrap()
+        .push(request["model"].as_str().unwrap_or_default().to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hosted answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n"
+    );
+    AxumResponse::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
+    // #1171 slice 2: a namespace whose policy names the hosted runtime plans
+    // and executes on its registered endpoint with the referenced credential;
+    // other namespaces cannot resolve it, and revoking it fails execution.
+    let observed = HostedEndpointObservations::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hosted_endpoint_chat))
+        .with_state(observed.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::native_execution_lifecycle::HOSTED_CREDENTIAL_OVERRIDE
+        .with(|value| *value.borrow_mut() = Some("hosted-secret".into()));
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
+    config.routing_credential_refs = vec!["ACME".into()];
+    let service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(db),
+        config,
+    );
+    let hosted_policy = |data_class: &str| crate::chisei::policy::Policy {
+        allowed_runtimes: vec!["hosted.acme-llm".into()],
+        allowed_models: vec!["hosted.acme-llm/acme-1".into()],
+        default_runtime: "hosted.acme-llm".into(),
+        default_model: "hosted.acme-llm/acme-1".into(),
+        data_class: data_class.into(),
+    };
+    for namespace in ["support", "open"] {
+        service
+            .put_routing_profile(Request::new(PutRoutingProfileRequest {
+                namespace: namespace.into(),
+                name: "acme-llm".into(),
+                endpoint_url: format!("{origin}/v1"),
+                model_patterns: vec!["acme-*".into()],
+                credential_ref: "ACME".into(),
+            }))
+            .await
+            .unwrap();
+    }
+    service
+        .policy
+        .set_namespace_policy("support", hosted_policy("unclassified"));
+    service
+        .policy
+        .set_namespace_policy("ops", hosted_policy("unclassified"));
+    let plan_request = |request_id: &str, namespace: &str, pin: &str| PlanExecutionRequest {
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            spec: "Summarize the incident.".into(),
+            preferred_model: "hosted.acme-llm/acme-1".into(),
+            max_tokens: 64,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+        routing_profile_id: pin.into(),
+    };
+
+    let plan = service
+        .plan_execution(Request::new(plan_request(
+            "request:hosted-plan",
+            "support",
+            "hosted:acme-llm",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(plan.resolved_runtime, "hosted.acme-llm");
+    assert_eq!(plan.resolved_model, "hosted.acme-llm/acme-1");
+    let receipt = service
+        .db
+        .runtime()
+        .get_operation_receipt(&plan.plan_id)
+        .unwrap()
+        .unwrap();
+    let route = receipt
+        .events
+        .iter()
+        .find(|event| event.kind == ReceiptEventKind::RouteSelected)
+        .unwrap();
+    assert_eq!(
+        route.attributes.get("routing_mode").map(String::as_str),
+        Some("customer_hosted")
+    );
+    assert_eq!(
+        route
+            .attributes
+            .get("routing_profile_id")
+            .map(String::as_str),
+        Some("hosted:acme-llm")
+    );
+
+    let mut stream = service
+        .execute_plan_stream(Request::new(ExecutePlanRequest {
+            plan: Some(plan.clone()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut terminal = None;
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        if event.done {
+            terminal = event.response;
+        }
+    }
+    assert_eq!(
+        terminal.expect("terminal response").content,
+        "hosted answer"
+    );
+    assert_eq!(
+        *observed.authorizations.lock().unwrap(),
+        ["Bearer hosted-secret"]
+    );
+    assert_eq!(*observed.models.lock().unwrap(), ["acme-1"]);
+
+    // Another namespace cannot resolve the profile even when its own policy
+    // names the runtime.
+    let foreign = service
+        .plan_execution(Request::new(plan_request(
+            "request:hosted-foreign",
+            "ops",
+            "",
+        )))
+        .await
+        .unwrap_err();
+    assert_ne!(foreign.code(), tonic::Code::Ok);
+    // Registration alone grants nothing without a policy naming the runtime.
+    let unpoliced = service
+        .plan_execution(Request::new(plan_request(
+            "request:hosted-open",
+            "open",
+            "",
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(unpoliced.code(), tonic::Code::FailedPrecondition);
+    // Sensitive private work never leaves for an external hosted endpoint.
+    service
+        .policy
+        .set_namespace_policy("support", hosted_policy("sensitive"));
+    let mut sensitive = plan_request("request:hosted-sensitive", "support", "");
+    sensitive.input.as_mut().unwrap().task_class = "private".into();
+    assert!(
+        service
+            .plan_execution(Request::new(sensitive))
+            .await
+            .is_err()
+    );
+    service
+        .policy
+        .set_namespace_policy("support", hosted_policy("unclassified"));
+
+    // Revoking after planning fails the execution closed before contact.
+    let planned_before_revocation = service
+        .plan_execution(Request::new(plan_request(
+            "request:hosted-before-revoke",
+            "support",
+            "hosted:acme-llm",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    service
+        .revoke_routing_profile(Request::new(RevokeRoutingProfileRequest {
+            namespace: "support".into(),
+            profile_id: "hosted:acme-llm".into(),
+        }))
+        .await
+        .unwrap();
+    let revoked = match service
+        .execute_plan_stream(Request::new(ExecutePlanRequest {
+            plan: Some(planned_before_revocation),
+        }))
+        .await
+    {
+        Ok(_) => panic!("revoked hosted route unexpectedly executed"),
+        Err(error) => error,
+    };
+    assert_eq!(revoked.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
+}

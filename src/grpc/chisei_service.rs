@@ -14,7 +14,8 @@ use tonic::{Request, Response, Status};
 use super::pb::chisei::chisei_service_server::ChiseiService;
 use super::pb::chisei::*;
 use super::provider_execution::{
-    ProviderExecutionRequest, estimate_chat_request, execute_native_chat_request_stream,
+    HostedExecution, ProviderExecutionRequest, estimate_chat_request,
+    execute_native_chat_request_stream,
 };
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::controller::ActivePromotions;

@@ -26,6 +26,17 @@ pub(super) struct ProviderExecutionRequest {
     pub(super) tools: Vec<ToolDef>,
     pub(super) max_tokens: i32,
     pub(super) user_id: Option<String>,
+    /// The customer-hosted route this request executes on, re-admitted from
+    /// live state by the caller (#1171).
+    pub(super) hosted: Option<HostedExecution>,
+}
+
+/// A hosted endpoint and the secret its profile's credential reference
+/// resolved to. The secret is redacted from `Debug`.
+#[derive(Clone, Debug)]
+pub(super) struct HostedExecution {
+    pub(super) endpoint: crate::provider_profile::HostedEndpoint,
+    pub(super) credential: crate::enterprise::SecretValue,
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +236,10 @@ async fn execute_chat_request_stream_with_cache(
     prompt_cache: llm::PromptCacheIntent,
     execution_authentication: Option<ExecutionAuthentication<'_>>,
 ) -> Result<ProviderExecutionStream, Status> {
-    let registry = refresh_provider_registry(config).await?;
+    let mut registry = refresh_provider_registry(config).await?;
+    if let Some(hosted) = &r.hosted {
+        registry = registry.with_hosted_endpoints(std::slice::from_ref(&hosted.endpoint));
+    }
     let prompt_cache = eligible_prompt_cache_intent(&registry, &r, prompt_cache)?;
     let provider_name = registry
         .resolve_model(&r.model)
@@ -248,9 +262,12 @@ async fn execute_chat_request_stream_with_cache(
         config.openai_api_key.as_deref(),
         &config.ollama_url,
         config.native_llm_url.as_deref(),
-        provider_credential
+        r.hosted
             .as_ref()
-            .map(|credential| credential.secret.expose()),
+            .map(|hosted| hosted.credential.expose())
+            .or(provider_credential
+                .as_ref()
+                .map(|credential| credential.secret.expose())),
     ) {
         Ok(p) => p,
         Err(e) => {
