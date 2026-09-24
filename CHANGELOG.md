@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `PlanContentExecution` and `ExecuteContentPlanStream` now route to
+  customer-hosted profiles under the same rules as native execution. Only the
+  namespace's profiles are added, the policy must name the runtime, the route
+  is re-admitted from live state before contact, and only the referenced
+  credential is used (#1183).
 - Customer-hosted routing profiles now execute through `PlanExecution` and
   `ExecutePlanStream` (the content-execution RPCs do not route to them yet
   and fail closed). Planning adds only the

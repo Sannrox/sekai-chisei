@@ -250,9 +250,9 @@ wired for hosted routes.
 - Only the endpoint's origin is kept. It must serve the OpenAI-compatible
   chat completions API under `/v1`.
 
-Execution (slice 2) covers `PlanExecution` and `ExecutePlanStream`. The
-content-execution RPCs do not route to hosted profiles yet; a hosted model
-there fails to resolve.
+Execution covers `PlanExecution`/`ExecutePlanStream` and
+`PlanContentExecution`/`ExecuteContentPlanStream` under the same rules
+(#1183).
 
 - Planning extends the provider registry with the calling namespace's
   admissible hosted profiles, and no other namespace's. Each profile becomes

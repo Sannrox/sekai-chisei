@@ -348,6 +348,27 @@ impl ChiseiServiceImpl {
             &execution.egress_decisions,
         );
 
+        let hosted = if provider == "hosted" {
+            match self.admit_hosted_execution(
+                &input.namespace,
+                &execution.resolved_model,
+                context.is_some(),
+            ) {
+                Ok(hosted) => Some(hosted),
+                Err(status) => {
+                    record_failed_operation_on(
+                        self.db.runtime(),
+                        &execution,
+                        &actor,
+                        "hosted_route_unavailable",
+                    )
+                    .map_err(Status::internal)?;
+                    return Err(status);
+                }
+            }
+        } else {
+            None
+        };
         {
             let mut plans = self
                 .planned_content_executions
@@ -388,6 +409,7 @@ impl ChiseiServiceImpl {
             tools: execution.tools.clone(),
             max_tokens: execution.max_tokens,
             user_id: Some(normalized_user_id),
+            hosted,
         };
         let provider_stream = match execute_native_content_request_stream(
             &self.config,

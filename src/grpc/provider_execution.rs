@@ -47,6 +47,8 @@ pub(super) struct ProviderContentExecutionRequest {
     pub(super) tools: Vec<ToolDef>,
     pub(super) max_tokens: i32,
     pub(super) user_id: Option<String>,
+    /// See [`ProviderExecutionRequest::hosted`] (#1183).
+    pub(super) hosted: Option<HostedExecution>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -103,7 +105,10 @@ pub async fn execute_native_content_request_stream(
     authenticated_context: Option<&crate::enterprise::AuthenticatedContext>,
     request: ProviderContentExecutionRequest,
 ) -> Result<ProviderExecutionStream, Status> {
-    let registry = refresh_provider_registry(config).await?;
+    let mut registry = refresh_provider_registry(config).await?;
+    if let Some(hosted) = &request.hosted {
+        registry = registry.with_hosted_endpoints(std::slice::from_ref(&hosted.endpoint));
+    }
     let provider_name = registry
         .resolve_model(&request.model)
         .map(|resolved| resolved.provider)
@@ -134,9 +139,13 @@ pub async fn execute_native_content_request_stream(
         config.openai_api_key.as_deref(),
         &config.ollama_url,
         config.native_llm_url.as_deref(),
-        provider_credential
+        request
+            .hosted
             .as_ref()
-            .map(|credential| credential.secret.expose()),
+            .map(|hosted| hosted.credential.expose())
+            .or(provider_credential
+                .as_ref()
+                .map(|credential| credential.secret.expose())),
     ) {
         Ok(provider) => provider,
         Err(error) => {
