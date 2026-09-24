@@ -357,6 +357,9 @@ struct ResolvedModelProvider {
     upstream_model: String,
     canonical_model: String,
     registry_state_path: Option<std::path::PathBuf>,
+    /// The request-scoped hosted profile this provider was built from. The
+    /// persisted registry never holds it, so capability re-checks add it back.
+    hosted_profile: Option<crate::provider_profile::ProviderProfile>,
 }
 
 #[async_trait::async_trait]
@@ -413,10 +416,16 @@ impl ResolvedModelProvider {
         request: &ChatRequest,
         streaming: bool,
     ) -> Result<(), ProviderError> {
-        let registry =
+        let mut registry =
             crate::provider_resolution::snapshot_for_execution(self.registry_state_path.as_deref())
                 .await
                 .map_err(ProviderError::Unavailable)?;
+        if let Some(hosted) = &self.hosted_profile {
+            registry
+                .profiles
+                .retain(|profile| profile.provider != hosted.provider);
+            registry.profiles.push(hosted.clone());
+        }
         let resolved = registry
             .resolve_model(&self.canonical_model)
             .map_err(ProviderError::Precondition)?;
@@ -438,10 +447,16 @@ impl ResolvedModelProvider {
         request: &ContentChatRequest,
         streaming: bool,
     ) -> Result<(), ProviderError> {
-        let registry =
+        let mut registry =
             crate::provider_resolution::snapshot_for_execution(self.registry_state_path.as_deref())
                 .await
                 .map_err(ProviderError::Unavailable)?;
+        if let Some(hosted) = &self.hosted_profile {
+            registry
+                .profiles
+                .retain(|profile| profile.provider != hosted.provider);
+            registry.profiles.push(hosted.clone());
+        }
         let resolved = registry
             .resolve_model(&self.canonical_model)
             .map_err(ProviderError::Precondition)?;
@@ -645,13 +660,28 @@ pub fn resolve_with_registry_and_provider_credential(
             let api_root = openai_compatible_api_root(&base_url);
             Box::new(openai::OpenAI::new(key, Some(api_root)))
         }
+        provider if crate::provider_profile::is_hosted_provider(provider) => {
+            let base_url = registry
+                .effective_profile(provider)
+                .and_then(|profile| profile.endpoint.default_base_url)
+                .ok_or_else(|| format!("hosted route {provider:?} is unavailable"))?;
+            // A hosted route authenticates only with the credential its
+            // profile references; process-wide provider keys never apply.
+            let key = provider_credential
+                .ok_or_else(|| format!("hosted route {provider:?} credential unavailable"))?;
+            Box::new(openai::OpenAI::new(key, Some(&base_url)))
+        }
         provider => return Err(format!("unsupported provider {provider:?}")),
     };
+    let hosted_profile = crate::provider_profile::is_hosted_provider(&resolved.provider)
+        .then(|| registry.effective_profile(&resolved.provider))
+        .flatten();
     Ok(Box::new(ResolvedModelProvider {
         inner,
         upstream_model: resolved.upstream_model,
         canonical_model: resolved.canonical_model,
         registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
+        hosted_profile,
     }))
 }
 
@@ -668,6 +698,7 @@ pub fn provider_name(model: &str) -> &'static str {
         Ok("native") => "native",
         Ok("xai") => "xai",
         Ok("meta") => "meta",
+        Ok(provider) if crate::provider_profile::is_hosted_provider(provider) => "hosted",
         _ => "unknown",
     }
 }
@@ -677,6 +708,36 @@ mod tests {
     use super::*;
     use sha2::Digest as _;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn hosted_routes_use_only_their_referenced_credential() {
+        let registry =
+            crate::provider_profile::ProviderRegistry::built_in().with_hosted_endpoints(&[
+                crate::provider_profile::HostedEndpoint {
+                    name: "acme".into(),
+                    origin: "https://models.example.com".into(),
+                    model_patterns: vec!["acme-*".into()],
+                },
+            ]);
+        let resolve = |credential| {
+            resolve_with_registry_and_provider_credential(
+                "hosted.acme/acme-1",
+                &registry,
+                None,
+                Some("process-anthropic-key"),
+                Some("process-openai-key"),
+                "http://127.0.0.1:11434",
+                None,
+                credential,
+            )
+        };
+        let Err(error) = resolve(None) else {
+            panic!("a hosted route must not fall back to process provider keys");
+        };
+        assert!(error.contains("credential unavailable"), "{error}");
+        assert!(resolve(Some("hosted-secret")).is_ok());
+        assert_eq!(provider_name("hosted.acme/acme-1"), "unknown");
+    }
 
     #[test]
     fn hosted_openai_compatible_urls_use_an_api_root() {
@@ -752,6 +813,7 @@ mod tests {
             upstream_model: "claude-sonnet-4-5".into(),
             canonical_model: "anthropic/claude-sonnet-4-5".into(),
             registry_state_path: None,
+            hosted_profile: None,
         };
         provider
             .chat(&ChatRequest {
@@ -775,6 +837,7 @@ mod tests {
             upstream_model: "mistral".into(),
             canonical_model: "native/mistral".into(),
             registry_state_path: None,
+            hosted_profile: None,
         };
         let error = provider
             .chat(&ChatRequest {
@@ -804,6 +867,7 @@ mod tests {
             upstream_model: "mistral".into(),
             canonical_model: "native/mistral".into(),
             registry_state_path: None,
+            hosted_profile: None,
         };
         let payload = b"png";
         let error = provider
@@ -852,6 +916,7 @@ mod tests {
             upstream_model: "gpt-5.5".into(),
             canonical_model: "openai/gpt-5.5".into(),
             registry_state_path: None,
+            hosted_profile: None,
         };
         let mut stream = provider
             .chat_stream(&ChatRequest {
@@ -917,6 +982,7 @@ mod tests {
             upstream_model: "gpt-5.5".into(),
             canonical_model: "openai/gpt-5.5".into(),
             registry_state_path: Some(registry_path),
+            hosted_profile: None,
         };
 
         let error = provider

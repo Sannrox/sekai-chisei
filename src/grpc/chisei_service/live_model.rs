@@ -108,6 +108,7 @@ impl ChiseiServiceImpl {
 
 fn is_registry_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic" | "ollama" | "native")
+        || crate::provider_profile::is_hosted_provider(runtime.trim())
 }
 
 pub(super) fn route_override_allowed(policy: Option<&Policy>, model: &str) -> bool {
@@ -127,7 +128,8 @@ pub(super) fn final_runtime_for_model(
 ) -> Result<String, String> {
     let explicitly_registry_routed = ["openai/", "anthropic/", "ollama/", "native/"]
         .iter()
-        .any(|prefix| model.starts_with(prefix));
+        .any(|prefix| model.starts_with(prefix))
+        || model.starts_with(crate::provider_profile::HOSTED_PROVIDER_PREFIX);
     if !is_registry_provider_runtime(current_runtime) && !explicitly_registry_routed {
         if model.contains('/') {
             crate::chisei::policy::validate_resolved_route(current_runtime, model)?;
@@ -139,7 +141,8 @@ pub(super) fn final_runtime_for_model(
             return Ok("native".to_string());
         }
     }
-    let runtime = crate::llm::provider_name(model);
+    let runtime = crate::chisei::routing_profiles::runtime_for_model(model);
+    let runtime = runtime.as_str();
     if runtime == "unknown" {
         return Err(format!(
             "model {model:?} has no registered provider runtime"

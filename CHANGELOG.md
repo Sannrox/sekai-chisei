@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Customer-hosted routing profiles now execute through `PlanExecution` and
+  `ExecutePlanStream` (the content-execution RPCs do not route to them yet
+  and fail closed). Planning adds only the
+  calling namespace's admissible hosted profiles to the provider registry, as
+  runtime `hosted.<name>` with models `hosted.<name>/<model>`. A namespace
+  routes to one only when its policy names that runtime. Hosted endpoints are
+  always external and never fall back to another provider. `ExecutePlanStream`
+  re-admits the profile from live state and authenticates only with the
+  referenced credential. Receipts record `routing_mode=customer_hosted`
+  (#1171).
 - Concurrent definition genesis seeds on community PostgreSQL no longer race
   the published-head insert. They serialize on the namespace's head lock:
   seeds of the same genesis all succeed, and a different concurrent seed

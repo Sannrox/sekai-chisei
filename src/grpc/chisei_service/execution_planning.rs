@@ -224,6 +224,7 @@ impl ChiseiServiceImpl {
             tools: input.tools.clone(),
             max_tokens: input.max_tokens,
             user_id: Some(normalized_user_id.clone()),
+            hosted: None,
         };
         let estimated_tokens = estimate_chat_request(&estimate_req);
         let allowed = self

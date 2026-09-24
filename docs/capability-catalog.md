@@ -247,8 +247,32 @@ wired for hosted routes.
   `routing profile unavailable`, the same as for an unknown id. A revoked
   profile, or one whose origin leaves the allowlist, disappears from the list
   and fails later pins closed.
-- Hosted execution is not wired yet. A plan that pins a hosted profile fails
-  `FAILED_PRECONDITION` as not serving the planned route.
+- Only the endpoint's origin is kept. It must serve the OpenAI-compatible
+  chat completions API under `/v1`.
+
+Execution (slice 2) covers `PlanExecution` and `ExecutePlanStream`. The
+content-execution RPCs do not route to hosted profiles yet; a hosted model
+there fails to resolve.
+
+- Planning extends the provider registry with the calling namespace's
+  admissible hosted profiles, and no other namespace's. Each profile becomes
+  runtime `hosted.<name>`, with models addressed as
+  `hosted.<name>/<upstream-model>` inside its model patterns. Enterprise
+  credentials get no extension.
+- Registering an endpoint grants nothing. A hosted route plans only when the
+  namespace policy lists `hosted.<name>` in `allowed_runtimes`; there is no
+  implicit allow without a policy. A pin on `hosted:<name>` then matches it.
+- A hosted endpoint is always external. Sensitive private work never reaches
+  it, and it never falls back to another provider.
+- `ExecutePlanStream` rebuilds the extension from live state and re-admits the
+  profile: still registered, origin still allowlisted, policy still naming
+  the runtime, credential still resolvable. Otherwise it fails
+  `FAILED_PRECONDITION` before any provider contact. The client authenticates
+  only with the referenced credential, never with process-wide provider keys.
+- Planning assumes 128k context and 32k output tokens for a hosted endpoint.
+  Hosted routes are unpriced unless operator pricing names them.
+- Receipts record `routing_mode=customer_hosted` and
+  `routing_profile_id=hosted:<name>`.
 
 ## Related capability surfaces
 

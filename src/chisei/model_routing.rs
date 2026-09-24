@@ -127,6 +127,14 @@ fn validate_or_fallback_provider_model(ctx: RoutingContext<'_>) -> Result<String
             "provider {provider:?} is not safe for sensitive data"
         ));
     }
+    if provider == "hosted" {
+        // A customer-hosted route resolves only through the request's
+        // namespace extension and never falls back to another provider.
+        crate::provider_resolution::resolve_model(ctx.requested)
+            .map_err(|_| format!("model_unavailable: {:?}", ctx.requested))?;
+        ensure_model_capabilities(ctx.requested, &ctx)?;
+        return Ok(ctx.requested.to_string());
+    }
     let provider_has_live_catalog = ctx
         .authoritative_providers
         .iter()
@@ -412,9 +420,9 @@ fn ensure_model_capabilities(model: &str, ctx: &RoutingContext<'_>) -> Result<()
     }) {
         return ensure_available_capabilities(available, ctx);
     }
-    let provider = llm::provider_name(model);
+    let provider = crate::chisei::routing_profiles::runtime_for_model(model);
     let profile = provider_registry_snapshot()
-        .effective_profile(provider)
+        .effective_profile(&provider)
         .ok_or_else(|| {
             format!("capability_unsupported: provider {provider:?} has no capability profile")
         })?;

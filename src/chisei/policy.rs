@@ -710,7 +710,7 @@ fn is_registry_runtime(runtime: &str) -> bool {
     matches!(
         runtime,
         "openai" | "anthropic" | "ollama" | "native" | "xai" | "meta"
-    )
+    ) || crate::provider_profile::is_hosted_provider(runtime)
 }
 
 pub(crate) fn validate_resolved_route(runtime: &str, model: &str) -> Result<(), String> {
