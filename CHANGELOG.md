@@ -10,6 +10,10 @@
   still skips when the evaluate reads an ungranted property or a narrowed kind
   has no schema, rather than comparing against a view wider than the grants
   (#1112).
+- Object-log ingest now group-commits concurrent admits: records queued while
+  another admit holds the log commit together as one mikura batch with one
+  fsync. Each admit still returns only after the commit that covers its
+  record, and a failed combined batch retries each record alone (#1127).
 - Combined now pins mikura `v0.2.0` (and its `mikura-ingest` crate) instead of
   `v0.1.0`. Object-log ingest, evaluate, and dual-read keep their `v0.1.0`
   semantics through an adapter. Identity lookups use a direct `Store::load`
