@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The object-log dual-read canary projects clerk property grants into mikura
+  `v0.2.0`'s multi-deny ACL instead of skipping every grant-narrowed kind. It
+  still skips when the evaluate reads an ungranted property or a narrowed kind
+  has no schema, rather than comparing against a view wider than the grants
+  (#1112).
 - Combined now pins mikura `v0.2.0` (and its `mikura-ingest` crate) instead of
   `v0.1.0`. Object-log ingest, evaluate, and dual-read keep their `v0.1.0`
   semantics through an adapter. Identity lookups use a direct `Store::load`
