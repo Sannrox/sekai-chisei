@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Updated `rustls` to 0.23.45 (with `aws-lc-rs` 1.18.1 and `rustls-webpki`
+  0.103.15) for RUSTSEC-2026-0285, a TLS 1.3 handshake-boundary flaw. `cargo
+  audit` passes again (#1177).
 - Combined now pins mikura `v0.2.0` (and its `mikura-ingest` crate) instead of
   `v0.1.0`. Object-log ingest, evaluate, and dual-read keep their `v0.1.0`
   semantics through an adapter. Identity lookups use a direct `Store::load`
