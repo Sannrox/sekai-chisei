@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reusable source writeback adapter (`adapters/source_writeback.rs`) that writes a change back to a source system of record through the governed Action path: permit, `SubmitActionInstance`, `external_mutate` effect, conditional source write, execution evidence, and receipt. The warehouse table implementation completes the source → object → Action → source loop; the next ingested snapshot shows the change (#1085).
 - New warehouse table ingest profile (`adapters/warehouse_table_ingest.rs`) that hydrates typed objects from a committed table snapshot through a connector outside the plane. It uses registered-source `ApplySourceBatch` batches with the snapshot id as the checkpoint. Restricted columns never leave the connector. Declared schema drift is refused until the new revision is registered, and undeclared drift is quarantined without clobbering the last consistent objects. SQLite-only, like source-type descriptors (#1085).
 - Hardened customer-hosted routing:
   - A hosted-shaped model id (`hosted.<name>/…`) is classified as hosted without consulting any registry. When it doesn't resolve, it fails closed instead of reading as an unknown provider that generic routing could replace (#1184).
