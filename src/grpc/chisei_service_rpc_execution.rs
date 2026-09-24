@@ -5,18 +5,17 @@ pub(super) async fn plan_execution(
     req: Request<PlanExecutionRequest>,
 ) -> Result<Response<PlanExecutionResponse>, Status> {
     let registry = service.refresh_provider_registry_for_resolution().await?;
-    let hosted_namespace = req
-        .get_ref()
-        .input
-        .as_ref()
-        .map(|input| input.namespace.clone())
-        .unwrap_or_default();
-    let registry = with_namespace_hosted_routes(
-        service,
-        registry,
-        &hosted_namespace,
-        enterprise_authenticated_context(&req)?.is_some(),
-    )?;
+    let registry = match req.get_ref().input.as_ref() {
+        Some(input) => planning_registry(
+            service,
+            registry,
+            authenticated_actor(&req).as_str(),
+            enterprise_authenticated_context(&req)?,
+            input,
+            &req.get_ref().routing_profile_id,
+        )?,
+        None => registry,
+    };
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let actor = authenticated_actor(&req);
         let context = enterprise_authenticated_context(&req)?.cloned();
@@ -121,31 +120,17 @@ pub(super) async fn execute_plan_stream(
         .into_inner()
         .plan
         .ok_or(Status::invalid_argument("plan required"))?;
-    // Execution resolves against live state: the namespace's hosted routes
-    // are rebuilt here, never carried over from planning.
-    let namespace = requested_plan
-        .input
-        .as_ref()
-        .map(|input| input.namespace.clone())
-        .unwrap_or_default();
-    let registry = with_namespace_hosted_routes(
-        service,
-        service.refresh_provider_registry_for_resolution().await?,
-        &namespace,
-        context.is_some(),
-    )?;
-    let stream = crate::provider_profile::with_provider_registry_snapshot(
-        registry,
-        service.execute_planned_stream(actor, context, requested_plan),
-    )
-    .await?;
+    // A hosted route is re-admitted inside execution, after the cached plan
+    // is bound and namespace access is checked (#1187).
+    let stream = service
+        .execute_planned_stream(actor, context, requested_plan)
+        .await?;
     Ok(Response::new(stream))
 }
 pub(super) async fn plan_content_execution(
     service: &ChiseiServiceImpl,
     req: Request<PlanContentExecutionRequest>,
 ) -> Result<Response<PlanContentExecutionResponse>, Status> {
-    let registry = service.refresh_provider_registry_for_resolution().await?;
     let hosted_namespace = req
         .get_ref()
         .input
@@ -153,12 +138,23 @@ pub(super) async fn plan_content_execution(
         .and_then(|input| input.execution.as_ref())
         .map(|execution| execution.namespace.clone())
         .unwrap_or_default();
-    let registry = with_namespace_hosted_routes(
-        service,
-        registry,
-        &hosted_namespace,
-        enterprise_authenticated_context(&req)?.is_some(),
-    )?;
+    let registry = service.refresh_provider_registry_for_resolution().await?;
+    let registry = match req
+        .get_ref()
+        .input
+        .as_ref()
+        .and_then(|input| input.execution.as_ref())
+    {
+        Some(execution) => planning_registry(
+            service,
+            registry,
+            authenticated_actor(&req).as_str(),
+            enterprise_authenticated_context(&req)?,
+            execution,
+            "",
+        )?,
+        None => registry,
+    };
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let actor = authenticated_actor(&req);
         let context = enterprise_authenticated_context(&req)?.cloned();
@@ -266,28 +262,9 @@ pub(super) async fn execute_content_plan_stream(
     let requested_plan = request
         .plan
         .ok_or_else(|| Status::invalid_argument("content execution plan required"))?;
-    let namespace = requested_plan
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.input.as_ref())
-        .map(|input| input.namespace.clone())
-        .unwrap_or_default();
-    let registry = with_namespace_hosted_routes(
-        service,
-        service.refresh_provider_registry_for_resolution().await?,
-        &namespace,
-        context.is_some(),
-    )?;
-    let stream = crate::provider_profile::with_provider_registry_snapshot(
-        registry,
-        service.execute_content_planned_stream(
-            actor,
-            context,
-            requested_plan,
-            request.resolved_parts,
-        ),
-    )
-    .await?;
+    let stream = service
+        .execute_content_planned_stream(actor, context, requested_plan, request.resolved_parts)
+        .await?;
     Ok(Response::new(stream))
 }
 pub(super) async fn list_kioku_candidates(
@@ -1292,22 +1269,55 @@ pub(super) async fn revoke_routing_profile(
     Ok(Response::new(RevokeRoutingProfileResponse { revoked }))
 }
 
-/// `registry` plus the namespace's admissible hosted routes (#1171). Only the
-/// caller's namespace is added, and enterprise credentials get none.
-fn with_namespace_hosted_routes(
+/// The registry one planning request resolves against. The namespace's
+/// admissible hosted routes are added only when the request can route to a
+/// hosted runtime at all (#1185), and only after the caller passed the
+/// namespace access check (#1187). Enterprise credentials get none.
+fn planning_registry(
     service: &ChiseiServiceImpl,
     registry: crate::provider_profile::ProviderRegistry,
-    namespace: &str,
-    enterprise: bool,
+    actor: &str,
+    context: Option<&crate::enterprise::AuthenticatedContext>,
+    input: &ExecutionInput,
+    pin: &str,
 ) -> Result<crate::provider_profile::ProviderRegistry, Status> {
-    if enterprise || namespace.trim().is_empty() {
+    if context.is_some()
+        || input.namespace.trim().is_empty()
+        || !hosted_route_possible(service, input, pin)
+    {
         return Ok(registry);
     }
-    let hosted = hosted_profiles_for(service, namespace)?;
+    require_execution_namespace_access_with_context(
+        service.db.runtime(),
+        &service.config,
+        actor,
+        context,
+        &input.namespace,
+    )?;
+    let hosted = hosted_profiles_for(service, &input.namespace)?;
     if hosted.is_empty() {
         return Ok(registry);
     }
     Ok(registry.with_hosted_endpoints(&crate::chisei::routing_profiles::hosted_endpoints(&hosted)))
+}
+
+/// Whether a planning request can resolve to a hosted runtime: it pins or
+/// names one, or its namespace policy admits one.
+fn hosted_route_possible(service: &ChiseiServiceImpl, input: &ExecutionInput, pin: &str) -> bool {
+    use crate::provider_profile::{hosted_provider_of, is_hosted_provider};
+    pin.starts_with("hosted:")
+        || hosted_provider_of(&input.preferred_model).is_some()
+        || hosted_provider_of(&input.route_override).is_some()
+        || is_hosted_provider(&input.preferred_runtime)
+        || service
+            .policy
+            .effective_policy(&input.namespace)
+            .is_some_and(|policy| {
+                policy
+                    .allowed_runtimes
+                    .iter()
+                    .any(|runtime| is_hosted_provider(runtime))
+            })
 }
 
 /// Registering an endpoint grants nothing: a hosted route needs a namespace

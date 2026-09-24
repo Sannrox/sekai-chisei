@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Hardened customer-hosted routing:
+  - A hosted-shaped model id (`hosted.<name>/…`) is classified as hosted without consulting any registry. When it doesn't resolve, it fails closed instead of reading as an unknown provider that generic routing could replace (#1184).
+  - Planning reads a namespace's hosted catalog only after the caller passes the namespace access check (#1187), and only when the request can reach a hosted runtime: a hosted pin, model, or runtime, or a policy that allows one (#1185).
+  - Execution no longer extends the registry at the RPC boundary. The one live re-admission, which runs after the cached plan is bound and access is checked, is the only catalog read per hosted execution (#1186, #1187).
 - Provider HTTP clients no longer follow redirects. An operator-allowlisted
   customer-hosted origin (or any provider endpoint) answering with a redirect
   now fails the call instead of moving the request and its bearer credential

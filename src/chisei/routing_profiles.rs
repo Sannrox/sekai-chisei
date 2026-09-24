@@ -229,11 +229,9 @@ pub fn profile_id_for_runtime(runtime: &str) -> String {
 /// The exact runtime serving `model`: the provider name, or the full
 /// `hosted.<name>` id for a customer-hosted model.
 pub fn runtime_for_model(model: &str) -> String {
-    match crate::llm::provider_name(model) {
-        "hosted" => crate::provider_resolution::resolve_model(model)
-            .map(|resolved| resolved.provider)
-            .unwrap_or_else(|_| "unknown".into()),
-        provider => provider.into(),
+    match crate::provider_profile::hosted_provider_of(model) {
+        Some(provider) => provider.into(),
+        None => crate::llm::provider_name(model).into(),
     }
 }
 

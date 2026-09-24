@@ -1419,6 +1419,15 @@ pub const HOSTED_PROVIDER_PREFIX: &str = "hosted.";
 pub const HOSTED_CONTEXT_TOKENS: u64 = 128_000;
 pub const HOSTED_OUTPUT_TOKENS: u64 = 32_000;
 
+/// The `hosted.<name>` provider a hosted-shaped model id names, without
+/// consulting any registry.
+pub fn hosted_provider_of(model: &str) -> Option<&str> {
+    model
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .filter(|provider| is_hosted_provider(provider))
+}
+
 /// Whether `provider` names a customer-hosted endpoint.
 pub fn is_hosted_provider(provider: &str) -> bool {
     provider
