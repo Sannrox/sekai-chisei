@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Combined now pins mikura `v0.2.0` (and its `mikura-ingest` crate) instead of
+  `v0.1.0`. Object-log ingest, evaluate, and dual-read keep their `v0.1.0`
+  semantics through an adapter. Identity lookups use a direct `Store::load`
+  instead of scanning the whole kind after each append. Existing `v0.1.0`
+  object logs open unchanged (#1111).
 - Experimental `ListRoutingProfiles` lists the model routes a namespace may pin
   (`provider:<runtime>`, mode `local` or `proxied`), and
   `PlanExecutionRequest.routing_profile_id` pins one. A pin that is unknown,
