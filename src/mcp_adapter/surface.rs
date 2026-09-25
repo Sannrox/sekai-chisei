@@ -12,7 +12,10 @@ use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::client::connect_sekai_with_token;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::chisei_service_server::ChiseiService;
-use crate::grpc::pb::chisei::{GetOperationReceiptRequest, GetOperationReceiptResponse};
+use crate::grpc::pb::chisei::{
+    ExecuteEvaluationManifestRequest, GetOperationReceiptRequest, GetOperationReceiptResponse,
+    ResolveEvaluationPlanRequest,
+};
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
@@ -35,6 +38,8 @@ pub enum NativeRpc {
     GetOperationReceipt,
     GetLinks,
     CreateLink,
+    ResolveEvaluationPlan,
+    ExecuteEvaluationManifest,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +138,37 @@ pub async fn dispatch_native(
                 .link
                 .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
             Ok(json!({"link": link_json(&link)}))
+        }
+        NativeRpc::ResolveEvaluationPlan => {
+            let payload =
+                serde_json::from_value::<ResolveEvaluationPlanRequest>(invocation.input.clone())
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = chisei
+                .resolve_evaluation_plan(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
+        }
+        NativeRpc::ExecuteEvaluationManifest => {
+            let payload = serde_json::from_value::<ExecuteEvaluationManifestRequest>(
+                invocation.input.clone(),
+            )
+            .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = chisei
+                .execute_evaluation_manifest(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
         }
         NativeRpc::EvaluateObjectSet => {
             let payload =
@@ -397,6 +433,13 @@ impl NativeSurface for FixtureSurface {
                     "created": 0,
                 }
             })),
+            NativeRpc::ResolveEvaluationPlan => Ok(json!({"status": "unknown"})),
+            NativeRpc::ExecuteEvaluationManifest => Err(projected(
+                "not_found",
+                "evaluation manifest not found",
+                &invocation.capability,
+                &invocation.operation_id,
+            )),
             NativeRpc::EvaluateObjectSet => Ok(json!({
                 "members": [],
                 "total": 0,
@@ -567,6 +610,40 @@ impl NativeSurface for SdkSurface {
                     .link
                     .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
                 Ok(json!({"link": link_json(&link)}))
+            }
+            NativeRpc::ResolveEvaluationPlan => {
+                let payload = serde_json::from_value::<ResolveEvaluationPlanRequest>(
+                    invocation.input.clone(),
+                )
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = ChiseiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.resolve_evaluation_plan(request))
+                        .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ExecuteEvaluationManifest => {
+                let payload = serde_json::from_value::<ExecuteEvaluationManifestRequest>(
+                    invocation.input.clone(),
+                )
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = ChiseiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.execute_evaluation_manifest(request),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
             }
             NativeRpc::EvaluateObjectSet => {
                 let payload =

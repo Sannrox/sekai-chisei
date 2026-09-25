@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The MCP projection host also lists `chisei.evaluation.resolve` → `ResolveEvaluationPlan` and `chisei.evaluation.execute` → `ExecuteEvaluationManifest`, now that both RPCs are stable. Each binds its request namespace to the session and refuses a foreign namespace. Evaluation compare stays CLI-only because it has no wire RPC (#1093).
 - The MCP projection host (`sekai-mcp` stdio and HTTP `POST /mcp`) now lists `sekai.links.get` → `GetLinks` and `sekai.links.create` → `CreateLink`, because both RPCs are stable. Link creation passes only the endpoints and relation (the server assigns the id), and forged metadata, missing fields, or non-string values fail closed. Registry-published packages remain open in #1093 (#1093).
 - Clerk processes can share one mikura object-log host (ADR 0088). `SEKAI_OBJECT_LOG_HOST`, exclusive with a local `SEKAI_OBJECT_LOG`, routes object-log admits and generation reads through `mikura-host`'s wire contract. A non-loopback host requires `SEKAI_OBJECT_LOG_HOST_BEARER`, and host or wire failures fail the ingest closed with no local fallback (#1196).
 - Reusable source writeback adapter (`adapters/source_writeback.rs`) that writes a change back to a source system of record through the governed Action path: permit, `SubmitActionInstance`, `external_mutate` effect, conditional source write, execution evidence, and receipt. The warehouse table implementation completes the source → object → Action → source loop; the next ingested snapshot shows the change (#1085).

@@ -340,9 +340,14 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 `EvaluateObjectSet`, `sekai.actions.describe` → `DescribeObjectAction`,
 `sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
 `SubmitActionInstance`, `chisei.receipt.read` → `GetOperationReceipt`,
-`sekai.links.get` → `GetLinks`, and `sekai.links.create` → `CreateLink`.
-The link tools are listed because both RPCs are `stable` (#1093). Evaluation
-tools stay off the list while their RPCs are experimental.
+`sekai.links.get` → `GetLinks`, `sekai.links.create` → `CreateLink`,
+`chisei.evaluation.resolve` → `ResolveEvaluationPlan`, and
+`chisei.evaluation.execute` → `ExecuteEvaluationManifest`. Link and evaluation
+tools are listed because their RPCs are `stable` (#1093, #1090). Evaluation
+compare is a CLI projection over existing evidence with no wire RPC, so it has
+no tool. The evaluation tools bind `input.resolution.namespace` or
+`input.execution.namespace` to the session namespace and refuse a different
+one.
 `SubmitActionInstance` uses the caller `operation_id` as `request_id`.
 `sekai.links.get` requires `object_id` and accepts `relation` and `direction`.
 `sekai.links.create` passes only `from_id`, `to_id`, and `relation`; the server

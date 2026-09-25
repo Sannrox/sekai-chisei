@@ -306,6 +306,8 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "chisei.kioku.candidates.list" => Some("ListKiokuCandidates"),
         "sekai.links.get" => Some("GetLinks"),
         "sekai.links.create" => Some("CreateLink"),
+        "chisei.evaluation.resolve" => Some("ResolveEvaluationPlan"),
+        "chisei.evaluation.execute" => Some("ExecuteEvaluationManifest"),
         other if other.starts_with("sekai.objects.query.") => Some("ListObjects"),
         other if other.starts_with("sekai.actions.") || other.starts_with("sekai.action.") => {
             Some("SubmitActionInstance")
