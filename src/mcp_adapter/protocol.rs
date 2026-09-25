@@ -16,6 +16,10 @@ pub const GET_RECEIPT_TOOL: &str = "chisei.receipt.read";
 /// Link read and create (#1093). Both back onto stable RPCs.
 pub const GET_LINKS_TOOL: &str = "sekai.links.get";
 pub const CREATE_LINK_TOOL: &str = "sekai.links.create";
+/// Evaluation resolve and execute (#1093), listed since both RPCs are stable
+/// (#1090). Compare is a CLI projection with no wire RPC, so it has no tool.
+pub const RESOLVE_EVALUATION_TOOL: &str = "chisei.evaluation.resolve";
+pub const EXECUTE_EVALUATION_TOOL: &str = "chisei.evaluation.execute";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "authorization",
@@ -29,7 +33,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 8] {
+pub fn well_known_tools() -> [&'static str; 10] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -39,6 +43,8 @@ pub fn well_known_tools() -> [&'static str; 8] {
         GET_RECEIPT_TOOL,
         GET_LINKS_TOOL,
         CREATE_LINK_TOOL,
+        RESOLVE_EVALUATION_TOOL,
+        EXECUTE_EVALUATION_TOOL,
     ]
 }
 
@@ -52,6 +58,8 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         GET_RECEIPT_TOOL => Some(NativeRpc::GetOperationReceipt),
         GET_LINKS_TOOL => Some(NativeRpc::GetLinks),
         CREATE_LINK_TOOL => Some(NativeRpc::CreateLink),
+        RESOLVE_EVALUATION_TOOL => Some(NativeRpc::ResolveEvaluationPlan),
+        EXECUTE_EVALUATION_TOOL => Some(NativeRpc::ExecuteEvaluationManifest),
         _ => None,
     }
 }
@@ -103,7 +111,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, and CreateLink. Discovery is not a grant."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, and ExecuteEvaluationManifest. Discovery is not a grant."
     }))
 }
 
@@ -285,6 +293,12 @@ fn bind_session_input(
             }
             *object = bound;
         }
+        NativeRpc::ResolveEvaluationPlan => {
+            bind_nested_namespace(object, "resolution", context)?;
+        }
+        NativeRpc::ExecuteEvaluationManifest => {
+            bind_nested_namespace(object, "execution", context)?;
+        }
         NativeRpc::DescribeObjectAction | NativeRpc::PreviewObjectAction => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
                 && namespace != context.namespace
@@ -298,6 +312,32 @@ fn bind_session_input(
         }
     }
     Ok(input)
+}
+
+/// Binds `input.<field>.namespace` to the session namespace, refusing a
+/// different one.
+fn bind_nested_namespace(
+    object: &mut serde_json::Map<String, Value>,
+    field: &str,
+    context: &ProjectionContext,
+) -> Result<(), Value> {
+    let nested = object
+        .get_mut(field)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(
+            || json!({"code":-32602,"message": format!("input.{field} must be an object")}),
+        )?;
+    if let Some(namespace) = nested.get("namespace").and_then(Value::as_str)
+        && !namespace.is_empty()
+        && namespace != context.namespace
+    {
+        return Err(json!({
+            "code":-32602,
+            "message":"evaluation namespace must match the authenticated adapter session"
+        }));
+    }
+    nested.insert("namespace".into(), json!(context.namespace));
+    Ok(())
 }
 
 /// A trimmed, non-empty string field, `None` when absent, and an error when
@@ -390,6 +430,22 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "action",
             "sekai.CreateLinkRequest",
             "sekai.CreateLinkResponse",
+            "write",
+        ),
+        capability_entry(
+            RESOLVE_EVALUATION_TOOL,
+            "Resolve one evaluation plan into a pinned manifest.",
+            "query",
+            "chisei.ResolveEvaluationPlanRequest",
+            "chisei.ResolveEvaluationPlanResponse",
+            "read",
+        ),
+        capability_entry(
+            EXECUTE_EVALUATION_TOOL,
+            "Execute one resolved evaluation manifest.",
+            "action",
+            "chisei.ExecuteEvaluationManifestRequest",
+            "chisei.ExecuteEvaluationManifestResponse",
             "write",
         ),
     ]
@@ -553,6 +609,8 @@ mod tests {
                 GET_RECEIPT_TOOL,
                 GET_LINKS_TOOL,
                 CREATE_LINK_TOOL,
+                RESOLVE_EVALUATION_TOOL,
+                EXECUTE_EVALUATION_TOOL,
             ]
         );
         assert_eq!(
