@@ -1998,6 +1998,9 @@ mod tests {
             request.idempotency_key = "record-signal-log".into();
             request.request_id = "operation-signal-log".into();
             tracing::subscriber::with_default(subscriber, || {
+                // #1200: re-evaluate callsites other test threads cached
+                // before this thread-local subscriber existed.
+                tracing::callsite::rebuild_interest_cache();
                 admission.admit(request, "alice", 10).unwrap();
             });
         });

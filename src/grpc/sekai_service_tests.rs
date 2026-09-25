@@ -483,6 +483,10 @@ where
         .with_ansi(false)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // #1200: callsite interest is cached process-wide. A callsite another
+    // test thread hit first can be cached as uninterested before this
+    // thread-local subscriber existed, so it would record nothing.
+    tracing::callsite::rebuild_interest_cache();
     work().await;
     String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs")
 }
