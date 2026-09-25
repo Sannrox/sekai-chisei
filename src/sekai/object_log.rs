@@ -164,18 +164,36 @@ pub struct ObjectLogDualRead {
 
 impl ObjectLogDualRead {
     pub fn from_env() -> Self {
-        let enabled = env::var(DUAL_READ_ENV).unwrap_or_default() == "1";
-        let sample_n = env::var(SAMPLE_ENV)
-            .ok()
+        Self::resolve(
+            env::var(DUAL_READ_ENV).ok(),
+            env::var(SAMPLE_ENV).ok(),
+            env::var(LOG_PATH_ENV).ok(),
+            env::var(crate::sekai::object_log_host::HOST_ENV).ok(),
+        )
+    }
+
+    /// Resolves the dual-read settings. A configured object-log host owns
+    /// the log (ADR 0088), so the canary never opens a local log then, even
+    /// when `SEKAI_OBJECT_LOG` is also set (#1202); admits refuse that
+    /// combination outright.
+    pub fn resolve(
+        dual_read: Option<String>,
+        sample: Option<String>,
+        log_path: Option<String>,
+        host: Option<String>,
+    ) -> Self {
+        let enabled = dual_read.unwrap_or_default() == "1";
+        let sample_n = sample
             .and_then(|value| value.parse().ok())
             .unwrap_or(if enabled { DEFAULT_SAMPLE_N } else { 1 });
+        let host_configured = host.is_some_and(|value| !value.trim().is_empty());
+        let log_path = log_path
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && !host_configured)
+            .map(PathBuf::from);
         Self {
             enabled,
-            log_path: env::var(LOG_PATH_ENV)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            log_path,
             sample_n: sample_n.max(1),
         }
     }
@@ -238,7 +256,9 @@ impl ObjectLogCompareError {
                     .into()
             }
             Self::MissingLog => {
-                "object-log dual-read requires SEKAI_OBJECT_LOG to an existing mikura log".into()
+                "object-log dual-read requires a local SEKAI_OBJECT_LOG to an existing mikura \
+                 log, and runs only without SEKAI_OBJECT_LOG_HOST"
+                    .into()
             }
             Self::Unsupported(reason) => {
                 format!("object-log dual-read cannot map request: {reason}")
@@ -873,6 +893,32 @@ fn visible_record(store: &Store, kind: &str, key: &str) -> Option<ObjectRecord> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_host_keeps_the_canary_off_the_local_log() {
+        let local = ObjectLogDualRead::resolve(
+            Some("1".into()),
+            None,
+            Some("./objects.mikura".into()),
+            None,
+        );
+        assert_eq!(local.log_path, Some(PathBuf::from("./objects.mikura")));
+        let hosted = ObjectLogDualRead::resolve(
+            Some("1".into()),
+            None,
+            Some("./objects.mikura".into()),
+            Some("127.0.0.1:7070".into()),
+        );
+        assert!(hosted.enabled);
+        assert_eq!(hosted.log_path, None, "#1202: no local Store behind a host");
+        let blank_host = ObjectLogDualRead::resolve(
+            Some("1".into()),
+            None,
+            Some("./objects.mikura".into()),
+            Some("  ".into()),
+        );
+        assert_eq!(blank_host.log_path, Some(PathBuf::from("./objects.mikura")));
+    }
     use mikura::ObjectRecord;
     use mikura_ingest::BatchIngest;
     use std::collections::{BTreeMap, HashMap};
