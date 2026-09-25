@@ -23,7 +23,9 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.actions.submit",
             "chisei.receipt.read",
             "sekai.links.get",
-            "sekai.links.create"
+            "sekai.links.create",
+            "chisei.evaluation.resolve",
+            "chisei.evaluation.execute"
         ]
     );
     assert_eq!(report.object_id, "widget-1");
@@ -274,4 +276,89 @@ async fn link_tools_create_and_read_links_and_fail_closed() {
         .await
         .unwrap();
     assert!(unscoped.get("error").is_some() || unscoped["result"]["isError"] == true);
+}
+
+#[tokio::test]
+async fn evaluation_tools_bind_the_session_namespace_and_fail_closed() {
+    // #1093: resolve and execute are listed because both RPCs are stable
+    // (#1090). The session namespace is bound, a foreign one is refused, and
+    // unknown plans or manifests never invent a result.
+    let surface = InProcessSurface::synthetic().await.unwrap();
+    let call = |id: i64, name: &str, input: serde_json::Value| {
+        json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "method":"tools/call",
+            "params":{"name":name,"arguments":{"operation_id":format!("op-eval-{id}"),"input":input}}
+        })
+    };
+    let resolution = |namespace: &str| {
+        json!({"resolution": {
+            "contractVersion": "chisei.evaluation-resolution-request/v1",
+            "resolverVersion": "chisei.evaluation-resolver/v1",
+            "namespace": namespace,
+            "requestId": "resolve-missing",
+            "planVersionId": "plan-missing",
+            "subjectProfile": "example.profile/v1",
+            "subjectIdentity": "subject-1",
+            "subjectContentDigest": format!("sha256:{}", "a".repeat(64)),
+            "evidenceObjectIds": [],
+            "evaluationTimeMs": 1
+        }})
+    };
+    let failed = |reply: &serde_json::Value| {
+        reply.get("error").is_some() || reply["result"]["isError"] == true
+    };
+    let foreign = handle_message(
+        &surface,
+        call(1, "chisei.evaluation.resolve", resolution("other")),
+    )
+    .await
+    .unwrap();
+    assert!(failed(&foreign), "{foreign}");
+    let unknown = handle_message(
+        &surface,
+        call(2, "chisei.evaluation.resolve", resolution("")),
+    )
+    .await
+    .unwrap();
+    // The call reaches the server, which has no such plan.
+    assert_eq!(
+        unknown["result"]["structuredContent"]["code"], "not_found",
+        "{unknown}"
+    );
+    let missing = handle_message(&surface, call(3, "chisei.evaluation.resolve", json!({})))
+        .await
+        .unwrap();
+    assert!(failed(&missing), "{missing}");
+    let execute = handle_message(
+        &surface,
+        call(
+            4,
+            "chisei.evaluation.execute",
+            json!({"execution": {
+                "contractVersion": "chisei.evaluation-execution-request/v1",
+                "executorVersion": "chisei.deterministic-evaluation-executor/v1",
+                "manifestDigest": format!("sha256:{}", "b".repeat(64)),
+                "maxTotalDurationMs": 0
+            }}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        execute["result"]["structuredContent"]["code"], "not_found",
+        "{execute}"
+    );
+    let forged = handle_message(
+        &surface,
+        call(
+            5,
+            "chisei.evaluation.execute",
+            json!({"execution": {}, "authorization": "Bearer x"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(failed(&forged), "{forged}");
 }
