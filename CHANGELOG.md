@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hosted-pinned `PlanExecution` reuses the planning catalog for the pin check instead of listing namespace profiles a second time. Execute still re-lists on admit (#1206).
 - The capability catalog MCP allowlist is pinned to `rpc_maturity`: `ResolveEvaluationPlan` and `ExecuteEvaluationManifest` stay listed because they are `stable`, and the catalog must not call those RPCs experimental (#1205).
 - `CreateLink` assigns a server id when the request id is empty and answers with the stored row. MCP `sekai.links.create` no longer persists an empty primary key or reports a later request as stored (#1201).
 - The MCP projection host also lists `chisei.evaluation.resolve` → `ResolveEvaluationPlan` and `chisei.evaluation.execute` → `ExecuteEvaluationManifest`, now that both RPCs are stable. Each binds its request namespace to the session and refuses a foreign namespace. Evaluation compare stays CLI-only because it has no wire RPC (#1093).

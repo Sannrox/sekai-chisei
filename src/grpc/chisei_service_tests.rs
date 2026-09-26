@@ -10381,6 +10381,7 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         routing_profile_id: pin.into(),
     };
 
+    rpc_execution::reset_hosted_profile_list_count();
     let plan = service
         .plan_execution(Request::new(plan_request(
             "request:hosted-plan",
@@ -10392,6 +10393,11 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         .into_inner()
         .plan
         .unwrap();
+    assert_eq!(
+        rpc_execution::hosted_profile_list_count(),
+        1,
+        "hosted-pinned Plan loads the namespace catalog once (#1206)"
+    );
     assert_eq!(plan.resolved_runtime, "hosted.acme-llm");
     assert_eq!(plan.resolved_model, "hosted.acme-llm/acme-1");
     let receipt = service
