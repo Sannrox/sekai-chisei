@@ -228,6 +228,40 @@ async fn link_tools_create_and_read_links_and_fail_closed() {
         link["id"], "forged-id",
         "the client cannot choose the link id"
     );
+    assert!(
+        link["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "{created}"
+    );
+    let second = handle_message(
+        &surface,
+        call(
+            8,
+            "sekai.links.create",
+            json!({"from_id": surface.peer_object_id, "to_id": surface.object_id, "relation": "feeds"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let second_link = &second["result"]["structuredContent"]["output"]["link"];
+    assert!(
+        second_link["id"].as_str().is_some_and(|id| !id.is_empty()),
+        "{second}"
+    );
+    assert_ne!(second_link["id"], link["id"]);
+    let feeds = handle_message(
+        &surface,
+        call(
+            9,
+            "sekai.links.get",
+            json!({"object_id": surface.peer_object_id, "relation": "feeds"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        feeds["result"]["structuredContent"]["output"]["links"][0]["id"], second_link["id"],
+        "{feeds}"
+    );
 
     let read = handle_message(
         &surface,
