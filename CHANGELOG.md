@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The object-log host client is resolved from the environment once per process. Later admits reuse that client instead of re-reading `SEKAI_OBJECT_LOG_HOST` and re-resolving DNS. The pinned host still serves one JSON line per connection, so each wire op opens its own TCP stream (#1207).
 - Hosted-pinned `PlanExecution` reuses the planning catalog for the pin check instead of listing namespace profiles a second time. Execute still re-lists on admit (#1206).
 - The capability catalog MCP allowlist is pinned to `rpc_maturity`: `ResolveEvaluationPlan` and `ExecuteEvaluationManifest` stay listed because they are `stable`, and the catalog must not call those RPCs experimental (#1205).
 - `CreateLink` assigns a server id when the request id is empty and answers with the stored row. MCP `sekai.links.create` no longer persists an empty primary key or reports a later request as stored (#1201).
