@@ -153,21 +153,6 @@ pub fn object_id(
     ))
 }
 
-fn visible_values(
-    snapshot: &TableSnapshot,
-    row: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    snapshot
-        .columns
-        .iter()
-        .filter(|column| !column.hidden)
-        .filter_map(|column| {
-            row.get(&column.name)
-                .map(|value| (column.name.clone(), value.clone()))
-        })
-        .collect()
-}
-
 fn digest_of(values: &BTreeMap<String, String>) -> String {
     let canonical = serde_json::to_vec(values).expect("string map serializes");
     format!("sha256:{:x}", Sha256::digest(canonical))
@@ -175,57 +160,90 @@ fn digest_of(values: &BTreeMap<String, String>) -> String {
 
 /// One record per row (upsert) and per deleted key (tombstone). The
 /// snapshot is validated first, so a hand-built one fails instead of
-/// panicking.
-pub fn records(snapshot: &TableSnapshot) -> Result<Vec<SourceRecord>, String> {
-    validate(snapshot)?;
-    let upserts = snapshot.rows.iter().map(|row| {
-        let properties = visible_values(snapshot, row);
-        let digest = digest_of(&properties);
+/// panicking. Visible cells are moved out of the snapshot rows; hidden
+/// columns are dropped without a second owned map of every cell (#1209).
+pub fn records(snapshot: TableSnapshot) -> Result<Vec<SourceRecord>, String> {
+    validate(&snapshot)?;
+    let hidden = snapshot
+        .columns
+        .iter()
+        .filter(|column| column.hidden)
+        .map(|column| column.name.clone())
+        .collect::<BTreeSet<_>>();
+    let TableSnapshot {
+        table,
+        snapshot_id,
+        record_kind,
+        key_column,
+        display_column,
+        version_column,
+        rows,
+        deleted_keys,
+        committed_at_ms,
+        ..
+    } = snapshot;
+    let upserts = rows
+        .into_iter()
+        .map(|mut row| {
+            if !hidden.is_empty() {
+                row.retain(|name, _| !hidden.contains(name));
+            }
+            let digest = digest_of(&row);
+            let external_id = row
+                .get(&key_column)
+                .cloned()
+                .ok_or("every row needs a key")?;
+            let source_version = row
+                .get(&version_column)
+                .cloned()
+                .ok_or("every row needs a version")?;
+            let display_name = row
+                .get(&display_column)
+                .cloned()
+                .ok_or("every row needs a display value")?;
+            Ok(SourceRecord {
+                source: SOURCE.into(),
+                source_instance: table.clone(),
+                external_id,
+                source_version,
+                type_name: record_kind.clone(),
+                display_name,
+                payload_digest: digest,
+                properties: row,
+                deleted: false,
+                observed_at_ms: committed_at_ms,
+                source_sequence: None,
+            })
+        })
+        .collect::<Result<Vec<_>, &str>>()?;
+    let tombstones = deleted_keys.into_iter().map(|key| {
+        let digest = digest_of(&BTreeMap::from([(key_column.clone(), key.clone())]));
         SourceRecord {
             source: SOURCE.into(),
-            source_instance: snapshot.table.clone(),
-            external_id: row[&snapshot.key_column].clone(),
-            source_version: row[&snapshot.version_column].clone(),
-            type_name: snapshot.record_kind.clone(),
-            display_name: properties[&snapshot.display_column].clone(),
-            payload_digest: digest,
-            properties,
-            deleted: false,
-            observed_at_ms: snapshot.committed_at_ms,
-            source_sequence: None,
-        }
-    });
-    let tombstones = snapshot.deleted_keys.iter().map(|key| {
-        let digest = digest_of(&BTreeMap::from([(
-            snapshot.key_column.clone(),
-            key.clone(),
-        )]));
-        SourceRecord {
-            source: SOURCE.into(),
-            source_instance: snapshot.table.clone(),
+            source_instance: table.clone(),
             external_id: key.clone(),
-            source_version: format!("deleted@{}", snapshot.snapshot_id),
-            type_name: snapshot.record_kind.clone(),
-            display_name: key.clone(),
+            source_version: format!("deleted@{snapshot_id}"),
+            type_name: record_kind.clone(),
+            display_name: key,
             payload_digest: digest,
             properties: BTreeMap::new(),
             deleted: true,
-            observed_at_ms: snapshot.committed_at_ms,
+            observed_at_ms: committed_at_ms,
             source_sequence: None,
         }
     });
-    Ok(upserts.chain(tombstones).collect())
+    Ok(upserts.into_iter().chain(tombstones).collect())
 }
 
 /// The batch that advances the table's checkpoint from `current_cursor` to
 /// this snapshot.
 pub fn batch(
-    snapshot: &TableSnapshot,
+    snapshot: TableSnapshot,
     namespace: &str,
     producer_identity: &str,
     current_cursor: &str,
 ) -> Result<SourceBatch, String> {
-    let descriptor = descriptor(snapshot)?;
+    let descriptor = descriptor(&snapshot)?;
     let mut batch = SourceBatch {
         contract_version: SOURCE_BATCH_VERSION.into(),
         namespace: namespace.into(),
@@ -237,7 +255,7 @@ pub fn batch(
         adapter_version: ADAPTER_REGISTERED_OBJECT_SYNC_VERSION.into(),
         type_digest: descriptor.digest,
         current_cursor: current_cursor.into(),
-        proposed_next_cursor: checkpoint(snapshot),
+        proposed_next_cursor: checkpoint(&snapshot),
         idempotency_key: format!("{}@{}", snapshot.table, snapshot.snapshot_id),
         batch_digest: String::new(),
         collected_at_ms: snapshot.committed_at_ms,
