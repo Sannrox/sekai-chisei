@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MCP `tools/call` fail-closes missing `operation_id` and reserved metadata on borrowed arguments before cloning or discovering the catalog, and reuses a session `CatalogSnapshot` until `catalog_version` changes (#1208).
 - The object-log host client is resolved from the environment once per process. Later admits reuse that client instead of re-reading `SEKAI_OBJECT_LOG_HOST` and re-resolving DNS. The pinned host still serves one JSON line per connection, so each wire op opens its own TCP stream (#1207).
 - Hosted-pinned `PlanExecution` reuses the planning catalog for the pin check instead of listing namespace profiles a second time. Execute still re-lists on admit (#1206).
 - The capability catalog MCP allowlist is pinned to `rpc_maturity`: `ResolveEvaluationPlan` and `ExecuteEvaluationManifest` stay listed because they are `stable`, and the catalog must not call those RPCs experimental (#1205).
