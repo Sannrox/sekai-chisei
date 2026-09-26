@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -42,6 +42,7 @@ pub struct InProcessSurface {
     pub action_version: String,
     sekai: SekaiServiceImpl,
     chisei: ChiseiServiceImpl,
+    catalog: Mutex<Option<CatalogSnapshot>>,
 }
 
 impl InProcessSurface {
@@ -86,6 +87,7 @@ impl InProcessSurface {
             action_version: ACTION_VERSION.into(),
             sekai,
             chisei,
+            catalog: Mutex::new(None),
         };
         surface.seed().await?;
         Ok(surface)
@@ -174,6 +176,9 @@ impl InProcessSurface {
 #[async_trait]
 impl NativeSurface for InProcessSurface {
     async fn discover(&self) -> Result<CatalogSnapshot, AdapterError> {
+        if let Some(cached) = self.catalog.lock().expect("catalog cache").clone() {
+            return Ok(cached);
+        }
         let response = self
             .sekai
             .discover_capabilities(with_identity(
@@ -189,7 +194,7 @@ impl NativeSurface for InProcessSurface {
             .await
             .map_err(status_error)?
             .into_inner();
-        Ok(CatalogSnapshot {
+        let snapshot = CatalogSnapshot {
             context: ProjectionContext {
                 namespace: self.namespace.clone(),
                 principal: self.principal.clone(),
@@ -200,7 +205,14 @@ impl NativeSurface for InProcessSurface {
                 },
                 catalog_version: response.catalog_version,
             },
-        })
+        };
+        *self.catalog.lock().expect("catalog cache") = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn refresh_catalog(&self) -> Result<CatalogSnapshot, AdapterError> {
+        *self.catalog.lock().expect("catalog cache") = None;
+        self.discover().await
     }
 
     async fn dispatch(
