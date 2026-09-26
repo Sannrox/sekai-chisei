@@ -3603,6 +3603,105 @@ async fn computed_property_resolves_from_function_without_persisting() {
 }
 
 #[tokio::test]
+async fn create_link_assigns_empty_id_and_returns_stored_row() {
+    let svc = service();
+    for id in ["link-from", "link-to"] {
+        svc.create_object(with_principal(CreateObjectRequest {
+            object: Some(Object {
+                id: id.into(),
+                kind: "widget".into(),
+                name: id.into(),
+                ..Default::default()
+            }),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap();
+    }
+    let created = svc
+        .create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
+            link: Some(Link {
+                id: "existing-link".into(),
+                from_id: "link-from".into(),
+                to_id: "link-to".into(),
+                relation: "pairs_with".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert_eq!(created.id, "existing-link");
+    let replayed = svc
+        .create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
+            link: Some(Link {
+                id: "existing-link".into(),
+                from_id: "link-from".into(),
+                to_id: "link-to".into(),
+                relation: "pairs_with".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert_eq!(replayed.id, "existing-link");
+    assert_eq!(replayed.from_id, "link-from");
+    assert_eq!(replayed.to_id, "link-to");
+    let collided = svc
+        .create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
+            link: Some(Link {
+                id: "existing-link".into(),
+                from_id: "link-to".into(),
+                to_id: "link-from".into(),
+                relation: "pairs_with".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(collided.code(), tonic::Code::AlreadyExists);
+    let assigned = svc
+        .create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: true,
+            link: Some(Link {
+                id: String::new(),
+                from_id: "link-from".into(),
+                to_id: "link-to".into(),
+                relation: "feeds".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .link
+        .unwrap();
+    assert!(assigned.id.starts_with("link-"), "{assigned:?}");
+    assert_ne!(assigned.id, "existing-link");
+    assert!(assigned.created > 0);
+    let feeds = svc
+        .get_links(with_principal(GetLinksRequest {
+            object_id: "link-from".into(),
+            relation: "feeds".into(),
+            direction: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .links;
+    assert_eq!(feeds.len(), 1, "{feeds:?}");
+    assert_eq!(feeds[0].id, assigned.id);
+}
+
+#[tokio::test]
 async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
     let svc = service();
     grant_schema_admin(&svc);
