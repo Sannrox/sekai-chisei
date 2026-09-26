@@ -5,7 +5,7 @@ pub(super) async fn plan_execution(
     req: Request<PlanExecutionRequest>,
 ) -> Result<Response<PlanExecutionResponse>, Status> {
     let registry = service.refresh_provider_registry_for_resolution().await?;
-    let registry = match req.get_ref().input.as_ref() {
+    let (registry, hosted) = match req.get_ref().input.as_ref() {
         Some(input) => planning_registry(
             service,
             registry,
@@ -14,7 +14,7 @@ pub(super) async fn plan_execution(
             input,
             &req.get_ref().routing_profile_id,
         )?,
-        None => registry,
+        None => (registry, Vec::new()),
     };
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let actor = authenticated_actor(&req);
@@ -47,11 +47,10 @@ pub(super) async fn plan_execution(
         let plan_namespace = input.namespace.clone();
         let mut plan = service.plan_from_input(input, &actor).await?;
         require_hosted_route_policy(service, &plan_namespace, &plan.resolved_runtime)?;
-        // A pin is checked against the live catalog after planning, so the
-        // listing never acts as a grant (#1094).
+        // A pin is checked against the planning catalog already loaded for
+        // this request. The listing never acts as a grant (#1094, #1206).
         let pinned = request.routing_profile_id.trim();
         if !pinned.is_empty() {
-            let hosted = hosted_profiles_for(service, &plan_namespace)?;
             crate::chisei::routing_profiles::check_pin(
                 &crate::provider_profile::provider_registry_snapshot(),
                 &hosted,
@@ -145,14 +144,17 @@ pub(super) async fn plan_content_execution(
         .as_ref()
         .and_then(|input| input.execution.as_ref())
     {
-        Some(execution) => planning_registry(
-            service,
-            registry,
-            authenticated_actor(&req).as_str(),
-            enterprise_authenticated_context(&req)?,
-            execution,
-            "",
-        )?,
+        Some(execution) => {
+            planning_registry(
+                service,
+                registry,
+                authenticated_actor(&req).as_str(),
+                enterprise_authenticated_context(&req)?,
+                execution,
+                "",
+            )?
+            .0
+        }
         None => registry,
     };
     crate::provider_profile::with_provider_registry_snapshot(registry, async {
@@ -1177,6 +1179,8 @@ fn hosted_profiles_for(
     service: &ChiseiServiceImpl,
     namespace: &str,
 ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, Status> {
+    #[cfg(test)]
+    HOSTED_PROFILE_LISTS.with(|count| count.set(count.get() + 1));
     let stored = service
         .db
         .runtime()
@@ -1186,6 +1190,21 @@ fn hosted_profiles_for(
         stored,
         &service.config.routing_endpoint_allowlist,
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOSTED_PROFILE_LISTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_hosted_profile_list_count() {
+    HOSTED_PROFILE_LISTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn hosted_profile_list_count() -> usize {
+    HOSTED_PROFILE_LISTS.with(|count| count.get())
 }
 
 fn routing_profile_admission_status(error: String) -> Status {
@@ -1280,12 +1299,18 @@ fn planning_registry(
     context: Option<&crate::enterprise::AuthenticatedContext>,
     input: &ExecutionInput,
     pin: &str,
-) -> Result<crate::provider_profile::ProviderRegistry, Status> {
+) -> Result<
+    (
+        crate::provider_profile::ProviderRegistry,
+        Vec<crate::chisei::routing_profiles::HostedRoutingProfile>,
+    ),
+    Status,
+> {
     if context.is_some()
         || input.namespace.trim().is_empty()
         || !hosted_route_possible(service, input, pin)
     {
-        return Ok(registry);
+        return Ok((registry, Vec::new()));
     }
     require_execution_namespace_access_with_context(
         service.db.runtime(),
@@ -1296,9 +1321,12 @@ fn planning_registry(
     )?;
     let hosted = hosted_profiles_for(service, &input.namespace)?;
     if hosted.is_empty() {
-        return Ok(registry);
+        return Ok((registry, hosted));
     }
-    Ok(registry.with_hosted_endpoints(&crate::chisei::routing_profiles::hosted_endpoints(&hosted)))
+    Ok((
+        registry.with_hosted_endpoints(&crate::chisei::routing_profiles::hosted_endpoints(&hosted)),
+        hosted,
+    ))
 }
 
 /// Whether a planning request can resolve to a hosted runtime: it pins or
