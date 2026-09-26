@@ -166,7 +166,7 @@ fn to_proto(batch: sekai_chisei::sekai::object_sync::SourceBatch) -> SourceBatch
 
 async fn ingest(sekai: &SekaiServiceImpl, store: &TableStore, current_cursor: &str) -> String {
     let batch =
-        warehouse_table_ingest::batch(&store.snapshot(), NAMESPACE, CONNECTOR, current_cursor)
+        warehouse_table_ingest::batch(store.snapshot(), NAMESPACE, CONNECTOR, current_cursor)
             .unwrap();
     let next = batch.proposed_next_cursor.clone();
     let result = sekai
