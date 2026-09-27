@@ -66,7 +66,7 @@ comparison.
    dropped to force a match.
 8. **This ADR does not cut over writes.** Dual-read is #942. Admitted Action
    apply through `mikura-ingest` is #943. Stopping SQL `object_type_index`
-   writes is #944 and needs its own accepted ADR after soak.
+   writes as evaluate authority is #944 / [ADR 0091](0091-object-log-owns-evaluate-identity.md).
 
 ## Alternatives considered
 

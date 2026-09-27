@@ -104,6 +104,12 @@ clerk adapter (`src/sekai/object_log_host.rs`) is its client:
 
 The validation above now runs as a test against a real host on loopback: one
 client writes, a second reads the same generation, and a committed record
-that does not carry the admitted properties fails closed. The SQL object-type
-index is still the evaluate authority. Retiring it remains #944, which now
-waits only on dual-read soak evidence.
+that does not carry the admitted properties fails closed.
+
+## Amendment: evaluate identity cutover (#944)
+
+[ADR 0091](0091-object-log-owns-evaluate-identity.md) records that object
+identity is the object-log and SQL `object_type_index*` is a rebuildable
+serving projection. `EvaluateObjectSet` keeps that projection because the
+tagged log is `(kind, key)` and is not namespace-scoped. The host wire is
+still append plus generation load.
