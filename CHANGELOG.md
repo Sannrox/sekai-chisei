@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match the session `x-sekai-namespace`. Object ACL on a foreign-namespace id is not enough (#1203).
 - Object identity stays in the configured object-log. Action apply writes the clerk receipt and log ingest only, and does not write SQL `object_type_index*`. Those tables remain a rebuildable serving projection for `EvaluateObjectSet` (ADR 0091, #944).
 - Warehouse table ingest moves visible row cells into `SourceRecord` properties and drops hidden columns, instead of cloning every cell into an intermediate map (#1209).
 - MCP `tools/call` fail-closes missing `operation_id` and reserved metadata on borrowed arguments before cloning or discovering the catalog, and reuses a session `CatalogSnapshot` until `catalog_version` changes (#1208).

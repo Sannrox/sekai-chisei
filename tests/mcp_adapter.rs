@@ -310,6 +310,101 @@ async fn link_tools_create_and_read_links_and_fail_closed() {
         .await
         .unwrap();
     assert!(unscoped.get("error").is_some() || unscoped["result"]["isError"] == true);
+
+    // #1203: session namespace binds get root and both create endpoints.
+    // ACL on a foreign-namespace object is not enough.
+    let foreign_get = handle_message(
+        &surface,
+        call(
+            10,
+            "sekai.links.get",
+            json!({"object_id": surface.foreign_object_id, "relation": "pairs_with"}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        foreign_get.get("error").is_some() || foreign_get["result"]["isError"] == true,
+        "foreign get root must refuse: {foreign_get}"
+    );
+    let foreign_create_to = handle_message(
+        &surface,
+        call(
+            11,
+            "sekai.links.create",
+            json!({
+                "from_id": surface.object_id,
+                "to_id": surface.foreign_object_id,
+                "relation": "pairs_with"
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        foreign_create_to.get("error").is_some() || foreign_create_to["result"]["isError"] == true,
+        "foreign create to_id must refuse: {foreign_create_to}"
+    );
+    let foreign_create_from = handle_message(
+        &surface,
+        call(
+            12,
+            "sekai.links.create",
+            json!({
+                "from_id": surface.foreign_object_id,
+                "to_id": surface.object_id,
+                "relation": "pairs_with"
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        foreign_create_from.get("error").is_some()
+            || foreign_create_from["result"]["isError"] == true,
+        "foreign create from_id must refuse: {foreign_create_from}"
+    );
+    let foreign_create_both = handle_message(
+        &surface,
+        call(
+            13,
+            "sekai.links.create",
+            json!({
+                "from_id": surface.foreign_object_id,
+                "to_id": surface.foreign_peer_object_id,
+                "relation": "pairs_with"
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        foreign_create_both.get("error").is_some()
+            || foreign_create_both["result"]["isError"] == true,
+        "foreign create both endpoints must refuse: {foreign_create_both}"
+    );
+    let leaked = handle_message(
+        &surface,
+        call(
+            14,
+            "sekai.links.get",
+            json!({"object_id": surface.object_id, "relation": "leaks_to"}),
+        ),
+    )
+    .await
+    .unwrap();
+    let leaked_links = leaked["result"]["structuredContent"]["output"]["links"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        leaked.get("error").is_none() && leaked["result"]["isError"] != true,
+        "same-namespace get root stays readable: {leaked}"
+    );
+    assert!(
+        leaked_links.is_empty(),
+        "cross-namespace link endpoints must not be disclosed: {leaked}"
+    );
 }
 
 #[tokio::test]

@@ -220,6 +220,18 @@ impl SekaiServiceImpl {
             .map(str::to_string)
     }
 
+    /// MCP link tools send `x-sekai-capability` as `sekai.links.get` /
+    /// `sekai.links.create`. Direct gRPC and the HTTP gateway also carry
+    /// `x-sekai-namespace`; only the MCP tools bind object ids to it.
+    fn mcp_link_session_namespace(req: &Request<impl prost::Message>) -> Option<String> {
+        match Self::catalog_metadata_value(req, "x-sekai-capability").as_deref() {
+            Some("sekai.links.get") | Some("sekai.links.create") => {
+                Self::catalog_metadata_value(req, "x-sekai-namespace")
+            }
+            _ => None,
+        }
+    }
+
     /// Begin a receipt-attributed catalog invocation for a semantic capability.
     /// Returns `None` when the caller did not send `x-sekai-capability` (direct RPC).
     /// Live discovery is rechecked; a previously observed catalog is never a grant.
