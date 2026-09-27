@@ -552,6 +552,7 @@ impl SekaiServiceImpl {
         let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
+        let session_namespace = Self::mcp_link_session_namespace(&req);
         let r = req.into_inner();
         let root = self
             .db
@@ -559,6 +560,12 @@ impl SekaiServiceImpl {
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
             .ok_or(Status::not_found("not found"))?;
+        if session_namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace != root.namespace)
+        {
+            return Err(Status::not_found("not found"));
+        }
         require_purpose_for_kind(
             self.db.runtime(),
             &root.namespace,
@@ -599,6 +606,13 @@ impl SekaiServiceImpl {
                     keep = false;
                     break;
                 };
+                if session_namespace
+                    .as_deref()
+                    .is_some_and(|namespace| namespace != object.namespace)
+                {
+                    keep = false;
+                    break;
+                }
                 if !object_is_visible(
                     self.db.runtime(),
                     &self.security,
