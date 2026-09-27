@@ -54,6 +54,10 @@ fn rpc_exists(rpc: &str) -> bool {
     if rpc.contains("TypeScript") || rpc.contains("goldens") {
         return Path::new("src/http_codegen.rs").exists();
     }
+    if rpc.contains("npm pack") || rpc.contains("pip wheel") {
+        return Path::new("sdk/typescript/package.json").exists()
+            && Path::new("sdk/python/pyproject.toml").exists();
+    }
     let name = rpc
         .rsplit('.')
         .next()
