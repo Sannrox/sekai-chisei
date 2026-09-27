@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.1.0
+
+Upgrade notes:
+
+- Community SQLite and PostgreSQL apply schema `0029`–`0049` on startup. Backup the store before the first 1.1.0 boot.
+- SQL `object_type_index*` is a rebuildable serving projection; object identity is the configured object-log (ADR 0091). Existing tables are retained; rematerialize with `ReindexObjectType`.
+- MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match session `x-sekai-namespace`.
+- Combined pins mikura `v0.2.0`. Existing `v0.1.0` object logs still open.
+- Provider HTTP clients no longer follow redirects.
+- Optional `SEKAI_OBJECT_LOG_HOST` is exclusive with `SEKAI_OBJECT_LOG`.
+
 - TypeScript and Python SDK trees pack (`npm pack`, `pip wheel`) and install from those bytes into a consumer with no in-repo path. Clerk `sdk-packages` records stay digest pins, not the install source (#1093).
 - MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match the session `x-sekai-namespace`. Object ACL on a foreign-namespace id is not enough (#1203).
 - Object identity stays in the configured object-log. Action apply writes the clerk receipt and log ingest only, and does not write SQL `object_type_index*`. Those tables remain a rebuildable serving projection for `EvaluateObjectSet` (ADR 0091, #944).
