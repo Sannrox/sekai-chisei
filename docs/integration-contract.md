@@ -68,7 +68,7 @@ Coverage:
 | HTTP/JSON ontology projection (#875) | supported | Interface | `POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
 | HTTP MCP projection (#875) | supported | Interface | `POST /mcp` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
 | Generated HTTP clients (#875) | supported | Interface | TypeScript / Python / Rust goldens | [sdk-packages.md](sdk-packages.md) | `src/http_codegen.rs` |
-| Registry-published SDK | unavailable | Interface | — | [sdk-packages.md](sdk-packages.md) | `docs/sdk-packages.md` |
+| Registry-published SDK | supported | Interface | npm pack / pip wheel of `sdk/typescript` and `sdk/python`; operator publish to npm/PyPI | [sdk-packages.md](sdk-packages.md) | `tests/sdk_external_consumer.rs` |
 
 <!-- /integration-contract-rows -->
 

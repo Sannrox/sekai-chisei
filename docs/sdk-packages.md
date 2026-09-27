@@ -48,11 +48,14 @@ names it. The superseded record stays inspectable and fails smoke.
 SQLite stores publications. PostgreSQL surfaces stay unavailable.
 
 Local artifacts, publication records, and registry packages are different
-objects. Current `main` stages isolated Rust, TypeScript, and Python trees,
-pins `sekai-proto` beside the Rust client, rewrites consumer fixtures onto
-local copies, and re-hashes protocol (`sekai.proto` and `chisei.proto`), source,
-and package bytes from disk (#840, #843, #844). It does not claim cargo, npm, or
-pip registry installs, and it does not upload crates.io, npm, or PyPI bytes.
+objects. Isolated proof stages Rust, TypeScript, and Python trees, pins
+`sekai-proto` beside the Rust client, rewrites consumer fixtures onto local
+copies, and re-hashes protocol (`sekai.proto` and `chisei.proto`), source, and
+package bytes from disk (#840, #843, #844). TypeScript and Python additionally
+pack (`npm pack`, `pip wheel`) and install those bytes into a directory that
+has no in-repo path (#1093). Clerk `sdk-packages` records pin digests; they
+are not the install source. Operators publish the same packed bytes to npm or
+PyPI; the plane does not upload them.
 
 ## Compatibility matrix
 
