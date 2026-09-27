@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "rewriteRelativeImportExtensions": true
   },
-  "include": ["capability.ts", "client.ts", "grpc.ts"]
+  "include": ["capability.ts", "client.ts", "grpc.ts", "http.ts"]
 }

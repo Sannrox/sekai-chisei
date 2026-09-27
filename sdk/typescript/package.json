@@ -1,12 +1,17 @@
 {
   "name": "@sannrox/sekai-chisei-sdk",
   "version": "0.1.0",
-  "private": true,
+  "description": "Typed server-side TypeScript facade for the Sekai/Chisei gRPC contracts",
+  "license": "Apache-2.0",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "types": "./dist/client.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
   },
   "exports": {
     ".": {
@@ -24,6 +29,10 @@
     "./capability": {
       "types": "./dist/capability.d.ts",
       "import": "./dist/capability.js"
+    },
+    "./http": {
+      "types": "./dist/http.d.ts",
+      "import": "./dist/http.js"
     }
   },
   "peerDependencies": {

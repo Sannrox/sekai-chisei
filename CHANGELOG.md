@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- TypeScript and Python SDK trees pack (`npm pack`, `pip wheel`) and install from those bytes into a consumer with no in-repo path. Clerk `sdk-packages` records stay digest pins, not the install source (#1093).
 - MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match the session `x-sekai-namespace`. Object ACL on a foreign-namespace id is not enough (#1203).
 - Object identity stays in the configured object-log. Action apply writes the clerk receipt and log ingest only, and does not write SQL `object_type_index*`. Those tables remain a rebuildable serving projection for `EvaluateObjectSet` (ADR 0091, #944).
 - Warehouse table ingest moves visible row cells into `SourceRecord` properties and drops hidden columns, instead of cloning every cell into an intermediate map (#1209).
