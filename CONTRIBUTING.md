@@ -83,9 +83,29 @@ The build vendors `protoc`; a system installation is not required.
   (including streams), `/v1/models`, and fail-closed when the control plane is
   down. It does not require live provider credentials.
 
+The ignored Ollama test requires a local compatible endpoint and model:
+
+```bash
+cargo test --test ollama_e2e -- --ignored
+```
+
 Changes to provider routing, LLM calls, authentication, authorization,
 persistence, migrations, evidence, retention, or coordination require focused
 tests for the affected path.
+
+## Project layout
+
+| Path | Responsibility |
+| --- | --- |
+| [`proto/`](proto/) | Public gRPC service definitions |
+| [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
+| [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
+| [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
+| [`crates/sekai-provider/`](crates/sekai-provider/) | Provider registry, adapters, pricing, and shared receipt contracts |
+| [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
+| [`adapters/`](adapters/) | External evidence and workflow reference adapters |
+| [`examples/`](examples/) | Runnable integration examples |
+| [`tests/`](tests/) | Integration tests and deterministic fixtures |
 
 ## Design expectations
 
