@@ -105,6 +105,23 @@ through the same CLI path as any user-owned domain document:
 PACK=tests/fixtures/lookup_first/reference_domain
 cargo run --bin sekaictl -- ontology apply --file "$PACK/domain-v1.json"
 cargo run --bin sekaictl -- ontology seed --file "$PACK/seed-v1.json"
+
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.resolve_ref \
+  --spec '{"external_id":"service:checkout-api"}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.expand_relations \
+  --spec '{"root":{"object_id":"svc-checkout-api"},"relations":["service_depends_on","service_owned_by"],"direction":"outgoing","max_depth":2}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.context.retrieve \
+  --spec '{"roots":[{"object_id":"svc-checkout-api"}],"direction":"both","max_depth":2}'
+cargo run --bin sekaictl -- ontology run \
+  --namespace reliability-demo \
+  --task-type sekai.semantic.explain_derivation \
+  --spec '{"from":{"object_id":"svc-checkout-api"},"to":{"object_id":"svc-ledger"},"relations":["service_depends_on"],"direction":"outgoing","max_depth":2}'
 ```
 
 The offline expected-path table is checked by
