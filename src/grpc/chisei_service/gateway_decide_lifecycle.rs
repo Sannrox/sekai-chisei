@@ -464,6 +464,7 @@ impl ChiseiServiceImpl {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            sekai_facts: self.sekai_facts.clone(),
         };
         let context_expansion_gate = self.pipeline_context_expansion_gate(input.namespace);
         let evidence_context_gates =

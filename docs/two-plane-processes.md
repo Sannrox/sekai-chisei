@@ -33,6 +33,26 @@ and on the commit lookup.
 `GetOperationReceipt` on Chisei projects that live commit handle. It does not
 copy the Sekai receipt body into the Chisei store.
 
+## Sekai facts in Chisei
+
+Lookup-first and pipeline object context read Sekai facts (objects, links,
+grants, schemas) through a Chisei-owned read port, never from the Chisei
+store. Combined mode reads the Sekai store in process, in the shared and the
+split layout. A Chisei process reads over the same `SEKAI_ENDPOINT` hop with
+public `SekaiService` RPCs, which Sekai authorizes for the hop credential;
+Chisei then narrows to the request actor. Graph retrieval for lookup-first has
+no public RPC, so on the hop lookup-first refuses with
+`sekai_read_unsupported` and takes the model path.
+
+Context authorization reads namespace-boundary and object grants, which Sekai
+serves only to an admin credential. With a less privileged `SEKAI_CREDENTIAL`
+those reads are refused and object context is dropped, not leaked. A namespace
+boundary the hop credential cannot see is not treated as absent, so a namespace
+without a visible boundary yields no context for non-local actors over the hop.
+An unreachable Sekai skips object context with `sekai_read_failed`. Without
+`SEKAI_ENDPOINT`, lookup-first refuses with `sekai_not_attached` and object
+context injection is skipped with the same reason.
+
 ## Gateway
 
 `chisei-gateway` remains a protocol translator. It does not open a third

@@ -164,6 +164,7 @@ mod tests {
             risk_signals: vec![],
             operation_risk_override: None,
             pinned_learning: None,
+            sekai_facts: Default::default(),
         }
     }
 
