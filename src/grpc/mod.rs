@@ -430,8 +430,10 @@ impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareI
 impl<I: tonic::service::Interceptor> tonic::service::Interceptor for RestoreFenceInterceptor<I> {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         if request_is_mutating_rpc(&req) {
-            crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
-                .map_err(Status::failed_precondition)?;
+            crate::db::postgres::off_runtime(|| {
+                crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
+            })
+            .map_err(Status::failed_precondition)?;
         }
         self.inner.call(req)
     }
