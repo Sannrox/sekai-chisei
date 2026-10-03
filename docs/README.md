@@ -2,7 +2,8 @@
 
 Use this page to choose a path. The [reference catalog](reference.md) lists
 every maintained guide and contract; the [research index](research/README.md)
-keeps design history separate from current usage.
+keeps design history separate from current usage. [Learnings](learnings/INDEX.md)
+record focused implementation traps and the tests that catch them.
 
 ## Start here
 
