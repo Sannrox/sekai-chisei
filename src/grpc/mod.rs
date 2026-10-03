@@ -950,15 +950,27 @@ pub fn build_services_for_plane(
         chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget);
     match plane {
         ProcessPlane::Combined => {
-            chisei_svc = chisei_svc.with_sekai_commit_lookup(Arc::new(sekai_store));
+            // Shared and split layouts alike: Sekai facts come from the Sekai
+            // store, never from the Chisei store.
+            chisei_svc = chisei_svc
+                .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+                    sekai_store.clone(),
+                ))
+                .with_sekai_commit_lookup(Arc::new(sekai_store));
         }
         ProcessPlane::Chisei => {
             if let Some(endpoint) = &config.sekai_endpoint {
-                chisei_svc = chisei_svc.with_sekai_commit_lookup(Arc::new(
-                    crate::chisei::remote_sekai::RemoteSekaiCommitLookup::from_env(
-                        endpoint.clone(),
-                    ),
-                ));
+                chisei_svc = chisei_svc
+                    .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
+                        crate::chisei::remote_sekai::RemoteSekaiFactReader::from_env(
+                            endpoint.clone(),
+                        ),
+                    )))
+                    .with_sekai_commit_lookup(Arc::new(
+                        crate::chisei::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                            endpoint.clone(),
+                        ),
+                    ));
             }
         }
         ProcessPlane::Sekai => {}

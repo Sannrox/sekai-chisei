@@ -117,6 +117,8 @@ pub struct ChiseiServiceImpl {
     pub(super) provider_registry_state_path: Option<PathBuf>,
     pub(super) sekai_commit_lookup:
         Option<Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>>,
+    /// Chisei-owned read port for Sekai facts (lookup-first, context injection).
+    pub(super) sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
 }
 
 #[derive(Clone)]
@@ -343,6 +345,7 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
         }
     }
 
@@ -426,6 +429,7 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
         }
     }
 
@@ -434,6 +438,13 @@ impl ChiseiServiceImpl {
         lookup: Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>,
     ) -> Self {
         self.sekai_commit_lookup = Some(lookup);
+        self
+    }
+
+    /// Attach the Sekai fact reader. Without it, lookup-first and object
+    /// context injection refuse with `sekai_not_attached`.
+    pub fn with_sekai_facts(mut self, facts: crate::chisei::sekai_facts::SekaiFacts) -> Self {
+        self.sekai_facts = facts;
         self
     }
 

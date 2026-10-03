@@ -38,6 +38,7 @@ use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
 use support_mapping::*;
+pub(crate) use support_mapping::{from_proto_grant, from_proto_obj, from_proto_schema_type};
 #[path = "sekai_service_support_domain.rs"]
 mod support_domain;
 use support_domain::*;

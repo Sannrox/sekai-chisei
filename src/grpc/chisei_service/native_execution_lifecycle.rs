@@ -171,8 +171,8 @@ impl ChiseiServiceImpl {
         // selection, residency, egress, or model payload preparation. A
         // complete structured hit must not enter the provider-routing path at
         // all.
-        let lookup_refusal = match evaluate_execute_lookup_first(self.db.runtime(), &input, &actor)
-        {
+        let sekai_facts = self.sekai_facts.reader();
+        let lookup_refusal = match evaluate_execute_lookup_first(sekai_facts, &input, &actor) {
             ExecuteLookupFirst::Hit {
                 response,
                 capability,
@@ -983,7 +983,7 @@ pub(super) fn record_completed_operation_on_with_path(
 
 /// After namespace authz, try allow-listed structured lookup before provider routing.
 pub(super) fn evaluate_execute_lookup_first(
-    db: &RuntimeDb,
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
     input: &ExecutionInput,
     actor: &str,
 ) -> ExecuteLookupFirst {
@@ -997,7 +997,7 @@ pub(super) fn evaluate_execute_lookup_first(
         &input.namespace,
         actor,
         &input.spec,
-        &crate::db::store::ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
+        facts,
     ) {
         Ok(crate::chisei::lookup_first::LookupDecision::Hit {
             answer_json,

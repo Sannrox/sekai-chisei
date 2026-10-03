@@ -31,7 +31,7 @@ template.
 | `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
-| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup (`http://127.0.0.1:50051`) |
+| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup and Sekai fact reads (`http://127.0.0.1:50051`); unset means lookup-first refuses with `sekai_not_attached` |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_ASSERTION_ISSUER` | unset | Audience-bound assertion issuer (#888). All three assertion variables must be set together; partial config is refused |
 | `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |

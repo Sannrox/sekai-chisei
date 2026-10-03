@@ -1024,7 +1024,7 @@ pub(super) async fn run_lookup_first_promotion_gate(
         require_namespace_access(service.db.runtime(), &case.actor, namespace)?;
     }
 
-    let mut report = lookup_first::run_lookup_promotion_gate(&suite, &service.db)
+    let mut report = lookup_first::run_lookup_promotion_gate(&suite, service.sekai_facts.reader())
         .map_err(Status::failed_precondition)?;
     let decision_id = lookup_first::record_lookup_promotion_gate(&service.db, &actor, &report)
         .map_err(Status::internal)?;
