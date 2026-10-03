@@ -544,6 +544,260 @@ fn seed_definition_parent(
     revision
 }
 
+/// Exercise definition reads through the actual assertion interceptor, then
+/// the handler, so transport admission cannot bypass resource authorization.
+#[tokio::test]
+async fn published_definition_assertions_preserve_namespace_and_member_authorization() {
+    use crate::enterprise::{
+        AuthenticatedPrincipal, EnterpriseExtension, ExtensionError, NamespaceAction, TenantContext,
+    };
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tonic::service::Interceptor;
+
+    struct DefinitionReadExtension(Arc<AtomicBool>);
+    impl EnterpriseExtension for DefinitionReadExtension {
+        fn authenticate_bearer(&self, _: &str) -> Result<AuthenticatedPrincipal, ExtensionError> {
+            Err(ExtensionError::CredentialNotFound)
+        }
+        fn authenticate_context(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, ExtensionError> {
+            Err(ExtensionError::CredentialNotFound)
+        }
+        fn tenant_context(
+            &self,
+            _: &AuthenticatedPrincipal,
+        ) -> Result<TenantContext, ExtensionError> {
+            Err(ExtensionError::Unauthenticated)
+        }
+        fn authorize_namespace(
+            &self,
+            context: &TenantContext,
+            namespace: &str,
+            action: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            if self.0.load(Ordering::SeqCst)
+                && context.tenant_id == "tenant-test"
+                && context.subject == "subject-a"
+                && namespace == "allowed"
+                && action == NamespaceAction::Read
+            {
+                Ok(())
+            } else {
+                Err(ExtensionError::PermissionDenied)
+            }
+        }
+        fn authorize_unscoped_namespace(
+            &self,
+            _: &AuthenticatedPrincipal,
+            _: &str,
+            _: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            Err(ExtensionError::PermissionDenied)
+        }
+    }
+
+    let active = Arc::new(AtomicBool::new(true));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(DefinitionReadExtension(active.clone()))),
+        )
+        .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    let parent = seed_definition_parent(&svc, "allowed");
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    let claims = |nonce: &str| IdentityAssertion {
+        contract_version: IDENTITY_ASSERTION_VERSION.into(),
+        issuer: "https://issuer.test".into(),
+        audience: "https://sekai.test".into(),
+        subject: "subject-a".into(),
+        credential_id: "credential-a".into(),
+        credential_kind: "human_session".into(),
+        tenant_id: Some("tenant-test".into()),
+        scopes: vec!["sekai.read".into()],
+        expires_at: chrono::Utc::now().timestamp() + 60,
+        nonce: nonce.into(),
+    };
+    let request = |token: &str, method: &'static str| {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        req.metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("root"));
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+        req
+    };
+    let read = |authenticated: Request<()>, namespace: &str| {
+        let (metadata, extensions, ()) = authenticated.into_parts();
+        Request::from_parts(
+            metadata,
+            extensions,
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+        )
+    };
+    let token = authority.sign(&claims("valid")).unwrap();
+    let authenticated = interceptor
+        .call(request(&token, "GetPublishedDefinitionRevision"))
+        .unwrap();
+    let context = authenticated
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .unwrap();
+    assert_eq!(context.principal.subject, "subject-a");
+    assert_eq!(context.tenant.as_ref().unwrap().tenant_id, "tenant-test");
+    assert_eq!(
+        authenticated.metadata().get("x-principal").unwrap(),
+        "subject-a"
+    );
+    let revision = svc
+        .get_published_definition_revision(read(authenticated, "allowed"))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap();
+    assert_eq!(revision.revision_digest, parent.revision_digest);
+    assert_eq!(
+        interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+
+    for (nonce, namespace, scopes, tenant) in [
+        (
+            "foreign-namespace",
+            "denied",
+            vec!["sekai.read".into()],
+            "tenant-test",
+        ),
+        (
+            "foreign-tenant",
+            "allowed",
+            vec!["sekai.read".into()],
+            "other-tenant",
+        ),
+        ("missing-scope", "allowed", vec![], "tenant-test"),
+    ] {
+        let mut assertion = claims(nonce);
+        assertion.scopes = scopes;
+        assertion.tenant_id = Some(tenant.into());
+        let token = authority.sign(&assertion).unwrap();
+        let authenticated = interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap();
+        assert_eq!(
+            svc.get_published_definition_revision(read(authenticated, namespace))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    for (nonce, object_id, expected) in [
+        (
+            "namespace-grant",
+            "namespace:allowed",
+            tonic::Code::PermissionDenied,
+        ),
+        ("member-grant", "schema:Ticket", tonic::Code::NotFound),
+    ] {
+        let grant = security::Grant {
+            id: nonce.into(),
+            object_id: object_id.into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        svc.security.add_grant(&grant);
+        let token = authority.sign(&claims(nonce)).unwrap();
+        let authenticated = interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap();
+        assert_eq!(
+            svc.get_published_definition_revision(read(authenticated, "allowed"))
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        svc.security.remove_grant(object_id, "other-reader");
+    }
+    active.store(false, Ordering::SeqCst);
+    let token = authority.sign(&claims("revoked-membership")).unwrap();
+    let authenticated = interceptor
+        .call(request(&token, "GetPublishedDefinitionRevision"))
+        .unwrap();
+    assert_eq!(
+        svc.get_published_definition_revision(read(authenticated, "allowed"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    active.store(true, Ordering::SeqCst);
+
+    for (nonce, audience, expires_at) in [
+        (
+            "wrong-audience",
+            "https://other.test",
+            chrono::Utc::now().timestamp() + 60,
+        ),
+        (
+            "expired",
+            "https://sekai.test",
+            chrono::Utc::now().timestamp() - 120,
+        ),
+    ] {
+        let mut assertion = claims(nonce);
+        assertion.audience = audience.into();
+        assertion.expires_at = expires_at;
+        let token = authority.sign(&assertion).unwrap();
+        assert_eq!(
+            interceptor
+                .call(request(&token, "GetPublishedDefinitionRevision"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+    for method in [
+        "CreateDefinitionBranch",
+        "ApplyDefinitionBranchEdit",
+        "ApproveDefinitionProposal",
+        "MergeDefinitionProposal",
+    ] {
+        let token = authority.sign(&claims(method)).unwrap();
+        assert_eq!(
+            interceptor
+                .call(request(&token, method))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+}
+
 #[tokio::test]
 async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
     let svc = service();
