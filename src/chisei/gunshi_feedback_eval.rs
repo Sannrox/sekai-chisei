@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{Assertion, Case, Suite};
 use crate::chisei::gunshi::{OperatorResponse, ResourceSelection};
 use crate::chisei::gunshi_feedback::{FEEDBACK_RECORD_VERSION, GunshiFeedbackRecord};
 use crate::db::store::{ChiseiDecisionStore, ChiseiEvalStore, ChiseiStore};
-use crate::sekai::audit::Decision;
 
 pub const FEEDBACK_SUITE_PREFIX: &str = "feedback-";
 pub const PROMOTE_ACTION: &str = "gunshi.feedback_promoted_to_eval";

@@ -477,7 +477,7 @@ pub fn record_lookup_promotion_gate(
     evidence.insert("passed".into(), report.passed.to_string());
     evidence.insert("failed".into(), report.failed.to_string());
     let verdict = report.verdict.as_str();
-    db.record_decision(&crate::sekai::audit::Decision {
+    db.record_decision(&crate::chisei::decision_ledger::Decision {
         id: decision_id.clone(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: actor.into(),
