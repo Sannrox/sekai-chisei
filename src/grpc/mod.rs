@@ -342,6 +342,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "Traverse"
             | "ListObjectChanges"
             | "GetPublishedDefinitionRevision"
+            | "GetDefinitionMember"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "PlanExecution"

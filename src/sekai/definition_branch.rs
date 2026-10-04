@@ -23,6 +23,7 @@ pub const MAX_DEFINITION_KIND_BYTES: usize = 64;
 
 const KNOWN_MEMBER_KINDS: &[&str] = &[
     "action_type",
+    "agent",
     "control",
     "function",
     "interface_type",
@@ -175,6 +176,12 @@ impl DefinitionMemberInput {
             .map_err(|error| format!("definition_json must be valid JSON: {error}"))?;
         if !value.is_object() {
             return Err("definition_json must be a JSON object".into());
+        }
+        if self.member_kind == "agent" {
+            let agent: crate::sekai::agent_definition::AgentDefinition =
+                serde_json::from_value(value.clone())
+                    .map_err(|_| "invalid Agent definition document")?;
+            agent.validate()?;
         }
         let canonical = crate::shomei::canonical_json_with_finite_numbers(&value)?;
         let definition_json =
@@ -340,6 +347,9 @@ pub fn prepare_revision(
         return Err("revision exceeds the supported member count".into());
     }
     let members = by_identity.into_values().collect::<Vec<_>>();
+    if published && members.iter().any(|member| member.member_kind == "agent") {
+        return Err("agent_promotion_requires_certification".into());
+    }
     let digest_input = RevisionDigestInput {
         contract_version: REVISION_CONTRACT_VERSION,
         namespace,

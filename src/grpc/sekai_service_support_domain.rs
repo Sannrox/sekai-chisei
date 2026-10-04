@@ -950,6 +950,8 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("fact_migration_limit")
     {
         Status::failed_precondition("definition write is not current")
+    } else if error == "agent_promotion_requires_certification" {
+        Status::failed_precondition("agent_promotion_requires_certification")
     } else if let Some(gate) = error.strip_prefix("compatibility_gate:") {
         Status::failed_precondition(format!("compatibility_gate:{gate}"))
     } else if error.starts_with("unknown_definition_construct") {

@@ -82,6 +82,7 @@ there cannot be decided on that runtime.
 | `SekaiService.ApproveDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.MergeDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.CloseDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionMember` | `sekai.definition-branch` | yes | generated gRPC client | `experimental` |
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |

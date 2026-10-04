@@ -11076,3 +11076,253 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
         server.await.unwrap();
     }
 }
+/// Exact-revision document reads retain transport scopes, grants, and integrity checks.
+#[tokio::test]
+async fn agent_definition_member_read_crosses_server_transport() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tower::Layer;
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let store = crate::db::store::SekaiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+        sqlite.clone(),
+    )));
+    let svc = SekaiServiceImpl::new(store.clone());
+    let parent = seed_definition_parent(&svc, "allowed");
+    sqlite
+        .create_definition_branch(
+            &definition_branch_domain::CreateDefinitionBranch {
+                namespace: "allowed".into(),
+                branch_id: "agent-draft".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create".into(),
+            },
+            "author",
+            2,
+        )
+        .unwrap();
+    let agent = definition_branch_domain::DefinitionMemberInput {
+        member_kind: "agent".into(), member_id: "triage".into(), member_digest: String::new(),
+        definition_json: serde_json::json!({"contract_version":"sekai.agent-definition/v1","name":"Triage","task_class":"lookup","instructions":"Inspect records.","allowed_action_types":["Ticket.inspect"]}).to_string()
+    };
+    let definition_branch_domain::DefinitionWriteResult::ApplyEdit { result } = sqlite
+        .apply_definition_branch_edit(
+            &definition_branch_domain::ApplyDefinitionBranchEdit {
+                namespace: "allowed".into(),
+                branch_id: "agent-draft".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![agent.clone()],
+                removals: Vec::new(),
+                idempotency_key: "edit".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected draft")
+    };
+    let revision = result.revision.revision_digest.clone();
+    let security = svc.security.clone();
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true)
+                .layer(crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(svc)),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap()
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let claims = || IdentityAssertion {
+        contract_version: IDENTITY_ASSERTION_VERSION.into(),
+        issuer: "https://issuer.test".into(),
+        audience: "https://sekai.test".into(),
+        subject: "subject-a".into(),
+        credential_id: "credential-a".into(),
+        credential_kind: "human_session".into(),
+        tenant_id: Some("tenant-test".into()),
+        scopes: vec!["sekai.read".into()],
+        expires_at: chrono::Utc::now().timestamp() + 30,
+        nonce: uuid::Uuid::new_v4().to_string(),
+    };
+    let request = |assertion: &IdentityAssertion, namespace: &str, digest: &str, id: &str| {
+        let mut request = Request::new(GetDefinitionMemberRequest {
+            namespace: namespace.into(),
+            revision_digest: digest.into(),
+            member_kind: "agent".into(),
+            member_id: id.into(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(assertion).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    };
+    let assertion = claims();
+    let response = client
+        .get_definition_member(request(&assertion, "allowed", &revision, "triage"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.revision_digest, revision);
+    let member = response.member.unwrap();
+    assert_eq!(
+        member.definition_json,
+        agent.prepare("allowed").unwrap().definition_json
+    );
+    assert_eq!(
+        member.member_digest,
+        agent.prepare("allowed").unwrap().member_digest
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&assertion, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&claims(), "foreign", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let missing = client
+        .get_definition_member(request(&claims(), "allowed", &revision, "absent"))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    let mut no_scope = claims();
+    no_scope.scopes.clear();
+    assert_eq!(
+        client
+            .get_definition_member(request(&no_scope, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut expired = claims();
+    expired.expires_at -= 150;
+    assert_eq!(
+        client
+            .get_definition_member(request(&expired, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let mut wrong_audience = claims();
+    wrong_audience.audience = "https://other.test".into();
+    assert_eq!(
+        client
+            .get_definition_member(request(&wrong_audience, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&claims(), "allowed", "invalid", "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    for (index, object_id) in ["schema:agent:triage", "schema:Ticket"]
+        .into_iter()
+        .enumerate()
+    {
+        let grant = security::Grant {
+            id: format!("deny-{index}"),
+            object_id: object_id.into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        security.add_grant(&grant);
+        let denied = client
+            .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), missing.code());
+        assert_eq!(denied.message(), missing.message());
+        security.remove_grant(&grant.object_id, &grant.principal);
+    }
+    // Valid documents must still match their storage lookup identity.
+    let original_body = serde_json::to_string(&result.revision).unwrap();
+    for substituted in [
+        parent.clone(),
+        definition_branch_domain::prepare_revision("foreign", "", Vec::new(), false, "author", 4)
+            .unwrap(),
+    ] {
+        sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+            rusqlite::params![serde_json::to_string(&substituted).unwrap(), revision]).unwrap();
+        let corrupt = client
+            .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+            .await
+            .unwrap_err();
+        assert_eq!(corrupt.code(), tonic::Code::Internal);
+        assert_eq!(corrupt.message(), "definition member unavailable");
+    }
+    sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+        rusqlite::params![original_body, revision]).unwrap();
+    sqlite
+        .conn()
+        .execute(
+            "UPDATE sekai_definition_members SET body_json = '{}' WHERE member_kind = 'agent'",
+            [],
+        )
+        .unwrap();
+    let corrupt = client
+        .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+        .await
+        .unwrap_err();
+    assert_eq!(corrupt.code(), tonic::Code::Internal);
+    assert_eq!(corrupt.message(), "definition member unavailable");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[test]
+fn agent_certification_refusal_has_public_precondition_status() {
+    let error = map_definition_write_error("agent_promotion_requires_certification".into());
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "agent_promotion_requires_certification");
+}
