@@ -1993,6 +1993,26 @@ message CreateDefinitionBranchResponse {
   DefinitionBranch branch = 1;
 }
 
+// Read one immutable body bound to the requested namespace and revision.
+message GetDefinitionMemberRequest {
+  string namespace = 1;
+  string revision_digest = 2;
+  string member_kind = 3;
+  string member_id = 4;
+}
+message DefinitionMember {
+  string contract_version = 1;
+  string namespace = 2;
+  string member_kind = 3;
+  string member_id = 4;
+  string definition_json = 5;
+  string member_digest = 6;
+}
+message GetDefinitionMemberResponse {
+  DefinitionMember member = 1;
+  string revision_digest = 2;
+}
+
 message GetDefinitionBranchRequest {
   string namespace = 1;
   string branch_id = 2;
@@ -2323,6 +2343,7 @@ service SekaiService {
   rpc InspectSourceTypeDescriptor(InspectSourceTypeDescriptorRequest) returns (InspectSourceTypeDescriptorResponse);
   rpc RetireSourceTypeDescriptor(RetireSourceTypeDescriptorRequest) returns (RetireSourceTypeDescriptorResponse);
   rpc CreateDefinitionBranch(CreateDefinitionBranchRequest) returns (CreateDefinitionBranchResponse);
+  rpc GetDefinitionMember(GetDefinitionMemberRequest) returns (GetDefinitionMemberResponse);
   rpc GetDefinitionBranch(GetDefinitionBranchRequest) returns (GetDefinitionBranchResponse);
   rpc ApplyDefinitionBranchEdit(ApplyDefinitionBranchEditRequest) returns (ApplyDefinitionBranchEditResponse);
   rpc CreateDefinitionProposal(CreateDefinitionProposalRequest) returns (CreateDefinitionProposalResponse);

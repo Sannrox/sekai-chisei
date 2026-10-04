@@ -11,11 +11,12 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
 use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
-use crate::sekai::audit::{Decision, insert_object_changes, object_diff_changes};
+use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 
 pub const MIN_RECURRING_TASKS: usize = 3;
 pub const MIN_SUCCESSFUL_TASKS: usize = 2;
@@ -1026,7 +1027,7 @@ fn insert_registry_decision(
     evidence: BTreeMap<String, String>,
     now: i64,
 ) -> Result<(), CapabilityRegistryError> {
-    let decision = crate::sekai::audit::Decision {
+    let decision = crate::chisei::decision_ledger::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: now,
         actor: actor.into(),
@@ -1036,7 +1037,8 @@ fn insert_registry_decision(
         target_id: target_id.into(),
         outcome: outcome.into(),
     };
-    crate::sekai::ledger::insert_chained_decision(conn, &decision).map_err(registry_storage)?;
+    crate::chisei::decision_ledger::insert_chained_decision(conn, &decision)
+        .map_err(registry_storage)?;
     Ok(())
 }
 
@@ -1078,18 +1080,17 @@ fn record_capability_decision(
     evidence: BTreeMap<String, String>,
     now: i64,
 ) -> Result<(), CapabilityGateError> {
-    db.runtime()
-        .record_decision(&Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: actor.to_string(),
-            action: action.to_string(),
-            reason: reason.to_string(),
-            evidence: evidence.into_iter().collect(),
-            target_id: proposal.id.clone(),
-            outcome: outcome.to_string(),
-        })
-        .map_err(CapabilityGateError::Audit)
+    db.record_decision(&Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now,
+        actor: actor.to_string(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        evidence: evidence.into_iter().collect(),
+        target_id: proposal.id.clone(),
+        outcome: outcome.to_string(),
+    })
+    .map_err(CapabilityGateError::Audit)
 }
 
 fn normalize_task_class(value: &str) -> String {
@@ -1134,8 +1135,8 @@ fn is_terminal(status: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::decision_ledger::DecisionFilter;
     use crate::chisei::eval::{CaseResult, Run};
-    use crate::sekai::audit::DecisionFilter;
 
     fn observation(
         id: &str,
@@ -1406,7 +1407,6 @@ mod tests {
 
         assert_eq!(proposal.status, PROPOSAL_APPROVED);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(proposal.id.clone()),
                 limit: 10,
@@ -1515,7 +1515,6 @@ mod tests {
         assert_eq!(authorization.proposal_id, proposal.id);
         assert_eq!(authorization.approved_by, "reviewer");
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(proposal.id.clone()),
                 limit: 10,
@@ -1640,7 +1639,6 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].status, CAPABILITY_ACTIVE);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 action: Some("capability_registered".to_string()),
                 target_id: Some(first.id),
@@ -1705,7 +1703,6 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].status, CAPABILITY_REVOKED);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(registered.id),
                 limit: 10,

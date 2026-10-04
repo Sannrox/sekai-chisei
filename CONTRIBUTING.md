@@ -30,8 +30,10 @@ lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 1. Install the compiler pinned in `rust-toolchain.toml` (Rust 2024 edition).
 2. Clone the repository.
 3. Copy `.env.example` to `.env` if you need local overrides. Combined
-   `cargo run` does not load `.env`; export `SEKAI_DB_PATH` and
-   `CHISEI_DB_PATH` (or `SEKAI_SHARED_STORE=1` for a single file). See
+   `cargo run` does not load `.env`. With no store variable it opens split
+   `sekai.db` and `chisei.db` under `SEKAI_DATA_DIR` (default `./data`);
+   `SEKAI_DB_PATH` and `CHISEI_DB_PATH` override the files (or
+   `SEKAI_SHARED_STORE=1` with `DB_PATH` for a single file). See
    [configuration](docs/configuration.md).
 4. Run the standard checks:
 
@@ -45,10 +47,10 @@ Those aliases in `.cargo/config.toml` are what CI runs: `fmt --all -- --check`,
 `clippy --workspace --all-targets --locked -- -D warnings`, and
 `test --workspace --locked`.
 
-Start a trusted local Combined server with the dest-pair:
+Start a trusted local Combined server (split stores under `./data`):
 
 ```bash
-SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
+SEKAI_INSECURE=1 cargo run
 ```
 
 Separate `sekai-plane` and `chisei-plane` processes are documented in
@@ -83,9 +85,29 @@ The build vendors `protoc`; a system installation is not required.
   (including streams), `/v1/models`, and fail-closed when the control plane is
   down. It does not require live provider credentials.
 
+The ignored Ollama test requires a local compatible endpoint and model:
+
+```bash
+cargo test --test ollama_e2e -- --ignored
+```
+
 Changes to provider routing, LLM calls, authentication, authorization,
 persistence, migrations, evidence, retention, or coordination require focused
 tests for the affected path.
+
+## Project layout
+
+| Path | Responsibility |
+| --- | --- |
+| [`proto/`](proto/) | Public gRPC service definitions |
+| [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
+| [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
+| [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
+| [`crates/sekai-provider/`](crates/sekai-provider/) | Provider registry, adapters, pricing, and shared receipt contracts |
+| [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
+| [`adapters/`](adapters/) | External evidence and workflow reference adapters |
+| [`examples/`](examples/) | Runnable integration examples |
+| [`tests/`](tests/) | Integration tests and deterministic fixtures |
 
 ## Design expectations
 

@@ -38,6 +38,7 @@ use support_access::*;
 #[path = "sekai_service_support_mapping.rs"]
 mod support_mapping;
 use support_mapping::*;
+pub(crate) use support_mapping::{from_proto_grant, from_proto_obj, from_proto_schema_type};
 #[path = "sekai_service_support_domain.rs"]
 mod support_domain;
 use support_domain::*;
@@ -395,6 +396,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<CreateDefinitionBranchRequest>,
     ) -> Result<Response<CreateDefinitionBranchResponse>, Status> {
         rpc_definitions::create_definition_branch(self, req).await
+    }
+
+    async fn get_definition_member(
+        &self,
+        req: Request<GetDefinitionMemberRequest>,
+    ) -> Result<Response<GetDefinitionMemberResponse>, Status> {
+        rpc_definitions::get_definition_member(self, req).await
     }
 
     async fn get_definition_branch(

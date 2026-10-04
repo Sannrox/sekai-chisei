@@ -11,7 +11,7 @@ use crate::chisei::gunshi::{
     load_kioku_evidence,
 };
 use crate::chisei::receipt::ReceiptEventKind;
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiReceiptStore, ChiseiStore};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoDispatchPolicy {
@@ -296,10 +296,7 @@ fn dispatch_evidence_matches_receipt(
     let Some(request_id) = evidence.receipt_reference.as_deref() else {
         return Ok(false);
     };
-    let Some(receipt) = db
-        .runtime()
-        .find_operation_receipt_by_request_id(request_id)?
-    else {
+    let Some(receipt) = db.find_operation_receipt_by_request_id(request_id)? else {
         return Ok(false);
     };
     if !receipt.completeness().complete
@@ -510,59 +507,58 @@ mod tests {
                 references: Vec::new(),
                 attributes,
             };
-        db.runtime()
-            .put_operation_receipt(&OperationReceipt {
-                version: OPERATION_RECEIPT_VERSION.into(),
-                operation_id: "receipt-op-1".into(),
-                parent_operation_id: None,
-                namespace: "support".into(),
-                operation_class: "triage".into(),
-                initiating_actor: "agent:test".into(),
-                schema_version: "schema-v1".into(),
-                policy_version: "governance-v1".into(),
-                started_at_ms: 1,
-                completed_at_ms: Some(2),
-                events: vec![
-                    event(
-                        "intent",
-                        None,
-                        ReceiptEventKind::IntentRecorded,
-                        BTreeMap::from([("request_id".into(), "receipt-1".into())]),
-                    ),
-                    event(
-                        "policy",
-                        Some("intent"),
-                        ReceiptEventKind::PolicyDecided,
-                        BTreeMap::new(),
-                    ),
-                    event(
-                        "route",
-                        Some("policy"),
-                        ReceiptEventKind::RouteSelected,
-                        BTreeMap::from([("resolved_model".into(), "local".into())]),
-                    ),
-                    event(
-                        "budget",
-                        Some("route"),
-                        ReceiptEventKind::BudgetDecided,
-                        BTreeMap::new(),
-                    ),
-                    event(
-                        "outcome",
-                        Some("budget"),
-                        ReceiptEventKind::OutcomeRecorded,
-                        BTreeMap::from([
-                            ("passed".into(), "true".into()),
-                            ("score".into(), "90".into()),
-                        ]),
-                    ),
-                ],
-                uncovered_surfaces: Vec::new(),
-                reporter_grants: Vec::new(),
-                ontology_digest: None,
-                artifact: None,
-            })
-            .unwrap();
+        db.put_operation_receipt(&OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: "receipt-op-1".into(),
+            parent_operation_id: None,
+            namespace: "support".into(),
+            operation_class: "triage".into(),
+            initiating_actor: "agent:test".into(),
+            schema_version: "schema-v1".into(),
+            policy_version: "governance-v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(2),
+            events: vec![
+                event(
+                    "intent",
+                    None,
+                    ReceiptEventKind::IntentRecorded,
+                    BTreeMap::from([("request_id".into(), "receipt-1".into())]),
+                ),
+                event(
+                    "policy",
+                    Some("intent"),
+                    ReceiptEventKind::PolicyDecided,
+                    BTreeMap::new(),
+                ),
+                event(
+                    "route",
+                    Some("policy"),
+                    ReceiptEventKind::RouteSelected,
+                    BTreeMap::from([("resolved_model".into(), "local".into())]),
+                ),
+                event(
+                    "budget",
+                    Some("route"),
+                    ReceiptEventKind::BudgetDecided,
+                    BTreeMap::new(),
+                ),
+                event(
+                    "outcome",
+                    Some("budget"),
+                    ReceiptEventKind::OutcomeRecorded,
+                    BTreeMap::from([
+                        ("passed".into(), "true".into()),
+                        ("score".into(), "90".into()),
+                    ]),
+                ),
+            ],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: None,
+        })
+        .unwrap();
         db
     }
 

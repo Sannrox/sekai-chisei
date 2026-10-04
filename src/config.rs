@@ -86,7 +86,7 @@ impl Config {
             http_port: optional_port("SEKAI_HTTP_PORT", "50080"),
             http_bind: env("SEKAI_HTTP_BIND", "127.0.0.1"),
             sekai_socket: socket_path("SEKAI_SOCKET", "./data/sekai.sock"),
-            db_path: env("DB_PATH", "./data/sekai.db"),
+            db_path: crate::combined_stores::default_sekai_sqlite_path(),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
             openai_api_key: env::var("OPENAI_API_KEY").ok(),
             ollama_url: env("OLLAMA_URL", "http://localhost:11434"),

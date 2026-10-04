@@ -1064,6 +1064,9 @@ fn load_revision_sqlite(
             let revision: DefinitionRevision = serde_json::from_str(&body)
                 .map_err(|error| format!("corrupt definition revision: {error}"))?;
             revision.verify()?;
+            if revision.namespace != namespace || revision.revision_digest != revision_digest {
+                return Err("corrupt definition revision: lookup identity mismatch".into());
+            }
             Ok(revision)
         })
         .transpose()
@@ -1287,7 +1290,11 @@ fn load_members_sqlite(
         let member: DefinitionMember = serde_json::from_str(&body)
             .map_err(|error| format!("corrupt definition member: {error}"))?;
         member.verify()?;
-        if member.member_kind != reference.member_kind || member.member_id != reference.member_id {
+        if member.namespace != revision.namespace
+            || member.member_digest != reference.member_digest
+            || member.member_kind != reference.member_kind
+            || member.member_id != reference.member_id
+        {
             return Err("corrupt definition revision: member identity mismatch".into());
         }
         members.push(member);

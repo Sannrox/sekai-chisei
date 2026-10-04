@@ -14,7 +14,7 @@ use crate::chisei::receipt::{
 use crate::db::chisei_operation_reservation::{
     OperationReservation, RESERVATION_FINALIZED, RESERVATION_PENDING, RESERVATION_RELEASED,
 };
-use crate::db::store::{ChiseiStore, SekaiStore};
+use crate::db::store::{ChiseiReceiptStore, ChiseiStore, SekaiStore};
 use crate::sekai::action_instance::{
     compute_request_digest_with_envelope, submit_budget_subject, validate_parameters_json,
 };
@@ -64,7 +64,7 @@ impl CrossStoreAdmission {
         sekai: SekaiStore,
         budget: Option<Arc<BudgetTracker>>,
     ) -> Self {
-        let distinct_stores = !std::sync::Arc::ptr_eq(&chisei.runtime_arc(), &sekai.runtime_arc());
+        let distinct_stores = !chisei.shares_physical_store_with(&sekai);
         Self {
             chisei,
             sekai,
@@ -113,7 +113,6 @@ impl CrossStoreAdmission {
 
         if let Some(existing) = self
             .chisei
-            .runtime()
             .get_operation_reservation(namespace, &operation_id)
             .map_err(ActionInstanceAdmissionError::Internal)?
         {
@@ -154,7 +153,6 @@ impl CrossStoreAdmission {
         };
         let stored = self
             .chisei
-            .runtime()
             .put_operation_reservation(&reservation)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
@@ -195,7 +193,6 @@ impl CrossStoreAdmission {
         }
         let stored = self
             .chisei
-            .runtime()
             .put_operation_reservation(&next)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         if self.distinct_stores {
@@ -226,7 +223,6 @@ impl CrossStoreAdmission {
         next.updated_at_ms = now_ms;
         next.incurred_usage = 0;
         self.chisei
-            .runtime()
             .put_operation_reservation(&next)
             .map_err(ActionInstanceAdmissionError::Internal)
     }
@@ -257,7 +253,6 @@ impl CrossStoreAdmission {
     ) -> Result<Vec<OperationReservation>, ActionInstanceAdmissionError> {
         let pending = self
             .chisei
-            .runtime()
             .list_pending_operation_reservations(256)
             .map_err(ActionInstanceAdmissionError::Internal)?;
         pending
@@ -338,7 +333,6 @@ impl CrossStoreAdmission {
             artifact: None,
         };
         self.chisei
-            .runtime()
             .put_operation_receipt(&receipt)
             .map_err(ActionInstanceAdmissionError::Internal)
     }
@@ -505,7 +499,6 @@ mod tests {
         assert_eq!(outcome.instance.status, "admitted");
         let still = clerk
             .chisei
-            .runtime()
             .get_operation_reservation("acme", "op-commit")
             .unwrap()
             .unwrap();
@@ -564,7 +557,6 @@ mod tests {
         let outcome = clerk.admit(request("op-receipts"), "alice", 10).unwrap();
         let chisei_receipt = clerk
             .chisei
-            .runtime()
             .get_operation_receipt("op-receipts")
             .unwrap()
             .expect("chisei decision receipt");
@@ -583,7 +575,6 @@ mod tests {
         assert_eq!(
             clerk
                 .chisei
-                .runtime()
                 .get_operation_reservation("acme", "op-receipts")
                 .unwrap()
                 .unwrap()
@@ -602,7 +593,6 @@ mod tests {
         clerk.admit(request("op-shared"), "alice", 10).unwrap();
         let receipt = clerk
             .chisei
-            .runtime()
             .get_operation_receipt("op-shared")
             .unwrap()
             .expect("shared receipt");

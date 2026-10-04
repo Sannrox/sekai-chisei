@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::chisei::decision_ledger::Decision;
 use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
-use crate::db::store::ChiseiStore;
-use crate::sekai::audit::Decision;
+use crate::db::store::{ChiseiBudgetStore, ChiseiDecisionStore, ChiseiStore};
 
 pub use crate::db::chisei_budget::BudgetTransferRecord;
 
@@ -257,7 +257,6 @@ impl BudgetTracker {
             home_site_id.trim()
         };
         self.db
-            .runtime()
             .budget_set_limit_scoped(
                 scope_id,
                 metric,
@@ -284,7 +283,6 @@ impl BudgetTracker {
             // without a shared pool; pool ceilings are for transfer topology.
         }
         self.db
-            .runtime()
             .budget_set_pool_ceiling(pool_id, metric, max_amount, period.as_str())
     }
 
@@ -298,7 +296,7 @@ impl BudgetTracker {
         estimated: i32,
         metric: &str,
     ) -> Result<(), String> {
-        self.db.runtime().budget_check_chain_for_site(
+        self.db.budget_check_chain_for_site(
             scope_id,
             metric,
             estimated as i64,
@@ -321,7 +319,7 @@ impl BudgetTracker {
         estimated: i32,
         metric: &str,
     ) -> Result<(), String> {
-        self.db.runtime().budget_check_and_reserve_chain_for_site(
+        self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             metric,
             estimated as i64,
@@ -339,7 +337,7 @@ impl BudgetTracker {
         estimated: i32,
         idempotency_key: &str,
     ) -> Result<(), String> {
-        self.db.runtime().budget_check_and_reserve_chain_for_site(
+        self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             METRIC_TOKENS,
             i64::from(estimated),
@@ -369,12 +367,8 @@ impl BudgetTracker {
             ));
         }
         if self.topology.partition_simulated {
-            let had = self
-                .db
-                .runtime()
-                .budget_get_transfer(transfer_id)?
-                .is_some();
-            let refused = self.db.runtime().budget_record_transfer_refused(
+            let had = self.db.budget_get_transfer(transfer_id)?.is_some();
+            let refused = self.db.budget_record_transfer_refused(
                 transfer_id,
                 metric,
                 from_scope_id,
@@ -392,12 +386,8 @@ impl BudgetTracker {
                 refused.reason
             ));
         }
-        let had = self
-            .db
-            .runtime()
-            .budget_get_transfer(transfer_id)?
-            .is_some();
-        let record = self.db.runtime().budget_transfer_capacity(
+        let had = self.db.budget_get_transfer(transfer_id)?.is_some();
+        let record = self.db.budget_transfer_capacity(
             transfer_id,
             metric,
             from_scope_id,
@@ -413,7 +403,7 @@ impl BudgetTracker {
     }
 
     pub fn get_transfer(&self, transfer_id: &str) -> Result<Option<BudgetTransferRecord>, String> {
-        self.db.runtime().budget_get_transfer(transfer_id)
+        self.db.budget_get_transfer(transfer_id)
     }
 
     fn audit_transfer(&self, record: &BudgetTransferRecord, actor: &str) -> Result<(), String> {
@@ -444,7 +434,7 @@ impl BudgetTracker {
             target_id: record.from_scope_id.clone(),
             outcome: record.status.clone(),
         };
-        self.db.runtime().record_decision(&decision)
+        self.db.record_decision(&decision)
     }
 
     /// Adjust reservation to actual usage after the call completes.
@@ -454,7 +444,7 @@ impl BudgetTracker {
 
     pub fn adjust_with_metric(&self, scope_id: &str, reserved: i32, actual: i32, metric: &str) {
         let delta = actual as i64 - reserved as i64;
-        if let Err(err) = self.db.runtime().budget_adjust_chain_for_site(
+        if let Err(err) = self.db.budget_adjust_chain_for_site(
             scope_id,
             metric,
             delta,
@@ -471,7 +461,7 @@ impl BudgetTracker {
     }
 
     pub fn record_with_metric(&self, scope_id: &str, amount: i32, metric: &str) {
-        if let Err(err) = self.db.runtime().budget_adjust_chain_for_site(
+        if let Err(err) = self.db.budget_adjust_chain_for_site(
             scope_id,
             metric,
             amount as i64,
@@ -493,13 +483,10 @@ impl BudgetTracker {
         // Idempotent record still goes through the shared store; pin is
         // enforced on positive debits of limited scopes.
         if amount > 0 && self.require_home_pin() {
-            self.db.runtime().budget_assert_home_writable(
-                scope_id,
-                metric,
-                self.local_site_id(),
-            )?;
+            self.db
+                .budget_assert_home_writable(scope_id, metric, self.local_site_id())?;
         }
-        self.db.runtime().budget_record_idempotent(
+        self.db.budget_record_idempotent(
             scope_id,
             metric,
             i64::from(amount),
@@ -515,7 +502,6 @@ impl BudgetTracker {
     pub fn get_usage_with_metric(&self, scope_id: &str, metric: &str) -> Usage {
         let (used, max, period_type) = self
             .db
-            .runtime()
             .budget_usage(scope_id, metric, now_ms())
             .unwrap_or((0, 0, "daily".to_string()));
         Usage {
@@ -590,7 +576,6 @@ impl BudgetTracker {
     pub fn namespace_pressure(&self, namespace: &str) -> PressureLevel {
         let level = self
             .db
-            .runtime()
             .budget_namespace_pressure(namespace, METRIC_TOKENS, now_ms())
             .unwrap_or(0);
         match level {
@@ -798,8 +783,7 @@ mod tests {
 
         // Audit decision recorded.
         let decisions = db
-            .runtime()
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
                 action: Some("budget.transfer".into()),
                 target_id: Some("region:us".into()),
                 ..Default::default()

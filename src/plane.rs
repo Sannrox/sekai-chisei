@@ -6,7 +6,8 @@
 //! destination variables or a store already stamped for the other plane.
 
 use crate::combined_stores::{
-    CombinedStoreLayout, CombinedStoreSources, StoreIdentity, optional_trimmed_env,
+    CHISEI_STORE_FILE, CombinedStoreLayout, CombinedStoreSources, SEKAI_STORE_FILE, StoreIdentity,
+    data_dir_file, optional_trimmed_env,
 };
 use crate::db::store_plane::{StorePlaneRole, ensure_store_plane};
 use crate::runtime_backend::{
@@ -78,12 +79,23 @@ fn open_owned_layout(
     refuse_foreign_destinations(role, &sources)?;
     let backend = sources.backend.unwrap_or(BackendIdentity::Sqlite);
     let default_sqlite_path = sources.default_sqlite_path.as_str();
+    // No store variable: this plane derives only its own file in the data dir.
+    let derived = sources.data_dir.as_deref().map(|dir| {
+        data_dir_file(
+            dir,
+            match role {
+                StorePlaneRole::Sekai => SEKAI_STORE_FILE,
+                StorePlaneRole::Chisei => CHISEI_STORE_FILE,
+            },
+        )
+    });
     let (path, url) = match role {
         StorePlaneRole::Sekai => (
             sources
                 .sekai_sqlite_path
                 .as_deref()
                 .or(sources.legacy_sqlite_path.as_deref())
+                .or(derived.as_deref())
                 .unwrap_or(default_sqlite_path),
             sources
                 .sekai_postgres_url
@@ -91,7 +103,7 @@ fn open_owned_layout(
                 .or(sources.legacy_postgres_url.as_deref()),
         ),
         StorePlaneRole::Chisei => match (
-            sources.chisei_sqlite_path.as_deref(),
+            sources.chisei_sqlite_path.as_deref().or(derived.as_deref()),
             sources.chisei_postgres_url.as_deref(),
             backend,
         ) {

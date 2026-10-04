@@ -70,8 +70,15 @@ cp .env.example .env
 ```
 
 Start Combined in one terminal. `cargo run` reads the process environment
-only; it does not load `.env` (`sekaictl launch` does). Export the dest-pair
-from [`.env.example`](.env.example):
+only; it does not load `.env` (`sekaictl launch` does). With no store
+variable set, Combined opens split `./data/sekai.db` and `./data/chisei.db`:
+
+```bash
+SEKAI_INSECURE=1 cargo run
+```
+
+`SEKAI_DATA_DIR` moves that directory. The dest-pair from
+[`.env.example`](.env.example) overrides the files explicitly:
 
 ```bash
 SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
@@ -96,43 +103,6 @@ domain-neutral examples; your domain concepts live in your own ontology and
 seed documents. Continue with the [ontology guide](docs/ontology.md) for
 separate apply, seed, run, and receipt commands.
 
-### Reference ontology domain pack
-
-The lookup-first density demo at
-`tests/fixtures/lookup_first/reference_domain/` is a small reliability graph:
-services depend on services, teams own services, and incidents connect to
-services and runbooks. Load it with the normal product-loop commands:
-
-```bash
-PACK=tests/fixtures/lookup_first/reference_domain
-cargo run --bin sekaictl -- ontology apply --file "$PACK/domain-v1.json"
-cargo run --bin sekaictl -- ontology seed --file "$PACK/seed-v1.json"
-
-cargo run --bin sekaictl -- ontology run \
-  --namespace reliability-demo \
-  --task-type sekai.semantic.resolve_ref \
-  --spec '{"external_id":"service:checkout-api"}'
-cargo run --bin sekaictl -- ontology run \
-  --namespace reliability-demo \
-  --task-type sekai.semantic.expand_relations \
-  --spec '{"root":{"object_id":"svc-checkout-api"},"relations":["service_depends_on","service_owned_by"],"direction":"outgoing","max_depth":2}'
-cargo run --bin sekaictl -- ontology run \
-  --namespace reliability-demo \
-  --task-type sekai.context.retrieve \
-  --spec '{"roots":[{"object_id":"svc-checkout-api"}],"direction":"both","max_depth":2}'
-cargo run --bin sekaictl -- ontology run \
-  --namespace reliability-demo \
-  --task-type sekai.semantic.explain_derivation \
-  --spec '{"from":{"object_id":"svc-checkout-api"},"to":{"object_id":"svc-ledger"},"relations":["service_depends_on"],"direction":"outgoing","max_depth":2}'
-```
-
-The expected outcomes are recorded in
-`lookup-first-v1.json`: `lookup_hit` for the four complete resolve/expand/
-retrieve/explain cases, and `model_path` with `lookup_refusal=incomplete` for
-the intentionally unknown service. This is an example domain, not product
-ontology; its classes, kinds, relations, and objects are not built into the
-server or core protocol.
-
 Verify the service and repository:
 
 ```bash
@@ -143,69 +113,6 @@ curl --fail http://127.0.0.1:9464/healthz
 `SEKAI_INSECURE=1` is only for trusted local development. Read the
 [operations and security guide](docs/operations.md) before binding to a
 network-accessible interface.
-
-### Optional: connect an existing client
-
-The compatibility gateway lets Codex, Claude Code, and OpenAI- or
-Anthropic-compatible clients use the same control plane:
-
-```bash
-cargo run --bin sekaictl -- doctor codex-app
-cargo run --bin sekaictl -- launch codex-app
-```
-
-For Claude Code, replace `codex-app` with `claude-code`. Add
-`OPENAI_API_KEY` or `ANTHROPIC_API_KEY` when the gateway should own provider
-credentials; supported client-subscription passthrough paths are also
-available.
-
-See [Gateway and clients](docs/gateway.md) for routing, upstream modes, manual
-setup, smoke checks, and security boundaries.
-
-### Local ontology tool
-
-The `sekai` CLI is a standalone tool for portable ontology databases. It does
-not require the control-plane server or network access.
-
-Install it:
-
-```bash
-cargo install --path crates/sekai-ontology
-```
-
-The database is resolved in this order (first match wins):
-
-1. `--db <path>` (explicit flag)
-2. `SEKAI_DB` environment variable
-3. The nearest existing `.sekai/knowledge.db` while walking upward from the
-   current directory
-4. User-level default (if the file exists):
-   - macOS: `~/Library/Application Support/sekai/knowledge.db`
-   - Linux: `${XDG_DATA_HOME:-~/.local/share}/sekai/knowledge.db`
-5. `knowledge.db` in the current directory
-
-Create and use an ontology:
-
-```bash
-sekai setup --scope project --prune # scoped .sekai/knowledge.db, directory facts, skill
-sekai import definitions.json       # import classes and relations
-sekai validate                      # check structural integrity
-sekai --json explain SomeClass      # definition, closure, provenance
-sekai --json query SomeClass --direction outbound --depth 2
-sekai --json find interface        # deterministic vocabulary discovery
-sekai --json ask "What does Api depend on?"  # read-only typed query frontend
-sekai --json diff before.json after.json
-```
-
-Do not use the control-plane database (`data/sekai.db`) as a portable ontology
-database. See the [sekai-ontology crate](crates/sekai-ontology/) for library
-usage.
-
-This repository also ships
-`crates/sekai-ontology/ontologies/sekai-chisei-product-v1.json` as contributor
-and agent vocabulary for sekai-chisei product terms. Import it into a
-throwaway `sekai` database. It is not a built-in server ontology, not
-`directory init` vocabulary, and not a customer domain.
 
 ## What works today
 
@@ -232,87 +139,20 @@ operations, attempts, actions, artifacts, verification, and outcomes. Domain
 objects such as repositories, incidents, campaigns, or support tickets belong
 in schemas and adapters rather than the core ontology.
 
-## Documentation
+For feature tiers and discovery details, see [Public RPC maturity](docs/rpc-maturity.md)
+and the [capability catalogs](docs/capability-catalog.md).
 
-Start with the [documentation index](docs/README.md), or go directly to:
+## Next steps
 
-- [Ontology](docs/ontology.md) — define a domain, seed governed facts, run an
-  operation, and inspect its receipt;
-- [Architecture](docs/architecture.md) — control-plane boundaries, data model,
-  and governed entry paths;
-- [Configuration](docs/configuration.md) — environment variables and defaults;
-- [Operations and security](docs/operations.md) — transport, credentials,
-  observability, backups, and production checks;
-- [Examples](examples/README.md) — runnable, domain-neutral examples;
-- [Gateway and clients](docs/gateway.md) — optional compatibility integration
-  for Codex, Claude Code, and provider-compatible clients;
-- [Docker](docs/docker.md) — container quick start and transport choices;
-- [Vision](VISION.md) — product direction and non-goals; and
-- [Changelog](CHANGELOG.md) — release changes and required migrations;
-- [Contributing](CONTRIBUTING.md) — development workflow and review
-  expectations;
-- [Support](SUPPORT.md) — questions, bug reports, design proposals, and private
-  security reporting;
-- [Project operating system](docs/project-operating-system.md) — how Issues,
-  Discussions, pull requests, documentation, and Skills fit together; and
-- [Code of conduct](CODE_OF_CONDUCT.md) — community standards and enforcement.
+Use the [documentation index](docs/README.md) to choose a guide by task.
 
-The gRPC contract is defined in [`proto/`](proto/). The
-[`responses-harness-profile`](docs/responses-harness-profile.md) documents the
-supported Responses harness contract.
-
-## Development
-
-```bash
-cargo fmt-check
-cargo clippy-all
-cargo test-all
-```
-
-Run an end-to-end example against a local server:
-
-```bash
-SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
-# in another terminal
-cargo run --example demo_client
-```
-
-The native binary smoke starts `sekai-chisei` with a loopback fake LLM and
-drives the product palette (`sekaictl` plus public gRPC) over a temp Unix
-socket:
-
-```bash
-cargo test --test native_server_smoke --locked
-```
-
-The gateway HTTP smoke starts `chisei-gateway` against the same control plane
-and a loopback fake provider:
-
-```bash
-cargo test --test gateway_http_smoke --locked
-```
-
-The ignored Ollama test requires a local compatible endpoint and model:
-
-```bash
-cargo test --test ollama_e2e -- --ignored
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-
-## Project layout
-
-| Path | Responsibility |
-| --- | --- |
-| [`proto/`](proto/) | Public gRPC service definitions |
-| [`src/grpc/`](src/grpc/) | Tonic services and transport boundary |
-| [`src/sekai/`](src/sekai/) | Graph, audit, lineage, security, coordination, and memory |
-| [`src/chisei/`](src/chisei/) | Policy, budgets, routing, evaluation, and learning |
-| [`crates/sekai-provider/`](crates/sekai-provider/) | Provider registry, adapters, pricing, and shared receipt contracts |
-| [`crates/chisei-gateway/`](crates/chisei-gateway/) | Standalone compatible HTTP gateway |
-| [`adapters/`](adapters/) | External evidence and workflow reference adapters |
-| [`examples/`](examples/) | Runnable integration examples |
-| [`tests/`](tests/) | Integration tests and deterministic fixtures |
+- Try the [reference lookup-first domain pack](docs/ontology.md#reference-lookup-first-domain-pack).
+- Connect Codex, Claude Code, or another supported client through the
+  [compatibility gateway](docs/gateway.md#guided-launch).
+- Use the standalone [local `sekai` ontology tool](crates/sekai-ontology/README.md)
+  for portable ontology databases.
+- Run a [domain-neutral example](examples/README.md) or read
+  [CONTRIBUTING.md](CONTRIBUTING.md) to develop and test the project.
 
 ## Security
 

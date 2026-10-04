@@ -4,7 +4,8 @@ use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
 use crate::chisei::policy::{
     ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
 };
-use crate::db::store::ChiseiStore;
+use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader, SekaiFacts};
+use crate::db::store::{ChiseiKiokuStore, ChiseiStore};
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
 use crate::sekai::evidence::EvidenceClassification;
@@ -45,6 +46,9 @@ pub struct PipelineRequest {
     pub(crate) risk_score_ready: bool,
     pub(crate) risk_signals: Vec<String>,
     pub(crate) operation_risk_override: Option<OperationRisk>,
+    /// Read port for Sekai facts (context objects, grants, schemas, links).
+    /// Not attached means no object context, never Chisei-store reads.
+    pub sekai_facts: SekaiFacts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -370,7 +374,17 @@ fn normalize_identifier(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn resolve_context_objects(req: &PipelineRequest, db: &ChiseiStore) -> Vec<crate::domain::Object> {
+fn resolve_context_objects(req: &PipelineRequest) -> Vec<crate::domain::Object> {
+    resolve_context_objects_reporting(req).0
+}
+
+/// Resolve context objects and keep the first Sekai read failure, so callers
+/// can report an unreachable or detached Sekai instead of "no context".
+fn resolve_context_objects_reporting(
+    req: &PipelineRequest,
+) -> (Vec<crate::domain::Object>, Option<SekaiFactError>) {
+    let facts = req.sekai_facts.reader();
+    let mut first_error = None;
     let mut objects = Vec::new();
     let mut seen = HashSet::new();
     for (kind, value) in extract_object_context_refs(&req.namespace, &req.spec) {
@@ -378,21 +392,23 @@ fn resolve_context_objects(req: &PipelineRequest, db: &ChiseiStore) -> Vec<crate
         if !seen.insert(external_id.clone()) {
             continue;
         }
-        let obj = db
-            .runtime()
-            .find_by_external_id(&external_id)
-            .ok()
-            .flatten();
+        let obj = match facts.find_by_external_id(&external_id) {
+            Ok(obj) => obj,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                None
+            }
+        };
         if let Some(obj) = obj
-            && context_object_authorized(req, db, &obj)
+            && context_object_authorized(req, &obj)
         {
             objects.push(obj);
         }
     }
-    objects
+    (objects, first_error)
 }
 
-fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &Object) -> bool {
+fn context_object_authorized(req: &PipelineRequest, object: &Object) -> bool {
     // Direct in-process pipeline users are trusted and historically omit an
     // actor. Network entry points always populate this from authenticated metadata.
     if req.memory_actor.is_empty() || matches!(req.memory_actor.as_str(), "root" | "local") {
@@ -401,14 +417,15 @@ fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &O
     if object.namespace != req.namespace.trim() {
         return false;
     }
-    let namespace_authorized = match db.runtime().find_namespace_boundary(&req.namespace) {
+    let facts = req.sekai_facts.reader();
+    let namespace_authorized = match facts.find_namespace_boundary(&req.namespace) {
         Ok(Some(boundary))
             if boundary
                 .properties
                 .get("team_managed")
                 .is_some_and(|value| value == "true") =>
         {
-            db.runtime().list_grants(&boundary.id).is_ok_and(|grants| {
+            facts.list_grants(&boundary.id).is_ok_and(|grants| {
                 grants
                     .iter()
                     .any(|grant| grant.principal == req.memory_actor)
@@ -420,7 +437,7 @@ fn context_object_authorized(req: &PipelineRequest, db: &ChiseiStore, object: &O
     if !namespace_authorized {
         return false;
     }
-    db.runtime().list_grants(&object.id).is_ok_and(|grants| {
+    facts.list_grants(&object.id).is_ok_and(|grants| {
         grants.is_empty()
             || grants
                 .iter()
@@ -542,7 +559,7 @@ pub fn applicable_evidence_classes(
     req: &PipelineRequest,
     db: &ChiseiStore,
 ) -> Result<Vec<EvidenceContextClass>, String> {
-    let target_object_ids = resolve_context_objects(req, db)
+    let target_object_ids = resolve_context_objects(req)
         .into_iter()
         .map(|object| object.id)
         .collect::<Vec<_>>();
@@ -562,8 +579,8 @@ pub fn applicable_evidence_classes(
         })
 }
 
-fn object_implements(db: &ChiseiStore, obj: &Object, interface_name: &str) -> bool {
-    db.runtime()
+fn object_implements(facts: &dyn SekaiFactReader, obj: &Object, interface_name: &str) -> bool {
+    facts
         .get_object_type(&obj.kind)
         .ok()
         .flatten()
@@ -575,14 +592,14 @@ fn object_implements(db: &ChiseiStore, obj: &Object, interface_name: &str) -> bo
         })
 }
 
-fn is_evaluable_context(db: &ChiseiStore, obj: &Object) -> bool {
+fn is_evaluable_context(facts: &dyn SekaiFactReader, obj: &Object) -> bool {
     obj.kind == KIND_COMPONENT
-        || object_implements(db, obj, INTERFACE_EVALUABLE)
-        || object_implements(db, obj, INTERFACE_RISK_SCORED)
+        || object_implements(facts, obj, INTERFACE_EVALUABLE)
+        || object_implements(facts, obj, INTERFACE_RISK_SCORED)
 }
 
-fn is_degraded_evaluable(db: &ChiseiStore, obj: &Object, max_success_rate: i32) -> bool {
-    is_evaluable_context(db, obj)
+fn is_degraded_evaluable(facts: &dyn SekaiFactReader, obj: &Object, max_success_rate: i32) -> bool {
+    is_evaluable_context(facts, obj)
         && obj
             .properties
             .get("success_rate")
@@ -605,8 +622,8 @@ fn risk_score_value(obj: &Object) -> Option<f64> {
 }
 
 fn filter_context_property(
-    db: &ChiseiStore,
-    type_cache: &mut HashMap<String, Option<ObjectType>>,
+    facts: &dyn SekaiFactReader,
+    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
     obj: &Object,
     field: &str,
     record: &mut egress::ContextEgressRecord,
@@ -614,31 +631,52 @@ fn filter_context_property(
 ) -> Option<String> {
     let object_type = type_cache
         .entry(obj.kind.clone())
-        .or_insert_with(|| db.runtime().get_object_type(&obj.kind).ok().flatten());
-    egress::filter_property_with_schema(obj, field, object_type.as_ref(), record, external)
+        .or_insert_with(|| facts.get_object_type(&obj.kind));
+    match object_type {
+        Ok(object_type) => {
+            egress::filter_property_with_schema(obj, field, object_type.as_ref(), record, external)
+        }
+        // Without the schema the property classification is unknown, so it
+        // may not leave the host on the strength of an object allowlist.
+        Err(error) if external => {
+            if obj
+                .properties
+                .get(field)
+                .is_some_and(|value| !value.is_empty())
+            {
+                record.redacted_fields.push(field.to_string());
+                record
+                    .reasons
+                    .push(format!("{field} withheld: {}", error.reason()));
+            }
+            None
+        }
+        Err(_) => egress::filter_property_with_schema(obj, field, None, record, external),
+    }
 }
 
 fn collect_related_verdict_context(
     req: &mut PipelineRequest,
     obj: &Object,
-    db: &ChiseiStore,
     external_egress: bool,
 ) -> (Vec<String>, Vec<egress::ContextEgressRecord>) {
+    let facts = req.sekai_facts.clone();
     let mut lines = Vec::new();
     let mut records = Vec::new();
     let mut type_cache = HashMap::new();
-    let mut candidates = db
-        .runtime()
+    let mut candidates = facts
+        .reader()
         .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
         .unwrap_or_default();
     candidates.extend(
-        db.runtime()
+        facts
+            .reader()
             .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Outgoing)
             .unwrap_or_default(),
     );
 
     for candidate in candidates {
-        if !context_object_authorized(req, db, &candidate) {
+        if !context_object_authorized(req, &candidate) {
             continue;
         }
         if candidate.kind == KIND_LEARNING {
@@ -659,7 +697,7 @@ fn collect_related_verdict_context(
         };
         let mut record = egress::new_record(&candidate);
         let Some(verdict) = filter_context_property(
-            db,
+            facts.reader(),
             &mut type_cache,
             &candidate,
             verdict_key,
@@ -725,6 +763,7 @@ fn run_object_context_enrich(
     db: &ChiseiStore,
     context_expansion_allowed: bool,
 ) -> StepDecision {
+    let facts = req.sekai_facts.clone();
     if req.template_only {
         return StepDecision {
             step: String::new(),
@@ -736,7 +775,22 @@ fn run_object_context_enrich(
         };
     }
     let mut lines = Vec::new();
-    let context_objects = resolve_context_objects(req, db);
+    let (context_objects, read_error) = resolve_context_objects_reporting(req);
+    if context_objects.is_empty()
+        && let Some(error) = read_error
+    {
+        return StepDecision {
+            step: String::new(),
+            action: "skipped".into(),
+            reasoning: format!(
+                "{}: object context references cannot be resolved",
+                error.reason()
+            ),
+            confidence: 1.0,
+            suggestion: String::new(),
+            value: String::new(),
+        };
+    }
     if context_objects.is_empty() {
         return StepDecision {
             step: String::new(),
@@ -770,7 +824,7 @@ fn run_object_context_enrich(
                 .get(**key)
                 .is_some_and(|value| !value.is_empty())
         }) && let Some(verdict) = filter_context_property(
-            db,
+            facts.reader(),
             &mut type_cache,
             &obj,
             verdict_key,
@@ -785,7 +839,7 @@ fn run_object_context_enrich(
                 .get(**key)
                 .is_some_and(|value| !value.is_empty())
         }) && let Some(conviction) = filter_context_property(
-            db,
+            facts.reader(),
             &mut type_cache,
             &obj,
             conviction_key,
@@ -798,7 +852,7 @@ fn run_object_context_enrich(
         if obj.properties.get("score").is_some_and(|s| !s.is_empty())
             && !details.iter().any(|d| d.contains("conviction"))
             && let Some(score) = filter_context_property(
-                db,
+                facts.reader(),
                 &mut type_cache,
                 &obj,
                 "score",
@@ -814,7 +868,7 @@ fn run_object_context_enrich(
             .get("success_rate")
             .is_some_and(|value| !value.is_empty())
             && let Some(rate) = filter_context_property(
-                db,
+                facts.reader(),
                 &mut type_cache,
                 &obj,
                 "success_rate",
@@ -825,13 +879,13 @@ fn run_object_context_enrich(
             details.push(format!("success_rate: {}", rate));
             has_content = true;
         }
-        if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+        if object_implements(facts.reader(), &obj, INTERFACE_RISK_SCORED)
             && obj
                 .properties
                 .get("risk_score")
                 .is_some_and(|value| !value.is_empty())
             && let Some(score) = filter_context_property(
-                db,
+                facts.reader(),
                 &mut type_cache,
                 &obj,
                 "risk_score",
@@ -842,13 +896,13 @@ fn run_object_context_enrich(
             details.push(format!("risk_score: {}", score));
             has_content = true;
         }
-        if object_implements(db, &obj, INTERFACE_RISK_SCORED)
+        if object_implements(facts.reader(), &obj, INTERFACE_RISK_SCORED)
             && obj
                 .properties
                 .get("risk_reason")
                 .is_some_and(|value| !value.is_empty())
             && let Some(reason) = filter_context_property(
-                db,
+                facts.reader(),
                 &mut type_cache,
                 &obj,
                 "risk_reason",
@@ -861,13 +915,13 @@ fn run_object_context_enrich(
         }
 
         if context_expansion_allowed {
-            let learnings = db
-                .runtime()
+            let learnings = facts
+                .reader()
                 .get_linked_objects(&obj.id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             let mut pitfalls = Vec::new();
             for candidate in learnings {
-                if !context_object_authorized(req, db, &candidate) {
+                if !context_object_authorized(req, &candidate) {
                     continue;
                 }
                 if candidate.kind == KIND_LEARNING {
@@ -878,7 +932,7 @@ fn run_object_context_enrich(
                     }
                     let mut learning_record = egress::new_record(&candidate);
                     let title = filter_context_property(
-                        db,
+                        facts.reader(),
                         &mut type_cache,
                         &candidate,
                         "title",
@@ -886,7 +940,7 @@ fn run_object_context_enrich(
                         req.external_egress,
                     );
                     let prevention = filter_context_property(
-                        db,
+                        facts.reader(),
                         &mut type_cache,
                         &candidate,
                         "prevention",
@@ -914,7 +968,7 @@ fn run_object_context_enrich(
                 has_content = true;
             }
             let (related_verdicts, mut related_records) =
-                collect_related_verdict_context(req, &obj, db, req.external_egress);
+                collect_related_verdict_context(req, &obj, req.external_egress);
             if !related_verdicts.is_empty() {
                 req.expanded_context_items = req
                     .expanded_context_items
@@ -1099,7 +1153,7 @@ impl Pipeline {
             .collect();
         // A pinned learning changes context only: it is added after every
         // routing and review-policy step, so none of them can read it.
-        let (learning_decision, applied_learning) = apply_pinned_learning(req, db);
+        let (learning_decision, applied_learning) = apply_pinned_learning(req);
         decisions.extend(learning_decision);
         let review_policy = decode_review_policy(&decisions);
         RunResult {
@@ -1127,11 +1181,11 @@ impl Pipeline {
 /// applied, which the caller turns into a fail-closed refusal.
 fn apply_pinned_learning(
     req: &mut PipelineRequest,
-    db: &ChiseiStore,
 ) -> (
     Option<StepDecision>,
     Option<crate::chisei::learning_change::PinnedLearning>,
 ) {
+    let facts = req.sekai_facts.clone();
     let Some(learning) = req.pinned_learning.clone() else {
         return (None, None);
     };
@@ -1139,7 +1193,7 @@ fn apply_pinned_learning(
     let reference = format!("{}@{}", learning.learning_id, learning.candidate_digest);
     // Activation does not grant object access: the caller must be able to read
     // the learning exactly as with ordinary learning retrieval.
-    if !context_object_authorized(req, db, object) {
+    if !context_object_authorized(req, object) {
         return (
             Some(StepDecision {
                 step: "learning_pin".into(),
@@ -1155,7 +1209,7 @@ fn apply_pinned_learning(
     let mut type_cache = HashMap::new();
     let mut record = egress::new_record(object);
     let title = filter_context_property(
-        db,
+        facts.reader(),
         &mut type_cache,
         object,
         "title",
@@ -1163,7 +1217,7 @@ fn apply_pinned_learning(
         req.external_egress,
     );
     let prevention = filter_context_property(
-        db,
+        facts.reader(),
         &mut type_cache,
         object,
         "prevention",
@@ -1264,44 +1318,40 @@ fn run_kioku_enrich(
             value: String::new(),
         };
     }
-    let context_object_ids = resolve_context_objects(req, db)
+    let context_object_ids = resolve_context_objects(req)
         .into_iter()
         .map(|object| object.id)
         .collect();
-    let actor_ceiling = match db
-        .runtime()
-        .kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor)
-    {
-        Ok(ceiling) => ceiling,
-        Err(error) => {
-            return StepDecision {
-                step: String::new(),
-                action: "skipped".into(),
-                reasoning: format!("memory retrieval denied: {error}"),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-    };
+    let actor_ceiling =
+        match db.kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor) {
+            Ok(ceiling) => ceiling,
+            Err(error) => {
+                return StepDecision {
+                    step: String::new(),
+                    action: "skipped".into(),
+                    reasoning: format!("memory retrieval denied: {error}"),
+                    confidence: 1.0,
+                    suggestion: String::new(),
+                    value: String::new(),
+                };
+            }
+        };
     let classification_ceiling = if req.external_egress {
         actor_ceiling.min(EvidenceClassification::Public)
     } else {
         actor_ceiling
     };
     let retrieved =
-        match db
-            .runtime()
-            .retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
-                namespace: req.namespace.clone(),
-                operation_class: req.task_type.clone(),
-                context_object_ids,
-                classification_ceiling,
-                min_confidence_bps: 0,
-                max_results: 16,
-                actor: req.memory_actor.clone(),
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            }) {
+        match db.retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
+            namespace: req.namespace.clone(),
+            operation_class: req.task_type.clone(),
+            context_object_ids,
+            classification_ceiling,
+            min_confidence_bps: 0,
+            max_results: 16,
+            actor: req.memory_actor.clone(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }) {
             Ok(retrieved) => retrieved,
             Err(error) => {
                 return StepDecision {
@@ -1534,25 +1584,25 @@ impl Step for LearningsEnrichStep {
         "learnings_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
-        run_learnings_enrich(req, db, false)
+    fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
+        run_learnings_enrich(req, false)
     }
 
     fn run_with_context_expansion(
         &self,
         req: &mut PipelineRequest,
-        db: &ChiseiStore,
+        _db: &ChiseiStore,
         context_expansion_allowed: bool,
     ) -> StepDecision {
-        run_learnings_enrich(req, db, context_expansion_allowed)
+        run_learnings_enrich(req, context_expansion_allowed)
     }
 }
 
 fn run_learnings_enrich(
     req: &mut PipelineRequest,
-    db: &ChiseiStore,
     context_expansion_allowed: bool,
 ) -> StepDecision {
+    let facts = req.sekai_facts.clone();
     if req.template_only {
         return StepDecision {
             step: String::new(),
@@ -1576,25 +1626,25 @@ fn run_learnings_enrich(
     let mut pitfalls = Vec::new();
     let mut found_context = false;
     let mut type_cache = HashMap::new();
-    for context in resolve_context_objects(req, db) {
+    for context in resolve_context_objects(req) {
         found_context = true;
         let mut sources = vec![context.id.clone()];
-        if let Some(ns_obj) = db
-            .runtime()
+        if let Some(ns_obj) = facts
+            .reader()
             .find_by_external_id(&format!("namespace:{}", context.kind))
             .ok()
             .flatten()
-            .filter(|object| context_object_authorized(req, db, object))
+            .filter(|object| context_object_authorized(req, object))
         {
             sources.push(ns_obj.id);
         }
         for source_id in sources {
-            let learnings = db
-                .runtime()
+            let learnings = facts
+                .reader()
                 .get_linked_objects(&source_id, REL_TOUCHES, &Direction::Incoming)
                 .unwrap_or_default();
             for obj in learnings {
-                if !context_object_authorized(req, db, &obj) {
+                if !context_object_authorized(req, &obj) {
                     continue;
                 }
                 if obj.kind != KIND_LEARNING {
@@ -1607,7 +1657,7 @@ fn run_learnings_enrich(
                 }
                 let mut learning_record = egress::new_record(&obj);
                 let title = filter_context_property(
-                    db,
+                    facts.reader(),
                     &mut type_cache,
                     &obj,
                     "title",
@@ -1615,7 +1665,7 @@ fn run_learnings_enrich(
                     req.external_egress,
                 );
                 let prevention = filter_context_property(
-                    db,
+                    facts.reader(),
                     &mut type_cache,
                     &obj,
                     "prevention",
@@ -1681,7 +1731,8 @@ impl Step for SpecEnrichStep {
         "spec_enrich"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
+        let facts = req.sekai_facts.clone();
         if req.template_only {
             return StepDecision {
                 step: String::new(),
@@ -1695,17 +1746,17 @@ impl Step for SpecEnrichStep {
         let mut hints = Vec::new();
         let mut found_context = false;
         let mut type_cache = HashMap::new();
-        for context in resolve_context_objects(req, db) {
+        for context in resolve_context_objects(req) {
             found_context = true;
-            let components = db
-                .runtime()
+            let components = facts
+                .reader()
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default();
             for comp in components {
-                if !context_object_authorized(req, db, &comp) {
+                if !context_object_authorized(req, &comp) {
                     continue;
                 }
-                if !is_evaluable_context(db, &comp) {
+                if !is_evaluable_context(facts.reader(), &comp) {
                     continue;
                 }
                 let descriptor = EpistemicDescriptor::unknown();
@@ -1715,7 +1766,7 @@ impl Step for SpecEnrichStep {
                 }
                 let mut comp_record = egress::new_record(&comp);
                 let Some(safe_total) = filter_context_property(
-                    db,
+                    facts.reader(),
                     &mut type_cache,
                     &comp,
                     "task_total",
@@ -1728,7 +1779,7 @@ impl Step for SpecEnrichStep {
                     continue;
                 };
                 let Some(safe_rate) = filter_context_property(
-                    db,
+                    facts.reader(),
                     &mut type_cache,
                     &comp,
                     "success_rate",
@@ -1813,6 +1864,7 @@ impl Step for RiskStep {
     }
 
     fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
+        let facts = req.sekai_facts.clone();
         if req.risk_score_ready {
             return risk_step_decision(&req.risk_signals, req.risk_score);
         }
@@ -1846,7 +1898,7 @@ impl Step for RiskStep {
                 risk = risk.max(0.6);
             }
         }
-        for context in resolve_context_objects(req, db) {
+        for context in resolve_context_objects(req) {
             let context_decision = admit_context(
                 req,
                 &EpistemicDescriptor::unknown(),
@@ -1856,12 +1908,12 @@ impl Step for RiskStep {
             if !context_decision.admits_context() {
                 continue;
             }
-            let authorized_components = db
-                .runtime()
+            let authorized_components = facts
+                .reader()
                 .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|object| context_object_authorized(req, db, object))
+                .filter(|object| context_object_authorized(req, object))
                 .collect::<Vec<_>>();
             let components = authorized_components
                 .into_iter()
@@ -1877,7 +1929,7 @@ impl Step for RiskStep {
                 .collect::<Vec<_>>();
             let degraded = components
                 .iter()
-                .filter(|c| is_degraded_evaluable(db, c, 30))
+                .filter(|c| is_degraded_evaluable(facts.reader(), c, 30))
                 .count();
             if degraded > 0 {
                 signals.push(format!("{degraded} degraded evaluable object(s) detected"));
@@ -1887,11 +1939,11 @@ impl Step for RiskStep {
             let mut redacted_high_risk = 0usize;
             for candidate in std::iter::once(&context)
                 .chain(components.iter())
-                .filter(|c| object_implements(db, c, INTERFACE_RISK_SCORED))
+                .filter(|c| object_implements(facts.reader(), c, INTERFACE_RISK_SCORED))
             {
                 let mut record = egress::new_record(candidate);
                 let exposed_score = filter_context_property(
-                    db,
+                    facts.reader(),
                     &mut type_cache,
                     candidate,
                     "risk_score",
@@ -1934,6 +1986,7 @@ impl Step for RiskStep {
 }
 
 fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
+    let facts = req.sekai_facts.clone();
     let mut risk = 0.0f64;
     let snapshots = capacity::latest_snapshots(db.runtime(), 24).unwrap_or_default();
     if snapshots.len() >= 3 {
@@ -1945,23 +1998,23 @@ fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
             risk = risk.max(0.6);
         }
     }
-    for context in resolve_context_objects(req, db) {
-        let components = db
-            .runtime()
+    for context in resolve_context_objects(req) {
+        let components = facts
+            .reader()
             .get_linked_objects(&context.id, REL_CONTAINS, &Direction::Outgoing)
             .unwrap_or_default()
             .into_iter()
-            .filter(|object| context_object_authorized(req, db, object))
+            .filter(|object| context_object_authorized(req, object))
             .collect::<Vec<_>>();
         if components
             .iter()
-            .any(|component| is_degraded_evaluable(db, component, 30))
+            .any(|component| is_degraded_evaluable(facts.reader(), component, 30))
         {
             risk = risk.max(0.7);
         }
         if std::iter::once(&context)
             .chain(components.iter())
-            .filter(|candidate| object_implements(db, candidate, INTERFACE_RISK_SCORED))
+            .filter(|candidate| object_implements(facts.reader(), candidate, INTERFACE_RISK_SCORED))
             .any(|candidate| risk_score_value(candidate).is_some_and(|score| score >= 0.7))
         {
             risk = risk.max(0.7);
@@ -2177,6 +2230,41 @@ fn decode_review_policy(steps: &[StepDecision]) -> Option<ReviewPolicy> {
     })
 }
 
+/// Minimal request for tests in sibling modules.
+#[cfg(test)]
+pub(crate) fn test_request(sekai_facts: SekaiFacts) -> PipelineRequest {
+    PipelineRequest {
+        request_id: "t1".into(),
+        namespace: "ns".into(),
+        spec: "fix the broken test".into(),
+        model: String::new(),
+        runtime: String::new(),
+        task_type: String::new(),
+        priority: 0,
+        risk_score: 0.0,
+        budget_pressure: PressureLevel::None,
+        review_model: String::new(),
+        egress_records: vec![],
+        external_egress: true,
+        template_only: false,
+        expanded_context_items: 0,
+        evidence_references: vec![],
+        memory_actor: String::new(),
+        memory_assignment_id: String::new(),
+        memory_token_budget: 0,
+        memory_references: vec![],
+        memory_holdouts: vec![],
+        allowed_evidence_classes: HashSet::new(),
+        context_admission_policy: None,
+        context_admission: ContextAdmissionSummary::default(),
+        risk_score_ready: false,
+        risk_signals: vec![],
+        operation_risk_override: None,
+        pinned_learning: None,
+        sekai_facts,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2291,8 +2379,8 @@ mod tests {
     #[test]
     fn a_pinned_learning_is_rendered_as_untrusted_context_with_its_egress_recorded() {
         let db = ChiseiStore::memory();
-        let mut req = make_req();
-        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let mut req = make_req(&db);
+        let (decision, applied) = apply_pinned_learning(&mut req);
         assert!(
             decision.is_none() && applied.is_none(),
             "without a pin the pipeline adds nothing"
@@ -2302,7 +2390,7 @@ mod tests {
 
         req.external_egress = false;
         req.pinned_learning = Some(pinned_learning(&[]));
-        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let (decision, applied) = apply_pinned_learning(&mut req);
         let decision = decision.expect("a decision is recorded");
         assert_eq!(decision.step, "learning_pin");
         assert_eq!(decision.action, "enrich");
@@ -2328,13 +2416,13 @@ mod tests {
     #[test]
     fn a_pinned_learning_obeys_the_property_egress_filter_and_is_refused_when_withheld() {
         let db = ChiseiStore::memory();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.external_egress = true;
         let spec_before = req.spec.clone();
 
         // No external allowlist: the ordinary default egress policy redacts it.
         req.pinned_learning = Some(pinned_learning(&[]));
-        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let (decision, applied) = apply_pinned_learning(&mut req);
         assert_eq!(decision.expect("recorded").action, "denied");
         assert!(applied.is_none(), "a withheld pin is not applied");
         assert_eq!(req.spec, spec_before);
@@ -2350,7 +2438,7 @@ mod tests {
             crate::chisei::egress::EXTERNAL_PROPERTIES_KEY,
             "prevention",
         )]));
-        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let (decision, applied) = apply_pinned_learning(&mut req);
         assert_eq!(decision.expect("recorded").action, "denied");
         assert!(applied.is_none());
         assert_eq!(req.spec, spec_before);
@@ -2361,7 +2449,7 @@ mod tests {
             crate::chisei::egress::EXTERNAL_PROPERTIES_KEY,
             "title,prevention",
         )]));
-        let (decision, applied) = apply_pinned_learning(&mut req, &db);
+        let (decision, applied) = apply_pinned_learning(&mut req);
         assert_eq!(decision.expect("recorded").action, "enrich");
         assert!(applied.is_some());
         assert!(
@@ -2385,13 +2473,13 @@ mod tests {
             })
             .unwrap();
 
-        let mut outsider = make_req();
+        let mut outsider = make_req(&db);
         outsider.namespace = "payments".into();
         outsider.external_egress = false;
         outsider.memory_actor = "alice".into();
         outsider.pinned_learning = Some(learning.clone());
         let spec_before = outsider.spec.clone();
-        let (decision, applied) = apply_pinned_learning(&mut outsider, &db);
+        let (decision, applied) = apply_pinned_learning(&mut outsider);
         assert_eq!(decision.expect("recorded").action, "denied");
         assert!(applied.is_none());
         assert_eq!(
@@ -2400,12 +2488,12 @@ mod tests {
         );
         assert!(outsider.egress_records.is_empty());
 
-        let mut reviewer = make_req();
+        let mut reviewer = make_req(&db);
         reviewer.namespace = "payments".into();
         reviewer.external_egress = false;
         reviewer.memory_actor = "reviewer".into();
         reviewer.pinned_learning = Some(learning);
-        let (decision, applied) = apply_pinned_learning(&mut reviewer, &db);
+        let (decision, applied) = apply_pinned_learning(&mut reviewer);
         assert_eq!(decision.expect("recorded").action, "enrich");
         assert!(applied.is_some());
     }
@@ -2435,7 +2523,7 @@ mod tests {
         let db = ChiseiStore::memory();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let pipeline = Pipeline::new(vec![Box::new(SpecProbe(seen.clone()))]);
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.external_egress = false;
         let spec_before = req.spec.clone();
         req.pinned_learning = Some(pinned_learning(&[]));
@@ -2456,36 +2544,15 @@ mod tests {
         assert!(result.pinned_learning.is_some());
     }
 
-    fn make_req() -> PipelineRequest {
-        PipelineRequest {
-            request_id: "t1".into(),
-            namespace: "ns".into(),
-            spec: "fix the broken test".into(),
-            model: String::new(),
-            runtime: String::new(),
-            task_type: String::new(),
-            priority: 0,
-            risk_score: 0.0,
-            budget_pressure: PressureLevel::None,
-            review_model: String::new(),
-            egress_records: vec![],
-            external_egress: true,
-            template_only: false,
-            expanded_context_items: 0,
-            evidence_references: vec![],
-            memory_actor: String::new(),
-            memory_assignment_id: String::new(),
-            memory_token_budget: 0,
-            memory_references: vec![],
-            memory_holdouts: vec![],
-            allowed_evidence_classes: HashSet::new(),
-            context_admission_policy: None,
-            context_admission: ContextAdmissionSummary::default(),
-            risk_score_ready: false,
-            risk_signals: vec![],
-            operation_risk_override: None,
-            pinned_learning: None,
-        }
+    /// Shared-compatibility layout: Sekai facts live in the same physical store.
+    fn shared_facts(db: &ChiseiStore) -> SekaiFacts {
+        SekaiFacts::in_process(crate::db::store::SekaiStore::from_shared_runtime(
+            db.runtime_arc(),
+        ))
+    }
+
+    fn make_req(db: &ChiseiStore) -> PipelineRequest {
+        test_request(shared_facts(db))
     }
 
     #[test]
@@ -2552,38 +2619,36 @@ mod tests {
             reassessment_key: String::new(),
             reassessment_actor: String::new(),
         };
-        db.runtime()
-            .insert_kioku_memory(
-                &memory,
-                &[KiokuEvidenceLink {
-                    memory_id: memory.id.clone(),
-                    memory_version: 1,
-                    operation_id: "operation-1".into(),
-                    verification_event_id: "verify-1".into(),
-                    evidence_reference: "evidence:operation-1".into(),
-                    evidence_digest: "digest-1".into(),
-                    stance: MemoryEvidenceStance::Supporting,
-                    outcome_metric: "verification_pass_rate".into(),
-                    outcome_value: 1.0,
-                    observed_at_ms: 90,
-                }],
-            )
-            .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                "memory-migrations",
-                1,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "human:operator".into(),
-                    rationale: "representative evidence".into(),
-                    reviewed_at_ms: 110,
-                },
-            )
-            .unwrap();
+        db.insert_kioku_memory(
+            &memory,
+            &[KiokuEvidenceLink {
+                memory_id: memory.id.clone(),
+                memory_version: 1,
+                operation_id: "operation-1".into(),
+                verification_event_id: "verify-1".into(),
+                evidence_reference: "evidence:operation-1".into(),
+                evidence_digest: "digest-1".into(),
+                stance: MemoryEvidenceStance::Supporting,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                observed_at_ms: 90,
+            }],
+        )
+        .unwrap();
+        db.review_kioku_candidate(
+            "memory-migrations",
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "representative evidence".into(),
+                reviewed_at_ms: 110,
+            },
+        )
+        .unwrap();
 
         let pipeline = Pipeline::new(vec![Box::new(KiokuEnrichStep)]);
-        let mut request = make_req();
+        let mut request = make_req(&db);
         request.namespace = "payments".into();
         request.task_type = "schema_change".into();
         request.spec = "change component:{migrations}".into();
@@ -2630,8 +2695,7 @@ mod tests {
             ]
         );
         assert!(
-            db.runtime()
-                .list_kioku_lifecycle_events("memory-migrations", 1)
+            db.list_kioku_lifecycle_events("memory-migrations", 1)
                 .unwrap()
                 .iter()
                 .all(|event| event.action != "injected")
@@ -2644,7 +2708,7 @@ mod tests {
         assert!(result.memory_references.is_empty());
         assert!(!result.prepared_spec.contains("Governed memory"));
 
-        let mut truncated = make_req();
+        let mut truncated = make_req(&db);
         truncated.namespace = "payments".into();
         truncated.task_type = "schema_change".into();
         truncated.spec = "change component:{migrations}".into();
@@ -2904,13 +2968,13 @@ mod tests {
         }
 
         let pipeline = default_pipeline();
-        let mut denied = make_req();
+        let mut denied = make_req(&db);
         denied.namespace = "service:payments".into();
         let denied_result = pipeline.run(&mut denied, &db);
         assert!(denied_result.evidence_references.is_empty());
         assert!(!denied_result.prepared_spec.contains("External evidence"));
 
-        let mut external = make_req();
+        let mut external = make_req(&db);
         external.namespace = "service:payments".into();
         let external_result = pipeline.run_with_context_admission(
             &mut external,
@@ -2969,7 +3033,7 @@ mod tests {
             ]
         );
 
-        let mut local = make_req();
+        let mut local = make_req(&db);
         local.namespace = "service:payments".into();
         local.external_egress = false;
         let local_result = pipeline.run_with_context_admission(
@@ -3000,7 +3064,7 @@ mod tests {
     fn test_pipeline_runs_all_steps() {
         let db = ChiseiStore::memory();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps.len(), 9);
         assert_eq!(result.steps[0].step, "object_context_enrich");
@@ -3064,7 +3128,7 @@ mod tests {
             })
             .unwrap();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "component:service".into();
         let result = p.run_with_context_expansion(&mut req, &db, true);
         assert_eq!(result.steps[2].step, "learnings_enrich");
@@ -3178,6 +3242,7 @@ mod tests {
             risk_signals: vec![],
             operation_risk_override: None,
             pinned_learning: None,
+            sekai_facts: shared_facts(&db),
         };
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "enrich");
@@ -3233,7 +3298,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "service:checkout".into();
         let result = p.run(&mut req, &db);
 
@@ -3279,7 +3344,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "service:checkout".into();
         let result = p.run(&mut req, &db);
 
@@ -3314,7 +3379,7 @@ mod tests {
             })
             .unwrap();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "asset:SECRET".into();
         let result = p.run(&mut req, &db);
         assert_eq!(result.steps[0].action, "none");
@@ -3348,7 +3413,7 @@ mod tests {
             unknown_action: ContextAdmissionAction::HoldOut,
             rules: vec![],
         };
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "asset:ADMISSION".into();
         req.external_egress = false;
         req.context_admission_policy = Some(policy.clone());
@@ -3359,7 +3424,7 @@ mod tests {
 
         let mut qualified_policy = policy;
         qualified_policy.unknown_action = ContextAdmissionAction::Qualify;
-        let mut qualified_req = make_req();
+        let mut qualified_req = make_req(&db);
         qualified_req.namespace = "asset:ADMISSION".into();
         qualified_req.external_egress = false;
         qualified_req.context_admission_policy = Some(qualified_policy);
@@ -3417,7 +3482,7 @@ mod tests {
             unknown_action: ContextAdmissionAction::HoldOut,
             rules: vec![],
         };
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "service:held-out-risk".into();
         req.context_admission_policy = Some(policy);
         let result = default_pipeline().run(&mut req, &db);
@@ -3465,7 +3530,7 @@ mod tests {
                 operation_risk: Some(OperationRisk::High),
             }],
         };
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "service:review-risk".into();
         req.context_admission_policy = Some(policy);
         let result = default_pipeline().run(&mut req, &db);
@@ -3495,7 +3560,7 @@ mod tests {
             })
             .unwrap();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "asset:LOCAL".into();
         req.external_egress = false;
         let result = p.run(&mut req, &db);
@@ -3530,7 +3595,7 @@ mod tests {
             })
             .unwrap();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "asset:SECRET".into();
         let result = p.run(&mut req, &db);
         assert!(result.prepared_spec.contains("object asset (SecretCo)"));
@@ -3577,7 +3642,7 @@ mod tests {
             })
             .unwrap();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "component:service".into();
         let result = p.run(&mut req, &db);
         assert!(!result.prepared_spec.contains("Known pitfalls"));
@@ -3629,7 +3694,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "namespace:alpha".into();
         let result = p.run(&mut req, &db);
 
@@ -3691,7 +3756,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "namespace:alpha".into();
         req.external_egress = false;
         let result = p.run(&mut req, &db);
@@ -3759,7 +3824,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "namespace:alpha".into();
         let result = p.run(&mut req, &db);
 
@@ -3850,7 +3915,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "namespace:alpha".into();
         let result = p.run(&mut req, &db);
 
@@ -3890,7 +3955,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "service:checkout".into();
         let result = p.run(&mut req, &db);
 
@@ -3940,7 +4005,7 @@ mod tests {
             .unwrap();
 
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.namespace = "asset:LOCAL".into();
         req.external_egress = false;
         let result = p.run_with_context_expansion(&mut req, &db, true);
@@ -3966,7 +4031,7 @@ mod tests {
         };
         db.runtime().create_object(&object).unwrap();
         let pipeline = default_pipeline();
-        let mut request = make_req();
+        let mut request = make_req(&db);
         request.namespace = "acme".into();
         request.spec = "inspect asset:SECRET".into();
         request.memory_actor = "alice".into();
@@ -4022,10 +4087,73 @@ mod tests {
     }
 
     #[test]
+    fn split_stores_resolve_context_objects_from_the_sekai_store() {
+        let sekai = crate::db::store::SekaiStore::memory();
+        let chisei = ChiseiStore::memory();
+        sekai
+            .runtime()
+            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .unwrap();
+        let object = Object {
+            id: "asset-split".into(),
+            kind: "asset".into(),
+            name: "Split".into(),
+            namespace: "acme".into(),
+            external_id: "asset:SPLIT".into(),
+            properties: HashMap::from([("verdict".into(), "sekai-only context".into())]),
+            created: 1,
+            updated: 1,
+        };
+        sekai.runtime().create_object(&object).unwrap();
+        sekai
+            .runtime()
+            .create_grant(&Grant {
+                id: "split-alice".into(),
+                object_id: object.id.clone(),
+                principal: "alice".into(),
+                role: Role::Viewer,
+                created: 1,
+            })
+            .unwrap();
+        let pipeline = default_pipeline();
+        let request_with = |facts: SekaiFacts| {
+            let mut request = make_req(&chisei);
+            request.namespace = "acme".into();
+            request.spec = "inspect asset:SPLIT".into();
+            request.memory_actor = "alice".into();
+            request.external_egress = false;
+            request.sekai_facts = facts;
+            request
+        };
+
+        let mut split = request_with(SekaiFacts::in_process(sekai.clone()));
+        let resolved = pipeline.run(&mut split, &chisei);
+        assert_eq!(resolved.steps[0].step, "object_context_enrich");
+        assert_eq!(resolved.steps[0].action, "enrich");
+        assert!(resolved.prepared_spec.contains("sekai-only context"));
+
+        // The Chisei store holds no Sekai facts: reading it finds nothing.
+        let mut chisei_only = request_with(shared_facts(&chisei));
+        let missed = pipeline.run(&mut chisei_only, &chisei);
+        assert_eq!(missed.steps[0].action, "none");
+        assert!(!missed.prepared_spec.contains("sekai-only context"));
+
+        let mut detached = request_with(SekaiFacts::not_attached());
+        let refused = pipeline.run(&mut detached, &chisei);
+        assert_eq!(refused.steps[0].action, "skipped");
+        assert!(
+            refused.steps[0]
+                .reasoning
+                .starts_with(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED)
+        );
+        assert!(!refused.prepared_spec.contains("sekai-only context"));
+    }
+
+    #[test]
     fn test_review_policy_extracted() {
         let db = ChiseiStore::memory();
         let p = default_pipeline();
-        let mut req = make_req();
+        let mut req = make_req(&db);
         req.risk_score = 0.6;
         let result = p.run(&mut req, &db);
         let policy = result.review_policy.expect("review policy");

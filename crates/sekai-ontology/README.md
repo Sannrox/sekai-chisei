@@ -205,6 +205,12 @@ replaces it during installation.
 
 ## Installation
 
+From the repository root, install the CLI from source:
+
+```bash
+cargo install --path crates/sekai-ontology
+```
+
 Tagged releases publish prebuilt `sekai` archives for macOS and Linux on
 Arm64 and x86-64. The supported Homebrew installation does not require Rust:
 

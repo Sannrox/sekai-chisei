@@ -443,7 +443,7 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.entries.len(), 177);
+        assert_eq!(table.entries.len(), 178);
         assert_eq!(table.stable_rpcs().len(), 66);
         assert!(
             table
@@ -527,6 +527,13 @@ mod tests {
                 .code(),
             tonic::Code::FailedPrecondition
         );
+        assert_eq!(
+            require_invokable("GetDefinitionMember", false)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(require_invokable("GetDefinitionMember", true).is_ok());
         assert!(require_invokable("CreateFunction", true).is_ok());
         assert!(require_invokable("ListKiokuCandidates", true).is_ok());
     }

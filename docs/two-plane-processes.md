@@ -9,9 +9,9 @@ and still opens the typed two-store contract. The ontology CLI keeps the
 
 | Process | Store | Credentials | Public service |
 | --- | --- | --- | --- |
-| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL` (or legacy `DB_PATH` / `DATABASE_URL`) | Sekai store only | `SekaiService` |
-| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL` | Chisei store only | `ChiseiService` |
-| `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs). Shared one-identity boot only with `SEKAI_SHARED_STORE=1` | Sekai store (combined) | both |
+| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL` (or legacy `DB_PATH` / `DATABASE_URL`); with none set, `<SEKAI_DATA_DIR>/sekai.db` | Sekai store only | `SekaiService` |
+| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | Chisei store only | `ChiseiService` |
+| `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). Shared one-identity boot only with `SEKAI_SHARED_STORE=1` | Sekai store (combined) | both |
 
 A Sekai process refuses `CHISEI_DB_PATH` / `CHISEI_DATABASE_URL`. A Chisei
 process refuses `SEKAI_DB_PATH` / `SEKAI_DATABASE_URL`. Each physical store is
@@ -32,6 +32,26 @@ and on the commit lookup.
 
 `GetOperationReceipt` on Chisei projects that live commit handle. It does not
 copy the Sekai receipt body into the Chisei store.
+
+## Sekai facts in Chisei
+
+Lookup-first and pipeline object context read Sekai facts (objects, links,
+grants, schemas) through a Chisei-owned read port, never from the Chisei
+store. Combined mode reads the Sekai store in process, in the shared and the
+split layout. A Chisei process reads over the same `SEKAI_ENDPOINT` hop with
+public `SekaiService` RPCs, which Sekai authorizes for the hop credential;
+Chisei then narrows to the request actor. Graph retrieval for lookup-first has
+no public RPC, so on the hop lookup-first refuses with
+`sekai_read_unsupported` and takes the model path.
+
+Context authorization reads namespace-boundary and object grants, which Sekai
+serves only to an admin credential. With a less privileged `SEKAI_CREDENTIAL`
+those reads are refused and object context is dropped, not leaked. A namespace
+boundary the hop credential cannot see is not treated as absent, so a namespace
+without a visible boundary yields no context for non-local actors over the hop.
+An unreachable Sekai skips object context with `sekai_read_failed`. Without
+`SEKAI_ENDPOINT`, lookup-first refuses with `sekai_not_attached` and object
+context injection is skipped with the same reason.
 
 ## Gateway
 

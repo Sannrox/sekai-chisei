@@ -544,6 +544,260 @@ fn seed_definition_parent(
     revision
 }
 
+/// Exercise definition reads through the actual assertion interceptor, then
+/// the handler, so transport admission cannot bypass resource authorization.
+#[tokio::test]
+async fn published_definition_assertions_preserve_namespace_and_member_authorization() {
+    use crate::enterprise::{
+        AuthenticatedPrincipal, EnterpriseExtension, ExtensionError, NamespaceAction, TenantContext,
+    };
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tonic::service::Interceptor;
+
+    struct DefinitionReadExtension(Arc<AtomicBool>);
+    impl EnterpriseExtension for DefinitionReadExtension {
+        fn authenticate_bearer(&self, _: &str) -> Result<AuthenticatedPrincipal, ExtensionError> {
+            Err(ExtensionError::CredentialNotFound)
+        }
+        fn authenticate_context(
+            &self,
+            _: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, ExtensionError> {
+            Err(ExtensionError::CredentialNotFound)
+        }
+        fn tenant_context(
+            &self,
+            _: &AuthenticatedPrincipal,
+        ) -> Result<TenantContext, ExtensionError> {
+            Err(ExtensionError::Unauthenticated)
+        }
+        fn authorize_namespace(
+            &self,
+            context: &TenantContext,
+            namespace: &str,
+            action: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            if self.0.load(Ordering::SeqCst)
+                && context.tenant_id == "tenant-test"
+                && context.subject == "subject-a"
+                && namespace == "allowed"
+                && action == NamespaceAction::Read
+            {
+                Ok(())
+            } else {
+                Err(ExtensionError::PermissionDenied)
+            }
+        }
+        fn authorize_unscoped_namespace(
+            &self,
+            _: &AuthenticatedPrincipal,
+            _: &str,
+            _: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            Err(ExtensionError::PermissionDenied)
+        }
+    }
+
+    let active = Arc::new(AtomicBool::new(true));
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(
+            ":memory:",
+            Some(Arc::new(DefinitionReadExtension(active.clone()))),
+        )
+        .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    let parent = seed_definition_parent(&svc, "allowed");
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    let claims = |nonce: &str| IdentityAssertion {
+        contract_version: IDENTITY_ASSERTION_VERSION.into(),
+        issuer: "https://issuer.test".into(),
+        audience: "https://sekai.test".into(),
+        subject: "subject-a".into(),
+        credential_id: "credential-a".into(),
+        credential_kind: "human_session".into(),
+        tenant_id: Some("tenant-test".into()),
+        scopes: vec!["sekai.read".into()],
+        expires_at: chrono::Utc::now().timestamp() + 60,
+        nonce: nonce.into(),
+    };
+    let request = |token: &str, method: &'static str| {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        req.metadata_mut()
+            .insert("x-principal", MetadataValue::from_static("root"));
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+        req
+    };
+    let read = |authenticated: Request<()>, namespace: &str| {
+        let (metadata, extensions, ()) = authenticated.into_parts();
+        Request::from_parts(
+            metadata,
+            extensions,
+            GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            },
+        )
+    };
+    let token = authority.sign(&claims("valid")).unwrap();
+    let authenticated = interceptor
+        .call(request(&token, "GetPublishedDefinitionRevision"))
+        .unwrap();
+    let context = authenticated
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+        .unwrap();
+    assert_eq!(context.principal.subject, "subject-a");
+    assert_eq!(context.tenant.as_ref().unwrap().tenant_id, "tenant-test");
+    assert_eq!(
+        authenticated.metadata().get("x-principal").unwrap(),
+        "subject-a"
+    );
+    let revision = svc
+        .get_published_definition_revision(read(authenticated, "allowed"))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap();
+    assert_eq!(revision.revision_digest, parent.revision_digest);
+    assert_eq!(
+        interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+
+    for (nonce, namespace, scopes, tenant) in [
+        (
+            "foreign-namespace",
+            "denied",
+            vec!["sekai.read".into()],
+            "tenant-test",
+        ),
+        (
+            "foreign-tenant",
+            "allowed",
+            vec!["sekai.read".into()],
+            "other-tenant",
+        ),
+        ("missing-scope", "allowed", vec![], "tenant-test"),
+    ] {
+        let mut assertion = claims(nonce);
+        assertion.scopes = scopes;
+        assertion.tenant_id = Some(tenant.into());
+        let token = authority.sign(&assertion).unwrap();
+        let authenticated = interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap();
+        assert_eq!(
+            svc.get_published_definition_revision(read(authenticated, namespace))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    for (nonce, object_id, expected) in [
+        (
+            "namespace-grant",
+            "namespace:allowed",
+            tonic::Code::PermissionDenied,
+        ),
+        ("member-grant", "schema:Ticket", tonic::Code::NotFound),
+    ] {
+        let grant = security::Grant {
+            id: nonce.into(),
+            object_id: object_id.into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        svc.security.add_grant(&grant);
+        let token = authority.sign(&claims(nonce)).unwrap();
+        let authenticated = interceptor
+            .call(request(&token, "GetPublishedDefinitionRevision"))
+            .unwrap();
+        assert_eq!(
+            svc.get_published_definition_revision(read(authenticated, "allowed"))
+                .await
+                .unwrap_err()
+                .code(),
+            expected
+        );
+        svc.security.remove_grant(object_id, "other-reader");
+    }
+    active.store(false, Ordering::SeqCst);
+    let token = authority.sign(&claims("revoked-membership")).unwrap();
+    let authenticated = interceptor
+        .call(request(&token, "GetPublishedDefinitionRevision"))
+        .unwrap();
+    assert_eq!(
+        svc.get_published_definition_revision(read(authenticated, "allowed"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    active.store(true, Ordering::SeqCst);
+
+    for (nonce, audience, expires_at) in [
+        (
+            "wrong-audience",
+            "https://other.test",
+            chrono::Utc::now().timestamp() + 60,
+        ),
+        (
+            "expired",
+            "https://sekai.test",
+            chrono::Utc::now().timestamp() - 120,
+        ),
+    ] {
+        let mut assertion = claims(nonce);
+        assertion.audience = audience.into();
+        assertion.expires_at = expires_at;
+        let token = authority.sign(&assertion).unwrap();
+        assert_eq!(
+            interceptor
+                .call(request(&token, "GetPublishedDefinitionRevision"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+    for method in [
+        "CreateDefinitionBranch",
+        "ApplyDefinitionBranchEdit",
+        "ApproveDefinitionProposal",
+        "MergeDefinitionProposal",
+    ] {
+        let token = authority.sign(&claims(method)).unwrap();
+        assert_eq!(
+            interceptor
+                .call(request(&token, method))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+}
+
 #[tokio::test]
 async fn definition_branch_rpc_preserves_parent_and_rejects_stale_head() {
     let svc = service();
@@ -10617,4 +10871,458 @@ async fn capability_discovery_rejects_a_stale_pinned_snapshot_without_metadata()
     assert_eq!(stale.code(), tonic::Code::Aborted);
     assert_eq!(stale.message(), "capability catalog version unavailable");
     assert!(!stale.message().contains("widget"));
+}
+
+/// Real transport regression: client extensions cannot cross the wire.
+#[cfg(unix)]
+#[tokio::test]
+async fn scoped_published_definition_read_crosses_the_server_transport() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::service::Interceptor;
+    for (local_mode, unix_mode) in [(false, false), (true, false), (false, true), (true, true)] {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TestEnterpriseExtension)),
+            )
+            .unwrap(),
+        )));
+        let store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
+        let svc = SekaiServiceImpl::new(store.clone());
+        let revision = seed_definition_parent(&svc, "allowed");
+        let authority = Arc::new(AssertionAuthority::new(
+            "https://issuer.test",
+            "https://sekai.test",
+            b"synthetic-test-key",
+        ));
+        let credentials = Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new());
+        let mut token = crate::grpc::TokenAuthInterceptor::from_runtime(
+            credentials.clone(),
+            store,
+            Some(authority.clone()),
+        );
+        let mut local =
+            crate::grpc::local_or_token_interceptor(credentials, db, Some(authority.clone()));
+        let interceptor = move |req| {
+            if local_mode {
+                local.call(req)
+            } else {
+                token.call(req)
+            }
+        };
+        let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+            crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::with_interceptor(
+                svc,
+                interceptor,
+            ),
+        );
+        let socket_dir = tempfile::tempdir().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (server, channel) = if unix_mode {
+            let socket = socket_dir.path().join("grpc.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::UnixListenerStream::new(listener),
+                        async {
+                            let _ = stopped.await;
+                        },
+                    )
+                    .await
+                    .unwrap()
+            });
+            let channel = tonic::transport::Endpoint::from_static("http://localhost")
+                .connect_with_connector(tower::service_fn(move |_| {
+                    let socket = socket.clone();
+                    async move {
+                        tokio::net::UnixStream::connect(socket)
+                            .await
+                            .map(hyper_util::rt::TokioIo::new)
+                    }
+                }))
+                .await
+                .unwrap();
+            (server, channel)
+        } else {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap()
+            });
+            (
+                server,
+                tonic::transport::Endpoint::from_shared(endpoint)
+                    .unwrap()
+                    .connect()
+                    .await
+                    .unwrap(),
+            )
+        };
+        let mut client =
+            crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::new(channel);
+        let claims = |nonce: &str| IdentityAssertion {
+            contract_version: IDENTITY_ASSERTION_VERSION.into(),
+            issuer: "https://issuer.test".into(),
+            audience: "https://sekai.test".into(),
+            subject: "subject-a".into(),
+            credential_id: "credential-a".into(),
+            credential_kind: "human_session".into(),
+            tenant_id: Some("tenant-test".into()),
+            scopes: vec!["sekai.read".into()],
+            expires_at: chrono::Utc::now().timestamp() + 30,
+            nonce: nonce.into(),
+        };
+        let bearer = authority.sign(&claims("transport-read")).unwrap();
+        let mut request = Request::new(GetPublishedDefinitionRevisionRequest {
+            namespace: "allowed".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+        let response = client.get_published_definition_revision(request).await;
+        assert_eq!(
+            response
+                .unwrap()
+                .into_inner()
+                .revision
+                .unwrap()
+                .revision_digest,
+            revision.revision_digest
+        );
+        let read_request = |bearer: &str, namespace: &str| {
+            let mut request = Request::new(GetPublishedDefinitionRevisionRequest {
+                namespace: namespace.into(),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+            request
+        };
+        assert_eq!(
+            client
+                .get_published_definition_revision(read_request(&bearer, "allowed"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated,
+            "replay"
+        );
+        let token = authority.sign(&claims("foreign-namespace")).unwrap();
+        assert_eq!(
+            client
+                .get_published_definition_revision(read_request(&token, "foreign"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        for (nonce, audience, expiry) in [
+            (
+                "wrong-audience",
+                "https://other.test",
+                chrono::Utc::now().timestamp() + 30,
+            ),
+            (
+                "expired",
+                "https://sekai.test",
+                chrono::Utc::now().timestamp() - 120,
+            ),
+        ] {
+            let mut assertion = claims(nonce);
+            assertion.audience = audience.into();
+            assertion.expires_at = expiry;
+            let token = authority.sign(&assertion).unwrap();
+            assert_eq!(
+                client
+                    .get_published_definition_revision(read_request(&token, "allowed"))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+        }
+        let token = authority.sign(&claims("disallowed-rpc")).unwrap();
+        let mut request = Request::new(GetDefinitionBranchRequest {
+            namespace: "allowed".into(),
+            branch_id: "fixture".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        request.metadata_mut().insert(
+            "x-rpc-method",
+            "GetPublishedDefinitionRevision".parse().unwrap(),
+        );
+        assert_eq!(
+            client
+                .get_definition_branch(request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
+}
+/// Exact-revision document reads retain transport scopes, grants, and integrity checks.
+#[tokio::test]
+async fn agent_definition_member_read_crosses_server_transport() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tower::Layer;
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let store = crate::db::store::SekaiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+        sqlite.clone(),
+    )));
+    let svc = SekaiServiceImpl::new(store.clone());
+    let parent = seed_definition_parent(&svc, "allowed");
+    sqlite
+        .create_definition_branch(
+            &definition_branch_domain::CreateDefinitionBranch {
+                namespace: "allowed".into(),
+                branch_id: "agent-draft".into(),
+                parent_revision_digest: parent.revision_digest.clone(),
+                idempotency_key: "create".into(),
+            },
+            "author",
+            2,
+        )
+        .unwrap();
+    let agent = definition_branch_domain::DefinitionMemberInput {
+        member_kind: "agent".into(), member_id: "triage".into(), member_digest: String::new(),
+        definition_json: serde_json::json!({"contract_version":"sekai.agent-definition/v1","name":"Triage","task_class":"lookup","instructions":"Inspect records.","allowed_action_types":["Ticket.inspect"]}).to_string()
+    };
+    let definition_branch_domain::DefinitionWriteResult::ApplyEdit { result } = sqlite
+        .apply_definition_branch_edit(
+            &definition_branch_domain::ApplyDefinitionBranchEdit {
+                namespace: "allowed".into(),
+                branch_id: "agent-draft".into(),
+                expected_head_digest: parent.revision_digest.clone(),
+                upserts: vec![agent.clone()],
+                removals: Vec::new(),
+                idempotency_key: "edit".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected draft")
+    };
+    let revision = result.revision.revision_digest.clone();
+    let security = svc.security.clone();
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true)
+                .layer(crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(svc)),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap()
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let claims = || IdentityAssertion {
+        contract_version: IDENTITY_ASSERTION_VERSION.into(),
+        issuer: "https://issuer.test".into(),
+        audience: "https://sekai.test".into(),
+        subject: "subject-a".into(),
+        credential_id: "credential-a".into(),
+        credential_kind: "human_session".into(),
+        tenant_id: Some("tenant-test".into()),
+        scopes: vec!["sekai.read".into()],
+        expires_at: chrono::Utc::now().timestamp() + 30,
+        nonce: uuid::Uuid::new_v4().to_string(),
+    };
+    let request = |assertion: &IdentityAssertion, namespace: &str, digest: &str, id: &str| {
+        let mut request = Request::new(GetDefinitionMemberRequest {
+            namespace: namespace.into(),
+            revision_digest: digest.into(),
+            member_kind: "agent".into(),
+            member_id: id.into(),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(assertion).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    };
+    let assertion = claims();
+    let response = client
+        .get_definition_member(request(&assertion, "allowed", &revision, "triage"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.revision_digest, revision);
+    let member = response.member.unwrap();
+    assert_eq!(
+        member.definition_json,
+        agent.prepare("allowed").unwrap().definition_json
+    );
+    assert_eq!(
+        member.member_digest,
+        agent.prepare("allowed").unwrap().member_digest
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&assertion, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&claims(), "foreign", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let missing = client
+        .get_definition_member(request(&claims(), "allowed", &revision, "absent"))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    let mut no_scope = claims();
+    no_scope.scopes.clear();
+    assert_eq!(
+        client
+            .get_definition_member(request(&no_scope, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut expired = claims();
+    expired.expires_at -= 150;
+    assert_eq!(
+        client
+            .get_definition_member(request(&expired, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    let mut wrong_audience = claims();
+    wrong_audience.audience = "https://other.test".into();
+    assert_eq!(
+        client
+            .get_definition_member(request(&wrong_audience, "allowed", &revision, "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        client
+            .get_definition_member(request(&claims(), "allowed", "invalid", "triage"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    for (index, object_id) in ["schema:agent:triage", "schema:Ticket"]
+        .into_iter()
+        .enumerate()
+    {
+        let grant = security::Grant {
+            id: format!("deny-{index}"),
+            object_id: object_id.into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 1,
+        };
+        security.add_grant(&grant);
+        let denied = client
+            .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), missing.code());
+        assert_eq!(denied.message(), missing.message());
+        security.remove_grant(&grant.object_id, &grant.principal);
+    }
+    // Valid documents must still match their storage lookup identity.
+    let original_body = serde_json::to_string(&result.revision).unwrap();
+    for substituted in [
+        parent.clone(),
+        definition_branch_domain::prepare_revision("foreign", "", Vec::new(), false, "author", 4)
+            .unwrap(),
+    ] {
+        sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+            rusqlite::params![serde_json::to_string(&substituted).unwrap(), revision]).unwrap();
+        let corrupt = client
+            .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+            .await
+            .unwrap_err();
+        assert_eq!(corrupt.code(), tonic::Code::Internal);
+        assert_eq!(corrupt.message(), "definition member unavailable");
+    }
+    sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+        rusqlite::params![original_body, revision]).unwrap();
+    sqlite
+        .conn()
+        .execute(
+            "UPDATE sekai_definition_members SET body_json = '{}' WHERE member_kind = 'agent'",
+            [],
+        )
+        .unwrap();
+    let corrupt = client
+        .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
+        .await
+        .unwrap_err();
+    assert_eq!(corrupt.code(), tonic::Code::Internal);
+    assert_eq!(corrupt.message(), "definition member unavailable");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[test]
+fn agent_certification_refusal_has_public_precondition_status() {
+    let error = map_definition_write_error("agent_promotion_requires_certification".into());
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.message(), "agent_promotion_requires_certification");
 }

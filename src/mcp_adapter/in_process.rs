@@ -85,8 +85,11 @@ impl InProcessSurface {
             sekai_store.clone(),
             Some(budget),
         );
-        let sekai = SekaiServiceImpl::new(sekai_store).with_cross_store_admission(Arc::new(clerk));
-        let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config());
+        let sekai =
+            SekaiServiceImpl::new(sekai_store.clone()).with_cross_store_admission(Arc::new(clerk));
+        let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config()).with_sekai_facts(
+            crate::chisei::sekai_facts::SekaiFacts::in_process(sekai_store.clone()),
+        );
 
         let surface = Self {
             principal: PRINCIPAL.into(),
