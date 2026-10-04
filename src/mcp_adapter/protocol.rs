@@ -119,7 +119,7 @@ async fn list_tools<S>(surface: &S) -> Result<Value, Value>
 where
     S: NativeSurface,
 {
-    let snapshot = surface.discover().await.map_err(adapter_error)?;
+    let snapshot = surface.refresh_catalog().await.map_err(adapter_error)?;
     let tools = well_known_entries()
         .into_iter()
         .map(|entry| {
@@ -139,11 +139,9 @@ where
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| json!({"code":-32602,"message":"tool name is required"}))?;
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if contains_reserved_metadata(&arguments) {
+    let empty_arguments = json!({});
+    let arguments = params.get("arguments").unwrap_or(&empty_arguments);
+    if contains_reserved_metadata(arguments) {
         return Ok(tool_error(
             "invalid_argument",
             "forged reserved metadata is rejected",
@@ -159,13 +157,13 @@ where
             "",
         ));
     };
-    let snapshot = surface.discover().await.map_err(adapter_error)?;
     let operation_id = arguments
         .get("operation_id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| json!({"code":-32602,"message":"operation_id is required"}))?;
+    let snapshot = surface.discover().await.map_err(adapter_error)?;
     let mut input = arguments.get("input").cloned().unwrap_or_else(|| json!({}));
     if !input.is_object() {
         return Ok(tool_error(
@@ -674,6 +672,67 @@ mod tests {
         assert_eq!(
             forged["result"]["structuredContent"]["code"],
             "invalid_argument"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_operation_id_does_not_discover_and_warm_calls_reuse_catalog() {
+        let fixture = surface();
+        let missing = handle_message(
+            &fixture,
+            json!({
+                "jsonrpc":"2.0",
+                "id":1,
+                "method":"tools/call",
+                "params":{"name":GET_OBJECT_TOOL,"arguments":{"input":{"id":"widget-1"}}}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing["error"]["message"], "operation_id is required");
+        assert_eq!(
+            fixture
+                .discover_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let first = handle_message(
+            &fixture,
+            json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name":GET_OBJECT_TOOL,"arguments":{"operation_id":"op-1","input":{"id":"widget-1"}}}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(first.get("error").is_none());
+        assert_eq!(
+            fixture
+                .discover_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let second = handle_message(
+            &fixture,
+            json!({
+                "jsonrpc":"2.0",
+                "id":3,
+                "method":"tools/call",
+                "params":{"name":GET_OBJECT_TOOL,"arguments":{"operation_id":"op-2","input":{"id":"widget-1"}}}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(second.get("error").is_none());
+        assert_eq!(
+            fixture
+                .discover_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
     }
 }

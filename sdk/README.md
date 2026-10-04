@@ -36,7 +36,8 @@ The TypeScript package is intended for Node.js server or desktop-host code.
 Install the local package with the native transport dependencies:
 
 ```bash
-npm install ./sdk/typescript @grpc/grpc-js @grpc/proto-loader
+(cd sdk/typescript && npm install && npm pack)
+npm install ./sdk/typescript/sannrox-sekai-chisei-sdk-0.1.0.tgz @grpc/grpc-js @grpc/proto-loader
 ```
 
 Use HTTPS for remote targets. Plain HTTP is accepted only for loopback targets
@@ -46,10 +47,11 @@ canonical checkout's `proto/` directory; the SDK intentionally does not bundle
 a second protocol snapshot. Publication records from
 `sekaictl admin sdk-packages` pin protocol, source, and package digests; they
 are not registry downloads. Isolated consumer proof lives in
-`tests/sdk_external_consumer.rs` (#840, #843, #844). It fails closed without
-`python3`, `node`, and `rustc`, pins `sekai-proto` beside the staged Rust
-client, and re-hashes protocol, source, and package bytes from disk. It does
-not claim registry or cargo/npm/pip install graphs.
+`tests/sdk_external_consumer.rs` (#840, #843, #844, #1093). It fails closed
+without `python3`, `node`, `npm`, and `rustc`, pins `sekai-proto` beside the
+staged Rust client, re-hashes protocol, source, and package bytes from disk,
+and installs packed TypeScript/Python artifacts into a consumer that does not
+import an in-repo path.
 
 ```ts
 import { SekaiChiseiClient } from "@sannrox/sekai-chisei-sdk";
@@ -95,6 +97,9 @@ The Python facade has no mandatory runtime dependency. Install the optional
 native transport support with:
 
 ```bash
+python3 -m pip wheel --no-deps --wheel-dir /tmp/sekai-sdk-wheels ./sdk/python
+python3 -m pip install /tmp/sekai-sdk-wheels/sekai_chisei_sdk-0.1.0-py3-none-any.whl
+# optional native transport extras still use the source extra:
 python3 -m pip install './sdk/python[grpc]'
 ```
 

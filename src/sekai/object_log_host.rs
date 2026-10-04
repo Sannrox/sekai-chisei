@@ -15,6 +15,7 @@
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use mikura::ObjectRecord;
@@ -76,7 +77,17 @@ impl ObjectLogHost {
         Ok(Self { addr, bearer })
     }
 
+    /// Resolves the process host client once. Later admits reuse this
+    /// client instead of re-reading env and re-resolving DNS (#1207).
     pub fn from_env() -> Result<Option<Self>, String> {
+        let cache = CACHED_FROM_ENV.get_or_init(|| Mutex::new(None));
+        let mut cached = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        take_cached(&mut cached, Self::from_env_uncached)
+    }
+
+    fn from_env_uncached() -> Result<Option<Self>, String> {
         let Some(address) = std::env::var(HOST_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -94,6 +105,8 @@ impl ObjectLogHost {
         let mut line = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
         line.push(b'\n');
         let unreachable = |_| "object-log host is unreachable".to_string();
+        #[cfg(test)]
+        CONNECT_COUNT.with(|count| count.set(count.get() + 1));
         let mut stream = TcpStream::connect_timeout(&self.addr, TIMEOUT).map_err(unreachable)?;
         stream
             .set_read_timeout(Some(TIMEOUT))
@@ -182,6 +195,39 @@ impl ObjectLogHost {
         }
         Ok(committed.r#gen)
     }
+}
+
+type CachedFromEnv = Option<Result<Option<ObjectLogHost>, String>>;
+
+fn take_cached(
+    cache: &mut CachedFromEnv,
+    resolve: impl FnOnce() -> Result<Option<ObjectLogHost>, String>,
+) -> Result<Option<ObjectLogHost>, String> {
+    if let Some(resolved) = cache.as_ref() {
+        return resolved.clone();
+    }
+    let resolved = resolve();
+    if resolved.is_ok() {
+        *cache = Some(resolved.clone());
+    }
+    resolved
+}
+
+static CACHED_FROM_ENV: OnceLock<Mutex<CachedFromEnv>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static CONNECT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_connect_count() {
+    CONNECT_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn connect_count() -> usize {
+    CONNECT_COUNT.with(|count| count.get())
 }
 
 #[cfg(test)]
@@ -358,5 +404,52 @@ mod tests {
             });
         assert!(both.unwrap_err().contains("mutually exclusive"));
         assert!(!dir.path().join("local.mikura").exists());
+    }
+
+    #[test]
+    fn take_cached_resolves_the_host_client_once() {
+        let mut cache = None;
+        let calls = std::cell::Cell::new(0);
+        let host = ObjectLogHost::new("127.0.0.1:1", None).unwrap();
+        let resolve = || {
+            calls.set(calls.get() + 1);
+            Ok(Some(host.clone()))
+        };
+        assert!(take_cached(&mut cache, resolve).unwrap().is_some());
+        assert!(take_cached(&mut cache, resolve).unwrap().is_some());
+        assert_eq!(calls.get(), 1);
+
+        let mut errors = None;
+        let error_calls = std::cell::Cell::new(0);
+        assert!(
+            take_cached(&mut errors, || {
+                error_calls.set(error_calls.get() + 1);
+                Err("dns lookup failed".into())
+            })
+            .is_err()
+        );
+        assert!(
+            take_cached(&mut errors, || {
+                error_calls.set(error_calls.get() + 1);
+                Err("dns lookup failed".into())
+            })
+            .is_err()
+        );
+        assert_eq!(error_calls.get(), 2);
+    }
+
+    #[test]
+    fn identical_admits_do_not_pay_three_rtts_each() {
+        let (addr, _dir) = spawn_host(None);
+        let host = ObjectLogHost::new(&addr.to_string(), None).unwrap();
+        reset_connect_count();
+        let generation = host.admit(record("c-cache", "eu")).unwrap();
+        assert_eq!(host.admit(record("c-cache", "eu")).unwrap(), generation);
+        assert_eq!(host.admit(record("c-cache", "eu")).unwrap(), generation);
+        assert_eq!(
+            connect_count(),
+            5,
+            "first admit is load+ingest+load; later identical admits are one load each"
+        );
     }
 }

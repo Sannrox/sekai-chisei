@@ -26,8 +26,8 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 Admitted object create/update still persists clerk objects and receipts
 here. When `SEKAI_OBJECT_LOG` is set, the same admitted mutation is
 appended through tagged mikura ingest so the log owns identity
-generations. A denied or unadmitted Action does not append. SQL index
-writes continue until the later retirement ADR.
+generations. A denied or unadmitted Action does not append. Action apply
+does not write these SQL tables. See [ADR 0091](decisions/0091-object-log-owns-evaluate-identity.md).
 
 One process at a time may set `SEKAI_OBJECT_LOG` to a given path: the
 in-process log handle is a single writer. Several clerk processes, such as
@@ -37,9 +37,13 @@ that every clerk process calls, and it waits on a mikura release with that
 host. See [ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
 
 `EvaluateObjectSet` reads the index when a datasource is registered. Set
-`required_freshness_ms` to fail closed when the index is stale or lagging.
-Hidden rows never appear in members, counts, order, errors, or continuation
-tokens. The SQL index remains the current evaluate backend.
+`required_freshness_ms` to fail closed when the serving projection is stale
+or lagging. Hidden rows never appear in members, counts, order, errors, or
+continuation tokens. Existing `object_type_index*` tables are retained as a
+rebuildable projection: `ReindexObjectType` rematerializes them; they are
+not recovery material. The tagged object-log is `(kind, key)` identity, not
+a namespace-scoped evaluate backend ([ADR 0091](decisions/0091-object-log-owns-evaluate-identity.md)).
+The SQL index is the serving backend.
 `SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` is a canary: it
 compares hop/count/sum answers to a tagged in-process object-log library on
 a sample of requests (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1`

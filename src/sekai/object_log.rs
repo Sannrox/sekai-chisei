@@ -2,6 +2,8 @@
 //!
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
+//! ADR 0091: the log owns identity generations; EvaluateObjectSet keeps the
+//! SQL serving projection because the tagged log is not namespace-scoped.
 
 use crate::domain::Object;
 use crate::sekai::object_security::ObjectSecurityPolicy;
@@ -616,19 +618,28 @@ fn configured_log_path() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
-    struct ClearOnDrop;
-    impl Drop for ClearOnDrop {
-        fn drop(&mut self) {
-            TEST_LOG_PATH.with(|slot| {
-                *slot.borrow_mut() = None;
-            });
-        }
+pub struct TestLogPathGuard;
+
+#[cfg(test)]
+impl Drop for TestLogPathGuard {
+    fn drop(&mut self) {
+        TEST_LOG_PATH.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
     }
+}
+
+#[cfg(test)]
+pub fn enter_test_log_path(path: &Path) -> TestLogPathGuard {
     TEST_LOG_PATH.with(|slot| {
         *slot.borrow_mut() = Some(path.to_path_buf());
     });
-    let _clear = ClearOnDrop;
+    TestLogPathGuard
+}
+
+#[cfg(test)]
+pub fn with_test_log_path<R>(path: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = enter_test_log_path(path);
     body()
 }
 

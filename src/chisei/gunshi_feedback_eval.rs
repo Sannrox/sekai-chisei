@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+use crate::chisei::decision_ledger::Decision;
 use crate::chisei::eval::{Assertion, Case, Suite};
 use crate::chisei::gunshi::{OperatorResponse, ResourceSelection};
 use crate::chisei::gunshi_feedback::{FEEDBACK_RECORD_VERSION, GunshiFeedbackRecord};
-use crate::db::store::ChiseiStore;
-use crate::sekai::audit::Decision;
+use crate::db::store::{ChiseiDecisionStore, ChiseiEvalStore, ChiseiStore};
 
 pub const FEEDBACK_SUITE_PREFIX: &str = "feedback-";
 pub const PROMOTE_ACTION: &str = "gunshi.feedback_promoted_to_eval";
@@ -189,7 +189,7 @@ pub fn promote_feedback_to_eval(
         return Err("feedback namespace does not match request namespace".into());
     }
     let case = case_from_feedback(&record)?;
-    let existing = db.runtime().get_eval_suite_record(suite_id)?;
+    let existing = db.get_eval_suite_record(suite_id)?;
     let (suite, created) = match existing {
         Some(mut suite) => {
             if let Some(existing_case) = suite.cases.iter().find(|item| item.id == case.id) {
@@ -216,7 +216,7 @@ pub fn promote_feedback_to_eval(
             }
             suite.cases.push(case.clone());
             suite.cases.sort_by(|left, right| left.id.cmp(&right.id));
-            db.runtime().append_feedback_eval_suite(&suite)?;
+            db.append_feedback_eval_suite(&suite)?;
             (suite, true)
         }
         None => {
@@ -229,7 +229,7 @@ pub fn promote_feedback_to_eval(
                 description: "Operator feedback promoted into evaluation cases".into(),
                 cases: vec![case.clone()],
             };
-            db.runtime().append_feedback_eval_suite(&suite)?;
+            db.append_feedback_eval_suite(&suite)?;
             (suite, true)
         }
     };
@@ -291,7 +291,7 @@ fn audit_promotion(
             "unchanged".into()
         },
     };
-    db.runtime().record_decision(&decision)
+    db.record_decision(&decision)
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

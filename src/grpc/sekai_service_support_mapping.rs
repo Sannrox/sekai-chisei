@@ -367,7 +367,7 @@ pub(super) fn to_proto_link(l: &domain::Link) -> Link {
         created: l.created,
     }
 }
-pub(super) fn from_proto_obj(o: &Object) -> domain::Object {
+pub(crate) fn from_proto_obj(o: &Object) -> domain::Object {
     domain::Object {
         id: o.id.clone(),
         kind: o.kind.clone(),
@@ -419,7 +419,7 @@ pub(super) fn to_proto_struct_field_def(field: &schema::StructFieldDef) -> Struc
         enum_values: field.enum_values.clone(),
     }
 }
-pub(super) fn from_proto_schema_type(
+pub(crate) fn from_proto_schema_type(
     object_type: &ObjectType,
 ) -> Result<schema::ObjectType, Status> {
     let properties = object_type
@@ -1214,7 +1214,7 @@ pub(super) fn map_handoff_lifecycle_error(error: HandoffLifecycleError) -> Statu
         HandoffLifecycleError::Storage(message) => Status::internal(message),
     }
 }
-pub(super) fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
+pub(crate) fn from_proto_grant(g: &Grant) -> Result<security::Grant, Status> {
     let role = security::Role::parse(&g.role).ok_or(Status::invalid_argument("invalid role"))?;
     Ok(security::Grant {
         id: g.id.clone(),

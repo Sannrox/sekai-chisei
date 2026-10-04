@@ -10,10 +10,11 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | `./data/sekai.db` when the shared-store hatch is set and dest-pair is unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
+| `SEKAI_DATA_DIR` | `./data` | SQLite layout directory. With no store path or URL variable set, Combined opens split `<dir>/sekai.db` and `<dir>/chisei.db`; `sekai-plane` and `chisei-plane` each derive only their own file. Provider-registry state defaults beside `sekai.db`. |
+| `DB_PATH` | `<SEKAI_DATA_DIR>/sekai.db` when the shared-store hatch is set and dest-pair is unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
 | `SEKAI_SHARED_STORE` | unset | Set `1` to boot Combined as one physical identity. Migration compatibility, not the default. |
-| `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
-| `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
+| `SEKAI_DB_PATH` | `<SEKAI_DATA_DIR>/sekai.db` | Combined-mode Sekai SQLite file; overrides the data directory and must be paired with `CHISEI_DB_PATH` |
+| `CHISEI_DB_PATH` | `<SEKAI_DATA_DIR>/chisei.db` | Combined-mode Chisei SQLite file; overrides the data directory and must be paired with `SEKAI_DB_PATH` |
 | `SEKAI_STORE_PEER` | unset | Read-only generation peer for an owned-plane or Shared open of a stamped dest |
 | `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; Combined shared-compat also needs `SEKAI_SHARED_STORE=1` |
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
@@ -31,7 +32,7 @@ template.
 | `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
-| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup (`http://127.0.0.1:50051`) |
+| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup and Sekai fact reads (`http://127.0.0.1:50051`); unset means lookup-first refuses with `sekai_not_attached` |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_ASSERTION_ISSUER` | unset | Audience-bound assertion issuer (#888). All three assertion variables must be set together; partial config is refused |
 | `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |
@@ -48,7 +49,7 @@ template.
 | `SEKAI_OBJECT_INDEX_DUAL_READ` | unset | Canary/CI only. Set `1` to compare both engines and fail closed on mismatch; evaluate also requires `max_rows_scanned` because both plans share the cost meter |
 | `SEKAI_OBJECT_LOG_DUAL_READ` | unset | Canary/CI only. Set `1` to sample-compare SQL EvaluateObjectSet to a tagged mikura log and fail closed on mismatch, missing log, or missing `max_rows_scanned`. Plans the log cannot witness (`group_by`, path multiplicity, non-i64 sum, incoming hop direction) keep the SQL answer and skip the canary instead of refusing evaluate. After #980 every production multi-hop has `group_by`, so those requests skip. Property grants project into the tagged multi-deny view: declared properties a kind neither grants nor reads are denied. The canary still skips when the evaluate reads an ungranted property or a narrowed kind has no schema ([ADR 0081](decisions/0081-evaluate-reads-mikura-library.md)) |
 | `SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE` | `32` when dual-read is on | Compare one of N armed evaluates. `1` is CI. Unsampled requests do not open the log |
-| `SEKAI_OBJECT_LOG` | unset | Path to the mikura object log required when `SEKAI_OBJECT_LOG_DUAL_READ=1` |
+| `SEKAI_OBJECT_LOG` | unset | Path to the local mikura object log (identity generations, ADR 0091). Required when `SEKAI_OBJECT_LOG_DUAL_READ=1`. Exclusive with `SEKAI_OBJECT_LOG_HOST` |
 | `SEKAI_OBJECT_LOG_HOST` | unset | `host:port` of a mikura object-log host (ADR 0088). Admits append and read generations through it instead of a local log. Mutually exclusive with `SEKAI_OBJECT_LOG`: setting both fails every ingest closed, and the dual-read canary never opens the local log behind a host |
 | `SEKAI_OBJECT_LOG_HOST_BEARER` | unset | Bearer the object-log host requires. Required for a non-loopback host |
 | `CHISEI_PERMIT_SIGNING_KEY` | unset | Ed25519 seed (64 lowercase hex chars) for external-action permit signing; required to issue permits |
@@ -78,7 +79,12 @@ provenance issuance; they never fall back to a wider activation window.
 refuses a pair that resolves to the same file, including hardlinks to one
 inode, or the same database. Partial destination
 configuration is refused; a second file is never invented from one path.
-Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`.
+With no store variable at all (no destination pair, `DB_PATH`, or URL) and
+the SQLite backend, Combined derives the pair from `SEKAI_DATA_DIR` (default
+`./data`): `sekai.db` and `chisei.db`. `sekaictl launch` hands the server that
+directory rather than a single path. Explicit destination variables win over
+the directory; setting only one of them is still refused. PostgreSQL URLs are
+unaffected. Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`.
 `DB_PATH` and `DATABASE_URL` with that hatch remain migration compatibility
 until [store relocation](store-relocation.md) copies Chisei families and
 raises the writer fence. After the fence even the hatch cannot start a

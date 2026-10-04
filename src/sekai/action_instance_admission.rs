@@ -1858,6 +1858,12 @@ mod tests {
                     .unwrap(),
                 1
             );
+            assert!(
+                db.object_type_index_status("acme", "customer_record", 20)
+                    .unwrap()
+                    .is_none(),
+                "Action apply must not write object_type_index as identity"
+            );
         });
     }
 

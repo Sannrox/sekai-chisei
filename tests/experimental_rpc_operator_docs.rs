@@ -2,7 +2,10 @@
 //! #1095: advertised "supported" / dual-backend sentences must not cover gated
 //! RPCs. #1086: the product loop is dual-backend, so its PostgreSQL cells say so.
 
-use sekai_chisei::rpc_maturity::{RpcClassification, RpcMaturityTable};
+use sekai_chisei::mcp_adapter::well_known_tools;
+use sekai_chisei::rpc_maturity::{
+    RpcClassification, RpcMaturityTable, capability_backing_rpc, capability_is_stable,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -126,4 +129,76 @@ fn operator_docs_advertise_postgres_for_ontology_apply() {
         Some("yes"),
         "ontology apply runs on PostgreSQL (#1086): {row}"
     );
+}
+
+/// #1205: catalog copy must follow rpc_maturity, not invent an experimental
+/// reason for projected evaluation tools.
+fn mcp_allowlist_paragraph(catalog: &str) -> &str {
+    let heading = catalog
+        .find("### MCP and SDK projections")
+        .expect("MCP projection heading");
+    let section = catalog[heading..]
+        .split("\nThe SDK bindings")
+        .next()
+        .expect("MCP section before SDK bindings");
+    let start = section
+        .find("returns only the v1 allowlist:")
+        .expect("MCP v1 allowlist sentence");
+    &section[start..]
+}
+
+#[test]
+fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
+    let table = RpcMaturityTable::load().expect("maturity table");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let catalog = fs::read_to_string(root.join("docs/capability-catalog.md")).expect("catalog");
+    let allowlist = mcp_allowlist_paragraph(&catalog);
+    let projected: Vec<&str> = well_known_tools().into_iter().collect();
+
+    for tool in ["chisei.evaluation.resolve", "chisei.evaluation.execute"] {
+        assert!(
+            projected.contains(&tool),
+            "{tool} must stay on the shipped MCP allowlist while its RPC is stable"
+        );
+        assert!(
+            capability_is_stable(tool),
+            "{tool} backing RPC must be stable in rpc_maturity"
+        );
+        let rpc = capability_backing_rpc(tool).expect("evaluation tool maps to an RPC");
+        let class = table
+            .entries
+            .iter()
+            .find(|entry| entry.rpc == rpc)
+            .unwrap_or_else(|| panic!("{rpc} missing from maturity table"))
+            .classification;
+        assert_eq!(
+            class,
+            RpcClassification::Stable,
+            "{rpc} maturity is the catalog reason, not experimental"
+        );
+        assert!(
+            allowlist.contains(tool),
+            "capability catalog must list projected tool {tool}"
+        );
+        assert!(
+            allowlist.contains(rpc),
+            "capability catalog must list projected RPC {rpc}"
+        );
+    }
+
+    assert!(
+        allowlist.contains("`stable`"),
+        "capability catalog must give stable maturity as the listing reason: {allowlist}"
+    );
+    assert!(
+        !allowlist.to_ascii_lowercase().contains("experimental"),
+        "capability catalog must not call stable evaluation RPCs experimental: {allowlist}"
+    );
+
+    for tool in &projected {
+        assert!(
+            allowlist.contains(tool),
+            "capability catalog MCP allowlist must list projected tool {tool}"
+        );
+    }
 }

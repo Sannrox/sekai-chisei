@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -14,8 +14,8 @@ use crate::db::sekai::SekaiDb;
 use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest, GovernedActionType,
-    Object, ObjectType, PropertyDef, PutGovernedActionTypeRequest,
+    CreateLinkRequest, CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest,
+    GovernedActionType, Link, Object, ObjectType, PropertyDef, PutGovernedActionTypeRequest,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::action_policy::ActionPolicy;
@@ -29,6 +29,10 @@ const NAMESPACE: &str = "acme";
 const OBJECT_ID: &str = "widget-1";
 /// A second synthetic object, so link tools have two endpoints (#1093).
 const PEER_OBJECT_ID: &str = "widget-2";
+/// Objects in another namespace the principal can still ACL, for #1203.
+const FOREIGN_NAMESPACE: &str = "other";
+const FOREIGN_OBJECT_ID: &str = "other-widget-1";
+const FOREIGN_PEER_OBJECT_ID: &str = "other-widget-2";
 const ACTION_TYPE: &str = "review.intake";
 const ACTION_VERSION: &str = "1.0.0";
 
@@ -38,10 +42,13 @@ pub struct InProcessSurface {
     pub namespace: String,
     pub object_id: String,
     pub peer_object_id: String,
+    pub foreign_object_id: String,
+    pub foreign_peer_object_id: String,
     pub action_type: String,
     pub action_version: String,
     sekai: SekaiServiceImpl,
     chisei: ChiseiServiceImpl,
+    catalog: Mutex<Option<CatalogSnapshot>>,
 }
 
 impl InProcessSurface {
@@ -51,11 +58,15 @@ impl InProcessSurface {
         )));
         db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, "local")
             .map_err(|error| error.to_string())?;
+        db.ensure_team_namespace(FOREIGN_NAMESPACE, PRINCIPAL, Role::Admin, "local")
+            .map_err(|error| error.to_string())?;
         db.upsert_action_policy(&ActionPolicy::allow_all(PRINCIPAL))
             .map_err(|error| error.to_string())?;
         for (id, object_id) in [
             ("schema-admin-mcp", "schema"),
             ("action-admin-mcp", "action"),
+            ("foreign-object-acl-1", FOREIGN_OBJECT_ID),
+            ("foreign-object-acl-2", FOREIGN_PEER_OBJECT_ID),
         ] {
             db.create_grant(&Grant {
                 id: id.into(),
@@ -74,18 +85,24 @@ impl InProcessSurface {
             sekai_store.clone(),
             Some(budget),
         );
-        let sekai = SekaiServiceImpl::new(sekai_store).with_cross_store_admission(Arc::new(clerk));
-        let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config());
+        let sekai =
+            SekaiServiceImpl::new(sekai_store.clone()).with_cross_store_admission(Arc::new(clerk));
+        let chisei = ChiseiServiceImpl::new(chisei_store, fixture_config()).with_sekai_facts(
+            crate::chisei::sekai_facts::SekaiFacts::in_process(sekai_store.clone()),
+        );
 
         let surface = Self {
             principal: PRINCIPAL.into(),
             namespace: NAMESPACE.into(),
             object_id: OBJECT_ID.into(),
             peer_object_id: PEER_OBJECT_ID.into(),
+            foreign_object_id: FOREIGN_OBJECT_ID.into(),
+            foreign_peer_object_id: FOREIGN_PEER_OBJECT_ID.into(),
             action_type: ACTION_TYPE.into(),
             action_version: ACTION_VERSION.into(),
             sekai,
             chisei,
+            catalog: Mutex::new(None),
         };
         surface.seed().await?;
         Ok(surface)
@@ -136,6 +153,54 @@ impl InProcessSurface {
                 .await
                 .map_err(|error| error.message().to_string())?;
         }
+        for (id, name, color) in [
+            (&self.foreign_object_id, "foreign-spinner", "green"),
+            (&self.foreign_peer_object_id, "foreign-gear", "yellow"),
+        ] {
+            self.sekai
+                .create_object(with_identity(
+                    CreateObjectRequest {
+                        object: Some(Object {
+                            id: id.clone(),
+                            kind: "widget".into(),
+                            name: name.into(),
+                            namespace: FOREIGN_NAMESPACE.into(),
+                            external_id: String::new(),
+                            properties: HashMap::from([
+                                ("name".into(), name.into()),
+                                ("color".into(), color.into()),
+                            ]),
+                            created: 0,
+                            updated: 0,
+                        }),
+                        lease_precondition: None,
+                    },
+                    &self.principal,
+                    FOREIGN_NAMESPACE,
+                ))
+                .await
+                .map_err(|error| error.message().to_string())?;
+        }
+        // A native create without session namespace can still persist a
+        // cross-namespace link. MCP get must not disclose the foreign id.
+        let mut leak = Request::new(CreateLinkRequest {
+            link: Some(Link {
+                id: String::new(),
+                from_id: self.object_id.clone(),
+                to_id: self.foreign_object_id.clone(),
+                relation: "leaks_to".into(),
+                created: 0,
+            }),
+            fail_if_exists: false,
+        });
+        leak.metadata_mut().insert(
+            "x-principal",
+            MetadataValue::try_from(self.principal.as_str()).expect("principal"),
+        );
+        self.sekai
+            .create_link(leak)
+            .await
+            .map_err(|error| error.message().to_string())?;
         self.sekai
             .put_governed_action_type(with_identity(
                 PutGovernedActionTypeRequest {
@@ -174,6 +239,9 @@ impl InProcessSurface {
 #[async_trait]
 impl NativeSurface for InProcessSurface {
     async fn discover(&self) -> Result<CatalogSnapshot, AdapterError> {
+        if let Some(cached) = self.catalog.lock().expect("catalog cache").clone() {
+            return Ok(cached);
+        }
         let response = self
             .sekai
             .discover_capabilities(with_identity(
@@ -189,7 +257,7 @@ impl NativeSurface for InProcessSurface {
             .await
             .map_err(status_error)?
             .into_inner();
-        Ok(CatalogSnapshot {
+        let snapshot = CatalogSnapshot {
             context: ProjectionContext {
                 namespace: self.namespace.clone(),
                 principal: self.principal.clone(),
@@ -200,7 +268,14 @@ impl NativeSurface for InProcessSurface {
                 },
                 catalog_version: response.catalog_version,
             },
-        })
+        };
+        *self.catalog.lock().expect("catalog cache") = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn refresh_catalog(&self) -> Result<CatalogSnapshot, AdapterError> {
+        *self.catalog.lock().expect("catalog cache") = None;
+        self.discover().await
     }
 
     async fn dispatch(

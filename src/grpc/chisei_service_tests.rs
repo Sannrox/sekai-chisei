@@ -1239,14 +1239,18 @@ fn stochastic_admission_fails_closed_before_external_or_unbudgetable_calls() {
     );
 }
 
+/// Shared-compatibility layout: Sekai facts live in the Chisei test store.
+fn shared_sekai_store(db: &crate::db::store::ChiseiStore) -> crate::db::store::SekaiStore {
+    crate::db::store::SekaiStore::from_shared_runtime(db.runtime_arc())
+}
+
 fn memory_service() -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
-        config(":memory:"),
-    )
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    ChiseiServiceImpl::new(chisei, config(":memory:")).with_sekai_facts(facts)
 }
 
 fn gunshi_planning_service() -> ChiseiServiceImpl {
@@ -6772,7 +6776,7 @@ async fn evaluation_gate_evidence_selects_latest_bound_run_and_redacts_details()
 #[tokio::test]
 async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
     let svc = memory_service();
-    lookup_first::seed_s1_fixture_graph(&svc.db).unwrap();
+    lookup_first::seed_s1_fixture_graph(&shared_sekai_store(&svc.db)).unwrap();
     svc.db
         .runtime()
         .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
@@ -9627,7 +9631,8 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
     use crate::sekai::semantic;
 
     let svc = memory_service();
-    lookup_first::seed_s1_fixture_graph(&svc.db).expect("seed lookup fixtures");
+    lookup_first::seed_s1_fixture_graph(&shared_sekai_store(&svc.db))
+        .expect("seed lookup fixtures");
 
     let plan = ExecutionPlan {
         plan_id: "lookup-hit-plan".into(),
@@ -9810,11 +9815,8 @@ async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path(
 
     // Only evaluate the decision path here — full model execute needs a live
     // provider. The fail-closed refusal is unit-tested below via evaluate.
-    let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from_shared_runtime(
-        std::sync::Arc::new(db.clone()),
-    ))
-    .unwrap();
+    let db = crate::db::store::SekaiStore::memory();
+    lookup_first::seed_s1_fixture_graph(&db).unwrap();
     let input = ExecutionInput {
         request_id: "incomplete".into(),
         namespace: "acme".into(),
@@ -9849,11 +9851,8 @@ fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
     use crate::chisei::lookup_first;
     use crate::sekai::semantic;
 
-    let db = RuntimeDb::memory();
-    lookup_first::seed_s1_fixture_graph(&crate::db::store::ChiseiStore::from_shared_runtime(
-        std::sync::Arc::new(db.clone()),
-    ))
-    .expect("seed lookup fixtures");
+    let db = crate::db::store::SekaiStore::memory();
+    lookup_first::seed_s1_fixture_graph(&db).expect("seed lookup fixtures");
     for (capability, spec) in [
         (
             semantic::CAPABILITY_EXPAND_RELATIONS,
@@ -10381,6 +10380,7 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         routing_profile_id: pin.into(),
     };
 
+    rpc_execution::reset_hosted_profile_list_count();
     let plan = service
         .plan_execution(Request::new(plan_request(
             "request:hosted-plan",
@@ -10392,6 +10392,11 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
         .into_inner()
         .plan
         .unwrap();
+    assert_eq!(
+        rpc_execution::hosted_profile_list_count(),
+        1,
+        "hosted-pinned Plan loads the namespace catalog once (#1206)"
+    );
     assert_eq!(plan.resolved_runtime, "hosted.acme-llm");
     assert_eq!(plan.resolved_model, "hosted.acme-llm/acme-1");
     let receipt = service
@@ -10960,4 +10965,85 @@ async fn a_policy_mirrored_from_the_routing_list_admits_the_hosted_route() {
         .unwrap();
     assert_eq!(plan.resolved_runtime, listed.runtime);
     assert_eq!(plan.resolved_model, model);
+}
+
+fn split_layout(dir: &std::path::Path) -> crate::combined_stores::CombinedStoreLayout {
+    crate::combined_stores::CombinedStoreSources {
+        backend: Some(crate::runtime_backend::BackendIdentity::Sqlite),
+        default_sqlite_path: "unused.db".into(),
+        sekai_sqlite_path: Some(dir.join("sekai.db").to_string_lossy().into_owned()),
+        chisei_sqlite_path: Some(dir.join("chisei.db").to_string_lossy().into_owned()),
+        postgres_max_connections: 16,
+        ..crate::combined_stores::CombinedStoreSources::default()
+    }
+    .open()
+    .unwrap()
+}
+
+fn resolve_lookup_root_input() -> ExecutionInput {
+    ExecutionInput {
+        request_id: "split-lookup".into(),
+        namespace: "acme".into(),
+        spec: r#"{"external_id":"widget:lookup-root"}"#.into(),
+        task_type: crate::sekai::semantic::CAPABILITY_RESOLVE_REF.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
+    use crate::chisei::lookup_first;
+
+    let dir = tempfile::tempdir().unwrap();
+    let layout = split_layout(dir.path());
+    assert!(layout.is_split());
+    let (sekai_store, _) = layout.handles();
+    lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
+    let (_, chisei_svc) = crate::grpc::build_services(&crate::config::Config::from_env(), &layout);
+
+    match evaluate_execute_lookup_first(
+        chisei_svc.sekai_facts.reader(),
+        &resolve_lookup_root_input(),
+        "alice",
+    ) {
+        ExecuteLookupFirst::Hit { response, .. } => {
+            assert_eq!(response.provider, lookup_first::LOOKUP_PROVIDER);
+            assert!(response.content.contains("lookup-root"));
+        }
+        other => panic!("expected a lookup hit from the Sekai store, got {other:?}"),
+    }
+
+    // The Chisei store carries no Sekai facts; reading it was the bug.
+    let chisei_as_facts = shared_sekai_store(&chisei_svc.db);
+    match evaluate_execute_lookup_first(&chisei_as_facts, &resolve_lookup_root_input(), "alice") {
+        ExecuteLookupFirst::ModelPath { lookup_refusal } => {
+            assert_eq!(lookup_refusal.as_deref(), Some("incomplete"));
+        }
+        other => panic!("expected the Chisei store to miss, got {other:?}"),
+    }
+}
+
+#[test]
+fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let layout = split_layout(dir.path());
+    let (sekai_store, _) = layout.handles();
+    crate::chisei::lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
+    let mut config = crate::config::Config::from_env();
+    config.sekai_endpoint = None;
+    let (_, chisei_svc) =
+        crate::grpc::build_services_for_plane(&config, &layout, crate::plane::ProcessPlane::Chisei);
+
+    assert!(!chisei_svc.sekai_facts.reader().attached());
+    match evaluate_execute_lookup_first(
+        chisei_svc.sekai_facts.reader(),
+        &resolve_lookup_root_input(),
+        "alice",
+    ) {
+        ExecuteLookupFirst::ModelPath { lookup_refusal } => assert_eq!(
+            lookup_refusal.as_deref(),
+            Some(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED)
+        ),
+        other => panic!("expected sekai_not_attached, got {other:?}"),
+    }
 }

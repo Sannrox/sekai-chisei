@@ -112,3 +112,6 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0088: One object-log host owns identity; clerk processes are its clients](0088-one-object-log-host-many-clerk-clients.md)
 - [ADR 0089: Park approval-gated Action instances and decide them explicitly](0089-park-and-decide-action-instances.md)
 - [ADR 0090: Bind object changes to governed Actions through a plane-owned binding](0090-object-change-action-bindings.md)
+- [ADR 0091: Object-log owns EvaluateObjectSet identity; SQL object_type_index is a rebuildable projection](0091-object-log-owns-evaluate-identity.md)
+- [ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei](0092-chisei-builds-without-sekai.md)
+- [ADR 0093: Agent drafts use immutable definition members](0093-agent-drafts-use-definition-members.md)

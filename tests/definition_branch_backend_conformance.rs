@@ -1048,8 +1048,142 @@ fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, n
     );
 }
 
+fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
+    let (parent, create) = seed(db, namespace);
+    db.create_definition_branch(&create, "author", 2).unwrap();
+    let agent = typed_member(
+        namespace,
+        "agent",
+        "triage",
+        r#"{
+        "contract_version":"sekai.agent-definition/v1","name":"Triage",
+        "task_class":"lookup","instructions":"Inspect records.",
+        "allowed_action_types":["Ticket.inspect"]
+    }"#,
+    );
+    let edit = ApplyDefinitionBranchEdit {
+        namespace: namespace.into(),
+        branch_id: "feature".into(),
+        expected_head_digest: parent.clone(),
+        upserts: vec![agent.clone()],
+        removals: Vec::new(),
+        idempotency_key: "agent-edit".into(),
+    };
+    let applied = db.apply_definition_branch_edit(&edit, "author", 3).unwrap();
+    assert_eq!(
+        applied,
+        db.apply_definition_branch_edit(&edit, "author", 4).unwrap()
+    );
+    let DefinitionWriteResult::ApplyEdit { result } = applied else {
+        panic!("expected edit")
+    };
+    let first = result.revision.revision_digest;
+    let original = db.get_definition_members(namespace, &first).unwrap();
+    assert_eq!(
+        original.iter().find(|m| m.member_kind == "agent").unwrap(),
+        &agent.prepare(namespace).unwrap()
+    );
+    let changed = typed_member(
+        namespace,
+        "agent",
+        "triage",
+        &agent
+            .definition_json
+            .replace("Inspect records.", "Inspect open records."),
+    );
+    let second_edit = ApplyDefinitionBranchEdit {
+        expected_head_digest: first.clone(),
+        upserts: vec![changed],
+        idempotency_key: "agent-edit-two".into(),
+        ..edit.clone()
+    };
+    let DefinitionWriteResult::ApplyEdit { result: second } = db
+        .apply_definition_branch_edit(&second_edit, "author", 5)
+        .unwrap()
+    else {
+        panic!("expected edit")
+    };
+    assert_ne!(first, second.revision.revision_digest);
+    assert_eq!(
+        original,
+        db.get_definition_members(namespace, &first).unwrap()
+    );
+    let stale = ApplyDefinitionBranchEdit {
+        idempotency_key: "agent-stale".into(),
+        ..edit
+    };
+    assert!(
+        db.apply_definition_branch_edit(&stale, "author", 6)
+            .unwrap_err()
+            .contains("stale_definition_branch_head")
+    );
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "agent-proposal".into(),
+            base_digest: parent.clone(),
+            candidate_digest: second.revision.revision_digest,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "agent-propose".into(),
+        },
+        "author",
+        7,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "agent-proposal".into(),
+            idempotency_key: "agent-approve".into(),
+        },
+        "reviewer",
+        8,
+    )
+    .unwrap();
+    let error = db
+        .merge_definition_proposal(
+            &MergeDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: "agent-proposal".into(),
+                expected_published_digest: parent.clone(),
+                idempotency_key: "agent-merge".into(),
+            },
+            "author",
+            9,
+        )
+        .unwrap_err();
+    assert_eq!(error, "agent_promotion_requires_certification");
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent
+    );
+    let prepared = agent.prepare(namespace).unwrap();
+    assert!(
+        prepare_revision(
+            namespace,
+            "",
+            [DefinitionRevisionMember {
+                member_kind: prepared.member_kind,
+                member_id: prepared.member_id,
+                member_digest: prepared.member_digest
+            }],
+            true,
+            "author",
+            10
+        )
+        .unwrap_err()
+        .contains("agent_promotion_requires_certification")
+    );
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
+    exercise_agent_draft(&SekaiDb::new(":memory:").unwrap(), "sqlite-agent");
     exercise_backend(&SekaiDb::new(":memory:").unwrap(), "sqlite-definition");
     exercise_proposal_publish(&SekaiDb::new(":memory:").unwrap(), "sqlite-proposal");
     exercise_revision_diff(&SekaiDb::new(":memory:").unwrap(), "sqlite-diff");
@@ -1081,6 +1215,7 @@ fn postgres() -> PostgresDb {
 fn postgres_definition_branch_backend_conformance() {
     let prefix = format!("pg-definition-{}", uuid::Uuid::new_v4().simple());
     let db = Arc::new(postgres());
+    exercise_agent_draft(db.as_ref(), &format!("{prefix}-agent"));
     exercise_backend(db.as_ref(), &prefix);
     exercise_proposal_publish(db.as_ref(), &format!("{prefix}-proposal"));
     exercise_revision_diff(db.as_ref(), &format!("{prefix}-diff"));

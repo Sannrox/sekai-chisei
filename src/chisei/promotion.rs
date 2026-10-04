@@ -7,11 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::chisei::decision_ledger::DecisionFilter;
 use crate::chisei::eval::EvalStore;
 use crate::chisei::evolve::{self, TaskRecord};
 use crate::chisei::scoring::normalize_task_class;
-use crate::db::store::ChiseiStore;
-use crate::sekai::audit::DecisionFilter;
+use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
 
 /// What a candidate would change if promoted.
 pub const KIND_ROUTING_BIAS: &str = "routing_bias";
@@ -193,7 +193,6 @@ pub fn propose_routing_bias_candidate(
     }
 
     let decisions = db
-        .runtime()
         .list_decisions(&DecisionFilter {
             actor: Some("chisei.scoring".to_string()),
             action: Some("scored".to_string()),
@@ -364,6 +363,7 @@ pub fn propose_template_candidates(
 mod tests {
     use super::*;
     use crate::chisei::scoring::{Judge, JudgeError, JudgeVerdict, SampleObservation, ScoringJob};
+    use crate::db::store::ChiseiObservationStore;
     use std::sync::Arc;
 
     /// Batch size used for regression-signal tests: must be >= `scoring::MIN_OBS_FOR_REGRESSION`
@@ -398,23 +398,22 @@ mod tests {
     }
 
     fn observe(db: &ChiseiStore, request_id: &str, namespace: &str, task_class: &str, ts: i64) {
-        db.runtime()
-            .put_sample_observation(&SampleObservation {
-                request_id: request_id.into(),
-                namespace: namespace.into(),
-                spec: "do the thing".into(),
-                resolved_model: "claude-opus-4-8".into(),
-                output_content: "here is the thing".into(),
-                sample_reason: "base".into(),
-                input_tokens: 10,
-                output_tokens: 20,
-                stop_reason: "end_turn".into(),
-                timestamp: ts,
-                scored: false,
-                task_class: task_class.into(),
-                cost_usd_micros: 0,
-            })
-            .unwrap();
+        db.put_sample_observation(&SampleObservation {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            spec: "do the thing".into(),
+            resolved_model: "claude-opus-4-8".into(),
+            output_content: "here is the thing".into(),
+            sample_reason: "base".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            stop_reason: "end_turn".into(),
+            timestamp: ts,
+            scored: false,
+            task_class: task_class.into(),
+            cost_usd_micros: 0,
+        })
+        .unwrap();
     }
 
     fn observe_batch(

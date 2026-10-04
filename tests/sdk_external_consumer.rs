@@ -338,6 +338,149 @@ fn main() {
     );
 }
 
+/// Pack TypeScript and Python SDKs and install them into a directory that
+/// has no in-repo path. Clerk publication records are not the install source.
+#[test]
+fn isolated_registry_packs_install_without_an_in_repo_path() {
+    let (root, _rust, typescript, python, _proto, _proto_crate) = stage_consumers();
+    require_tool("python3");
+    require_tool("node");
+    require_tool("npm");
+
+    run_in(&typescript, "npm", &["install", "--ignore-scripts"]);
+    run_in(&typescript, "npm", &["run", "build"]);
+    let pack_out = run_in(&typescript, "npm", &["pack", "--json"]);
+    let tarball = pack_out
+        .lines()
+        .rev()
+        .find_map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_array()
+                        .and_then(|rows| rows.first().cloned())
+                        .or(Some(value))
+                })
+                .and_then(|value| {
+                    value
+                        .get("filename")
+                        .and_then(|name| name.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| "sannrox-sekai-chisei-sdk-0.1.0.tgz".into());
+    let tarball_path = typescript.join(&tarball);
+    assert!(
+        tarball_path.is_file(),
+        "npm pack did not write {tarball}: {pack_out}"
+    );
+
+    let ts_consumer = root.path().join("ts-from-pack");
+    fs::create_dir_all(&ts_consumer).unwrap();
+    fs::write(
+        ts_consumer.join("package.json"),
+        r#"{"name":"sekai-sdk-pack-consumer","type":"module","private":true}"#,
+    )
+    .unwrap();
+    run_in(
+        &ts_consumer,
+        "npm",
+        &[
+            "install",
+            tarball_path.to_str().expect("tarball path"),
+            "@grpc/grpc-js",
+            "@grpc/proto-loader",
+        ],
+    );
+    let ts_import = run_in(
+        &ts_consumer,
+        "node",
+        &[
+            "--input-type=module",
+            "-e",
+            "import { SDK_CONTRACT_VERSION, SekaiChiseiClient } from '@sannrox/sekai-chisei-sdk'; import { HTTP_PROJECTION_CONTRACT } from '@sannrox/sekai-chisei-sdk/http'; if (typeof SekaiChiseiClient.connect !== 'function') throw new Error('runCoreLoop client missing'); console.log(SDK_CONTRACT_VERSION); console.log(HTTP_PROJECTION_CONTRACT);",
+        ],
+    );
+    assert!(
+        ts_import.contains("sekai.sdk-core-loop/v1"),
+        "typescript pack install missing contract: {ts_import}"
+    );
+    assert!(
+        ts_import.contains("sekai.http-projection/v1"),
+        "typescript pack install missing HTTP client: {ts_import}"
+    );
+    let ts_lock = fs::read_to_string(ts_consumer.join("package-lock.json"))
+        .unwrap_or_else(|_| fs::read_to_string(ts_consumer.join("package.json")).unwrap());
+    assert!(
+        !ts_lock.contains("sdk/typescript"),
+        "typescript consumer still names the in-repo tree: {ts_lock}"
+    );
+
+    let py_wheel = root.path().join("py-wheels");
+    fs::create_dir_all(&py_wheel).unwrap();
+    run_in(
+        &python,
+        "python3",
+        &[
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--wheel-dir",
+            py_wheel.to_str().expect("wheel dir"),
+            ".",
+        ],
+    );
+    let wheel = fs::read_dir(&py_wheel)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".whl"))
+        })
+        .expect("python wheel");
+    let py_consumer = root.path().join("py-from-wheel");
+    fs::create_dir_all(&py_consumer).unwrap();
+    run_in(
+        &py_consumer,
+        "python3",
+        &[
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            py_consumer.to_str().expect("py consumer"),
+            wheel.to_str().expect("wheel path"),
+        ],
+    );
+    let py_import = Command::new("python3")
+        .env("PYTHONPATH", &py_consumer)
+        .args([
+            "-c",
+            "from sekai_client import SDK_CONTRACT_VERSION, SekaiChiseiClient; from sekai_http import HTTP_PROJECTION_CONTRACT; assert hasattr(SekaiChiseiClient, 'run_core_loop'); print(SDK_CONTRACT_VERSION); print(HTTP_PROJECTION_CONTRACT)",
+        ])
+        .output()
+        .expect("python import from wheel");
+    assert!(
+        py_import.status.success(),
+        "python wheel import failed: {}\n{}",
+        String::from_utf8_lossy(&py_import.stderr),
+        String::from_utf8_lossy(&py_import.stdout)
+    );
+    let py_out = String::from_utf8(py_import.stdout).expect("utf8");
+    assert!(
+        py_out.contains("sekai.sdk-core-loop/v1"),
+        "python pack install missing contract: {py_out}"
+    );
+    assert!(
+        py_out.contains("sekai.http-projection/v1"),
+        "python pack install missing HTTP client: {py_out}"
+    );
+}
+
 fn rewrite_python_fixture(python: &Path) {
     let path = python.join("test_sekai_client.py");
     let source = fs::read_to_string(&path).unwrap();

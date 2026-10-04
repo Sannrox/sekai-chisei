@@ -15,11 +15,18 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
+        let session_namespace = Self::mcp_link_session_namespace(&req);
         let inner = req.into_inner();
         let fail_if_exists = inner.fail_if_exists;
-        let l = inner
+        let mut l = inner
             .link
             .ok_or(Status::invalid_argument("link required"))?;
+        if l.id.trim().is_empty() {
+            l.id = format!("link-{}", uuid::Uuid::new_v4().simple());
+        }
+        if l.created == 0 {
+            l.created = now_millis();
+        }
         let mut endpoints = Vec::with_capacity(2);
         for object_id in [&l.from_id, &l.to_id] {
             let object = self
@@ -28,6 +35,12 @@ impl SekaiServiceImpl {
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
+            if session_namespace
+                .as_deref()
+                .is_some_and(|namespace| namespace != object.namespace)
+            {
+                return Err(Status::not_found("link endpoint not found"));
+            }
             if evaluate_active_object_policy(
                 self.db.runtime(),
                 &object,
@@ -102,7 +115,18 @@ impl SekaiServiceImpl {
         if fail_if_exists && !created {
             return Err(Status::already_exists("link already exists"));
         }
-        Ok(Response::new(CreateLinkResponse { link: Some(l) }))
+        let stored = self
+            .db
+            .runtime()
+            .get_link(&l.id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::internal("link missing after create"))?;
+        if stored.from_id != l.from_id || stored.to_id != l.to_id || stored.relation != l.relation {
+            return Err(Status::already_exists("link already exists"));
+        }
+        Ok(Response::new(CreateLinkResponse {
+            link: Some(to_proto_link(&stored)),
+        }))
     }
 
     pub(super) async fn delete_authorized_link(

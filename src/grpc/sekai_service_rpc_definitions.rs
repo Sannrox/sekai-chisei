@@ -56,6 +56,75 @@ pub(super) async fn create_definition_branch(
         branch: Some(to_proto_definition_branch(&branch)),
     }))
 }
+pub(super) async fn get_definition_member(
+    service: &SekaiServiceImpl,
+    req: Request<GetDefinitionMemberRequest>,
+) -> Result<Response<GetDefinitionMemberResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &input.namespace,
+        false,
+    )?;
+    definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
+        .map_err(Status::invalid_argument)?;
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: input.member_kind.clone(),
+        member_id: input.member_id.clone(),
+    }
+    .validate()
+    .map_err(Status::invalid_argument)?;
+    // Preserve the existing revision-wide grant requirement, including sibling members.
+    authorize_definition_revision(
+        service,
+        &principals,
+        &input.namespace,
+        &input.revision_digest,
+        false,
+    )
+    .map_err(|status| match status.code() {
+        tonic::Code::NotFound => Status::not_found("definition member unavailable"),
+        tonic::Code::Internal => Status::internal("definition member unavailable"),
+        _ => status,
+    })?;
+    let revision = service
+        .db
+        .runtime()
+        .get_definition_revision(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition member unavailable"))?
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    let members = service
+        .db
+        .runtime()
+        .get_definition_members(&input.namespace, &input.revision_digest)
+        .map_err(|_| Status::internal("definition member unavailable"))?;
+    // The store verifies individual documents; verify their exact revision binding too.
+    definition_branch_domain::validate_revision_members(&revision, &members)
+        .map_err(|_| Status::internal("definition member unavailable"))?;
+    let member = members
+        .into_iter()
+        .find(|member| {
+            member.member_kind == input.member_kind && member.member_id == input.member_id
+        })
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    Ok(Response::new(GetDefinitionMemberResponse {
+        revision_digest: revision.revision_digest,
+        member: Some(DefinitionMember {
+            contract_version: member.contract_version,
+            namespace: member.namespace,
+            member_kind: member.member_kind,
+            member_id: member.member_id,
+            definition_json: member.definition_json,
+            member_digest: member.member_digest,
+        }),
+    }))
+}
+
 pub(super) async fn get_definition_branch(
     service: &SekaiServiceImpl,
     req: Request<GetDefinitionBranchRequest>,

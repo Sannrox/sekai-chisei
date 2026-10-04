@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -71,6 +74,9 @@ impl std::error::Error for AdapterError {}
 #[async_trait]
 pub trait NativeSurface: Send + Sync {
     async fn discover(&self) -> Result<CatalogSnapshot, AdapterError>;
+    async fn refresh_catalog(&self) -> Result<CatalogSnapshot, AdapterError> {
+        self.discover().await
+    }
     async fn dispatch(
         &self,
         rpc: NativeRpc,
@@ -285,6 +291,8 @@ pub struct FixtureSurface {
     pub actions: BTreeMap<String, FixtureAction>,
     pub receipts: BTreeMap<String, Value>,
     pub hidden_fields: BTreeMap<String, String>,
+    pub discover_calls: Arc<AtomicUsize>,
+    catalog: Arc<Mutex<Option<CatalogSnapshot>>>,
 }
 
 impl FixtureSurface {
@@ -298,6 +306,8 @@ impl FixtureSurface {
             actions: BTreeMap::new(),
             receipts: BTreeMap::new(),
             hidden_fields: BTreeMap::new(),
+            discover_calls: Arc::new(AtomicUsize::new(0)),
+            catalog: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -310,6 +320,7 @@ impl FixtureSurface {
 impl NativeSurface for FixtureSurface {
     async fn discover(&self) -> Result<CatalogSnapshot, AdapterError> {
         if self.revoked {
+            self.discover_calls.fetch_add(1, Ordering::SeqCst);
             return Err(projected(
                 "permission_denied",
                 "capability discovery denied",
@@ -317,14 +328,27 @@ impl NativeSurface for FixtureSurface {
                 "",
             ));
         }
-        Ok(CatalogSnapshot {
+        if let Some(cached) = self.catalog.lock().expect("catalog cache").clone()
+            && cached.context.catalog_version == self.catalog_version
+        {
+            return Ok(cached);
+        }
+        self.discover_calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = CatalogSnapshot {
             context: ProjectionContext {
                 namespace: self.namespace.clone(),
                 principal: self.principal.clone(),
                 contract_version: CONTRACT_VERSION.into(),
                 catalog_version: self.catalog_version.clone(),
             },
-        })
+        };
+        *self.catalog.lock().expect("catalog cache") = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn refresh_catalog(&self) -> Result<CatalogSnapshot, AdapterError> {
+        *self.catalog.lock().expect("catalog cache") = None;
+        self.discover().await
     }
 
     async fn dispatch(
@@ -460,6 +484,7 @@ impl NativeSurface for FixtureSurface {
 
 pub struct SdkSurface {
     config: AdapterConfig,
+    catalog: Mutex<Option<CatalogSnapshot>>,
 }
 
 impl SdkSurface {
@@ -469,7 +494,10 @@ impl SdkSurface {
                 "adapter principal and namespace are required".into(),
             ));
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            catalog: Mutex::new(None),
+        })
     }
 
     async fn channel(&self) -> Result<crate::grpc::client::GatewayClient, AdapterError> {
@@ -488,6 +516,9 @@ impl SdkSurface {
 #[async_trait]
 impl NativeSurface for SdkSurface {
     async fn discover(&self) -> Result<CatalogSnapshot, AdapterError> {
+        if let Some(cached) = self.catalog.lock().expect("catalog cache").clone() {
+            return Ok(cached);
+        }
         let channel = self.channel().await?;
         let mut client = SekaiServiceClient::new(channel);
         let mut request = Request::new(DiscoverCapabilitiesRequest {
@@ -504,7 +535,7 @@ impl NativeSurface for SdkSurface {
         )?;
         let response =
             with_timeout(self.config.timeout, client.discover_capabilities(request)).await?;
-        Ok(CatalogSnapshot {
+        let snapshot = CatalogSnapshot {
             context: ProjectionContext {
                 namespace: self.config.namespace.clone(),
                 principal: self.config.principal.clone(),
@@ -515,7 +546,14 @@ impl NativeSurface for SdkSurface {
                 },
                 catalog_version: response.catalog_version,
             },
-        })
+        };
+        *self.catalog.lock().expect("catalog cache") = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    async fn refresh_catalog(&self) -> Result<CatalogSnapshot, AdapterError> {
+        *self.catalog.lock().expect("catalog cache") = None;
+        self.discover().await
     }
 
     async fn dispatch(

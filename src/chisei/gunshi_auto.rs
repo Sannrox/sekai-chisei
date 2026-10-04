@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chisei::decision_ledger::Decision;
 use crate::chisei::gunshi::{AllocationPlan, CapacityEnvelope, PendingOperation};
 use crate::chisei::gunshi_dispatch::{
     AutoDispatchPolicy, DispatchAuthorization, DispatchMode, authorize_dispatch,
@@ -18,8 +19,7 @@ use crate::chisei::gunshi_policy::{
     ActiveAllocationPolicy, AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
     PolicyTransition, PolicyTransitionDecision, apply_promotion, monitor_and_rollback,
 };
-use crate::db::store::ChiseiStore;
-use crate::sekai::audit::Decision;
+use crate::db::store::{ChiseiDecisionStore, ChiseiGunshiStore, ChiseiStore};
 
 pub const STATE_CONTRACT_VERSION: &str = "gunshi.allocation-control/v1";
 pub const AUDIT_PROMOTE: &str = "gunshi.allocation_policy.promote";
@@ -129,7 +129,7 @@ pub fn load_state(
     namespace: &str,
 ) -> Result<Option<NamespaceAllocationState>, String> {
     required("namespace", namespace)?;
-    let Some(json) = db.runtime().get_gunshi_allocation_state(namespace)? else {
+    let Some(json) = db.get_gunshi_allocation_state(namespace)? else {
         return Ok(None);
     };
     let state: NamespaceAllocationState =
@@ -618,7 +618,7 @@ fn persist(
 ) -> Result<bool, String> {
     let json = serde_json::to_string(state)
         .map_err(|error| format!("encode allocation state: {error}"))?;
-    db.runtime().put_gunshi_allocation_state_cas(
+    db.put_gunshi_allocation_state_cas(
         &state.namespace,
         &state.policy.active.revision_id,
         state.policy.changed_at_ms,
@@ -663,7 +663,7 @@ fn audit(
         target_id: state.namespace.clone(),
         outcome: outcome.into(),
     };
-    db.runtime().record_decision(&decision)
+    db.record_decision(&decision)
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

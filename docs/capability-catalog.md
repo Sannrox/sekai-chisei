@@ -173,7 +173,10 @@ short-circuit **after** namespace authorization and **before** provider routing:
 
 Fail closed: incomplete graph state, ACL miss, cross-namespace object, or
 schema miss records `lookup_refusal` on the operation receipt and continues on
-the normal model path (`answer_path=model_path`). The S2 traversal path also
+the normal model path (`answer_path=model_path`). Lookup reads the Sekai store,
+not the Chisei store; a Chisei process with no Sekai attached records
+`sekai_not_attached`, and one reaching Sekai only over the gRPC hop records
+`sekai_read_unsupported`. The S2 traversal path also
 refuses PostgreSQL entailment because the native community runtime has no
 authorization-filtered ontology snapshot there; callers may use asserted-only
 retrieval. Lookup evaluation occurs after execution namespace authorization and

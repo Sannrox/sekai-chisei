@@ -69,6 +69,7 @@ impl ChiseiServiceImpl {
             risk_score_ready: false,
             risk_signals: vec![],
             operation_risk_override: None,
+            sekai_facts: self.sekai_facts.clone(),
         };
         let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
@@ -153,6 +154,7 @@ impl ChiseiServiceImpl {
                 risk_score_ready: false,
                 risk_signals: vec![],
                 operation_risk_override: None,
+                sekai_facts: self.sekai_facts.clone(),
             };
             let projection_started = Instant::now();
             let local_run = self.pipeline.run_with_context_admission(

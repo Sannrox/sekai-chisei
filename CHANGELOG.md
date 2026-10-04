@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 1.1.0
+
+Upgrade notes:
+
+- Community SQLite and PostgreSQL apply schema `0029`–`0049` on startup. Backup the store before the first 1.1.0 boot.
+- SQL `object_type_index*` is a rebuildable serving projection; object identity is the configured object-log (ADR 0091). Existing tables are retained; rematerialize with `ReindexObjectType`.
+- MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match session `x-sekai-namespace`.
+- Combined pins mikura `v0.2.0`. Existing `v0.1.0` object logs still open.
+- Provider HTTP clients no longer follow redirects.
+- Optional `SEKAI_OBJECT_LOG_HOST` is exclusive with `SEKAI_OBJECT_LOG`.
+
+- TypeScript and Python SDK trees pack (`npm pack`, `pip wheel`) and install from those bytes into a consumer with no in-repo path. Clerk `sdk-packages` records stay digest pins, not the install source (#1093).
+- MCP `sekai.links.get` and `sekai.links.create` require every referenced object's namespace to match the session `x-sekai-namespace`. Object ACL on a foreign-namespace id is not enough (#1203).
+- Object identity stays in the configured object-log. Action apply writes the clerk receipt and log ingest only, and does not write SQL `object_type_index*`. Those tables remain a rebuildable serving projection for `EvaluateObjectSet` (ADR 0091, #944).
+- Warehouse table ingest moves visible row cells into `SourceRecord` properties and drops hidden columns, instead of cloning every cell into an intermediate map (#1209).
+- MCP `tools/call` fail-closes missing `operation_id` and reserved metadata on borrowed arguments before cloning or discovering the catalog, and reuses a session `CatalogSnapshot` until `catalog_version` changes (#1208).
+- The object-log host client is resolved from the environment once per process. Later admits reuse that client instead of re-reading `SEKAI_OBJECT_LOG_HOST` and re-resolving DNS. The pinned host still serves one JSON line per connection, so each wire op opens its own TCP stream (#1207).
+- Hosted-pinned `PlanExecution` reuses the planning catalog for the pin check instead of listing namespace profiles a second time. Execute still re-lists on admit (#1206).
+- The capability catalog MCP allowlist is pinned to `rpc_maturity`: `ResolveEvaluationPlan` and `ExecuteEvaluationManifest` stay listed because they are `stable`, and the catalog must not call those RPCs experimental (#1205).
+- `CreateLink` assigns a server id when the request id is empty and answers with the stored row. MCP `sekai.links.create` no longer persists an empty primary key or reports a later request as stored (#1201).
 - The MCP projection host also lists `chisei.evaluation.resolve` → `ResolveEvaluationPlan` and `chisei.evaluation.execute` → `ExecuteEvaluationManifest`, now that both RPCs are stable. Each binds its request namespace to the session and refuses a foreign namespace. Evaluation compare stays CLI-only because it has no wire RPC (#1093).
 - The object-log dual-read canary no longer opens a local `SEKAI_OBJECT_LOG` when `SEKAI_OBJECT_LOG_HOST` is set. Sampled dual-read evaluates fail closed with a message naming both settings, matching the admit path's exclusivity (#1202).
 - The MCP projection host (`sekai-mcp` stdio and HTTP `POST /mcp`) now lists `sekai.links.get` → `GetLinks` and `sekai.links.create` → `CreateLink`, because both RPCs are stable. Link creation passes only the endpoints and relation (the server assigns the id), and forged metadata, missing fields, or non-string values fail closed. Registry-published packages remain open in #1093 (#1093).

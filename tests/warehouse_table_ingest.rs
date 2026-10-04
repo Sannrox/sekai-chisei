@@ -88,7 +88,7 @@ fn to_proto(batch: sekai_chisei::sekai::object_sync::SourceBatch) -> SourceBatch
 
 async fn apply(
     service: &SekaiServiceImpl,
-    snapshot: &warehouse_table_ingest::TableSnapshot,
+    snapshot: warehouse_table_ingest::TableSnapshot,
     namespace: &str,
     producer: &str,
     current_cursor: &str,
@@ -271,7 +271,7 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
 
     // Snapshot 1 admits three typed objects; the restricted column never
     // reaches the plane.
-    let admitted = apply(&service, &first, NAMESPACE, CONNECTOR, "")
+    let admitted = apply(&service, first.clone(), NAMESPACE, CONNECTOR, "")
         .await
         .unwrap();
     assert_eq!(status(&admitted), "COMMITTED", "{admitted:?}");
@@ -337,9 +337,15 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
 
     // Snapshot 2 advances the checkpoint: one row changed, one tombstoned.
     let second = snapshot("orders-snapshot-2.json");
-    let advanced = apply(&service, &second, NAMESPACE, CONNECTOR, "snapshot:4081")
-        .await
-        .unwrap();
+    let advanced = apply(
+        &service,
+        second.clone(),
+        NAMESPACE,
+        CONNECTOR,
+        "snapshot:4081",
+    )
+    .await
+    .unwrap();
     assert_eq!(status(&advanced), "COMMITTED", "{advanced:?}");
     assert_eq!(
         checkpoint(&service, &descriptor.digest).await,
@@ -363,9 +369,15 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
     // Declared drift: snapshot 3 moved to schema revision v2, which nobody
     // registered. The plane refuses it before any write.
     let drift = snapshot("orders-snapshot-3-drift.json");
-    let declared = apply(&service, &drift, NAMESPACE, CONNECTOR, "snapshot:4082")
-        .await
-        .unwrap_err();
+    let declared = apply(
+        &service,
+        drift.clone(),
+        NAMESPACE,
+        CONNECTOR,
+        "snapshot:4082",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(declared.code(), Code::FailedPrecondition, "{declared:?}");
     assert_eq!(
         checkpoint(&service, &descriptor.digest).await,
@@ -376,9 +388,15 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
     // revision and row version. The plane quarantines the batch, sync state
     // shows it, and the last consistent object and checkpoint stay.
     let rewrite = snapshot("orders-snapshot-4-rewrite.json");
-    let quarantined = apply(&service, &rewrite, NAMESPACE, CONNECTOR, "snapshot:4082")
-        .await
-        .unwrap();
+    let quarantined = apply(
+        &service,
+        rewrite.clone(),
+        NAMESPACE,
+        CONNECTOR,
+        "snapshot:4082",
+    )
+    .await
+    .unwrap();
     assert_eq!(status(&quarantined), "QUARANTINED", "{quarantined:?}");
     let state = service
         .get_source_sync_state(with_principal(
@@ -407,7 +425,14 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
     assert_eq!(kept.get("region").map(String::as_str), Some("eu"));
 
     // A producer without access to the namespace cannot admit a batch.
-    let outsider = apply(&service, &second, NAMESPACE, OUTSIDER, "snapshot:4082").await;
+    let outsider = apply(
+        &service,
+        second.clone(),
+        NAMESPACE,
+        OUTSIDER,
+        "snapshot:4082",
+    )
+    .await;
     match outsider {
         Err(status) => assert!(
             matches!(
@@ -446,10 +471,10 @@ fn the_adapter_refuses_malformed_snapshots() {
     duplicated.rows.push(row);
     assert!(warehouse_table_ingest::validate(&duplicated).is_err());
     // An unchanged row keeps its source version across snapshots.
-    let first = warehouse_table_ingest::records(&snapshot("orders-snapshot-1.json")).unwrap();
-    let second = warehouse_table_ingest::records(&snapshot("orders-snapshot-2.json")).unwrap();
-    assert!(warehouse_table_ingest::records(&undisplayed).is_err());
-    assert!(warehouse_table_ingest::batch(&unversioned, NAMESPACE, CONNECTOR, "").is_err());
+    let first = warehouse_table_ingest::records(snapshot("orders-snapshot-1.json")).unwrap();
+    let second = warehouse_table_ingest::records(snapshot("orders-snapshot-2.json")).unwrap();
+    assert!(warehouse_table_ingest::records(undisplayed).is_err());
+    assert!(warehouse_table_ingest::batch(unversioned, NAMESPACE, CONNECTOR, "").is_err());
     let version = |records: &[sekai_chisei::sekai::object_sync::SourceRecord], key: &str| {
         records
             .iter()
@@ -457,5 +482,11 @@ fn the_adapter_refuses_malformed_snapshots() {
             .map(|record| record.source_version.clone())
     };
     assert_eq!(version(&first, "1002"), version(&second, "1002"));
+    assert!(
+        first
+            .iter()
+            .all(|record| !record.properties.contains_key("customer_email")),
+        "hidden columns must be dropped from moved row maps (#1209)"
+    );
     assert_ne!(version(&first, "1001"), version(&second, "1001"));
 }
