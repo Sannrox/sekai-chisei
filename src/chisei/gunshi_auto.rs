@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chisei::decision_ledger::Decision;
 use crate::chisei::gunshi::{AllocationPlan, CapacityEnvelope, PendingOperation};
 use crate::chisei::gunshi_dispatch::{
     AutoDispatchPolicy, DispatchAuthorization, DispatchMode, authorize_dispatch,
@@ -19,7 +20,6 @@ use crate::chisei::gunshi_policy::{
     PolicyTransition, PolicyTransitionDecision, apply_promotion, monitor_and_rollback,
 };
 use crate::db::store::{ChiseiDecisionStore, ChiseiGunshiStore, ChiseiStore};
-use crate::sekai::audit::Decision;
 
 pub const STATE_CONTRACT_VERSION: &str = "gunshi.allocation-control/v1";
 pub const AUDIT_PROMOTE: &str = "gunshi.allocation_policy.promote";

@@ -1,21 +1,10 @@
+pub use crate::chisei::decision_ledger::{Decision, DecisionFilter};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashMap};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Decision {
-    pub id: String,
-    pub timestamp: i64,
-    pub actor: String,
-    pub action: String,
-    pub reason: String,
-    pub evidence: HashMap<String, String>,
-    pub target_id: String,
-    pub outcome: String,
-}
 
 #[derive(Debug, Clone)]
 pub struct ObjectChange {
@@ -26,16 +15,6 @@ pub struct ObjectChange {
     pub new_value: String,
     pub changed_by: String,
     pub timestamp: i64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecisionFilter {
-    pub actor: Option<String>,
-    pub action: Option<String>,
-    pub target_id: Option<String>,
-    pub after: i64,
-    pub limit: i32,
-    pub offset: i32,
 }
 
 fn validate_decision(decision: &Decision) -> Result<(), String> {

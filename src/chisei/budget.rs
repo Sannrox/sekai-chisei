@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::chisei::decision_ledger::Decision;
 use crate::db::chisei_budget::{METRIC_TOKENS, scope_chain};
 use crate::db::store::{ChiseiBudgetStore, ChiseiDecisionStore, ChiseiStore};
-use crate::sekai::audit::Decision;
 
 pub use crate::db::chisei_budget::BudgetTransferRecord;
 
@@ -783,7 +783,7 @@ mod tests {
 
         // Audit decision recorded.
         let decisions = db
-            .list_decisions(&crate::sekai::audit::DecisionFilter {
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
                 action: Some("budget.transfer".into()),
                 target_id: Some("region:us".into()),
                 ..Default::default()

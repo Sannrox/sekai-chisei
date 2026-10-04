@@ -6,6 +6,7 @@ pub mod capability;
 pub mod controller;
 pub mod cross_store_admission;
 pub mod data_quality;
+pub mod decision_ledger;
 pub mod egress;
 pub mod entitlements;
 pub mod epistemic_descriptor;
