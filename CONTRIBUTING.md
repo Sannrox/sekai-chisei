@@ -30,8 +30,10 @@ lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 1. Install the compiler pinned in `rust-toolchain.toml` (Rust 2024 edition).
 2. Clone the repository.
 3. Copy `.env.example` to `.env` if you need local overrides. Combined
-   `cargo run` does not load `.env`; export `SEKAI_DB_PATH` and
-   `CHISEI_DB_PATH` (or `SEKAI_SHARED_STORE=1` for a single file). See
+   `cargo run` does not load `.env`. With no store variable it opens split
+   `sekai.db` and `chisei.db` under `SEKAI_DATA_DIR` (default `./data`);
+   `SEKAI_DB_PATH` and `CHISEI_DB_PATH` override the files (or
+   `SEKAI_SHARED_STORE=1` with `DB_PATH` for a single file). See
    [configuration](docs/configuration.md).
 4. Run the standard checks:
 
@@ -45,10 +47,10 @@ Those aliases in `.cargo/config.toml` are what CI runs: `fmt --all -- --check`,
 `clippy --workspace --all-targets --locked -- -D warnings`, and
 `test --workspace --locked`.
 
-Start a trusted local Combined server with the dest-pair:
+Start a trusted local Combined server (split stores under `./data`):
 
 ```bash
-SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
+SEKAI_INSECURE=1 cargo run
 ```
 
 Separate `sekai-plane` and `chisei-plane` processes are documented in

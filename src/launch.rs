@@ -266,11 +266,11 @@ pub async fn run_launch(
     config: LaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
-    let db_path = std::env::var("SEKAI_DB_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("DB_PATH").ok())
-        .unwrap_or_else(|| "./data/sekai.db".into());
+    // The Sekai file the server opens: SEKAI_DB_PATH, DB_PATH, else
+    // `<SEKAI_DATA_DIR>/sekai.db`.
+    let db_path = crate::combined_stores::registry_db_anchor(
+        &crate::combined_stores::default_sekai_sqlite_path(),
+    );
     if config.kind().is_some() {
         let contract = validate_launch_contract(&config, &db_path)?;
         println!(
@@ -303,7 +303,7 @@ pub async fn run_launch(
     std::fs::create_dir_all(LOG_DIR)?;
     recover_stale_codex_config();
 
-    ensure_server(&config, &db_path).await?;
+    ensure_server(&config).await?;
     seed_agent(&config).await?;
     ensure_gateway(&config, &credential.token).await?;
 
@@ -387,9 +387,19 @@ fn validate_launch_contract(
     })
 }
 
+/// Store layout handed to the spawned server: the data directory, never a
+/// single `DB_PATH`. With no store variable the server derives split
+/// `sekai.db` / `chisei.db` there; explicit store variables are inherited
+/// from the environment and still win.
+fn server_store_env() -> Vec<(String, String)> {
+    vec![(
+        crate::combined_stores::DATA_DIR_ENV.to_string(),
+        crate::combined_stores::data_dir(),
+    )]
+}
+
 async fn ensure_server(
     config: &LaunchConfig,
-    db_path: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if socket_ready(&config.socket).await {
         println!("sekai server already running at {}", config.socket);
@@ -410,7 +420,7 @@ async fn ensure_server(
         ),
     ];
     envs.push(("SEKAI_BIND".to_string(), "127.0.0.1".to_string()));
-    envs.push(("DB_PATH".to_string(), db_path.to_string()));
+    envs.extend(server_store_env());
     envs.push(("SEKAI_INSECURE".to_string(), String::new()));
     println!("starting authenticated sekai server on local-only endpoints");
     let mut child = spawn_service(SERVER_BIN, &envs)?;
@@ -1581,5 +1591,11 @@ mod tests {
                 .contains("does not support the Responses harness")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn launch_hands_the_server_a_data_dir_not_a_single_db_path() {
+        let keys: Vec<_> = server_store_env().into_iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["SEKAI_DATA_DIR"]);
     }
 }
