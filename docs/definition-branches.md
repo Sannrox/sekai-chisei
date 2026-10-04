@@ -207,3 +207,38 @@ See [ADR 0024](decisions/0024-governed-definition-branches.md) for the
 branch/revision foundation, [ADR 0026](decisions/0026-governed-branch-proposals.md)
 for publication as a digest-bound proposal, and
 [the native protocol](../proto/sekai.proto) for exact messages.
+
+## Agent draft documents and exact member reads
+
+`agent` members use this strict document shape:
+
+```json
+{
+  "contract_version": "sekai.agent-definition/v1",
+  "name": "Triage",
+  "task_class": "lookup",
+  "instructions": "Inspect records.",
+  "allowed_action_types": ["Ticket.inspect"]
+}
+```
+
+Names, task classes, and Action references must be nonempty canonical identifiers
+of at most 256 bytes. Instructions must be nonempty text of at most 128 KiB,
+without NUL bytes. The Action allowlist contains at most 128 unique references.
+Unknown fields, missing fields, duplicate JSON keys, and unsupported document
+versions are rejected before persistence. Action references grant no authority.
+
+Use existing branch edits to save a draft. `GetDefinitionMember` accepts the
+namespace, exact `revision_digest`, `member_kind`, and `member_id`, returning
+canonical `definition_json`, its member digest, and the revision digest. It
+supports existing member kinds too. A read requires namespace access and read
+grants for every member of the selected revision, preserving revision-wide
+visibility. Missing and denied members return the same generic NotFound status;
+corrupt or incorrectly bound content returns a generic Internal status.
+
+The RPC is experimental and disabled unless the server sets
+`SEKAI_EXPERIMENTAL_RPCS=1` or builds with `experimental-rpcs`. This does not change
+credential scopes or resource grants. Agent-containing revisions cannot be
+published or merged: `agent_promotion_requires_certification` preserves the
+[certification decision](decisions/0079-evaluation-promotion-gate.md) until its
+promotion integration is delivered. See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).

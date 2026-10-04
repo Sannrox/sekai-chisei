@@ -398,6 +398,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_definitions::create_definition_branch(self, req).await
     }
 
+    async fn get_definition_member(
+        &self,
+        req: Request<GetDefinitionMemberRequest>,
+    ) -> Result<Response<GetDefinitionMemberResponse>, Status> {
+        rpc_definitions::get_definition_member(self, req).await
+    }
+
     async fn get_definition_branch(
         &self,
         req: Request<GetDefinitionBranchRequest>,

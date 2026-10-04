@@ -221,6 +221,16 @@ pub fn require_merge_compatibility(
     to: &DefinitionRevision,
     to_members: &[DefinitionMember],
 ) -> Result<(), String> {
+    // ADR 0079: ordinary proposal approval cannot substitute for bound certification.
+    // Agent drafts cannot promote until a certification integration is delivered.
+    if from
+        .members
+        .iter()
+        .chain(&to.members)
+        .any(|member| member.member_kind == "agent")
+    {
+        return Err("agent_promotion_requires_certification".into());
+    }
     let report = classify_definition_revision_compatibility(from, from_members, to, to_members)?;
     let gate = report.reasons.iter().find(|reason| {
         reason.class == "unknown"

@@ -212,6 +212,10 @@ impl GatewayStack {
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", &sekai_db)
             .env("CHISEI_DB_PATH", &chisei_db)
+            .env(
+                "CHISEI_PROVIDER_REGISTRY_STATE_PATH",
+                dir.path().join("provider-registry-state.json"),
+            )
             .env("GRPC_PORT", grpc_port.to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
