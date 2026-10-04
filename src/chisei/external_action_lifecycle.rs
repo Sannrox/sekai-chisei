@@ -178,7 +178,7 @@ pub fn ensure_audit(db: &ChiseiStore, record: &AuthorizationRecord) -> Result<()
     } else {
         record.approval_status.as_str()
     };
-    db.record_decisions_idempotently(&[crate::sekai::audit::Decision {
+    db.record_decisions_idempotently(&[crate::chisei::decision_ledger::Decision {
         id: format!("{}:audit:{lifecycle}", record.decision.authorization_id),
         timestamp: record.decision_updated_at_ms,
         actor: record.decision_actor.clone(),
