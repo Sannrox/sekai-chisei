@@ -70,8 +70,15 @@ cp .env.example .env
 ```
 
 Start Combined in one terminal. `cargo run` reads the process environment
-only; it does not load `.env` (`sekaictl launch` does). Export the dest-pair
-from [`.env.example`](.env.example):
+only; it does not load `.env` (`sekaictl launch` does). With no store
+variable set, Combined opens split `./data/sekai.db` and `./data/chisei.db`:
+
+```bash
+SEKAI_INSECURE=1 cargo run
+```
+
+`SEKAI_DATA_DIR` moves that directory. The dest-pair from
+[`.env.example`](.env.example) overrides the files explicitly:
 
 ```bash
 SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run

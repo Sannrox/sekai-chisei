@@ -1,6 +1,7 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
 mod provider_execution;
+pub mod rpc_identity;
 pub mod sekai_service;
 mod visible_page;
 
@@ -205,11 +206,8 @@ fn finish_authenticated(
                     .map_err(|_| Status::unauthenticated("invalid tenant identity"))?,
             );
         }
-        let method = req
-            .extensions()
-            .get::<tonic::GrpcMethod<'_>>()
-            .map(|method| method.method());
-        if method.is_none_or(|method| !enterprise_namespace_method(method)) {
+        let method = rpc_identity::request_rpc_method(&req);
+        if method.is_none_or(|(service, method)| !enterprise_namespace_rpc(service, method)) {
             return Err(Status::permission_denied(
                 "RPC is not available to enterprise-scoped credentials",
             ));
@@ -309,6 +307,19 @@ fn valid_single_principal(principal: &str) -> bool {
     !principal.is_empty() && principal.trim() == principal && !principal.contains(',')
 }
 
+fn enterprise_namespace_rpc(service: &str, method: &str) -> bool {
+    let chisei = matches!(
+        method,
+        "PlanExecution" | "ExecutePlanStream" | "PlanContentExecution" | "ExecuteContentPlanStream"
+    );
+    let expected = if chisei {
+        "chisei.ChiseiService"
+    } else {
+        "sekai.SekaiService"
+    };
+    service == expected && enterprise_namespace_method(method)
+}
+
 fn enterprise_namespace_method(method: &str) -> bool {
     matches!(
         method,
@@ -330,6 +341,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetLinkedObjects"
             | "Traverse"
             | "ListObjectChanges"
+            | "GetPublishedDefinitionRevision"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "PlanExecution"
@@ -418,17 +430,18 @@ impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareI
 impl<I: tonic::service::Interceptor> tonic::service::Interceptor for RestoreFenceInterceptor<I> {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         if request_is_mutating_rpc(&req) {
-            crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
-                .map_err(Status::failed_precondition)?;
+            crate::db::postgres::off_runtime(|| {
+                crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
+            })
+            .map_err(Status::failed_precondition)?;
         }
         self.inner.call(req)
     }
 }
 
 fn request_is_mutating_rpc<T>(req: &Request<T>) -> bool {
-    req.extensions()
-        .get::<tonic::GrpcMethod>()
-        .map(|method| crate::store_relocate::is_mutating_rpc(method.method()))
+    rpc_identity::request_rpc_method(req)
+        .map(|(_, method)| crate::store_relocate::is_mutating_rpc(method))
         .unwrap_or(false)
 }
 
@@ -823,22 +836,28 @@ where
 
     server
         .add_service(health_service)
-        .add_service(InterceptedService::new(
-            RpcMaturityLayer::from_env().layer(
-                pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
-            ),
-            with_restore_fence(
-                stores.clone(),
-                with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
-            ),
-        ))
-        .add_service(InterceptedService::new(
-            RpcMaturityLayer::from_env().layer(
-                pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
-                    chisei_svc.clone(),
+        .add_service(rpc_identity::RpcIdentityService::new(
+            InterceptedService::new(
+                RpcMaturityLayer::from_env().layer(
+                    pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(
+                        sekai_svc.clone(),
+                    ),
+                ),
+                with_restore_fence(
+                    stores.clone(),
+                    with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
                 ),
             ),
-            with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
+        ))
+        .add_service(rpc_identity::RpcIdentityService::new(
+            InterceptedService::new(
+                RpcMaturityLayer::from_env().layer(
+                    pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
+                        chisei_svc.clone(),
+                    ),
+                ),
+                with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
+            ),
         ))
         .serve(addr)
         .await
@@ -887,22 +906,28 @@ where
     Ok(tonic::transport::Server::builder()
         .layer(MetricsLayer)
         .add_service(health_service)
-        .add_service(InterceptedService::new(
-            RpcMaturityLayer::from_env().layer(
-                pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(sekai_svc.clone()),
-            ),
-            with_restore_fence(
-                stores.clone(),
-                with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
-            ),
-        ))
-        .add_service(InterceptedService::new(
-            RpcMaturityLayer::from_env().layer(
-                pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
-                    chisei_svc.clone(),
+        .add_service(rpc_identity::RpcIdentityService::new(
+            InterceptedService::new(
+                RpcMaturityLayer::from_env().layer(
+                    pb::sekai::sekai_service_server::SekaiServiceServer::from_arc(
+                        sekai_svc.clone(),
+                    ),
+                ),
+                with_restore_fence(
+                    stores.clone(),
+                    with_plane(plane, ProcessPlane::Sekai, interceptor.clone()),
                 ),
             ),
-            with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
+        ))
+        .add_service(rpc_identity::RpcIdentityService::new(
+            InterceptedService::new(
+                RpcMaturityLayer::from_env().layer(
+                    pb::chisei::chisei_service_server::ChiseiServiceServer::from_arc(
+                        chisei_svc.clone(),
+                    ),
+                ),
+                with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
+            ),
         ))
         .serve_with_incoming(UnixListenerStream::new(listener))
         .await?)

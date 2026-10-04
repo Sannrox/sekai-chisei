@@ -3,7 +3,8 @@
 //! Destination variables open two stores. A shared path or database is refused.
 //! Legacy `DB_PATH` / `DATABASE_URL` remain one physical identity until
 //! relocation copies families (#1006). Combined mode never invents a second
-//! file from a single path.
+//! file from a single path. With no store variable at all, SQLite derives
+//! `<SEKAI_DATA_DIR>/sekai.db` and `<SEKAI_DATA_DIR>/chisei.db` (#1238).
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -63,6 +64,28 @@ pub enum CombinedStoreLayout {
 }
 
 const UNCACHED_MATCHED_GENERATION: i64 = i64::MIN;
+
+/// Directory that owns the local SQLite layout when no store variable is set.
+pub const DATA_DIR_ENV: &str = "SEKAI_DATA_DIR";
+pub const DEFAULT_DATA_DIR: &str = "./data";
+pub const SEKAI_STORE_FILE: &str = "sekai.db";
+pub const CHISEI_STORE_FILE: &str = "chisei.db";
+
+/// `SEKAI_DATA_DIR`, defaulting to `./data`.
+pub fn data_dir() -> String {
+    optional_trimmed_env(DATA_DIR_ENV).unwrap_or_else(|| DEFAULT_DATA_DIR.into())
+}
+
+/// `<dir>/<file>` as a path string.
+pub fn data_dir_file(dir: &str, file: &str) -> String {
+    Path::new(dir).join(file).to_string_lossy().into_owned()
+}
+
+/// Sekai SQLite file for single-path callers: `DB_PATH`, else
+/// `<SEKAI_DATA_DIR>/sekai.db`.
+pub fn default_sekai_sqlite_path() -> String {
+    optional_trimmed_env("DB_PATH").unwrap_or_else(|| data_dir_file(&data_dir(), SEKAI_STORE_FILE))
+}
 
 pub const SEKAI_POOL_ENV: &str = "SEKAI_POSTGRES_SEKAI_CONNECTIONS";
 pub const CHISEI_POOL_ENV: &str = "SEKAI_POSTGRES_CHISEI_CONNECTIONS";
@@ -146,6 +169,10 @@ pub struct CombinedStoreSources {
     /// Constructed fixtures keep Shared. `from_env` sets this only when
     /// `SEKAI_SHARED_STORE=1` so Combined does not silently boot one identity.
     pub allow_shared_compatibility: bool,
+    /// SQLite directory that derives `sekai.db` / `chisei.db`. `from_env` sets
+    /// it only when no store path or URL variable is set; each consumer
+    /// derives only the files it owns.
+    pub data_dir: Option<String>,
 }
 
 impl Default for CombinedStoreSources {
@@ -164,6 +191,7 @@ impl Default for CombinedStoreSources {
             chisei_pool_connections: None,
             postgres_ca_cert_path: None,
             allow_shared_compatibility: true,
+            data_dir: None,
         }
     }
 }
@@ -186,21 +214,38 @@ impl CombinedStoreSources {
                 .transpose()
         };
         let postgres_max_connections = connections("SEKAI_POSTGRES_MAX_CONNECTIONS")?.unwrap_or(16);
+        let legacy_sqlite_path = optional_trimmed_env("DB_PATH");
+        let legacy_postgres_url = optional_trimmed_env("DATABASE_URL");
+        let sekai_sqlite_path = optional_trimmed_env("SEKAI_DB_PATH");
+        let chisei_sqlite_path = optional_trimmed_env("CHISEI_DB_PATH");
+        let sekai_postgres_url = optional_trimmed_env("SEKAI_DATABASE_URL");
+        let chisei_postgres_url = optional_trimmed_env("CHISEI_DATABASE_URL");
+        let names_a_store = [
+            &legacy_sqlite_path,
+            &legacy_postgres_url,
+            &sekai_sqlite_path,
+            &chisei_sqlite_path,
+            &sekai_postgres_url,
+            &chisei_postgres_url,
+        ]
+        .iter()
+        .any(|value| value.is_some());
         Ok(Self {
             backend: Some(backend),
             default_sqlite_path: default_sqlite_path.to_string(),
-            legacy_sqlite_path: optional_trimmed_env("DB_PATH"),
-            legacy_postgres_url: optional_trimmed_env("DATABASE_URL"),
-            sekai_sqlite_path: optional_trimmed_env("SEKAI_DB_PATH"),
-            chisei_sqlite_path: optional_trimmed_env("CHISEI_DB_PATH"),
-            sekai_postgres_url: optional_trimmed_env("SEKAI_DATABASE_URL"),
-            chisei_postgres_url: optional_trimmed_env("CHISEI_DATABASE_URL"),
+            legacy_sqlite_path,
+            legacy_postgres_url,
+            sekai_sqlite_path,
+            chisei_sqlite_path,
+            sekai_postgres_url,
+            chisei_postgres_url,
             postgres_max_connections,
             sekai_pool_connections: connections(SEKAI_POOL_ENV)?,
             chisei_pool_connections: connections(CHISEI_POOL_ENV)?,
             postgres_ca_cert_path: optional_trimmed_env("SEKAI_POSTGRES_CA_CERT"),
             allow_shared_compatibility: std::env::var("SEKAI_SHARED_STORE").unwrap_or_default()
                 == "1",
+            data_dir: (backend == BackendIdentity::Sqlite && !names_a_store).then(data_dir),
         })
     }
 
@@ -212,8 +257,15 @@ impl CombinedStoreSources {
         )
     }
 
-    pub fn open(self) -> Result<CombinedStoreLayout, String> {
+    pub fn open(mut self) -> Result<CombinedStoreLayout, String> {
         let backend = self.backend.unwrap_or(BackendIdentity::Sqlite);
+        // `SEKAI_SHARED_STORE=1` keeps its explicit one-identity boot.
+        if let Some(dir) = self.data_dir.as_deref()
+            && !self.allow_shared_compatibility
+        {
+            self.sekai_sqlite_path = Some(data_dir_file(dir, SEKAI_STORE_FILE));
+            self.chisei_sqlite_path = Some(data_dir_file(dir, CHISEI_STORE_FILE));
+        }
         let dest_paths = (
             self.sekai_sqlite_path.as_deref(),
             self.chisei_sqlite_path.as_deref(),
@@ -461,6 +513,7 @@ impl CombinedStoreLayout {
 }
 
 /// Path used for provider-registry state beside the Sekai (or shared) file.
+/// With no store variable, `default_sqlite_path` is `<SEKAI_DATA_DIR>/sekai.db`.
 pub fn registry_db_anchor(default_sqlite_path: &str) -> String {
     optional_trimmed_env("SEKAI_DB_PATH").unwrap_or_else(|| default_sqlite_path.to_string())
 }
@@ -690,6 +743,38 @@ mod tests {
         assert_eq!(layout.mode_name(), "shared-compatibility");
         let (sekai, chisei) = layout.handles();
         assert!(Arc::ptr_eq(&sekai.runtime_arc(), &chisei.runtime_arc()));
+    }
+
+    #[test]
+    fn data_dir_derives_split_unless_the_shared_hatch_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let sources = |allow_shared_compatibility| CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: data_dir_file(data_dir, "legacy.db"),
+            postgres_max_connections: 16,
+            allow_shared_compatibility,
+            data_dir: Some(data_dir.into()),
+            ..CombinedStoreSources::default()
+        };
+
+        let split = sources(false).open().unwrap();
+        assert!(split.is_split());
+        assert_eq!(
+            split.sekai_identity(),
+            &sqlite_identity(&data_dir_file(data_dir, SEKAI_STORE_FILE)).unwrap()
+        );
+        assert_eq!(
+            split.chisei_identity(),
+            &sqlite_identity(&data_dir_file(data_dir, CHISEI_STORE_FILE)).unwrap()
+        );
+
+        let shared = sources(true).open().unwrap();
+        assert!(!shared.is_split());
+        assert_eq!(
+            shared.sekai_identity(),
+            &sqlite_identity(&data_dir_file(data_dir, "legacy.db")).unwrap()
+        );
     }
 
     #[test]

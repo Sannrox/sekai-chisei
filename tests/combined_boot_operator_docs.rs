@@ -51,13 +51,17 @@ fn docker_operator_docs_name_shared_store_hatch() {
 }
 
 #[test]
-fn readme_combined_cargo_run_exports_dest_pair() {
+fn readme_combined_cargo_run_boots_split_without_env() {
     let readme = read("README.md");
+    assert!(
+        readme.contains("SEKAI_INSECURE=1 cargo run") && readme.contains("SEKAI_DATA_DIR"),
+        "README Combined cargo run must boot split under SEKAI_DATA_DIR without .env"
+    );
     assert!(
         readme.contains(
             "SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run"
         ),
-        "README Combined cargo run must export dest-pair; cargo run does not load .env"
+        "README must show the explicit dest-pair override"
     );
     assert!(
         readme.contains("cargo run") && readme.contains("does not load `.env`"),

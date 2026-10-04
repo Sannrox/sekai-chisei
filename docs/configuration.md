@@ -10,10 +10,11 @@ template.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `SEKAI_DB_BACKEND` | `sqlite` | Runtime backend selection (`sqlite` or `postgres`). SQLite remains the default. |
-| `DB_PATH` | `./data/sekai.db` when the shared-store hatch is set and dest-pair is unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
+| `SEKAI_DATA_DIR` | `./data` | SQLite layout directory. With no store path or URL variable set, Combined opens split `<dir>/sekai.db` and `<dir>/chisei.db`; `sekai-plane` and `chisei-plane` each derive only their own file. Provider-registry state defaults beside `sekai.db`. |
+| `DB_PATH` | `<SEKAI_DATA_DIR>/sekai.db` when the shared-store hatch is set and dest-pair is unset | SQLite compatibility path for an explicit shared store (`SEKAI_SHARED_STORE=1`) |
 | `SEKAI_SHARED_STORE` | unset | Set `1` to boot Combined as one physical identity. Migration compatibility, not the default. |
-| `SEKAI_DB_PATH` | unset | Combined-mode Sekai SQLite file; must be paired with `CHISEI_DB_PATH` |
-| `CHISEI_DB_PATH` | unset | Combined-mode Chisei SQLite file; must be paired with `SEKAI_DB_PATH` |
+| `SEKAI_DB_PATH` | `<SEKAI_DATA_DIR>/sekai.db` | Combined-mode Sekai SQLite file; overrides the data directory and must be paired with `CHISEI_DB_PATH` |
+| `CHISEI_DB_PATH` | `<SEKAI_DATA_DIR>/chisei.db` | Combined-mode Chisei SQLite file; overrides the data directory and must be paired with `SEKAI_DB_PATH` |
 | `SEKAI_STORE_PEER` | unset | Read-only generation peer for an owned-plane or Shared open of a stamped dest |
 | `DATABASE_URL` | unset | PostgreSQL compatibility URL when destination URLs are unset; Combined shared-compat also needs `SEKAI_SHARED_STORE=1` |
 | `SEKAI_DATABASE_URL` | unset | Combined-mode Sekai PostgreSQL URL; must be paired with `CHISEI_DATABASE_URL` |
@@ -78,7 +79,12 @@ provenance issuance; they never fall back to a wider activation window.
 refuses a pair that resolves to the same file, including hardlinks to one
 inode, or the same database. Partial destination
 configuration is refused; a second file is never invented from one path.
-Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`.
+With no store variable at all (no destination pair, `DB_PATH`, or URL) and
+the SQLite backend, Combined derives the pair from `SEKAI_DATA_DIR` (default
+`./data`): `sekai.db` and `chisei.db`. `sekaictl launch` hands the server that
+directory rather than a single path. Explicit destination variables win over
+the directory; setting only one of them is still refused. PostgreSQL URLs are
+unaffected. Combined env boot refuses a shared store unless `SEKAI_SHARED_STORE=1`.
 `DB_PATH` and `DATABASE_URL` with that hatch remain migration compatibility
 until [store relocation](store-relocation.md) copies Chisei families and
 raises the writer fence. After the fence even the hatch cannot start a
