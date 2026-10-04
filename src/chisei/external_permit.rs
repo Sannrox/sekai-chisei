@@ -1219,6 +1219,7 @@ mod tests {
         ASSURANCE_VERSION, AssuranceDeclaration, AuthorizationClaim, ExternalActionDecision,
         ExternalActionRequest, REQUEST_VERSION,
     };
+    use crate::db::store::{ChiseiExternalActionStore, ChiseiPermitStore};
     use std::sync::{Arc, Barrier};
 
     fn authorization(deadline_ms: i64, invocations: u32) -> AuthorizationRecord {
@@ -1289,19 +1290,16 @@ mod tests {
 
     fn persist_authorization(db: &ChiseiStore, record: &AuthorizationRecord) {
         assert!(matches!(
-            db.runtime()
-                .claim_external_action_authorization(
-                    &record.request,
-                    &record.decision.request_digest,
-                    &record.decision.authorization_id,
-                    1_000
-                )
-                .unwrap(),
+            db.claim_external_action_authorization(
+                &record.request,
+                &record.decision.request_digest,
+                &record.decision.authorization_id,
+                1_000
+            )
+            .unwrap(),
             AuthorizationClaim::Claimed(_)
         ));
-        db.runtime()
-            .put_external_action_authorization(record)
-            .unwrap();
+        db.put_external_action_authorization(record).unwrap();
     }
 
     fn signed(record: &AuthorizationRecord) -> (Permit, SigningKey) {
@@ -1410,11 +1408,8 @@ mod tests {
         {
             let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
             persist_authorization(&db, &record);
-            db.runtime()
-                .put_permit(&permit, "issue-1", "agent:test")
-                .unwrap();
+            db.put_permit(&permit, "issue-1", "agent:test").unwrap();
             let first = db
-                .runtime()
                 .redeem_permit(
                     &permit,
                     &context(&permit),
@@ -1426,7 +1421,6 @@ mod tests {
                 )
                 .unwrap();
             let retry = db
-                .runtime()
                 .redeem_permit(
                     &permit,
                     &context(&permit),
@@ -1440,16 +1434,14 @@ mod tests {
             assert_eq!(first, retry);
         }
         let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
-        db.runtime()
-            .revoke_permit(
-                &permit.revocation_handle,
-                "operator:test",
-                "revoked after lost response",
-                10_001,
-            )
-            .unwrap();
+        db.revoke_permit(
+            &permit.revocation_handle,
+            "operator:test",
+            "revoked after lost response",
+            10_001,
+        )
+        .unwrap();
         let retry = db
-            .runtime()
             .redeem_permit(
                 &permit,
                 &context(&permit),
@@ -1462,7 +1454,6 @@ mod tests {
             .unwrap();
         assert_eq!(retry.execution_id, "execution-1");
         let error = db
-            .runtime()
             .redeem_permit(
                 &permit,
                 &context(&permit),
@@ -1484,9 +1475,7 @@ mod tests {
         let (permit, key) = signed(&record);
         let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "issue-1", "agent:test")
-            .unwrap();
+        db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         drop(db);
         let barrier = Arc::new(Barrier::new(2));
         let mut joins = Vec::new();
@@ -1498,7 +1487,7 @@ mod tests {
             joins.push(std::thread::spawn(move || {
                 let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
                 barrier.wait();
-                db.runtime().redeem_permit(
+                db.redeem_permit(
                     &permit,
                     &context(&permit),
                     &key.verifying_key(),
@@ -1523,48 +1512,43 @@ mod tests {
         let (permit, key) = signed(&record);
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "issue-1", "agent:test")
-            .unwrap();
+        db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         let mut changed = context(&permit);
         changed
             .observed_preconditions
             .insert("resource_version".into(), "git:def456".into());
         assert!(
-            db.runtime()
-                .redeem_permit(
-                    &permit,
-                    &changed,
-                    &key.verifying_key(),
-                    "r-1",
-                    "e-1",
-                    "local",
-                    3_000
-                )
-                .unwrap_err()
-                .contains("reauthorization")
-        );
-        db.runtime()
-            .revoke_permit(
-                &permit.revocation_handle,
-                "operator:test",
-                "operator revoked",
-                3_001,
+            db.redeem_permit(
+                &permit,
+                &changed,
+                &key.verifying_key(),
+                "r-1",
+                "e-1",
+                "local",
+                3_000
             )
-            .unwrap();
+            .unwrap_err()
+            .contains("reauthorization")
+        );
+        db.revoke_permit(
+            &permit.revocation_handle,
+            "operator:test",
+            "operator revoked",
+            3_001,
+        )
+        .unwrap();
         assert!(
-            db.runtime()
-                .redeem_permit(
-                    &permit,
-                    &context(&permit),
-                    &key.verifying_key(),
-                    "r-2",
-                    "e-2",
-                    "local",
-                    3_002
-                )
-                .unwrap_err()
-                .contains("revoked")
+            db.redeem_permit(
+                &permit,
+                &context(&permit),
+                &key.verifying_key(),
+                "r-2",
+                "e-2",
+                "local",
+                3_002
+            )
+            .unwrap_err()
+            .contains("revoked")
         );
 
         let record2 = {
@@ -1593,25 +1577,21 @@ mod tests {
             (permit, key)
         };
         persist_authorization(&db, &record2);
-        db.runtime()
-            .put_permit(&permit2, "issue-2", "agent:test")
-            .unwrap();
-        db.runtime()
-            .set_permit_kill_switch("executor", &permit2.executor, true, "emergency", 3_003)
+        db.put_permit(&permit2, "issue-2", "agent:test").unwrap();
+        db.set_permit_kill_switch("executor", &permit2.executor, true, "emergency", 3_003)
             .unwrap();
         assert!(
-            db.runtime()
-                .redeem_permit(
-                    &permit2,
-                    &context(&permit2),
-                    &key2.verifying_key(),
-                    "r-3",
-                    "e-3",
-                    "local",
-                    3_004
-                )
-                .unwrap_err()
-                .contains("kill switch")
+            db.redeem_permit(
+                &permit2,
+                &context(&permit2),
+                &key2.verifying_key(),
+                "r-3",
+                "e-3",
+                "local",
+                3_004
+            )
+            .unwrap_err()
+            .contains("kill switch")
         );
     }
 
@@ -1660,19 +1640,16 @@ mod tests {
 
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "offline-issue", "agent:test")
+        db.put_permit(&permit, "offline-issue", "agent:test")
             .unwrap();
-        db.runtime()
-            .revoke_permit(
-                &permit.revocation_handle,
-                "operator:test",
-                "learned after disconnected execution",
-                4_001,
-            )
-            .unwrap();
+        db.revoke_permit(
+            &permit.revocation_handle,
+            "operator:test",
+            "learned after disconnected execution",
+            4_001,
+        )
+        .unwrap();
         let reconciled = db
-            .runtime()
             .redeem_or_reconcile_permit(
                 &permit,
                 &context(&permit),
@@ -1689,41 +1666,38 @@ mod tests {
         assert_eq!(reconciled.invocation_ordinal, 1);
         assert_eq!(reconciled.execution_id, "offline-execution-1");
         assert_eq!(
-            db.runtime()
-                .replay_redemption(&permit, "offline-reconcile-1", "offline-execution-1")
+            db.replay_redemption(&permit, "offline-reconcile-1", "offline-execution-1")
                 .unwrap(),
             Some(reconciled)
         );
-        db.runtime()
-            .redeem_or_reconcile_permit(
+        db.redeem_or_reconcile_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "offline-reconcile-2",
+            "offline-execution-2",
+            "local",
+            RedemptionTiming {
+                invoked_at_ms: 3_500,
+                reconciled_at_ms: 5_001,
+            },
+        )
+        .unwrap();
+        assert!(
+            db.redeem_or_reconcile_permit(
                 &permit,
                 &context(&permit),
                 &key.verifying_key(),
-                "offline-reconcile-2",
-                "offline-execution-2",
+                "offline-reconcile-3",
+                "offline-execution-3",
                 "local",
                 RedemptionTiming {
-                    invoked_at_ms: 3_500,
-                    reconciled_at_ms: 5_001,
-                },
+                    invoked_at_ms: 3_750,
+                    reconciled_at_ms: 5_002,
+                }
             )
-            .unwrap();
-        assert!(
-            db.runtime()
-                .redeem_or_reconcile_permit(
-                    &permit,
-                    &context(&permit),
-                    &key.verifying_key(),
-                    "offline-reconcile-3",
-                    "offline-execution-3",
-                    "local",
-                    RedemptionTiming {
-                        invoked_at_ms: 3_750,
-                        reconciled_at_ms: 5_002,
-                    }
-                )
-                .unwrap_err()
-                .contains("invocation count exhausted")
+            .unwrap_err()
+            .contains("invocation count exhausted")
         );
 
         let mut destructive = authorization(10_000, 1);
@@ -1782,12 +1756,9 @@ mod tests {
         let (root, key) = signed(&record);
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .set_external_permit_policy(&permit_policy(), 2_500)
+        db.set_external_permit_policy(&permit_policy(), 2_500)
             .unwrap();
-        db.runtime()
-            .put_permit(&root, "root", "agent:test")
-            .unwrap();
+        db.put_permit(&root, "root", "agent:test").unwrap();
         let child = delegate(
             &root,
             &permit_policy(),
@@ -1811,13 +1782,10 @@ mod tests {
         .unwrap();
         assert_eq!(child.initiating_actor, "agent:test");
         assert_eq!(child.parent_chain, vec![root.permit_id.clone()]);
-        db.runtime()
-            .put_delegated_permit(&child, "agent:test")
-            .unwrap();
-        db.runtime().validate_delegation_chain(&child).unwrap();
+        db.put_delegated_permit(&child, "agent:test").unwrap();
+        db.validate_delegation_chain(&child).unwrap();
         assert!(
-            db.runtime()
-                .validate_permit_state(&root)
+            db.validate_permit_state(&root)
                 .unwrap_err()
                 .contains("transferred")
         );
@@ -1843,8 +1811,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            db.runtime()
-                .put_delegated_permit(&sibling, "agent:test")
+            db.put_delegated_permit(&sibling, "agent:test")
                 .unwrap_err()
                 .contains("UNIQUE")
         );
@@ -1876,17 +1843,15 @@ mod tests {
             .contains("expand")
         );
 
-        db.runtime()
-            .revoke_permit(
-                &root.revocation_handle,
-                "operator:test",
-                "root revoked",
-                3_100,
-            )
-            .unwrap();
+        db.revoke_permit(
+            &root.revocation_handle,
+            "operator:test",
+            "root revoked",
+            3_100,
+        )
+        .unwrap();
         assert!(
-            db.runtime()
-                .validate_delegation_chain(&child)
+            db.validate_delegation_chain(&child)
                 .unwrap_err()
                 .contains("revoked")
         );
@@ -1894,8 +1859,7 @@ mod tests {
         missing.parent_chain = vec!["missing".into()];
         missing.parent_permit_id = "missing".into();
         assert!(
-            db.runtime()
-                .validate_delegation_chain(&missing)
+            db.validate_delegation_chain(&missing)
                 .unwrap_err()
                 .contains("missing")
         );
@@ -1994,11 +1958,8 @@ mod tests {
         assert_eq!(permit.site_id, "local");
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "issue-1", "agent:test")
-            .unwrap();
+        db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         let redemption = db
-            .runtime()
             .redeem_permit(
                 &permit,
                 &context(&permit),
@@ -2033,10 +1994,8 @@ mod tests {
         assert_eq!(permit.site_id, "us-east");
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "issue-us", "agent:test")
-            .unwrap();
-        let foreign = db.runtime().redeem_permit(
+        db.put_permit(&permit, "issue-us", "agent:test").unwrap();
+        let foreign = db.redeem_permit(
             &permit,
             &context(&permit),
             &key.verifying_key(),
@@ -2050,7 +2009,6 @@ mod tests {
             "foreign region must fail closed"
         );
         let home = db
-            .runtime()
             .redeem_permit(
                 &permit,
                 &context(&permit),
@@ -2063,7 +2021,7 @@ mod tests {
             .unwrap();
         assert_eq!(home.site_id, "us-east");
         // Second distinct redeem at home fails on invocation count, not pin.
-        let double = db.runtime().redeem_permit(
+        let double = db.redeem_permit(
             &permit,
             &context(&permit),
             &key.verifying_key(),
@@ -2090,19 +2048,17 @@ mod tests {
         permit.sign(&key).unwrap();
         let db = ChiseiStore::memory();
         persist_authorization(&db, &record);
-        db.runtime()
-            .put_permit(&permit, "issue-legacy", "agent:test")
+        db.put_permit(&permit, "issue-legacy", "agent:test")
             .unwrap();
-        db.runtime()
-            .redeem_permit(
-                &permit,
-                &context(&permit),
-                &key.verifying_key(),
-                "r-legacy",
-                "e-legacy",
-                "local",
-                3_000,
-            )
-            .unwrap();
+        db.redeem_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "r-legacy",
+            "e-legacy",
+            "local",
+            3_000,
+        )
+        .unwrap();
     }
 }

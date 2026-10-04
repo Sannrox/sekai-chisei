@@ -3,7 +3,7 @@ use crate::chisei::gunshi::{
     compare_advisory, score_advisory_comparisons,
 };
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDecisionStore, ChiseiReceiptStore, ChiseiStore};
 use crate::sekai::audit::Decision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,20 +97,18 @@ pub fn record_issued_recommendations(
             outcome: "advisory".into(),
         },
     );
-    db.runtime()
-        .record_decisions_idempotently_by(&decisions, |existing, requested| {
-            if existing.action == ISSUANCE_ACTION && requested.action == ISSUANCE_ACTION {
-                return existing.evidence.get("request_digest")
-                    == requested.evidence.get("request_digest")
-                    && existing.evidence.get("allocation_digest")
-                        == requested.evidence.get("allocation_digest");
-            }
-            existing.action == requested.action
-                && existing.target_id == requested.target_id
-                && existing.evidence.get("namespace") == requested.evidence.get("namespace")
-                && existing.evidence.get("allocation_plan")
-                    == requested.evidence.get("allocation_plan")
-        })
+    db.record_decisions_idempotently_by(&decisions, |existing, requested| {
+        if existing.action == ISSUANCE_ACTION && requested.action == ISSUANCE_ACTION {
+            return existing.evidence.get("request_digest")
+                == requested.evidence.get("request_digest")
+                && existing.evidence.get("allocation_digest")
+                    == requested.evidence.get("allocation_digest");
+        }
+        existing.action == requested.action
+            && existing.target_id == requested.target_id
+            && existing.evidence.get("namespace") == requested.evidence.get("namespace")
+            && existing.evidence.get("allocation_plan") == requested.evidence.get("allocation_plan")
+    })
 }
 
 pub fn record_feedback(
@@ -138,7 +136,6 @@ pub fn record_feedback(
     }
     if let Some(outcome) = outcome {
         let receipt = db
-            .runtime()
             .get_operation_receipt(&outcome.receipt_reference)?
             .ok_or_else(|| "observed outcome receipt is not governed by Sekai".to_string())?;
         let logical_operation_id = receipt
@@ -194,8 +191,7 @@ pub fn record_feedback(
             Some(outcome),
         )?);
     }
-    db.runtime()
-        .record_decisions_idempotently_by(&decisions, feedback_decisions_equivalent)?;
+    db.record_decisions_idempotently_by(&decisions, feedback_decisions_equivalent)?;
     Ok(record)
 }
 
@@ -224,7 +220,6 @@ pub fn require_issued_plan(
     plan: &AllocationPlan,
 ) -> Result<Decision, String> {
     let issued = db
-        .runtime()
         .get_decision(&record_id(
             "issued",
             &plan.namespace,
@@ -375,8 +370,7 @@ fn feedback_decisions(
     action: &str,
     namespace: &str,
 ) -> Result<Vec<Decision>, String> {
-    db.runtime()
-        .list_decisions_for_action_namespace(action, namespace)
+    db.list_decisions_for_action_namespace(action, namespace)
 }
 
 fn feedback_decision(
@@ -456,7 +450,6 @@ pub fn load_choice_feedback(
     issuance_id: &str,
 ) -> Result<GunshiFeedbackRecord, String> {
     let decision = db
-        .runtime()
         .get_decision(&record_id("choice", namespace, allocation_id, issuance_id))?
         .filter(|decision| decision.action == CHOICE_ACTION)
         .ok_or_else(|| "no operator choice feedback found for allocation".to_string())?;
@@ -609,25 +602,24 @@ mod tests {
             .attributes
             .insert("cost_usd_micros".into(), "9".into());
         terminal.attributes.insert("latency_ms".into(), "18".into());
-        db.runtime()
-            .put_operation_receipt(&OperationReceipt {
-                version: OPERATION_RECEIPT_VERSION.into(),
-                operation_id: receipt_operation_id.into(),
-                parent_operation_id: None,
-                namespace: plan.namespace.clone(),
-                operation_class: plan.operation_class.clone(),
-                initiating_actor: "alice".into(),
-                schema_version: "test/v1".into(),
-                policy_version: plan.policy_version.clone(),
-                started_at_ms: 1,
-                completed_at_ms: Some(20),
-                events,
-                uncovered_surfaces: Vec::new(),
-                reporter_grants: Vec::new(),
-                ontology_digest: None,
-                artifact: None,
-            })
-            .unwrap();
+        db.put_operation_receipt(&OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: receipt_operation_id.into(),
+            parent_operation_id: None,
+            namespace: plan.namespace.clone(),
+            operation_class: plan.operation_class.clone(),
+            initiating_actor: "alice".into(),
+            schema_version: "test/v1".into(),
+            policy_version: plan.policy_version.clone(),
+            started_at_ms: 1,
+            completed_at_ms: Some(20),
+            events,
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: None,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -711,7 +703,6 @@ mod tests {
         )
         .unwrap();
         let issued = db
-            .runtime()
             .get_decision(&record_id(
                 "issued",
                 &plan.namespace,
@@ -738,7 +729,6 @@ mod tests {
         record_feedback(&db, "bob", "issuance-a", &plan, &choice, Some(&outcome)).unwrap();
 
         let stored_choice = db
-            .runtime()
             .get_decision(&record_id(
                 "choice",
                 &plan.namespace,
@@ -748,7 +738,6 @@ mod tests {
             .unwrap()
             .unwrap();
         let stored_outcome = db
-            .runtime()
             .get_decision(&record_id(
                 "outcome",
                 &plan.namespace,
