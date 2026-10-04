@@ -2702,6 +2702,7 @@ mod tests {
     use crate::chisei::receipt::{
         GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceiptEvent, ReceiptEventKind,
     };
+    use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore};
     use crate::domain::Object;
     use crate::sekai::security::Grant;
     use std::collections::{BTreeMap, HashMap};
@@ -2857,26 +2858,21 @@ mod tests {
     fn candidate_listing_is_namespace_scoped_and_operation_filtered() {
         let db = ChiseiStore::memory();
         let first = candidate();
-        db.runtime()
-            .insert_kioku_memory(&first, &[candidate_evidence(&first)])
+        db.insert_kioku_memory(&first, &[candidate_evidence(&first)])
             .unwrap();
         let mut second = candidate();
         second.id = "memory-2".into();
         second.namespace = "other".into();
         let mut second_evidence = candidate_evidence(&second);
         second_evidence.operation_id = "operation-2".into();
-        db.runtime()
-            .insert_kioku_memory(&second, &[second_evidence])
-            .unwrap();
+        db.insert_kioku_memory(&second, &[second_evidence]).unwrap();
 
         let listed = db
-            .runtime()
             .list_kioku_candidates("payments", Some("schema_change"), 10)
             .unwrap();
         assert_eq!(listed, vec![first]);
         assert!(
-            db.runtime()
-                .list_kioku_candidates("payments", Some("incident"), 10)
+            db.list_kioku_candidates("payments", Some("incident"), 10)
                 .unwrap()
                 .is_empty()
         );
@@ -2887,29 +2883,25 @@ mod tests {
         let db = ChiseiStore::memory();
         let mut memory = candidate();
         memory.confidence_bps = 10_000;
-        db.runtime()
-            .insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
+        db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
             .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                &memory.id,
-                memory.version,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "reviewer".into(),
-                    rationale: "verified".into(),
-                    reviewed_at_ms: 120,
-                },
-            )
-            .unwrap();
+        db.review_kioku_candidate(
+            &memory.id,
+            memory.version,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "reviewer".into(),
+                rationale: "verified".into(),
+                reviewed_at_ms: 120,
+            },
+        )
+        .unwrap();
         let disabled = db
-            .runtime()
             .disable_kioku_memory(&memory.id, memory.version, "reviewer", "regressed", 130)
             .unwrap();
         assert_eq!(disabled.state, MemoryLifecycleState::Rejected);
         assert!(
-            db.runtime()
-                .list_kioku_lifecycle_events(&memory.id, memory.version)
+            db.list_kioku_lifecycle_events(&memory.id, memory.version)
                 .unwrap()
                 .iter()
                 .any(|event| event.action == "disabled")
@@ -3025,7 +3017,7 @@ mod tests {
             .unwrap()
             .attributes
             .insert("request_id".into(), request_id.into());
-        db.runtime().put_operation_receipt(&receipt).unwrap();
+        db.put_operation_receipt(&receipt).unwrap();
     }
 
     #[test]
@@ -3033,25 +3025,22 @@ mod tests {
         let db = ChiseiStore::memory();
         let mut memory = candidate();
         memory.confidence_bps = 10_000;
-        db.runtime()
-            .insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
+        db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
             .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                &memory.id,
-                memory.version,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "reviewer".into(),
-                    rationale: "verified".into(),
-                    reviewed_at_ms: 120,
-                },
-            )
-            .unwrap();
+        db.review_kioku_candidate(
+            &memory.id,
+            memory.version,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "reviewer".into(),
+                rationale: "verified".into(),
+                reviewed_at_ms: 120,
+            },
+        )
+        .unwrap();
         let receipt = verified_outcome("atomic-plan", true).receipt;
 
         let error = db
-            .runtime()
             .put_operation_receipt_with_kioku_holdouts(
                 &receipt,
                 &[(memory.id.clone(), memory.version), ("missing".into(), 1)],
@@ -3061,15 +3050,9 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "memory version not found");
+        assert!(db.get_operation_receipt("atomic-plan").unwrap().is_none());
         assert!(
-            db.runtime()
-                .get_operation_receipt("atomic-plan")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            db.runtime()
-                .list_kioku_lifecycle_events(&memory.id, memory.version)
+            db.list_kioku_lifecycle_events(&memory.id, memory.version)
                 .unwrap()
                 .iter()
                 .all(|event| event.action != "held_out")
@@ -3083,33 +3066,31 @@ mod tests {
         affinity_object_ids: Vec<String>,
         classification: EvidenceClassification,
     ) {
-        db.runtime()
-            .produce_kioku_candidate(CandidateDerivation {
-                id: id.into(),
-                kind: MemoryKind::Recommendation,
-                claim: format!("Apply guidance from {id}"),
-                outcome_definition: "verification pass rate".into(),
-                outcomes: vec![verified_outcome(operation_id, true)],
-                affinity_object_ids,
-                producer_identity: "kioku:deriver".into(),
-                classification,
-                created_at_ms: 120,
-                expires_at_ms: Some(220),
-                retention_until_ms: Some(320),
-            })
-            .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                id,
-                1,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "human:operator".into(),
-                    rationale: "representative evidence".into(),
-                    reviewed_at_ms: 130,
-                },
-            )
-            .unwrap();
+        db.produce_kioku_candidate(CandidateDerivation {
+            id: id.into(),
+            kind: MemoryKind::Recommendation,
+            claim: format!("Apply guidance from {id}"),
+            outcome_definition: "verification pass rate".into(),
+            outcomes: vec![verified_outcome(operation_id, true)],
+            affinity_object_ids,
+            producer_identity: "kioku:deriver".into(),
+            classification,
+            created_at_ms: 120,
+            expires_at_ms: Some(220),
+            retention_until_ms: Some(320),
+        })
+        .unwrap();
+        db.review_kioku_candidate(
+            id,
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "representative evidence".into(),
+                reviewed_at_ms: 130,
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3143,13 +3124,8 @@ mod tests {
             vec![],
             EvidenceClassification::Internal,
         );
-        let prior = db
-            .runtime()
-            .get_kioku_memory("reassessable", 1)
-            .unwrap()
-            .unwrap();
+        let prior = db.get_kioku_memory("reassessable", 1).unwrap().unwrap();
         let prior_link = db
-            .runtime()
             .list_kioku_evidence("reassessable", 1)
             .unwrap()
             .pop()
@@ -3169,7 +3145,7 @@ mod tests {
             }],
             now_ms: 150,
         };
-        let first = db.runtime().reassess_kioku_memory(request.clone()).unwrap();
+        let first = db.reassess_kioku_memory(request.clone()).unwrap();
         assert!(!first.idempotent);
         assert_eq!(first.candidate.state, MemoryLifecycleState::Candidate);
         assert_eq!(
@@ -3180,36 +3156,30 @@ mod tests {
             })
         );
         assert_eq!(
-            db.runtime()
-                .get_kioku_memory(&prior.id, prior.version)
+            db.get_kioku_memory(&prior.id, prior.version)
                 .unwrap()
                 .unwrap()
                 .state,
             MemoryLifecycleState::Active
         );
         assert!(
-            db.runtime()
-                .list_kioku_lifecycle_events(&first.candidate.id, 1)
+            db.list_kioku_lifecycle_events(&first.candidate.id, 1)
                 .unwrap()
                 .iter()
                 .any(|event| event.action == "evidence_reassessed")
         );
 
         assert!(
-            db.runtime()
-                .validate_kioku_candidate(&first.candidate.id, 1)
+            db.validate_kioku_candidate(&first.candidate.id, 1)
                 .unwrap()
                 .valid
         );
-        let replay = db.runtime().reassess_kioku_memory(request.clone()).unwrap();
+        let replay = db.reassess_kioku_memory(request.clone()).unwrap();
         assert!(replay.idempotent);
         assert_eq!(replay.candidate, first.candidate);
 
         db.runtime().delete_grant("grant-payments").unwrap();
-        let denied_replay = db
-            .runtime()
-            .reassess_kioku_memory(request.clone())
-            .unwrap_err();
+        let denied_replay = db.reassess_kioku_memory(request.clone()).unwrap_err();
         assert!(denied_replay.contains("classification"));
         db.runtime()
             .create_grant(&Grant {
@@ -3236,19 +3206,15 @@ mod tests {
             }],
             now_ms: 150,
         };
-        let error = db
-            .runtime()
-            .reassess_kioku_memory(conflict.clone())
-            .unwrap_err();
+        let error = db.reassess_kioku_memory(conflict.clone()).unwrap_err();
         assert!(error.contains("exact prior digest"));
         conflict.reassessment_key = "evidence-change-2".into();
         conflict.evidence_basis[0].evidence_digest = prior_link.evidence_digest;
-        let second = db.runtime().reassess_kioku_memory(conflict).unwrap();
+        let second = db.reassess_kioku_memory(conflict).unwrap();
         assert!(!second.idempotent);
         assert_ne!(second.candidate.id, first.candidate.id);
 
         let promoted = db
-            .runtime()
             .review_kioku_candidate(
                 &first.candidate.id,
                 1,
@@ -3262,14 +3228,13 @@ mod tests {
             .unwrap();
         assert_eq!(promoted.state, MemoryLifecycleState::Active);
         assert_eq!(
-            db.runtime()
-                .get_kioku_memory("reassessable", 1)
+            db.get_kioku_memory("reassessable", 1)
                 .unwrap()
                 .unwrap()
                 .state,
             MemoryLifecycleState::Superseded
         );
-        let replay_after_promotion = db.runtime().reassess_kioku_memory(request).unwrap();
+        let replay_after_promotion = db.reassess_kioku_memory(request).unwrap();
         assert!(replay_after_promotion.idempotent);
     }
 
@@ -3290,27 +3255,17 @@ mod tests {
             observed_at_ms: 90,
         };
 
-        db.runtime()
-            .insert_kioku_memory(&memory, std::slice::from_ref(&link))
+        db.insert_kioku_memory(&memory, std::slice::from_ref(&link))
             .unwrap();
 
-        assert_eq!(
-            db.runtime().get_kioku_memory("memory-1", 1).unwrap(),
-            Some(memory)
-        );
-        assert_eq!(
-            db.runtime().list_kioku_evidence("memory-1", 1).unwrap(),
-            vec![link]
-        );
+        assert_eq!(db.get_kioku_memory("memory-1", 1).unwrap(), Some(memory));
+        assert_eq!(db.list_kioku_evidence("memory-1", 1).unwrap(), vec![link]);
     }
 
     #[test]
     fn rejects_untraceable_memory() {
         let db = ChiseiStore::memory();
-        let error = db
-            .runtime()
-            .insert_kioku_memory(&candidate(), &[])
-            .unwrap_err();
+        let error = db.insert_kioku_memory(&candidate(), &[]).unwrap_err();
         assert!(error.contains("evidence link"));
     }
 
@@ -3332,10 +3287,7 @@ mod tests {
             outcome_value: 1.0,
             observed_at_ms: 90,
         };
-        let error = db
-            .runtime()
-            .insert_kioku_memory(&memory, &[link])
-            .unwrap_err();
+        let error = db.insert_kioku_memory(&memory, &[link]).unwrap_err();
         assert!(error.contains("unreviewed candidates"));
     }
 
@@ -3366,7 +3318,6 @@ mod tests {
             observed_at_ms: 90,
         };
         let error = db
-            .runtime()
             .insert_kioku_memory(&memory, &[contradiction])
             .unwrap_err();
         assert!(error.contains("supporting evidence"));
@@ -3376,7 +3327,6 @@ mod tests {
     fn derives_candidate_from_verified_binary_outcomes() {
         let db = ChiseiStore::memory();
         let memory = db
-            .runtime()
             .produce_kioku_candidate(CandidateDerivation {
                 id: "derived-1".into(),
                 kind: MemoryKind::Recommendation,
@@ -3398,7 +3348,7 @@ mod tests {
         assert_eq!(memory.state, MemoryLifecycleState::Candidate);
         assert_eq!(memory.confidence_bps, 5_000);
         assert_eq!(memory.sample_size, 2);
-        let links = db.runtime().list_kioku_evidence("derived-1", 1).unwrap();
+        let links = db.list_kioku_evidence("derived-1", 1).unwrap();
         assert_eq!(links.len(), 2);
         assert!(
             links
@@ -3484,29 +3434,24 @@ mod tests {
     #[test]
     fn validates_and_promotes_candidate_with_human_audit() {
         let db = ChiseiStore::memory();
-        db.runtime()
-            .produce_kioku_candidate(CandidateDerivation {
-                id: "reviewed-1".into(),
-                kind: MemoryKind::Recommendation,
-                claim: "Verify migrations".into(),
-                outcome_definition: "verification pass rate".into(),
-                outcomes: vec![verified_outcome("operation-1", true)],
-                affinity_object_ids: vec![],
-                producer_identity: "kioku:deriver".into(),
-                classification: EvidenceClassification::Internal,
-                created_at_ms: 120,
-                expires_at_ms: Some(220),
-                retention_until_ms: Some(320),
-            })
-            .unwrap();
+        db.produce_kioku_candidate(CandidateDerivation {
+            id: "reviewed-1".into(),
+            kind: MemoryKind::Recommendation,
+            claim: "Verify migrations".into(),
+            outcome_definition: "verification pass rate".into(),
+            outcomes: vec![verified_outcome("operation-1", true)],
+            affinity_object_ids: vec![],
+            producer_identity: "kioku:deriver".into(),
+            classification: EvidenceClassification::Internal,
+            created_at_ms: 120,
+            expires_at_ms: Some(220),
+            retention_until_ms: Some(320),
+        })
+        .unwrap();
 
-        let validation = db
-            .runtime()
-            .validate_kioku_candidate("reviewed-1", 1)
-            .unwrap();
+        let validation = db.validate_kioku_candidate("reviewed-1", 1).unwrap();
         assert!(validation.valid);
         let promoted = db
-            .runtime()
             .review_kioku_candidate(
                 "reviewed-1",
                 1,
@@ -3520,7 +3465,6 @@ mod tests {
             .unwrap();
         assert_eq!(promoted.state, MemoryLifecycleState::Active);
         let duplicate_review = db
-            .runtime()
             .review_kioku_candidate(
                 "reviewed-1",
                 1,
@@ -3533,10 +3477,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(duplicate_review.contains("no longer awaiting review"));
-        let events = db
-            .runtime()
-            .list_kioku_lifecycle_events("reviewed-1", 1)
-            .unwrap();
+        let events = db.list_kioku_lifecycle_events("reviewed-1", 1).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].action, "promoted");
         assert_eq!(events[1].actor, "human:operator");
@@ -3636,23 +3577,19 @@ mod tests {
             now_ms: 150,
         };
 
-        let retrieved = db.runtime().retrieve_kioku_memories(&request).unwrap();
+        let retrieved = db.retrieve_kioku_memories(&request).unwrap();
         assert_eq!(retrieved.len(), 2);
         assert_eq!(retrieved[0].memory.id, "affine");
         assert_eq!(retrieved[0].graph_affinity, 1.0);
         assert!(!retrieved[0].evidence.is_empty());
-        let events = db
-            .runtime()
-            .list_kioku_lifecycle_events("affine", 1)
-            .unwrap();
+        let events = db.list_kioku_lifecycle_events("affine", 1).unwrap();
         assert_eq!(events.last().unwrap().action, "retrieved");
 
         let mut spoofed = request.clone();
         spoofed.actor = "root".into();
         spoofed.classification_ceiling = EvidenceClassification::Restricted;
         assert!(
-            db.runtime()
-                .retrieve_kioku_memories(&spoofed)
+            db.retrieve_kioku_memories(&spoofed)
                 .unwrap_err()
                 .contains("not authorized")
         );
@@ -3660,16 +3597,14 @@ mod tests {
         let mut unauthorized = request;
         unauthorized.namespace = "other".into();
         assert!(
-            db.runtime()
-                .retrieve_kioku_memories(&unauthorized)
+            db.retrieve_kioku_memories(&unauthorized)
                 .unwrap_err()
                 .contains("not authorized")
         );
         unauthorized.namespace = "payments".into();
         unauthorized.classification_ceiling = EvidenceClassification::Restricted;
         assert!(
-            db.runtime()
-                .retrieve_kioku_memories(&unauthorized)
+            db.retrieve_kioku_memories(&unauthorized)
                 .unwrap_err()
                 .contains("exceeds actor grant")
         );
@@ -3686,30 +3621,27 @@ mod tests {
             EvidenceClassification::Internal,
         );
         persist_outcome_receipt(&db, "control-invalidated", "request-control", true);
-        db.runtime()
-            .record_kioku_holdout(
-                "invalidated",
-                1,
-                "control-invalidated",
-                "kioku:evaluator",
-                140,
-            )
-            .unwrap();
-        db.runtime()
-            .record_kioku_lifecycle_event(&MemoryLifecycleEvent {
-                memory_id: "invalidated".into(),
-                memory_version: 1,
-                action: "holdout_invalidated".into(),
-                from_state: Some("active".into()),
-                to_state: "active".into(),
-                actor: "kioku:evaluator".into(),
-                reason: "pipeline operation control-invalidated".into(),
-                recorded_at_ms: 145,
-            })
-            .unwrap();
+        db.record_kioku_holdout(
+            "invalidated",
+            1,
+            "control-invalidated",
+            "kioku:evaluator",
+            140,
+        )
+        .unwrap();
+        db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+            memory_id: "invalidated".into(),
+            memory_version: 1,
+            action: "holdout_invalidated".into(),
+            from_state: Some("active".into()),
+            to_state: "active".into(),
+            actor: "kioku:evaluator".into(),
+            reason: "pipeline operation control-invalidated".into(),
+            recorded_at_ms: 145,
+        })
+        .unwrap();
 
         let error = db
-            .runtime()
             .record_kioku_outcome(&MemoryOutcomeObservation {
                 memory_id: "invalidated".into(),
                 memory_version: 1,
@@ -3750,22 +3682,20 @@ mod tests {
             .unwrap()
             .attributes
             .insert("outcome_metric".into(), " verification_pass_rate ".into());
-        db.runtime().put_operation_receipt(&receipt).unwrap();
-        db.runtime()
-            .record_kioku_lifecycle_event(&MemoryLifecycleEvent {
-                memory_id: "trimmed-metric".into(),
-                memory_version: 1,
-                action: "injected".into(),
-                from_state: Some("active".into()),
-                to_state: "active".into(),
-                actor: "agent:planner".into(),
-                reason: "pipeline request request-trimmed".into(),
-                recorded_at_ms: 140,
-            })
-            .unwrap();
+        db.put_operation_receipt(&receipt).unwrap();
+        db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+            memory_id: "trimmed-metric".into(),
+            memory_version: 1,
+            action: "injected".into(),
+            from_state: Some("active".into()),
+            to_state: "active".into(),
+            actor: "agent:planner".into(),
+            reason: "pipeline request request-trimmed".into(),
+            recorded_at_ms: 140,
+        })
+        .unwrap();
         assert_eq!(
-            db.runtime()
-                .list_kioku_outcome_assignments("trimmed-operation")
+            db.list_kioku_outcome_assignments("trimmed-operation")
                 .unwrap(),
             vec![MemoryOutcomeAssignment {
                 memory_id: "trimmed-metric".into(),
@@ -3774,19 +3704,18 @@ mod tests {
             }]
         );
 
-        db.runtime()
-            .record_kioku_outcome(&MemoryOutcomeObservation {
-                memory_id: "trimmed-metric".into(),
-                memory_version: 1,
-                operation_id: "trimmed-operation".into(),
-                request_id: "request-trimmed".into(),
-                memory_applied: true,
-                outcome_metric: "verification_pass_rate".into(),
-                outcome_value: 1.0,
-                passed: true,
-                recorded_at_ms: 150,
-            })
-            .unwrap();
+        db.record_kioku_outcome(&MemoryOutcomeObservation {
+            memory_id: "trimmed-metric".into(),
+            memory_version: 1,
+            operation_id: "trimmed-operation".into(),
+            request_id: "request-trimmed".into(),
+            memory_applied: true,
+            outcome_metric: "verification_pass_rate".into(),
+            outcome_value: 1.0,
+            passed: true,
+            recorded_at_ms: 150,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -3802,18 +3731,17 @@ mod tests {
         for operation_id in ["treatment-1", "treatment-2"] {
             let request_id = format!("request-{operation_id}");
             persist_outcome_receipt(&db, operation_id, &request_id, false);
-            db.runtime()
-                .record_kioku_lifecycle_event(&MemoryLifecycleEvent {
-                    memory_id: "regressing".into(),
-                    memory_version: 1,
-                    action: "injected".into(),
-                    from_state: Some("active".into()),
-                    to_state: "active".into(),
-                    actor: "agent:planner".into(),
-                    reason: format!("pipeline operation {operation_id}"),
-                    recorded_at_ms: 140,
-                })
-                .unwrap();
+            db.record_kioku_lifecycle_event(&MemoryLifecycleEvent {
+                memory_id: "regressing".into(),
+                memory_version: 1,
+                action: "injected".into(),
+                from_state: Some("active".into()),
+                to_state: "active".into(),
+                actor: "agent:planner".into(),
+                reason: format!("pipeline operation {operation_id}"),
+                recorded_at_ms: 140,
+            })
+            .unwrap();
             let observation = MemoryOutcomeObservation {
                 memory_id: "regressing".into(),
                 memory_version: 1,
@@ -3828,49 +3756,41 @@ mod tests {
             let mut forged = observation.clone();
             forged.outcome_value = 1.0;
             forged.passed = true;
-            assert!(db.runtime().record_kioku_outcome(&forged).is_err());
-            db.runtime().record_kioku_outcome(&observation).unwrap();
-            db.runtime().record_kioku_outcome(&observation).unwrap();
+            assert!(db.record_kioku_outcome(&forged).is_err());
+            db.record_kioku_outcome(&observation).unwrap();
+            db.record_kioku_outcome(&observation).unwrap();
         }
         for operation_id in ["control-1", "control-2"] {
             let request_id = format!("request-{operation_id}");
             persist_outcome_receipt(&db, operation_id, &request_id, true);
-            db.runtime()
-                .record_kioku_holdout("regressing", 1, operation_id, "kioku:evaluator", 140)
+            db.record_kioku_holdout("regressing", 1, operation_id, "kioku:evaluator", 140)
                 .unwrap();
-            db.runtime()
-                .record_kioku_outcome(&MemoryOutcomeObservation {
-                    memory_id: "regressing".into(),
-                    memory_version: 1,
-                    operation_id: operation_id.into(),
-                    request_id,
-                    memory_applied: false,
-                    outcome_metric: "verification_pass_rate".into(),
-                    outcome_value: 1.0,
-                    passed: true,
-                    recorded_at_ms: 150,
-                })
-                .unwrap();
+            db.record_kioku_outcome(&MemoryOutcomeObservation {
+                memory_id: "regressing".into(),
+                memory_version: 1,
+                operation_id: operation_id.into(),
+                request_id,
+                memory_applied: false,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                passed: true,
+                recorded_at_ms: 150,
+            })
+            .unwrap();
         }
 
         let evaluation = db
-            .runtime()
             .evaluate_kioku_impact_if_ready("regressing", 1, 2, 0.05, "kioku:evaluator", 160)
             .unwrap()
             .expect("both evaluation arms are ready");
         assert!(evaluation.retired);
         assert_eq!(evaluation.delta, -1.0);
         assert_eq!(
-            db.runtime()
-                .get_kioku_memory("regressing", 1)
-                .unwrap()
-                .unwrap()
-                .state,
+            db.get_kioku_memory("regressing", 1).unwrap().unwrap().state,
             MemoryLifecycleState::Rejected
         );
         assert_eq!(
-            db.runtime()
-                .list_kioku_lifecycle_events("regressing", 1)
+            db.list_kioku_lifecycle_events("regressing", 1)
                 .unwrap()
                 .last()
                 .unwrap()
@@ -3889,19 +3809,17 @@ mod tests {
             vec![],
             EvidenceClassification::Internal,
         );
-        db.runtime()
-            .record_kioku_holdout(
-                "scoped-holdout",
-                1,
-                "preview-operation",
-                "agent:planner",
-                140,
-            )
-            .unwrap();
+        db.record_kioku_holdout(
+            "scoped-holdout",
+            1,
+            "preview-operation",
+            "agent:planner",
+            140,
+        )
+        .unwrap();
 
         assert_eq!(
-            db.runtime()
-                .list_kioku_outcome_assignments("preview-operation")
+            db.list_kioku_outcome_assignments("preview-operation")
                 .unwrap(),
             vec![MemoryOutcomeAssignment {
                 memory_id: "scoped-holdout".into(),
@@ -3910,8 +3828,7 @@ mod tests {
             }]
         );
         assert!(
-            db.runtime()
-                .list_kioku_outcome_assignments("completed-operation")
+            db.list_kioku_outcome_assignments("completed-operation")
                 .unwrap()
                 .is_empty()
         );
@@ -3946,32 +3863,24 @@ mod tests {
             outcome_value: 1.0,
             observed_at_ms: 100,
         };
-        db.runtime()
-            .insert_kioku_memory(&replacement, &[evidence])
-            .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                "new",
-                1,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "human:operator".into(),
-                    rationale: "newer representative evidence".into(),
-                    reviewed_at_ms: 130,
-                },
-            )
-            .unwrap();
+        db.insert_kioku_memory(&replacement, &[evidence]).unwrap();
+        db.review_kioku_candidate(
+            "new",
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "newer representative evidence".into(),
+                reviewed_at_ms: 130,
+            },
+        )
+        .unwrap();
         assert_eq!(
-            db.runtime()
-                .get_kioku_memory("old", 1)
-                .unwrap()
-                .unwrap()
-                .state,
+            db.get_kioku_memory("old", 1).unwrap().unwrap().state,
             MemoryLifecycleState::Superseded
         );
         assert_eq!(
-            db.runtime()
-                .list_kioku_lifecycle_events("old", 1)
+            db.list_kioku_lifecycle_events("old", 1)
                 .unwrap()
                 .last()
                 .unwrap()
@@ -3979,29 +3888,21 @@ mod tests {
             "superseded"
         );
 
-        let sweep = db
-            .runtime()
-            .sweep_kioku_lifecycle("kioku:sweeper", 221)
-            .unwrap();
+        let sweep = db.sweep_kioku_lifecycle("kioku:sweeper", 221).unwrap();
         assert_eq!(sweep.expired, 1);
         assert_eq!(
-            db.runtime()
-                .list_kioku_lifecycle_events("new", 1)
+            db.list_kioku_lifecycle_events("new", 1)
                 .unwrap()
                 .last()
                 .unwrap()
                 .action,
             "expired"
         );
-        let sweep = db
-            .runtime()
-            .sweep_kioku_lifecycle("kioku:sweeper", 321)
-            .unwrap();
+        let sweep = db.sweep_kioku_lifecycle("kioku:sweeper", 321).unwrap();
         assert_eq!(sweep.purged, 2);
-        assert!(db.runtime().get_kioku_memory("new", 1).unwrap().is_none());
+        assert!(db.get_kioku_memory("new", 1).unwrap().is_none());
         assert_eq!(
-            db.runtime()
-                .list_kioku_lifecycle_events("new", 1)
+            db.list_kioku_lifecycle_events("new", 1)
                 .unwrap()
                 .last()
                 .unwrap()

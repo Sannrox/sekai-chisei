@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::chisei::eval::{Assertion, Case, EvalStore, Suite};
 use crate::chisei::evolve::{self, TaskRecord};
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
 use crate::domain::{KIND_CAPABILITY, Link, ListFilter, Object, REL_DEPENDS_ON};
 use crate::sekai::audit::{Decision, insert_object_changes, object_diff_changes};
 
@@ -1078,18 +1078,17 @@ fn record_capability_decision(
     evidence: BTreeMap<String, String>,
     now: i64,
 ) -> Result<(), CapabilityGateError> {
-    db.runtime()
-        .record_decision(&Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now,
-            actor: actor.to_string(),
-            action: action.to_string(),
-            reason: reason.to_string(),
-            evidence: evidence.into_iter().collect(),
-            target_id: proposal.id.clone(),
-            outcome: outcome.to_string(),
-        })
-        .map_err(CapabilityGateError::Audit)
+    db.record_decision(&Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: now,
+        actor: actor.to_string(),
+        action: action.to_string(),
+        reason: reason.to_string(),
+        evidence: evidence.into_iter().collect(),
+        target_id: proposal.id.clone(),
+        outcome: outcome.to_string(),
+    })
+    .map_err(CapabilityGateError::Audit)
 }
 
 fn normalize_task_class(value: &str) -> String {
@@ -1406,7 +1405,6 @@ mod tests {
 
         assert_eq!(proposal.status, PROPOSAL_APPROVED);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(proposal.id.clone()),
                 limit: 10,
@@ -1515,7 +1513,6 @@ mod tests {
         assert_eq!(authorization.proposal_id, proposal.id);
         assert_eq!(authorization.approved_by, "reviewer");
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(proposal.id.clone()),
                 limit: 10,
@@ -1640,7 +1637,6 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].status, CAPABILITY_ACTIVE);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 action: Some("capability_registered".to_string()),
                 target_id: Some(first.id),
@@ -1705,7 +1701,6 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].status, CAPABILITY_REVOKED);
         let decisions = db
-            .runtime()
             .list_decisions(&DecisionFilter {
                 target_id: Some(registered.id),
                 limit: 10,

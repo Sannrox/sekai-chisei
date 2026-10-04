@@ -5,7 +5,7 @@ use crate::chisei::policy::{
     ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
 };
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader, SekaiFacts};
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiKiokuStore, ChiseiStore};
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
 use crate::sekai::evidence::EvidenceClassification;
@@ -1322,40 +1322,36 @@ fn run_kioku_enrich(
         .into_iter()
         .map(|object| object.id)
         .collect();
-    let actor_ceiling = match db
-        .runtime()
-        .kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor)
-    {
-        Ok(ceiling) => ceiling,
-        Err(error) => {
-            return StepDecision {
-                step: String::new(),
-                action: "skipped".into(),
-                reasoning: format!("memory retrieval denied: {error}"),
-                confidence: 1.0,
-                suggestion: String::new(),
-                value: String::new(),
-            };
-        }
-    };
+    let actor_ceiling =
+        match db.kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor) {
+            Ok(ceiling) => ceiling,
+            Err(error) => {
+                return StepDecision {
+                    step: String::new(),
+                    action: "skipped".into(),
+                    reasoning: format!("memory retrieval denied: {error}"),
+                    confidence: 1.0,
+                    suggestion: String::new(),
+                    value: String::new(),
+                };
+            }
+        };
     let classification_ceiling = if req.external_egress {
         actor_ceiling.min(EvidenceClassification::Public)
     } else {
         actor_ceiling
     };
     let retrieved =
-        match db
-            .runtime()
-            .retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
-                namespace: req.namespace.clone(),
-                operation_class: req.task_type.clone(),
-                context_object_ids,
-                classification_ceiling,
-                min_confidence_bps: 0,
-                max_results: 16,
-                actor: req.memory_actor.clone(),
-                now_ms: chrono::Utc::now().timestamp_millis(),
-            }) {
+        match db.retrieve_kioku_memories(&crate::chisei::kioku::MemoryRetrievalRequest {
+            namespace: req.namespace.clone(),
+            operation_class: req.task_type.clone(),
+            context_object_ids,
+            classification_ceiling,
+            min_confidence_bps: 0,
+            max_results: 16,
+            actor: req.memory_actor.clone(),
+            now_ms: chrono::Utc::now().timestamp_millis(),
+        }) {
             Ok(retrieved) => retrieved,
             Err(error) => {
                 return StepDecision {
@@ -2623,35 +2619,33 @@ mod tests {
             reassessment_key: String::new(),
             reassessment_actor: String::new(),
         };
-        db.runtime()
-            .insert_kioku_memory(
-                &memory,
-                &[KiokuEvidenceLink {
-                    memory_id: memory.id.clone(),
-                    memory_version: 1,
-                    operation_id: "operation-1".into(),
-                    verification_event_id: "verify-1".into(),
-                    evidence_reference: "evidence:operation-1".into(),
-                    evidence_digest: "digest-1".into(),
-                    stance: MemoryEvidenceStance::Supporting,
-                    outcome_metric: "verification_pass_rate".into(),
-                    outcome_value: 1.0,
-                    observed_at_ms: 90,
-                }],
-            )
-            .unwrap();
-        db.runtime()
-            .review_kioku_candidate(
-                "memory-migrations",
-                1,
-                HumanMemoryReview {
-                    action: HumanReviewAction::Promote,
-                    reviewer: "human:operator".into(),
-                    rationale: "representative evidence".into(),
-                    reviewed_at_ms: 110,
-                },
-            )
-            .unwrap();
+        db.insert_kioku_memory(
+            &memory,
+            &[KiokuEvidenceLink {
+                memory_id: memory.id.clone(),
+                memory_version: 1,
+                operation_id: "operation-1".into(),
+                verification_event_id: "verify-1".into(),
+                evidence_reference: "evidence:operation-1".into(),
+                evidence_digest: "digest-1".into(),
+                stance: MemoryEvidenceStance::Supporting,
+                outcome_metric: "verification_pass_rate".into(),
+                outcome_value: 1.0,
+                observed_at_ms: 90,
+            }],
+        )
+        .unwrap();
+        db.review_kioku_candidate(
+            "memory-migrations",
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "human:operator".into(),
+                rationale: "representative evidence".into(),
+                reviewed_at_ms: 110,
+            },
+        )
+        .unwrap();
 
         let pipeline = Pipeline::new(vec![Box::new(KiokuEnrichStep)]);
         let mut request = make_req(&db);
@@ -2701,8 +2695,7 @@ mod tests {
             ]
         );
         assert!(
-            db.runtime()
-                .list_kioku_lifecycle_events("memory-migrations", 1)
+            db.list_kioku_lifecycle_events("memory-migrations", 1)
                 .unwrap()
                 .iter()
                 .all(|event| event.action != "injected")
