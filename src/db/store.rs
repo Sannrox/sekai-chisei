@@ -12,6 +12,14 @@ use std::sync::Arc;
 
 use super::runtime_db::RuntimeDb;
 
+mod chisei_ports;
+
+pub use chisei_ports::{
+    ChiseiBudgetStore, ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiEvalStore,
+    ChiseiExternalActionStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
+    ChiseiObservationStore, ChiseiPermitStore, ChiseiPortfolioStore, ChiseiReceiptStore,
+};
+
 /// Sekai-owned facts and commits. Chisei code must not construct or hold this.
 #[derive(Clone, Debug)]
 pub struct SekaiStore {
@@ -68,6 +76,12 @@ impl ChiseiStore {
         ))))
     }
 
+    /// True when this Chisei store and `sekai` share one physical store
+    /// (the combined-mode compatibility facade).
+    pub fn shares_physical_store_with(&self, sekai: &SekaiStore) -> bool {
+        Arc::ptr_eq(&self.inner, &sekai.inner)
+    }
+
     pub fn runtime(&self) -> &RuntimeDb {
         &self.inner
     }
@@ -90,6 +104,13 @@ mod tests {
             chisei.runtime().backend_name()
         );
         assert_eq!(sekai.runtime().backend_name(), "sqlite");
+    }
+
+    #[test]
+    fn shares_physical_store_only_for_the_shared_facade() {
+        let (sekai, chisei) = split_shared_runtime(Arc::new(RuntimeDb::memory()));
+        assert!(chisei.shares_physical_store_with(&sekai));
+        assert!(!ChiseiStore::memory().shares_physical_store_with(&SekaiStore::memory()));
     }
 
     #[test]

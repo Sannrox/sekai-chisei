@@ -16,7 +16,7 @@ use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
 use crate::chisei::sekai_facts::SekaiFactReader;
-use crate::db::store::{ChiseiStore, SekaiStore};
+use crate::db::store::{ChiseiDecisionStore, ChiseiStore, SekaiStore};
 use crate::domain::Object;
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
 use crate::sekai::compute;
@@ -477,22 +477,20 @@ pub fn record_lookup_promotion_gate(
     evidence.insert("passed".into(), report.passed.to_string());
     evidence.insert("failed".into(), report.failed.to_string());
     let verdict = report.verdict.as_str();
-    db.runtime()
-        .record_decision(&crate::sekai::audit::Decision {
-            id: decision_id.clone(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: actor.into(),
-            action: LOOKUP_FIRST_GATE_AUDIT_ACTION.into(),
-            reason: if verdict == "allow" {
-                "lookup-vs-golden promotion gate passed".into()
-            } else {
-                "lookup-vs-golden promotion gate failed; prior route policy remains unchanged"
-                    .into()
-            },
-            evidence: evidence.into_iter().collect(),
-            target_id: format!("lookup-first:{}:{}", report.namespace, report.suite_id),
-            outcome: verdict.into(),
-        })?;
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: decision_id.clone(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: actor.into(),
+        action: LOOKUP_FIRST_GATE_AUDIT_ACTION.into(),
+        reason: if verdict == "allow" {
+            "lookup-vs-golden promotion gate passed".into()
+        } else {
+            "lookup-vs-golden promotion gate failed; prior route policy remains unchanged".into()
+        },
+        evidence: evidence.into_iter().collect(),
+        target_id: format!("lookup-first:{}:{}", report.namespace, report.suite_id),
+        outcome: verdict.into(),
+    })?;
     Ok(decision_id)
 }
 
@@ -2494,7 +2492,6 @@ mod tests {
         let audit = ChiseiStore::memory();
         let decision_id = record_lookup_promotion_gate(&audit, "alice", &report).expect("audit");
         let decision = audit
-            .runtime()
             .get_decision(&decision_id)
             .expect("read audit")
             .unwrap();
@@ -2531,7 +2528,6 @@ mod tests {
         let audit = ChiseiStore::memory();
         let decision_id = record_lookup_promotion_gate(&audit, "alice", &report).expect("audit");
         let decision = audit
-            .runtime()
             .get_decision(&decision_id)
             .expect("read audit")
             .unwrap();

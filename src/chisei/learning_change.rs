@@ -5,7 +5,7 @@
 //! activation are explicit. Rollback supersedes history without rewriting
 //! source evidence.
 
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore};
 use crate::domain::KIND_LEARNING;
 use crate::sekai::audit::Decision;
 use crate::shomei;
@@ -109,7 +109,7 @@ pub fn propose_change(
     let candidate_digest = learning_digest(&learning)?;
     let baseline_digest = live_baseline_digest(db, &request.namespace, &request.learning_id)?;
     let change_id = change_id_for(&request.namespace, &request.learning_id);
-    if let Some(mut existing) = db.runtime().get_learning_change(&change_id)? {
+    if let Some(mut existing) = db.get_learning_change(&change_id)? {
         if existing.namespace != request.namespace || existing.learning_id != request.learning_id {
             return Err(UNAVAILABLE.into());
         }
@@ -136,7 +136,7 @@ pub fn propose_change(
             restored_change_id: None,
         });
         existing.updated_at_ms = now_ms;
-        db.runtime().put_learning_change(&existing)?;
+        db.put_learning_change(&existing)?;
         audit(db, actor, PROPOSE_ACTION, "proposed", &existing, now_ms)?;
         return Ok(existing);
     }
@@ -159,7 +159,7 @@ pub fn propose_change(
         proposed_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
-    db.runtime().put_learning_change(&record)?;
+    db.put_learning_change(&record)?;
     audit(db, actor, PROPOSE_ACTION, "proposed", &record, now_ms)?;
     Ok(record)
 }
@@ -195,7 +195,7 @@ pub fn approve_change(
         approved_at_ms: now_ms,
     });
     record.updated_at_ms = now_ms;
-    db.runtime().put_learning_change(&record)?;
+    db.put_learning_change(&record)?;
     audit(db, actor, APPROVE_ACTION, "approved", &record, now_ms)?;
     Ok(record)
 }
@@ -229,7 +229,7 @@ pub fn activate_change(
     });
     record.updated_at_ms = now_ms;
     set_learning_status(db, &record.learning_id, "active")?;
-    db.runtime().put_learning_change(&record)?;
+    db.put_learning_change(&record)?;
     audit(db, actor, ACTIVATE_ACTION, "activated", &record, now_ms)?;
     Ok(record)
 }
@@ -262,7 +262,7 @@ pub fn rollback_change(
     });
     record.updated_at_ms = now_ms;
     set_learning_status(db, &record.learning_id, "candidate")?;
-    db.runtime().put_learning_change(&record)?;
+    db.put_learning_change(&record)?;
     audit(db, actor, ROLLBACK_ACTION, "rolled_back", &record, now_ms)?;
     Ok(record)
 }
@@ -284,7 +284,7 @@ pub fn note_lease_loss(
     }
     record.reconciliation = RECONCILE_LEASE_LOST.into();
     record.updated_at_ms = now_ms;
-    db.runtime().put_learning_change(&record)?;
+    db.put_learning_change(&record)?;
     audit(db, actor, RECONCILE_ACTION, "lease_lost", &record, now_ms)?;
     Ok(record)
 }
@@ -298,7 +298,6 @@ pub fn get_change(
     required("learning id", learning_id)?;
     let change_id = change_id_for(namespace, learning_id);
     let record = db
-        .runtime()
         .get_learning_change(&change_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if record.namespace != namespace || record.learning_id != learning_id {
@@ -311,7 +310,7 @@ pub fn list_changes(
     db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<LearningChange>, String> {
-    db.runtime().list_learning_changes(namespace)
+    db.list_learning_changes(namespace)
 }
 
 pub fn inspect_change(
@@ -455,7 +454,6 @@ fn live_baseline_digest(
 ) -> Result<String, String> {
     let current = change_id_for(namespace, learning_id);
     Ok(db
-        .runtime()
         .list_learning_changes(Some(namespace))?
         .into_iter()
         .filter(|record| record.status == STATUS_ACTIVE && record.change_id != current)
@@ -521,7 +519,7 @@ fn audit(
     record: &LearningChange,
     now_ms: i64,
 ) -> Result<(), String> {
-    db.runtime().record_decision(&Decision {
+    db.record_decision(&Decision {
         id: format!("{action}:{}:{now_ms}", record.change_id),
         timestamp: now_ms,
         actor: actor.into(),

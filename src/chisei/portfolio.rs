@@ -1,4 +1,4 @@
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiPortfolioStore, ChiseiStore};
 
 pub const LEGACY_PROMPT_VARIANT: &str = "legacy@1";
 
@@ -129,12 +129,11 @@ impl PortfolioStore {
             prompt_variant,
             ..observation.clone()
         };
-        self.db.runtime().portfolio_record_observation(&normalized)
+        self.db.portfolio_record_observation(&normalized)
     }
 
     pub fn points(&self, namespace: &str, task_class: &str) -> Result<Vec<FrontierPoint>, String> {
         self.db
-            .runtime()
             .portfolio_points(namespace.trim(), &normalize_task_class(task_class))
     }
 
@@ -175,11 +174,11 @@ impl PortfolioStore {
         if objective.min_samples <= 0 {
             return Err("portfolio min_samples must be positive".into());
         }
-        self.db.runtime().portfolio_set_objective(objective)
+        self.db.portfolio_set_objective(objective)
     }
 
     pub fn objective(&self, namespace: &str) -> Result<Option<Objective>, String> {
-        self.db.runtime().portfolio_objective(namespace.trim())
+        self.db.portfolio_objective(namespace.trim())
     }
 
     pub fn allocate(
@@ -287,7 +286,7 @@ impl PortfolioStore {
         if namespace.trim().is_empty() || proposed_model.trim().is_empty() {
             return Err("portfolio route namespace and proposed model required".into());
         }
-        self.db.runtime().portfolio_damped_route(
+        self.db.portfolio_damped_route(
             namespace.trim(),
             &normalize_task_class(task_class),
             proposed_model.trim(),

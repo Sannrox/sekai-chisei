@@ -14,7 +14,7 @@ use crate::chisei::promotion::{
     STATUS_GATE_FAILED, STATUS_GATE_PASSED, STATUS_PROPOSED,
 };
 use crate::chisei::scoring::sampling_suite_id;
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDecisionStore, ChiseiStore};
 
 /// Minimum aggregate success rate a template candidate's namespace task history must show to pass
 /// the gate.
@@ -78,18 +78,16 @@ pub fn gate_candidate(
         "candidate_score".to_string(),
         format!("{:.2}", decision.candidate_score),
     );
-    let _ = db
-        .runtime()
-        .record_decision(&crate::sekai::audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: chrono::Utc::now().timestamp_millis(),
-            actor: "chisei.gate".into(),
-            action: "gated".into(),
-            reason: decision.reason.clone(),
-            evidence,
-            target_id: candidate.id.clone(),
-            outcome: if passed { "pass".into() } else { "fail".into() },
-        });
+    let _ = db.record_decision(&crate::sekai::audit::Decision {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: "chisei.gate".into(),
+        action: "gated".into(),
+        reason: decision.reason.clone(),
+        evidence,
+        target_id: candidate.id.clone(),
+        outcome: if passed { "pass".into() } else { "fail".into() },
+    });
 
     Some(decision)
 }
@@ -240,6 +238,7 @@ mod tests {
         STATUS_SUPERSEDED, propose_routing_bias_candidate, propose_template_candidates,
     };
     use crate::chisei::scoring::{Judge, JudgeError, JudgeVerdict, SampleObservation, ScoringJob};
+    use crate::db::store::ChiseiObservationStore;
     use std::sync::Arc;
 
     const REGRESSION_BATCH: usize = 5;
@@ -280,23 +279,22 @@ mod tests {
         ts_base: i64,
     ) {
         for i in 0..count {
-            db.runtime()
-                .put_sample_observation(&SampleObservation {
-                    request_id: format!("{base}-{i}"),
-                    namespace: namespace.into(),
-                    spec: "do the thing".into(),
-                    resolved_model: "claude-opus-4-8".into(),
-                    output_content: "here is the thing".into(),
-                    sample_reason: "base".into(),
-                    input_tokens: 10,
-                    output_tokens: 20,
-                    stop_reason: "end_turn".into(),
-                    timestamp: ts_base + i as i64,
-                    scored: false,
-                    task_class: task_class.into(),
-                    cost_usd_micros: 0,
-                })
-                .unwrap();
+            db.put_sample_observation(&SampleObservation {
+                request_id: format!("{base}-{i}"),
+                namespace: namespace.into(),
+                spec: "do the thing".into(),
+                resolved_model: "claude-opus-4-8".into(),
+                output_content: "here is the thing".into(),
+                sample_reason: "base".into(),
+                input_tokens: 10,
+                output_tokens: 20,
+                stop_reason: "end_turn".into(),
+                timestamp: ts_base + i as i64,
+                scored: false,
+                task_class: task_class.into(),
+                cost_usd_micros: 0,
+            })
+            .unwrap();
         }
     }
 

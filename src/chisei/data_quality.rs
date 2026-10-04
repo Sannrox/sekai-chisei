@@ -1,6 +1,6 @@
 //! Content-bound data-quality rules and results (#681).
 
-use crate::db::store::ChiseiStore;
+use crate::db::store::{ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiStore};
 use crate::domain::Object;
 use crate::sekai::audit::Decision;
 use serde::{Deserialize, Serialize};
@@ -156,14 +156,12 @@ pub fn publish_rule(
         published_at_ms: now_ms,
     };
     rule.rule_digest = rule_digest(&rule)?;
-    if let Some(existing) = db
-        .runtime()
-        .get_data_quality_rule(&request.namespace, &request.rule_id)?
+    if let Some(existing) = db.get_data_quality_rule(&request.namespace, &request.rule_id)?
         && existing.rule_digest == rule.rule_digest
     {
         return Ok(existing);
     }
-    db.runtime().put_data_quality_rule(&rule)?;
+    db.put_data_quality_rule(&rule)?;
     audit(
         db,
         actor,
@@ -188,7 +186,7 @@ pub fn start_evaluation(
     let (rule, dataset, revision) =
         prepare_evaluation(db, actor, namespace, rule_id, pinned_rule_digest)?;
     let result_id = result_id_for(namespace, &rule.rule_digest, &revision);
-    if let Some(existing) = db.runtime().get_data_quality_result(&result_id)? {
+    if let Some(existing) = db.get_data_quality_result(&result_id)? {
         return Ok(existing);
     }
     let running = DataQualityResult {
@@ -216,7 +214,7 @@ pub fn start_evaluation(
         evaluated_by: actor.into(),
         evaluated_at_ms: now_ms,
     };
-    db.runtime().put_data_quality_result(&running)?;
+    db.put_data_quality_result(&running)?;
     Ok(running)
 }
 
@@ -244,7 +242,6 @@ pub fn cancel_evaluation(
     required("actor", actor)?;
     required("result id", result_id)?;
     let mut record = db
-        .runtime()
         .get_data_quality_result(result_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if is_closed(&record.status) {
@@ -254,7 +251,7 @@ pub fn cancel_evaluation(
     record.evaluated_by = actor.into();
     record.evaluated_at_ms = now_ms;
     record.evidence_receipt_digest = receipt_digest(&record)?;
-    db.runtime().put_data_quality_result(&record)?;
+    db.put_data_quality_result(&record)?;
     audit(
         db,
         actor,
@@ -277,7 +274,6 @@ pub fn restart_evaluation(
     required("actor", actor)?;
     required("result id", result_id)?;
     let existing = db
-        .runtime()
         .get_data_quality_result(result_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if is_closed(&existing.status) {
@@ -293,8 +289,7 @@ pub fn show_rule(
 ) -> Result<DataQualityRule, String> {
     required("namespace", namespace)?;
     required("rule id", rule_id)?;
-    db.runtime()
-        .get_data_quality_rule(namespace, rule_id)?
+    db.get_data_quality_rule(namespace, rule_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())
 }
 
@@ -302,13 +297,12 @@ pub fn list_rules(
     db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<DataQualityRule>, String> {
-    db.runtime().list_data_quality_rules(namespace)
+    db.list_data_quality_rules(namespace)
 }
 
 pub fn show_result(db: &ChiseiStore, result_id: &str) -> Result<DataQualityResult, String> {
     required("result id", result_id)?;
-    db.runtime()
-        .get_data_quality_result(result_id)?
+    db.get_data_quality_result(result_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())
 }
 
@@ -316,7 +310,7 @@ pub fn list_results(
     db: &ChiseiStore,
     namespace: Option<&str>,
 ) -> Result<Vec<DataQualityResult>, String> {
-    db.runtime().list_data_quality_results(namespace)
+    db.list_data_quality_results(namespace)
 }
 
 fn finish_evaluation(
@@ -326,7 +320,6 @@ fn finish_evaluation(
     now_ms: i64,
 ) -> Result<DataQualityResult, String> {
     let mut record = db
-        .runtime()
         .get_data_quality_result(result_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if is_closed(&record.status) {
@@ -338,7 +331,6 @@ fn finish_evaluation(
         None
     };
     let rule = db
-        .runtime()
         .get_data_quality_rule(&record.namespace, &record.rule_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if rule.rule_digest != record.rule_digest {
@@ -352,7 +344,7 @@ fn finish_evaluation(
     record.evaluated_by = actor.into();
     record.evaluated_at_ms = now_ms;
     record.evidence_receipt_digest = receipt_digest(&record)?;
-    db.runtime().put_data_quality_result(&record)?;
+    db.put_data_quality_result(&record)?;
     audit(
         db,
         actor,
@@ -377,7 +369,6 @@ fn prepare_evaluation(
     required("namespace", namespace)?;
     required("rule id", rule_id)?;
     let rule = db
-        .runtime()
         .get_data_quality_rule(namespace, rule_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if let Some(pinned) = pinned_rule_digest.filter(|value| !value.is_empty()) {
@@ -612,7 +603,7 @@ fn audit(
     target_id: &str,
     now_ms: i64,
 ) -> Result<(), String> {
-    db.runtime().record_decision(&Decision {
+    db.record_decision(&Decision {
         id: format!("{action}:{target_id}:{now_ms}"),
         timestamp: now_ms,
         actor: actor.into(),
