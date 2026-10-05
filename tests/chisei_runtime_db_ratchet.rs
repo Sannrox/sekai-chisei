@@ -20,7 +20,7 @@ const ALLOWED: &[(&str, usize)] = &[
     ("src/chisei/gunshi.rs", 2),
     ("src/chisei/gunshi_dispatch.rs", 1),
     ("src/chisei/kioku.rs", 6),
-    ("src/chisei/learning_change.rs", 13),
+    ("src/chisei/learning_change.rs", 11),
     ("src/chisei/lookup_first.rs", 28),
     ("src/chisei/pipeline.rs", 65),
     ("src/chisei/remote_sekai.rs", 2),

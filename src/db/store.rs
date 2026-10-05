@@ -66,6 +66,14 @@ impl SekaiStore {
     pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
     }
+
+    pub fn get_object(&self, id: &str) -> Result<Option<crate::domain::Object>, String> {
+        self.inner.get_object(id)
+    }
+
+    pub fn update_object(&self, object: &crate::domain::Object) -> Result<(), String> {
+        self.inner.update_object(object)
+    }
 }
 
 impl ChiseiStore {

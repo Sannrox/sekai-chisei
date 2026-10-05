@@ -437,7 +437,6 @@ fn visible_learning(
     learning_id: &str,
 ) -> Result<crate::domain::Object, String> {
     let learning = object_store(facts)?
-        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if learning.kind != KIND_LEARNING || learning.namespace != namespace {
@@ -487,12 +486,11 @@ fn set_learning_status(
 ) -> Result<(), String> {
     let store = object_store(facts)?;
     let mut learning = store
-        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     learning.properties.insert("status".into(), status.into());
     learning.updated = learning.updated.saturating_add(1);
-    store.runtime().update_object(&learning)
+    store.update_object(&learning)
 }
 
 fn learning_digest(object: &crate::domain::Object) -> Result<String, String> {
