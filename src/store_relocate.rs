@@ -11,7 +11,8 @@
 //!
 //! Destination pairs also carry a split generation. Combined split open
 //! compares the pair. Dual-unstamped stores auto-stamp only when both are
-//! empty; operator facts without a cutover stay unattested until restamp.
+//! empty; operator facts without a cutover stay unattested until restamp,
+//! or until relocate when the Sekai dest still holds Chisei families.
 //! A Shared or owned-plane open of a stamped store compares
 //! `SEKAI_STORE_PEER` (read-only) or refuses mutations until an operator
 //! restamp. Independent backups are not a paired restore set.
@@ -1327,7 +1328,7 @@ pub fn refuse_mutating_if_generation_mismatch(layout: &CombinedStoreLayout) -> R
         SplitGenerationState::Mismatched { sekai, chisei } => {
             Err(generation_mismatch_guidance(sekai, chisei))
         }
-        SplitGenerationState::Unattested => Err(unattested_guidance()),
+        SplitGenerationState::Unattested => Err(unattested_guidance(layout)?),
         SplitGenerationState::Matched { generation } => match matched_pairing_epoch(layout)? {
             Some(current) => {
                 layout.cache_matched_generation(generation);
@@ -1344,8 +1345,55 @@ fn pairing_epoch_guidance() -> String {
     "split pairing epochs disagree after a one-sided restore; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Equal cutover generation is not a pairing proof".into()
 }
 
-fn unattested_guidance() -> String {
-    "split stores hold operator facts without a cutover generation; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Dual-unstamped is not a green-field pair".into()
+fn unattested_guidance(layout: &CombinedStoreLayout) -> Result<String, String> {
+    if sekai_holds_chisei_families(layout)? {
+        Ok(stranded_chisei_family_guidance())
+    } else {
+        Ok(
+            "split stores hold operator facts without a cutover generation; mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. Dual-unstamped is not a green-field pair".into(),
+        )
+    }
+}
+
+fn stranded_chisei_family_guidance() -> String {
+    "split stores hold Chisei families in the Sekai dest without a cutover generation; mutating RPCs stay refused until an operator relocates with `sekaictl admin store relocate --source <path-or-url> --sekai <path-or-url> --chisei <path-or-url>`. restamp only writes matching generations and leaves those families in the Sekai dest".into()
+}
+
+fn sekai_holds_chisei_families(layout: &CombinedStoreLayout) -> Result<bool, String> {
+    if !layout.is_split() {
+        return Ok(false);
+    }
+    runtime_holds_chisei_families(&layout.sekai_runtime())
+}
+
+fn runtime_holds_chisei_families(db: &RuntimeDb) -> Result<bool, String> {
+    match db {
+        RuntimeDb::Sqlite(_) => db.with_sqlite_conn(sqlite_holds_chisei_families)?,
+        RuntimeDb::Postgres(db) => postgres_holds_chisei_families(db),
+    }
+}
+
+fn sqlite_holds_chisei_families(conn: &Connection) -> Result<bool, String> {
+    for table in list_chisei_tables(conn, "main")? {
+        if sqlite_table_row_count(conn, &table)? > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn postgres_holds_chisei_families(db: &PostgresDb) -> Result<bool, String> {
+    let mut conn = db.connection()?;
+    for table in list_postgres_chisei_tables(&mut *conn)? {
+        let count: i64 = conn
+            .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// #1108: kept for the ignored Postgres regression tests that call this
@@ -1413,6 +1461,14 @@ pub fn generation_mismatch_guidance(sekai: Option<i64>, chisei: Option<i64>) -> 
 pub fn restamp_split_generation(layout: &CombinedStoreLayout) -> Result<i64, String> {
     if !layout.is_split() {
         return Err("restamp requires a destination pair".into());
+    }
+    if sekai_holds_chisei_families(layout)? {
+        match split_generation_state(layout)? {
+            SplitGenerationState::Unattested | SplitGenerationState::Unstamped => {
+                return Err(stranded_chisei_family_guidance());
+            }
+            _ => {}
+        }
     }
     layout.invalidate_matched_generation();
     let generation = chrono::Utc::now().timestamp_millis();
@@ -2411,6 +2467,40 @@ mod tests {
         assert!(err.contains("operator facts"), "{err}");
         assert!(err.contains("restamp"), "{err}");
         restamp_split_generation(&layout).unwrap();
+        refuse_mutating_if_generation_mismatch(&layout).unwrap();
+    }
+
+    #[test]
+    fn unattested_split_with_stranded_chisei_families_requires_relocate() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let sekai_s = sekai.to_str().unwrap();
+        let chisei_s = chisei.to_str().unwrap();
+        let layout = open_dest_pair(sekai_s, chisei_s);
+        BudgetTracker::new(ChiseiStore::from_shared_runtime(layout.sekai_runtime()))
+            .set_limit("stranded", 99, PeriodType::Daily)
+            .unwrap();
+        wipe_cutover(&layout);
+
+        assert_eq!(
+            split_generation_state(&layout).unwrap(),
+            SplitGenerationState::Unattested
+        );
+        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
+        assert!(err.contains("relocate"), "{err}");
+        assert!(err.contains("Chisei families"), "{err}");
+        assert!(
+            restamp_split_generation(&layout)
+                .unwrap_err()
+                .contains("relocate"),
+            "restamp must fail closed while Chisei families remain in the Sekai dest"
+        );
+        drop(layout);
+
+        relocate(sekai_s, sekai_s, chisei_s).unwrap();
+        assert_eq!(budget_limit(chisei_s, "stranded"), 99);
+        let layout = open_dest_pair(sekai_s, chisei_s);
         refuse_mutating_if_generation_mismatch(&layout).unwrap();
     }
 
