@@ -130,7 +130,7 @@ require TLS; the optional CA path only extends trust for a private test CA.
 The image currently exports `DB_PATH=/data/sekai.db` and
 `SEKAI_SOCKET=/data/sekai.sock` only. Combined `sekai-chisei` refuses that
 shared file unless the runtime sets a dest-pair or `SEKAI_SHARED_STORE=1`.
-Checked-in compose sets `SEKAI_DB_PATH=/data/sekai.db` and
+Checked-in compose and `deploy/tenkai.toml` set `SEKAI_DB_PATH=/data/sekai.db` and
 `CHISEI_DB_PATH=/data/chisei.db` on the server. File databases use SQLite WAL
 mode, so volume backups must include both dest files plus `-wal`/`-shm`
 sidecars, or use `VACUUM INTO` on each.
