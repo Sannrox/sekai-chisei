@@ -115,3 +115,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0091: Object-log owns EvaluateObjectSet identity; SQL object_type_index is a rebuildable projection](0091-object-log-owns-evaluate-identity.md)
 - [ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei](0092-chisei-builds-without-sekai.md)
 - [ADR 0093: Agent drafts use immutable definition members](0093-agent-drafts-use-definition-members.md)
+- [ADR 0094: Scoped contexts author immutable definition drafts](0094-scoped-definition-draft-authoring.md)

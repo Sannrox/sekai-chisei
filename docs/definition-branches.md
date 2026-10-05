@@ -242,3 +242,23 @@ credential scopes or resource grants. Agent-containing revisions cannot be
 published or merged: `agent_promotion_requires_certification` preserves the
 [certification decision](decisions/0079-evaluation-promotion-gate.md) until its
 promotion integration is delivered. See [ADR 0093](decisions/0093-agent-drafts-use-definition-members.md).
+
+### Scoped draft authoring
+
+Scoped authenticated contexts can call qualified `sekai.SekaiService`
+`GetDefinitionBranch`, `CreateDefinitionBranch`, and `ApplyDefinitionBranchEdit`
+through the normal server-established RPC identity. All three remain experimental.
+Creation and editing require actual namespace write scope and grants; editing
+also requires revision-wide read visibility and administration of changed members.
+The server attributes writes to the authenticated subject, not caller metadata.
+
+Use separate idempotency keys for branch creation and each edit. Every edit
+requires the exact expected head digest. A stale head returns FailedPrecondition;
+a conflicting request under the same key returns AlreadyExists. After a timeout,
+the outcome is unknown: retry the identical operation and key with a fresh
+assertion. Identical retries return the original receipt, even after the head has
+advanced. Reload before choosing a new edit following a conflict.
+
+Draft authoring does not grant proposal, approval, merge, or publication access
+and never advances the published pointer. See
+[ADR 0094](decisions/0094-scoped-definition-draft-authoring.md).

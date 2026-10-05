@@ -782,8 +782,7 @@ async fn published_definition_assertions_preserve_namespace_and_member_authoriza
         );
     }
     for method in [
-        "CreateDefinitionBranch",
-        "ApplyDefinitionBranchEdit",
+        "CreateDefinitionProposal",
         "ApproveDefinitionProposal",
         "MergeDefinitionProposal",
     ] {
@@ -11053,9 +11052,9 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
             );
         }
         let token = authority.sign(&claims("disallowed-rpc")).unwrap();
-        let mut request = Request::new(GetDefinitionBranchRequest {
+        let mut request = Request::new(GetDefinitionProposalRequest {
             namespace: "allowed".into(),
-            branch_id: "fixture".into(),
+            proposal_id: "fixture".into(),
         });
         request
             .metadata_mut()
@@ -11066,7 +11065,7 @@ async fn scoped_published_definition_read_crosses_the_server_transport() {
         );
         assert_eq!(
             client
-                .get_definition_branch(request)
+                .get_definition_proposal(request)
                 .await
                 .unwrap_err()
                 .code(),
@@ -11325,4 +11324,330 @@ fn agent_certification_refusal_has_public_precondition_status() {
     let error = map_definition_write_error("agent_promotion_requires_certification".into());
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(error.message(), "agent_promotion_requires_certification");
+}
+
+/// Scoped draft transport retains store retry/conflict authority and never admits promotion.
+#[tokio::test]
+async fn scoped_definition_draft_authoring_crosses_server_transport() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tower::Layer;
+    fn signed<T>(
+        authority: &AssertionAuthority,
+        claims: &IdentityAssertion,
+        body: T,
+    ) -> Request<T> {
+        let mut request = Request::new(body);
+        request.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {}", authority.sign(claims).unwrap())
+                .parse()
+                .unwrap(),
+        );
+        request
+    }
+    let sqlite = Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    );
+    let store = crate::db::store::SekaiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+        sqlite.clone(),
+    )));
+    let svc = SekaiServiceImpl::new(store.clone());
+    let parent = seed_definition_parent(&svc, "allowed");
+    let security = svc.security.clone();
+    let authority = Arc::new(AssertionAuthority::new(
+        "https://issuer.test",
+        "https://sekai.test",
+        b"synthetic-draft-test-key",
+    ));
+    let interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(authority.clone()),
+    );
+    let service = crate::grpc::rpc_identity::RpcIdentityService::new(
+        tonic::service::interceptor::InterceptedService::new(
+            crate::rpc_maturity::RpcMaturityLayer::new(true)
+                .layer(crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer::new(svc)),
+            interceptor,
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient::connect(endpoint)
+            .await
+            .unwrap();
+    let claims = || IdentityAssertion {
+        contract_version: IDENTITY_ASSERTION_VERSION.into(),
+        issuer: "https://issuer.test".into(),
+        audience: "https://sekai.test".into(),
+        subject: "subject-a".into(),
+        credential_id: "credential-a".into(),
+        credential_kind: "human_session".into(),
+        tenant_id: Some("tenant-test".into()),
+        scopes: vec!["sekai.read".into(), "sekai.write".into()],
+        expires_at: chrono::Utc::now().timestamp() + 30,
+        nonce: uuid::Uuid::new_v4().to_string(),
+    };
+    let create = CreateDefinitionBranchRequest {
+        namespace: "allowed".into(),
+        branch_id: "agent-save".into(),
+        parent_revision_digest: parent.revision_digest.clone(),
+        idempotency_key: "create-agent-save".into(),
+    };
+    let mut read_only = claims();
+    read_only.scopes = vec!["sekai.read".into()];
+    assert_eq!(
+        client
+            .create_definition_branch(signed(&authority, &read_only, create.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let mut foreign = create.clone();
+    foreign.namespace = "foreign".into();
+    assert_eq!(
+        client
+            .create_definition_branch(signed(&authority, &claims(), foreign))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    for (audience, expiry) in [
+        ("https://other.test", chrono::Utc::now().timestamp() + 30),
+        ("https://sekai.test", chrono::Utc::now().timestamp() - 120),
+    ] {
+        let mut invalid = claims();
+        invalid.audience = audience.into();
+        invalid.expires_at = expiry;
+        assert_eq!(
+            client
+                .create_definition_branch(signed(&authority, &invalid, create.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+    }
+    let first_claims = claims();
+    let first = client
+        .create_definition_branch(signed(&authority, &first_claims, create.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.branch.as_ref().unwrap().created_by, "subject-a");
+    assert_eq!(
+        client
+            .create_definition_branch(signed(&authority, &first_claims, create.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+    assert_eq!(
+        first,
+        client
+            .create_definition_branch(signed(&authority, &claims(), create.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+    );
+    let mut changed_create = create.clone();
+    changed_create.branch_id = "another-branch".into();
+    assert_eq!(
+        client
+            .create_definition_branch(signed(&authority, &claims(), changed_create))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    let agent = DefinitionMemberInput { member_kind: "agent".into(), member_id: "triage".into(), member_digest: String::new(), definition_json: serde_json::json!({"contract_version":"sekai.agent-definition/v1","name":"Triage","task_class":"lookup","instructions":"Inspect records.","allowed_action_types":[]}).to_string() };
+    let edit = ApplyDefinitionBranchEditRequest {
+        namespace: "allowed".into(),
+        branch_id: create.branch_id.clone(),
+        expected_head_digest: parent.revision_digest.clone(),
+        upserts: vec![agent.clone()],
+        removals: vec![],
+        idempotency_key: "save-agent-1".into(),
+    };
+    read_only.nonce = uuid::Uuid::new_v4().to_string();
+    assert_eq!(
+        client
+            .apply_definition_branch_edit(signed(&authority, &read_only, edit.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    for object_id in ["namespace:allowed", "schema:agent:triage", "schema:Ticket"] {
+        let grant = security::Grant {
+            id: uuid::Uuid::new_v4().to_string(),
+            object_id: object_id.into(),
+            principal: "other-author".into(),
+            role: security::Role::Admin,
+            created: 1,
+        };
+        security.add_grant(&grant);
+        let denied = client
+            .apply_definition_branch_edit(signed(&authority, &claims(), edit.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                denied.code(),
+                tonic::Code::PermissionDenied | tonic::Code::NotFound
+            ),
+            "{denied}"
+        );
+        security.remove_grant(object_id, "other-author");
+    }
+    security.add_grant(&security::Grant {
+        id: "author-agent-admin".into(),
+        object_id: "schema:agent:triage".into(),
+        principal: "subject-a".into(),
+        role: security::Role::Admin,
+        created: 1,
+    });
+    let saved = client
+        .apply_definition_branch_edit(signed(&authority, &claims(), edit.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    let revision = saved.revision.as_ref().unwrap();
+    assert!(!revision.published);
+    assert_eq!(revision.created_by, "subject-a");
+    assert_eq!(saved.previous_head_digest, parent.revision_digest);
+    assert_eq!(
+        saved,
+        client
+            .apply_definition_branch_edit(signed(&authority, &claims(), edit.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+    );
+    let mut changed = edit.clone();
+    changed.upserts[0].definition_json = agent
+        .definition_json
+        .replace("Inspect records.", "Inspect updated records.");
+    assert_eq!(
+        client
+            .apply_definition_branch_edit(signed(&authority, &claims(), changed.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    changed.idempotency_key = "stale-edit".into();
+    assert_eq!(
+        client
+            .apply_definition_branch_edit(signed(&authority, &claims(), changed.clone()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let get = GetDefinitionBranchRequest {
+        namespace: "allowed".into(),
+        branch_id: create.branch_id.clone(),
+    };
+    let head = client
+        .get_definition_branch(signed(&authority, &claims(), get))
+        .await
+        .unwrap()
+        .into_inner()
+        .branch
+        .unwrap();
+    assert_eq!(head.head_revision_digest, revision.revision_digest);
+    changed.expected_head_digest = head.head_revision_digest.clone();
+    changed.idempotency_key = "save-agent-2".into();
+    let second = client
+        .apply_definition_branch_edit(signed(&authority, &claims(), changed))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(
+        second.revision.unwrap().revision_digest,
+        revision.revision_digest
+    );
+    assert_eq!(
+        saved,
+        client
+            .apply_definition_branch_edit(signed(&authority, &claims(), edit))
+            .await
+            .unwrap()
+            .into_inner(),
+        "an old retry returns its receipt even after the head advances"
+    );
+    let historical = client
+        .get_definition_member(signed(
+            &authority,
+            &claims(),
+            GetDefinitionMemberRequest {
+                namespace: "allowed".into(),
+                revision_digest: revision.revision_digest.clone(),
+                member_kind: "agent".into(),
+                member_id: "triage".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .member
+        .unwrap();
+    assert!(historical.definition_json.contains("Inspect records."));
+    assert_eq!(
+        sqlite
+            .get_published_definition_revision("allowed")
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        parent.revision_digest
+    );
+    let mut promotion = signed(
+        &authority,
+        &claims(),
+        CreateDefinitionProposalRequest {
+            namespace: "allowed".into(),
+            ..Default::default()
+        },
+    );
+    promotion
+        .metadata_mut()
+        .insert("x-rpc-method", "ApplyDefinitionBranchEdit".parse().unwrap());
+    assert_eq!(
+        client
+            .create_definition_proposal(promotion)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    for method in [
+        "GetDefinitionBranch",
+        "CreateDefinitionBranch",
+        "ApplyDefinitionBranchEdit",
+    ] {
+        assert!(crate::rpc_maturity::require_invokable(method, false).is_err());
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap();
 }

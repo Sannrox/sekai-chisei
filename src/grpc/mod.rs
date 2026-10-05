@@ -343,6 +343,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ListObjectChanges"
             | "GetPublishedDefinitionRevision"
             | "GetDefinitionMember"
+            | "GetDefinitionBranch"
+            | "CreateDefinitionBranch"
+            | "ApplyDefinitionBranchEdit"
             | "GetGovernedFactVersion"
             | "ResolveInvariantSet"
             | "PlanExecution"
@@ -1629,6 +1632,25 @@ mod tests {
             "ExecutePlanStream",
         ] {
             assert!(enterprise_namespace_method(method));
+        }
+    }
+
+    #[test]
+    fn scoped_draft_methods_require_the_qualified_service() {
+        for method in [
+            "GetDefinitionBranch",
+            "CreateDefinitionBranch",
+            "ApplyDefinitionBranchEdit",
+        ] {
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+            assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
+        }
+        for method in [
+            "CreateDefinitionProposal",
+            "ApproveDefinitionProposal",
+            "MergeDefinitionProposal",
+        ] {
+            assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
         }
     }
 
