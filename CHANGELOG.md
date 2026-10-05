@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
+
 ## 1.1.0
 
 Upgrade notes:

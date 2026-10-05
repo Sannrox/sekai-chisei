@@ -62,11 +62,10 @@ layer that adds governed facts, ontology, and Actions on top of it.
 | `system_one_action::fill_provenance_json` / `proposed_parameters` | Keep. System One is a Chisei Function (ADR 0084). |
 | other `crate::chisei` uses in `execution_evidence`, `peer_import`, `workflow_action` | Keep while they use types or pure functions; move to composition code if they need Chisei state. |
 
-Known violation of rule 2: `workflow_action::submit_step` builds a
-`BudgetTracker` over the Sekai `RuntimeDb`, so in split mode workflow-step
-budget reservations read and write the Sekai store instead of the Chisei
-store. It must take the budget handle from the composition layer like Action
-admission does.
+Rule 2 for workflow steps (#1270): `workflow_action::submit_step` takes
+`Option<&BudgetTracker>` from the caller, the same contract as Action
+admission. Combined callers pass a tracker over the Chisei store; Sekai-only
+callers pass `None` (budget `not_configured`).
 
 ### Disposition of current Chisei → Sekai edges
 
