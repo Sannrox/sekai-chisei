@@ -53,6 +53,8 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     // boundary, matching receipt/report CLIs. Callers who can open the runtime
     // store can already read the underlying tables. Networked multi-tenant
     // export must go through an authorized gRPC surface (follow-up).
+    crate::combined_stores::refuse_split_single_store_cli("ChiseiService.GetOperationReceipt")
+        .map_err(std::io::Error::other)?;
     let cfg = Config::from_env();
     let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
     let db = backend.database();
