@@ -23,12 +23,9 @@ sekaictl report quality \
   --output reports/acme-quality.json
 ```
 
-The command is a single-store reader: `DB_PATH` (default `./data/sekai.db`)
-or `SEKAI_DB_BACKEND=postgres` with `DATABASE_URL`. Combined Split
-(`SEKAI_DB_PATH`/`CHISEI_DB_PATH` or `SEKAI_DATA_DIR` without
-`SEKAI_SHARED_STORE=1`) is refused so relocated Chisei receipts cannot be
-omitted; use `GetQualityTrend`. Shared `SEKAI_SHARED_STORE=1` still matches
-the CLI. With `SEKAI_CREDENTIAL`, the
+The command is a single-store reader of the Sekai store: `SEKAI_DB_PATH` (default `<SEKAI_DATA_DIR>/sekai.db`) or `SEKAI_DB_BACKEND=postgres` with `SEKAI_DATABASE_URL`. Combined Split
+(`SEKAI_DB_PATH`/`CHISEI_DB_PATH` or `SEKAI_DATA_DIR`) is refused so relocated Chisei receipts cannot be
+omitted; use `GetQualityTrend`. With `SEKAI_CREDENTIAL`, the
 optional `--principal` or `SEKAI_PRINCIPAL` must match the authenticated
 principal. Without a credential, only the trusted local bootstrap principal
 is available. Namespace authorization is checked before receipts are listed.

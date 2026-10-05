@@ -94,13 +94,9 @@ fn open_owned_layout(
             sources
                 .sekai_sqlite_path
                 .as_deref()
-                .or(sources.legacy_sqlite_path.as_deref())
                 .or(derived.as_deref())
                 .unwrap_or(default_sqlite_path),
-            sources
-                .sekai_postgres_url
-                .as_deref()
-                .or(sources.legacy_postgres_url.as_deref()),
+            sources.sekai_postgres_url.as_deref(),
         ),
         StorePlaneRole::Chisei => match (
             sources.chisei_sqlite_path.as_deref().or(derived.as_deref()),
@@ -109,13 +105,12 @@ fn open_owned_layout(
         ) {
             (None, None, BackendIdentity::Sqlite) => {
                 return Err(
-                    "chisei process requires CHISEI_DB_PATH; it does not open SEKAI_DB_PATH or DB_PATH"
-                        .into(),
+                    "chisei process requires CHISEI_DB_PATH; it does not open SEKAI_DB_PATH".into(),
                 );
             }
             (None, None, BackendIdentity::Postgres) => {
                 return Err(
-                    "chisei process requires CHISEI_DATABASE_URL; it does not open SEKAI_DATABASE_URL or DATABASE_URL"
+                    "chisei process requires CHISEI_DATABASE_URL; it does not open SEKAI_DATABASE_URL"
                         .into(),
                 );
             }
@@ -156,12 +151,12 @@ fn open_owned_layout(
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
-            CombinedStoreLayout::shared(backend, identity)
+            CombinedStoreLayout::owned(backend, identity)
         }
         (BackendIdentity::Postgres, None) => {
             return Err(match role {
                 StorePlaneRole::Sekai => {
-                    "sekai process with SEKAI_DB_BACKEND=postgres requires SEKAI_DATABASE_URL or DATABASE_URL"
+                    "sekai process with SEKAI_DB_BACKEND=postgres requires SEKAI_DATABASE_URL"
                         .into()
                 }
                 StorePlaneRole::Chisei => {
@@ -183,7 +178,7 @@ fn open_owned_layout(
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
-            CombinedStoreLayout::shared(backend, identity)
+            CombinedStoreLayout::owned(backend, identity)
         }
     };
     ensure_store_plane(&layout.sekai_runtime(), role)?;

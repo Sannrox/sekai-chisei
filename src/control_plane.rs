@@ -10,6 +10,8 @@ use crate::plane::{ProcessPlane, plane_registry_anchor, plane_store_identity};
 
 pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
     let mut telemetry = crate::obs::logging::init();
+    // Refuse retired single-store variables before anything touches the data dir.
+    crate::combined_stores::refuse_legacy_store_env().map_err(std::io::Error::other)?;
     let config = Config::from_env();
     tracing::info!(
         version = crate::build_info::PKG_VERSION,
@@ -170,13 +172,9 @@ fn open_gateway_report_layout(db_path: &str) -> Result<CombinedStoreLayout, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::budget::{BudgetTracker, PeriodType};
-    use crate::db::store::ChiseiStore;
-    use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
-    use crate::store_relocate::relocate_sqlite;
 
     #[test]
-    fn gateway_report_refuses_fenced_shared_source() {
+    fn gateway_report_refuses_a_legacy_single_store() {
         static STORE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = STORE_ENV.lock().unwrap();
         let keys = [
@@ -208,36 +206,18 @@ mod tests {
         for key in keys {
             unsafe { std::env::remove_var(key) };
         }
-        // Shared is a named hatch. This fixture opens the fenced source as
-        // one identity so the writer-fence check can run.
-        unsafe { std::env::set_var("SEKAI_SHARED_STORE", "1") };
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
-        let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
-        let chisei_s = chisei.to_str().unwrap();
-
-        RuntimeBackend::initialize(
-            RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(source_s),
-                source_s,
-                None,
-                16,
-                None,
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
-            .set_limit("report-user", 3_000, PeriodType::Daily)
-            .unwrap();
-
-        let report = relocate_sqlite(source_s, source_s, chisei_s).unwrap();
-        assert!(report.fence_raised);
+        unsafe { std::env::set_var("DB_PATH", source_s) };
 
         let err = open_gateway_report_layout(source_s).unwrap_err();
         drop(saved);
-        assert!(err.contains("writer fence"), "{err}");
+        assert!(err.contains("DB_PATH is no longer supported"), "{err}");
+        assert!(err.contains("store relocate"), "{err}");
+        assert!(
+            !source.exists(),
+            "a refused boot must not create the legacy file"
+        );
     }
 }

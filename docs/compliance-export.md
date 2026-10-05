@@ -69,12 +69,13 @@ prompts, PII, or free-form error text under unexpected field names.
 
 - At most 5,000 receipts and 10,000 decisions per export
 - Window length at most 366 days
-- `sekaictl admin assurance compliance export` is a single-store reader
-  (`SEKAI_DB_BACKEND` / `DB_PATH` or `DATABASE_URL`). Combined Split
-  (dest-pair or `SEKAI_DATA_DIR` without `SEKAI_SHARED_STORE=1`) is refused
-  so the bundle cannot omit relocated Chisei receipts; use
-  `ChiseiService.GetOperationReceipt`. Shared `SEKAI_SHARED_STORE=1` still
-  matches the CLI.
+- `sekaictl admin assurance compliance export` is a single-store reader of
+  the Sekai store (`SEKAI_DB_PATH`, default `<SEKAI_DATA_DIR>/sekai.db`, or
+  `SEKAI_DB_BACKEND=postgres` with `SEKAI_DATABASE_URL`). Combined Split
+  (dest-pair or `SEKAI_DATA_DIR`) is refused so the bundle cannot omit
+  relocated Chisei receipts; use `ChiseiService.GetOperationReceipt`. The
+  retired shared store (`DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE`)
+  refuses with guidance.
 - Host filesystem/DB credentials are the trust boundary for this CLI, as with
   other offline `sekaictl` report tools. A future gRPC export will enforce
   namespace authorization for networked multi-tenant access.

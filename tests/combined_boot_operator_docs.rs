@@ -36,11 +36,16 @@ fn combined_first_success_docs_name_dest_pair() {
 }
 
 #[test]
-fn docker_operator_docs_name_shared_store_hatch() {
+fn docker_image_and_docs_never_boot_a_single_store() {
+    let image = read("build/server-image/Dockerfile");
+    assert!(
+        image.contains("SEKAI_DATA_DIR=/data") && !image.contains("DB_PATH"),
+        "the server image must derive split stores from SEKAI_DATA_DIR, not export DB_PATH"
+    );
     let docker = read("docs/docker.md");
     assert!(
-        docker.contains("SEKAI_SHARED_STORE"),
-        "docs/docker.md must name SEKAI_SHARED_STORE; the image still sets DB_PATH"
+        docker.contains("store relocate"),
+        "docs/docker.md must point a legacy single-file volume at store relocate"
     );
     let compose = read("docker-compose.yml");
     assert!(

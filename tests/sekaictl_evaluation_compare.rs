@@ -76,8 +76,8 @@ impl Workspace {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         command
             .env("SEKAI_SOCKET", &socket)
-            .env("DB_PATH", self.path("sekai.db"))
-            .env("SEKAI_SHARED_STORE", "1")
+            .env("SEKAI_DB_PATH", self.path("sekai.db"))
+            .env("CHISEI_DB_PATH", self.path("chisei.db"))
             .env("GRPC_PORT", free_tcp_port().to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
@@ -89,8 +89,6 @@ impl Workspace {
             .env_remove("SEKAI_ALLOW_PLAINTEXT")
             .env_remove("SEKAI_DB_BACKEND")
             .env_remove("DATABASE_URL")
-            .env_remove("SEKAI_DB_PATH")
-            .env_remove("CHISEI_DB_PATH")
             .env_remove("OLLAMA_URL")
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")

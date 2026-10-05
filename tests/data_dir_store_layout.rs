@@ -1,5 +1,6 @@
 //! `SEKAI_DATA_DIR` derives the Sekai and Chisei SQLite files when no store
 //! variable is set; each plane process opens only its own file (#1238).
+//! Retired single-store variables refuse boot with guidance (#1239).
 
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -40,10 +41,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Start `bin` with no store variable except `extras`, wait until it serves,
-/// then stop it.
-fn boot(bin: &str, cwd: &Path, extras: &[(&str, &str)]) {
-    let port = free_port();
+fn server_command(bin: &str, cwd: &Path, port: u16, extras: &[(&str, &str)]) -> Command {
     let mut command = Command::new(bin);
     command
         .current_dir(cwd)
@@ -62,7 +60,14 @@ fn boot(bin: &str, cwd: &Path, extras: &[(&str, &str)]) {
     for (key, value) in extras {
         command.env(key, value);
     }
-    let mut child = Running(command.spawn().unwrap());
+    command
+}
+
+/// Start `bin` with no store variable except `extras`, wait until it serves,
+/// then stop it.
+fn boot(bin: &str, cwd: &Path, extras: &[(&str, &str)]) {
+    let port = free_port();
+    let mut child = Running(server_command(bin, cwd, port, extras).spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(30);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -128,4 +133,76 @@ fn explicit_store_paths_override_the_data_dir() {
     assert!(chisei.is_file());
     assert!(!data_dir.join("sekai.db").exists());
     assert!(!data_dir.join("chisei.db").exists());
+}
+
+/// Run `bin` with `extras` and require it to refuse boot with the guidance.
+fn refused(bin: &str, cwd: &Path, extras: &[(&str, &str)]) -> String {
+    let mut command = server_command(bin, cwd, free_port(), extras);
+    command.stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "{bin} booted with {extras:?}");
+    assert!(stderr.contains("no longer supported"), "{bin}: {stderr}");
+    for replacement in [
+        "SEKAI_DATA_DIR",
+        "SEKAI_DB_PATH",
+        "CHISEI_DB_PATH",
+        "SEKAI_DATABASE_URL",
+        "CHISEI_DATABASE_URL",
+        "sekaictl admin store relocate",
+    ] {
+        assert!(stderr.contains(replacement), "{bin}: {stderr}");
+    }
+    stderr
+}
+
+#[test]
+fn retired_single_store_variables_refuse_boot_with_guidance() {
+    let cwd = tempdir().unwrap();
+    let legacy = cwd.path().join("legacy.db");
+    let legacy = legacy.to_str().unwrap();
+    let cases: &[&[(&str, &str)]] = &[
+        &[("DB_PATH", legacy)],
+        &[("SEKAI_SHARED_STORE", "1")],
+        &[("DB_PATH", legacy), ("SEKAI_SHARED_STORE", "1")],
+        &[
+            ("SEKAI_DB_BACKEND", "postgres"),
+            ("DATABASE_URL", "postgres://user@127.0.0.1:1/sekai"),
+        ],
+        // A dest pair does not make a leftover legacy variable harmless.
+        &[
+            ("SEKAI_DB_PATH", "s.db"),
+            ("CHISEI_DB_PATH", "c.db"),
+            ("DB_PATH", legacy),
+        ],
+    ];
+    for extras in cases {
+        let stderr = refused(env!("CARGO_BIN_EXE_sekai-chisei"), cwd.path(), extras);
+        for (key, _) in *extras {
+            if ["DB_PATH", "DATABASE_URL", "SEKAI_SHARED_STORE"].contains(key) {
+                assert!(stderr.contains(key), "{stderr}");
+            }
+        }
+    }
+    refused(
+        env!("CARGO_BIN_EXE_sekai-plane"),
+        cwd.path(),
+        &[("DB_PATH", legacy)],
+    );
+    refused(
+        env!("CARGO_BIN_EXE_chisei-plane"),
+        cwd.path(),
+        &[
+            ("SEKAI_SHARED_STORE", "1"),
+            ("SEKAI_ENDPOINT", "http://127.0.0.1:1"),
+        ],
+    );
+    assert!(
+        !Path::new(legacy).exists(),
+        "a refused boot must not create the legacy file"
+    );
+    assert!(
+        !cwd.path().join("data").exists(),
+        "a refused boot must not touch the data dir"
+    );
 }

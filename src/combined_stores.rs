@@ -1,10 +1,12 @@
 //! Combined-mode physical store composition.
 //!
 //! Destination variables open two stores. A shared path or database is refused.
-//! Legacy `DB_PATH` / `DATABASE_URL` remain one physical identity until
-//! relocation copies families (#1006). Combined mode never invents a second
-//! file from a single path. With no store variable at all, SQLite derives
-//! `<SEKAI_DATA_DIR>/sekai.db` and `<SEKAI_DATA_DIR>/chisei.db` (#1238).
+//! Combined mode never invents a second file from a single path. With no store
+//! variable at all, SQLite derives `<SEKAI_DATA_DIR>/sekai.db` and
+//! `<SEKAI_DATA_DIR>/chisei.db` (#1238). The retired single-store variables
+//! `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` refuse with guidance
+//! toward the data directory, the dest pair, and `store relocate` (ADR 0083
+//! decision 7, #1239).
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -46,14 +48,15 @@ impl fmt::Display for StoreIdentity {
     }
 }
 
-/// How combined `sekai-chisei` opened its durable stores.
+/// How a server process opened its durable stores.
 pub enum CombinedStoreLayout {
-    /// One physical store behind both typed handles. Migration compatibility.
-    Shared {
+    /// One physical store behind both typed handles: the store a single-plane
+    /// process owns, or an in-process fixture. Combined boot never opens it.
+    Owned {
         backend: RuntimeBackend,
         identity: StoreIdentity,
     },
-    /// Two distinct physical stores. The combined-mode target.
+    /// Two distinct physical stores. Combined boot always opens this.
     Split {
         sekai: RuntimeBackend,
         chisei: RuntimeBackend,
@@ -81,10 +84,37 @@ pub fn data_dir_file(dir: &str, file: &str) -> String {
     Path::new(dir).join(file).to_string_lossy().into_owned()
 }
 
-/// Sekai SQLite file for single-path callers: `DB_PATH`, else
+/// Sekai SQLite file for single-path callers: `SEKAI_DB_PATH`, else
 /// `<SEKAI_DATA_DIR>/sekai.db`.
 pub fn default_sekai_sqlite_path() -> String {
-    optional_trimmed_env("DB_PATH").unwrap_or_else(|| data_dir_file(&data_dir(), SEKAI_STORE_FILE))
+    optional_trimmed_env("SEKAI_DB_PATH")
+        .unwrap_or_else(|| data_dir_file(&data_dir(), SEKAI_STORE_FILE))
+}
+
+/// Retired single-store variables (ADR 0083 decision 7).
+pub const LEGACY_STORE_ENV: [&str; 3] = ["DB_PATH", "DATABASE_URL", "SEKAI_SHARED_STORE"];
+
+/// Refuse a retired single-store variable with migration guidance.
+pub fn refuse_legacy_store_env() -> Result<(), String> {
+    let set: Vec<&str> = LEGACY_STORE_ENV
+        .into_iter()
+        .filter(|name| optional_trimmed_env(name).is_some())
+        .collect();
+    if set.is_empty() {
+        Ok(())
+    } else {
+        Err(legacy_store_guidance(&set))
+    }
+}
+
+/// Operator guidance for retired single-store variables.
+pub fn legacy_store_guidance(set: &[&str]) -> String {
+    format!(
+        "{} {} no longer supported: the single shared store is retired. Unset {} and use SEKAI_DATA_DIR (default ./data, derives sekai.db and chisei.db), SEKAI_DB_PATH and CHISEI_DB_PATH (SQLite), or SEKAI_DATABASE_URL and CHISEI_DATABASE_URL with SEKAI_DB_BACKEND=postgres. Move an existing single store first with `sekaictl admin store relocate --source <old> --sekai <old> --chisei <new>`",
+        set.join(", "),
+        if set.len() == 1 { "is" } else { "are" },
+        if set.len() == 1 { "it" } else { "them" },
+    )
 }
 
 pub const SEKAI_POOL_ENV: &str = "SEKAI_POSTGRES_SEKAI_CONNECTIONS";
@@ -151,12 +181,10 @@ fn new_matched_generation_cache() -> Arc<AtomicI64> {
 }
 
 /// Testable inputs for [`CombinedStoreLayout`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CombinedStoreSources {
     pub backend: Option<BackendIdentity>,
     pub default_sqlite_path: String,
-    pub legacy_sqlite_path: Option<String>,
-    pub legacy_postgres_url: Option<String>,
     pub sekai_sqlite_path: Option<String>,
     pub chisei_sqlite_path: Option<String>,
     pub sekai_postgres_url: Option<String>,
@@ -166,42 +194,16 @@ pub struct CombinedStoreSources {
     pub sekai_pool_connections: Option<u32>,
     pub chisei_pool_connections: Option<u32>,
     pub postgres_ca_cert_path: Option<String>,
-    /// Constructed fixtures keep Shared. `from_env` sets this only when
-    /// `SEKAI_SHARED_STORE=1` so Combined does not silently boot one identity.
-    pub allow_shared_compatibility: bool,
     /// SQLite directory that derives `sekai.db` / `chisei.db`. `from_env` sets
     /// it only when no store path or URL variable is set; each consumer
     /// derives only the files it owns.
     pub data_dir: Option<String>,
 }
 
-impl Default for CombinedStoreSources {
-    fn default() -> Self {
-        Self {
-            backend: None,
-            default_sqlite_path: String::new(),
-            legacy_sqlite_path: None,
-            legacy_postgres_url: None,
-            sekai_sqlite_path: None,
-            chisei_sqlite_path: None,
-            sekai_postgres_url: None,
-            chisei_postgres_url: None,
-            postgres_max_connections: 0,
-            sekai_pool_connections: None,
-            chisei_pool_connections: None,
-            postgres_ca_cert_path: None,
-            allow_shared_compatibility: true,
-            data_dir: None,
-        }
-    }
-}
-
 impl CombinedStoreSources {
     /// Whether Combined would open two physical stores from these sources.
     pub fn opens_split(&self) -> bool {
-        let (sekai_path, chisei_path) = if let Some(dir) = self.data_dir.as_deref()
-            && !self.allow_shared_compatibility
-        {
+        let (sekai_path, chisei_path) = if let Some(dir) = self.data_dir.as_deref() {
             (
                 Some(data_dir_file(dir, SEKAI_STORE_FILE)),
                 Some(data_dir_file(dir, CHISEI_STORE_FILE)),
@@ -224,6 +226,7 @@ impl CombinedStoreSources {
     }
 
     pub fn from_env(default_sqlite_path: &str) -> Result<Self, String> {
+        refuse_legacy_store_env()?;
         let backend = BackendIdentity::parse(
             &std::env::var("SEKAI_DB_BACKEND").unwrap_or_else(|_| "sqlite".into()),
         )?;
@@ -240,15 +243,11 @@ impl CombinedStoreSources {
                 .transpose()
         };
         let postgres_max_connections = connections("SEKAI_POSTGRES_MAX_CONNECTIONS")?.unwrap_or(16);
-        let legacy_sqlite_path = optional_trimmed_env("DB_PATH");
-        let legacy_postgres_url = optional_trimmed_env("DATABASE_URL");
         let sekai_sqlite_path = optional_trimmed_env("SEKAI_DB_PATH");
         let chisei_sqlite_path = optional_trimmed_env("CHISEI_DB_PATH");
         let sekai_postgres_url = optional_trimmed_env("SEKAI_DATABASE_URL");
         let chisei_postgres_url = optional_trimmed_env("CHISEI_DATABASE_URL");
         let names_a_store = [
-            &legacy_sqlite_path,
-            &legacy_postgres_url,
             &sekai_sqlite_path,
             &chisei_sqlite_path,
             &sekai_postgres_url,
@@ -259,8 +258,6 @@ impl CombinedStoreSources {
         Ok(Self {
             backend: Some(backend),
             default_sqlite_path: default_sqlite_path.to_string(),
-            legacy_sqlite_path,
-            legacy_postgres_url,
             sekai_sqlite_path,
             chisei_sqlite_path,
             sekai_postgres_url,
@@ -269,8 +266,6 @@ impl CombinedStoreSources {
             sekai_pool_connections: connections(SEKAI_POOL_ENV)?,
             chisei_pool_connections: connections(CHISEI_POOL_ENV)?,
             postgres_ca_cert_path: optional_trimmed_env("SEKAI_POSTGRES_CA_CERT"),
-            allow_shared_compatibility: std::env::var("SEKAI_SHARED_STORE").unwrap_or_default()
-                == "1",
             data_dir: (backend == BackendIdentity::Sqlite && !names_a_store).then(data_dir),
         })
     }
@@ -285,10 +280,7 @@ impl CombinedStoreSources {
 
     pub fn open(mut self) -> Result<CombinedStoreLayout, String> {
         let backend = self.backend.unwrap_or(BackendIdentity::Sqlite);
-        // `SEKAI_SHARED_STORE=1` keeps its explicit one-identity boot.
-        if let Some(dir) = self.data_dir.as_deref()
-            && !self.allow_shared_compatibility
-        {
+        if let Some(dir) = self.data_dir.as_deref() {
             self.sekai_sqlite_path = Some(data_dir_file(dir, SEKAI_STORE_FILE));
             self.chisei_sqlite_path = Some(data_dir_file(dir, CHISEI_STORE_FILE));
         }
@@ -312,11 +304,6 @@ impl CombinedStoreSources {
                 "SQLite destination paths and PostgreSQL destination URLs cannot both be configured".into(),
             ),
             ((Some(sekai), Some(chisei)), (None, None), BackendIdentity::Sqlite) => {
-                if self.legacy_postgres_url.is_some() {
-                    return Err(
-                        "DATABASE_URL cannot be combined with SEKAI_DB_PATH / CHISEI_DB_PATH".into(),
-                    );
-                }
                 open_split_sqlite(
                     sekai,
                     chisei,
@@ -328,12 +315,6 @@ impl CombinedStoreSources {
                 "SEKAI_DB_PATH / CHISEI_DB_PATH require SEKAI_DB_BACKEND=sqlite".into(),
             ),
             ((None, None), (Some(sekai), Some(chisei)), BackendIdentity::Postgres) => {
-                if self.legacy_sqlite_path.is_some() {
-                    return Err(
-                        "DB_PATH cannot be combined with SEKAI_DATABASE_URL / CHISEI_DATABASE_URL"
-                            .into(),
-                    );
-                }
                 open_split_postgres(
                     sekai,
                     chisei,
@@ -344,46 +325,12 @@ impl CombinedStoreSources {
             ((None, None), (Some(_), Some(_)), BackendIdentity::Sqlite) => Err(
                 "SEKAI_DATABASE_URL / CHISEI_DATABASE_URL require SEKAI_DB_BACKEND=postgres".into(),
             ),
-            ((None, None), (None, None), _) => {
-                if self.sekai_pool_connections.is_some() || self.chisei_pool_connections.is_some()
-                {
-                    return Err(format!(
-                        "{SEKAI_POOL_ENV} and {CHISEI_POOL_ENV} size Split store pools; a shared store uses SEKAI_POSTGRES_MAX_CONNECTIONS"
-                    ));
-                }
-                if !self.allow_shared_compatibility {
-                    return Err(
-                        "combined mode refuses a shared store unless SEKAI_SHARED_STORE=1; set SEKAI_DB_PATH and CHISEI_DB_PATH, or SEKAI_DATABASE_URL and CHISEI_DATABASE_URL"
-                            .into(),
-                    );
-                }
-                let config = RuntimeBackendConfig::from_sources(
-                    backend,
-                    self.legacy_sqlite_path.as_deref(),
-                    &self.default_sqlite_path,
-                    self.legacy_postgres_url.as_deref(),
-                    self.postgres_max_connections,
-                    self.postgres_ca_cert_path.as_deref(),
-                )?;
-                let identity = match backend {
-                    BackendIdentity::Sqlite => sqlite_identity(
-                        config
-                            .sqlite_path
-                            .as_deref()
-                            .unwrap_or(&self.default_sqlite_path),
-                    )?,
-                    BackendIdentity::Postgres => postgres_identity(
-                        config
-                            .postgres_url
-                            .as_deref()
-                            .ok_or("SEKAI_DB_BACKEND=postgres requires DATABASE_URL")?,
-                    )?,
-                };
-                let backend = RuntimeBackend::initialize(config)?;
-                let layout = CombinedStoreLayout::Shared { backend, identity };
-                crate::store_relocate::refuse_shared_writer_if_fenced(&layout)?;
-                Ok(layout)
-            }
+            ((None, None), (None, None), BackendIdentity::Sqlite) => Err(
+                "combined mode requires SEKAI_DB_PATH and CHISEI_DB_PATH, or no store variable so SEKAI_DATA_DIR derives both".into(),
+            ),
+            ((None, None), (None, None), BackendIdentity::Postgres) => Err(
+                "combined mode with SEKAI_DB_BACKEND=postgres requires SEKAI_DATABASE_URL and CHISEI_DATABASE_URL".into(),
+            ),
         }
     }
 }
@@ -424,12 +371,12 @@ impl CombinedStoreLayout {
         CombinedStoreSources::from_env(default_sqlite_path)?.open()
     }
 
-    pub fn shared(backend: RuntimeBackend, identity: StoreIdentity) -> Self {
-        Self::Shared { backend, identity }
+    pub fn owned(backend: RuntimeBackend, identity: StoreIdentity) -> Self {
+        Self::Owned { backend, identity }
     }
 
     pub fn from_backend(backend: RuntimeBackend) -> Self {
-        Self::Shared {
+        Self::Owned {
             backend,
             identity: StoreIdentity::Sqlite {
                 canonical_path: ":memory:".into(),
@@ -443,21 +390,21 @@ impl CombinedStoreLayout {
 
     pub fn mode_name(&self) -> &'static str {
         match self {
-            Self::Shared { .. } => "shared-compatibility",
+            Self::Owned { .. } => "owned",
             Self::Split { .. } => "split",
         }
     }
 
     pub fn sekai_identity(&self) -> &StoreIdentity {
         match self {
-            Self::Shared { identity, .. } => identity,
+            Self::Owned { identity, .. } => identity,
             Self::Split { sekai_identity, .. } => sekai_identity,
         }
     }
 
     pub fn chisei_identity(&self) -> &StoreIdentity {
         match self {
-            Self::Shared { identity, .. } => identity,
+            Self::Owned { identity, .. } => identity,
             Self::Split {
                 chisei_identity, ..
             } => chisei_identity,
@@ -466,14 +413,14 @@ impl CombinedStoreLayout {
 
     pub fn sekai_runtime(&self) -> Arc<RuntimeDb> {
         match self {
-            Self::Shared { backend, .. } => backend.database(),
+            Self::Owned { backend, .. } => backend.database(),
             Self::Split { sekai, .. } => sekai.database(),
         }
     }
 
     pub fn chisei_runtime(&self) -> Arc<RuntimeDb> {
         match self {
-            Self::Shared { backend, .. } => backend.database(),
+            Self::Owned { backend, .. } => backend.database(),
             Self::Split { chisei, .. } => chisei.database(),
         }
     }
@@ -481,7 +428,7 @@ impl CombinedStoreLayout {
     #[cfg(test)]
     pub(crate) fn connection_pool_maxes(&self) -> (u32, u32) {
         match self {
-            Self::Shared { backend, .. } => {
+            Self::Owned { backend, .. } => {
                 let max = backend.connection_pool_max();
                 (max, max)
             }
@@ -499,7 +446,7 @@ impl CombinedStoreLayout {
                 let generation = matched_generation.load(Ordering::Acquire);
                 (generation != UNCACHED_MATCHED_GENERATION).then_some(generation)
             }
-            Self::Shared { .. } => None,
+            Self::Owned { .. } => None,
         }
     }
 
@@ -523,7 +470,7 @@ impl CombinedStoreLayout {
 
     pub fn handles(&self) -> (SekaiStore, ChiseiStore) {
         match self {
-            Self::Shared { backend, .. } => split_shared_runtime(backend.database()),
+            Self::Owned { backend, .. } => split_shared_runtime(backend.database()),
             Self::Split { sekai, chisei, .. } => (
                 SekaiStore::from_shared_runtime(sekai.database()),
                 ChiseiStore::from_split_runtimes(chisei.database(), sekai.database()),
@@ -544,7 +491,7 @@ impl CombinedStoreLayout {
 
     pub fn validate_required_surfaces(&self) -> Result<(), String> {
         match self {
-            Self::Shared { backend, .. } => backend
+            Self::Owned { backend, .. } => backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES),
             Self::Split { sekai, chisei, .. } => {
@@ -559,7 +506,7 @@ impl CombinedStoreLayout {
     }
 }
 
-/// Path used for provider-registry state beside the Sekai (or shared) file.
+/// Path used for provider-registry state beside the Sekai file.
 /// With no store variable, `default_sqlite_path` is `<SEKAI_DATA_DIR>/sekai.db`.
 pub fn registry_db_anchor(default_sqlite_path: &str) -> String {
     optional_trimmed_env("SEKAI_DB_PATH").unwrap_or_else(|| default_sqlite_path.to_string())
@@ -651,7 +598,7 @@ fn open_split_postgres(
 fn refuse_shared_identity(sekai: &StoreIdentity, chisei: &StoreIdentity) -> Result<(), String> {
     if sekai == chisei || sqlite_same_inode(sekai, chisei) {
         Err(format!(
-            "combined mode refuses a shared store identity ({sekai}); set distinct SEKAI_DB_PATH and CHISEI_DB_PATH, or distinct SEKAI_DATABASE_URL and CHISEI_DATABASE_URL. A single DB_PATH or DATABASE_URL remains migration compatibility until relocation"
+            "combined mode refuses a shared store identity ({sekai}); set distinct SEKAI_DB_PATH and CHISEI_DB_PATH, or distinct SEKAI_DATABASE_URL and CHISEI_DATABASE_URL"
         ))
     } else {
         Ok(())
@@ -778,35 +725,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sqlite_stays_one_physical_store() {
-        let layout = CombinedStoreSources {
+    fn data_dir_derives_split_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+        let split = CombinedStoreSources {
             backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: ":memory:".into(),
+            default_sqlite_path: data_dir_file(data_dir, "unused.db"),
             postgres_max_connections: 16,
+            data_dir: Some(data_dir.into()),
             ..CombinedStoreSources::default()
         }
         .open()
         .unwrap();
-        assert!(!layout.is_split());
-        assert_eq!(layout.mode_name(), "shared-compatibility");
-        let (sekai, chisei) = layout.handles();
-        assert!(Arc::ptr_eq(&sekai.runtime_arc(), &chisei.runtime_arc()));
-    }
-
-    #[test]
-    fn data_dir_derives_split_unless_the_shared_hatch_is_set() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().to_str().unwrap();
-        let sources = |allow_shared_compatibility| CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: data_dir_file(data_dir, "legacy.db"),
-            postgres_max_connections: 16,
-            allow_shared_compatibility,
-            data_dir: Some(data_dir.into()),
-            ..CombinedStoreSources::default()
-        };
-
-        let split = sources(false).open().unwrap();
         assert!(split.is_split());
         assert_eq!(
             split.sekai_identity(),
@@ -816,27 +746,44 @@ mod tests {
             split.chisei_identity(),
             &sqlite_identity(&data_dir_file(data_dir, CHISEI_STORE_FILE)).unwrap()
         );
-
-        let shared = sources(true).open().unwrap();
-        assert!(!shared.is_split());
-        assert_eq!(
-            shared.sekai_identity(),
-            &sqlite_identity(&data_dir_file(data_dir, "legacy.db")).unwrap()
-        );
     }
 
     #[test]
-    fn env_style_shared_boot_is_refused_without_explicit_compat() {
-        let err = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: ":memory:".into(),
-            postgres_max_connections: 16,
-            allow_shared_compatibility: false,
-            ..CombinedStoreSources::default()
+    fn combined_open_never_falls_back_to_one_store() {
+        for backend in [BackendIdentity::Sqlite, BackendIdentity::Postgres] {
+            let err = CombinedStoreSources {
+                backend: Some(backend),
+                default_sqlite_path: ":memory:".into(),
+                postgres_max_connections: 16,
+                ..CombinedStoreSources::default()
+            }
+            .open()
+            .unwrap_err();
+            assert!(
+                err.contains("combined mode") && err.contains("requires"),
+                "{err}"
+            );
         }
-        .open()
-        .unwrap_err();
-        assert!(err.contains("SEKAI_SHARED_STORE=1"), "{err}");
+    }
+
+    #[test]
+    fn legacy_store_guidance_names_every_replacement() {
+        for set in [&["DB_PATH"][..], &LEGACY_STORE_ENV[..]] {
+            let guidance = legacy_store_guidance(set);
+            for name in set {
+                assert!(guidance.contains(name), "{guidance}");
+            }
+            for replacement in [
+                "SEKAI_DATA_DIR",
+                "SEKAI_DB_PATH",
+                "CHISEI_DB_PATH",
+                "SEKAI_DATABASE_URL",
+                "CHISEI_DATABASE_URL",
+                "sekaictl admin store relocate",
+            ] {
+                assert!(guidance.contains(replacement), "{guidance}");
+            }
+        }
     }
 
     #[test]
@@ -880,29 +827,12 @@ mod tests {
             backend: Some(BackendIdentity::Sqlite),
             default_sqlite_path: data_dir_file(dir.path().to_str().unwrap(), "legacy.db"),
             postgres_max_connections: 16,
-            allow_shared_compatibility: false,
             data_dir: Some(dir.path().to_str().unwrap().into()),
             ..CombinedStoreSources::default()
         };
         assert!(sources.opens_split());
         refuse_split_single_store_cli_from_sources(&sources, "ChiseiService.GetOperationReceipt")
             .unwrap_err();
-    }
-
-    #[test]
-    fn shared_hatch_allows_single_store_clis() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.db");
-        let sources = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: path.to_str().unwrap().into(),
-            postgres_max_connections: 16,
-            allow_shared_compatibility: true,
-            ..CombinedStoreSources::default()
-        };
-        assert!(!sources.opens_split());
-        refuse_split_single_store_cli_from_sources(&sources, "ChiseiService.GetQualityTrend")
-            .unwrap();
     }
 
     #[test]
@@ -962,22 +892,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_sqlite_keeps_the_full_process_pool_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.db");
-        let layout = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: path.to_str().unwrap().into(),
-            postgres_max_connections: 16,
-            ..CombinedStoreSources::default()
-        }
-        .open()
-        .unwrap();
-        assert!(!layout.is_split());
-        assert_eq!(layout.connection_pool_maxes(), (16, 16));
-    }
-
-    #[test]
     fn split_connection_pool_budget_divides_the_process_ceiling() {
         assert_eq!(split_connection_pool_budget(16, None, None), Ok((8, 8)));
         assert_eq!(split_connection_pool_budget(15, None, None), Ok((8, 7)));
@@ -990,22 +904,6 @@ mod tests {
         assert_eq!(owned_plane_pool_size(16, Some(12)), Ok(12));
         assert!(owned_plane_pool_size(16, Some(20)).is_err());
         assert!(owned_plane_pool_size(16, Some(0)).is_err());
-    }
-
-    #[test]
-    fn a_shared_store_refuses_per_plane_pool_sizes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shared.db");
-        let err = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: path.to_str().unwrap().into(),
-            postgres_max_connections: 16,
-            sekai_pool_connections: Some(12),
-            ..CombinedStoreSources::default()
-        }
-        .open()
-        .unwrap_err();
-        assert!(err.contains("size Split store pools"), "{err}");
     }
 
     #[test]

@@ -154,8 +154,7 @@ Evidence is checked in as:
 
 SQLite remains the default community backend. Combined PostgreSQL opens
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
-A single `DATABASE_URL` is Combined shared-compat and needs
-`SEKAI_SHARED_STORE=1`. Use that dest-pair (or hatch) when you need shared
+A single `DATABASE_URL` is retired and refuses boot. Use that dest-pair when you need shared
 multi-replica authority for the dual-backend surfaces above (see
 [configuration.md](configuration.md) and #238). Prefer SQLite when you need
 the SQLite-only paths listed under Outcome.

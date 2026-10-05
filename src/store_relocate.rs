@@ -13,7 +13,7 @@
 //! compares the pair. Dual-unstamped stores auto-stamp only when both are
 //! empty; operator facts without a cutover stay unattested until restamp,
 //! or until relocate when the Sekai dest still holds Chisei families.
-//! A Shared or owned-plane open of a stamped store compares
+//! A single-plane (owned) open of a stamped store compares
 //! `SEKAI_STORE_PEER` (read-only) or refuses mutations until an operator
 //! restamp. Independent backups are not a paired restore set.
 
@@ -1009,7 +1009,8 @@ fn remove_sqlite_sidecar(path: &str) {
     }
 }
 
-/// Shared-compatibility writers refuse after the fence is raised.
+/// A one-store layout over a fenced historical source refuses to become a
+/// writer. Combined boot only opens Split layouts, which this never refuses.
 pub fn refuse_shared_writer_if_fenced(layout: &CombinedStoreLayout) -> Result<(), String> {
     if layout.is_split() {
         return Ok(());
@@ -1426,10 +1427,10 @@ fn advance_pairing_epoch(layout: &CombinedStoreLayout) -> Result<(), String> {
 /// #1108: like [`pairing_epochs_match`], but returns the matched value
 /// itself so a caller that is about to advance can reuse it instead of
 /// paying [`advance_pairing_epoch`]'s own dual read to recompute the same
-/// number. `Ok(None)` means the epochs disagree. Shared layouts have no
+/// number. `Ok(None)` means the epochs disagree. Owned layouts have no
 /// pairing epoch to disagree on — matching `pairing_epochs_match`, this
 /// reports a trivial match; the placeholder value is never written, since
-/// [`advance_pairing_epoch_from`] no-ops on a Shared layout too.
+/// [`advance_pairing_epoch_from`] no-ops on an Owned layout too.
 fn matched_pairing_epoch(layout: &CombinedStoreLayout) -> Result<Option<i64>, String> {
     if !layout.is_split() {
         return Ok(Some(0));
@@ -1454,7 +1455,7 @@ fn advance_pairing_epoch_from(layout: &CombinedStoreLayout, current: i64) -> Res
 
 pub fn generation_mismatch_guidance(sekai: Option<i64>, chisei: Option<i64>) -> String {
     format!(
-        "split generations disagree (sekai={sekai:?}, chisei={chisei:?}); mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. An owned or Shared open of a stamped store must set SEKAI_STORE_PEER to the other dest for the compare. Independent backups are not a paired restore set"
+        "split generations disagree (sekai={sekai:?}, chisei={chisei:?}); mutating RPCs stay refused until an operator restamps both stores with `sekaictl admin store restamp --sekai <path-or-url> --chisei <path-or-url>`. A single-plane open of a stamped store must set SEKAI_STORE_PEER to the other dest for the compare. Independent backups are not a paired restore set"
     )
 }
 
@@ -1939,7 +1940,7 @@ impl serde::Serialize for FamilyReport {
     }
 }
 
-/// Hook used after opening a layout so shared fenced files cannot become writers.
+/// Hook used after opening a layout so a fenced one-store layout cannot become a writer.
 pub fn enforce_layout_writer_fence(layout: &CombinedStoreLayout) -> Result<(), String> {
     refuse_shared_writer_if_fenced(layout)
 }
@@ -1999,15 +2000,7 @@ mod tests {
         );
         assert!(writer_fence_raised(source_s).unwrap());
 
-        let err = CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: source_s.into(),
-            legacy_sqlite_path: Some(source_s.into()),
-            postgres_max_connections: 16,
-            ..CombinedStoreSources::default()
-        }
-        .open()
-        .unwrap_err();
+        let err = refuse_shared_writer_if_fenced(&open_shared(source_s)).unwrap_err();
         assert!(err.contains("writer fence"), "{err}");
     }
 
@@ -2249,8 +2242,9 @@ mod tests {
         assert!(err.contains("distinct --sekai"), "{err}");
     }
 
+    /// One store behind both handles, as a single-plane process opens it.
     fn open_shared(path: &str) -> CombinedStoreLayout {
-        RuntimeBackend::initialize(
+        let backend = RuntimeBackend::initialize(
             RuntimeBackendConfig::from_sources(
                 BackendIdentity::Sqlite,
                 Some(path),
@@ -2262,15 +2256,10 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        CombinedStoreSources {
-            backend: Some(BackendIdentity::Sqlite),
-            default_sqlite_path: path.into(),
-            legacy_sqlite_path: Some(path.into()),
-            postgres_max_connections: 16,
-            ..CombinedStoreSources::default()
-        }
-        .open()
-        .unwrap()
+        CombinedStoreLayout::owned(
+            backend,
+            crate::combined_stores::sqlite_identity(path).unwrap(),
+        )
     }
 
     fn open_dest_pair(sekai: &str, chisei: &str) -> CombinedStoreLayout {

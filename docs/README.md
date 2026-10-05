@@ -38,8 +38,8 @@ If you want to deploy or operate the control plane:
 3. Use [two-store relocation](store-relocation.md) when moving Chisei families off a historical single file, or [two-plane processes](two-plane-processes.md) to run `sekai-plane` and `chisei-plane` separately.
 4. Use the [Docker guide](docker.md) if you want the supported container
    topology. Compose sets Combined dest-pair
-   (`SEKAI_DB_PATH`/`CHISEI_DB_PATH`); the image `DB_PATH` alone needs
-   `SEKAI_SHARED_STORE=1`.
+   (`SEKAI_DB_PATH`/`CHISEI_DB_PATH`); the image sets `SEKAI_DATA_DIR=/data`,
+   which derives the same pair.
 5. For live operations, see the [operator console](operator-console.md),
    [leases](leases.md), [object security](object-security.md), and
    [PostgreSQL parity](postgres-sekai-parity.md) /

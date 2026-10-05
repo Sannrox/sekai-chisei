@@ -13,7 +13,7 @@ RUN apt-get update \
 
 COPY sekai-chisei chisei-gateway sekaictl /usr/local/bin/
 
-ENV DB_PATH=/data/sekai.db \
+ENV SEKAI_DATA_DIR=/data \
     SEKAI_SOCKET=/data/sekai.sock
 
 VOLUME /data

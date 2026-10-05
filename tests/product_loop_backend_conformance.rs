@@ -40,7 +40,8 @@ const WAIT_BUDGET: Duration = Duration::from_secs(30);
 enum Backend {
     Sqlite,
     Postgres {
-        url: String,
+        sekai_url: String,
+        chisei_url: String,
         ca_cert: Option<String>,
     },
 }
@@ -62,7 +63,6 @@ impl LoopServer {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         command
             .env("SEKAI_SOCKET", &socket)
-            .env("SEKAI_SHARED_STORE", "1")
             .env("GRPC_PORT", "0")
             .env("OPS_PORT", "")
             .env("RUST_LOG", "error")
@@ -70,10 +70,9 @@ impl LoopServer {
             .env_remove("SEKAI_INSECURE")
             .env_remove("SEKAI_CREDENTIAL")
             .env_remove("SEKAI_BIND")
-            .env_remove("SEKAI_DB_PATH")
-            .env_remove("CHISEI_DB_PATH")
-            .env_remove("SEKAI_DATABASE_URL")
-            .env_remove("CHISEI_DATABASE_URL")
+            .env_remove("SEKAI_SHARED_STORE")
+            .env_remove("DB_PATH")
+            .env_remove("DATABASE_URL")
             .env_remove("OLLAMA_URL")
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
@@ -82,15 +81,23 @@ impl LoopServer {
         match backend {
             Backend::Sqlite => {
                 command
-                    .env("DB_PATH", dir.path().join("sekai.db"))
+                    .env("SEKAI_DB_PATH", dir.path().join("sekai.db"))
+                    .env("CHISEI_DB_PATH", dir.path().join("chisei.db"))
                     .env_remove("SEKAI_DB_BACKEND")
-                    .env_remove("DATABASE_URL");
+                    .env_remove("SEKAI_DATABASE_URL")
+                    .env_remove("CHISEI_DATABASE_URL");
             }
-            Backend::Postgres { url, ca_cert } => {
+            Backend::Postgres {
+                sekai_url,
+                chisei_url,
+                ca_cert,
+            } => {
                 command
                     .env("SEKAI_DB_BACKEND", "postgres")
-                    .env("DATABASE_URL", url)
-                    .env_remove("DB_PATH");
+                    .env("SEKAI_DATABASE_URL", sekai_url)
+                    .env("CHISEI_DATABASE_URL", chisei_url)
+                    .env_remove("SEKAI_DB_PATH")
+                    .env_remove("CHISEI_DB_PATH");
                 match ca_cert {
                     Some(path) => command.env("SEKAI_POSTGRES_CA_CERT", path),
                     None => command.env_remove("SEKAI_POSTGRES_CA_CERT"),
@@ -515,10 +522,12 @@ async fn sqlite_runs_the_product_loop() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
 async fn postgres_runs_the_product_loop() {
-    let scratch = ScratchDatabase::create();
+    let sekai = ScratchDatabase::create();
+    let chisei = ScratchDatabase::create();
     let server = LoopServer::spawn(&Backend::Postgres {
-        url: scratch.url.clone(),
-        ca_cert: scratch.ca_cert.clone(),
+        sekai_url: sekai.url.clone(),
+        chisei_url: chisei.url.clone(),
+        ca_cert: sekai.ca_cert.clone(),
     });
     exercise_product_loop(&server).await;
 }
