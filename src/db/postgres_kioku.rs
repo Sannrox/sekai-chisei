@@ -3,9 +3,11 @@
 use crate::chisei::kioku::{
     HumanMemoryReview, HumanReviewAction, KIOKU_EVIDENCE_REASSESSMENT_METHOD, KiokuCandidateCursor,
     KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance, MemoryLifecycleEvent,
-    MemoryLifecycleState, MemoryValidation,
+    MemoryLifecycleState, MemoryValidation, namespace_classification_ceiling,
 };
+use crate::chisei::principal::PrincipalContext;
 use crate::db::postgres::PostgresDb;
+use crate::sekai::chisei_principal::principal_grants;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 
 impl PostgresDb {
@@ -601,26 +603,17 @@ impl PostgresDb {
         namespace: &str,
         actor: &str,
     ) -> Result<EvidenceClassification, String> {
-        if matches!(actor, "root" | "local") {
+        let principal = PrincipalContext::from_credential(actor);
+        if principal.is_privileged() {
             return Ok(EvidenceClassification::Restricted);
         }
         let namespace_object = self
             .find_by_external_id(&format!("namespace:{namespace}"))?
             .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
-        let grants = self.list_grants(&namespace_object.id)?;
-        if grants.is_empty() {
-            return Ok(EvidenceClassification::Public);
-        }
-        let role = grants
-            .iter()
-            .find(|grant| grant.principal == actor)
-            .map(|grant| &grant.role)
-            .ok_or_else(|| "actor is not authorized for memory namespace".to_string())?;
-        Ok(match role {
-            crate::sekai::security::Role::Viewer => EvidenceClassification::Internal,
-            crate::sekai::security::Role::Editor => EvidenceClassification::Confidential,
-            crate::sekai::security::Role::Admin => EvidenceClassification::Restricted,
-        })
+        namespace_classification_ceiling(
+            &principal,
+            &principal_grants(&self.list_grants(&namespace_object.id)?),
+        )
     }
 
     pub fn authorize_kioku_evidence(
@@ -665,11 +658,8 @@ impl PostgresDb {
         if let Some(object_id) =
             self.get_evidence_projection_object_id(&request.source_submission_id)?
         {
-            let grants = self.list_grants(&object_id)?;
-            if !grants.is_empty()
-                && !matches!(request.actor.as_str(), "root" | "local")
-                && !grants.iter().any(|grant| grant.principal == request.actor)
-            {
+            let grants = principal_grants(&self.list_grants(&object_id)?);
+            if !PrincipalContext::from_credential(&request.actor).may_read(&grants) {
                 return Err("actor is not authorized to read evidence projection".into());
             }
         } else {

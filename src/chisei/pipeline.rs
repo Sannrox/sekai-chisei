@@ -4,6 +4,7 @@ use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
 use crate::chisei::policy::{
     ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
 };
+use crate::chisei::principal::PrincipalContext;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader, SekaiFacts};
 use crate::db::store::{ChiseiKiokuStore, ChiseiStore};
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
@@ -411,7 +412,11 @@ fn resolve_context_objects_reporting(
 fn context_object_authorized(req: &PipelineRequest, object: &Object) -> bool {
     // Direct in-process pipeline users are trusted and historically omit an
     // actor. Network entry points always populate this from authenticated metadata.
-    if req.memory_actor.is_empty() || matches!(req.memory_actor.as_str(), "root" | "local") {
+    if req.memory_actor.is_empty() {
+        return true;
+    }
+    let principal = PrincipalContext::from_credential(&req.memory_actor);
+    if principal.is_privileged() {
         return true;
     }
     if object.namespace != req.namespace.trim() {
@@ -425,11 +430,9 @@ fn context_object_authorized(req: &PipelineRequest, object: &Object) -> bool {
                 .get("team_managed")
                 .is_some_and(|value| value == "true") =>
         {
-            facts.list_grants(&boundary.id).is_ok_and(|grants| {
-                grants
-                    .iter()
-                    .any(|grant| grant.principal == req.memory_actor)
-            })
+            facts
+                .list_grants(&boundary.id)
+                .is_ok_and(|grants| principal.holds_grant(&grants))
         }
         Ok(_) => true,
         Err(_) => false,
@@ -437,12 +440,9 @@ fn context_object_authorized(req: &PipelineRequest, object: &Object) -> bool {
     if !namespace_authorized {
         return false;
     }
-    facts.list_grants(&object.id).is_ok_and(|grants| {
-        grants.is_empty()
-            || grants
-                .iter()
-                .any(|grant| grant.principal == req.memory_actor)
-    })
+    facts
+        .list_grants(&object.id)
+        .is_ok_and(|grants| principal.may_read(&grants))
 }
 
 fn evidence_classification_allowed(classification: EvidenceClassification, external: bool) -> bool {
@@ -2286,6 +2286,7 @@ mod tests {
         KIOKU_MEMORY_VERSION, KiokuEvidenceBasis, KiokuEvidenceLink, KiokuMemory,
         MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
     };
+    use crate::chisei::principal::{PrincipalGrant, PrincipalRole};
     use crate::domain::{Link, Object};
     use crate::sekai::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
@@ -2295,7 +2296,6 @@ mod tests {
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
     };
     use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
-    use crate::sekai::security::{Grant, Role};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
 
@@ -2464,13 +2464,12 @@ mod tests {
         let learning = pinned_learning(&[]);
         db.runtime().create_object(&learning.object).unwrap();
         db.runtime()
-            .create_grant(&crate::sekai::security::Grant {
-                id: "grant-reviewer".into(),
-                object_id: "learning-1".into(),
-                principal: "reviewer".into(),
-                role: crate::sekai::security::Role::Viewer,
-                created: 1,
-            })
+            .create_principal_grant(
+                "grant-reviewer",
+                "learning-1",
+                &PrincipalGrant::new("reviewer", PrincipalRole::Viewer),
+                1,
+            )
             .unwrap();
 
         let mut outsider = make_req(&db);
@@ -2582,13 +2581,12 @@ mod tests {
         ] {
             db.runtime().create_object(&object).unwrap();
             db.runtime()
-                .create_grant(&Grant {
-                    id: format!("grant-{}", object.id),
-                    object_id: object.id,
-                    principal: "agent:planner".into(),
-                    role: Role::Viewer,
-                    created: 1,
-                })
+                .create_principal_grant(
+                    &format!("grant-{}", object.id),
+                    &object.id,
+                    &PrincipalGrant::new("agent:planner", PrincipalRole::Viewer),
+                    1,
+                )
                 .unwrap();
         }
         let memory = KiokuMemory {
@@ -4042,43 +4040,40 @@ mod tests {
 
         db.runtime().delete_object(&object.id).unwrap();
         db.runtime()
-            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .ensure_team_namespace("acme", "alice", PrincipalRole::Viewer.into(), "local")
             .unwrap();
         object.id = "asset-protected".into();
         object.namespace = "acme".into();
         db.runtime().create_object(&object).unwrap();
         db.runtime()
-            .create_grant(&Grant {
-                id: "secret-bob".into(),
-                object_id: object.id.clone(),
-                principal: "bob".into(),
-                role: Role::Viewer,
-                created: 1,
-            })
+            .create_principal_grant(
+                "secret-bob",
+                &object.id,
+                &PrincipalGrant::new("bob", PrincipalRole::Viewer),
+                1,
+            )
             .unwrap();
         let protected = pipeline.run(&mut request, &db);
         assert!(!protected.prepared_spec.contains("private context"));
 
         db.runtime()
-            .create_grant(&Grant {
-                id: "secret-alice".into(),
-                object_id: object.id.clone(),
-                principal: "alice".into(),
-                role: Role::Viewer,
-                created: 2,
-            })
+            .create_principal_grant(
+                "secret-alice",
+                &object.id,
+                &PrincipalGrant::new("alice", PrincipalRole::Viewer),
+                2,
+            )
             .unwrap();
         let authorized = pipeline.run(&mut request, &db);
         assert!(authorized.prepared_spec.contains("private context"));
 
         db.runtime()
-            .create_grant(&Grant {
-                id: "secret-gateway".into(),
-                object_id: object.id.clone(),
-                principal: "chisei-gateway".into(),
-                role: Role::Viewer,
-                created: 3,
-            })
+            .create_principal_grant(
+                "secret-gateway",
+                &object.id,
+                &PrincipalGrant::new("chisei-gateway", PrincipalRole::Viewer),
+                3,
+            )
             .unwrap();
         request.spec = "inspect asset:SECRET".into();
         request.memory_actor = "chisei-gateway".into();
@@ -4092,7 +4087,7 @@ mod tests {
         let chisei = ChiseiStore::memory();
         sekai
             .runtime()
-            .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
+            .ensure_team_namespace("acme", "alice", PrincipalRole::Viewer.into(), "local")
             .unwrap();
         let object = Object {
             id: "asset-split".into(),
@@ -4107,13 +4102,12 @@ mod tests {
         sekai.runtime().create_object(&object).unwrap();
         sekai
             .runtime()
-            .create_grant(&Grant {
-                id: "split-alice".into(),
-                object_id: object.id.clone(),
-                principal: "alice".into(),
-                role: Role::Viewer,
-                created: 1,
-            })
+            .create_principal_grant(
+                "split-alice",
+                &object.id,
+                &PrincipalGrant::new("alice", PrincipalRole::Viewer),
+                1,
+            )
             .unwrap();
         let pipeline = default_pipeline();
         let request_with = |facts: SekaiFacts| {

@@ -43,6 +43,7 @@ pub mod pipeline;
 pub mod policy;
 pub mod policy_dry_run;
 pub mod portfolio;
+pub mod principal;
 pub mod privacy;
 pub mod promotion;
 pub use sekai_provider::receipt;

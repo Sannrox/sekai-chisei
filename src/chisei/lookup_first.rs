@@ -15,6 +15,7 @@
 use crate::chisei::epistemic_descriptor::{
     EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
 };
+use crate::chisei::principal::{PrincipalContext, PrincipalGrant};
 use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::db::store::{ChiseiDecisionStore, ChiseiStore, SekaiStore};
 use crate::domain::Object;
@@ -27,7 +28,6 @@ use crate::sekai::retrieval::{
     self, ReasoningMode, RetrievalDirection, RetrievalQuery, RetrievalRoot,
 };
 use crate::sekai::schema::{self, SchemaRegistry};
-use crate::sekai::security::Role;
 use crate::sekai::semantic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -786,8 +786,8 @@ fn try_explain_derivation(
         Ok(root) => root,
         Err(()) => return Ok(refusal(capability, "schema_miss")),
     };
-    let principals = effective_lookup_principals(actor);
-    if !explain_target_is_authorized(&to, namespace, &principals, db)? {
+    let principal = effective_lookup_principal(actor);
+    if !explain_target_is_authorized(&to, namespace, &principal, db)? {
         // Missing and unauthorized targets intentionally share one outcome.
         // A distinct refusal for an existing but hidden target would create
         // an existence oracle through the lookup/model path boundary.
@@ -848,15 +848,15 @@ fn run_lookup_retrieval(
     mut query: RetrievalQuery,
 ) -> Result<retrieval::RetrievalResult, RetrievalLookupError> {
     let started = Instant::now();
-    let principals = effective_lookup_principals(actor);
+    let principal = effective_lookup_principal(actor);
     let roots = query.roots.clone();
-    if let Some(reason) = preflight_root_access(&roots, namespace, &principals, db)
+    if let Some(reason) = preflight_root_access(&roots, namespace, &principal, db)
         .map_err(RetrievalLookupError::Storage)?
     {
         return Err(RetrievalLookupError::Refusal(reason));
     }
     let (ontology, source_rows, source_rows_truncated) =
-        lookup_ontology_snapshot(db, &principals, &query, started)?;
+        lookup_ontology_snapshot(db, &principal, &query, started)?;
     query.initial_source_rows = source_rows;
     query.source_rows_truncated = source_rows_truncated;
     let namespace = namespace.to_string();
@@ -867,7 +867,7 @@ fn run_lookup_retrieval(
         started,
         |object| {
             (object.namespace.is_empty() || object.namespace == namespace)
-                && lookup_object_readable(object, &principals, db).unwrap_or(false)
+                && lookup_object_readable(object, &principal, db).unwrap_or(false)
         },
         |object| is_reserved_governance_kind(&object.kind),
     )
@@ -888,17 +888,17 @@ fn run_lookup_retrieval(
         result.truncated = true;
     }
     for candidate in &mut result.candidates {
-        candidate.object = redact_lookup_object(&candidate.object, &principals, &namespace, db)
+        candidate.object = redact_lookup_object(&candidate.object, &principal, &namespace, db)
             .map_err(RetrievalLookupError::Storage)?;
     }
     Ok(result)
 }
 
-fn effective_lookup_principals(actor: &str) -> Vec<String> {
+fn effective_lookup_principal(actor: &str) -> PrincipalContext {
     // ExecutePlanStream receives one canonical authenticated subject. Keep it
     // opaque; an independently authenticated principal list would need to be
     // passed as a separate request-context value, never encoded in the name.
-    vec![actor.to_string()]
+    PrincipalContext::from_credential(actor)
 }
 
 fn lookup_reasoning_timeout(max_time_ms: u32) -> Duration {
@@ -912,7 +912,7 @@ fn lookup_reasoning_timeout(max_time_ms: u32) -> Duration {
 fn preflight_root_access(
     roots: &[RetrievalRoot],
     namespace: &str,
-    principals: &[String],
+    principal: &PrincipalContext,
     db: &SekaiStore,
 ) -> Result<Option<&'static str>, String> {
     for root in roots {
@@ -943,7 +943,7 @@ fn preflight_root_access(
                 return Ok(Some("cross_namespace"));
             }
             if is_reserved_governance_kind(&object.kind)
-                || !lookup_object_readable(&object, principals, db)?
+                || !lookup_object_readable(&object, principal, db)?
             {
                 return Ok(Some("acl_denied"));
             }
@@ -955,7 +955,7 @@ fn preflight_root_access(
 fn explain_target_is_authorized(
     target: &RetrievalRoot,
     namespace: &str,
-    principals: &[String],
+    principal: &PrincipalContext,
     db: &SekaiStore,
 ) -> Result<bool, String> {
     let objects = match target {
@@ -984,13 +984,13 @@ fn explain_target_is_authorized(
     Ok(objects.iter().all(|object| {
         (object.namespace.is_empty() || object.namespace == namespace)
             && !is_reserved_governance_kind(&object.kind)
-            && lookup_object_readable(object, principals, db).unwrap_or(false)
+            && lookup_object_readable(object, principal, db).unwrap_or(false)
     }))
 }
 
 fn lookup_ontology_snapshot(
     db: &SekaiStore,
-    principals: &[String],
+    principal: &PrincipalContext,
     query: &RetrievalQuery,
     started: Instant,
 ) -> Result<(Option<OntologyRegistry>, u32, bool), RetrievalLookupError> {
@@ -1009,7 +1009,7 @@ fn lookup_ontology_snapshot(
     let mut source_rows = 0u32;
     let mut source_rows_truncated = false;
     let mut classes = match db.runtime().list_readable_ontology_classes(
-        principals,
+        principal.principals(),
         deadline,
         source_limit.saturating_add(1),
     ) {
@@ -1041,7 +1041,7 @@ fn lookup_ontology_snapshot(
     let remaining_rows = source_limit.saturating_sub(source_rows);
     let mut relations = if !source_rows_truncated && started < deadline {
         match db.runtime().list_readable_ontology_relations(
-            principals,
+            principal.principals(),
             deadline,
             remaining_rows.saturating_add(1),
         ) {
@@ -1313,7 +1313,7 @@ fn resolve_object_ref(
         });
     }
 
-    if !object_readable(&object, actor, db)? {
+    if !object_readable(&object, &PrincipalContext::from_credential(actor), db)? {
         return Ok(LookupDecision::Refusal {
             capability: semantic::CAPABILITY_RESOLVE_REF.into(),
             reason: "acl_denied".into(),
@@ -1360,7 +1360,11 @@ fn resolve_ontology_class(
     // Ontology class bodies are global; still re-check any projected ACL object
     // when grants exist (fail closed). No grant → readable.
     let class_object_id = format!("ontology.class:{class_name}");
-    if !id_readable(&class_object_id, actor, db)? {
+    if !id_readable(
+        &class_object_id,
+        &PrincipalContext::from_credential(actor),
+        db,
+    )? {
         return Ok(LookupDecision::Refusal {
             capability: semantic::CAPABILITY_RESOLVE_REF.into(),
             reason: "acl_denied".into(),
@@ -1400,7 +1404,11 @@ fn resolve_ontology_relation(
         });
     };
     let relation_object_id = format!("ontology.relation:{relation_name}");
-    if !id_readable(&relation_object_id, actor, db)? {
+    if !id_readable(
+        &relation_object_id,
+        &PrincipalContext::from_credential(actor),
+        db,
+    )? {
         return Ok(LookupDecision::Refusal {
             capability: semantic::CAPABILITY_RESOLVE_REF.into(),
             reason: "acl_denied".into(),
@@ -1431,108 +1439,53 @@ fn resolve_ontology_relation(
     })
 }
 
-/// Object is readable when unrestricted (no grants) or the actor holds a grant.
-/// Privileged local/root actors always pass, matching control-plane conventions.
-fn object_readable(object: &Object, actor: &str, db: &SekaiStore) -> Result<bool, String> {
-    if matches!(actor, "root" | "local") {
-        return Ok(true);
-    }
-    id_readable(&object.id, actor, db)
-}
-
-fn id_readable(object_id: &str, actor: &str, db: &SekaiStore) -> Result<bool, String> {
-    if matches!(actor, "root" | "local") {
-        return Ok(true);
-    }
-    let grants = db.runtime().list_grants(object_id)?;
-    if grants.is_empty() {
-        return Ok(true);
-    }
-    Ok(grants.iter().any(|grant| grant.principal == actor))
-}
-
-fn id_readable_for_principals(
-    object_id: &str,
-    principals: &[String],
+/// Object is readable when unrestricted (no grants) or the principal holds a
+/// grant. Privileged local/root principals always pass, matching control-plane
+/// conventions.
+fn object_readable(
+    object: &Object,
+    principal: &PrincipalContext,
     db: &SekaiStore,
 ) -> Result<bool, String> {
-    if principals
-        .iter()
-        .any(|principal| matches!(principal.as_str(), "root" | "local"))
-    {
+    id_readable(&object.id, principal, db)
+}
+
+fn id_readable(
+    object_id: &str,
+    principal: &PrincipalContext,
+    db: &SekaiStore,
+) -> Result<bool, String> {
+    if principal.is_privileged() {
         return Ok(true);
     }
-    let grants = db.runtime().list_grants(object_id)?;
-    if grants.is_empty() {
-        return Ok(true);
-    }
-    Ok(grants
-        .iter()
-        .any(|grant| principals.contains(&grant.principal)))
+    Ok(principal.may_read(&lookup_grants(object_id, db)?))
+}
+
+/// Grants on an object through the Sekai fact port, as Chisei sees them.
+fn lookup_grants(object_id: &str, db: &SekaiStore) -> Result<Vec<PrincipalGrant>, String> {
+    SekaiFactReader::list_grants(db, object_id).map_err(|error| error.to_string())
 }
 
 fn lookup_object_readable(
     object: &Object,
-    principals: &[String],
+    principal: &PrincipalContext,
     db: &SekaiStore,
 ) -> Result<bool, String> {
-    if !id_readable_for_principals(&object.id, principals, db)?
-        || is_reserved_governance_kind(&object.kind)
-    {
+    if !id_readable(&object.id, principal, db)? || is_reserved_governance_kind(&object.kind) {
         return Ok(false);
     }
-    if markings::object_marking_token(object).is_none() {
-        return Ok(true);
-    }
-    let primary = principals.first().map(String::as_str).unwrap_or_default();
-    let authority = lookup_principal_authority(primary, db)?;
-    let lattice = db.runtime().get_classification_lattice(&object.namespace)?;
+    // Sekai owns markings and the classification lattice; the port returns
+    // only the clearance outcome, and any error denies.
     Ok(
-        crate::sekai::classification_lattice::evaluate_lattice_access(
-            "lookup-first",
-            markings::object_marking_token(object),
-            &authority,
-            lattice.as_ref(),
-        )
-        .decision
-            != markings::MarkingDecision::Deny,
+        SekaiFactReader::marking_clearance(db, "lookup-first", object, principal.primary())
+            .map_err(|error| error.to_string())?
+            .allows(),
     )
-}
-
-fn lookup_principal_authority(
-    actor: &str,
-    db: &SekaiStore,
-) -> Result<markings::PrincipalAuthority, String> {
-    if let Some(trusted) = markings::trusted_service_authority(actor) {
-        return Ok(trusted);
-    }
-    let candidates = db
-        .runtime()
-        .find_all_by_external_id(&markings::principal_profile_external_id(actor))?;
-    let mut trusted_profiles = Vec::new();
-    for object in &candidates {
-        if object.kind != markings::PRINCIPAL_PROFILE_KIND
-            || object
-                .properties
-                .get(markings::PRINCIPAL_PROFILE_SEALED_PROPERTY)
-                .is_none_or(|value| value != "true")
-        {
-            continue;
-        }
-        let grants = db.runtime().list_grants(&object.id)?;
-        if grants.iter().any(|grant| matches!(grant.role, Role::Admin)) {
-            trusted_profiles.push(object);
-        }
-    }
-    if trusted_profiles.len() > 1 {
-        return Err("multiple trusted principal profiles found".into());
-    }
-    markings::principal_authority_from_profile(actor, trusted_profiles.first().copied())
 }
 
 fn redact_lookup_object(
     object: &Object,
-    principals: &[String],
+    principal: &PrincipalContext,
     namespace: &str,
     db: &SekaiStore,
 ) -> Result<Object, String> {
@@ -1547,21 +1500,13 @@ fn redact_lookup_object(
         &schema_registry,
         |candidate| {
             (candidate.namespace.is_empty() || candidate.namespace == namespace)
-                && lookup_object_readable(candidate, principals, db).unwrap_or(false)
+                && lookup_object_readable(candidate, principal, db).unwrap_or(false)
         },
     )?;
-    if principals
-        .iter()
-        .any(|principal| matches!(principal.as_str(), "root" | "local"))
-    {
+    if principal.is_privileged() {
         return db.runtime().project_object_property_grants(projected);
     }
-    let is_admin = db
-        .runtime()
-        .list_grants(&projected.id)?
-        .iter()
-        .any(|grant| principals.contains(&grant.principal) && matches!(grant.role, Role::Admin));
-    if is_admin {
+    if principal.is_admin_in(&lookup_grants(&projected.id, db)?) {
         return db.runtime().project_object_property_grants(projected);
     }
     let Some(object_type) = schema_registry.get(&projected.kind) else {
@@ -2097,8 +2042,8 @@ fn s2_explain_negative_golden_answer() -> Value {
 
 /// Seed the graph state required by [`s1_fixture_cases`].
 pub fn seed_s1_fixture_graph(db: &SekaiStore) -> Result<(), String> {
+    use crate::chisei::principal::PrincipalRole;
     use crate::domain::{Link, Object};
-    use crate::sekai::security::{Grant, Role};
     use std::collections::HashMap;
 
     let now = 1_700_000_000_000i64;
@@ -2153,13 +2098,12 @@ pub fn seed_s1_fixture_graph(db: &SekaiStore) -> Result<(), String> {
         db.runtime().create_object(&object)?;
     }
     // Restrict acl-denied so only bob can read it.
-    db.runtime().create_grant(&Grant {
-        id: "grant-acl-denied-bob".into(),
-        object_id: "acl-denied".into(),
-        principal: "bob".into(),
-        role: Role::Viewer,
-        created: now,
-    })?;
+    db.runtime().create_principal_grant(
+        "grant-acl-denied-bob",
+        "acl-denied",
+        &PrincipalGrant::new("bob", PrincipalRole::Viewer),
+        now,
+    )?;
     db.runtime().create_link(&Link {
         id: "lookup-link-contains".into(),
         from_id: "lookup-root".into(),
@@ -2250,6 +2194,32 @@ mod tests {
             try_lookup_first("free_form", "acme", "alice", "{}", &detached).unwrap(),
             LookupDecision::NotEligible
         );
+    }
+
+    #[test]
+    fn grant_reads_through_the_port_decide_like_the_standalone_context() {
+        use crate::chisei::principal::PrincipalRole;
+        let db = SekaiStore::memory();
+        seed_s1_fixture_graph(&db).expect("seed");
+        // The same grants, read from Sekai through the adapter and written
+        // out directly as a standalone Chisei context would hold them.
+        let adapted = lookup_grants("acl-denied", &db).unwrap();
+        let standalone = vec![PrincipalGrant::new("bob", PrincipalRole::Viewer)];
+        assert_eq!(adapted, standalone);
+        for actor in ["alice", "bob", "root", "local", ""] {
+            let principal = PrincipalContext::from_credential(actor);
+            assert_eq!(
+                id_readable("acl-denied", &principal, &db).unwrap(),
+                principal.may_read(&standalone),
+                "{actor}"
+            );
+        }
+        assert!(!principal_reads("alice", &standalone));
+        assert!(principal_reads("bob", &standalone));
+    }
+
+    fn principal_reads(actor: &str, grants: &[PrincipalGrant]) -> bool {
+        PrincipalContext::from_credential(actor).may_read(grants)
     }
 
     #[test]

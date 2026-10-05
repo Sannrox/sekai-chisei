@@ -14,10 +14,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, Object};
 use crate::sekai::schema::ObjectType;
-use crate::sekai::security::Grant;
 
 /// Refusal reason when no Sekai is attached to this Chisei process.
 pub const SEKAI_NOT_ATTACHED: &str = "sekai_not_attached";
@@ -63,7 +63,16 @@ pub trait SekaiFactReader: Send + Sync {
     }
     fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, SekaiFactError>;
     fn find_namespace_boundary(&self, namespace: &str) -> Result<Option<Object>, SekaiFactError>;
-    fn list_grants(&self, object_id: &str) -> Result<Vec<Grant>, SekaiFactError>;
+    /// Grants on an object, mapped into the Chisei principal context.
+    fn list_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError>;
+    /// Classification-marking clearance of `principal` for `object`. Sekai
+    /// owns markings and the lattice; Chisei receives only the outcome.
+    fn marking_clearance(
+        &self,
+        operation_id: &str,
+        object: &Object,
+        principal: &str,
+    ) -> Result<MarkingClearance, SekaiFactError>;
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError>;
     fn get_linked_objects(
         &self,
@@ -89,8 +98,17 @@ impl SekaiFactReader for SekaiStore {
         read(self.runtime().find_namespace_boundary(namespace))
     }
 
-    fn list_grants(&self, object_id: &str) -> Result<Vec<Grant>, SekaiFactError> {
-        read(self.runtime().list_grants(object_id))
+    fn list_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError> {
+        read(self.runtime().list_principal_grants(object_id))
+    }
+
+    fn marking_clearance(
+        &self,
+        operation_id: &str,
+        object: &Object,
+        principal: &str,
+    ) -> Result<MarkingClearance, SekaiFactError> {
+        read(self.principal_marking_clearance(operation_id, object, principal))
     }
 
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError> {
@@ -131,7 +149,16 @@ impl SekaiFactReader for SekaiNotAttached {
         Err(SekaiFactError::NotAttached)
     }
 
-    fn list_grants(&self, _: &str) -> Result<Vec<Grant>, SekaiFactError> {
+    fn list_grants(&self, _: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError> {
+        Err(SekaiFactError::NotAttached)
+    }
+
+    fn marking_clearance(
+        &self,
+        _: &str,
+        _: &Object,
+        _: &str,
+    ) -> Result<MarkingClearance, SekaiFactError> {
         Err(SekaiFactError::NotAttached)
     }
 
@@ -213,6 +240,36 @@ mod tests {
         assert!(reader.in_process_store().is_err());
         assert!(!reader.attached());
         assert_eq!(format!("{facts:?}"), "SekaiFacts(\"sekai_not_attached\")");
+    }
+
+    #[test]
+    fn not_attached_grant_and_clearance_reads_deny() {
+        use crate::chisei::principal::PrincipalContext;
+        let reader = SekaiNotAttached;
+        let object = Object {
+            id: "o1".into(),
+            kind: "widget".into(),
+            name: "w".into(),
+            namespace: "acme".into(),
+            external_id: "widget:w".into(),
+            properties: Default::default(),
+            created: 0,
+            updated: 0,
+        };
+        // No grants can be read, so no context decision can allow: callers
+        // treat the refusal as a deny, never as "unrestricted".
+        let alice = PrincipalContext::from_credential("alice");
+        assert!(
+            !reader
+                .list_grants("o1")
+                .is_ok_and(|grants| alice.may_read(&grants))
+        );
+        assert_eq!(
+            reader
+                .marking_clearance("test", &object, "alice")
+                .unwrap_err(),
+            SekaiFactError::NotAttached
+        );
     }
 
     #[test]
