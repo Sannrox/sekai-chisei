@@ -479,7 +479,7 @@ impl CombinedStoreLayout {
             Self::Shared { backend, .. } => split_shared_runtime(backend.database()),
             Self::Split { sekai, chisei, .. } => (
                 SekaiStore::from_shared_runtime(sekai.database()),
-                ChiseiStore::from_shared_runtime(chisei.database()),
+                ChiseiStore::from_split_runtimes(chisei.database(), sekai.database()),
             ),
         }
     }
@@ -717,6 +717,7 @@ pub(crate) fn optional_trimmed_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::store::ChiseiDecisionStore;
 
     fn sqlite_pair(sekai: &str, chisei: &str) -> CombinedStoreSources {
         CombinedStoreSources {
@@ -809,6 +810,46 @@ mod tests {
         let (sekai_pool, chisei_pool) = layout.connection_pool_maxes();
         assert_eq!((sekai_pool, chisei_pool), (8, 8));
         assert!(sekai_pool.saturating_add(chisei_pool) <= 16);
+    }
+
+    #[test]
+    fn split_handles_record_chisei_decisions_on_the_sekai_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let layout = sqlite_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap())
+            .open()
+            .unwrap();
+        let (sekai_store, chisei_store) = layout.handles();
+        chisei_store
+            .record_decision(&crate::sekai::audit::Decision {
+                id: "split-decision".into(),
+                timestamp: 1,
+                actor: "chisei.test".into(),
+                action: "policy".into(),
+                reason: "combined split ledger ownership".into(),
+                evidence: Default::default(),
+                target_id: "ns".into(),
+                outcome: "allow".into(),
+            })
+            .unwrap();
+        let on_sekai = sekai_store
+            .runtime()
+            .list_decisions(&crate::sekai::audit::DecisionFilter::default())
+            .unwrap();
+        assert_eq!(on_sekai.len(), 1);
+        assert_eq!(on_sekai[0].id, "split-decision");
+        assert!(
+            chisei_store
+                .runtime()
+                .list_decisions(&crate::sekai::audit::DecisionFilter::default())
+                .unwrap()
+                .is_empty(),
+            "Chisei dest must not hold stranded decision rows"
+        );
+        let verification = sekai_store.runtime().verify_ledger().unwrap();
+        assert!(verification.ok, "{}", verification.error);
+        assert_eq!(verification.entries_checked, 1);
     }
 
     #[test]

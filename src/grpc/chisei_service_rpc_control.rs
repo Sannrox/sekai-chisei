@@ -209,7 +209,6 @@ pub(super) async fn set_external_action_policy(
                 .map_err(Status::invalid_argument)?;
             service
                 .db
-                .runtime()
                 .record_decisions_idempotently(&[crate::sekai::audit::Decision {
                     id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
                     timestamp: now,

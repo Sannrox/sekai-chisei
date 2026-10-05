@@ -726,22 +726,19 @@ async fn report_operation_event(
             false,
         )
     {
-        let _ = service
-            .db
-            .runtime()
-            .record_decision(&crate::sekai::audit::Decision {
-                id: uuid::Uuid::new_v4().to_string(),
-                timestamp: now,
-                actor: "chisei.kioku".into(),
-                action: "kioku.outcome_attribution".into(),
-                reason: error,
-                evidence: std::collections::HashMap::from([
-                    ("operation_id".into(), receipt.operation_id.clone()),
-                    ("receipt_event_id".into(), event_id.clone()),
-                ]),
-                target_id: receipt.operation_id.clone(),
-                outcome: "failed".into(),
-            });
+        let _ = service.db.record_decision(&crate::sekai::audit::Decision {
+            id: uuid::Uuid::new_v4().to_string(),
+            timestamp: now,
+            actor: "chisei.kioku".into(),
+            action: "kioku.outcome_attribution".into(),
+            reason: error,
+            evidence: std::collections::HashMap::from([
+                ("operation_id".into(), receipt.operation_id.clone()),
+                ("receipt_event_id".into(), event_id.clone()),
+            ]),
+            target_id: receipt.operation_id.clone(),
+            outcome: "failed".into(),
+        });
     }
     Ok(Response::new(ReportOperationEventResponse {
         event_id,
