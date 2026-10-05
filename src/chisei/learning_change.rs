@@ -7,7 +7,7 @@
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
-use crate::db::store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore};
+use crate::db::store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore, SekaiStore};
 use crate::domain::KIND_LEARNING;
 use crate::shomei;
 use serde::{Deserialize, Serialize};
@@ -423,11 +423,9 @@ pub fn render_context(title: &str, prevention: &str) -> String {
     }
 }
 
-fn object_runtime(
-    facts: &dyn SekaiFactReader,
-) -> Result<&crate::db::runtime_db::RuntimeDb, String> {
+fn object_store(facts: &dyn SekaiFactReader) -> Result<&SekaiStore, String> {
     match facts.in_process_store() {
-        Ok(store) => Ok(store.runtime()),
+        Ok(store) => Ok(store),
         Err(SekaiFactError::Read(error)) => Err(error),
         Err(_) => Err(UNAVAILABLE.into()),
     }
@@ -438,7 +436,8 @@ fn visible_learning(
     namespace: &str,
     learning_id: &str,
 ) -> Result<crate::domain::Object, String> {
-    let learning = object_runtime(facts)?
+    let learning = object_store(facts)?
+        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if learning.kind != KIND_LEARNING || learning.namespace != namespace {
@@ -486,13 +485,14 @@ fn set_learning_status(
     learning_id: &str,
     status: &str,
 ) -> Result<(), String> {
-    let runtime = object_runtime(facts)?;
-    let mut learning = runtime
+    let store = object_store(facts)?;
+    let mut learning = store
+        .runtime()
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     learning.properties.insert("status".into(), status.into());
     learning.updated = learning.updated.saturating_add(1);
-    runtime.update_object(&learning)
+    store.runtime().update_object(&learning)
 }
 
 fn learning_digest(object: &crate::domain::Object) -> Result<String, String> {
