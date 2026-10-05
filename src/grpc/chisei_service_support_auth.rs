@@ -1,4 +1,5 @@
 use super::*;
+use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 
 pub(super) fn evaluation_gate_suite_digest(suite: &crate::chisei::eval::Suite) -> String {
     let snapshot = EvaluationGateSuiteSnapshot {
@@ -537,8 +538,19 @@ pub(super) fn quality_trend_report_to_proto(
         semantic_digest: report.semantic_digest.clone(),
     }
 }
+/// Map a refused or failed Sekai fact read to an authorization status.
+/// A Chisei process without Sekai denies with an explicit reason; it never
+/// treats the missing grant store as "no grants needed".
+fn sekai_fact_status(error: SekaiFactError, denied: &str) -> Status {
+    match error {
+        SekaiFactError::NotAttached | SekaiFactError::Unsupported(_) => {
+            Status::permission_denied(format!("{denied}: {}", error.reason()))
+        }
+        SekaiFactError::Read(error) => Status::internal(error),
+    }
+}
 pub(super) fn require_namespace_access(
-    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
@@ -546,13 +558,14 @@ pub(super) fn require_namespace_access(
     if matches!(actor, "root" | "local") {
         return Ok(());
     }
-    let boundary = db
+    let denied = "namespace access denied";
+    let boundary = facts
         .find_namespace_boundary(namespace)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::permission_denied("namespace access denied"))?;
-    let granted = db
+        .map_err(|error| sekai_fact_status(error, denied))?
+        .ok_or_else(|| Status::permission_denied(denied))?;
+    let granted = facts
         .list_grants(&boundary.id)
-        .map_err(Status::internal)?
+        .map_err(|error| sekai_fact_status(error, denied))?
         .into_iter()
         .any(|grant| grant.principal == actor);
     if granted {
@@ -562,7 +575,7 @@ pub(super) fn require_namespace_access(
     }
 }
 pub(super) fn require_namespace_write_access(
-    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
@@ -570,19 +583,21 @@ pub(super) fn require_namespace_write_access(
     if matches!(actor, "root" | "local") {
         return Ok(());
     }
-    let boundary = db
+    let denied = "namespace write access denied";
+    let boundary = facts
         .find_namespace_boundary(namespace)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::permission_denied("namespace write access denied"))?;
-    let granted = db
+        .map_err(|error| sekai_fact_status(error, denied))?
+        .ok_or_else(|| Status::permission_denied(denied))?;
+    let granted = facts
         .list_grants(&boundary.id)
-        .map_err(Status::internal)?
+        .map_err(|error| sekai_fact_status(error, denied))?
         .into_iter()
         .any(|grant| {
             grant.principal == actor
                 && matches!(
                     grant.role,
-                    crate::sekai::security::Role::Editor | crate::sekai::security::Role::Admin
+                    crate::chisei::principal::PrincipalRole::Editor
+                        | crate::chisei::principal::PrincipalRole::Admin
                 )
         });
     if granted {
@@ -595,7 +610,7 @@ pub(super) fn require_namespace_write_access(
 /// Enterprise contexts carry no namespace-admin action yet, so they fail
 /// closed here.
 pub(super) fn require_namespace_admin_access(
-    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     context: Option<&crate::enterprise::AuthenticatedContext>,
     namespace: &str,
@@ -609,16 +624,18 @@ pub(super) fn require_namespace_admin_access(
     if matches!(actor, "root" | "local") {
         return Ok(());
     }
-    let boundary = db
+    let denied = "namespace administration denied";
+    let boundary = facts
         .find_namespace_boundary(namespace)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::permission_denied("namespace administration denied"))?;
-    let granted = db
+        .map_err(|error| sekai_fact_status(error, denied))?
+        .ok_or_else(|| Status::permission_denied(denied))?;
+    let granted = facts
         .list_grants(&boundary.id)
-        .map_err(Status::internal)?
+        .map_err(|error| sekai_fact_status(error, denied))?
         .into_iter()
         .any(|grant| {
-            grant.principal == actor && matches!(grant.role, crate::sekai::security::Role::Admin)
+            grant.principal == actor
+                && matches!(grant.role, crate::chisei::principal::PrincipalRole::Admin)
         });
     if granted {
         Ok(())
@@ -627,7 +644,7 @@ pub(super) fn require_namespace_admin_access(
     }
 }
 pub(super) fn require_external_project_access(
-    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     project: &str,
@@ -635,23 +652,25 @@ pub(super) fn require_external_project_access(
     if project == namespace {
         return Ok(());
     }
-    let project_object = db
+    let denied = "external-action project access denied";
+    let project_object = facts
         .find_by_external_id(&format!("project:{project}"))
-        .map_err(Status::internal)?
+        .map_err(|error| sekai_fact_status(error, denied))?
         .filter(|object| object.namespace == namespace)
         .ok_or_else(|| Status::permission_denied("external-action project access denied"))?;
     if matches!(actor, "root" | "local") {
         return Ok(());
     }
-    let granted = db
+    let granted = facts
         .list_grants(&project_object.id)
-        .map_err(Status::internal)?
+        .map_err(|error| sekai_fact_status(error, denied))?
         .into_iter()
         .any(|grant| {
             grant.principal == actor
                 && matches!(
                     grant.role,
-                    crate::sekai::security::Role::Editor | crate::sekai::security::Role::Admin
+                    crate::chisei::principal::PrincipalRole::Editor
+                        | crate::chisei::principal::PrincipalRole::Admin
                 )
         });
     if granted {
@@ -664,15 +683,17 @@ pub(super) fn require_external_project_access(
 }
 pub(super) fn require_team_namespace_access<T>(
     db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     _config: &Config,
     request: &Request<T>,
     namespace: &str,
 ) -> Result<(), Status> {
     let actor = authenticated_actor(request);
-    require_team_namespace_actor_access(db, &actor, namespace)
+    require_team_namespace_actor_access(db, facts, &actor, namespace)
 }
 pub(super) fn require_team_namespace_actor_access(
     db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
@@ -680,9 +701,9 @@ pub(super) fn require_team_namespace_actor_access(
     if trusted_service {
         return Ok(());
     }
-    let boundary = db
+    let boundary = facts
         .find_namespace_boundary(namespace)
-        .map_err(Status::internal)?;
+        .map_err(|error| sekai_fact_status(error, "namespace access denied"))?;
     let team_managed_namespace = boundary.as_ref().is_some_and(|object| {
         object
             .properties
@@ -690,12 +711,12 @@ pub(super) fn require_team_namespace_actor_access(
             .is_some_and(|value| value == "true")
     });
     if team_managed_namespace || db.is_team_principal(actor).map_err(Status::internal)? {
-        require_namespace_access(db, actor, namespace)?;
+        require_namespace_access(facts, actor, namespace)?;
     }
     Ok(())
 }
 pub(super) fn require_execution_namespace_access(
-    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     _config: &Config,
     actor: &str,
     namespace: &str,
@@ -703,11 +724,12 @@ pub(super) fn require_execution_namespace_access(
     if actor == "chisei-gateway" {
         canonical_namespace(namespace).map(|_| ())
     } else {
-        require_namespace_access(db, actor, namespace)
+        require_namespace_access(facts, actor, namespace)
     }
 }
 pub(super) fn require_execution_namespace_access_with_context(
     db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     config: &Config,
     actor: &str,
     context: Option<&crate::enterprise::AuthenticatedContext>,
@@ -740,7 +762,7 @@ pub(super) fn require_execution_namespace_access_with_context(
             )
             .map_err(enterprise_execution_status);
     }
-    require_execution_namespace_access(db, config, actor, namespace)
+    require_execution_namespace_access(facts, config, actor, namespace)
 }
 pub(super) fn enterprise_execution_status(error: crate::enterprise::ExtensionError) -> Status {
     match error {
@@ -798,6 +820,7 @@ pub(super) fn strongest_pressure(
 }
 pub(super) fn execution_context_actor(
     db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
     _config: &Config,
     actor: &str,
     delegated: Option<&str>,
@@ -812,7 +835,7 @@ pub(super) fn execution_context_actor(
         ));
     }
     if db.is_team_principal(delegated).map_err(Status::internal)? {
-        require_namespace_access(db, delegated, namespace)?;
+        require_namespace_access(facts, delegated, namespace)?;
         Ok(delegated.to_string())
     } else {
         Ok(actor.to_string())

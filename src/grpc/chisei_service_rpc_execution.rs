@@ -32,6 +32,7 @@ pub(super) async fn plan_execution(
         }
         require_execution_namespace_access_with_context(
             service.db.runtime(),
+            service.sekai_facts.reader(),
             &service.config,
             &actor,
             context.as_ref(),
@@ -177,6 +178,7 @@ pub(super) async fn plan_content_execution(
         }
         require_execution_namespace_access_with_context(
             service.db.runtime(),
+            service.sekai_facts.reader(),
             &service.config,
             &actor,
             context.as_ref(),
@@ -275,6 +277,7 @@ pub(super) async fn list_kioku_candidates(
 ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
     require_team_namespace_access(
         service.db.runtime(),
+        service.sekai_facts.reader(),
         &service.config,
         &req,
         &req.get_ref().namespace,
@@ -485,7 +488,7 @@ pub(super) async fn get_sample_observation(
         return Err(Status::invalid_argument("namespace required"));
     }
     if !matches!(actor.as_str(), "root" | "local") {
-        require_namespace_access(service.db.runtime(), &actor, namespace.trim())?;
+        require_namespace_access(service.sekai_facts.reader(), &actor, namespace.trim())?;
     }
     let observation = service
         .db
@@ -718,7 +721,7 @@ pub(super) async fn get_quality_trend(
     let actor = authenticated_actor(&req);
     let request = req.into_inner();
     let namespace = canonical_namespace(&request.namespace)?.to_string();
-    require_namespace_access(service.db.runtime(), &actor, &namespace)?;
+    require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
     let report = crate::quality_trend::query_quality_trends(
         service.db.runtime(),
         &actor,
@@ -745,7 +748,11 @@ pub(super) async fn put_evaluator_definition(
             .get_evaluator_definition(&request.definition_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
-        require_namespace_write_access(service.db.runtime(), &actor, &definition.namespace)?;
+        require_namespace_write_access(
+            service.sekai_facts.reader(),
+            &actor,
+            &definition.namespace,
+        )?;
         let availability = service
             .db
             .runtime()
@@ -777,7 +784,7 @@ pub(super) async fn put_evaluator_definition(
         ));
     }
     let definition = from_proto_evaluator_definition(request.definition.unwrap())?;
-    require_namespace_write_access(service.db.runtime(), &actor, &definition.namespace)?;
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &definition.namespace)?;
     let definition = service
         .db
         .runtime()
@@ -806,7 +813,7 @@ pub(super) async fn put_evaluation_plan(
             .plan
             .ok_or_else(|| Status::invalid_argument("evaluation plan required"))?,
     );
-    require_namespace_write_access(service.db.runtime(), &actor, &plan.namespace)?;
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &plan.namespace)?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let plan = evaluation_plan_domain::prepare_plan(plan, &actor, now_ms)
         .map_err(map_evaluation_resource_error)?;
@@ -870,6 +877,7 @@ pub(super) async fn resolve_evaluation_plan(
     }
     let outcome = evaluation_manifest_resolution::EvaluationManifestResolutionLifecycle::new(
         service.db.clone(),
+        service.sekai_facts.clone(),
     )
     .resolve(&prepared)?;
     Ok(Response::new(to_proto_evaluation_resolution(&outcome)))
@@ -1006,7 +1014,7 @@ pub(super) async fn run_lookup_first_promotion_gate(
         )));
     }
     let namespace = canonical_namespace(&request.namespace)?;
-    require_namespace_access(service.db.runtime(), &actor, namespace)?;
+    require_namespace_access(service.sekai_facts.reader(), &actor, namespace)?;
     if request.suite_json.len() > lookup_first::LOOKUP_FIRST_GATE_MAX_SUITE_BYTES {
         return Err(Status::resource_exhausted(format!(
             "lookup promotion suite exceeds {} bytes",
@@ -1021,7 +1029,7 @@ pub(super) async fn run_lookup_first_promotion_gate(
         ));
     }
     for case in &suite.cases {
-        require_namespace_access(service.db.runtime(), &case.actor, namespace)?;
+        require_namespace_access(service.sekai_facts.reader(), &case.actor, namespace)?;
     }
 
     let mut report = lookup_first::run_lookup_promotion_gate(&suite, service.sekai_facts.reader())
@@ -1069,7 +1077,7 @@ pub(super) async fn execute_evaluation_manifest(
                 .ok_or_else(|| Status::invalid_argument("evaluation execution required"))?,
         ))
         .map_err(map_evaluation_resource_error)?;
-    require_namespace_write_access(service.db.runtime(), &actor, &request.namespace)?;
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let manifest = service
         .db
         .runtime()
@@ -1101,7 +1109,7 @@ pub(super) async fn cancel_evaluation_execution(
         },
     )
     .map_err(map_evaluation_resource_error)?;
-    require_namespace_write_access(service.db.runtime(), &actor, &validated.namespace)?;
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &validated.namespace)?;
     let manifest = service
         .db
         .runtime()
@@ -1140,6 +1148,7 @@ pub(super) async fn list_routing_profiles(
     }
     require_execution_namespace_access_with_context(
         service.db.runtime(),
+        service.sekai_facts.reader(),
         &service.config,
         &actor,
         context.as_ref(),
@@ -1226,7 +1235,7 @@ pub(super) async fn put_routing_profile(
     let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();
     require_namespace_admin_access(
-        service.db.runtime(),
+        service.sekai_facts.reader(),
         &actor,
         context.as_ref(),
         &request.namespace,
@@ -1271,7 +1280,7 @@ pub(super) async fn revoke_routing_profile(
     let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();
     require_namespace_admin_access(
-        service.db.runtime(),
+        service.sekai_facts.reader(),
         &actor,
         context.as_ref(),
         &request.namespace,
@@ -1314,6 +1323,7 @@ fn planning_registry(
     }
     require_execution_namespace_access_with_context(
         service.db.runtime(),
+        service.sekai_facts.reader(),
         &service.config,
         actor,
         context,

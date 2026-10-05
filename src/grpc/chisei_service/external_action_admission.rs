@@ -20,7 +20,11 @@ impl ChiseiServiceImpl {
         if actor != authorization.request.actor && !matches!(actor, "root" | "local") {
             return Err(Status::permission_denied("permit issuance denied"));
         }
-        require_namespace_write_access(self.db.runtime(), actor, &authorization.request.namespace)?;
+        require_namespace_write_access(
+            self.sekai_facts.reader(),
+            actor,
+            &authorization.request.namespace,
+        )?;
         if let Some(value) = self
             .db
             .runtime()
@@ -143,9 +147,9 @@ impl ChiseiServiceImpl {
                 "external-action actor must match authenticated principal",
             ));
         }
-        require_namespace_write_access(self.db.runtime(), &actor, &request.namespace)?;
+        require_namespace_write_access(self.sekai_facts.reader(), &actor, &request.namespace)?;
         require_external_project_access(
-            self.db.runtime(),
+            self.sekai_facts.reader(),
             &actor,
             &request.namespace,
             &request.policy_project,
@@ -317,13 +321,13 @@ impl ChiseiServiceImpl {
                     )
                     .map_err(Status::internal)?;
                 let access_revoked = require_namespace_write_access(
-                    self.db.runtime(),
+                    self.sekai_facts.reader(),
                     &record.request.actor,
                     &record.request.namespace,
                 )
                 .and_then(|_| {
                     require_external_project_access(
-                        self.db.runtime(),
+                        self.sekai_facts.reader(),
                         &record.request.actor,
                         &record.request.namespace,
                         &record.request.policy_project,
@@ -449,7 +453,11 @@ impl ChiseiServiceImpl {
                         "delegation requires the current permit subject",
                     ));
                 }
-                require_namespace_write_access(self.db.runtime(), &actor, &parent.namespace)?;
+                require_namespace_write_access(
+                    self.sekai_facts.reader(),
+                    &actor,
+                    &parent.namespace,
+                )?;
                 let key = permit_signing_key(&self.config)?;
                 parent
                     .verify_trust(&self.config.permit_issuer, &self.config.permit_key_id)
