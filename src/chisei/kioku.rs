@@ -1,16 +1,38 @@
 //! Governed institutional memory derived from verifiable operation outcomes.
 
+use crate::chisei::principal::{PrincipalContext, PrincipalGrant, PrincipalRole};
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
 #[cfg(test)]
 use crate::db::store::ChiseiStore;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
-use crate::sekai::security::Role;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const KIOKU_MEMORY_VERSION: &str = "kioku.memory/v1";
+
+/// Memory classification an actor may retrieve in a namespace, from the
+/// namespace grants as Chisei sees them. A namespace with no grants is public;
+/// otherwise the actor's first grant sets the ceiling and an actor without one
+/// is denied. Privileged subjects are handled by the caller before the
+/// namespace lookup.
+pub fn namespace_classification_ceiling(
+    principal: &PrincipalContext,
+    namespace_grants: &[PrincipalGrant],
+) -> Result<EvidenceClassification, String> {
+    if namespace_grants.is_empty() {
+        return Ok(EvidenceClassification::Public);
+    }
+    let role = principal
+        .role_in(namespace_grants)
+        .ok_or_else(|| "actor is not authorized for memory namespace".to_string())?;
+    Ok(match role {
+        PrincipalRole::Viewer => EvidenceClassification::Internal,
+        PrincipalRole::Editor => EvidenceClassification::Confidential,
+        PrincipalRole::Admin => EvidenceClassification::Restricted,
+    })
+}
 
 pub fn memory_claim_digest(memory: &KiokuMemory) -> String {
     let mut digest = Sha256::new();
@@ -1779,12 +1801,15 @@ impl SekaiDb {
         if request.classification_ceiling > authorized_ceiling {
             return Err("requested memory classification exceeds actor grant".into());
         }
+        let principal = PrincipalContext::from_credential(actor);
         for object_id in &request.context_object_ids {
             if self.get_object(object_id)?.is_none() {
                 return Err(format!("context object {object_id} not found"));
             }
-            let grants = self.list_grants(object_id)?;
-            if !grants.is_empty() && !grants.iter().any(|grant| grant.principal == actor) {
+            // No privileged bypass here: context objects must be unrestricted
+            // or granted to the actor.
+            let grants = self.list_principal_grants(object_id)?;
+            if !grants.is_empty() && !principal.holds_grant(&grants) {
                 return Err(format!(
                     "actor is not authorized for context object {object_id}"
                 ));
@@ -1798,28 +1823,17 @@ impl SekaiDb {
         namespace: &str,
         actor: &str,
     ) -> Result<EvidenceClassification, String> {
-        if matches!(actor, "root" | "local") {
+        let principal = PrincipalContext::from_credential(actor);
+        if principal.is_privileged() {
             return Ok(EvidenceClassification::Restricted);
         }
         let namespace_object = self
             .find_by_external_id(&format!("namespace:{namespace}"))?
             .ok_or_else(|| "memory namespace is not an authorized graph scope".to_string())?;
-        let grants = self.list_grants(&namespace_object.id)?;
-        let authorized_ceiling = if grants.is_empty() {
-            EvidenceClassification::Public
-        } else {
-            let role = grants
-                .iter()
-                .find(|grant| grant.principal == actor)
-                .map(|grant| &grant.role)
-                .ok_or_else(|| "actor is not authorized for memory namespace".to_string())?;
-            match role {
-                Role::Viewer => EvidenceClassification::Internal,
-                Role::Editor => EvidenceClassification::Confidential,
-                Role::Admin => EvidenceClassification::Restricted,
-            }
-        };
-        Ok(authorized_ceiling)
+        namespace_classification_ceiling(
+            &principal,
+            &self.list_principal_grants(&namespace_object.id)?,
+        )
     }
 
     pub fn authorize_kioku_evidence(
@@ -1864,11 +1878,8 @@ impl SekaiDb {
         if let Some(object_id) =
             self.get_evidence_projection_object_id(&request.source_submission_id)?
         {
-            let grants = self.list_grants(&object_id)?;
-            if !grants.is_empty()
-                && !matches!(request.actor.as_str(), "root" | "local")
-                && !grants.iter().any(|grant| grant.principal == request.actor)
-            {
+            let grants = self.list_principal_grants(&object_id)?;
+            if !PrincipalContext::from_credential(&request.actor).may_read(&grants) {
                 return Err("actor is not authorized to read evidence projection".into());
             }
         } else {
@@ -2704,8 +2715,38 @@ mod tests {
     };
     use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore};
     use crate::domain::Object;
-    use crate::sekai::security::Grant;
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn namespace_ceiling_follows_the_first_matching_grant_and_denies_non_members() {
+        let alice = PrincipalContext::from_credential("alice");
+        assert_eq!(
+            namespace_classification_ceiling(&alice, &[]).unwrap(),
+            EvidenceClassification::Public
+        );
+        for (role, ceiling) in [
+            (PrincipalRole::Viewer, EvidenceClassification::Internal),
+            (PrincipalRole::Editor, EvidenceClassification::Confidential),
+            (PrincipalRole::Admin, EvidenceClassification::Restricted),
+        ] {
+            let grants = [
+                PrincipalGrant::new("bob", PrincipalRole::Admin),
+                PrincipalGrant::new("alice", role),
+                PrincipalGrant::new("alice", PrincipalRole::Admin),
+            ];
+            assert_eq!(
+                namespace_classification_ceiling(&alice, &grants).unwrap(),
+                ceiling
+            );
+        }
+        assert!(
+            namespace_classification_ceiling(
+                &alice,
+                &[PrincipalGrant::new("bob", PrincipalRole::Viewer)]
+            )
+            .is_err()
+        );
+    }
 
     fn candidate() -> KiokuMemory {
         KiokuMemory {
@@ -3109,13 +3150,12 @@ mod tests {
             })
             .unwrap();
         db.runtime()
-            .create_grant(&Grant {
-                id: "grant-payments".into(),
-                object_id: "namespace-payments".into(),
-                principal: "reviewer".into(),
-                role: Role::Admin,
-                created: 1,
-            })
+            .create_principal_grant(
+                "grant-payments",
+                "namespace-payments",
+                &PrincipalGrant::new("reviewer", PrincipalRole::Admin),
+                1,
+            )
             .unwrap();
         active_memory(
             &db,
@@ -3182,13 +3222,12 @@ mod tests {
         let denied_replay = db.reassess_kioku_memory(request.clone()).unwrap_err();
         assert!(denied_replay.contains("classification"));
         db.runtime()
-            .create_grant(&Grant {
-                id: "grant-payments-restored".into(),
-                object_id: "namespace-payments".into(),
-                principal: "reviewer".into(),
-                role: Role::Admin,
-                created: 151,
-            })
+            .create_principal_grant(
+                "grant-payments-restored",
+                "namespace-payments",
+                &PrincipalGrant::new("reviewer", PrincipalRole::Admin),
+                151,
+            )
             .unwrap();
 
         let mut conflict = KiokuEvidenceReassessmentRequest {
@@ -3520,30 +3559,19 @@ mod tests {
         ] {
             db.runtime().create_object(&object).unwrap();
         }
-        for grant in [
-            Grant {
-                id: "grant-payments".into(),
-                object_id: "namespace-payments".into(),
-                principal: "agent:planner".into(),
-                role: Role::Viewer,
-                created: 1,
-            },
-            Grant {
-                id: "grant-other".into(),
-                object_id: "namespace-other".into(),
-                principal: "agent:other".into(),
-                role: Role::Viewer,
-                created: 1,
-            },
-            Grant {
-                id: "grant-component".into(),
-                object_id: "component:migrations".into(),
-                principal: "agent:planner".into(),
-                role: Role::Viewer,
-                created: 1,
-            },
+        for (grant_id, object_id, principal) in [
+            ("grant-payments", "namespace-payments", "agent:planner"),
+            ("grant-other", "namespace-other", "agent:other"),
+            ("grant-component", "component:migrations", "agent:planner"),
         ] {
-            db.runtime().create_grant(&grant).unwrap();
+            db.runtime()
+                .create_principal_grant(
+                    grant_id,
+                    object_id,
+                    &PrincipalGrant::new(principal, PrincipalRole::Viewer),
+                    1,
+                )
+                .unwrap();
         }
         active_memory(
             &db,

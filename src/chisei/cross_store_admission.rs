@@ -412,7 +412,6 @@ mod tests {
     use super::*;
     use crate::chisei::budget::PeriodType;
     use crate::sekai::governed_action_type::{EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType};
-    use crate::sekai::object_security::PrincipalPolicyContext;
     use tempfile::tempdir;
 
     fn dest_pair() -> (SekaiStore, ChiseiStore) {
@@ -455,7 +454,7 @@ mod tests {
             request_id: operation_id.into(),
             ontology_digest: String::new(),
             autonomous_envelope_id: String::new(),
-            policy_context: PrincipalPolicyContext::default(),
+            policy_context: Default::default(),
             budget_already_reserved: false,
         }
     }

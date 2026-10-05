@@ -11,6 +11,7 @@ use tokio::runtime::{Handle, Runtime};
 use tonic::transport::Channel;
 
 use crate::chisei::cross_store_admission::{SekaiCommitLookup, SekaiCommitRef};
+use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, Object};
@@ -20,7 +21,6 @@ use crate::grpc::pb::sekai::{
     ListSchemaTypesRequest,
 };
 use crate::sekai::schema::ObjectType;
-use crate::sekai::security::Grant;
 
 /// Lazily connected, credential-carrying channel to a Sekai process.
 struct SekaiHop {
@@ -160,7 +160,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
         }
     }
 
-    fn list_grants(&self, object_id: &str) -> Result<Vec<Grant>, SekaiFactError> {
+    fn list_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError> {
         let object_id = object_id.to_string();
         self.call(async move |mut client, credential| {
             let request = authorized(ListGrantsRequest { object_id }, credential)?;
@@ -174,6 +174,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
                 .iter()
                 .map(|grant| {
                     crate::grpc::sekai_service::from_proto_grant(grant)
+                        .map(|grant| PrincipalGrant::from(&grant))
                         .map_err(|status| format!("sekai hop list_grants: {status}"))
                 })
                 .collect()
@@ -228,6 +229,19 @@ impl SekaiFactReader for RemoteSekaiFactReader {
                 .map(crate::grpc::sekai_service::from_proto_obj)
                 .collect())
         })
+    }
+
+    fn marking_clearance(
+        &self,
+        _: &str,
+        _: &Object,
+        _: &str,
+    ) -> Result<MarkingClearance, SekaiFactError> {
+        // The hop exposes no marking evaluation for another principal; refuse
+        // so callers deny instead of treating the object as unmarked.
+        Err(SekaiFactError::Unsupported(
+            "marking clearance over the Sekai hop",
+        ))
     }
 
     fn in_process_store(&self) -> Result<&SekaiStore, SekaiFactError> {
@@ -308,6 +322,7 @@ async fn lookup_on_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::principal::PrincipalRole;
 
     #[test]
     fn lookup_outside_runtime_reports_connect_error() {
@@ -360,12 +375,7 @@ mod tests {
         crate::chisei::lookup_first::seed_s1_fixture_graph(&sekai).unwrap();
         sekai
             .runtime()
-            .ensure_team_namespace(
-                "acme",
-                "alice",
-                crate::sekai::security::Role::Viewer,
-                "local",
-            )
+            .ensure_team_namespace("acme", "alice", PrincipalRole::Viewer.into(), "local")
             .unwrap();
         sekai
             .runtime()
