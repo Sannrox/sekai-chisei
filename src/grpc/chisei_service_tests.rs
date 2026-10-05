@@ -3627,13 +3627,16 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cancellation_is_durable_and_reduces_fail_closed() {
     let svc = Arc::new(evaluation_execution_service(250));
-    let cancellation_replica = Arc::new(ChiseiServiceImpl::new_with_evaluator_registry(
-        svc.db.clone(),
-        svc.config.clone(),
-        svc.evaluation_execution_lifecycle
-            .evaluator_registry()
-            .clone(),
-    ));
+    let cancellation_replica = Arc::new(
+        ChiseiServiceImpl::new_with_evaluator_registry(
+            svc.db.clone(),
+            svc.config.clone(),
+            svc.evaluation_execution_lifecycle
+                .evaluator_registry()
+                .clone(),
+        )
+        .with_sekai_facts(svc.sekai_facts.clone()),
+    );
     let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
     let execute_request = ExecuteEvaluationManifestRequest {
         execution: Some(EvaluationExecutionRequest {
