@@ -25,6 +25,7 @@ pub(super) async fn evaluate_governed_subject(
     };
     let result = governed_subject_lifecycle::GovernedSubjectLifecycle::new(
         service.db.clone(),
+        service.sekai_facts.clone(),
         service.config.clone(),
     )
     .evaluate(&actor, envelope, chrono::Utc::now().timestamp_millis())?;
@@ -41,6 +42,7 @@ pub(super) async fn export_governed_subject_provenance(
     let now_ms = chrono::Utc::now().timestamp_millis();
     let outcome = governed_subject_lifecycle::GovernedSubjectLifecycle::new(
         service.db.clone(),
+        service.sekai_facts.clone(),
         service.config.clone(),
     )
     .export_provenance(
@@ -385,7 +387,7 @@ pub(super) async fn get_effective_policy_summary(
 ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
     let actor = required_authenticated_actor(&req)?;
     let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
-    require_namespace_access(service.db.runtime(), &actor, &namespace)?;
+    require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
 
     let routing = service.policy.effective_policy(&namespace).map_or_else(
         || EffectiveRoutingSummary {

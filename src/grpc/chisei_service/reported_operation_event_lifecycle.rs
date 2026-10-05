@@ -506,7 +506,8 @@ async fn report_operation_event(
         && complete_kioku_outcome
         && trusted_outcome_reporter;
     let namespace_writer =
-        require_namespace_write_access(service.db.runtime(), &actor, &receipt.namespace).is_ok();
+        require_namespace_write_access(service.sekai_facts.reader(), &actor, &receipt.namespace)
+            .is_ok();
     if actor != receipt.initiating_actor
         && actor != "root"
         && !namespace_writer

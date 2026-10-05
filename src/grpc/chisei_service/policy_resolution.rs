@@ -33,7 +33,12 @@ impl ChiseiServiceImpl {
         } else {
             r.namespace.trim()
         };
-        require_team_namespace_actor_access(self.db.runtime(), actor, requested_namespace)?;
+        require_team_namespace_actor_access(
+            self.db.runtime(),
+            self.sekai_facts.reader(),
+            actor,
+            requested_namespace,
+        )?;
         let registry = self.refresh_provider_registry_for_resolution().await?;
         crate::provider_profile::with_provider_registry_snapshot(registry, async {
         let capability_requirements = if r.capability_requirements_json.is_empty() {

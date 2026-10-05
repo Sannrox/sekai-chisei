@@ -133,6 +133,7 @@ impl ChiseiServiceImpl {
             .ok_or(Status::invalid_argument("plan input required"))?;
         require_execution_namespace_access_with_context(
             self.db.runtime(),
+            self.sekai_facts.reader(),
             &self.config,
             &actor,
             context.as_ref(),

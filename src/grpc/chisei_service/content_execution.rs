@@ -262,6 +262,7 @@ impl ChiseiServiceImpl {
             .ok_or_else(|| Status::data_loss("content execution input missing"))?;
         require_execution_namespace_access_with_context(
             self.db.runtime(),
+            self.sekai_facts.reader(),
             &self.config,
             &actor,
             context.as_ref(),

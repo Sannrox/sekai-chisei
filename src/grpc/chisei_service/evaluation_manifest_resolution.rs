@@ -909,11 +909,18 @@ fn resolve_evaluation_manifest_live(
 
 pub(super) struct EvaluationManifestResolutionLifecycle {
     db: crate::db::store::ChiseiStore,
+    sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
 }
 
 impl EvaluationManifestResolutionLifecycle {
-    pub(super) fn new(db: impl Into<crate::db::store::ChiseiStore>) -> Self {
-        Self { db: db.into() }
+    pub(super) fn new(
+        db: impl Into<crate::db::store::ChiseiStore>,
+        sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
+    ) -> Self {
+        Self {
+            db: db.into(),
+            sekai_facts,
+        }
     }
 
     pub(super) fn resolve(
@@ -923,7 +930,7 @@ impl EvaluationManifestResolutionLifecycle {
         let (mut outcome, stored) = self.db.runtime().with_evaluation_resolution_snapshot(
             || {
                 require_namespace_write_access(
-                    self.db.runtime(),
+                    self.sekai_facts.reader(),
                     &prepared.actor,
                     &prepared.request.namespace,
                 )?;

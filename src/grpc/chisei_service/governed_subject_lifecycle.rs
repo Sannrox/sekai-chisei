@@ -9,13 +9,19 @@ pub(super) struct ProvenanceExportOutcome {
 
 pub(super) struct GovernedSubjectLifecycle {
     db: crate::db::store::ChiseiStore,
+    sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
     config: Config,
 }
 
 impl GovernedSubjectLifecycle {
-    pub(super) fn new(db: impl Into<crate::db::store::ChiseiStore>, config: Config) -> Self {
+    pub(super) fn new(
+        db: impl Into<crate::db::store::ChiseiStore>,
+        sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
+        config: Config,
+    ) -> Self {
         Self {
             db: db.into(),
+            sekai_facts,
             config,
         }
     }
@@ -26,7 +32,7 @@ impl GovernedSubjectLifecycle {
         envelope: subject::GovernedSubjectEnvelope,
         now_ms: i64,
     ) -> Result<subject::GovernedSubjectResult, Status> {
-        require_namespace_write_access(self.db.runtime(), actor, &envelope.namespace)?;
+        require_namespace_write_access(self.sekai_facts.reader(), actor, &envelope.namespace)?;
         let fresh = subject::validate_envelope(&envelope, actor, now_ms)
             .map_err(Status::invalid_argument)?;
         if !matches!(actor, "root" | "local") {
@@ -95,7 +101,11 @@ impl GovernedSubjectLifecycle {
                     "export_id is already bound to different governed-subject evidence",
                 ));
             }
-            require_namespace_access(self.db.runtime(), &binding.actor, &existing.namespace)?;
+            require_namespace_access(
+                self.sekai_facts.reader(),
+                &binding.actor,
+                &existing.namespace,
+            )?;
             validate_export_record(&existing, now_ms)?;
             return Ok(ProvenanceExportOutcome {
                 record: existing,
@@ -109,7 +119,11 @@ impl GovernedSubjectLifecycle {
             .get_operation_receipt(&binding.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
-        require_namespace_write_access(self.db.runtime(), &binding.actor, &receipt.namespace)?;
+        require_namespace_write_access(
+            self.sekai_facts.reader(),
+            &binding.actor,
+            &receipt.namespace,
+        )?;
         let (namespace, content_digest) = reconcile_receipt(&receipt, &binding, now_ms)?;
         let key_hex = self
             .config

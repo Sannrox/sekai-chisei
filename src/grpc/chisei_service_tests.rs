@@ -2300,11 +2300,10 @@ fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
             Arc::new(SchemaFixtureEvaluator { delay_ms }),
         )
         .unwrap();
-    ChiseiServiceImpl::new_with_evaluator_registry(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
-        config(":memory:"),
-        registry,
-    )
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    ChiseiServiceImpl::new_with_evaluator_registry(chisei, config(":memory:"), registry)
+        .with_sekai_facts(facts)
 }
 
 fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
@@ -5192,7 +5191,7 @@ async fn gunshi_scorecards_require_namespace_membership() {
     )
     .unwrap();
     assert_eq!(scorecard.comparisons, 0);
-    assert!(require_namespace_write_access(svc.db.runtime(), "alice", "acme").is_err());
+    assert!(require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme").is_err());
     svc.db
         .runtime()
         .ensure_team_namespace(
@@ -5202,7 +5201,7 @@ async fn gunshi_scorecards_require_namespace_membership() {
             "local",
         )
         .unwrap();
-    require_namespace_write_access(svc.db.runtime(), "alice", "acme").unwrap();
+    require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme").unwrap();
 }
 
 #[tokio::test]
@@ -5262,30 +5261,35 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
         })
         .unwrap();
 
-    require_namespace_access(svc.db.runtime(), "alice", "acme").unwrap();
+    require_namespace_access(svc.sekai_facts.reader(), "alice", "acme").unwrap();
     assert_eq!(
-        require_namespace_access(svc.db.runtime(), "alice", " acme ")
+        require_namespace_access(svc.sekai_facts.reader(), "alice", " acme ")
             .unwrap_err()
             .code(),
         tonic::Code::InvalidArgument
     );
     assert_eq!(
-        require_namespace_access(svc.db.runtime(), "mallory", "acme")
+        require_namespace_access(svc.sekai_facts.reader(), "mallory", "acme")
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
     );
     require_execution_namespace_access(
-        svc.db.runtime(),
+        svc.sekai_facts.reader(),
         &svc.config,
         "chisei-gateway",
         "unmanaged",
     )
     .unwrap();
     assert_eq!(
-        require_execution_namespace_access(svc.db.runtime(), &svc.config, "alice", "unmanaged")
-            .unwrap_err()
-            .code(),
+        require_execution_namespace_access(
+            svc.sekai_facts.reader(),
+            &svc.config,
+            "alice",
+            "unmanaged"
+        )
+        .unwrap_err()
+        .code(),
         tonic::Code::PermissionDenied
     );
     assert_eq!(
@@ -7227,6 +7231,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
     assert_eq!(
         execution_context_actor(
             svc.db.runtime(),
+            svc.sekai_facts.reader(),
             &svc.config,
             "Gateway-Prod",
             Some("alice"),
@@ -7239,6 +7244,7 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
     assert_eq!(
         execution_context_actor(
             svc.db.runtime(),
+            svc.sekai_facts.reader(),
             &svc.config,
             "local",
             Some("alice"),
@@ -7248,8 +7254,15 @@ async fn internal_gateway_pipeline_honors_delegated_membership() {
         "alice"
     );
     assert_eq!(
-        execution_context_actor(svc.db.runtime(), &svc.config, "root", Some("alice"), "acme",)
-            .unwrap(),
+        execution_context_actor(
+            svc.db.runtime(),
+            svc.sekai_facts.reader(),
+            &svc.config,
+            "root",
+            Some("alice"),
+            "acme",
+        )
+        .unwrap(),
         "alice"
     );
     let response = svc
@@ -10005,10 +10018,9 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
     config.routing_endpoint_allowlist =
         crate::chisei::routing_profiles::endpoint_allowlist_from("https://models.example.com");
     config.routing_credential_refs = vec!["ACME".into()];
-    let service = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
-        config.clone(),
-    );
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    let service = ChiseiServiceImpl::new(chisei, config.clone()).with_sekai_facts(facts);
     for (id, namespace, principal, role) in [
         ("support", "support", "alice", Role::Admin),
         ("support", "support", "bob", Role::Editor),
@@ -11046,4 +11058,76 @@ fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
         ),
         other => panic!("expected sekai_not_attached, got {other:?}"),
     }
+}
+
+/// Split stores: the namespace boundary and grants live only in the Sekai
+/// store, so Chisei authorization must read them through the Sekai fact port
+/// (#1269).
+fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
+    let sekai_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let chisei_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut service = ChiseiServiceImpl::new(
+        crate::db::store::ChiseiStore::from_shared_runtime(chisei_db),
+        config(":memory:"),
+    );
+    if attach_sekai {
+        service = service.with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+            crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
+        ));
+    }
+    sekai_db
+        .ensure_team_namespace(
+            "acme",
+            "alice",
+            crate::sekai::security::Role::Editor,
+            "local",
+        )
+        .unwrap();
+    (service, sekai_db)
+}
+
+#[test]
+fn split_store_namespace_authorization_reads_sekai_grants() {
+    let (svc, _sekai) = split_store_service(true);
+    assert!(
+        svc.db
+            .runtime()
+            .find_namespace_boundary("acme")
+            .unwrap()
+            .is_none()
+    );
+    require_namespace_access(svc.sekai_facts.reader(), "alice", "acme").unwrap();
+    require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme").unwrap();
+    for denied in [
+        require_namespace_access(svc.sekai_facts.reader(), "mallory", "acme"),
+        require_namespace_write_access(svc.sekai_facts.reader(), "mallory", "acme"),
+    ] {
+        assert_eq!(denied.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+}
+
+#[test]
+fn namespace_authorization_without_sekai_denies_with_an_explicit_reason() {
+    let (svc, _sekai) = split_store_service(false);
+    for denied in [
+        require_namespace_access(svc.sekai_facts.reader(), "alice", "acme"),
+        require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme"),
+        require_namespace_admin_access(svc.sekai_facts.reader(), "alice", None, "acme"),
+    ] {
+        let status = denied.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert!(
+            status
+                .message()
+                .ends_with(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED),
+            "{}",
+            status.message()
+        );
+    }
+    // Trusted local principals never depend on Sekai grants.
+    require_namespace_access(svc.sekai_facts.reader(), "local", "acme").unwrap();
 }

@@ -32,9 +32,12 @@ impl ChiseiServiceImpl {
                 ..Default::default()
             });
         }
-        if let Err(status) =
-            require_execution_namespace_access(self.db.runtime(), &self.config, &actor, namespace)
-        {
+        if let Err(status) = require_execution_namespace_access(
+            self.sekai_facts.reader(),
+            &self.config,
+            &actor,
+            namespace,
+        ) {
             let reason = if status.code() == tonic::Code::PermissionDenied {
                 GatewayDecideDenyReason::Unauthorized
             } else {
@@ -427,6 +430,7 @@ impl ChiseiServiceImpl {
     ) -> Result<GatewayPipelineDecision, Status> {
         let context_actor = execution_context_actor(
             self.db.runtime(),
+            self.sekai_facts.reader(),
             &self.config,
             input.actor,
             input.delegated_principal,
