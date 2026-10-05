@@ -14,10 +14,23 @@ pub(super) fn in_process_facts_runtime(
     facts
         .in_process_store()
         .map(|store| store.runtime())
-        .map_err(|error| match error {
-            crate::chisei::sekai_facts::SekaiFactError::Read(message) => Status::internal(message),
-            _ => Status::failed_precondition("governed invariant reference unavailable"),
-        })
+        .map_err(map_in_process_facts_error)
+}
+
+pub(super) fn in_process_facts_runtime_arc(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+) -> Result<Arc<RuntimeDb>, Status> {
+    facts
+        .in_process_store()
+        .map(|store| store.runtime_arc())
+        .map_err(map_in_process_facts_error)
+}
+
+fn map_in_process_facts_error(error: crate::chisei::sekai_facts::SekaiFactError) -> Status {
+    match error {
+        crate::chisei::sekai_facts::SekaiFactError::Read(message) => Status::internal(message),
+        _ => Status::failed_precondition("governed invariant reference unavailable"),
+    }
 }
 
 fn principal_authority(

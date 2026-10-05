@@ -1084,9 +1084,11 @@ pub(super) async fn execute_evaluation_manifest(
         .map_err(Status::internal)?
         .filter(|manifest| manifest.namespace == request.namespace)
         .ok_or_else(|| Status::not_found("evaluation manifest not found"))?;
+    let facts =
+        evaluation_manifest_resolution::in_process_facts_runtime_arc(service.sekai_facts.reader())?;
     let projection = service
         .evaluation_execution_lifecycle
-        .execute(&manifest, &actor, request.max_total_duration_ms)
+        .execute(&manifest, &actor, request.max_total_duration_ms, facts)
         .await?;
     Ok(Response::new(ExecuteEvaluationManifestResponse {
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
@@ -1123,9 +1125,11 @@ pub(super) async fn cancel_evaluation_execution(
         .map_err(Status::internal)?
         .filter(|index| index.namespace == validated.namespace)
         .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
+    let facts =
+        evaluation_manifest_resolution::in_process_facts_runtime_arc(service.sekai_facts.reader())?;
     let projection = service
         .evaluation_execution_lifecycle
-        .cancel(&manifest, &index, &actor)
+        .cancel(&manifest, &index, &actor, facts)
         .await?;
     Ok(Response::new(CancelEvaluationExecutionResponse {
         execution: Some(to_proto_evaluation_execution_projection(&projection)),

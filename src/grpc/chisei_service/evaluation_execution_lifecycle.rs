@@ -56,6 +56,7 @@ impl EvaluationExecutionLifecycle {
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
         actor: &str,
         max_total_duration_ms: u64,
+        facts: Arc<RuntimeDb>,
     ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
         for node in &manifest.nodes {
             if let Some(definition) = self
@@ -90,6 +91,7 @@ impl EvaluationExecutionLifecycle {
                 frozen_total_duration_ms,
                 cancelled,
                 self.stochastic_egress_reasons(manifest),
+                facts,
             )
             .await?;
         self.cleanup_terminal(manifest, &execution_lock, &projection)?;
@@ -101,6 +103,7 @@ impl EvaluationExecutionLifecycle {
         manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
         index: &evaluation_execution_domain::EvaluationExecutionIndex,
         actor: &str,
+        facts: Arc<RuntimeDb>,
     ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
         let cancelled = self.cancellation_for(&manifest.manifest_digest)?;
         cancelled.store(true, Ordering::Release);
@@ -123,6 +126,7 @@ impl EvaluationExecutionLifecycle {
                 max_total_duration_ms,
                 cancelled,
                 BTreeMap::new(),
+                facts,
             )
             .await?;
         self.cleanup_terminal(manifest, &execution_lock, &projection)?;
@@ -319,6 +323,7 @@ impl EvaluationExecutionLifecycle {
         max_total_duration_ms: u64,
         cancelled: Arc<AtomicBool>,
         stochastic_egress_reasons: BTreeMap<String, String>,
+        facts: Arc<RuntimeDb>,
     ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
         let db = self.db.clone();
         let budget = self.budget.clone();
@@ -333,6 +338,7 @@ impl EvaluationExecutionLifecycle {
             );
             run_evaluation_execution(
                 db.runtime(),
+                facts.as_ref(),
                 &engine,
                 &manifest,
                 &index,
@@ -436,7 +442,7 @@ fn get_evaluation_projection(
 }
 
 fn load_evaluation_node_evidence(
-    db: &RuntimeDb,
+    facts: &RuntimeDb,
     manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
     node: &evaluation_manifest_domain::ResolvedEvaluationNode,
 ) -> Result<Vec<evaluation_execution_domain::EvaluationEvidenceInput>, String> {
@@ -450,7 +456,7 @@ fn load_evaluation_node_evidence(
         let binding = by_object
             .get(object_id.as_str())
             .ok_or_else(|| "manifest node evidence binding is missing".to_string())?;
-        let submission = db
+        let submission = facts
             .get_evidence_submission(&binding.submission_id)?
             .ok_or_else(|| evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string())?;
         let envelope = submission
@@ -513,6 +519,7 @@ fn unavailable_evaluation_node_evidence(
 
 fn run_evaluation_execution(
     db: &RuntimeDb,
+    facts: &RuntimeDb,
     engine: &evaluation_execution_domain::EvaluationExecutionEngine<'_>,
     manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
     index: &evaluation_execution_domain::EvaluationExecutionIndex,
@@ -557,7 +564,7 @@ fn run_evaluation_execution(
         let node = nodes
             .get(node_id.as_str())
             .ok_or_else(|| Status::data_loss("evaluation node is missing"))?;
-        let evidence = load_evaluation_node_evidence(db, manifest, node);
+        let evidence = load_evaluation_node_evidence(facts, manifest, node);
         let evaluator_evidence = match &evidence {
             Ok(evidence) => evidence.clone(),
             Err(_) => {
@@ -763,5 +770,178 @@ mod tests {
         let first_lock = lifecycle.execution_lock_for("sha256:manifest").unwrap();
         let second_lock = lifecycle.execution_lock_for("sha256:manifest").unwrap();
         assert!(Arc::ptr_eq(&first_lock, &second_lock));
+    }
+
+    #[test]
+    fn dest_pair_execution_loads_admitted_evidence_from_sekai() {
+        use crate::sekai::evidence::{
+            EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
+            EvidenceSignal, EvidenceTarget, SchemaCompatibility,
+        };
+        use crate::sekai::evidence_store::{
+            EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
+        };
+
+        let sekai = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
+        ));
+        let chisei = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
+        ));
+        sekai
+            .ensure_team_namespace(
+                "acme",
+                "alice",
+                crate::sekai::security::Role::Editor,
+                "local",
+            )
+            .unwrap();
+        sekai
+            .create_object(&crate::domain::Object {
+                id: "target-doc".into(),
+                kind: "document".into(),
+                name: "doc".into(),
+                namespace: "acme".into(),
+                external_id: "doc:1".into(),
+                properties: Default::default(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        sekai
+            .upsert_evidence_producer(
+                &EvidenceProducerCapability {
+                    producer_identity: "producer:eval".into(),
+                    config_version: 1,
+                    source_types: vec!["verification_system".into()],
+                    source_instances: vec!["eval-fixture".into()],
+                    namespaces: vec!["acme".into()],
+                    evidence_types: vec!["schema-check.record".into()],
+                    target_kinds: vec!["document".into()],
+                    classification_ceiling: EvidenceClassification::Internal,
+                    allowed_intents: vec![EvidenceIntent::Upsert],
+                    allow_operation_attachment: false,
+                    replay_window_ms: 60_000,
+                    max_clock_skew_ms: 1_000,
+                    max_payload_bytes: 1_024,
+                    max_relationships: 4,
+                    rate_limit_per_minute: 20,
+                    max_retained_submissions: 100_000,
+                    revoked: false,
+                },
+                1,
+            )
+            .unwrap();
+        sekai
+            .register_evidence_schema(
+                &EvidenceSchemaDefinition {
+                    schema_id: "schema://evidence/schema-check/v1".into(),
+                    schema_version: "1.0.0".into(),
+                    evidence_type: "schema-check.record".into(),
+                    compatible_versions: vec![],
+                },
+                1,
+            )
+            .unwrap();
+        let content = serde_json::json!({"result": "passed"});
+        let digest = canonical_content_digest(&content).unwrap();
+        let envelope = EvidenceEnvelope {
+            contract_version: EVIDENCE_ENVELOPE_VERSION.into(),
+            source_type: "verification_system".into(),
+            source_instance: "eval-fixture".into(),
+            source_record_id: "sub-1".into(),
+            source_version: "1".into(),
+            source_sequence: 1,
+            target: EvidenceTarget {
+                namespace: "acme".into(),
+                object_external_id: "doc:1".into(),
+                object_kind: "document".into(),
+            },
+            evidence_type: "schema-check.record".into(),
+            signal: EvidenceSignal::Verification,
+            schema_id: "schema://evidence/schema-check/v1".into(),
+            schema_version: "1.0.0".into(),
+            schema_compatibility: SchemaCompatibility::Exact,
+            observed_at_ms: 1,
+            collected_at_ms: 2,
+            expires_at_ms: Some(10_000),
+            content_digest: digest.clone(),
+            content,
+            relationships: vec![],
+            producer_identity: "producer:eval".into(),
+            confidence_bps: 10_000,
+            classification: EvidenceClassification::Internal,
+            provenance: Default::default(),
+            idempotency_key: "sub-1".into(),
+            intent: EvidenceIntent::Upsert,
+            causality: None,
+        };
+        let outcome =
+            crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle::new(&sekai)
+                .admit(&envelope, "producer:eval", 3)
+                .unwrap();
+        let object_id = outcome
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.evidence_object_id.clone())
+            .expect("admitted evidence object");
+        let binding = evaluation_manifest_domain::ResolvedEvidenceBinding {
+            evidence_object_id: object_id.clone(),
+            submission_id: outcome.submission.id.clone(),
+            content_digest: digest,
+            evidence_type: "schema-check.record".into(),
+            schema_id: "schema://evidence/schema-check/v1".into(),
+            schema_version: "1.0.0".into(),
+            classification: "internal".into(),
+            observed_at_ms: 1,
+            expires_at_ms: 10_000,
+            source_identity_digest: "src".into(),
+        };
+        let node = evaluation_manifest_domain::ResolvedEvaluationNode {
+            node_id: "schema".into(),
+            evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                definition_id: "def".into(),
+                definition_digest: "def-digest".into(),
+                implementation_digest: "impl".into(),
+                stochastic_policy: None,
+            },
+            depends_on_node_ids: vec![],
+            input_bindings: vec![],
+            parameters_json: "{}".into(),
+            invariants: vec![],
+            evidence_object_ids: vec![object_id],
+            classification: "required".into(),
+        };
+        let manifest = evaluation_manifest_domain::ResolvedEvaluationManifest {
+            contract_version: evaluation_manifest_domain::MANIFEST_CONTRACT.into(),
+            resolver_version: evaluation_manifest_domain::RESOLVER_VERSION.into(),
+            manifest_id: "m".into(),
+            manifest_digest: "digest".into(),
+            namespace: "acme".into(),
+            plan_version_id: "plan".into(),
+            plan_digest: "plan-digest".into(),
+            subject_profile: "document/v1".into(),
+            subject_identity: "doc:1".into(),
+            subject_content_digest: "subject".into(),
+            invariant_set_id: "set".into(),
+            invariant_set_digest: "set-digest".into(),
+            invariant_profile_digest: "profile".into(),
+            evaluation_time_ms: 4,
+            resolved_by: "alice".into(),
+            requirements: vec![],
+            nodes: vec![node.clone()],
+            evidence: vec![binding],
+            waivers: vec![],
+            created_at_ms: 4,
+        };
+
+        let from_chisei = load_evaluation_node_evidence(&chisei, &manifest, &node);
+        assert_eq!(
+            from_chisei.unwrap_err(),
+            evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE
+        );
+        let from_sekai = load_evaluation_node_evidence(&sekai, &manifest, &node).unwrap();
+        assert_eq!(from_sekai.len(), 1);
+        assert_eq!(from_sekai[0].submission_id, outcome.submission.id);
     }
 }

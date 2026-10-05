@@ -9,7 +9,7 @@ and still opens the typed two-store contract. The ontology CLI keeps the
 
 | Process | Store | Credentials | Public service |
 | --- | --- | --- | --- |
-| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL` (or legacy `DB_PATH` / `DATABASE_URL`); with none set, `<SEKAI_DATA_DIR>/sekai.db` | Sekai store only | `SekaiService` |
+| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`; with none set, `<SEKAI_DATA_DIR>/sekai.db`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store only | `SekaiService` |
 | `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | Chisei store only | `ChiseiService` |
 | `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store (combined) | both |
 
@@ -37,8 +37,7 @@ copy the Sekai receipt body into the Chisei store.
 
 Lookup-first and pipeline object context read Sekai facts (objects, links,
 grants, schemas) through a Chisei-owned read port, never from the Chisei
-store. Combined mode reads the Sekai store in process, in the shared and the
-split layout. A Chisei process reads over the same `SEKAI_ENDPOINT` hop with
+store. Combined mode reads the Sekai dest in process. A Chisei process reads over the same `SEKAI_ENDPOINT` hop with
 public `SekaiService` RPCs, which Sekai authorizes for the hop credential;
 Chisei then narrows to the request actor. Graph retrieval for lookup-first has
 no public RPC, so on the hop lookup-first refuses with
