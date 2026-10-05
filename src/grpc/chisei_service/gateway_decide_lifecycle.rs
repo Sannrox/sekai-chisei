@@ -380,46 +380,43 @@ impl ChiseiServiceImpl {
             }
         }
 
-        let _ = self
-            .db
-            .runtime()
-            .record_decision(&crate::sekai::audit::Decision {
-                id: format!(
-                    "gateway-decide:{}:{}:{}",
-                    namespace,
-                    domain_request.correlation_operation_id,
-                    domain_request.correlation_attempt
+        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+            id: format!(
+                "gateway-decide:{}:{}:{}",
+                namespace,
+                domain_request.correlation_operation_id,
+                domain_request.correlation_attempt
+            ),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+            actor,
+            action: "gateway.decide".into(),
+            reason: if response.admitted {
+                "gateway fat-decide admitted".into()
+            } else {
+                response.deny_message.clone()
+            },
+            evidence: std::collections::HashMap::from([
+                ("namespace".into(), namespace.into()),
+                (
+                    "correlation_operation_id".into(),
+                    domain_request.correlation_operation_id.clone(),
                 ),
-                timestamp: chrono::Utc::now().timestamp_millis(),
-                actor,
-                action: "gateway.decide".into(),
-                reason: if response.admitted {
-                    "gateway fat-decide admitted".into()
-                } else {
-                    response.deny_message.clone()
-                },
-                evidence: std::collections::HashMap::from([
-                    ("namespace".into(), namespace.into()),
-                    (
-                        "correlation_operation_id".into(),
-                        domain_request.correlation_operation_id.clone(),
-                    ),
-                    ("admitted".into(), response.admitted.to_string()),
-                    ("deny_reason".into(), response.deny_reason.clone()),
-                    ("resolved_model".into(), response.resolved_model.clone()),
-                    ("budget_scope".into(), response.budget_scope.clone()),
-                    (
-                        "contract_version".into(),
-                        GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-                    ),
-                ]),
-                target_id: domain_request.correlation_operation_id,
-                outcome: if response.admitted {
-                    "admitted".into()
-                } else {
-                    "denied".into()
-                },
-            });
+                ("admitted".into(), response.admitted.to_string()),
+                ("deny_reason".into(), response.deny_reason.clone()),
+                ("resolved_model".into(), response.resolved_model.clone()),
+                ("budget_scope".into(), response.budget_scope.clone()),
+                (
+                    "contract_version".into(),
+                    GATEWAY_DECIDE_CONTRACT_VERSION.into(),
+                ),
+            ]),
+            target_id: domain_request.correlation_operation_id,
+            outcome: if response.admitted {
+                "admitted".into()
+            } else {
+                "denied".into()
+            },
+        });
 
         Ok(response)
     }

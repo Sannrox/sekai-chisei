@@ -156,25 +156,18 @@ impl ChiseiServiceImpl {
                 false,
             )
         {
-            let _ = self
-                .db
-                .runtime()
-                .record_decision(&crate::sekai::audit::Decision {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: now,
-                    actor: "chisei.kioku".into(),
-                    action: "kioku.outcome_attribution".into(),
-                    reason: error,
-                    evidence: HashMap::from([(
-                        "operation_id".into(),
-                        receipt.operation_id.clone(),
-                    )]),
-                    target_id: receipt.operation_id.clone(),
-                    outcome: "failed".into(),
-                });
+            let _ = self.db.record_decision(&crate::sekai::audit::Decision {
+                id: uuid::Uuid::new_v4().to_string(),
+                timestamp: now,
+                actor: "chisei.kioku".into(),
+                action: "kioku.outcome_attribution".into(),
+                reason: error,
+                evidence: HashMap::from([("operation_id".into(), receipt.operation_id.clone())]),
+                target_id: receipt.operation_id.clone(),
+                outcome: "failed".into(),
+            });
         }
         self.db
-            .runtime()
             .record_decisions_idempotently(&[crate::sekai::audit::Decision {
                 id: format!("{}:gateway-receipt", receipt.operation_id),
                 timestamp: now,

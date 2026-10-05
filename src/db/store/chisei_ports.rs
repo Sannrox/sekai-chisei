@@ -52,15 +52,54 @@ macro_rules! chisei_store_trait {
     };
 }
 
-chisei_store_trait! {
-    /// Decision ledger rows Chisei records for its own decisions.
-    pub trait ChiseiDecisionStore {
-        fn record_decision(&self, decision: &Decision) -> Result<(), String>;
-        fn list_decisions(&self, filter: &DecisionFilter) -> Result<Vec<Decision>, String>;
-        fn get_decision(&self, id: &str) -> Result<Option<Decision>, String>;
-        fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String>;
-        fn record_decisions_idempotently_by(&self, decisions: &[Decision], equivalent: impl Fn(&Decision, &Decision) -> bool) -> Result<(), String>;
-        fn list_decisions_for_action_namespace(&self, action: &str, namespace: &str) -> Result<Vec<Decision>, String>;
+/// Decision ledger rows Chisei records. Combined Split writes these to the
+/// Sekai dest (ADR 0083 rule 1); Shared and Chisei-only keep them on `inner`.
+pub trait ChiseiDecisionStore {
+    fn record_decision(&self, decision: &Decision) -> Result<(), String>;
+    fn list_decisions(&self, filter: &DecisionFilter) -> Result<Vec<Decision>, String>;
+    fn get_decision(&self, id: &str) -> Result<Option<Decision>, String>;
+    fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String>;
+    fn record_decisions_idempotently_by(
+        &self,
+        decisions: &[Decision],
+        equivalent: impl Fn(&Decision, &Decision) -> bool,
+    ) -> Result<(), String>;
+    fn list_decisions_for_action_namespace(
+        &self,
+        action: &str,
+        namespace: &str,
+    ) -> Result<Vec<Decision>, String>;
+}
+
+impl ChiseiDecisionStore for ChiseiStore {
+    fn record_decision(&self, decision: &Decision) -> Result<(), String> {
+        self.decision_runtime().record_decision(decision)
+    }
+    fn list_decisions(&self, filter: &DecisionFilter) -> Result<Vec<Decision>, String> {
+        self.decision_runtime().list_decisions(filter)
+    }
+    fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
+        self.decision_runtime().get_decision(id)
+    }
+    fn record_decisions_idempotently(&self, decisions: &[Decision]) -> Result<(), String> {
+        self.decision_runtime()
+            .record_decisions_idempotently(decisions)
+    }
+    fn record_decisions_idempotently_by(
+        &self,
+        decisions: &[Decision],
+        equivalent: impl Fn(&Decision, &Decision) -> bool,
+    ) -> Result<(), String> {
+        self.decision_runtime()
+            .record_decisions_idempotently_by(decisions, equivalent)
+    }
+    fn list_decisions_for_action_namespace(
+        &self,
+        action: &str,
+        namespace: &str,
+    ) -> Result<Vec<Decision>, String> {
+        self.decision_runtime()
+            .list_decisions_for_action_namespace(action, namespace)
     }
 }
 

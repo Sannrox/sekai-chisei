@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Combined Split records Chisei `RecordDecision` rows on the Sekai dest so `verify_ledger` covers them; relocate leaves that table with Sekai (ADR 0083, #1265).
 - Unattested Split with Chisei families still in the Sekai dest refuses restamp and names `sekaictl admin store relocate` (#1263).
 - `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.1.0`, matching crate version and compose (#1268).
 - Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).

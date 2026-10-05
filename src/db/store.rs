@@ -27,14 +27,21 @@ pub struct SekaiStore {
 }
 
 /// Chisei-owned decision state. Sekai constructors must not take this.
+///
+/// Combined Split keeps Chisei families on `inner` and records
+/// `RecordDecision` rows on `decisions` (the Sekai dest, ADR 0083 rule 1).
 #[derive(Clone, Debug)]
 pub struct ChiseiStore {
     inner: Arc<RuntimeDb>,
+    decisions: Arc<RuntimeDb>,
 }
 
 /// Transitional combined-mode facade: both planes share one physical store.
 pub fn split_shared_runtime(db: Arc<RuntimeDb>) -> (SekaiStore, ChiseiStore) {
-    (SekaiStore { inner: db.clone() }, ChiseiStore { inner: db })
+    (
+        SekaiStore { inner: db.clone() },
+        ChiseiStore::from_shared_runtime(db),
+    )
 }
 
 impl SekaiStore {
@@ -63,7 +70,18 @@ impl SekaiStore {
 
 impl ChiseiStore {
     pub fn from_shared_runtime(db: Arc<RuntimeDb>) -> Self {
-        Self { inner: db }
+        Self {
+            inner: db.clone(),
+            decisions: db,
+        }
+    }
+
+    /// Combined Split: Chisei families on `chisei`, decision-ledger rows on `sekai`.
+    pub fn from_split_runtimes(chisei: Arc<RuntimeDb>, sekai: Arc<RuntimeDb>) -> Self {
+        Self {
+            inner: chisei,
+            decisions: sekai,
+        }
     }
 
     pub fn memory() -> Self {
@@ -88,6 +106,10 @@ impl ChiseiStore {
 
     pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
+    }
+
+    pub fn decision_runtime(&self) -> &RuntimeDb {
+        &self.decisions
     }
 }
 
@@ -117,6 +139,43 @@ mod tests {
     fn chisei_memory_does_not_require_naming_runtime_db_at_callers() {
         let store = ChiseiStore::memory();
         store.runtime().ping().expect("memory store pings");
+    }
+
+    #[test]
+    fn split_runtimes_record_decisions_on_the_sekai_handle() {
+        let sekai = SekaiStore::memory();
+        let chisei = ChiseiStore::from_split_runtimes(
+            ChiseiStore::memory().runtime_arc(),
+            sekai.runtime_arc(),
+        );
+        chisei
+            .record_decision(&crate::sekai::audit::Decision {
+                id: "owned-by-sekai".into(),
+                timestamp: 1,
+                actor: "chisei.test".into(),
+                action: "policy".into(),
+                reason: "adr-0083".into(),
+                evidence: Default::default(),
+                target_id: "ns".into(),
+                outcome: "allow".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            sekai
+                .runtime()
+                .list_decisions(&crate::sekai::audit::DecisionFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            chisei
+                .runtime()
+                .list_decisions(&crate::sekai::audit::DecisionFilter::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(sekai.runtime().verify_ledger().unwrap().ok);
     }
 
     #[test]

@@ -44,6 +44,7 @@ use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
+use crate::db::store::ChiseiDecisionStore;
 use crate::domain::{ListFilter, Object};
 #[cfg(test)]
 use crate::sekai::action_policy::ActionDecision;
