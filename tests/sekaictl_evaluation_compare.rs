@@ -73,11 +73,20 @@ impl Workspace {
         let _ = std::fs::remove_file(&socket);
         let log_path = self.path("server.log");
         let log = std::fs::File::create(&log_path).expect("server log");
+        let sekai_db = self.path("sekai.db");
+        let chisei_db = self.path("chisei.db");
+        // Seeding Sekai facts before boot leaves the dest pair dual-unstamped.
+        // Combined refuses mutating RPCs until an operator restamp.
+        sekai_chisei::store_relocate::restamp_destinations(
+            sekai_db.to_str().expect("utf8 sekai path"),
+            chisei_db.to_str().expect("utf8 chisei path"),
+        )
+        .expect("stamp dest pair after seeding Sekai facts");
         let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         command
             .env("SEKAI_SOCKET", &socket)
-            .env("SEKAI_DB_PATH", self.path("sekai.db"))
-            .env("CHISEI_DB_PATH", self.path("chisei.db"))
+            .env("SEKAI_DB_PATH", &sekai_db)
+            .env("CHISEI_DB_PATH", &chisei_db)
             .env("GRPC_PORT", free_tcp_port().to_string())
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")

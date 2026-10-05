@@ -814,6 +814,8 @@ pub(super) async fn put_evaluation_plan(
             .ok_or_else(|| Status::invalid_argument("evaluation plan required"))?,
     );
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &plan.namespace)?;
+    let facts =
+        evaluation_manifest_resolution::in_process_facts_runtime(service.sekai_facts.reader())?;
     let now_ms = chrono::Utc::now().timestamp_millis();
     let plan = evaluation_plan_domain::prepare_plan(plan, &actor, now_ms)
         .map_err(map_evaluation_resource_error)?;
@@ -828,12 +830,8 @@ pub(super) async fn put_evaluation_plan(
                 "evaluation plan version already exists with different content",
             ));
         }
-        if !evaluation_manifest_resolution::evaluation_plan_visible(
-            service.db.runtime(),
-            &existing,
-            &actor,
-        )
-        .map_err(Status::internal)?
+        if !evaluation_manifest_resolution::evaluation_plan_visible(facts, &existing, &actor)
+            .map_err(Status::internal)?
         {
             return Err(Status::failed_precondition(
                 "governed invariant reference unavailable",
@@ -845,6 +843,7 @@ pub(super) async fn put_evaluation_plan(
     }
     evaluation_manifest_resolution::validate_evaluation_plan_references(
         service.db.runtime(),
+        facts,
         &plan,
         &actor,
     )?;

@@ -6,6 +6,7 @@
 //! source evidence.
 
 use crate::chisei::decision_ledger::Decision;
+use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::{ChiseiDecisionStore, ChiseiLearningChangeStore, ChiseiStore};
 use crate::domain::KIND_LEARNING;
 use crate::shomei;
@@ -93,6 +94,7 @@ pub fn change_id_for(namespace: &str, learning_id: &str) -> String {
 
 pub fn propose_change(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     request: &ProposeLearningChange,
     now_ms: i64,
@@ -105,7 +107,7 @@ pub fn propose_change(
         return Err("proposal timestamp must be non-negative".into());
     }
 
-    let learning = visible_learning(db, &request.namespace, &request.learning_id)?;
+    let learning = visible_learning(facts, &request.namespace, &request.learning_id)?;
     let candidate_digest = learning_digest(&learning)?;
     let baseline_digest = live_baseline_digest(db, &request.namespace, &request.learning_id)?;
     let change_id = change_id_for(&request.namespace, &request.learning_id);
@@ -166,6 +168,7 @@ pub fn propose_change(
 
 pub fn approve_change(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -177,7 +180,7 @@ pub fn approve_change(
     }
     let mut record = get_change(db, namespace, learning_id)?;
     deny_if_unusable(&record)?;
-    require_current_candidate(db, &record)?;
+    require_current_candidate(facts, &record)?;
     if record.status == STATUS_APPROVED
         && record
             .approval
@@ -202,6 +205,7 @@ pub fn approve_change(
 
 pub fn activate_change(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -216,7 +220,7 @@ pub fn activate_change(
     if record.status == STATUS_ACTIVE {
         return Ok(record);
     }
-    require_current_candidate(db, &record)?;
+    require_current_candidate(facts, &record)?;
     if record.status != STATUS_APPROVED || record.approval.is_none() {
         return Err(UNAVAILABLE.into());
     }
@@ -228,7 +232,7 @@ pub fn activate_change(
         restored_change_id: None,
     });
     record.updated_at_ms = now_ms;
-    set_learning_status(db, &record.learning_id, "active")?;
+    set_learning_status(facts, &record.learning_id, "active")?;
     db.put_learning_change(&record)?;
     audit(db, actor, ACTIVATE_ACTION, "activated", &record, now_ms)?;
     Ok(record)
@@ -236,6 +240,7 @@ pub fn activate_change(
 
 pub fn rollback_change(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     learning_id: &str,
@@ -261,7 +266,7 @@ pub fn rollback_change(
         restored_change_id: None,
     });
     record.updated_at_ms = now_ms;
-    set_learning_status(db, &record.learning_id, "candidate")?;
+    set_learning_status(facts, &record.learning_id, "candidate")?;
     db.put_learning_change(&record)?;
     audit(db, actor, ROLLBACK_ACTION, "rolled_back", &record, now_ms)?;
     Ok(record)
@@ -349,16 +354,18 @@ pub struct PinnedLearning {
 /// indistinguishable to the caller.
 pub fn resolve_pin(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     namespace: &str,
     learning_id: &str,
     candidate_digest: &str,
 ) -> Result<PinnedLearning, String> {
-    resolve_pin_inner(db, namespace, learning_id, candidate_digest)
+    resolve_pin_inner(db, facts, namespace, learning_id, candidate_digest)
         .map_err(|_| UNAVAILABLE.to_string())
 }
 
 fn resolve_pin_inner(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     namespace: &str,
     learning_id: &str,
     candidate_digest: &str,
@@ -369,7 +376,7 @@ fn resolve_pin_inner(
     if record.status != STATUS_ACTIVE || record.candidate_digest != candidate_digest {
         return Err(UNAVAILABLE.into());
     }
-    let learning = visible_learning(db, &record.namespace, &record.learning_id)?;
+    let learning = visible_learning(facts, &record.namespace, &record.learning_id)?;
     if learning_digest(&learning)? != record.candidate_digest
         || learning.properties.get("status").map(String::as_str) != Some("active")
     {
@@ -416,13 +423,22 @@ pub fn render_context(title: &str, prevention: &str) -> String {
     }
 }
 
+fn object_runtime(
+    facts: &dyn SekaiFactReader,
+) -> Result<&crate::db::runtime_db::RuntimeDb, String> {
+    match facts.in_process_store() {
+        Ok(store) => Ok(store.runtime()),
+        Err(SekaiFactError::Read(error)) => Err(error),
+        Err(_) => Err(UNAVAILABLE.into()),
+    }
+}
+
 fn visible_learning(
-    db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     namespace: &str,
     learning_id: &str,
 ) -> Result<crate::domain::Object, String> {
-    let learning = db
-        .runtime()
+    let learning = object_runtime(facts)?
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     if learning.kind != KIND_LEARNING || learning.namespace != namespace {
@@ -431,8 +447,11 @@ fn visible_learning(
     Ok(learning)
 }
 
-fn require_current_candidate(db: &ChiseiStore, record: &LearningChange) -> Result<(), String> {
-    let learning = visible_learning(db, &record.namespace, &record.learning_id)?;
+fn require_current_candidate(
+    facts: &dyn SekaiFactReader,
+    record: &LearningChange,
+) -> Result<(), String> {
+    let learning = visible_learning(facts, &record.namespace, &record.learning_id)?;
     let current = learning_digest(&learning)?;
     if current != record.candidate_digest {
         return Err(UNAVAILABLE.into());
@@ -462,14 +481,18 @@ fn live_baseline_digest(
         .unwrap_or_default())
 }
 
-fn set_learning_status(db: &ChiseiStore, learning_id: &str, status: &str) -> Result<(), String> {
-    let mut learning = db
-        .runtime()
+fn set_learning_status(
+    facts: &dyn SekaiFactReader,
+    learning_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    let runtime = object_runtime(facts)?;
+    let mut learning = runtime
         .get_object(learning_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
     learning.properties.insert("status".into(), status.into());
     learning.updated = learning.updated.saturating_add(1);
-    db.runtime().update_object(&learning)
+    runtime.update_object(&learning)
 }
 
 fn learning_digest(object: &crate::domain::Object) -> Result<String, String> {
@@ -557,6 +580,87 @@ mod tests {
 
     fn db() -> ChiseiStore {
         ChiseiStore::memory()
+    }
+
+    fn facts(db: &ChiseiStore) -> crate::chisei::sekai_facts::SekaiFacts {
+        crate::chisei::sekai_facts::SekaiFacts::in_process(
+            crate::db::store::SekaiStore::from_shared_runtime(db.runtime_arc()),
+        )
+    }
+
+    fn propose_change(
+        db: &ChiseiStore,
+        actor: &str,
+        request: &ProposeLearningChange,
+        now_ms: i64,
+    ) -> Result<LearningChange, String> {
+        super::propose_change(db, facts(db).reader(), actor, request, now_ms)
+    }
+
+    fn approve_change(
+        db: &ChiseiStore,
+        actor: &str,
+        namespace: &str,
+        learning_id: &str,
+        now_ms: i64,
+    ) -> Result<LearningChange, String> {
+        super::approve_change(
+            db,
+            facts(db).reader(),
+            actor,
+            namespace,
+            learning_id,
+            now_ms,
+        )
+    }
+
+    fn activate_change(
+        db: &ChiseiStore,
+        actor: &str,
+        namespace: &str,
+        learning_id: &str,
+        now_ms: i64,
+    ) -> Result<LearningChange, String> {
+        super::activate_change(
+            db,
+            facts(db).reader(),
+            actor,
+            namespace,
+            learning_id,
+            now_ms,
+        )
+    }
+
+    fn rollback_change(
+        db: &ChiseiStore,
+        actor: &str,
+        namespace: &str,
+        learning_id: &str,
+        now_ms: i64,
+    ) -> Result<LearningChange, String> {
+        super::rollback_change(
+            db,
+            facts(db).reader(),
+            actor,
+            namespace,
+            learning_id,
+            now_ms,
+        )
+    }
+
+    fn resolve_pin(
+        db: &ChiseiStore,
+        namespace: &str,
+        learning_id: &str,
+        candidate_digest: &str,
+    ) -> Result<PinnedLearning, String> {
+        super::resolve_pin(
+            db,
+            facts(db).reader(),
+            namespace,
+            learning_id,
+            candidate_digest,
+        )
     }
 
     fn evidence() -> String {

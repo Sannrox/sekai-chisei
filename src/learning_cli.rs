@@ -1,9 +1,10 @@
 //! sekaictl admin learning change commands (#714).
 
 use crate::chisei::learning_change::{self, ProposeLearningChange};
+use crate::chisei::sekai_facts::SekaiFacts;
+use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::store::ChiseiStore;
-use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use chrono::Utc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -32,10 +33,19 @@ pub async fn run_learning_command(args: Vec<String>) -> Result<(), BoxErr> {
     }
 }
 
-async fn open_db() -> Result<std::sync::Arc<crate::db::runtime_db::RuntimeDb>, BoxErr> {
+struct OpenedStores {
+    chisei: ChiseiStore,
+    facts: SekaiFacts,
+}
+
+fn open_stores() -> Result<OpenedStores, BoxErr> {
     let cfg = Config::from_env();
-    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
-    Ok(backend.database())
+    let layout = CombinedStoreLayout::from_env(&cfg.db_path).map_err(std::io::Error::other)?;
+    let (sekai, chisei) = layout.handles();
+    Ok(OpenedStores {
+        chisei,
+        facts: SekaiFacts::in_process(sekai),
+    })
 }
 
 struct ProposeConfig {
@@ -59,9 +69,10 @@ enum MutateOp {
 }
 
 async fn propose(config: ProposeConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
+    let stores = open_stores()?;
     let record = learning_change::propose_change(
-        &ChiseiStore::from_shared_runtime(db.clone()),
+        &stores.chisei,
+        stores.facts.reader(),
         &config.actor,
         &ProposeLearningChange {
             namespace: config.namespace,
@@ -76,32 +87,35 @@ async fn propose(config: ProposeConfig) -> Result<(), BoxErr> {
 }
 
 async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
-    let db = open_db().await?;
+    let stores = open_stores()?;
     let now = Utc::now().timestamp_millis();
     let record = match op {
         MutateOp::Approve => learning_change::approve_change(
-            &ChiseiStore::from_shared_runtime(db.clone()),
+            &stores.chisei,
+            stores.facts.reader(),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Activate => learning_change::activate_change(
-            &ChiseiStore::from_shared_runtime(db.clone()),
+            &stores.chisei,
+            stores.facts.reader(),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::Rollback => learning_change::rollback_change(
-            &ChiseiStore::from_shared_runtime(db.clone()),
+            &stores.chisei,
+            stores.facts.reader(),
             &config.actor,
             &config.namespace,
             &config.learning_id,
             now,
         ),
         MutateOp::LeaseLoss => learning_change::note_lease_loss(
-            &ChiseiStore::from_shared_runtime(db.clone()),
+            &stores.chisei,
             &config.actor,
             &config.namespace,
             &config.learning_id,
@@ -114,36 +128,27 @@ async fn mutate(config: TargetConfig, op: MutateOp) -> Result<(), BoxErr> {
 }
 
 async fn inspect(config: TargetConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let comparison = learning_change::inspect_change(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        &config.namespace,
-        &config.learning_id,
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let comparison =
+        learning_change::inspect_change(&stores.chisei, &config.namespace, &config.learning_id)
+            .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&comparison)?);
     Ok(())
 }
 
 async fn show(config: TargetConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let record = learning_change::get_change(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        &config.namespace,
-        &config.learning_id,
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let record =
+        learning_change::get_change(&stores.chisei, &config.namespace, &config.learning_id)
+            .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 
 async fn list_changes(namespace: Option<String>) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let records = learning_change::list_changes(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        namespace.as_deref(),
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let records = learning_change::list_changes(&stores.chisei, namespace.as_deref())
+        .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
