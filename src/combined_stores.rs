@@ -197,6 +197,32 @@ impl Default for CombinedStoreSources {
 }
 
 impl CombinedStoreSources {
+    /// Whether Combined would open two physical stores from these sources.
+    pub fn opens_split(&self) -> bool {
+        let (sekai_path, chisei_path) = if let Some(dir) = self.data_dir.as_deref()
+            && !self.allow_shared_compatibility
+        {
+            (
+                Some(data_dir_file(dir, SEKAI_STORE_FILE)),
+                Some(data_dir_file(dir, CHISEI_STORE_FILE)),
+            )
+        } else {
+            (
+                self.sekai_sqlite_path.clone(),
+                self.chisei_sqlite_path.clone(),
+            )
+        };
+        matches!(
+            (
+                sekai_path.as_deref(),
+                chisei_path.as_deref(),
+                self.sekai_postgres_url.as_deref(),
+                self.chisei_postgres_url.as_deref(),
+            ),
+            (Some(_), Some(_), _, _) | (_, _, Some(_), Some(_))
+        )
+    }
+
     pub fn from_env(default_sqlite_path: &str) -> Result<Self, String> {
         let backend = BackendIdentity::parse(
             &std::env::var("SEKAI_DB_BACKEND").unwrap_or_else(|_| "sqlite".into()),
@@ -369,6 +395,27 @@ impl fmt::Debug for CombinedStoreLayout {
             .field("sekai", self.sekai_identity())
             .field("chisei", self.chisei_identity())
             .finish()
+    }
+}
+
+/// Offline single-store CLIs refuse Combined Split instead of a quietly
+/// incomplete Sekai-only bundle. `rpc` is the operator-facing gRPC report.
+pub fn refuse_split_single_store_cli(rpc: &str) -> Result<(), String> {
+    let cfg = crate::config::Config::from_env();
+    let sources = CombinedStoreSources::from_env(&cfg.db_path)?;
+    refuse_split_single_store_cli_from_sources(&sources, rpc)
+}
+
+pub fn refuse_split_single_store_cli_from_sources(
+    sources: &CombinedStoreSources,
+    rpc: &str,
+) -> Result<(), String> {
+    if sources.opens_split() {
+        Err(format!(
+            "this command is a single-store reader and refuses Combined Split; use {rpc}"
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -810,6 +857,52 @@ mod tests {
         let (sekai_pool, chisei_pool) = layout.connection_pool_maxes();
         assert_eq!((sekai_pool, chisei_pool), (8, 8));
         assert!(sekai_pool.saturating_add(chisei_pool) <= 16);
+    }
+
+    #[test]
+    fn dest_pair_sources_refuse_single_store_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let sekai = dir.path().join("sekai.db");
+        let chisei = dir.path().join("chisei.db");
+        let sources = sqlite_pair(sekai.to_str().unwrap(), chisei.to_str().unwrap());
+        assert!(sources.opens_split());
+        let err =
+            refuse_split_single_store_cli_from_sources(&sources, "ChiseiService.GetQualityTrend")
+                .unwrap_err();
+        assert!(err.contains("refuses Combined Split"), "{err}");
+        assert!(err.contains("ChiseiService.GetQualityTrend"), "{err}");
+    }
+
+    #[test]
+    fn data_dir_split_refuses_single_store_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: data_dir_file(dir.path().to_str().unwrap(), "legacy.db"),
+            postgres_max_connections: 16,
+            allow_shared_compatibility: false,
+            data_dir: Some(dir.path().to_str().unwrap().into()),
+            ..CombinedStoreSources::default()
+        };
+        assert!(sources.opens_split());
+        refuse_split_single_store_cli_from_sources(&sources, "ChiseiService.GetOperationReceipt")
+            .unwrap_err();
+    }
+
+    #[test]
+    fn shared_hatch_allows_single_store_clis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let sources = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: path.to_str().unwrap().into(),
+            postgres_max_connections: 16,
+            allow_shared_compatibility: true,
+            ..CombinedStoreSources::default()
+        };
+        assert!(!sources.opens_split());
+        refuse_split_single_store_cli_from_sources(&sources, "ChiseiService.GetQualityTrend")
+            .unwrap();
     }
 
     #[test]

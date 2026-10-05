@@ -71,6 +71,8 @@ fn quality_report(args: &[String]) -> Result<(), BoxErr> {
     let until_ms = flag(args, "--until-ms")
         .ok_or_else(|| std::io::Error::other("--until-ms is required"))?
         .parse::<i64>()?;
+    crate::combined_stores::refuse_split_single_store_cli("ChiseiService.GetQualityTrend")
+        .map_err(std::io::Error::other)?;
     let config = crate::config::Config::from_env();
     let backend_config = crate::runtime_backend::RuntimeBackendConfig::from_env(&config.db_path)
         .map_err(std::io::Error::other)?;
@@ -107,6 +109,8 @@ fn substitution_report(args: &[String]) -> Result<(), BoxErr> {
     let until_ms = flag(args, "--until-ms")
         .ok_or_else(|| std::io::Error::other("--until-ms is required"))?
         .parse::<i64>()?;
+    crate::combined_stores::refuse_split_single_store_cli("ChiseiService.GetOperationReceipt")
+        .map_err(std::io::Error::other)?;
     let config = crate::config::Config::from_env();
     let backend_config = crate::runtime_backend::RuntimeBackendConfig::from_env(&config.db_path)
         .map_err(std::io::Error::other)?;
