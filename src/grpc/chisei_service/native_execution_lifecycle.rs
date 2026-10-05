@@ -442,7 +442,7 @@ impl ChiseiServiceImpl {
                     let completed_at_ms = chrono::Utc::now().timestamp_millis();
                     let answer_path = lookup_refusal
                         .as_ref()
-                        .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                        .map(|_| crate::composition::lookup_first::ANSWER_PATH_MODEL);
                     if let Err(error) = record_completed_operation_on_with_path(
                         db.runtime(),
                         &receipt_plan,
@@ -519,7 +519,7 @@ impl ChiseiServiceImpl {
                 let completed_at_ms = chrono::Utc::now().timestamp_millis();
                 let answer_path = lookup_refusal
                     .as_ref()
-                    .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                    .map(|_| crate::composition::lookup_first::ANSWER_PATH_MODEL);
                 if let Err(error) = record_completed_operation_on_with_path(
                     db.runtime(),
                     &receipt_plan,
@@ -771,13 +771,13 @@ pub(super) fn record_completed_lookup_operation_on(
             ("content_hash".into(), planned_response_hash(response)),
             ("content_stored".into(), "false".into()),
             (
-                crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+                crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
+                crate::composition::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
             ),
             ("capability".into(), capability.into()),
             (
                 "provider".into(),
-                crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+                crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
             ),
             ("input_tokens".into(), "0".into()),
             ("output_tokens".into(), "0".into()),
@@ -824,11 +824,11 @@ pub(super) fn record_completed_lookup_operation_on(
                     ("status".into(), "succeeded".into()),
                     (
                         "completion_reason".into(),
-                        crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                        crate::composition::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
                     ),
                     (
-                        crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                        crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+                        crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
+                        crate::composition::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
                     ),
                     ("provider_tokens".into(), "0".into()),
                     (
@@ -906,13 +906,13 @@ pub(super) fn record_completed_operation_on_with_path(
                     }
                     if let Some(path) = answer_path {
                         attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
                             path.into(),
                         );
                     }
                     if let Some(reason) = lookup_refusal {
                         attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            crate::composition::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
                             reason.into(),
                         );
                     }
@@ -961,13 +961,13 @@ pub(super) fn record_completed_operation_on_with_path(
                     ]);
                     if let Some(path) = answer_path {
                         attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
                             path.into(),
                         );
                     }
                     if let Some(reason) = lookup_refusal {
                         attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            crate::composition::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
                             reason.into(),
                         );
                     }
@@ -988,32 +988,32 @@ pub(super) fn evaluate_execute_lookup_first(
     input: &ExecutionInput,
     actor: &str,
 ) -> ExecuteLookupFirst {
-    if !crate::chisei::lookup_first::is_lookup_first_capability(&input.task_type) {
+    if !crate::composition::lookup_first::is_lookup_first_capability(&input.task_type) {
         return ExecuteLookupFirst::ModelPath {
             lookup_refusal: None,
         };
     }
-    match crate::chisei::lookup_first::try_lookup_first(
+    match crate::composition::lookup_first::try_lookup_first(
         &input.task_type,
         &input.namespace,
         actor,
         &input.spec,
         facts,
     ) {
-        Ok(crate::chisei::lookup_first::LookupDecision::Hit {
+        Ok(crate::composition::lookup_first::LookupDecision::Hit {
             answer_json,
             capability,
             provenance,
         }) => {
-            crate::chisei::lookup_first::record_lookup_hit();
+            crate::composition::lookup_first::record_lookup_hit();
             ExecuteLookupFirst::Hit {
                 response: PlannedChatResponse {
                     content: answer_json,
                     tool_calls: Vec::new(),
                     input_tokens: 0,
                     output_tokens: 0,
-                    stop_reason: crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
-                    provider: crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+                    stop_reason: crate::composition::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                    provider: crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 },
@@ -1021,19 +1021,19 @@ pub(super) fn evaluate_execute_lookup_first(
                 provenance,
             }
         }
-        Ok(crate::chisei::lookup_first::LookupDecision::Refusal { reason, .. }) => {
-            crate::chisei::lookup_first::record_model_path(true);
+        Ok(crate::composition::lookup_first::LookupDecision::Refusal { reason, .. }) => {
+            crate::composition::lookup_first::record_model_path(true);
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: Some(reason),
             }
         }
-        Ok(crate::chisei::lookup_first::LookupDecision::NotEligible) => {
+        Ok(crate::composition::lookup_first::LookupDecision::NotEligible) => {
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: None,
             }
         }
         Err(error) => {
-            crate::chisei::lookup_first::record_model_path(true);
+            crate::composition::lookup_first::record_model_path(true);
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: Some(format!("storage_error:{error}")),
             }

@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// Default single-region site pin (`SEKAI_SITE_ID` default).
+pub const DEFAULT_SITE_ID: &str = "local";
+
 pub const SIGNATURE_ALGORITHM: &str = crate::shomei::SIGNATURE_ALGORITHM;
 pub const REDEMPTION_MODE: &str = "online_atomic";
 pub const OFFLINE_REDEMPTION_MODE: &str = "offline_bounded";
@@ -96,7 +99,7 @@ pub struct Permit {
 }
 
 fn default_permit_site_id() -> String {
-    crate::sekai::lease::DEFAULT_SITE_ID.into()
+    DEFAULT_SITE_ID.into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,7 +879,7 @@ impl SekaiDb {
         let host_site_id = crate::config::validate_site_id(host_site_id)?;
         // Fail closed: online (and offline reconcile) authority is pin-home only.
         let permit_site = if permit.site_id.trim().is_empty() {
-            crate::sekai::lease::DEFAULT_SITE_ID
+            DEFAULT_SITE_ID
         } else {
             permit.site_id.as_str()
         };

@@ -9718,7 +9718,7 @@ async fn decide_gateway_execution_requires_authenticated_principal() {
 
 #[tokio::test]
 async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     let svc = memory_service();
@@ -9901,7 +9901,7 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 
 #[tokio::test]
 async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     // Only evaluate the decision path here — full model execute needs a live
@@ -9939,7 +9939,7 @@ async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path(
 
 #[test]
 fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     let db = crate::db::store::SekaiStore::memory();
@@ -11082,7 +11082,7 @@ fn resolve_lookup_root_input() -> ExecutionInput {
 
 #[test]
 fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
 
     let dir = tempfile::tempdir().unwrap();
     let layout = split_layout(dir.path());
@@ -11118,7 +11118,7 @@ fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
     let dir = tempfile::tempdir().unwrap();
     let layout = split_layout(dir.path());
     let (sekai_store, _) = layout.handles();
-    crate::chisei::lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
+    crate::composition::lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
     let mut config = crate::config::Config::from_env();
     config.sekai_endpoint = None;
     let (_, chisei_svc) =

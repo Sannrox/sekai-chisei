@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
 use tonic::transport::Channel;
 
-use crate::chisei::cross_store_admission::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
+use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, Object};
@@ -372,7 +372,7 @@ mod tests {
 
     fn seeded_sekai() -> SekaiStore {
         let sekai = SekaiStore::memory();
-        crate::chisei::lookup_first::seed_s1_fixture_graph(&sekai).unwrap();
+        crate::composition::lookup_first::seed_s1_fixture_graph(&sekai).unwrap();
         sekai
             .runtime()
             .ensure_team_namespace("acme", "alice", PrincipalRole::Viewer.into(), "local")
@@ -503,7 +503,7 @@ mod tests {
     async fn remote_lookup_first_refuses_graph_reads_the_hop_cannot_serve() {
         let endpoint = serve_sekai(seeded_sekai()).await;
         let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
-        let decision = crate::chisei::lookup_first::try_lookup_first(
+        let decision = crate::composition::lookup_first::try_lookup_first(
             crate::sekai::semantic::CAPABILITY_RESOLVE_REF,
             "acme",
             "alice",
@@ -513,7 +513,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decision,
-            crate::chisei::lookup_first::LookupDecision::Refusal {
+            crate::composition::lookup_first::LookupDecision::Refusal {
                 capability: crate::sekai::semantic::CAPABILITY_RESOLVE_REF.into(),
                 reason: crate::chisei::sekai_facts::SEKAI_READ_UNSUPPORTED.into(),
             }

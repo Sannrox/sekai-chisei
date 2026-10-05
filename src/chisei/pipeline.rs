@@ -1,6 +1,7 @@
 use crate::chisei::budget::PressureLevel;
 use crate::chisei::egress;
 use crate::chisei::epistemic_descriptor::EpistemicDescriptor;
+use crate::chisei::evidence_vocabulary::EvidenceClassification;
 use crate::chisei::policy::{
     ContextAdmissionAction, ContextAdmissionDecision, ContextAdmissionPolicy, OperationRisk,
 };
@@ -9,7 +10,6 @@ use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader, SekaiFacts};
 use crate::db::store::{ChiseiKiokuStore, ChiseiStore};
 use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAINS, REL_TOUCHES};
 use crate::sekai::capacity;
-use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::schema::ObjectType;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -2794,7 +2794,7 @@ mod tests {
             evidence_digest: "sha256:authoritative".into(),
             source_submission_id: "submission:authoritative".into(),
             stance: MemoryEvidenceStance::Supporting,
-            lifecycle_state: crate::sekai::evidence::EvidenceLifecycleState::Available,
+            lifecycle_state: crate::chisei::evidence_vocabulary::EvidenceLifecycleState::Available,
             observed_at_ms: 100,
         }];
         let reassessed_rendered = render_memory_context(&crate::chisei::kioku::RetrievedMemory {

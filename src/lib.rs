@@ -7,6 +7,7 @@ pub mod capability_projection;
 pub mod chisei;
 pub mod compliance_cli;
 pub mod compliance_export;
+pub mod composition;
 pub mod config;
 pub use sekai_provider::content;
 pub mod federation_cli;

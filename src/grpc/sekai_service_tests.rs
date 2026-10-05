@@ -5297,7 +5297,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
     budget
         .set_limit("action:governed", 1, PeriodType::Daily)
         .unwrap();
-    let clerk = crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+    let clerk = crate::composition::cross_store_admission::CrossStoreAdmission::new(
         chisei_store,
         sekai_store.clone(),
         Some(budget.clone()),

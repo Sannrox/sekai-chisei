@@ -163,7 +163,7 @@ pub struct SekaiServiceImpl {
     pub(super) object_index_dual_read: bool,
     pub(super) object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead,
     pub(super) cross_store:
-        Option<std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>>,
+        Option<std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>>,
 }
 
 impl SekaiServiceImpl {
@@ -201,7 +201,7 @@ impl SekaiServiceImpl {
 
     pub fn with_cross_store_admission(
         mut self,
-        clerk: std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+        clerk: std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,
     ) -> Self {
         self.cross_store = Some(clerk);
         self

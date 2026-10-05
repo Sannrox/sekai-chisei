@@ -29,7 +29,6 @@ use crate::chisei::external_action_lifecycle as external_lifecycle;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
-use crate::chisei::lookup_first;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
@@ -39,6 +38,7 @@ use crate::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, ReceiptSurface, UncoveredSurface,
 };
+use crate::composition::lookup_first;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
@@ -116,8 +116,7 @@ pub struct ChiseiServiceImpl {
     pub(super) db: crate::db::store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
-    pub(super) sekai_commit_lookup:
-        Option<Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>>,
+    pub(super) sekai_commit_lookup: Option<Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>>,
     /// Chisei-owned read port for Sekai facts (lookup-first, context injection).
     pub(super) sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
 }
@@ -436,7 +435,7 @@ impl ChiseiServiceImpl {
 
     pub fn with_sekai_commit_lookup(
         mut self,
-        lookup: Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>,
+        lookup: Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>,
     ) -> Self {
         self.sekai_commit_lookup = Some(lookup);
         self

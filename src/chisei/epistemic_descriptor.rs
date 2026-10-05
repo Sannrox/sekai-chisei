@@ -6,10 +6,10 @@
 //! single trust enum.  Constructors in this module only use fields that are
 //! already authoritative for the source being projected.
 
+use crate::chisei::evidence_vocabulary::EvidenceLifecycleState;
 use crate::chisei::kioku::{
     KIOKU_EVIDENCE_REASSESSMENT_METHOD, KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance,
 };
-use crate::sekai::evidence::EvidenceLifecycleState;
 use crate::sekai::evidence_store::EvidenceSubmissionRecord;
 use serde::{Deserialize, Serialize};
 
@@ -548,10 +548,12 @@ fn serialized_len(descriptor: &EpistemicDescriptor) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::evidence_vocabulary::{
+        EvidenceClassification, EvidenceIntent, EvidenceLifecycleState,
+    };
     use crate::chisei::kioku::{
         KiokuEvidenceBasis, KiokuEvidenceLink, KiokuMemory, MemoryKind, MemoryLifecycleState,
     };
-    use crate::sekai::evidence::{EvidenceClassification, EvidenceIntent, EvidenceLifecycleState};
 
     fn memory(state: MemoryLifecycleState) -> KiokuMemory {
         KiokuMemory {

@@ -314,10 +314,10 @@ mod tests {
 
     #[test]
     fn marked_objects_follow_sekai_clearance_through_the_principal_context() {
-        use crate::chisei::lookup_first::{LookupDecision, try_lookup_first};
+        use crate::composition::lookup_first::{LookupDecision, try_lookup_first};
         use crate::sekai::semantic;
         let db = SekaiStore::memory();
-        crate::chisei::lookup_first::seed_s1_fixture_graph(&db).expect("seed");
+        crate::composition::lookup_first::seed_s1_fixture_graph(&db).expect("seed");
         let marked = Object {
             id: "lookup-marked".into(),
             kind: "widget".into(),

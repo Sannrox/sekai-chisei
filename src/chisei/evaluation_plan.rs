@@ -711,7 +711,7 @@ fn validate_acyclic(nodes: &[EvaluationPlanNode]) -> Result<(), String> {
 }
 
 fn parse_parameter_schema(input: &str) -> Result<Value, String> {
-    if crate::sekai::json::contains_duplicate_object_keys(input)
+    if crate::chisei::json::contains_duplicate_object_keys(input)
         .map_err(|error| format!("parameter_schema_json must be JSON: {error}"))?
     {
         return Err("parameter schema must not contain duplicate object keys".into());

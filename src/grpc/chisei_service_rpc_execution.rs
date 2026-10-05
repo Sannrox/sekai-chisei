@@ -682,14 +682,14 @@ pub(super) async fn get_operation_receipt(
                 .lookup_commit(operation_id)
                 .map_err(Status::unavailable)?
                 .ok_or_else(|| Status::not_found("operation receipt not found"))?;
-            crate::chisei::cross_store_admission::hop_projection_receipt(operation_id, &commit)
+            crate::chisei::sekai_commit::hop_projection_receipt(operation_id, &commit)
         }
     };
     if receipt.operation_class != "sekai_commit_projection"
         && let Some(lookup) = &service.sekai_commit_lookup
         && let Ok(Some(commit)) = lookup.lookup_commit(&receipt.operation_id)
     {
-        crate::chisei::cross_store_admission::project_commit_handles(&mut receipt, &commit);
+        crate::chisei::sekai_commit::project_commit_handles(&mut receipt, &commit);
     }
     if actor != receipt.initiating_actor
             // The UDS interceptor assigns `local`; local socket access is the

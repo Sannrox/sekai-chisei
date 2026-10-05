@@ -967,7 +967,7 @@ pub fn build_services_for_plane(
     .with_site_id(config.site_id.clone());
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
-            crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            crate::composition::cross_store_admission::CrossStoreAdmission::new(
                 chisei_store.clone(),
                 sekai_store.clone(),
                 Some(budget.clone()),
@@ -991,12 +991,12 @@ pub fn build_services_for_plane(
             if let Some(endpoint) = &config.sekai_endpoint {
                 chisei_svc = chisei_svc
                     .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
-                        crate::chisei::remote_sekai::RemoteSekaiFactReader::from_env(
+                        crate::composition::remote_sekai::RemoteSekaiFactReader::from_env(
                             endpoint.clone(),
                         ),
                     )))
                     .with_sekai_commit_lookup(Arc::new(
-                        crate::chisei::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                        crate::composition::remote_sekai::RemoteSekaiCommitLookup::from_env(
                             endpoint.clone(),
                         ),
                     ));
@@ -1040,7 +1040,7 @@ fn spawn_service_background_tasks(
 }
 
 fn spawn_admission_reconciler(
-    clerk: Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+    clerk: Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
