@@ -21,7 +21,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Router, http::StatusCode};
-use sekai_chisei::chisei::lookup_first::{
+use sekai_chisei::composition::lookup_first::{
     LOOKUP_HIT_STOP_REASON, LOOKUP_PROVIDER, LOOKUP_REFUSAL_ATTR,
 };
 use sekai_chisei::grpc::client::connect_sekai;

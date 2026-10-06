@@ -1,11 +1,11 @@
 //! Governed institutional memory derived from verifiable operation outcomes.
 
+use crate::chisei::evidence_vocabulary::{EvidenceClassification, EvidenceLifecycleState};
 use crate::chisei::principal::{PrincipalContext, PrincipalGrant, PrincipalRole};
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
 #[cfg(test)]
 use crate::db::store::ChiseiStore;
-use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
