@@ -1883,7 +1883,15 @@ impl Step for RiskStep {
         let mut signals = Vec::new();
         let mut risk = 0.0f64;
         let mut type_cache = HashMap::new();
-        let snapshots = capacity::latest_snapshots(db.runtime(), 24).unwrap_or_default();
+        let snapshots = capacity::snapshots_from_objects(
+            db.runtime()
+                .list_all_objects(&crate::domain::ListFilter {
+                    kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
+                    ..Default::default()
+                })
+                .unwrap_or_default(),
+            24,
+        );
         if snapshots.len() >= 3 {
             let latest = &snapshots[0];
             if latest.agent_count > 0 && latest.queue_depth > latest.agent_count * 2 {
@@ -1988,7 +1996,15 @@ impl Step for RiskStep {
 fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
     let facts = req.sekai_facts.clone();
     let mut risk = 0.0f64;
-    let snapshots = capacity::latest_snapshots(db.runtime(), 24).unwrap_or_default();
+    let snapshots = capacity::snapshots_from_objects(
+        db.runtime()
+            .list_all_objects(&crate::domain::ListFilter {
+                kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
+                ..Default::default()
+            })
+            .unwrap_or_default(),
+        24,
+    );
     if snapshots.len() >= 3 {
         let latest = &snapshots[0];
         if latest.agent_count > 0 && latest.queue_depth > latest.agent_count * 2 {

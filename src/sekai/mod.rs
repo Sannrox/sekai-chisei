@@ -14,6 +14,7 @@ pub mod audit;
 pub mod autonomous_envelope;
 pub mod capability;
 pub mod capability_package;
+pub mod capacity;
 pub mod chisei_principal;
 pub mod chisei_projection;
 pub mod classification_lattice;
