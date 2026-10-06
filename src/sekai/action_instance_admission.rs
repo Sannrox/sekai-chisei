@@ -154,7 +154,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     "idempotency key conflict: same key with different request digest".into(),
                 ));
             }
-            return self.completed_replay(existing);
+            return self.completed_replay(existing, now);
         }
 
         // New admissions consume a live signed envelope. Replay of an already
@@ -366,7 +366,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         })?;
         let replay = stored.instance_id != instance_id;
         if replay {
-            return self.completed_replay(stored);
+            return self.completed_replay(stored, now);
         }
 
         // Same-key replay already returned above. Plan only a fresh admit so a
@@ -379,6 +379,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
+                now,
             ) {
                 Ok(None) => None,
                 Ok(Some(planned)) => {
@@ -424,6 +425,9 @@ impl<'a> ActionInstanceAdmission<'a> {
                 let _ = self.db.delete_action_instance(&stored.instance_id);
             }
             return Err(error);
+        }
+        if let Some(applied) = &applied_object {
+            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: stored,
@@ -614,6 +618,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
+            now,
         )
         .map_err(map_object_mutation_error)?;
         let mut granted = instance.clone();
@@ -645,7 +650,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 applied.map(|applied| *applied)
             }
             action_object_mutation::ParkedGrant::NotParked => {
-                return self.replay_decided(&instance.instance_id, decision);
+                return self.replay_decided(&instance.instance_id, decision, now);
             }
             action_object_mutation::ParkedGrant::Stale => {
                 return self.finish_denied(instance, "stale_on_resume", &approval, now);
@@ -691,6 +696,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             return Err(error);
         }
+        if let Some(applied) = &applied_object {
+            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
+        }
         Ok(ActionInstanceAdmissionOutcome {
             instance: granted,
             replay: false,
@@ -718,7 +726,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             .decide_parked_action_instance(&denied)
             .map_err(ActionInstanceAdmissionError::Internal)?
         {
-            return self.replay_decided(&denied.instance_id, approval.decision);
+            return self.replay_decided(&denied.instance_id, approval.decision, now);
         }
         let ontology_digest = self
             .db
@@ -749,6 +757,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         &self,
         instance_id: &str,
         decision: &str,
+        now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         let current = self
             .db
@@ -758,6 +767,11 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ActionInstanceAdmissionError::Internal("decided instance vanished".into())
             })?;
         if current.approval_decision == decision {
+            if current.status == STATUS_ADMITTED
+                && let Some(object) = object_for_admitted_instance(self.db, &current)?
+            {
+                crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
+            }
             Ok(ActionInstanceAdmissionOutcome {
                 instance: current,
                 replay: true,
@@ -772,6 +786,7 @@ impl<'a> ActionInstanceAdmission<'a> {
     fn completed_replay(
         &self,
         existing: ActionInstance,
+        now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         if self
             .db
@@ -789,6 +804,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             // Clerk admission is already durable. Log catch-up is best-effort so
             // a transient object-log error cannot fail an idempotent replay.
             catch_up_object_log(&existing.operation_id, &object.id, &object.kind, &object);
+            crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: existing,
