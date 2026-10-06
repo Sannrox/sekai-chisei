@@ -832,6 +832,33 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_definition_member(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<Option<DefinitionMember>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_member(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+                member_kind,
+                member_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::get_definition_member(
+                    db.as_ref(),
+                    namespace,
+                    revision_digest,
+                    member_kind,
+                    member_id,
+                )
+            }),
+        }
+    }
+
     pub fn get_definition_branch(
         &self,
         namespace: &str,

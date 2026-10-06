@@ -1,5 +1,7 @@
 //! PostgreSQL persistence for governed definition branches.
 
+use std::collections::BTreeMap;
+
 use postgres::{GenericClient, Transaction};
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key};
@@ -65,6 +67,21 @@ impl PostgresDb {
             return Ok(Vec::new());
         };
         load_members_postgres(&mut *connection, &revision)
+    }
+
+    pub fn get_definition_member(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<Option<DefinitionMember>, String> {
+        let mut connection = self.connection()?;
+        let Some(revision) = load_revision_postgres(&mut *connection, namespace, revision_digest)?
+        else {
+            return Ok(None);
+        };
+        load_member_postgres(&mut *connection, &revision, member_kind, member_id)
     }
 
     pub fn get_definition_branch(
@@ -988,34 +1005,70 @@ fn load_branch_postgres(
     Ok(branch)
 }
 
-fn load_members_postgres(
+pub(crate) fn load_members_postgres(
     client: &mut impl GenericClient,
     revision: &DefinitionRevision,
 ) -> Result<Vec<DefinitionMember>, String> {
+    if revision.members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let digests = revision
+        .members
+        .iter()
+        .map(|member| member.member_digest.clone())
+        .collect::<Vec<_>>();
+    let rows = client
+        .query(
+            "SELECT member_digest, body_json FROM sekai_definition_members
+             WHERE namespace=$1 AND member_digest = ANY($2)",
+            &[&revision.namespace, &digests],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut by_digest = BTreeMap::new();
+    for row in rows {
+        let digest: String = row.get(0);
+        let body: String = row.get(1);
+        if by_digest.insert(digest, body).is_some() {
+            return Err("corrupt definition revision: duplicate member digest".into());
+        }
+    }
     let mut members = Vec::with_capacity(revision.members.len());
     for reference in &revision.members {
-        let row = client
-            .query_opt(
-                "SELECT body_json FROM sekai_definition_members
-                 WHERE namespace=$1 AND member_digest=$2",
-                &[&revision.namespace, &reference.member_digest],
-            )
-            .map_err(|error| error.to_string())?
+        let body = by_digest
+            .get(&reference.member_digest)
             .ok_or_else(|| "corrupt definition revision: member is missing".to_string())?;
-        let body: String = row.get(0);
-        let member: DefinitionMember = serde_json::from_str(&body)
-            .map_err(|error| format!("corrupt definition member: {error}"))?;
-        member.verify()?;
-        if member.namespace != revision.namespace
-            || member.member_digest != reference.member_digest
-            || member.member_kind != reference.member_kind
-            || member.member_id != reference.member_id
-        {
-            return Err("corrupt definition revision: member identity mismatch".into());
-        }
-        members.push(member);
+        members.push(DefinitionMember::from_stored_body(
+            body, revision, reference,
+        )?);
     }
     Ok(members)
+}
+
+fn load_member_postgres(
+    client: &mut impl GenericClient,
+    revision: &DefinitionRevision,
+    member_kind: &str,
+    member_id: &str,
+) -> Result<Option<DefinitionMember>, String> {
+    let Some(reference) = revision
+        .members
+        .iter()
+        .find(|member| member.member_kind == member_kind && member.member_id == member_id)
+    else {
+        return Ok(None);
+    };
+    let row = client
+        .query_opt(
+            "SELECT body_json FROM sekai_definition_members
+             WHERE namespace=$1 AND member_digest=$2",
+            &[&revision.namespace, &reference.member_digest],
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "corrupt definition revision: member is missing".to_string())?;
+    let body: String = row.get(0);
+    Ok(Some(DefinitionMember::from_stored_body(
+        &body, revision, reference,
+    )?))
 }
 
 fn replay_postgres(
