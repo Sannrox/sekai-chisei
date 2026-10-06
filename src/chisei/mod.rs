@@ -1,8 +1,9 @@
+pub mod action_policy;
 pub mod affinity;
 pub mod billing_adapter;
 pub mod budget;
 pub mod cache_policy;
-pub mod capability;
+pub mod capacity;
 pub mod controller;
 pub mod data_quality;
 pub mod decision_ledger;
@@ -39,6 +40,7 @@ pub mod sekai_commit;
 pub mod sekai_facts;
 pub use sekai_provider::model_availability;
 pub mod model_routing;
+pub mod object_schema;
 pub mod pipeline;
 pub mod policy;
 pub mod policy_dry_run;

@@ -219,7 +219,7 @@ pub(super) fn to_proto_evidence_submission(
         received_at_ms: submission.received_at_ms,
         updated_at_ms: submission.updated_at_ms,
         descriptor: Some(to_proto_epistemic_descriptor(
-            &DomainEpistemicDescriptor::from_external_evidence(submission),
+            &submission.epistemic_descriptor(),
         )),
     }
 }

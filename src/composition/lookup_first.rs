@@ -12,9 +12,7 @@
 //! - Fixture suite + dual-run/shadow structural equality where practical.
 //! - No fleet-wide spend-% claim.
 
-use crate::chisei::epistemic_descriptor::{
-    EPISTEMIC_DESCRIPTOR_VERSION, EpistemicDescriptor as DomainEpistemicDescriptor,
-};
+use crate::chisei::epistemic_descriptor::EPISTEMIC_DESCRIPTOR_VERSION;
 use crate::chisei::principal::{PrincipalContext, PrincipalGrant};
 use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::db::store::{ChiseiDecisionStore, ChiseiStore, SekaiStore};
@@ -1211,10 +1209,12 @@ fn explanation_json(explanation: &retrieval::Explanation) -> Value {
 }
 
 fn descriptor_json(explanation: &retrieval::Explanation, source_rows_truncated: bool) -> Value {
-    serde_json::to_value(DomainEpistemicDescriptor::from_graph_explanation(
-        explanation,
-        source_rows_truncated,
-    ))
+    serde_json::to_value(
+        crate::sekai::chisei_projection::graph_explanation_descriptor(
+            explanation,
+            source_rows_truncated,
+        ),
+    )
     .expect("epistemic descriptor is serializable")
 }
 

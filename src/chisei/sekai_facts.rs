@@ -14,10 +14,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::chisei::object_schema::ObjectType;
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, Object};
-use crate::sekai::schema::ObjectType;
 
 /// Refusal reason when no Sekai is attached to this Chisei process.
 pub const SEKAI_NOT_ATTACHED: &str = "sekai_not_attached";
