@@ -14,11 +14,12 @@ use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
-use crate::domain::{Direction, Object};
+use crate::domain::{Direction, ListFilter, Object};
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
-    FindByExternalIdRequest, GetActionInstanceRequest, GetLinkedObjectsRequest, ListGrantsRequest,
-    ListSchemaTypesRequest,
+    FindByExternalIdRequest, GetActionInstanceRequest, GetLinkedObjectsRequest, GetObjectRequest,
+    ListFilter as ProtoListFilter, ListGrantsRequest, ListObjectsRequest, ListSchemaTypesRequest,
+    PropertyFilter as ProtoPropertyFilter,
 };
 use crate::sekai::schema::ObjectType;
 
@@ -181,6 +182,29 @@ impl SekaiFactReader for RemoteSekaiFactReader {
         })
     }
 
+    fn get_object(&self, id: &str) -> Result<Option<Object>, SekaiFactError> {
+        let id = id.to_string();
+        self.call(async move |mut client, credential| {
+            let request = authorized(GetObjectRequest { id }, credential)?;
+            match client.get_object(request).await {
+                Ok(response) => Ok(response
+                    .into_inner()
+                    .object
+                    .as_ref()
+                    .map(crate::grpc::sekai_service::from_proto_obj)),
+                Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+                Err(status) => Err(format!("sekai hop get_object: {status}")),
+            }
+        })
+    }
+
+    fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, SekaiFactError> {
+        let filter = filter.clone();
+        self.call(async move |mut client, credential| {
+            list_objects_pages(&mut client, credential, &filter).await
+        })
+    }
+
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError> {
         let kind = kind.to_string();
         self.call(async move |mut client, credential| {
@@ -248,6 +272,112 @@ impl SekaiFactReader for RemoteSekaiFactReader {
         Err(SekaiFactError::Unsupported(
             "graph retrieval over the Sekai hop",
         ))
+    }
+}
+
+/// Walk ListObjects pages until the complete matching set (or the caller's
+/// explicit limit) is collected. A zero filter limit is a complete-set read
+/// in-process (`list_all_objects`); the RPC defaults that to 100 rows and
+/// caps a page at [`crate::domain::MAX_LIST_LIMIT`].
+async fn list_objects_pages(
+    client: &mut SekaiServiceClient<Channel>,
+    credential: Option<String>,
+    filter: &ListFilter,
+) -> Result<Vec<Object>, String> {
+    let want = if filter.limit <= 0 {
+        None
+    } else {
+        Some(filter.limit as usize)
+    };
+    // Cursor pages bind `limit` into the query digest, so the RPC page size
+    // must stay constant for the whole walk. Request MAX when the caller
+    // wants a complete set or more than one page; smaller explicit limits
+    // fit in a single page.
+    let rpc_limit = match want {
+        Some(limit) if limit <= crate::domain::MAX_LIST_LIMIT as usize => limit as i32,
+        _ => crate::domain::MAX_LIST_LIMIT,
+    };
+    let namespaced = filter
+        .namespace
+        .as_deref()
+        .is_some_and(|namespace| !namespace.is_empty());
+    let mut collected = Vec::new();
+    let mut page_token = String::new();
+    let mut offset = filter.offset.max(0);
+    loop {
+        if want.is_some_and(|limit| collected.len() >= limit) {
+            break;
+        }
+        let mut proto = proto_list_filter(filter);
+        proto.limit = rpc_limit;
+        // Cursor pages require offset 0; the token already encodes the resume.
+        proto.offset = if page_token.is_empty() { offset } else { 0 };
+        let request = authorized(
+            ListObjectsRequest {
+                filter: Some(proto),
+                page_token: page_token.clone(),
+            },
+            credential.clone(),
+        )?;
+        let inner = client
+            .list_objects(request)
+            .await
+            .map_err(|status| format!("sekai hop list_objects: {status}"))?
+            .into_inner();
+        let page_len = inner.objects.len();
+        collected.extend(
+            inner
+                .objects
+                .iter()
+                .map(crate::grpc::sekai_service::from_proto_obj),
+        );
+        if let Some(limit) = want
+            && collected.len() >= limit
+        {
+            collected.truncate(limit);
+            break;
+        }
+        if page_len == 0 {
+            break;
+        }
+        if !inner.next_page_token.is_empty() {
+            page_token = inner.next_page_token;
+            continue;
+        }
+        if namespaced {
+            break;
+        }
+        // No cursor without a namespace filter. Advance offset until `total`
+        // is exhausted so the hop still matches in-process.
+        let total = inner.total.max(0) as usize;
+        offset = offset.saturating_add(page_len as i32);
+        page_token.clear();
+        if (offset as usize) >= total {
+            break;
+        }
+    }
+    Ok(collected)
+}
+
+fn proto_list_filter(filter: &ListFilter) -> ProtoListFilter {
+    ProtoListFilter {
+        kind: filter.kind.clone().unwrap_or_default(),
+        name: filter.name.clone().unwrap_or_default(),
+        namespace: filter.namespace.clone().unwrap_or_default(),
+        property_filters: filter
+            .property_filters
+            .iter()
+            .map(|property| ProtoPropertyFilter {
+                key: property.key.clone(),
+                op: property.op.clone(),
+                value: property.value.clone(),
+            })
+            .collect(),
+        limit: filter.limit,
+        offset: filter.offset,
+        order_by: filter.order_by.clone(),
+        descending: filter.descending,
+        interface_filter: filter.interface_filter.clone(),
     }
 }
 
@@ -484,6 +614,72 @@ mod tests {
             reader.in_process_store(),
             Err(SekaiFactError::Unsupported(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_objects_reads_every_page_over_the_hop() {
+        let sekai = SekaiStore::memory();
+        sekai
+            .runtime()
+            .ensure_team_namespace("acme", "alice", PrincipalRole::Viewer.into(), "local")
+            .unwrap();
+        let count = crate::domain::MAX_LIST_LIMIT as usize + 50;
+        for i in 0..count {
+            sekai
+                .create_object(&Object {
+                    id: format!("page-{i}"),
+                    kind: "widget".into(),
+                    name: format!("page-{i}"),
+                    namespace: "acme".into(),
+                    external_id: format!("widget:page-{i}"),
+                    properties: Default::default(),
+                    created: i as i64,
+                    updated: i as i64,
+                })
+                .unwrap();
+        }
+        let endpoint = serve_sekai(sekai).await;
+        let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
+        let filter = ListFilter {
+            kind: Some("widget".into()),
+            namespace: Some("acme".into()),
+            ..Default::default()
+        };
+        let objects = reader.list_objects(&filter).unwrap();
+        assert_eq!(objects.len(), count, "complete-set hop must walk pages");
+        assert_eq!(
+            reader
+                .list_objects(&ListFilter {
+                    limit: 12,
+                    ..filter.clone()
+                })
+                .unwrap()
+                .len(),
+            12
+        );
+        let over_max = crate::domain::MAX_LIST_LIMIT + 1;
+        assert_eq!(
+            reader
+                .list_objects(&ListFilter {
+                    limit: over_max,
+                    ..filter.clone()
+                })
+                .unwrap()
+                .len(),
+            over_max as usize
+        );
+        let skipped = reader
+            .list_objects(&ListFilter {
+                offset: 5,
+                ..filter
+            })
+            .unwrap();
+        assert_eq!(skipped.len(), count - 5);
+        let unique = skipped
+            .iter()
+            .map(|object| object.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), skipped.len());
     }
 
     #[tokio::test(flavor = "multi_thread")]

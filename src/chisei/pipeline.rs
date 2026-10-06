@@ -473,7 +473,7 @@ fn safe_evidence_scalar(value: &serde_json::Value) -> Option<String> {
 
 fn collect_external_evidence_context(
     req: &mut PipelineRequest,
-    db: &ChiseiStore,
+    _db: &ChiseiStore,
     target_object_ids: &[String],
 ) -> Vec<String> {
     const DISCLOSABLE_FIELDS: [&str; 5] = ["status", "result", "outcome", "state", "value"];
@@ -483,17 +483,24 @@ fn collect_external_evidence_context(
         .cloned()
         .collect::<Vec<_>>();
     allowed_evidence_classes.sort();
-    let evidence = db
-        .runtime()
-        .list_usable_evidence_for_targets(
-            target_object_ids,
-            &allowed_evidence_classes
-                .iter()
-                .map(|class| (class.source_type.clone(), class.evidence_type.clone()))
-                .collect::<Vec<_>>(),
-            chrono::Utc::now().timestamp_millis(),
-            8,
-        )
+    let evidence = req
+        .sekai_facts
+        .reader()
+        .in_process_store()
+        .ok()
+        .and_then(|sekai| {
+            sekai
+                .list_usable_evidence_for_targets(
+                    target_object_ids,
+                    &allowed_evidence_classes
+                        .iter()
+                        .map(|class| (class.source_type.clone(), class.evidence_type.clone()))
+                        .collect::<Vec<_>>(),
+                    chrono::Utc::now().timestamp_millis(),
+                    8,
+                )
+                .ok()
+        })
         .unwrap_or_default();
     let mut lines = Vec::new();
     for item in evidence {
@@ -557,26 +564,26 @@ fn collect_external_evidence_context(
 
 pub fn applicable_evidence_classes(
     req: &PipelineRequest,
-    db: &ChiseiStore,
+    _db: &ChiseiStore,
 ) -> Result<Vec<EvidenceContextClass>, String> {
     let target_object_ids = resolve_context_objects(req)
         .into_iter()
         .map(|object| object.id)
         .collect::<Vec<_>>();
-    db.runtime()
-        .list_usable_evidence_classes_for_targets(
+    let classes = match req.sekai_facts.reader().in_process_store() {
+        Ok(sekai) => sekai.list_usable_evidence_classes_for_targets(
             &target_object_ids,
             chrono::Utc::now().timestamp_millis(),
-        )
-        .map(|classes| {
-            classes
-                .into_iter()
-                .map(|(source_type, evidence_type)| EvidenceContextClass {
-                    source_type,
-                    evidence_type,
-                })
-                .collect()
+        )?,
+        Err(_) => Vec::new(),
+    };
+    Ok(classes
+        .into_iter()
+        .map(|(source_type, evidence_type)| EvidenceContextClass {
+            source_type,
+            evidence_type,
         })
+        .collect())
 }
 
 fn object_implements(facts: &dyn SekaiFactReader, obj: &Object, interface_name: &str) -> bool {
@@ -1884,8 +1891,9 @@ impl Step for RiskStep {
         let mut risk = 0.0f64;
         let mut type_cache = HashMap::new();
         let snapshots = capacity::snapshots_from_objects(
-            db.runtime()
-                .list_all_objects(&crate::domain::ListFilter {
+            facts
+                .reader()
+                .list_objects(&crate::domain::ListFilter {
                     kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
                     ..Default::default()
                 })
@@ -1993,12 +2001,13 @@ impl Step for RiskStep {
     }
 }
 
-fn raw_risk_score(req: &PipelineRequest, db: &ChiseiStore) -> f64 {
+fn raw_risk_score(req: &PipelineRequest, _db: &ChiseiStore) -> f64 {
     let facts = req.sekai_facts.clone();
     let mut risk = 0.0f64;
     let snapshots = capacity::snapshots_from_objects(
-        db.runtime()
-            .list_all_objects(&crate::domain::ListFilter {
+        facts
+            .reader()
+            .list_objects(&crate::domain::ListFilter {
                 kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
                 ..Default::default()
             })
@@ -2131,7 +2140,7 @@ impl Step for ModelSelectStep {
         "model_select"
     }
 
-    fn run(&self, req: &mut PipelineRequest, db: &ChiseiStore) -> StepDecision {
+    fn run(&self, req: &mut PipelineRequest, _db: &ChiseiStore) -> StepDecision {
         if !req.model.is_empty() {
             return StepDecision {
                 step: String::new(),
@@ -2146,7 +2155,7 @@ impl Step for ModelSelectStep {
         let recommended = if namespace.is_empty() {
             String::new()
         } else {
-            crate::chisei::affinity::get_affinity(db, &namespace).best_model
+            crate::chisei::affinity::get_affinity(req.sekai_facts.reader(), &namespace).best_model
         };
         let model = if !recommended.is_empty() {
             recommended

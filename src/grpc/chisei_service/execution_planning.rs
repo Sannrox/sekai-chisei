@@ -72,7 +72,10 @@ impl ChiseiServiceImpl {
             operation_risk_override: None,
             sekai_facts: self.sekai_facts.clone(),
         };
-        let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
+        let affinity = crate::chisei::affinity::get_affinity(
+            self.sekai_facts.reader(),
+            namespace_hint.as_str(),
+        );
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
         let evidence_context_gates =
             self.applicable_evidence_context_gates(&pipeline_req, context_expansion_gate.allowed)?;

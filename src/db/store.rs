@@ -76,6 +76,85 @@ impl SekaiStore {
     pub fn update_object(&self, object: &crate::domain::Object) -> Result<(), String> {
         self.inner.update_object(object)
     }
+
+    pub fn create_object(&self, object: &crate::domain::Object) -> Result<(), String> {
+        self.inner.create_object(object)
+    }
+
+    pub fn create_link(&self, link: &crate::domain::Link) -> Result<(), String> {
+        self.inner.create_link(link)
+    }
+
+    pub fn find_by_external_id(
+        &self,
+        external_id: &str,
+    ) -> Result<Option<crate::domain::Object>, String> {
+        self.inner.find_by_external_id(external_id)
+    }
+
+    pub fn get_linked_objects(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &crate::domain::Direction,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        self.inner
+            .get_linked_objects(object_id, relation, direction)
+    }
+
+    pub fn list_objects(
+        &self,
+        filter: &crate::domain::ListFilter,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        self.inner.list_all_objects(filter)
+    }
+
+    #[cfg(test)]
+    pub fn create_principal_grant(
+        &self,
+        grant_id: &str,
+        object_id: &str,
+        grant: &crate::chisei::principal::PrincipalGrant,
+        created: i64,
+    ) -> Result<(), String> {
+        self.inner
+            .create_principal_grant(grant_id, object_id, grant, created)
+    }
+
+    #[cfg(test)]
+    pub fn delete_grant(&self, grant_id: &str) -> Result<(), String> {
+        self.inner.delete_grant(grant_id).map(|_| ())
+    }
+
+    pub fn list_usable_evidence_for_targets(
+        &self,
+        target_object_ids: &[String],
+        allowed_evidence_classes: &[(String, String)],
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::evidence_store::UsableEvidenceContext>, String> {
+        self.inner.list_usable_evidence_for_targets(
+            target_object_ids,
+            allowed_evidence_classes,
+            now_ms,
+            limit,
+        )
+    }
+
+    pub fn list_usable_evidence_classes_for_targets(
+        &self,
+        target_object_ids: &[String],
+        now_ms: i64,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.inner
+            .list_usable_evidence_classes_for_targets(target_object_ids, now_ms)
+    }
+}
+
+/// In-process fixture: one physical store behind both typed handles.
+#[cfg(test)]
+pub fn paired_memory() -> (SekaiStore, ChiseiStore) {
+    split_shared_runtime(Arc::new(RuntimeDb::memory()))
 }
 
 impl ChiseiStore {
@@ -110,15 +189,16 @@ impl ChiseiStore {
         Arc::ptr_eq(&self.inner, &sekai.inner)
     }
 
-    pub fn runtime(&self) -> &RuntimeDb {
+    pub(crate) fn runtime(&self) -> &RuntimeDb {
         &self.inner
     }
 
-    pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
+    #[cfg(test)]
+    pub(crate) fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
     }
 
-    pub fn decision_runtime(&self) -> &RuntimeDb {
+    pub(crate) fn decision_runtime(&self) -> &RuntimeDb {
         &self.decisions
     }
 }
@@ -191,12 +271,24 @@ mod tests {
     #[test]
     fn typed_handles_do_not_coerce_to_runtime_db() {
         let production = include_str!("store.rs")
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests {")
             .next()
             .expect("production handle module");
         assert!(
             !production.contains("impl std::ops::Deref"),
             "typed handles must not Deref to RuntimeDb"
+        );
+        let chisei_impl = production
+            .split("impl ChiseiStore {")
+            .nth(1)
+            .expect("ChiseiStore impl");
+        assert!(
+            !chisei_impl.contains("pub fn runtime("),
+            "ChiseiStore must not expose RuntimeDb on its public surface"
+        );
+        assert!(
+            !chisei_impl.contains("pub fn runtime_arc("),
+            "ChiseiStore must not expose RuntimeDb on its public surface"
         );
         assert!(
             !production.contains("impl From<"),

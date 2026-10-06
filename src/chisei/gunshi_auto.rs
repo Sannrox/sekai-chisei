@@ -19,6 +19,7 @@ use crate::chisei::gunshi_policy::{
     ActiveAllocationPolicy, AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
     PolicyTransition, PolicyTransitionDecision, apply_promotion, monitor_and_rollback,
 };
+use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::db::store::{ChiseiDecisionStore, ChiseiGunshiStore, ChiseiStore};
 
 pub const STATE_CONTRACT_VERSION: &str = "gunshi.allocation-control/v1";
@@ -508,6 +509,7 @@ pub fn set_kill_switch(
 /// Authorize auto-dispatch for a plan under the durable namespace control plane.
 pub fn authorize_namespace_auto_dispatch(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     namespace: &str,
     plan: &AllocationPlan,
     operation: &PendingOperation,
@@ -534,7 +536,7 @@ pub fn authorize_namespace_auto_dispatch(
     };
     let calibration = advisory_scorecard(db, namespace)?;
     let policy = state.effective_dispatch_policy();
-    let decision = authorize_dispatch(plan, operation, capacity, &policy, &calibration, db)?;
+    let decision = authorize_dispatch(plan, operation, capacity, &policy, &calibration, db, facts)?;
     let attrs = receipt_attributes(
         decision.authorized,
         plan,

@@ -3136,8 +3136,8 @@ mod tests {
 
     #[test]
     fn evidence_reassessment_is_idempotent_and_preserves_active_lineage() {
-        let db = ChiseiStore::memory();
-        db.runtime()
+        let (sekai, db) = crate::db::store::paired_memory();
+        sekai
             .create_object(&Object {
                 id: "namespace-payments".into(),
                 kind: "namespace".into(),
@@ -3149,7 +3149,7 @@ mod tests {
                 updated: 1,
             })
             .unwrap();
-        db.runtime()
+        sekai
             .create_principal_grant(
                 "grant-payments",
                 "namespace-payments",
@@ -3218,10 +3218,10 @@ mod tests {
         assert!(replay.idempotent);
         assert_eq!(replay.candidate, first.candidate);
 
-        db.runtime().delete_grant("grant-payments").unwrap();
+        sekai.delete_grant("grant-payments").unwrap();
         let denied_replay = db.reassess_kioku_memory(request.clone()).unwrap_err();
         assert!(denied_replay.contains("classification"));
-        db.runtime()
+        sekai
             .create_principal_grant(
                 "grant-payments-restored",
                 "namespace-payments",
@@ -3524,7 +3524,7 @@ mod tests {
 
     #[test]
     fn retrieves_active_memories_by_scope_affinity_and_classification() {
-        let db = ChiseiStore::memory();
+        let (sekai, db) = crate::db::store::paired_memory();
         for object in [
             Object {
                 id: "namespace-payments".into(),
@@ -3557,14 +3557,14 @@ mod tests {
                 updated: 1,
             },
         ] {
-            db.runtime().create_object(&object).unwrap();
+            sekai.create_object(&object).unwrap();
         }
         for (grant_id, object_id, principal) in [
             ("grant-payments", "namespace-payments", "agent:planner"),
             ("grant-other", "namespace-other", "agent:other"),
             ("grant-component", "component:migrations", "agent:planner"),
         ] {
-            db.runtime()
+            sekai
                 .create_principal_grant(
                     grant_id,
                     object_id,
