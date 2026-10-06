@@ -17,7 +17,10 @@ deploy, or authorize invocation. See
 - optional predecessor, supersession, revocation, and revocation timestamp
 
 Closed member kinds are `change_set`, `action_type`, `ontology`, and
-`evaluation`.
+`evaluation`. The evidence and finding domain package
+(`pkg:feedback.evidence-finding/v1`, ADR 0095) certifies ontology, Action
+type, and evaluation members from `tests/fixtures/feedback/`. It does not
+package live instances and is not a runtime grant.
 
 ## Operator workflow
 

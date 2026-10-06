@@ -200,9 +200,13 @@ pub fn preview_object_action(
     )
     .map_err(ObjectActionProjectionError::InvalidArgument)?;
 
-    if let Err(error) =
-        action_object_mutation::plan(db, &type_def, &object.namespace, parameters_json)
-    {
+    if let Err(error) = action_object_mutation::plan(
+        db,
+        &type_def,
+        &object.namespace,
+        parameters_json,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
         return Ok(invalid_preview(
             &type_def,
             object,

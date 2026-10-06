@@ -42,6 +42,7 @@ pub mod federation_conflict;
 pub mod federation_network;
 pub mod federation_profile;
 pub mod federation_revocation;
+pub mod feedback_package;
 pub mod function;
 pub mod geospatial;
 pub mod governed_action_type;
