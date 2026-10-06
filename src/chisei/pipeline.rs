@@ -586,11 +586,26 @@ pub fn applicable_evidence_classes(
         .collect())
 }
 
-fn object_implements(facts: &dyn SekaiFactReader, obj: &Object, interface_name: &str) -> bool {
-    facts
-        .get_object_type(&obj.kind)
+fn cached_object_type<'a>(
+    facts: &dyn SekaiFactReader,
+    type_cache: &'a mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    kind: &str,
+) -> &'a Result<Option<ObjectType>, SekaiFactError> {
+    type_cache
+        .entry(kind.to_string())
+        .or_insert_with(|| facts.get_object_type(kind))
+}
+
+fn object_implements(
+    facts: &dyn SekaiFactReader,
+    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    obj: &Object,
+    interface_name: &str,
+) -> bool {
+    cached_object_type(facts, type_cache, &obj.kind)
+        .as_ref()
         .ok()
-        .flatten()
+        .and_then(|object_type| object_type.as_ref())
         .is_some_and(|object_type| {
             object_type
                 .implements
@@ -599,14 +614,23 @@ fn object_implements(facts: &dyn SekaiFactReader, obj: &Object, interface_name: 
         })
 }
 
-fn is_evaluable_context(facts: &dyn SekaiFactReader, obj: &Object) -> bool {
+fn is_evaluable_context(
+    facts: &dyn SekaiFactReader,
+    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    obj: &Object,
+) -> bool {
     obj.kind == KIND_COMPONENT
-        || object_implements(facts, obj, INTERFACE_EVALUABLE)
-        || object_implements(facts, obj, INTERFACE_RISK_SCORED)
+        || object_implements(facts, type_cache, obj, INTERFACE_EVALUABLE)
+        || object_implements(facts, type_cache, obj, INTERFACE_RISK_SCORED)
 }
 
-fn is_degraded_evaluable(facts: &dyn SekaiFactReader, obj: &Object, max_success_rate: i32) -> bool {
-    is_evaluable_context(facts, obj)
+fn is_degraded_evaluable(
+    facts: &dyn SekaiFactReader,
+    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    obj: &Object,
+    max_success_rate: i32,
+) -> bool {
+    is_evaluable_context(facts, type_cache, obj)
         && obj
             .properties
             .get("success_rate")
@@ -636,9 +660,7 @@ fn filter_context_property(
     record: &mut egress::ContextEgressRecord,
     external: bool,
 ) -> Option<String> {
-    let object_type = type_cache
-        .entry(obj.kind.clone())
-        .or_insert_with(|| facts.get_object_type(&obj.kind));
+    let object_type = cached_object_type(facts, type_cache, &obj.kind);
     match object_type {
         Ok(object_type) => {
             egress::filter_property_with_schema(obj, field, object_type.as_ref(), record, external)
@@ -886,7 +908,7 @@ fn run_object_context_enrich(
             details.push(format!("success_rate: {}", rate));
             has_content = true;
         }
-        if object_implements(facts.reader(), &obj, INTERFACE_RISK_SCORED)
+        if object_implements(facts.reader(), &mut type_cache, &obj, INTERFACE_RISK_SCORED)
             && obj
                 .properties
                 .get("risk_score")
@@ -903,7 +925,7 @@ fn run_object_context_enrich(
             details.push(format!("risk_score: {}", score));
             has_content = true;
         }
-        if object_implements(facts.reader(), &obj, INTERFACE_RISK_SCORED)
+        if object_implements(facts.reader(), &mut type_cache, &obj, INTERFACE_RISK_SCORED)
             && obj
                 .properties
                 .get("risk_reason")
@@ -1763,7 +1785,7 @@ impl Step for SpecEnrichStep {
                 if !context_object_authorized(req, &comp) {
                     continue;
                 }
-                if !is_evaluable_context(facts.reader(), &comp) {
+                if !is_evaluable_context(facts.reader(), &mut type_cache, &comp) {
                     continue;
                 }
                 let descriptor = EpistemicDescriptor::unknown();
@@ -1945,7 +1967,7 @@ impl Step for RiskStep {
                 .collect::<Vec<_>>();
             let degraded = components
                 .iter()
-                .filter(|c| is_degraded_evaluable(facts.reader(), c, 30))
+                .filter(|c| is_degraded_evaluable(facts.reader(), &mut type_cache, c, 30))
                 .count();
             if degraded > 0 {
                 signals.push(format!("{degraded} degraded evaluable object(s) detected"));
@@ -1953,10 +1975,13 @@ impl Step for RiskStep {
             }
             let mut exposed_high_risk = 0usize;
             let mut redacted_high_risk = 0usize;
-            for candidate in std::iter::once(&context)
+            let scored = std::iter::once(&context)
                 .chain(components.iter())
-                .filter(|c| object_implements(facts.reader(), c, INTERFACE_RISK_SCORED))
-            {
+                .filter(|c| {
+                    object_implements(facts.reader(), &mut type_cache, c, INTERFACE_RISK_SCORED)
+                })
+                .collect::<Vec<_>>();
+            for candidate in scored {
                 let mut record = egress::new_record(candidate);
                 let exposed_score = filter_context_property(
                     facts.reader(),
@@ -2003,6 +2028,7 @@ impl Step for RiskStep {
 
 fn raw_risk_score(req: &PipelineRequest, _db: &ChiseiStore) -> f64 {
     let facts = req.sekai_facts.clone();
+    let mut type_cache = HashMap::new();
     let mut risk = 0.0f64;
     let snapshots = capacity::snapshots_from_objects(
         facts
@@ -2033,13 +2059,20 @@ fn raw_risk_score(req: &PipelineRequest, _db: &ChiseiStore) -> f64 {
             .collect::<Vec<_>>();
         if components
             .iter()
-            .any(|component| is_degraded_evaluable(facts.reader(), component, 30))
+            .any(|component| is_degraded_evaluable(facts.reader(), &mut type_cache, component, 30))
         {
             risk = risk.max(0.7);
         }
         if std::iter::once(&context)
             .chain(components.iter())
-            .filter(|candidate| object_implements(facts.reader(), candidate, INTERFACE_RISK_SCORED))
+            .filter(|candidate| {
+                object_implements(
+                    facts.reader(),
+                    &mut type_cache,
+                    candidate,
+                    INTERFACE_RISK_SCORED,
+                )
+            })
             .any(|candidate| risk_score_value(candidate).is_some_and(|score| score >= 0.7))
         {
             risk = risk.max(0.7);
