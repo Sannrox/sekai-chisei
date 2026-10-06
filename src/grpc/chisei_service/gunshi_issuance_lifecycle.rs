@@ -63,8 +63,12 @@ impl ChiseiServiceImpl {
         }
         for (namespace, operation_class) in std::mem::take(&mut scopes) {
             input.kioku_evidence.extend(
-                crate::chisei::gunshi::load_kioku_evidence(&self.db, &namespace, &operation_class)
-                    .map_err(Status::internal)?,
+                crate::chisei::gunshi::load_kioku_evidence(
+                    self.sekai_facts.reader(),
+                    &namespace,
+                    &operation_class,
+                )
+                .map_err(Status::internal)?,
             );
         }
         input
@@ -110,6 +114,7 @@ impl ChiseiServiceImpl {
             let (mut authorization, mut attributes) =
                 crate::chisei::gunshi_auto::authorize_namespace_auto_dispatch(
                     &self.db,
+                    self.sekai_facts.reader(),
                     &plan.namespace,
                     plan,
                     operation,

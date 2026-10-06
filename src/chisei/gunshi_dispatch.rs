@@ -11,6 +11,7 @@ use crate::chisei::gunshi::{
     load_kioku_evidence,
 };
 use crate::chisei::receipt::ReceiptEventKind;
+use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::db::store::{ChiseiReceiptStore, ChiseiStore};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +116,7 @@ pub fn authorize_dispatch(
     policy: &AutoDispatchPolicy,
     calibration: &AdvisoryScorecard,
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
 ) -> Result<DispatchAuthorization, String> {
     plan.validate()?;
     operation.validate()?;
@@ -200,7 +202,8 @@ pub fn authorize_dispatch(
         reasons.push("selected model exceeds the live dispatch budget envelope".into());
     }
     if policy.require_governed_evidence {
-        let governed = load_kioku_evidence(db, &operation.namespace, &operation.operation_class)?;
+        let governed =
+            load_kioku_evidence(facts, &operation.namespace, &operation.operation_class)?;
         let mut has_governed_evidence = false;
         for reference in plan
             .evidence
@@ -471,9 +474,9 @@ mod tests {
         }
     }
 
-    fn db() -> ChiseiStore {
-        let db = ChiseiStore::memory();
-        db.runtime()
+    fn fixtures() -> (crate::chisei::sekai_facts::SekaiFacts, ChiseiStore) {
+        let (sekai, db) = crate::db::store::paired_memory();
+        sekai
             .create_object(&Object {
                 id: "memory-1".into(),
                 kind: crate::domain::KIND_LEARNING.into(),
@@ -559,7 +562,29 @@ mod tests {
             artifact: None,
         })
         .unwrap();
-        db
+        (
+            crate::chisei::sekai_facts::SekaiFacts::in_process(sekai),
+            db,
+        )
+    }
+
+    fn decide(
+        plan: &AllocationPlan,
+        operation: &PendingOperation,
+        capacity: &CapacityEnvelope,
+        policy: &AutoDispatchPolicy,
+        calibration: &AdvisoryScorecard,
+    ) -> Result<DispatchAuthorization, String> {
+        let (facts, db) = fixtures();
+        authorize_dispatch(
+            plan,
+            operation,
+            capacity,
+            policy,
+            calibration,
+            &db,
+            facts.reader(),
+        )
     }
 
     fn calibrated() -> AdvisoryScorecard {
@@ -578,15 +603,8 @@ mod tests {
 
     #[test]
     fn calibrated_low_risk_allocation_can_be_authorized() {
-        let decision = authorize_dispatch(
-            &plan(),
-            &operation(),
-            &capacity(),
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision =
+            decide(&plan(), &operation(), &capacity(), &policy(), &calibrated()).unwrap();
         assert!(decision.authorized);
         assert_eq!(decision.mode, DispatchMode::Automatic);
         assert!(decision.reasons.is_empty());
@@ -597,13 +615,12 @@ mod tests {
         let plan = plan();
         let mut high_risk_operation = operation();
         high_risk_operation.risk = OperationRisk::High;
-        let decision = authorize_dispatch(
+        let decision = decide(
             &plan,
             &high_risk_operation,
             &capacity(),
             &policy(),
             &calibrated(),
-            &db(),
         )
         .unwrap();
         assert!(!decision.authorized);
@@ -616,13 +633,12 @@ mod tests {
 
         let mut review_plan = plan;
         review_plan.verification.human_review_required = true;
-        let decision = authorize_dispatch(
+        let decision = decide(
             &review_plan,
             &operation(),
             &capacity(),
             &policy(),
             &calibrated(),
-            &db(),
         )
         .unwrap();
         assert!(!decision.authorized);
@@ -652,15 +668,7 @@ mod tests {
         calibration.comparisons = 2;
         calibration.accepted = 1;
         calibration.observed_outcomes = 2;
-        let decision = authorize_dispatch(
-            &plan,
-            &operation(),
-            &capacity(),
-            &policy(),
-            &calibration,
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan, &operation(), &capacity(), &policy(), &calibration).unwrap();
         assert!(!decision.authorized);
         assert_eq!(decision.mode, DispatchMode::AdvisoryOnly);
         assert_eq!(decision.reasons.len(), 2);
@@ -670,15 +678,7 @@ mod tests {
     fn forgeable_evidence_markers_do_not_unlock_automatic_dispatch() {
         let mut plan = plan();
         plan.evidence[0].reference = "not-a-governed-memory".into();
-        let decision = authorize_dispatch(
-            &plan,
-            &operation(),
-            &capacity(),
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan, &operation(), &capacity(), &policy(), &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -693,15 +693,7 @@ mod tests {
         let mut calibration = calibrated();
         calibration.accepted = 100;
         assert_eq!(
-            authorize_dispatch(
-                &plan(),
-                &operation(),
-                &capacity(),
-                &policy(),
-                &calibration,
-                &db(),
-            )
-            .unwrap_err(),
+            decide(&plan(), &operation(), &capacity(), &policy(), &calibration,).unwrap_err(),
             "advisory scorecard counts are inconsistent"
         );
     }
@@ -711,15 +703,7 @@ mod tests {
         let mut capacity = capacity();
         capacity.policy_version = "governance-v2".into();
         capacity.agents[0].available_slots = 0;
-        let decision = authorize_dispatch(
-            &plan(),
-            &operation(),
-            &capacity,
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan(), &operation(), &capacity, &policy(), &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -749,15 +733,7 @@ mod tests {
         capacity.max_parallel_attempts = 2;
         capacity.budget_remaining_usd_micros = 20_000;
 
-        let decision = authorize_dispatch(
-            &plan,
-            &operation(),
-            &capacity,
-            &policy,
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan, &operation(), &capacity, &policy, &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -780,15 +756,7 @@ mod tests {
         let mut capacity = capacity();
         capacity.agents[0].tools.insert("shell".into());
 
-        let decision = authorize_dispatch(
-            &plan,
-            &operation(),
-            &capacity,
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan, &operation(), &capacity, &policy(), &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -811,9 +779,7 @@ mod tests {
         let mut capacity = capacity();
         capacity.max_parallel_attempts = 2;
 
-        let decision =
-            authorize_dispatch(&plan, &operation, &capacity, &policy, &calibrated(), &db())
-                .unwrap();
+        let decision = decide(&plan, &operation, &capacity, &policy, &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -828,15 +794,7 @@ mod tests {
         let mut plan = plan();
         plan.verification.acceptance_criteria.clear();
         plan.verification.checks.clear();
-        let decision = authorize_dispatch(
-            &plan,
-            &operation(),
-            &capacity(),
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan, &operation(), &capacity(), &policy(), &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision
@@ -850,15 +808,7 @@ mod tests {
     fn live_model_cost_is_rechecked_at_dispatch() {
         let mut capacity = capacity();
         capacity.model_profiles[0].cost_per_attempt_usd_micros = 11_000;
-        let decision = authorize_dispatch(
-            &plan(),
-            &operation(),
-            &capacity,
-            &policy(),
-            &calibrated(),
-            &db(),
-        )
-        .unwrap();
+        let decision = decide(&plan(), &operation(), &capacity, &policy(), &calibrated()).unwrap();
         assert!(!decision.authorized);
         assert!(
             decision

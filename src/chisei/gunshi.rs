@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::db::store::ChiseiStore;
+use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::domain::{KIND_LEARNING, ListFilter};
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
@@ -621,15 +621,17 @@ pub fn recommend_advisory(
 /// Load governed learning objects without bypassing their namespace/status
 /// metadata. Invalid legacy rows are ignored rather than trusted implicitly.
 pub fn load_kioku_evidence(
-    db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     namespace: &str,
     operation_class: &str,
 ) -> Result<Vec<KiokuEvidence>, String> {
-    let objects = db.runtime().list_all_objects(&ListFilter {
-        kind: Some(KIND_LEARNING.into()),
-        namespace: Some(namespace.trim().to_string()),
-        ..Default::default()
-    })?;
+    let objects = facts
+        .list_objects(&ListFilter {
+            kind: Some(KIND_LEARNING.into()),
+            namespace: Some(namespace.trim().to_string()),
+            ..Default::default()
+        })
+        .map_err(|error| error.to_string())?;
     let mut evidence = objects
         .into_iter()
         .filter_map(|object| {
@@ -1471,8 +1473,8 @@ mod tests {
         use crate::domain::Object;
         use std::collections::HashMap;
 
-        let db = ChiseiStore::memory();
-        db.runtime()
+        let sekai = crate::db::store::SekaiStore::memory();
+        sekai
             .create_object(&Object {
                 id: "learning-1".into(),
                 kind: KIND_LEARNING.into(),
@@ -1491,8 +1493,9 @@ mod tests {
                 updated: 2,
             })
             .unwrap();
+        let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(sekai);
 
-        let loaded = load_kioku_evidence(&db, "support", "triage").unwrap();
+        let loaded = load_kioku_evidence(facts.reader(), "support", "triage").unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].score, 0.87);
         assert_eq!(loaded[0].observed_at_ms, 2_000);

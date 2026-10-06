@@ -6,7 +6,7 @@ use crate::chisei::object_schema::ObjectType;
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
-use crate::domain::{Direction, Object};
+use crate::domain::{Direction, ListFilter, Object};
 
 fn read<T>(result: Result<T, String>) -> Result<T, SekaiFactError> {
     result.map_err(SekaiFactError::Read)
@@ -14,7 +14,7 @@ fn read<T>(result: Result<T, String>) -> Result<T, SekaiFactError> {
 
 impl SekaiFactReader for SekaiStore {
     fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, SekaiFactError> {
-        read(self.runtime().find_by_external_id(external_id))
+        read(SekaiStore::find_by_external_id(self, external_id))
     }
 
     fn find_namespace_boundary(&self, namespace: &str) -> Result<Option<Object>, SekaiFactError> {
@@ -38,16 +38,23 @@ impl SekaiFactReader for SekaiStore {
         read(self.runtime().get_object_type(kind))
     }
 
+    fn get_object(&self, id: &str) -> Result<Option<Object>, SekaiFactError> {
+        read(SekaiStore::get_object(self, id))
+    }
+
+    fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, SekaiFactError> {
+        read(SekaiStore::list_objects(self, filter))
+    }
+
     fn get_linked_objects(
         &self,
         object_id: &str,
         relation: &str,
         direction: &Direction,
     ) -> Result<Vec<Object>, SekaiFactError> {
-        read(
-            self.runtime()
-                .get_linked_objects(object_id, relation, direction),
-        )
+        read(SekaiStore::get_linked_objects(
+            self, object_id, relation, direction,
+        ))
     }
 
     fn in_process_store(&self) -> Result<&SekaiStore, SekaiFactError> {

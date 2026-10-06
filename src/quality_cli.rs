@@ -1,9 +1,10 @@
 //! sekaictl admin quality rule commands (#681).
 
 use crate::chisei::data_quality::{self, PublishDataQualityRule};
+use crate::chisei::sekai_facts::SekaiFacts;
+use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::store::ChiseiStore;
-use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use chrono::Utc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -29,10 +30,19 @@ pub async fn run_quality_command(args: Vec<String>) -> Result<(), BoxErr> {
     }
 }
 
-async fn open_db() -> Result<std::sync::Arc<crate::db::runtime_db::RuntimeDb>, BoxErr> {
+struct OpenedStores {
+    chisei: ChiseiStore,
+    facts: SekaiFacts,
+}
+
+fn open_stores() -> Result<OpenedStores, BoxErr> {
     let cfg = Config::from_env();
-    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
-    Ok(backend.database())
+    let layout = CombinedStoreLayout::from_env(&cfg.db_path).map_err(std::io::Error::other)?;
+    let (sekai, chisei) = layout.handles();
+    Ok(OpenedStores {
+        chisei,
+        facts: SekaiFacts::in_process(sekai),
+    })
 }
 
 struct PublishConfig {
@@ -63,9 +73,9 @@ enum MutateOp {
 }
 
 async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
+    let stores = open_stores()?;
     let record = data_quality::publish_rule(
-        &ChiseiStore::from_shared_runtime(db.clone()),
+        &stores.chisei,
         &config.actor,
         &config.request,
         Utc::now().timestamp_millis(),
@@ -76,9 +86,10 @@ async fn publish(config: PublishConfig) -> Result<(), BoxErr> {
 }
 
 async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
+    let stores = open_stores()?;
     let record = data_quality::evaluate_rule(
-        &ChiseiStore::from_shared_runtime(db.clone()),
+        &stores.chisei,
+        stores.facts.reader(),
         &config.actor,
         &config.namespace,
         &config.rule_id,
@@ -91,51 +102,39 @@ async fn evaluate(config: EvaluateConfig) -> Result<(), BoxErr> {
 }
 
 async fn show_rule(config: ShowConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let record = data_quality::show_rule(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        &config.namespace,
-        &config.rule_id,
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let record = data_quality::show_rule(&stores.chisei, &config.namespace, &config.rule_id)
+        .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 
 async fn list_rules(namespace: Option<String>) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let records = data_quality::list_rules(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        namespace.as_deref(),
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let records = data_quality::list_rules(&stores.chisei, namespace.as_deref())
+        .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&records)?);
     Ok(())
 }
 
 async fn show_result(config: ResultConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let record = data_quality::show_result(
-        &ChiseiStore::from_shared_runtime(db.clone()),
-        &config.result_id,
-    )
-    .map_err(std::io::Error::other)?;
+    let stores = open_stores()?;
+    let record = data_quality::show_result(&stores.chisei, &config.result_id)
+        .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
 }
 
 async fn mutate_result(config: ResultConfig, op: MutateOp) -> Result<(), BoxErr> {
-    let db = open_db().await?;
+    let stores = open_stores()?;
     let now = Utc::now().timestamp_millis();
     let record = match op {
-        MutateOp::Cancel => data_quality::cancel_evaluation(
-            &ChiseiStore::from_shared_runtime(db.clone()),
-            &config.actor,
-            &config.result_id,
-            now,
-        ),
+        MutateOp::Cancel => {
+            data_quality::cancel_evaluation(&stores.chisei, &config.actor, &config.result_id, now)
+        }
         MutateOp::Restart => data_quality::restart_evaluation(
-            &ChiseiStore::from_shared_runtime(db.clone()),
+            &stores.chisei,
+            stores.facts.reader(),
             &config.actor,
             &config.result_id,
             now,

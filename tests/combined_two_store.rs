@@ -84,7 +84,10 @@ fn assert_plane_isolation(sekai_path: &Path, chisei_path: &Path) {
 
     let chisei = ChiseiStore::open_sqlite(chisei_path.to_str().unwrap());
     assert!(
-        chisei.runtime().get_object(OBJECT_ID).unwrap().is_none(),
+        SekaiStore::open_sqlite(chisei_path.to_str().unwrap())
+            .get_object(OBJECT_ID)
+            .unwrap()
+            .is_none(),
         "Sekai fact must not persist on the Chisei file"
     );
     assert_eq!(

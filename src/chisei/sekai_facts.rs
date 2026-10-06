@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::chisei::object_schema::ObjectType;
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::db::store::SekaiStore;
-use crate::domain::{Direction, Object};
+use crate::domain::{Direction, ListFilter, Object};
 
 /// Refusal reason when no Sekai is attached to this Chisei process.
 pub const SEKAI_NOT_ATTACHED: &str = "sekai_not_attached";
@@ -74,6 +74,8 @@ pub trait SekaiFactReader: Send + Sync {
         principal: &str,
     ) -> Result<MarkingClearance, SekaiFactError>;
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError>;
+    fn get_object(&self, id: &str) -> Result<Option<Object>, SekaiFactError>;
+    fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, SekaiFactError>;
     fn get_linked_objects(
         &self,
         object_id: &str,
@@ -116,6 +118,14 @@ impl SekaiFactReader for SekaiNotAttached {
     }
 
     fn get_object_type(&self, _: &str) -> Result<Option<ObjectType>, SekaiFactError> {
+        Err(SekaiFactError::NotAttached)
+    }
+
+    fn get_object(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+        Err(SekaiFactError::NotAttached)
+    }
+
+    fn list_objects(&self, _: &ListFilter) -> Result<Vec<Object>, SekaiFactError> {
         Err(SekaiFactError::NotAttached)
     }
 
@@ -229,7 +239,6 @@ mod tests {
     fn in_process_reader_reads_the_sekai_store_it_was_given() {
         let sekai = SekaiStore::memory();
         sekai
-            .runtime()
             .create_object(&Object {
                 id: "o1".into(),
                 kind: "widget".into(),
