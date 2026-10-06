@@ -2,6 +2,10 @@ use super::*;
 use crate::chisei::evaluation_execution::{
     DeterministicEvaluator, DeterministicEvaluatorOutput, EVALUATOR_RESULT_CONTRACT, STATUS_PASS,
 };
+use crate::db::store::{
+    ChiseiBudgetStore, ChiseiDecisionStore, ChiseiEvaluationStore, ChiseiKiokuStore,
+    ChiseiObservationStore, ChiseiReceiptStore,
+};
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
 use axum::body::Body;
@@ -145,7 +149,6 @@ async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(
         svc.db
-            .runtime()
             .list_decisions(&Default::default())
             .unwrap()
             .is_empty()
@@ -811,7 +814,6 @@ async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
     let now = chrono::Utc::now().timestamp_millis();
     for (task_class, delta, regressed) in [("background", -80.0, true), ("bulk", 0.0, false)] {
         svc.db
-            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{task_class}"),
                 timestamp: now,
@@ -885,7 +887,6 @@ async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
     let now = chrono::Utc::now().timestamp_millis();
     for (scope, delta, regressed) in [("project-scope", 0.0, false), ("request-ns", -80.0, true)] {
         svc.db
-            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{scope}"),
                 timestamp: now,
@@ -1398,7 +1399,6 @@ async fn issued_gunshi_allocation_feeds_native_planning_before_kioku_enrichment(
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -1719,7 +1719,6 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
     ] {
         let receipts_before = service
             .db
-            .runtime()
             .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100)
             .unwrap()
             .len();
@@ -1732,7 +1731,6 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
         assert_eq!(
             service
                 .db
-                .runtime()
                 .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100,)
                 .unwrap()
                 .len(),
@@ -1934,7 +1932,6 @@ async fn managed_stream_preserves_tool_calls_usage_and_receipt_without_route_ove
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("operation receipt");
@@ -2040,7 +2037,6 @@ async fn managed_unary_execution_accepts_machine_context_and_normalizes_receipt(
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("completed unary receipt");
@@ -2127,7 +2123,6 @@ async fn managed_provider_failure_records_failed_receipt_without_route_switch() 
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed operation receipt");
@@ -2188,7 +2183,6 @@ async fn managed_stream_read_failure_records_failed_receipt_without_route_switch
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed stream receipt");
@@ -2237,7 +2231,6 @@ async fn managed_explicit_retry_creates_distinct_correlated_attempts() {
             .unwrap();
         let receipt = service
             .db
-            .runtime()
             .get_operation_receipt(&plan.plan_id)
             .unwrap()
             .expect("planned retry receipt");
@@ -3155,7 +3148,6 @@ async fn deterministic_manifest_execution_is_receipt_authoritative_and_idempoten
     assert_eq!(tighter.code(), tonic::Code::FailedPrecondition);
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&first.operation_id)
         .unwrap()
         .unwrap();
@@ -3545,7 +3537,6 @@ async fn evaluation_comparison_refuses_an_unfinished_execution() {
     let manifest = resolved_execution_fixture(&svc, "compare-unfinished-resolve").await;
     let stored = svc
         .db
-        .runtime()
         .get_evaluation_manifest(&manifest.manifest_digest)
         .unwrap()
         .unwrap();
@@ -3572,7 +3563,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
     let manifest = resolved_execution_fixture(&svc, "cancel-race-resolve").await;
     let manifest = svc
         .db
-        .runtime()
         .get_evaluation_manifest(&manifest.manifest_digest)
         .unwrap()
         .unwrap();
@@ -3582,7 +3572,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
         .unwrap();
     let stale_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3596,7 +3585,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3685,7 +3673,6 @@ async fn cancellation_is_durable_and_reduces_fail_closed() {
     );
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&cancelled.operation_id)
         .unwrap()
         .unwrap();
@@ -4236,7 +4223,6 @@ async fn governed_subject_profiles_share_receipt_and_idempotency_contract() {
         );
         let receipt = svc
             .db
-            .runtime()
             .get_operation_receipt(&first.operation_id)
             .unwrap()
             .unwrap();
@@ -4892,15 +4878,12 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
-        .runtime()
         .budget_set_limit("global", METRIC_REQUESTS, 100, "daily")
         .unwrap();
     svc.db
-        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 1_000, "weekly")
         .unwrap();
     svc.db
-        .runtime()
         .budget_adjust_chain("project:acme", METRIC_TOKENS, 37, 1)
         .unwrap();
     let mut action_policy = ActionPolicy::allow_all("project:acme");
@@ -4949,7 +4932,6 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
-        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 2_000, "weekly")
         .unwrap();
     let changed = svc
@@ -5706,7 +5688,6 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.context_expansion".into()),
             ..Default::default()
@@ -5720,7 +5701,6 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
     }));
     let evidence_decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.evidence_context_admission".into()),
             ..Default::default()
@@ -6050,10 +6030,7 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
 
     svc.record_usage(Request::new(usage.clone())).await.unwrap();
     assert_eq!(
-        svc.db
-            .runtime()
-            .get_operation_receipt(operation_id)
-            .unwrap(),
+        svc.db.get_operation_receipt(operation_id).unwrap(),
         Some(receipt)
     );
 
@@ -6365,7 +6342,6 @@ async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.portfolio_route_shift".into()),
             ..Default::default()
@@ -6572,7 +6548,6 @@ async fn internal_eval_run_tracking_is_visible_to_gateway_reads() {
 async fn restored_read_contracts_return_bounded_projections() {
     let svc = memory_service();
     svc.db
-        .runtime()
         .put_sample_observation(&crate::chisei::scoring::SampleObservation {
             request_id: "observation-1".into(),
             namespace: "context-a".into(),
@@ -6830,7 +6805,6 @@ async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
     assert!(!report.audit_decision_id.is_empty());
     let decision = svc
         .db
-        .runtime()
         .get_decision(&report.audit_decision_id)
         .unwrap()
         .unwrap();
@@ -7115,7 +7089,6 @@ async fn sqlite_reload_restores_iterations_and_regression_gate() {
     );
     let denied_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -7353,7 +7326,6 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     svc.record_planned_operation(&plan, "agent:test").unwrap();
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -7426,7 +7398,6 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     assert_eq!(memory.disclosed_fields, ["claim"]);
     assert!(
         svc.db
-            .runtime()
             .list_kioku_lifecycle_events("memory-7", 3)
             .unwrap()
             .is_empty(),
@@ -7456,7 +7427,6 @@ fn execution_memory_injection_revalidates_cached_versions() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(
         svc.db
-            .runtime()
             .list_kioku_lifecycle_events("purged-memory", 4)
             .unwrap()
             .is_empty()
@@ -7625,7 +7595,6 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
     // A matching audit decision was recorded.
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("sample".into()),
             ..Default::default()
@@ -7735,7 +7704,6 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
         .unwrap();
     let first_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&first.plan_id)
         .unwrap()
         .unwrap();
@@ -7822,7 +7790,6 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
     // Receipt lineage: operation -> verification -> learning -> plan.
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&second.plan_id)
         .unwrap()
         .unwrap();
@@ -8140,7 +8107,6 @@ async fn plan_execution_exposes_and_audits_egress_decisions() {
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -8176,7 +8142,6 @@ fn egress_audit_serializes_epistemic_descriptor_fields() {
 
     let decision = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -8516,7 +8481,6 @@ async fn template_only_plan_blocks_known_entity_leak() {
     }));
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.privacy".into()),
             action: Some("leak_check".into()),
@@ -8587,7 +8551,6 @@ async fn execute_plan_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected execution receipt");
@@ -8653,7 +8616,6 @@ async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected streamed execution receipt");
@@ -9822,7 +9784,6 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt("lookup-hit-plan")
         .unwrap()
         .unwrap();
@@ -10053,7 +10014,6 @@ async fn routing_profiles_list_pin_and_record_the_route_mode() {
     assert_eq!(plan.resolved_runtime, "openai");
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -10491,7 +10451,6 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
     assert_eq!(plan.resolved_model, "hosted.acme-llm/acme-1");
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();

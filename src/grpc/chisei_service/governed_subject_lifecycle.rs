@@ -1,6 +1,7 @@
 //! Governed Subject evaluation and situation-specific provenance lifecycle.
 
 use super::*;
+use crate::db::store::{ChiseiGovernedSubjectStore, ChiseiReceiptStore};
 
 pub(super) struct ProvenanceExportOutcome {
     pub record: subject_provenance::ExportRecord,
@@ -44,7 +45,6 @@ impl GovernedSubjectLifecycle {
         let operation_id = subject::operation_id(&envelope.namespace, actor, &envelope.request_id);
         if let Some(existing) = self
             .db
-            .runtime()
             .get_operation_receipt(&operation_id)
             .map_err(Status::internal)?
         {
@@ -60,10 +60,9 @@ impl GovernedSubjectLifecycle {
             fresh,
             now_ms,
         );
-        if let Err(error) = self.db.runtime().insert_operation_receipt(&receipt) {
+        if let Err(error) = self.db.insert_operation_receipt(&receipt) {
             if let Some(existing) = self
                 .db
-                .runtime()
                 .get_operation_receipt(&operation_id)
                 .map_err(Status::internal)?
             {
@@ -92,7 +91,6 @@ impl GovernedSubjectLifecycle {
             subject_provenance::binding_digest(&binding).map_err(Status::invalid_argument)?;
         if let Some(existing) = self
             .db
-            .runtime()
             .get_governed_subject_provenance_export(&binding.actor, &binding.export_id)
             .map_err(Status::internal)?
         {
@@ -115,7 +113,6 @@ impl GovernedSubjectLifecycle {
 
         let receipt = self
             .db
-            .runtime()
             .get_operation_receipt(&binding.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("governed-subject receipt not found"))?;
@@ -179,7 +176,6 @@ impl GovernedSubjectLifecycle {
         };
         let (stored, inserted) = self
             .db
-            .runtime()
             .put_governed_subject_provenance_export(&binding.actor, &binding.export_id, &record)
             .map_err(map_export_persistence_error)?;
         validate_export_record(&stored, now_ms)?;

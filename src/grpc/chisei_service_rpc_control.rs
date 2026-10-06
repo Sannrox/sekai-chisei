@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::store::{ChiseiBudgetStore, ChiseiPermitStore};
 
 pub(super) async fn evaluate_governed_subject(
     service: &ChiseiServiceImpl,
@@ -103,7 +104,6 @@ pub(super) async fn redeem_external_action_permit(
     }
     if let Some(redemption) = service
         .db
-        .runtime()
         .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
         .map_err(Status::failed_precondition)?
     {
@@ -134,7 +134,6 @@ pub(super) async fn redeem_external_action_permit(
         .map_err(Status::failed_precondition)?;
     let redemption = service
         .db
-        .runtime()
         .redeem_or_reconcile_permit(
             &value,
             &context,
@@ -183,7 +182,6 @@ pub(super) async fn set_external_action_policy(
             };
             service
                 .db
-                .runtime()
                 .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
                 .map_err(Status::invalid_argument)?;
             Ok(Response::new(SetExternalActionPolicyResponse {
@@ -198,7 +196,6 @@ pub(super) async fn set_external_action_policy(
             let now = chrono::Utc::now().timestamp_millis();
             let changed = service
                 .db
-                .runtime()
                 .set_permit_kill_switch(
                     &input.scope_kind,
                     &input.scope_value,
@@ -406,7 +403,6 @@ pub(super) async fn get_effective_policy_summary(
 
     let raw_limits = service
         .db
-        .runtime()
         .budget_limits_for_scope(&format!("project:{namespace}"))
         .map_err(Status::internal)?;
     let budget_version = content_version(&raw_limits);
