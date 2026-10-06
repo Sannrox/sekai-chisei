@@ -6,6 +6,7 @@
 //! streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 use super::*;
+use crate::db::store::{ChiseiKiokuStore, ChiseiRoutingProfileStore};
 
 /// Result of the post-authz lookup-first attempt on ExecutePlanStream.
 #[derive(Debug)]
@@ -50,7 +51,6 @@ impl ChiseiServiceImpl {
             crate::provider_profile::resolve_provider_id(model).map_err(|_| unavailable())?;
         let stored = self
             .db
-            .runtime()
             .list_hosted_routing_profiles(namespace)
             .map_err(|_| Status::internal("routing profiles unavailable"))?;
         let profile =
@@ -554,7 +554,6 @@ impl ChiseiServiceImpl {
         for reference in references {
             let memory = self
                 .db
-                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::failed_precondition("planned memory version not found"))?;
@@ -570,7 +569,6 @@ impl ChiseiServiceImpl {
             }
             let authorized_ceiling = self
                 .db
-                .runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .map_err(|_| {
                     Status::permission_denied(
@@ -590,7 +588,6 @@ impl ChiseiServiceImpl {
         }
         for reference in references {
             self.db
-                .runtime()
                 .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                     memory_id: reference.memory_id.clone(),
                     memory_version: reference.memory_version,
@@ -616,7 +613,6 @@ impl ChiseiServiceImpl {
         for reference in references {
             let Some(memory) = self
                 .db
-                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
             else {
@@ -624,7 +620,6 @@ impl ChiseiServiceImpl {
             };
             let authorized = self
                 .db
-                .runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .is_ok_and(|ceiling| memory.classification <= ceiling);
             let eligible = memory_lifecycle_allows_execution(
@@ -637,7 +632,6 @@ impl ChiseiServiceImpl {
                 && crate::chisei::kioku::memory_claim_digest(&memory) == reference.content_digest;
             if !eligible {
                 self.db
-                    .runtime()
                     .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                         memory_id: reference.memory_id.clone(),
                         memory_version: reference.memory_version,

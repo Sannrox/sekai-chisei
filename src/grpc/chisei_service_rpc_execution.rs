@@ -1,4 +1,8 @@
 use super::*;
+use crate::db::store::{
+    ChiseiEvaluationStore, ChiseiGatewayStore, ChiseiKiokuStore, ChiseiObservationStore,
+    ChiseiReceiptStore, ChiseiRoutingProfileStore,
+};
 
 pub(super) async fn plan_execution(
     service: &ChiseiServiceImpl,
@@ -315,12 +319,10 @@ pub(super) async fn list_kioku_candidates(
         .map(|memory| -> Result<KiokuCandidateRecord, Status> {
             let evidence = service
                 .db
-                .runtime()
                 .list_kioku_evidence(&memory.id, memory.version)
                 .map_err(Status::internal)?;
             let validation = service
                 .db
-                .runtime()
                 .validate_kioku_candidate(&memory.id, memory.version)
                 .map_err(Status::internal)?;
             Ok(KiokuCandidateRecord {
@@ -492,7 +494,6 @@ pub(super) async fn get_sample_observation(
     }
     let observation = service
         .db
-        .runtime()
         .get_sample_observation_in_namespace(request_id, namespace)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("sample observation not found"))?;
@@ -554,7 +555,6 @@ pub(super) async fn claim_gateway_dispatch(
     }
     let reserved = service
         .db
-        .runtime()
         .reserve_gateway_request_alias(
             &request.caller_scope,
             &request.request_alias,
@@ -569,7 +569,6 @@ pub(super) async fn claim_gateway_dispatch(
     }
     let claimed = service
         .db
-        .runtime()
         .claim_gateway_request_alias_dispatch(
             &request.caller_scope,
             &request.request_alias,
@@ -599,21 +598,17 @@ pub(super) async fn get_operation_receipt(
         if let Some(attempt) = attempt {
             match service
                 .db
-                .runtime()
                 .find_gateway_receipt_by_logical_operation_id(operation_id, Some(attempt))
             {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
-                Ok(None) if attempt == 1 => {
-                    service.db.runtime().get_operation_receipt(operation_id)
-                }
+                Ok(None) if attempt == 1 => service.db.get_operation_receipt(operation_id),
                 Ok(None) => Ok(None),
                 Err(error) => Err(error),
             }
         } else {
-            let exact = service.db.runtime().get_operation_receipt(operation_id);
+            let exact = service.db.get_operation_receipt(operation_id);
             let derived = service
                 .db
-                .runtime()
                 .find_gateway_receipt_by_logical_operation_id(operation_id, None);
             match (exact, derived) {
                 (Ok(Some(_)), Ok(Some(_))) => {
@@ -632,21 +627,14 @@ pub(super) async fn get_operation_receipt(
             ));
         }
         let alias_lookup = || {
-            service
-                .db
-                .runtime()
-                .find_operation_receipt_by_lookup_request_id(
-                    request_id,
-                    (!caller_scope.is_empty()).then_some(caller_scope),
-                    None,
-                )
+            service.db.find_operation_receipt_by_lookup_request_id(
+                request_id,
+                (!caller_scope.is_empty()).then_some(caller_scope),
+                None,
+            )
         };
         if caller_scope.is_empty() {
-            match service
-                .db
-                .runtime()
-                .find_operation_receipt_by_request_id(request_id)
-            {
+            match service.db.find_operation_receipt_by_request_id(request_id) {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
                 Ok(None) => alias_lookup(),
                 Err(error) => Err(error),
@@ -654,10 +642,7 @@ pub(super) async fn get_operation_receipt(
         } else {
             match alias_lookup() {
                 Ok(Some(receipt)) => Ok(Some(receipt)),
-                Ok(None) => service
-                    .db
-                    .runtime()
-                    .find_operation_receipt_by_request_id(request_id),
+                Ok(None) => service.db.find_operation_receipt_by_request_id(request_id),
                 Err(error) => Err(error),
             }
         }
@@ -744,7 +729,6 @@ pub(super) async fn put_evaluator_definition(
     if request.definition.is_none() {
         let definition = service
             .db
-            .runtime()
             .get_evaluator_definition(&request.definition_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::failed_precondition("evaluator definition not found"))?;
@@ -755,7 +739,6 @@ pub(super) async fn put_evaluator_definition(
         )?;
         let availability = service
             .db
-            .runtime()
             .set_evaluator_availability(
                 &request.definition_id,
                 &request.availability_state,
@@ -787,7 +770,6 @@ pub(super) async fn put_evaluator_definition(
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &definition.namespace)?;
     let definition = service
         .db
-        .runtime()
         .put_evaluator_definition(definition, &actor, chrono::Utc::now().timestamp_millis())
         .map_err(map_evaluation_resource_error)?;
     let (implementation_executable, implementation_status) = service
@@ -821,7 +803,6 @@ pub(super) async fn put_evaluation_plan(
         .map_err(map_evaluation_resource_error)?;
     if let Some(existing) = service
         .db
-        .runtime()
         .get_evaluation_plan(&plan.plan_version_id)
         .map_err(Status::internal)?
     {
@@ -849,7 +830,6 @@ pub(super) async fn put_evaluation_plan(
     )?;
     let plan = service
         .db
-        .runtime()
         .put_evaluation_plan(plan, &actor, now_ms)
         .map_err(map_evaluation_resource_error)?;
     Ok(Response::new(PutEvaluationPlanResponse {
@@ -1079,7 +1059,6 @@ pub(super) async fn execute_evaluation_manifest(
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let manifest = service
         .db
-        .runtime()
         .get_evaluation_manifest(&request.manifest_digest)
         .map_err(Status::internal)?
         .filter(|manifest| manifest.namespace == request.namespace)
@@ -1113,14 +1092,12 @@ pub(super) async fn cancel_evaluation_execution(
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &validated.namespace)?;
     let manifest = service
         .db
-        .runtime()
         .get_evaluation_manifest(&validated.manifest_digest)
         .map_err(Status::internal)?
         .filter(|manifest| manifest.namespace == validated.namespace)
         .ok_or_else(|| Status::not_found("evaluation execution not found"))?;
     let index = service
         .db
-        .runtime()
         .get_evaluation_execution_index(&validated.manifest_digest)
         .map_err(Status::internal)?
         .filter(|index| index.namespace == validated.namespace)
@@ -1195,7 +1172,6 @@ fn hosted_profiles_for(
     HOSTED_PROFILE_LISTS.with(|count| count.set(count.get() + 1));
     let stored = service
         .db
-        .runtime()
         .list_hosted_routing_profiles(namespace)
         .map_err(|_| Status::internal("routing profiles unavailable"))?;
     Ok(crate::chisei::routing_profiles::admissible_hosted_profiles(
@@ -1265,7 +1241,6 @@ pub(super) async fn put_routing_profile(
     .map_err(routing_profile_admission_status)?;
     service
         .db
-        .runtime()
         .put_hosted_routing_profile(&profile)
         .map_err(|_| Status::internal("routing profile unavailable"))?;
     let origin = profile.endpoint_origin.clone();
@@ -1290,7 +1265,6 @@ pub(super) async fn revoke_routing_profile(
     )?;
     let revoked = service
         .db
-        .runtime()
         .revoke_hosted_routing_profile(
             &request.namespace,
             &request.profile_id,

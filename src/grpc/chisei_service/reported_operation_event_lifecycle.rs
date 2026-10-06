@@ -1,6 +1,7 @@
 //! Admission lifecycle for externally reported canonical receipt events.
 
 use super::*;
+use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore};
 
 pub(super) fn record_reported_memory_outcomes(
     db: &RuntimeDb,
@@ -402,7 +403,6 @@ async fn report_operation_event(
     }
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&request.operation_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("operation receipt not found"))?;
@@ -424,7 +424,6 @@ async fn report_operation_event(
     }
     let receipt_has_kioku_context = !service
         .db
-        .runtime()
         .list_kioku_outcome_assignments(&receipt.operation_id)
         .map_err(Status::internal)?
         .is_empty()
@@ -694,7 +693,6 @@ async fn report_operation_event(
     }
     let (receipt, recorded) = service
         .db
-        .runtime()
         .append_operation_receipt_event(&request.operation_id, event)
         .map_err(|error| {
             if error.contains("not found") {

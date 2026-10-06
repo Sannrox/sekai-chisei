@@ -7,6 +7,7 @@
 //! ordering, and terminal process-state cleanup.
 
 use super::*;
+use crate::db::store::{ChiseiEvaluationStore, ChiseiReceiptStore};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -61,7 +62,6 @@ impl EvaluationExecutionLifecycle {
         for node in &manifest.nodes {
             if let Some(definition) = self
                 .db
-                .runtime()
                 .get_evaluator_definition(&node.evaluator.definition_id)
                 .map_err(Status::internal)?
             {
@@ -71,7 +71,6 @@ impl EvaluationExecutionLifecycle {
         let index = self.ensure_execution(manifest, actor, max_total_duration_ms)?;
         let receipt = self
             .db
-            .runtime()
             .get_operation_receipt(&index.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
@@ -109,7 +108,6 @@ impl EvaluationExecutionLifecycle {
         cancelled.store(true, Ordering::Release);
         let receipt = self
             .db
-            .runtime()
             .get_operation_receipt(&index.operation_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::data_loss("evaluation execution receipt is missing"))?;
@@ -203,7 +201,6 @@ impl EvaluationExecutionLifecycle {
     ) -> Result<evaluation_execution_domain::EvaluationExecutionIndex, Status> {
         if let Some(index) = self
             .db
-            .runtime()
             .get_evaluation_execution_index(&manifest.manifest_digest)
             .map_err(Status::internal)?
         {
@@ -237,7 +234,6 @@ impl EvaluationExecutionLifecycle {
             created_at_ms: now_ms,
         };
         self.db
-            .runtime()
             .create_evaluation_execution(&index, &receipt)
             .map_err(Status::internal)
     }
@@ -248,14 +244,13 @@ impl EvaluationExecutionLifecycle {
         receipt: &OperationReceipt,
         actor: &str,
     ) -> Result<(), Status> {
-        let append = self.db.runtime().append_operation_receipt_event(
+        let append = self.db.append_operation_receipt_event(
             &index.operation_id,
             evaluation_cancellation_event(receipt, actor, chrono::Utc::now().timestamp_millis()),
         );
         if let Err(error) = append {
             let reconciled = self
                 .db
-                .runtime()
                 .get_operation_receipt(&index.operation_id)
                 .map_err(Status::internal)?
                 .is_some_and(|receipt| {

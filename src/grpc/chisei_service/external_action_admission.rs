@@ -5,6 +5,7 @@
 //! persist ordering, permit issuance, and approve/deny/cancel CAS transitions.
 
 use super::*;
+use crate::db::store::{ChiseiExternalActionStore, ChiseiPermitStore};
 
 impl ChiseiServiceImpl {
     pub(super) fn issue_external_permit(
@@ -27,7 +28,6 @@ impl ChiseiServiceImpl {
         )?;
         if let Some(value) = self
             .db
-            .runtime()
             .replay_permit(&authorization.decision.authorization_id, idempotency_key)
             .map_err(|error| {
                 if error.contains("different idempotency") {
@@ -67,7 +67,6 @@ impl ChiseiServiceImpl {
         let value = if offline {
             let policy = self
                 .db
-                .runtime()
                 .get_external_permit_policy(&authorization.decision.policy_scope)
                 .map_err(Status::internal)?;
             permit::issue_offline(authorization, &policy, &key, issuance)
@@ -76,7 +75,6 @@ impl ChiseiServiceImpl {
         }
         .map_err(Status::failed_precondition)?;
         self.db
-            .runtime()
             .put_permit(&value, idempotency_key, actor)
             .map_err(|error| {
                 if error.contains("different idempotency") {
@@ -163,7 +161,6 @@ impl ChiseiServiceImpl {
         let mut authorization_id = format!("external-auth-{}", uuid::Uuid::new_v4().simple());
         match self
             .db
-            .runtime()
             .claim_external_action_authorization(&request, &request_digest, &authorization_id, now)
             .map_err(Status::internal)?
         {
@@ -212,7 +209,6 @@ impl ChiseiServiceImpl {
             Err(error) => {
                 let _ = self
                     .db
-                    .runtime()
                     .abandon_external_action_claim(&request, &request_digest);
                 return Err(Status::internal(error));
             }
@@ -229,7 +225,7 @@ impl ChiseiServiceImpl {
         if plan.policy_decision != crate::sekai::action_policy::ActionDecision::Deny
             && (plan.max_mutations.is_some() || plan.max_deletes.is_some())
         {
-            match self.db.runtime().reserve_external_action_blast_radius(
+            match self.db.reserve_external_action_blast_radius(
                 &authorization_id,
                 &request,
                 plan.max_mutations,
@@ -264,10 +260,9 @@ impl ChiseiServiceImpl {
             }
         }
         let mut record = plan.finish();
-        if let Err(error) = self.db.runtime().put_external_action_authorization(&record) {
+        if let Err(error) = self.db.put_external_action_authorization(&record) {
             let _ = self
                 .db
-                .runtime()
                 .abandon_external_action_claim(&request, &request_digest);
             external_lifecycle::release_reservations(&self.db, &self.budget, &mut record)
                 .map_err(Status::internal)?;
@@ -305,7 +300,6 @@ impl ChiseiServiceImpl {
                 }
                 let mut record = self
                     .db
-                    .runtime()
                     .get_external_action_authorization_by_id(&input.authorization_id)
                     .map_err(Status::internal)?
                     .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
@@ -346,7 +340,6 @@ impl ChiseiServiceImpl {
                 .map_err(Status::failed_precondition)?;
                 if !self
                     .db
-                    .runtime()
                     .compare_and_swap_external_action_authorization(&expected, &record)
                     .map_err(Status::internal)?
                 {
@@ -382,7 +375,6 @@ impl ChiseiServiceImpl {
             "cancel" => {
                 let mut record = self
                     .db
-                    .runtime()
                     .get_external_action_authorization_by_id(&input.authorization_id)
                     .map_err(Status::internal)?
                     .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
@@ -398,7 +390,6 @@ impl ChiseiServiceImpl {
                     external_lifecycle::cancel(&mut record, &actor, &input.reason, now);
                     if !self
                         .db
-                        .runtime()
                         .compare_and_swap_external_action_authorization(&expected, &record)
                         .map_err(Status::internal)?
                     {
@@ -433,7 +424,6 @@ impl ChiseiServiceImpl {
                 let now = chrono::Utc::now().timestamp_millis();
                 let changed = self
                     .db
-                    .runtime()
                     .revoke_permit(&input.revocation_handle, &actor, &input.reason, now)
                     .map_err(Status::internal)?;
                 Ok(TransitionExternalActionResponse {
@@ -464,13 +454,11 @@ impl ChiseiServiceImpl {
                     .and_then(|_| parent.verify_signature(&key.verifying_key()))
                     .map_err(Status::failed_precondition)?;
                 self.db
-                    .runtime()
                     .validate_permit_for_delegation(&parent)
-                    .and_then(|_| self.db.runtime().validate_delegation_chain(&parent))
+                    .and_then(|_| self.db.validate_delegation_chain(&parent))
                     .map_err(Status::failed_precondition)?;
                 let policy = self
                     .db
-                    .runtime()
                     .get_external_permit_policy(&parent.policy_scope)
                     .map_err(Status::internal)?;
                 let child = permit::delegate(
@@ -496,7 +484,6 @@ impl ChiseiServiceImpl {
                 .map_err(Status::failed_precondition)?;
                 let child = self
                     .db
-                    .runtime()
                     .put_delegated_permit(&child, &actor)
                     .map_err(Status::failed_precondition)?;
                 Ok(TransitionExternalActionResponse {

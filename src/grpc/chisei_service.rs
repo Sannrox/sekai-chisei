@@ -1,3 +1,4 @@
+use crate::db::store::ChiseiEvolveStore;
 use base64::Engine as _;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -311,8 +312,7 @@ impl ChiseiServiceImpl {
         load_namespace_policies(db.runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.runtime()
-                .list_evolve_task_records()
+            db.list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))
@@ -386,8 +386,7 @@ impl ChiseiServiceImpl {
         load_namespace_policies(db.runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.runtime()
-                .list_evolve_task_records()
+            db.list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))

@@ -16,8 +16,10 @@ mod chisei_ports;
 
 pub use chisei_ports::{
     ChiseiBudgetStore, ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiEvalStore,
-    ChiseiExternalActionStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
+    ChiseiEvaluationStore, ChiseiEvolveStore, ChiseiExternalActionStore, ChiseiGatewayStore,
+    ChiseiGovernedSubjectStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
     ChiseiObservationStore, ChiseiPermitStore, ChiseiPortfolioStore, ChiseiReceiptStore,
+    ChiseiRoutingProfileStore,
 };
 
 /// Sekai-owned facts and commits. Chisei code must not construct or hold this.

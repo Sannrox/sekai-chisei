@@ -10,6 +10,7 @@
 
 use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
+use crate::db::store::ChiseiKiokuStore;
 
 const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
 
@@ -979,7 +980,6 @@ impl ChiseiServiceImpl {
             .map(|holdout| (holdout.memory_id.clone(), holdout.memory_version))
             .collect::<Vec<_>>();
         self.db
-            .runtime()
             .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
         Ok(())
     }
