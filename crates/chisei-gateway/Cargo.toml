@@ -29,7 +29,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sekai-provider = { version = "1.0.0", path = "../sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "../sekai-admin-client" }
-sekai-proto = { version = "1.1.0", path = "../sekai-proto" }
+sekai-proto = { version = "1.2.0", path = "../sekai-proto" }
 sha2 = "0.10"
 subtle = "2"
 tokio = { version = "1", features = ["full"] }
@@ -45,5 +45,5 @@ tracing-opentelemetry = { version = "0.33", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-sekai-chisei = { version = "1.1.0", path = "../..", features = ["gateway-test-support"] }
+sekai-chisei = { version = "1.2.0", path = "../..", features = ["gateway-test-support"] }
 tempfile = "3"

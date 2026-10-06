@@ -2,12 +2,20 @@
 
 ## Unreleased
 
+## 1.2.0
+
+Upgrade notes:
+
+- Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE`. Unset them and use `SEKAI_DATA_DIR` (default `./data`) or dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` (SQLite) or `SEKAI_DATABASE_URL`/`CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
+- The server image sets `ENV SEKAI_DATA_DIR=/data` instead of `DB_PATH=/data/sekai.db`, so a bare image opens split `/data/sekai.db` and `/data/chisei.db`.
+- Relocate an existing single store before upgrading: `sekaictl admin store relocate --source <old> --sekai <old> --chisei <new>`.
+
 - Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` with guidance toward `SEKAI_DATA_DIR`, dest-pair paths/URLs, and `sekaictl admin store relocate`. The server image sets `SEKAI_DATA_DIR=/data` (#1239).
 - Combined dest-pair evaluation apply/resolve reads governed invariants from the Sekai store. `sekaictl admin learning` opens the dest pair (or `SEKAI_DATA_DIR`) and writes change records to the Chisei dest (#1239).
 - Compliance export, `sekaictl report quality`, and `sekaictl report substitution` refuse Combined Split instead of a Sekai-only bundle and name the gRPC report RPCs (#1264).
 - Combined Split records Chisei `RecordDecision` rows on the Sekai dest so `verify_ledger` covers them; relocate leaves that table with Sekai (ADR 0083, #1265).
 - Unattested Split with Chisei families still in the Sekai dest refuses restamp and names `sekaictl admin store relocate` (#1263).
-- `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.1.0`, matching crate version and compose (#1268).
+- `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.2.0`, matching crate version and compose (#1268).
 - Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
 
 ## 1.1.0
