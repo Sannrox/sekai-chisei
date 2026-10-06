@@ -206,6 +206,9 @@ impl SekaiFactReader for RemoteSekaiFactReader {
     }
 
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError> {
+        // Each lookup lists the schema. Request-scoped reuse lives in the
+        // pipeline type cache so classification and interface changes are
+        // visible on the next request.
         let kind = kind.to_string();
         self.call(async move |mut client, credential| {
             let request = authorized(ListSchemaTypesRequest {}, credential)?;
@@ -714,6 +717,19 @@ mod tests {
                 reason: crate::chisei::sekai_facts::SEKAI_READ_UNSUPPORTED.into(),
             }
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_object_type_reads_builtin_kinds_over_the_hop() {
+        let endpoint = serve_sekai(SekaiStore::memory()).await;
+        let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
+        let agent = reader
+            .get_object_type("agent")
+            .unwrap()
+            .expect("builtin agent type");
+        assert_eq!(agent.kind, "agent");
+        assert!(reader.get_object_type("namespace").unwrap().is_some());
+        assert!(reader.get_object_type("absent-kind").unwrap().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

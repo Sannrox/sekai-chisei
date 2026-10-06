@@ -1887,3 +1887,109 @@ fn test_review_policy_extracted() {
     assert!(policy.confidence_threshold >= 0.7);
     assert!(policy.max_cycles >= 2);
 }
+
+struct CountingTypes {
+    object_type: ObjectType,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl SekaiFactReader for CountingTypes {
+    fn find_by_external_id(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+        Ok(None)
+    }
+
+    fn find_namespace_boundary(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_grants(&self, _: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn marking_clearance(
+        &self,
+        _: &str,
+        _: &Object,
+        _: &str,
+    ) -> Result<crate::chisei::principal::MarkingClearance, SekaiFactError> {
+        Ok(crate::chisei::principal::MarkingClearance::Unmarked)
+    }
+
+    fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if kind == self.object_type.kind {
+            Ok(Some(self.object_type.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_object(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_objects(&self, _: &crate::domain::ListFilter) -> Result<Vec<Object>, SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn get_linked_objects(
+        &self,
+        _: &str,
+        _: &str,
+        _: &Direction,
+    ) -> Result<Vec<Object>, SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn in_process_store(&self) -> Result<&crate::db::store::SekaiStore, SekaiFactError> {
+        Err(SekaiFactError::Unsupported("counting fixture"))
+    }
+}
+
+#[test]
+fn object_implements_reuses_a_warm_type_cache() {
+    let facts = CountingTypes {
+        object_type: ObjectType {
+            kind: "gadget".into(),
+            description: String::new(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec![INTERFACE_EVALUABLE.into()],
+        },
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let obj = Object {
+        id: "g1".into(),
+        kind: "gadget".into(),
+        name: "g1".into(),
+        namespace: "ns".into(),
+        external_id: "gadget:g1".into(),
+        properties: HashMap::from([
+            ("success_rate".into(), "10".into()),
+            ("task_total".into(), "5".into()),
+        ]),
+        created: 1,
+        updated: 1,
+    };
+    let mut type_cache = HashMap::new();
+    assert!(object_implements(
+        &facts,
+        &mut type_cache,
+        &obj,
+        INTERFACE_EVALUABLE
+    ));
+    assert!(is_evaluable_context(&facts, &mut type_cache, &obj));
+    assert!(is_degraded_evaluable(&facts, &mut type_cache, &obj, 30));
+    let other = Object {
+        id: "g2".into(),
+        name: "g2".into(),
+        ..obj.clone()
+    };
+    assert!(object_implements(
+        &facts,
+        &mut type_cache,
+        &other,
+        INTERFACE_EVALUABLE
+    ));
+    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

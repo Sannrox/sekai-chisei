@@ -11,6 +11,7 @@
 - `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.1.0`, matching crate version and compose (#1268).
 - Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
 - Chisei persistence goes through per-family store traits. `src/chisei` no longer calls `ChiseiStore::runtime()`, and that method is crate-private. `sekaictl admin quality` opens the dest pair (or `SEKAI_DATA_DIR`) so evaluate/restart can read dataset facts from Sekai (#1237).
+- Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
 
 ## 1.1.0
 
