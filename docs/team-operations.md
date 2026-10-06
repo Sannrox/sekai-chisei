@@ -15,8 +15,8 @@ sekaictl report quality \
 ```
 
 Authenticated clients can read the same report through
-`ChiseiService.GetQualityTrend`. The CLI is a single-store reader (`DB_PATH` /
-`DATABASE_URL`) and refuses Combined Split; dest-pair operators use the RPC. The report
+`ChiseiService.GetQualityTrend`. The CLI is a single-store reader of the Sekai store (`SEKAI_DB_PATH` /
+`SEKAI_DATABASE_URL`) and refuses Combined Split; dest-pair operators use the RPC. The report
 keeps allow, deny, unknown, unavailable, cancelled, running,
 partial-population, missing-dependency, and invalid-receipt states distinct.
 Its totals reconcile to the selected receipt window. Baselines require an
@@ -41,10 +41,9 @@ sekaictl report substitution \
   --output reports/acme-substitution.json
 ```
 
-The command is a single-store reader: `DB_PATH` (default `./data/sekai.db`)
-or `SEKAI_DB_BACKEND=postgres` with `DATABASE_URL`. Combined Split is
+The command is a single-store reader of the Sekai store: `SEKAI_DB_PATH` (default `<SEKAI_DATA_DIR>/sekai.db`) or `SEKAI_DB_BACKEND=postgres` with `SEKAI_DATABASE_URL`. Combined Split is
 refused so relocated Chisei receipts cannot be omitted; use
-`ChiseiService.GetOperationReceipt`. Shared `SEKAI_SHARED_STORE=1` still matches the CLI. With `SEKAI_CREDENTIAL`, the
+`ChiseiService.GetOperationReceipt`. With `SEKAI_CREDENTIAL`, the
 command authenticates the credential against the configured backend; an
 optional `--principal` or `SEKAI_PRINCIPAL` must match that authenticated
 principal. Without a credential, the command runs as the local bootstrap

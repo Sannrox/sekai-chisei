@@ -56,8 +56,8 @@ lives in the separate [research index](research/README.md).
   resume, rollback point, and writer fence.
 - [Two-plane processes](two-plane-processes.md) — separate `sekai-plane` and
   `chisei-plane` processes, wrong-plane rejection, and the authenticated hop.
-- [Docker](docker.md) — container dest-pair Combined boot, image `DB_PATH`
-  hatch, and transport choices.
+- [Docker](docker.md) — container dest-pair Combined boot, image
+  `SEKAI_DATA_DIR`, and transport choices.
 - [Operator console](operator-console.md) — authenticated browser shell and
   namespace context.
 - [Evaluation-plan operator CLI](evaluation-operator-cli.md) — safe plan

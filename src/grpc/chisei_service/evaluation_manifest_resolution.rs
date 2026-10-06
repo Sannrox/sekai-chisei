@@ -6,6 +6,33 @@
 
 use super::*;
 
+/// Governed objects live on Sekai. Combined reads them in process; a Chisei
+/// plane without that store fails closed.
+pub(super) fn in_process_facts_runtime(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+) -> Result<&RuntimeDb, Status> {
+    facts
+        .in_process_store()
+        .map(|store| store.runtime())
+        .map_err(map_in_process_facts_error)
+}
+
+pub(super) fn in_process_facts_runtime_arc(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+) -> Result<Arc<RuntimeDb>, Status> {
+    facts
+        .in_process_store()
+        .map(|store| store.runtime_arc())
+        .map_err(map_in_process_facts_error)
+}
+
+fn map_in_process_facts_error(error: crate::chisei::sekai_facts::SekaiFactError) -> Status {
+    match error {
+        crate::chisei::sekai_facts::SekaiFactError::Read(message) => Status::internal(message),
+        _ => Status::failed_precondition("governed invariant reference unavailable"),
+    }
+}
+
 fn principal_authority(
     db: &RuntimeDb,
     actor: &str,
@@ -212,6 +239,7 @@ fn fact_evidence_classifications(
 
 pub(super) fn validate_evaluation_plan_references(
     db: &RuntimeDb,
+    facts: &RuntimeDb,
     plan: &evaluation_plan_domain::EvaluationPlan,
     actor: &str,
 ) -> Result<(), Status> {
@@ -257,7 +285,7 @@ pub(super) fn validate_evaluation_plan_references(
         }
         for invariant_id in &node.invariant_version_ids {
             if !invariant_reference_visible(
-                db,
+                facts,
                 &plan.namespace,
                 invariant_id,
                 actor,
@@ -270,7 +298,7 @@ pub(super) fn validate_evaluation_plan_references(
                     "governed invariant reference unavailable",
                 ));
             }
-            let object = db
+            let object = facts
                 .get_object(invariant_id)
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::failed_precondition("unknown invariant version"))?;
@@ -328,7 +356,7 @@ pub(super) fn validate_evaluation_plan_references(
                 ));
             }
             let evidence_classifications = fact_evidence_classifications(
-                db,
+                facts,
                 &plan.namespace,
                 invariant_id,
                 &mut fact_classification_cache,
@@ -550,6 +578,7 @@ fn resolve_manifest_evidence(
 
 fn resolve_evaluation_manifest_live(
     db: &RuntimeDb,
+    facts: &RuntimeDb,
     request: &evaluation_manifest_domain::PreparedResolutionRequest,
     now_ms: i64,
 ) -> Result<evaluation_manifest_domain::EvaluationResolutionOutcome, Status> {
@@ -560,7 +589,7 @@ fn resolve_evaluation_manifest_live(
         return Err(Status::not_found("evaluation plan not found"));
     };
     if plan.namespace != request.request.namespace
-        || !evaluation_plan_visible(db, &plan, &request.actor).map_err(Status::internal)?
+        || !evaluation_plan_visible(facts, &plan, &request.actor).map_err(Status::internal)?
     {
         return Err(Status::not_found("evaluation plan not found"));
     }
@@ -582,7 +611,7 @@ fn resolve_evaluation_manifest_live(
         ));
     }
     let (invariant_set, _, _, hidden_applicable_invariant) =
-        match resolve_invariant_set_for_manifest(db, request) {
+        match resolve_invariant_set_for_manifest(facts, request) {
             Ok(resolved) => resolved,
             Err(status)
                 if matches!(
@@ -690,7 +719,7 @@ fn resolve_evaluation_manifest_live(
     let mut admitted_evidence = Vec::with_capacity(all_evidence_ids.len());
     for evidence_id in &all_evidence_ids {
         match resolve_manifest_evidence(
-            db,
+            facts,
             &request.request.namespace,
             &request.actor,
             evidence_id,
@@ -954,8 +983,10 @@ impl EvaluationManifestResolutionLifecycle {
                         None,
                     ));
                 }
+                let facts = in_process_facts_runtime(self.sekai_facts.reader())?;
                 let outcome = resolve_evaluation_manifest_live(
                     self.db.runtime(),
+                    facts,
                     prepared,
                     chrono::Utc::now().timestamp_millis(),
                 )?;

@@ -344,7 +344,7 @@ fn check_gateway_port() -> DoctorCheck {
 }
 
 fn check_database() -> DoctorCheck {
-    let path = std::env::var("DB_PATH").unwrap_or_else(|_| "./data/sekai.db".into());
+    let path = crate::combined_stores::default_sekai_sqlite_path();
     if !Path::new(&path).exists() {
         return DoctorCheck::ok(
             "database and migrations",

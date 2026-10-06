@@ -979,7 +979,7 @@ pub fn build_services_for_plane(
         chisei_service::ChiseiServiceImpl::with_budget(chisei_store, config.clone(), budget);
     match plane {
         ProcessPlane::Combined => {
-            // Shared and split layouts alike: Sekai facts come from the Sekai
+            // Owned and split layouts alike: Sekai facts come from the Sekai
             // store, never from the Chisei store.
             chisei_svc = chisei_svc
                 .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(

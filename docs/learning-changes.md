@@ -22,7 +22,8 @@ sekaictl admin learning rollback --namespace payments --learning-id learning-1
 Stale, hidden, unknown, or lease-lost inputs return the same unavailable
 result. Lease loss is an explicit reconciliation state and blocks later
 approval or activation. SQLite is the reference store. PostgreSQL stays
-unavailable.
+unavailable. Combined dest-pair CLIs open both stores: the learning object
+stays on Sekai, and the change record is written to Chisei.
 
 ## Pin an active learning on the next plan
 

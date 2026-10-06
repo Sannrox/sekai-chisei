@@ -547,6 +547,7 @@ impl ChiseiServiceImpl {
         }
         crate::chisei::learning_change::resolve_pin(
             &self.db,
+            self.sekai_facts.reader(),
             input.namespace.trim(),
             &pin.learning_id,
             &pin.candidate_digest,

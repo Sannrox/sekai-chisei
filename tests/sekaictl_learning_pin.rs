@@ -75,10 +75,19 @@ impl Server {
         let socket = dir.path().join("sekai.sock");
         let log_path = dir.path().join("server.log");
         let log = std::fs::File::create(&log_path).expect("server log");
+        let sekai_db = Self::db_path(dir.path());
+        let chisei_db = dir.path().join("chisei.db");
+        // Seeding a learning object before boot leaves the dest pair
+        // dual-unstamped. Combined refuses mutating RPCs until restamp.
+        sekai_chisei::store_relocate::restamp_destinations(
+            sekai_db.to_str().expect("utf8 sekai path"),
+            chisei_db.to_str().expect("utf8 chisei path"),
+        )
+        .expect("stamp dest pair after seeding Sekai facts");
         let child = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"))
             .env("SEKAI_SOCKET", &socket)
-            .env("DB_PATH", Self::db_path(dir.path()))
-            .env("SEKAI_SHARED_STORE", "1")
+            .env("SEKAI_DB_PATH", &sekai_db)
+            .env("CHISEI_DB_PATH", &chisei_db)
             .env(
                 "GRPC_PORT",
                 std::net::TcpListener::bind("127.0.0.1:0")
@@ -97,8 +106,6 @@ impl Server {
             .env_remove("SEKAI_ALLOW_PLAINTEXT")
             .env_remove("SEKAI_DB_BACKEND")
             .env_remove("DATABASE_URL")
-            .env_remove("SEKAI_DB_PATH")
-            .env_remove("CHISEI_DB_PATH")
             .env("OLLAMA_URL", ollama_url)
             .env("LLM_HTTP_CONNECT_TIMEOUT_SECS", "2")
             .env("LLM_HTTP_READ_TIMEOUT_SECS", "5")
@@ -154,12 +161,10 @@ impl Server {
             Command::new(env!("CARGO_BIN_EXE_sekaictl"))
                 .args(args)
                 .env("SEKAI_SOCKET", &self.socket)
-                .env("DB_PATH", Self::db_path(self.dir.path()))
-                .env("SEKAI_SHARED_STORE", "1")
+                .env("SEKAI_DB_PATH", Self::db_path(self.dir.path()))
+                .env("CHISEI_DB_PATH", self.dir.path().join("chisei.db"))
                 .env_remove("SEKAI_DB_BACKEND")
                 .env_remove("DATABASE_URL")
-                .env_remove("SEKAI_DB_PATH")
-                .env_remove("CHISEI_DB_PATH")
                 .env_remove("CHISEI_GRPC_URL")
                 .env_remove("SEKAI_CREDENTIAL")
                 .output()

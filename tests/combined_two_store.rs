@@ -148,7 +148,6 @@ async fn spawned_binary_opens_two_sqlite_stores() {
         .env("SEKAI_SOCKET", &socket)
         .env("SEKAI_DB_PATH", &sekai_path)
         .env("CHISEI_DB_PATH", &chisei_path)
-        .env("DB_PATH", &sekai_path)
         .env("GRPC_PORT", "0")
         .env("OPS_PORT", "")
         .env("OPS_BIND", "127.0.0.1")

@@ -84,7 +84,9 @@ SEKAI_INSECURE=1 cargo run
 SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 ```
 
-A single `DB_PATH` is refused unless `SEKAI_SHARED_STORE=1`. To run the planes
+The retired single-store variables `DB_PATH`, `DATABASE_URL`, and
+`SEKAI_SHARED_STORE` refuse boot; move an old single file with
+[store relocation](docs/store-relocation.md). To run the planes
 as separate processes, see
 [two-plane processes](docs/two-plane-processes.md).
 

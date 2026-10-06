@@ -3627,13 +3627,16 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cancellation_is_durable_and_reduces_fail_closed() {
     let svc = Arc::new(evaluation_execution_service(250));
-    let cancellation_replica = Arc::new(ChiseiServiceImpl::new_with_evaluator_registry(
-        svc.db.clone(),
-        svc.config.clone(),
-        svc.evaluation_execution_lifecycle
-            .evaluator_registry()
-            .clone(),
-    ));
+    let cancellation_replica = Arc::new(
+        ChiseiServiceImpl::new_with_evaluator_registry(
+            svc.db.clone(),
+            svc.config.clone(),
+            svc.evaluation_execution_lifecycle
+                .evaluator_registry()
+                .clone(),
+        )
+        .with_sekai_facts(svc.sekai_facts.clone()),
+    );
     let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
     let execute_request = ExecuteEvaluationManifestRequest {
         execution: Some(EvaluationExecutionRequest {
@@ -7752,6 +7755,7 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
     let store = svc.db.clone();
     learning::propose_change(
         &store,
+        svc.sekai_facts.reader(),
         "operator",
         &learning::ProposeLearningChange {
             namespace: "payments".into(),
@@ -7761,9 +7765,24 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
         1_000,
     )
     .unwrap();
-    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
-    let active =
-        learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+    learning::approve_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "reviewer",
+        "payments",
+        "learning-1",
+        2_000,
+    )
+    .unwrap();
+    let active = learning::activate_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "operator",
+        "payments",
+        "learning-1",
+        3_000,
+    )
+    .unwrap();
 
     let pin = ("learning-1", active.candidate_digest.as_str());
     let second = svc
@@ -7862,6 +7881,7 @@ async fn an_unusable_learning_pin_fails_closed_with_one_error() {
     let store = svc.db.clone();
     let proposed = learning::propose_change(
         &store,
+        svc.sekai_facts.reader(),
         "operator",
         &learning::ProposeLearningChange {
             namespace: "payments".into(),
@@ -7886,13 +7906,29 @@ async fn an_unusable_learning_pin_fails_closed_with_one_error() {
             .await
             .unwrap_err(),
     );
-    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    learning::approve_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "reviewer",
+        "payments",
+        "learning-1",
+        2_000,
+    )
+    .unwrap();
     unavailable(
         plan("payments", Some(("learning-1", &digest)))
             .await
             .unwrap_err(),
     );
-    learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+    learning::activate_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "operator",
+        "payments",
+        "learning-1",
+        3_000,
+    )
+    .unwrap();
     assert!(
         plan("payments", Some(("learning-1", &digest)))
             .await
@@ -7920,7 +7956,15 @@ async fn an_unusable_learning_pin_fails_closed_with_one_error() {
     );
 
     // Rollback disables it.
-    learning::rollback_change(&store, "operator", "payments", "learning-1", 4_000).unwrap();
+    learning::rollback_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "operator",
+        "payments",
+        "learning-1",
+        4_000,
+    )
+    .unwrap();
     unavailable(
         plan("payments", Some(("learning-1", &digest)))
             .await
@@ -7930,6 +7974,7 @@ async fn an_unusable_learning_pin_fails_closed_with_one_error() {
     // A principal without namespace access cannot inject a learning at all.
     learning::propose_change(
         &store,
+        svc.sekai_facts.reader(),
         "operator",
         &learning::ProposeLearningChange {
             namespace: "payments".into(),
@@ -7939,8 +7984,24 @@ async fn an_unusable_learning_pin_fails_closed_with_one_error() {
         5_000,
     )
     .unwrap();
-    learning::approve_change(&store, "reviewer", "payments", "learning-1", 6_000).unwrap();
-    learning::activate_change(&store, "operator", "payments", "learning-1", 7_000).unwrap();
+    learning::approve_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "reviewer",
+        "payments",
+        "learning-1",
+        6_000,
+    )
+    .unwrap();
+    learning::activate_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "operator",
+        "payments",
+        "learning-1",
+        7_000,
+    )
+    .unwrap();
     let mut request = Request::new(learning_pin_input(
         "req",
         "payments",
@@ -7963,6 +8024,7 @@ async fn a_pin_the_selected_route_may_not_receive_fails_closed() {
     let store = svc.db.clone();
     let proposed = learning::propose_change(
         &store,
+        svc.sekai_facts.reader(),
         "operator",
         &learning::ProposeLearningChange {
             namespace: "payments".into(),
@@ -7972,8 +8034,24 @@ async fn a_pin_the_selected_route_may_not_receive_fails_closed() {
         1_000,
     )
     .unwrap();
-    learning::approve_change(&store, "reviewer", "payments", "learning-1", 2_000).unwrap();
-    learning::activate_change(&store, "operator", "payments", "learning-1", 3_000).unwrap();
+    learning::approve_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "reviewer",
+        "payments",
+        "learning-1",
+        2_000,
+    )
+    .unwrap();
+    learning::activate_change(
+        &store,
+        svc.sekai_facts.reader(),
+        "operator",
+        "payments",
+        "learning-1",
+        3_000,
+    )
+    .unwrap();
 
     // The learning is active and correctly pinned, but its text has no
     // external-egress allowlist and the default route is an external provider.

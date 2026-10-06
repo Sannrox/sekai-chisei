@@ -572,14 +572,23 @@ impl GatewayRuntime {
         .with_usage_recovery_path(Some(resolve_usage_recovery_path(
             std::env::var("CHISEI_GATEWAY_USAGE_RECOVERY_PATH").ok(),
         )))
-        // Registry state sits beside the Sekai (or shared) file. The gateway
-        // does not open a third durable store.
+        // Registry state sits beside the Sekai file: SEKAI_DB_PATH, else
+        // `<SEKAI_DATA_DIR>/sekai.db`. The gateway does not open a third
+        // durable store.
         .with_provider_registry_state_path(Some(provider_registry_state_path(
             &std::env::var("SEKAI_DB_PATH")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
-                .or_else(|| std::env::var("DB_PATH").ok())
-                .unwrap_or_else(|| "./data/sekai.db".to_string()),
+                .unwrap_or_else(|| {
+                    let dir = std::env::var("SEKAI_DATA_DIR")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "./data".to_string());
+                    std::path::Path::new(dir.trim())
+                        .join("sekai.db")
+                        .to_string_lossy()
+                        .into_owned()
+                }),
         )))
         .with_recovery_spool_path(Some(resolve_recovery_spool_path(
             std::env::var("CHISEI_GATEWAY_RECOVERY_SPOOL_PATH").ok(),

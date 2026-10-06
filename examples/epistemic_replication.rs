@@ -47,8 +47,10 @@ use sekai_chisei::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind,
 };
+use sekai_chisei::chisei::sekai_facts::SekaiFacts;
 use sekai_chisei::config::Config;
 use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::db::store::{ChiseiStore, SekaiStore};
 use sekai_chisei::domain::Object;
 use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
 use sekai_chisei::grpc::pb::chisei::{
@@ -1214,6 +1216,17 @@ fn fixture_config() -> Config {
     config
 }
 
+fn fixture_chisei_service(db: &RuntimeDb) -> ChiseiServiceImpl {
+    let runtime = Arc::new(db.clone());
+    ChiseiServiceImpl::new(
+        ChiseiStore::from_shared_runtime(runtime.clone()),
+        fixture_config(),
+    )
+    .with_sekai_facts(SekaiFacts::in_process(SekaiStore::from_shared_runtime(
+        runtime,
+    )))
+}
+
 fn authenticated_request<T>(body: T) -> Request<T> {
     let mut request = Request::new(body);
     request.metadata_mut().insert(
@@ -1345,10 +1358,7 @@ fn install_evaluation_plan(
         ACTOR,
         NOW_MS,
     )?;
-    let service = ChiseiServiceImpl::new(
-        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(Arc::new(db.clone())),
-        fixture_config(),
-    );
+    let service = fixture_chisei_service(db);
     let definition_response = block_on_fixture(ChiseiGrpcService::put_evaluator_definition(
         &service,
         authenticated_request(chisei::PutEvaluatorDefinitionRequest {
@@ -1456,10 +1466,7 @@ fn execute_evaluation_plan(
     ),
     String,
 > {
-    let service = ChiseiServiceImpl::new(
-        sekai_chisei::db::store::ChiseiStore::from_shared_runtime(Arc::new(db.clone())),
-        fixture_config(),
-    );
+    let service = fixture_chisei_service(db);
     let (manifest_digest, step_status, verdict, operation_id) = block_on_fixture(async {
         let resolution = ChiseiGrpcService::resolve_evaluation_plan(
             &service,

@@ -54,7 +54,7 @@ fn tenkai_install_sets_compose_dest_pair_and_matches_crate_version() {
     );
     assert!(
         install.contains("-e SEKAI_DB_PATH=/data/sekai.db"),
-        "bare-image install must set the Sekai dest so leftover image DB_PATH is not the Combined identity"
+        "bare-image install must set the Sekai dest matching compose"
     );
     assert!(
         install.contains("-e CHISEI_DB_PATH=/data/chisei.db"),
@@ -62,6 +62,6 @@ fn tenkai_install_sets_compose_dest_pair_and_matches_crate_version() {
     );
     assert!(
         !install.contains("SEKAI_SHARED_STORE=1"),
-        "dest-pair is the compose default; the Shared hatch is migration compatibility"
+        "dest-pair is the compose default; retired single-store variables must stay unset"
     );
 }

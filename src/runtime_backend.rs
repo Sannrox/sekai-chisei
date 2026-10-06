@@ -123,14 +123,19 @@ pub struct RuntimeBackendConfig {
 }
 
 impl RuntimeBackendConfig {
+    /// Single-store callers (sekaictl subcommands, reports) open the Sekai
+    /// store: `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`, else
+    /// `default_sqlite_path`. Retired `DB_PATH` / `DATABASE_URL` /
+    /// `SEKAI_SHARED_STORE` refuse with guidance.
     pub fn from_env(default_sqlite_path: &str) -> Result<Self, String> {
+        crate::combined_stores::refuse_legacy_store_env()?;
         let backend = BackendIdentity::parse(
             &std::env::var("SEKAI_DB_BACKEND").unwrap_or_else(|_| "sqlite".into()),
         )?;
-        let explicit_sqlite_path = std::env::var("DB_PATH")
+        let explicit_sqlite_path = std::env::var("SEKAI_DB_PATH")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let postgres_url = std::env::var("DATABASE_URL")
+        let postgres_url = std::env::var("SEKAI_DATABASE_URL")
             .ok()
             .filter(|value| !value.trim().is_empty());
         let postgres_max_connections = std::env::var("SEKAI_POSTGRES_MAX_CONNECTIONS")
@@ -166,7 +171,7 @@ impl RuntimeBackendConfig {
         postgres_ca_cert_path: Option<&str>,
     ) -> Result<Self, String> {
         if explicit_sqlite_path.is_some() && postgres_url.is_some() {
-            return Err("DB_PATH and DATABASE_URL cannot both be configured".into());
+            return Err("SEKAI_DB_PATH and SEKAI_DATABASE_URL cannot both be configured".into());
         }
         if postgres_max_connections == 0 {
             return Err("SEKAI_POSTGRES_MAX_CONNECTIONS must be greater than zero".into());
@@ -176,7 +181,7 @@ impl RuntimeBackendConfig {
             BackendIdentity::Sqlite => {
                 if postgres_url.is_some() {
                     return Err(
-                        "DATABASE_URL requires SEKAI_DB_BACKEND=postgres; SQLite is the default"
+                        "SEKAI_DATABASE_URL requires SEKAI_DB_BACKEND=postgres; SQLite is the default"
                             .into(),
                     );
                 }
@@ -194,10 +199,13 @@ impl RuntimeBackendConfig {
             }
             BackendIdentity::Postgres => {
                 if explicit_sqlite_path.is_some() {
-                    return Err("DB_PATH is incompatible with SEKAI_DB_BACKEND=postgres".into());
+                    return Err(
+                        "SEKAI_DB_PATH is incompatible with SEKAI_DB_BACKEND=postgres".into(),
+                    );
                 }
-                let postgres_url = postgres_url
-                    .ok_or_else(|| "SEKAI_DB_BACKEND=postgres requires DATABASE_URL".to_string())?;
+                let postgres_url = postgres_url.ok_or_else(|| {
+                    "SEKAI_DB_BACKEND=postgres requires SEKAI_DATABASE_URL".to_string()
+                })?;
                 Ok(Self {
                     backend,
                     sqlite_path: None,
@@ -224,7 +232,7 @@ impl RuntimeBackend {
                     config
                         .sqlite_path
                         .as_deref()
-                        .ok_or("SQLite backend requires DB_PATH")?,
+                        .ok_or("SQLite backend requires a database path")?,
                     config.postgres_max_connections,
                 )?);
                 let capabilities = BackendCapabilities {
@@ -247,7 +255,7 @@ impl RuntimeBackend {
                 let url = config
                     .postgres_url
                     .as_deref()
-                    .ok_or("PostgreSQL backend requires DATABASE_URL")?;
+                    .ok_or("PostgreSQL backend requires a database URL")?;
                 let postgres = if let Some(ca_path) = config.postgres_ca_cert_path.as_deref() {
                     let certificate = std::fs::read(ca_path)
                         .map_err(|error| format!("read SEKAI_POSTGRES_CA_CERT: {error}"))?;
@@ -397,7 +405,11 @@ mod tests {
             16,
             None,
         );
-        assert!(missing_url.unwrap_err().contains("requires DATABASE_URL"));
+        assert!(
+            missing_url
+                .unwrap_err()
+                .contains("requires SEKAI_DATABASE_URL")
+        );
 
         let conflicting = RuntimeBackendConfig::from_sources(
             BackendIdentity::Postgres,

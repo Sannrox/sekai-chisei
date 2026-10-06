@@ -32,8 +32,8 @@ lifecycle, label taxonomy, artifact decision rules, and repository Skills.
 3. Copy `.env.example` to `.env` if you need local overrides. Combined
    `cargo run` does not load `.env`. With no store variable it opens split
    `sekai.db` and `chisei.db` under `SEKAI_DATA_DIR` (default `./data`);
-   `SEKAI_DB_PATH` and `CHISEI_DB_PATH` override the files (or
-   `SEKAI_SHARED_STORE=1` with `DB_PATH` for a single file). See
+   `SEKAI_DB_PATH` and `CHISEI_DB_PATH` override the files. The retired
+   `DB_PATH` / `SEKAI_SHARED_STORE` refuse boot. See
    [configuration](docs/configuration.md).
 4. Run the standard checks:
 

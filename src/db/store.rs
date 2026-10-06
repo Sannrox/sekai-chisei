@@ -1,9 +1,9 @@
 //! Typed durable-store handles for the accepted two-store split.
 //!
-//! Combined mode opens two physical stores when destination variables are
-//! set. One [`RuntimeDb`] behind both handles remains an explicit
-//! compatibility facade (`from_shared_runtime` / `split_shared_runtime`)
-//! for a single `DB_PATH` / `DATABASE_URL` until relocation. Handles do
+//! Combined mode always opens two physical stores. One [`RuntimeDb`] behind
+//! both handles remains an explicit facade (`from_shared_runtime` /
+//! `split_shared_runtime`) for a single-plane process's own store and for
+//! in-process fixtures. Handles do
 //! not `Deref`, `From`, or `AsRef` to [`RuntimeDb`]: wrong-plane access
 //! has to name that constructor. Chisei constructors never take
 //! `RuntimeDb` and Sekai constructors never take a Chisei handle.
@@ -65,6 +65,14 @@ impl SekaiStore {
 
     pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
+    }
+
+    pub fn get_object(&self, id: &str) -> Result<Option<crate::domain::Object>, String> {
+        self.inner.get_object(id)
+    }
+
+    pub fn update_object(&self, object: &crate::domain::Object) -> Result<(), String> {
+        self.inner.update_object(object)
     }
 }
 

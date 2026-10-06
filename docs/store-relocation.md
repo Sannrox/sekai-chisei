@@ -77,13 +77,14 @@ are copied again and re-validated. A run interrupted after the fence keeps its
 dirty set, so the re-run copies those families again before stamping. Once the
 fence is raised, the source refuses Chisei writes until a re-run stamps both
 destinations; recover a failure in that window by re-running, not by
-reopening the source as a Shared writer.
+reopening the source as a single-store writer.
 
 ## After the fence
 
-Combined already refuses a lone `DB_PATH` / `DATABASE_URL` unless
-`SEKAI_SHARED_STORE=1`. After the fence, that hatch still cannot start a
-writer (including `gateway-report`). Stop the historical process, set
+Every server process refuses `DB_PATH`, `DATABASE_URL`, and
+`SEKAI_SHARED_STORE` with guidance, so the historical single store cannot
+start as a writer (including `gateway-report`). Pass it to relocation as the
+explicit `--source` instead. Stop the historical process, set
 `SEKAI_DB_PATH` and `CHISEI_DB_PATH` (or two PostgreSQL URLs), and start
 Combined against the destination pair. The capture triggers stay on the
 source's Chisei tables, which remain as rollback data and refuse writes.
@@ -100,8 +101,8 @@ as part of cutover. Dual-unstamped stores that already hold operator facts
 are not a pair: writes stay refused until restamp. Mutating admits also
 dual-write a pairing epoch. Equal generation after a one-sided restore of
 a matched backup is not a pairing proof; the restored plane keeps the old
-epoch and writes stay refused until restamp. A Shared or
-owned-plane process that opens one stamped dest compares `SEKAI_STORE_PEER`
+epoch and writes stay refused until restamp. A single-plane
+process that opens one stamped dest compares `SEKAI_STORE_PEER`
 (read-only; not a writer destination). A missing peer or unequal generation
 keeps mutating RPCs refused until an operator restamps both stores:
 

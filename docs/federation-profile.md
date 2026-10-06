@@ -20,21 +20,22 @@ Contract id: `sekai.federation-profile/v1`.
 
 ## Operator workflow (two local processes)
 
-This walkthrough uses one Shared file per site (`SEKAI_SHARED_STORE=1`) so
-the Combined server and `sekaictl admin federation` open the same identity.
-The CLI reads `DB_PATH` / `DATABASE_URL` only; it does not follow Combined
-dest-pair. Assume process A uses `DB_PATH=data/site-a.db` and process B uses
-`DB_PATH=data/site-b.db`. Generate offline Ed25519 keys; only verifying keys
+Federation tables are Sekai-owned. `sekaictl admin federation` opens the
+Sekai store only: `SEKAI_DB_PATH` (default `<SEKAI_DATA_DIR>/sekai.db`) or
+`SEKAI_DATABASE_URL`. Assume Combined process A uses
+`SEKAI_DB_PATH=data/site-a.db` with `CHISEI_DB_PATH=data/site-a-chisei.db`,
+and process B uses `SEKAI_DB_PATH=data/site-b.db` with
+`CHISEI_DB_PATH=data/site-b-chisei.db`. Generate offline Ed25519 keys; only verifying keys
 enter the control plane.
 
 ### 1. Register local site identity
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation register-site \
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation register-site \
   --site-id site-a --key-id k1 --public-key-hex <a-pubkey-hex> \
   --region eu-central --data-class internal
 
-DB_PATH=data/site-b.db sekaictl admin federation register-site \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation register-site \
   --site-id site-b --key-id k1 --public-key-hex <b-pubkey-hex> \
   --region us-east --data-class internal
 ```
@@ -42,10 +43,10 @@ DB_PATH=data/site-b.db sekaictl admin federation register-site \
 ### 2. Pin trust roots (reuse #290 store)
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation pin-trust-root \
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation pin-trust-root \
   --site-identity site-b --key-id k1 --public-key-hex <b-pubkey-hex>
 
-DB_PATH=data/site-b.db sekaictl admin federation pin-trust-root \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation pin-trust-root \
   --site-identity site-a --key-id k1 --public-key-hex <a-pubkey-hex>
 ```
 
@@ -56,11 +57,11 @@ namespace chosen by operators.
 ### 3. Join with policy pack pin
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation join \
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation join \
   --peer-site-id site-b --peer-key-id k1 --peer-public-key-hex <b-pubkey-hex> \
   --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:...
 
-DB_PATH=data/site-b.db sekaictl admin federation join \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation join \
   --peer-site-id site-a --peer-key-id k1 --peer-public-key-hex <a-pubkey-hex> \
   --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:...
 ```
@@ -69,18 +70,18 @@ Join is audited (`federation.peer_join`). The pack pin is visible on the peer
 record:
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation list-peers
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation list-peers
 ```
 
 ### 4. Peer health and import availability
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health up
-DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health up
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
 # {"available":true, ...}
 
-DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health down
-DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation set-health --peer-site-id site-b --health down
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation import-availability --peer-site-id site-b
 # {"available":false,"reason":"peer is down; cross-site import unavailable ..."}
 ```
 
@@ -91,7 +92,7 @@ true (and still under #290 verify rules).
 ### 5. Leave (audited)
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation leave --peer-site-id site-b
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation leave --peer-site-id site-b
 ```
 
 ## Namespace snapshots (#697)
@@ -103,7 +104,7 @@ independent planes. Each plane keeps local write and governance authority.
 2. On the importing plane, grant the peer an explicit namespace scope:
 
 ```text
-DB_PATH=data/site-b.db sekaictl admin federation grant-namespace \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation grant-namespace \
   --peer-site-id site-a --namespace ops --max-classification internal
 ```
 
@@ -112,7 +113,7 @@ DB_PATH=data/site-b.db sekaictl admin federation grant-namespace \
    objects are omitted without a hidden count.
 
 ```text
-DB_PATH=data/site-a.db sekaictl admin federation export-snapshot \
+SEKAI_DB_PATH=data/site-a.db sekaictl admin federation export-snapshot \
   --namespace ops --output ./ops-snapshot.json \
   --signing-key ./site-a-seed.hex \
   --pack-id governance-pack --pack-version 1.0.0 --pack-digest sha256:... \
@@ -125,8 +126,8 @@ DB_PATH=data/site-a.db sekaictl admin federation export-snapshot \
    that stores both claims. Import does not overwrite the local object.
 
 ```text
-DB_PATH=data/site-b.db sekaictl admin federation set-health --peer-site-id site-a --health up
-DB_PATH=data/site-b.db sekaictl admin federation import-snapshot \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation set-health --peer-site-id site-a --health up
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation import-snapshot \
   --namespace ops --bundle ./ops-snapshot.json
 ```
 
@@ -156,10 +157,10 @@ depend on the subject fail immediately. Snapshots, conflicts, and provenance
 stay on the plane.
 
 ```text
-DB_PATH=data/site-b.db sekaictl admin federation revoke-authority \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation revoke-authority \
   --kind peer --subject site-a --peer-site-id site-a --reason withdrawn
-DB_PATH=data/site-b.db sekaictl admin federation list-revocations
-DB_PATH=data/site-b.db sekaictl admin federation show-revocation-propagation \
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation list-revocations
+SEKAI_DB_PATH=data/site-b.db sekaictl admin federation show-revocation-propagation \
   --kind peer --subject site-a
 ```
 
@@ -212,9 +213,8 @@ sekaictl admin federation show-revocation ...
 sekaictl admin federation show-revocation-propagation ...
 ```
 
-Host filesystem / `DB_PATH` is the trust boundary for this CLI (same posture as
-compliance export). Combined dest-pair is a different process; this CLI still
-opens one Shared file. A multi-tenant gRPC federation admin surface is a
+Host filesystem / `SEKAI_DB_PATH` is the trust boundary for this CLI (same
+posture as compliance export). A multi-tenant gRPC federation admin surface is a
 follow-up.
 
 ## Runtime notes

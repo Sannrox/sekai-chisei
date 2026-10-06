@@ -266,11 +266,12 @@ pub async fn run_launch(
     config: LaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     load_local_env();
-    // The Sekai file the server opens: SEKAI_DB_PATH, DB_PATH, else
+    // Refuse retired single-store variables (shell or `.env`) before
+    // onboarding writes a credential into a store the server would refuse.
+    crate::combined_stores::refuse_legacy_store_env()?;
+    // The Sekai file the server opens: SEKAI_DB_PATH, else
     // `<SEKAI_DATA_DIR>/sekai.db`.
-    let db_path = crate::combined_stores::registry_db_anchor(
-        &crate::combined_stores::default_sekai_sqlite_path(),
-    );
+    let db_path = crate::combined_stores::default_sekai_sqlite_path();
     if config.kind().is_some() {
         let contract = validate_launch_contract(&config, &db_path)?;
         println!(

@@ -22,7 +22,7 @@ container image pull "$IMG" || container image inspect "$IMG" >/dev/null 2>&1
 container volume create sekai-chisei-prod-data >/dev/null 2>&1 || true
 container run --rm --user root -v sekai-chisei-prod-data:/data "$IMG" chown -R sekai /data
 container rm -f sekai-chisei-prod >/dev/null 2>&1 || true
-# Dest-pair wins over the image leftover DB_PATH=/data/sekai.db (docs/docker.md).
+# Explicit dest-pair matches compose (docs/docker.md). Image SEKAI_DATA_DIR=/data derives the same files.
 # Plaintext on 0.0.0.0 is confined to the container VM; ports publish to localhost only.
 container run -d --name sekai-chisei-prod -p 50052:50051 -p 9465:9464 -e SEKAI_INSECURE=1 -e SEKAI_BIND=0.0.0.0 -e SEKAI_ALLOW_PLAINTEXT=1 -e OPS_BIND=0.0.0.0 -e SEKAI_DB_PATH=/data/sekai.db -e CHISEI_DB_PATH=/data/chisei.db -v sekai-chisei-prod-data:/data "$IMG"
 """
