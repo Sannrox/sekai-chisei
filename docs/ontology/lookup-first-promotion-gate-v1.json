@@ -71,13 +71,13 @@
     {
       "subject": "LookupFirstPromotionGate",
       "source": "sekai-chisei",
-      "locator": "src/chisei/lookup_first.rs;run_lookup_promotion_gate;record_lookup_promotion_gate",
+      "locator": "src/composition/lookup_first.rs;run_lookup_promotion_gate;record_lookup_promotion_gate",
       "confidence": 1.0
     },
     {
       "subject": "LookupFirstPromotionGateSuite",
       "source": "sekai-chisei",
-      "locator": "src/chisei/lookup_first.rs;LookupPromotionGateSuite;parse_lookup_promotion_gate_suite",
+      "locator": "src/composition/lookup_first.rs;LookupPromotionGateSuite;parse_lookup_promotion_gate_suite",
       "confidence": 1.0
     },
     {

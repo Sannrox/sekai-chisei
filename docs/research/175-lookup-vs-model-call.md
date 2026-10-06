@@ -130,7 +130,7 @@ implementation after #151 landed:
 - Fail closed to model path with `lookup_refusal`; receipts mark `lookup_hit` vs `model_path`.
 
 See `docs/capability-catalog.md` (Lookup-first answers) and
-`src/chisei/lookup_first.rs`.
+`src/composition/lookup_first.rs`.
 
 ### S2 extension
 
