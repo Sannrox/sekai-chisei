@@ -98,19 +98,16 @@ pub(super) async fn get_definition_member(
         .get_definition_revision(&input.namespace, &input.revision_digest)
         .map_err(|_| Status::internal("definition member unavailable"))?
         .ok_or_else(|| Status::not_found("definition member unavailable"))?;
-    let members = service
+    let member = service
         .db
         .runtime()
-        .get_definition_members(&input.namespace, &input.revision_digest)
-        .map_err(|_| Status::internal("definition member unavailable"))?;
-    // The store verifies individual documents; verify their exact revision binding too.
-    definition_branch_domain::validate_revision_members(&revision, &members)
-        .map_err(|_| Status::internal("definition member unavailable"))?;
-    let member = members
-        .into_iter()
-        .find(|member| {
-            member.member_kind == input.member_kind && member.member_id == input.member_id
-        })
+        .get_definition_member(
+            &input.namespace,
+            &input.revision_digest,
+            &input.member_kind,
+            &input.member_id,
+        )
+        .map_err(|_| Status::internal("definition member unavailable"))?
         .ok_or_else(|| Status::not_found("definition member unavailable"))?;
     Ok(Response::new(GetDefinitionMemberResponse {
         revision_digest: revision.revision_digest,

@@ -1,5 +1,7 @@
 //! Backend-neutral persistence for governed definition branches.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
@@ -35,6 +37,14 @@ pub trait DefinitionBranchBackend: Send + Sync {
         namespace: &str,
         revision_digest: &str,
     ) -> Result<Vec<DefinitionMember>, String>;
+
+    fn get_definition_member(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<Option<DefinitionMember>, String>;
 
     fn get_definition_branch(
         &self,
@@ -120,6 +130,22 @@ macro_rules! forward {
             revision_digest: &str,
         ) -> Result<Vec<DefinitionMember>, String> {
             <$target>::get_definition_members(self, namespace, revision_digest)
+        }
+
+        fn get_definition_member(
+            &self,
+            namespace: &str,
+            revision_digest: &str,
+            member_kind: &str,
+            member_id: &str,
+        ) -> Result<Option<DefinitionMember>, String> {
+            <$target>::get_definition_member(
+                self,
+                namespace,
+                revision_digest,
+                member_kind,
+                member_id,
+            )
         }
 
         fn get_definition_branch(
@@ -416,6 +442,19 @@ impl SekaiDb {
             return Ok(Vec::new());
         };
         load_members_sqlite(&self.conn(), &revision)
+    }
+
+    pub fn get_definition_member(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<Option<DefinitionMember>, String> {
+        let Some(revision) = self.get_definition_revision(namespace, revision_digest)? else {
+            return Ok(None);
+        };
+        load_member_sqlite(&self.conn(), &revision, member_kind, member_id)
     }
 
     pub fn get_definition_branch(
@@ -1270,36 +1309,76 @@ fn mark_revision_published_sqlite(
     Ok(published)
 }
 
-fn load_members_sqlite(
+pub(crate) fn load_members_sqlite(
     connection: &rusqlite::Connection,
     revision: &DefinitionRevision,
 ) -> Result<Vec<DefinitionMember>, String> {
+    if revision.members.is_empty() {
+        return Ok(Vec::new());
+    }
+    let digests = revision
+        .members
+        .iter()
+        .map(|member| member.member_digest.as_str())
+        .collect::<Vec<_>>();
+    let digest_json = serde_json::to_string(&digests).map_err(|error| error.to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT member_digest, body_json FROM sekai_definition_members
+             WHERE namespace=?1 AND member_digest IN (SELECT value FROM json_each(?2))",
+        )
+        .map_err(|error| error.to_string())?;
+    let mut by_digest = BTreeMap::new();
+    let mut rows = statement
+        .query(params![revision.namespace, digest_json])
+        .map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let digest: String = row.get(0).map_err(|error| error.to_string())?;
+        let body: String = row.get(1).map_err(|error| error.to_string())?;
+        if by_digest.insert(digest, body).is_some() {
+            return Err("corrupt definition revision: duplicate member digest".into());
+        }
+    }
     let mut members = Vec::with_capacity(revision.members.len());
     for reference in &revision.members {
-        let body: Option<String> = connection
-            .query_row(
-                "SELECT body_json FROM sekai_definition_members
-                 WHERE namespace=?1 AND member_digest=?2",
-                params![revision.namespace, reference.member_digest],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let body =
-            body.ok_or_else(|| "corrupt definition revision: member is missing".to_string())?;
-        let member: DefinitionMember = serde_json::from_str(&body)
-            .map_err(|error| format!("corrupt definition member: {error}"))?;
-        member.verify()?;
-        if member.namespace != revision.namespace
-            || member.member_digest != reference.member_digest
-            || member.member_kind != reference.member_kind
-            || member.member_id != reference.member_id
-        {
-            return Err("corrupt definition revision: member identity mismatch".into());
-        }
-        members.push(member);
+        let body = by_digest
+            .get(&reference.member_digest)
+            .ok_or_else(|| "corrupt definition revision: member is missing".to_string())?;
+        members.push(DefinitionMember::from_stored_body(
+            body, revision, reference,
+        )?);
     }
     Ok(members)
+}
+
+fn load_member_sqlite(
+    connection: &rusqlite::Connection,
+    revision: &DefinitionRevision,
+    member_kind: &str,
+    member_id: &str,
+) -> Result<Option<DefinitionMember>, String> {
+    let Some(reference) = revision
+        .members
+        .iter()
+        .find(|member| member.member_kind == member_kind && member.member_id == member_id)
+    else {
+        return Ok(None);
+    };
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body_json FROM sekai_definition_members
+             WHERE namespace=?1 AND member_digest=?2",
+            params![revision.namespace, reference.member_digest],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some(body) = body else {
+        return Err("corrupt definition revision: member is missing".into());
+    };
+    Ok(Some(DefinitionMember::from_stored_body(
+        &body, revision, reference,
+    )?))
 }
 
 fn replay_sqlite(
@@ -1403,7 +1482,7 @@ fn persist_result_sqlite<T: serde::Serialize>(
 mod tests {
     use super::*;
     use crate::sekai::definition_branch::{
-        DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
+        DefinitionMember, DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
     };
 
     fn parent_fixture(
@@ -1814,5 +1893,164 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 0);
+    }
+
+    fn seed_members(db: &SekaiDb, ids: &[&str]) -> (DefinitionRevision, Vec<DefinitionMember>) {
+        let members = ids
+            .iter()
+            .map(|id| {
+                DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: (*id).into(),
+                    definition_json: format!(r#"{{"name":"{id}"}}"#),
+                    member_digest: String::new(),
+                }
+                .prepare("team-a")
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let revision = prepare_revision(
+            "team-a",
+            "",
+            members.iter().map(|member| DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            }),
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        db.seed_published_definition_revision(&revision, &members)
+            .unwrap();
+        (revision, members)
+    }
+
+    thread_local! {
+        static MEMBER_SQL: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn trace_member_sql(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql.contains("sekai_definition_members")
+        {
+            MEMBER_SQL.with(|log| log.borrow_mut().push(sql.to_string()));
+        }
+    }
+
+    #[test]
+    fn get_definition_members_loads_a_multi_member_revision_in_one_select() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (revision, members) = seed_members(&db, &["Ticket", "Incident", "Change", "Problem"]);
+        MEMBER_SQL.with(|log| log.borrow_mut().clear());
+        {
+            let conn = db.conn();
+            conn.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace_member_sql),
+            );
+        }
+        let loaded = db
+            .get_definition_members("team-a", &revision.revision_digest)
+            .unwrap();
+        assert_eq!(loaded.len(), members.len());
+        for member in &members {
+            assert!(loaded.contains(member), "missing {member:?}");
+        }
+        let sqls = MEMBER_SQL.with(|log| log.borrow().clone());
+        assert_eq!(sqls.len(), 1, "{sqls:?}");
+    }
+
+    #[test]
+    fn get_definition_members_rejects_a_tampered_body_on_the_read_path() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (revision, members) = seed_members(&db, &["Ticket", "Incident"]);
+        let digest = &members[1].member_digest;
+        db.conn()
+            .execute(
+                "UPDATE sekai_definition_members
+                 SET body_json = json_set(body_json, '$.definition_json', '{\"name\":\"Forged\"}')
+                 WHERE namespace='team-a' AND member_digest=?1",
+                params![digest],
+            )
+            .unwrap();
+        let error = db
+            .get_definition_members("team-a", &revision.revision_digest)
+            .unwrap_err();
+        assert!(
+            error.contains("digest does not match stored content"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn get_definition_member_does_not_load_sibling_bodies() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (revision, members) = seed_members(&db, &["Ticket", "Incident", "Change"]);
+        db.conn()
+            .execute(
+                "UPDATE sekai_definition_members
+                 SET body_json = json_set(body_json, '$.definition_json', '{\"name\":\"Forged\"}')
+                 WHERE namespace='team-a' AND member_digest=?1",
+                params![&members[1].member_digest],
+            )
+            .unwrap();
+        let loaded = db
+            .get_definition_member("team-a", &revision.revision_digest, "object_type", "Ticket")
+            .unwrap()
+            .expect("requested member");
+        assert_eq!(loaded, members[0]);
+        assert!(
+            db.get_definition_member(
+                "team-a",
+                &revision.revision_digest,
+                "object_type",
+                "Missing",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            db.get_definition_members("team-a", &revision.revision_digest)
+                .unwrap_err()
+                .contains("digest does not match stored content")
+        );
+    }
+
+    #[test]
+    fn write_path_still_rejects_a_non_canonical_member() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut member = DefinitionMemberInput {
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: r#"{"name":"Ticket"}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare("team-a")
+        .unwrap();
+        member.definition_json = r#"{ "name": "Ticket" }"#.into();
+        let revision = prepare_revision(
+            "team-a",
+            "",
+            [DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            }],
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        let error = db
+            .seed_published_definition_revision(&revision, std::slice::from_ref(&member))
+            .unwrap_err();
+        assert!(
+            error.contains("does not match canonical definition content")
+                || error.contains("content binding is invalid"),
+            "{error}"
+        );
     }
 }

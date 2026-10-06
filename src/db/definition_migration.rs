@@ -572,21 +572,13 @@ fn load_members_sqlite(
     digest: &str,
 ) -> Result<Vec<crate::sekai::definition_branch::DefinitionMember>, String> {
     let revision = load_revision_required_sqlite(tx, namespace, digest)?;
-    let mut members = Vec::new();
-    for member in revision.members {
-        let body: String = tx
-            .query_row(
-                "SELECT body_json FROM sekai_definition_members
-                 WHERE namespace=?1 AND member_digest=?2",
-                params![namespace, member.member_digest],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "definition_member_not_found: member is unavailable".to_string())?;
-        members.push(serde_json::from_str(&body).map_err(|error| error.to_string())?);
-    }
-    Ok(members)
+    super::definition_branch::load_members_sqlite(tx, &revision).map_err(|error| {
+        if error.contains("member is missing") {
+            "definition_member_not_found: member is unavailable".into()
+        } else {
+            error
+        }
+    })
 }
 
 fn load_published_digest_sqlite(
@@ -1201,20 +1193,13 @@ fn load_members_postgres(
     digest: &str,
 ) -> Result<Vec<crate::sekai::definition_branch::DefinitionMember>, String> {
     let revision = load_revision_required_postgres(tx, namespace, digest)?;
-    let mut members = Vec::new();
-    for member in revision.members {
-        let row = tx
-            .query_opt(
-                "SELECT body_json FROM sekai_definition_members
-                 WHERE namespace=$1 AND member_digest=$2",
-                &[&namespace, &member.member_digest],
-            )
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "definition_member_not_found: member is unavailable".to_string())?;
-        let body: String = row.get(0);
-        members.push(serde_json::from_str(&body).map_err(|error| error.to_string())?);
-    }
-    Ok(members)
+    super::postgres_definition_branch::load_members_postgres(tx, &revision).map_err(|error| {
+        if error.contains("member is missing") {
+            "definition_member_not_found: member is unavailable".into()
+        } else {
+            error
+        }
+    })
 }
 
 fn load_published_digest_postgres(
