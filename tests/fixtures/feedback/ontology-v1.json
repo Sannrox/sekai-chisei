@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "classes": [
+    {
+      "name": "Observation",
+      "description": "A typed observation retained from accepted source evidence. Required properties keep source evidence, problem signature, occurrence identifiers, classification, and disposition on the object.",
+      "mapped_kind": "feedback_observation",
+      "properties": [
+        {
+          "name": "source_evidence",
+          "type": "string",
+          "required": true,
+          "description": "Evidence submission id that authorized this observation."
+        },
+        {
+          "name": "problem_signature",
+          "type": "string",
+          "required": true,
+          "description": "Stable signature grouping related occurrences."
+        },
+        {
+          "name": "occurrence_ids",
+          "type": "string",
+          "required": true,
+          "description": "Occurrence identifiers retained as a single string value."
+        },
+        {
+          "name": "classification",
+          "type": "string",
+          "required": true,
+          "description": "Operator classification of the observation."
+        },
+        {
+          "name": "disposition",
+          "type": "string",
+          "required": true,
+          "description": "Current disposition of the observation."
+        }
+      ]
+    },
+    {
+      "name": "Finding",
+      "description": "A finding derived from one or more observations. It is a typed object, not a live investigation.",
+      "mapped_kind": "feedback_finding",
+      "properties": [
+        {
+          "name": "observation_id",
+          "type": "string",
+          "required": true,
+          "description": "Observation this finding is based on."
+        },
+        {
+          "name": "statement",
+          "type": "string",
+          "required": true,
+          "description": "Finding statement."
+        },
+        {
+          "name": "classification",
+          "type": "string",
+          "required": true,
+          "description": "Finding classification."
+        }
+      ]
+    },
+    {
+      "name": "InvestigationResult",
+      "description": "A measured investigation outcome. Distinct from a hypothesis and from a verification record.",
+      "mapped_kind": "feedback_investigation_result",
+      "disjoint_classes": ["Hypothesis", "VerificationRecord"],
+      "properties": [
+        {
+          "name": "observation_id",
+          "type": "string",
+          "required": true,
+          "description": "Observation under investigation."
+        },
+        {
+          "name": "outcome",
+          "type": "string",
+          "required": true,
+          "description": "Measured investigation outcome."
+        },
+        {
+          "name": "measured",
+          "type": "bool",
+          "required": true,
+          "description": "Whether the outcome is a measured fact."
+        }
+      ]
+    },
+    {
+      "name": "Hypothesis",
+      "description": "A proposed explanation. It is not a measured investigation result and cannot be the subject of the verification Action.",
+      "mapped_kind": "feedback_hypothesis",
+      "disjoint_classes": ["InvestigationResult", "VerificationRecord"],
+      "properties": [
+        {
+          "name": "observation_id",
+          "type": "string",
+          "required": true,
+          "description": "Observation this hypothesis proposes about."
+        },
+        {
+          "name": "statement",
+          "type": "string",
+          "required": true,
+          "description": "Hypothesis statement."
+        }
+      ]
+    },
+    {
+      "name": "ExternalIssueReference",
+      "description": "A reference to an issue in an external tracker. Adapters that write the tracker are outside this package.",
+      "mapped_kind": "feedback_external_issue",
+      "properties": [
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": true,
+          "description": "Finding this remote issue tracks."
+        },
+        {
+          "name": "tracker",
+          "type": "string",
+          "required": true,
+          "description": "Tracker name."
+        },
+        {
+          "name": "remote_id",
+          "type": "string",
+          "required": true,
+          "description": "Remote issue identifier."
+        }
+      ]
+    },
+    {
+      "name": "VerificationRecord",
+      "description": "A verification of a measured investigation result. The verification Action admits only subject_kind feedback_investigation_result.",
+      "mapped_kind": "feedback_verification",
+      "disjoint_classes": ["Hypothesis"],
+      "properties": [
+        {
+          "name": "subject_id",
+          "type": "string",
+          "required": true,
+          "description": "Investigation result being verified."
+        },
+        {
+          "name": "subject_kind",
+          "type": "string",
+          "required": true,
+          "description": "Must be feedback_investigation_result."
+        },
+        {
+          "name": "result",
+          "type": "string",
+          "required": true,
+          "description": "Verification result."
+        }
+      ]
+    }
+  ],
+  "relations": [
+    {
+      "name": "based_on",
+      "description": "A finding is based on an observation.",
+      "domain": "Finding",
+      "range": "Observation"
+    },
+    {
+      "name": "investigates",
+      "description": "An investigation result investigates an observation.",
+      "domain": "InvestigationResult",
+      "range": "Observation"
+    },
+    {
+      "name": "proposes_about",
+      "description": "A hypothesis proposes an explanation about an observation.",
+      "domain": "Hypothesis",
+      "range": "Observation"
+    },
+    {
+      "name": "tracks",
+      "description": "An external issue reference tracks a finding.",
+      "domain": "ExternalIssueReference",
+      "range": "Finding"
+    },
+    {
+      "name": "verifies",
+      "description": "A verification record verifies a measured investigation result.",
+      "domain": "VerificationRecord",
+      "range": "InvestigationResult"
+    }
+  ],
+  "provenance": [
+    {
+      "subject": "Observation",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1230",
+      "locator": "Acceptance: fixture observations retain source evidence and lineage",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Hypothesis",
+      "source": "https://github.com/Sannrox/sekai-chisei/discussions/1281",
+      "locator": "Hypotheses are a separate type from measured investigation results",
+      "confidence": 1.0
+    },
+    {
+      "subject": "VerificationRecord",
+      "source": "https://github.com/Sannrox/sekai-chisei/discussions/1281",
+      "locator": "Verification Action subject_kind admits investigation results only",
+      "confidence": 1.0
+    },
+    {
+      "subject": "verifies",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1230",
+      "locator": "Issue-verification lineage stays on typed objects",
+      "confidence": 1.0
+    }
+  ]
+}

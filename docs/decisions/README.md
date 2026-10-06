@@ -116,3 +116,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0092: Chisei builds without Sekai; Sekai may build on Chisei](0092-chisei-builds-without-sekai.md)
 - [ADR 0093: Agent drafts use immutable definition members](0093-agent-drafts-use-definition-members.md)
 - [ADR 0094: Scoped contexts author immutable definition drafts](0094-scoped-definition-draft-authoring.md)
+- [ADR 0095: Ship evidence and findings as a types-only domain package](0095-feedback-evidence-finding-package.md)
