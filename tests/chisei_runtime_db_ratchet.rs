@@ -14,13 +14,11 @@ use std::path::Path;
 /// Remaining backend-facade calls, as `(file, count)`.
 const ALLOWED: &[(&str, usize)] = &[
     ("src/chisei/affinity.rs", 7),
-    ("src/chisei/capability.rs", 4),
     ("src/chisei/data_quality.rs", 4),
     ("src/chisei/gunshi.rs", 2),
     ("src/chisei/gunshi_dispatch.rs", 1),
     ("src/chisei/kioku.rs", 6),
-    ("src/chisei/learning_change.rs", 11),
-    ("src/chisei/pipeline.rs", 65),
+    ("src/chisei/pipeline.rs", 4),
     ("src/chisei/sekai_facts.rs", 1),
 ];
 

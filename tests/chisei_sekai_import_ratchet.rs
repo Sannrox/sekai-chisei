@@ -1,53 +1,25 @@
-//! Ratchet for ADR 0092 rule 1: Chisei never depends on Sekai.
+//! Hard rule for ADR 0092 rule 1: Chisei never depends on Sekai.
 //!
-//! Scans `src/chisei` for `crate::sekai::<module>` paths and compares the
-//! (file, module) pairs with `ALLOWED`. A new pair fails, and so does an
-//! allowed pair that no longer exists, so the list only shrinks. Follow-up
-//! Issues (#1240, #1241, #1242) remove entries; when `ALLOWED` is empty this
-//! becomes a hard rule.
+//! Scans `src/chisei` for `crate::sekai::<module>` paths and fails on any.
+//! Shared primitives live in Chisei and Sekai re-exports them; Sekai facts
+//! reach Chisei through Chisei-owned ports; code that needs both planes,
+//! including tests that seed Sekai fixtures, lives in `src/composition`.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-/// Existing Chisei -> Sekai imports, one `"<file> <sekai module>"` per entry.
-const ALLOWED: &[&str] = &[
-    "src/chisei/capability.rs audit",
-    "src/chisei/capability.rs ontology",
-    "src/chisei/egress.rs schema",
-    "src/chisei/epistemic_descriptor.rs evidence_store",
-    "src/chisei/epistemic_descriptor.rs retrieval",
-    "src/chisei/external_action_lifecycle.rs action_policy",
-    "src/chisei/learning_change.rs learning",
-    "src/chisei/learning_change.rs schema",
-    "src/chisei/pipeline.rs capacity",
-    "src/chisei/pipeline.rs evidence",
-    "src/chisei/pipeline.rs evidence_store",
-    "src/chisei/pipeline.rs schema",
-    "src/chisei/sekai_facts.rs schema",
-    "src/chisei/system_one_action.rs governed_action_type",
-    "src/chisei/system_one_action.rs schema",
-];
-
 const NEEDLE: &str = "crate::sekai";
 
 #[test]
-fn chisei_imports_of_sekai_only_shrink() {
+fn chisei_never_imports_sekai() {
     let mut found = BTreeSet::new();
     collect(Path::new("src/chisei"), &mut found);
-    let allowed: BTreeSet<String> = ALLOWED.iter().map(|entry| entry.to_string()).collect();
-
-    let added: Vec<_> = found.difference(&allowed).collect();
-    let removed: Vec<_> = allowed.difference(&found).collect();
     assert!(
-        added.is_empty(),
-        "new Chisei -> Sekai imports violate ADR 0092 rule 1; route them through a \
-         Chisei-owned port instead: {added:#?}"
-    );
-    assert!(
-        removed.is_empty(),
-        "these imports are gone; remove them from ALLOWED so the ratchet keeps \
-         shrinking: {removed:#?}"
+        found.is_empty(),
+        "Chisei -> Sekai imports violate ADR 0092 rule 1; route them through a \
+         Chisei-owned port, move shared primitives into Chisei, or put code that \
+         needs both planes in src/composition: {found:#?}"
     );
 }
 

@@ -10,7 +10,6 @@ use crate::chisei::evidence_vocabulary::EvidenceLifecycleState;
 use crate::chisei::kioku::{
     KIOKU_EVIDENCE_REASSESSMENT_METHOD, KiokuEvidenceLink, KiokuMemory, MemoryEvidenceStance,
 };
-use crate::sekai::evidence_store::EvidenceSubmissionRecord;
 use serde::{Deserialize, Serialize};
 
 pub const EPISTEMIC_DESCRIPTOR_VERSION: &str = "chisei.epistemic-descriptor/v1";
@@ -107,6 +106,18 @@ pub struct EpistemicDescriptor {
     pub contradicting_evidence_count: Option<u32>,
 }
 
+/// The parts of one admitted external evidence row that a descriptor
+/// projects. Sekai builds it from its evidence submission records.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalEvidenceFacts<'a> {
+    pub id: &'a str,
+    pub content_digest: &'a str,
+    pub lifecycle_state: EvidenceLifecycleState,
+    pub observed_at_ms: i64,
+    /// Producer confidence from the source envelope, when one is present.
+    pub envelope_confidence_bps: Option<u16>,
+}
+
 impl EpistemicDescriptor {
     pub fn unknown() -> Self {
         Self {
@@ -125,22 +136,6 @@ impl EpistemicDescriptor {
             supporting_evidence_count: None,
             contradicting_evidence_count: None,
         }
-    }
-
-    /// Project an authorization-filtered graph retrieval explanation.  The
-    /// explanation is already the source of truth for whether a result was
-    /// asserted or entailed; this constructor does not infer evidence
-    /// polarity from graph shape or object properties.
-    pub fn from_graph_explanation(
-        explanation: &crate::sekai::retrieval::Explanation,
-        source_rows_truncated: bool,
-    ) -> Self {
-        Self::from_graph_projection(
-            explanation.derived,
-            &explanation.source_fact_ids,
-            &explanation.ontology_revision,
-            source_rows_truncated,
-        )
     }
 
     /// Projection form used by transport adapters that already serialized the
@@ -378,7 +373,7 @@ impl EpistemicDescriptor {
     /// Project an admitted external evidence row.  The row's source envelope
     /// is an assertion and its lifecycle is authoritative; polarity is not
     /// inferred from the evidence signal, so evidence status remains unknown.
-    pub fn from_external_evidence(submission: &EvidenceSubmissionRecord) -> Self {
+    pub fn from_external_evidence(submission: &ExternalEvidenceFacts<'_>) -> Self {
         let lifecycle_status = match submission.lifecycle_state {
             EvidenceLifecycleState::Available => LifecycleStatus::Current,
             EvidenceLifecycleState::Stale => LifecycleStatus::Stale,
@@ -387,9 +382,7 @@ impl EpistemicDescriptor {
             _ => LifecycleStatus::Unknown,
         };
         let producer_confidence_bps = submission
-            .envelope
-            .as_ref()
-            .map(|envelope| envelope.confidence_bps)
+            .envelope_confidence_bps
             .filter(|value| *value <= 10_000);
         Self {
             contract_version: EPISTEMIC_DESCRIPTOR_VERSION.into(),
@@ -400,8 +393,8 @@ impl EpistemicDescriptor {
             confidence_basis: producer_confidence_bps.map(|_| "producer_input".into()),
             observed_at_ms: bounded_observed_at(submission.observed_at_ms),
             derivation_ref: None,
-            source_refs: bounded_source_string(&submission.id).into_iter().collect(),
-            source_digests: bounded_source_string(&submission.content_digest)
+            source_refs: bounded_source_string(submission.id).into_iter().collect(),
+            source_digests: bounded_source_string(submission.content_digest)
                 .into_iter()
                 .collect(),
             source_row_count: Some(1),
@@ -548,9 +541,7 @@ fn serialized_len(descriptor: &EpistemicDescriptor) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::evidence_vocabulary::{
-        EvidenceClassification, EvidenceIntent, EvidenceLifecycleState,
-    };
+    use crate::chisei::evidence_vocabulary::EvidenceClassification;
     use crate::chisei::kioku::{
         KiokuEvidenceBasis, KiokuEvidenceLink, KiokuMemory, MemoryKind, MemoryLifecycleState,
     };
@@ -753,43 +744,6 @@ mod tests {
             EpistemicDescriptor::from_kioku(&memory(MemoryLifecycleState::Active), &evidence);
         assert!(descriptor.validate().is_ok());
         assert!(serialized_len(&descriptor) <= MAX_DESCRIPTOR_BYTES);
-    }
-
-    #[test]
-    fn external_projection_does_not_copy_payload() {
-        let submission = EvidenceSubmissionRecord {
-            id: "submission-1".into(),
-            producer_identity: "producer".into(),
-            source_type: "ci".into(),
-            source_instance: "runner".into(),
-            source_record_id: "record".into(),
-            source_version: "1".into(),
-            source_sequence: 1,
-            namespace: "demo".into(),
-            target_external_id: "service:api".into(),
-            target_kind: "component".into(),
-            evidence_type: "verification".into(),
-            schema_id: "schema".into(),
-            schema_version: "1".into(),
-            idempotency_key: "key".into(),
-            content_digest: "digest".into(),
-            classification: EvidenceClassification::Public,
-            intent: EvidenceIntent::Upsert,
-            lifecycle_state: EvidenceLifecycleState::Available,
-            rejection_code: None,
-            rejection_summary: None,
-            observed_at_ms: 42,
-            collected_at_ms: 42,
-            expires_at_ms: None,
-            received_at_ms: 42,
-            updated_at_ms: 42,
-            envelope: None,
-        };
-        let descriptor = EpistemicDescriptor::from_external_evidence(&submission);
-        assert_eq!(descriptor.origin_class, OriginClass::Asserted);
-        assert_eq!(descriptor.evidence_status, EvidenceStatus::Unknown);
-        assert_eq!(descriptor.source_refs, vec!["submission-1"]);
-        assert!(descriptor.validate().is_ok());
     }
 
     #[test]

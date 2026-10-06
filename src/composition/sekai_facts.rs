@@ -2,11 +2,11 @@
 //!
 //! Combined mode reads the Sekai store in this process, shared or split.
 
+use crate::chisei::object_schema::ObjectType;
 use crate::chisei::principal::{MarkingClearance, PrincipalGrant};
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::db::store::SekaiStore;
 use crate::domain::{Direction, Object};
-use crate::sekai::schema::ObjectType;
 
 fn read<T>(result: Result<T, String>) -> Result<T, SekaiFactError> {
     result.map_err(SekaiFactError::Read)

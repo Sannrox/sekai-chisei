@@ -1,22 +1,15 @@
+//! Capacity snapshot recording and listing over the Sekai object store.
+//!
+//! The vocabulary and projection live in Chisei (ADR 0092 rule 3).
+
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::domain::Object;
 use metrics::gauge;
-use std::collections::HashMap;
 
-pub const KIND_CAPACITY_SNAPSHOT: &str = "capacity_snapshot";
-
-#[derive(Debug, Clone)]
-pub struct CapacityMetrics {
-    pub timestamp: i64,
-    pub queue_depth: i32,
-    pub running_tasks: i32,
-    pub agent_count: i32,
-    pub avg_wait_seconds: i32,
-    pub failure_rate: i32,
-    pub utilization: i32,
-}
+pub use crate::chisei::capacity::{
+    CapacityMetrics, KIND_CAPACITY_SNAPSHOT, snapshot_object, snapshots_from_objects,
+};
 
 pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), String> {
     // Queue depth is emitted through the labeled operability signal so the
@@ -32,29 +25,7 @@ pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), 
     gauge!("sekai_utilization").set(metrics.utilization as f64);
     gauge!("sekai_failure_rate").set(metrics.failure_rate as f64);
 
-    let id = format!("cap:{}", metrics.timestamp);
-    let props = HashMap::from([
-        ("queue_depth".into(), metrics.queue_depth.to_string()),
-        ("running_tasks".into(), metrics.running_tasks.to_string()),
-        ("agent_count".into(), metrics.agent_count.to_string()),
-        (
-            "avg_wait_seconds".into(),
-            metrics.avg_wait_seconds.to_string(),
-        ),
-        ("failure_rate".into(), metrics.failure_rate.to_string()),
-        ("utilization".into(), metrics.utilization.to_string()),
-    ]);
-    let obj = Object {
-        id: id.clone(),
-        kind: KIND_CAPACITY_SNAPSHOT.into(),
-        name: format!("snapshot-{}", metrics.timestamp),
-        namespace: "".into(),
-        external_id: id,
-        properties: props,
-        created: metrics.timestamp,
-        updated: metrics.timestamp,
-    };
-    db.create_object(&obj)
+    db.create_object(&snapshot_object(metrics))
 }
 
 pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
@@ -62,45 +33,7 @@ pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetr
         kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
         ..Default::default()
     })?;
-    let mut sorted = objs;
-    sorted.sort_by_key(|o| std::cmp::Reverse(o.created));
-    sorted.truncate(limit);
-    Ok(sorted
-        .into_iter()
-        .map(|o| CapacityMetrics {
-            timestamp: o.created,
-            queue_depth: o
-                .properties
-                .get("queue_depth")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            running_tasks: o
-                .properties
-                .get("running_tasks")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            agent_count: o
-                .properties
-                .get("agent_count")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            avg_wait_seconds: o
-                .properties
-                .get("avg_wait_seconds")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            failure_rate: o
-                .properties
-                .get("failure_rate")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-            utilization: o
-                .properties
-                .get("utilization")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        })
-        .collect())
+    Ok(snapshots_from_objects(objs, limit))
 }
 
 #[cfg(test)]
