@@ -276,7 +276,7 @@ pub(super) fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     request
         .metadata_mut()
         .insert("x-principal", "chisei-gateway".parse().unwrap());
-    crate::obs::otel::inject_current_context(request.metadata_mut());
+    inject_trace_context(request.metadata_mut());
     request
 }
 pub(super) fn principal_request<T>(
@@ -287,6 +287,26 @@ pub(super) fn principal_request<T>(
     let principal = tonic::metadata::MetadataValue::try_from(principal)
         .map_err(|_| tonic::Status::internal("invalid authenticated gateway principal"))?;
     request.metadata_mut().insert("x-principal", principal);
-    crate::obs::otel::inject_current_context(request.metadata_mut());
+    inject_trace_context(request.metadata_mut());
     Ok(request)
+}
+
+fn inject_trace_context(metadata: &mut tonic::metadata::MetadataMap) {
+    use opentelemetry::propagation::Injector;
+    use tonic::metadata::{AsciiMetadataKey, MetadataValue};
+
+    struct MetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);
+
+    impl Injector for MetadataInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            if let (Ok(key), Ok(value)) = (
+                AsciiMetadataKey::from_bytes(key.as_bytes()),
+                MetadataValue::try_from(value),
+            ) {
+                self.0.insert(key, value);
+            }
+        }
+    }
+
+    crate::obs::otel::inject_current_context(&mut MetadataInjector(metadata));
 }

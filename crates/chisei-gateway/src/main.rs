@@ -3,7 +3,7 @@ use chisei_gateway::gateway_report::{GatewayReportConfig, report_usage, run_repo
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut telemetry = chisei_gateway::obs::logging::init();
+    let mut telemetry = chisei_gateway::obs::logging::init("chisei-gateway");
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("report") {
         args.remove(0);
@@ -36,8 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = GatewayConfig::from_env().map_err(|err| std::io::Error::other(err.to_string()))?;
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        git_version = env!("SEKAI_GIT_VERSION"),
-        git_commit = env!("SEKAI_GIT_COMMIT"),
+        git_version = chisei_gateway::obs::build_info::GIT_VERSION,
+        git_commit = chisei_gateway::obs::build_info::GIT_COMMIT,
         openai_upstream = %config.openai_base_url,
         anthropic_upstream = %config.anthropic_base_url,
         "chisei-gateway starting"

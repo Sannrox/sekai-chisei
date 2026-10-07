@@ -33,6 +33,28 @@ impl fmt::Debug for SecretValue {
     }
 }
 
+/// Resolved secret material for one provider call. Debug is always redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedProviderCredential {
+    pub credential_id: String,
+    pub tenant_id: Option<String>,
+    pub provider: String,
+    pub generation: u64,
+    pub secret: SecretValue,
+}
+
+impl fmt::Debug for ResolvedProviderCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedProviderCredential")
+            .field("credential_id", &self.credential_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("provider", &self.provider)
+            .field("generation", &self.generation)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
     HumanSession,
@@ -342,7 +364,7 @@ pub trait EnterpriseExtension: Send + Sync {
         &self,
         context: &AuthenticatedContext,
         provider: &str,
-    ) -> Result<crate::provider_credentials::ResolvedProviderCredential, ExtensionError> {
+    ) -> Result<ResolvedProviderCredential, ExtensionError> {
         let _ = (context, provider);
         Err(ExtensionError::Unavailable(
             "tenant-scoped provider credentials are not implemented".into(),
@@ -446,7 +468,7 @@ mod tests {
 
     #[test]
     fn community_protocol_has_no_tenant_runtime_methods() {
-        let protocol = include_str!("../proto/sekai.proto");
+        let protocol = include_str!("../../../proto/sekai.proto");
         for method in [
             "rpc CreateTenant(",
             "rpc GetTenant(",
@@ -458,5 +480,34 @@ mod tests {
                 "unexpected runtime method: {method}"
             );
         }
+    }
+
+    #[test]
+    fn machine_context_uses_the_full_identity_contract() {
+        let context = AuthenticatedContext::machine(AuthenticatedPrincipal {
+            subject: "gateway".into(),
+            credential_id: "key-1".into(),
+        });
+        assert_eq!(context.contract_version, IDENTITY_EXTENSION_VERSION);
+        assert_eq!(context.credential_kind, CredentialKind::Machine);
+        assert_eq!(context.issuer, "sekai:community");
+        assert_eq!(context.resource, "sekai:control-plane");
+        assert!(context.tenant.is_none());
+        assert!(context.scopes.is_empty());
+    }
+
+    #[test]
+    fn resolved_provider_credential_debug_redacts_secret() {
+        let credential = ResolvedProviderCredential {
+            credential_id: "cred-1".into(),
+            tenant_id: Some("tenant-a".into()),
+            provider: "openai".into(),
+            generation: 3,
+            secret: SecretValue::new("sk-live-secret"),
+        };
+        let rendered = format!("{credential:?}");
+        assert!(rendered.contains("cred-1"));
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("sk-live-secret"));
     }
 }

@@ -250,21 +250,18 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "futures-util",
- "http",
  "http-body",
  "http-body-util",
  "httpdate",
  "hyper-util",
- "metrics",
- "metrics-exporter-prometheus",
  "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
  "pin-project-lite",
  "prost",
  "reqwest 0.12.28",
  "sekai-admin-client",
  "sekai-chisei",
+ "sekai-domain",
+ "sekai-obs",
  "sekai-proto",
  "sekai-provider",
  "serde",
@@ -277,8 +274,6 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2552,6 +2547,8 @@ dependencies = [
  "rusqlite",
  "same-file",
  "sekai-admin-client",
+ "sekai-domain",
+ "sekai-obs",
  "sekai-ontology",
  "sekai-proto",
  "sekai-provider",
@@ -2592,6 +2589,30 @@ dependencies = [
  "tonic-prost",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "sekai-domain"
+version = "1.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sekai-obs"
+version = "1.1.0"
+dependencies = [
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

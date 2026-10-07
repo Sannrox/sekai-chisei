@@ -2,14 +2,12 @@ use std::time::Duration;
 
 use http::HeaderMap;
 use opentelemetry::Context;
-use opentelemetry::propagation::{Extractor, TextMapPropagator};
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_otlp::SpanExporter;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-const DEFAULT_SERVICE_NAME: &str = "sekai-chisei";
 
 /// Owns the exporter until the process has stopped accepting work.
 ///
@@ -43,7 +41,7 @@ impl Drop for TelemetryGuard {
     }
 }
 
-pub(crate) fn build_provider() -> Option<SdkTracerProvider> {
+pub(crate) fn build_provider(default_service_name: &'static str) -> Option<SdkTracerProvider> {
     if !telemetry_enabled() {
         return None;
     }
@@ -58,7 +56,7 @@ pub(crate) fn build_provider() -> Option<SdkTracerProvider> {
     let service_name = std::env::var("OTEL_SERVICE_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
+        .unwrap_or_else(|| default_service_name.to_string());
     let resource = opentelemetry_sdk::Resource::builder()
         .with_service_name(service_name)
         .build();
@@ -100,14 +98,22 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
-pub(crate) fn extract_parent(headers: &HeaderMap) -> Context {
+pub fn extract_parent(headers: &HeaderMap) -> Context {
     TraceContextPropagator::new().extract(&HeaderExtractor(headers))
 }
 
-pub(crate) fn set_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) {
+pub fn set_parent_from_headers(span: &tracing::Span, headers: &HeaderMap) {
     let parent = extract_parent(headers);
     if parent.span().span_context().is_valid() {
         let _ = span.set_parent(parent);
+    }
+}
+
+/// Inject the current trace context into a carrier (HTTP headers or gRPC metadata).
+pub fn inject_current_context(injector: &mut impl Injector) {
+    let context = tracing::Span::current().context();
+    if context.span().span_context().is_valid() {
+        TraceContextPropagator::new().inject_context(&context, injector);
     }
 }
 

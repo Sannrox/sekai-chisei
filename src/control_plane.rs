@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::plane::{ProcessPlane, plane_registry_anchor, plane_store_identity};
 
 pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
-    let mut telemetry = crate::obs::logging::init();
+    let mut telemetry = crate::obs::logging::init("sekai-chisei");
     // Refuse retired single-store variables before anything touches the data dir.
     crate::combined_stores::refuse_legacy_store_env().map_err(std::io::Error::other)?;
     let config = Config::from_env();

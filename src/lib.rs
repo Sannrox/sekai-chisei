@@ -1,7 +1,10 @@
 pub mod action_cli;
 pub mod attest_cli;
 pub mod autonomous_envelope_cli;
-pub mod build_info;
+pub mod build_info {
+    pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+    pub use sekai_obs::build_info::{GIT_COMMIT, GIT_VERSION};
+}
 pub mod capability_codegen;
 pub mod capability_projection;
 pub mod chisei;
@@ -16,9 +19,9 @@ pub mod geospatial_cli;
 pub use sekai_provider::cost_estimate;
 pub mod credential_cli;
 pub mod db;
-pub mod domain;
+pub use sekai_domain::domain;
 pub mod domain_admin;
-pub mod enterprise;
+pub use sekai_domain::enterprise;
 pub mod enterprise_conformance;
 pub mod evaluation_plan_cli;
 pub mod evidence_adapter_catalog;
@@ -75,7 +78,7 @@ pub mod replay_cli;
 pub mod report_cli;
 pub mod rpc_maturity;
 pub mod runtime_backend;
-pub mod secrets;
+pub use sekai_domain::secrets;
 pub mod sekai;
 pub mod shomei;
 pub mod source_adapter_catalog;
