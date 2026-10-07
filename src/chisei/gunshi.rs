@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::chisei::sekai_facts::SekaiFactReader;
-use crate::domain::{KIND_LEARNING, ListFilter};
+use crate::domain::{KIND_LEARNING, ListFilter, MAX_LIST_LIMIT, PropertyFilter};
 
 pub const ALLOCATION_CONTRACT_VERSION: &str = "gunshi.allocation/v1";
 pub const RECOMMENDATION_INPUT_VERSION: &str = "gunshi.recommendation-input/v1";
@@ -620,15 +620,38 @@ pub fn recommend_advisory(
 
 /// Load governed learning objects without bypassing their namespace/status
 /// metadata. Invalid legacy rows are ignored rather than trusted implicitly.
+///
+/// The list is filtered to `task_class` and `active` status, ordered newest
+/// first, and capped at [`MAX_LIST_LIMIT`]. Palantir analog: Foundry Object
+/// Search `pageSize` plus filter-early, and Functions `.take(N)` instead of
+/// `.all()`. An explicit positive limit keeps the split-mode hop to one RPC
+/// page instead of a complete-set walk.
 pub fn load_kioku_evidence(
     facts: &dyn SekaiFactReader,
     namespace: &str,
     operation_class: &str,
 ) -> Result<Vec<KiokuEvidence>, String> {
+    let namespace = namespace.trim();
+    let operation_class = operation_class.trim();
     let objects = facts
         .list_objects(&ListFilter {
             kind: Some(KIND_LEARNING.into()),
-            namespace: Some(namespace.trim().to_string()),
+            namespace: Some(namespace.to_string()),
+            property_filters: vec![
+                PropertyFilter {
+                    key: "task_class".into(),
+                    op: "eq".into(),
+                    value: operation_class.to_string(),
+                },
+                PropertyFilter {
+                    key: "status".into(),
+                    op: "eq".into(),
+                    value: "active".into(),
+                },
+            ],
+            limit: MAX_LIST_LIMIT,
+            order_by: "updated".into(),
+            descending: true,
             ..Default::default()
         })
         .map_err(|error| error.to_string())?;
@@ -1468,38 +1491,189 @@ mod tests {
         assert!(advisory.plans[0].evidence.is_empty());
     }
 
-    #[test]
-    fn governed_learning_objects_load_as_kioku_evidence() {
-        use crate::domain::Object;
+    fn learning_object(
+        id: &str,
+        task_class: &str,
+        status: &str,
+        updated: i64,
+    ) -> crate::domain::Object {
         use std::collections::HashMap;
 
-        let sekai = crate::db::store::SekaiStore::memory();
-        sekai
-            .create_object(&Object {
-                id: "learning-1".into(),
-                kind: KIND_LEARNING.into(),
-                name: "Scored learning".into(),
-                namespace: "support".into(),
-                external_id: "learning-1".into(),
-                properties: HashMap::from([
-                    ("task_class".into(), "triage".into()),
-                    ("model".into(), "local-small".into()),
-                    ("score".into(), "87".into()),
-                    ("passed".into(), "true".into()),
-                    ("status".into(), "active".into()),
-                    ("source_request_id".into(), "receipt-1".into()),
-                ]),
-                created: 1,
-                updated: 2,
-            })
-            .unwrap();
-        let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(sekai);
+        crate::domain::Object {
+            id: id.into(),
+            kind: KIND_LEARNING.into(),
+            name: id.into(),
+            namespace: "support".into(),
+            external_id: id.into(),
+            properties: HashMap::from([
+                ("task_class".into(), task_class.into()),
+                ("model".into(), "local-small".into()),
+                ("score".into(), "87".into()),
+                ("passed".into(), "true".into()),
+                ("status".into(), status.into()),
+                ("source_request_id".into(), format!("receipt-{id}")),
+            ]),
+            created: 1,
+            updated,
+        }
+    }
 
-        let loaded = load_kioku_evidence(facts.reader(), "support", "triage").unwrap();
-        assert_eq!(loaded.len(), 1);
+    struct RecordingFactReader {
+        inner: crate::db::store::SekaiStore,
+        last_filter: std::sync::Mutex<Option<ListFilter>>,
+    }
+
+    impl RecordingFactReader {
+        fn unsupported<T>() -> Result<T, crate::chisei::sekai_facts::SekaiFactError> {
+            Err(crate::chisei::sekai_facts::SekaiFactError::Unsupported(
+                "recording reader",
+            ))
+        }
+    }
+
+    impl crate::chisei::sekai_facts::SekaiFactReader for RecordingFactReader {
+        fn find_by_external_id(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::domain::Object>, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Self::unsupported()
+        }
+
+        fn find_namespace_boundary(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::domain::Object>, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Self::unsupported()
+        }
+
+        fn list_grants(
+            &self,
+            _: &str,
+        ) -> Result<
+            Vec<crate::chisei::principal::PrincipalGrant>,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            Self::unsupported()
+        }
+
+        fn marking_clearance(
+            &self,
+            _: &str,
+            _: &crate::domain::Object,
+            _: &str,
+        ) -> Result<
+            crate::chisei::principal::MarkingClearance,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            Self::unsupported()
+        }
+
+        fn get_object_type(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::chisei::object_schema::ObjectType>,
+            crate::chisei::sekai_facts::SekaiFactError,
+        > {
+            Self::unsupported()
+        }
+
+        fn get_object(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::domain::Object>, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Self::unsupported()
+        }
+
+        fn list_objects(
+            &self,
+            filter: &ListFilter,
+        ) -> Result<Vec<crate::domain::Object>, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            *self.last_filter.lock().expect("filter capture") = Some(filter.clone());
+            self.inner
+                .list_objects(filter)
+                .map_err(crate::chisei::sekai_facts::SekaiFactError::Read)
+        }
+
+        fn get_linked_objects(
+            &self,
+            _: &str,
+            _: &str,
+            _: &crate::domain::Direction,
+        ) -> Result<Vec<crate::domain::Object>, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Self::unsupported()
+        }
+
+        fn in_process_store(
+            &self,
+        ) -> Result<&crate::db::store::SekaiStore, crate::chisei::sekai_facts::SekaiFactError>
+        {
+            Ok(&self.inner)
+        }
+    }
+
+    #[test]
+    fn governed_learning_objects_load_as_kioku_evidence() {
+        let sekai = crate::db::store::SekaiStore::memory();
+        for object in [
+            learning_object("learning-other", "summarize", "active", 9),
+            learning_object("learning-inactive", "triage", "archived", 8),
+            learning_object("learning-old", "triage", "active", 2),
+            learning_object("learning-1", "triage", "active", 5),
+        ] {
+            sekai.create_object(&object).unwrap();
+        }
+        let reader = RecordingFactReader {
+            inner: sekai,
+            last_filter: std::sync::Mutex::new(None),
+        };
+
+        let loaded = load_kioku_evidence(&reader, "support", "triage").unwrap();
+        assert_eq!(
+            loaded
+                .iter()
+                .map(|memory| memory.memory_id.as_str())
+                .collect::<Vec<_>>(),
+            ["learning-1", "learning-old"]
+        );
         assert_eq!(loaded[0].score, 0.87);
-        assert_eq!(loaded[0].observed_at_ms, 2_000);
-        assert_eq!(loaded[0].receipt_reference.as_deref(), Some("receipt-1"));
+        assert_eq!(loaded[0].observed_at_ms, 5_000);
+        assert_eq!(
+            loaded[0].receipt_reference.as_deref(),
+            Some("receipt-learning-1")
+        );
+
+        let filter = reader
+            .last_filter
+            .lock()
+            .expect("filter capture")
+            .clone()
+            .expect("load_kioku_evidence lists objects");
+        assert_eq!(filter.kind.as_deref(), Some(KIND_LEARNING));
+        assert_eq!(filter.namespace.as_deref(), Some("support"));
+        assert_eq!(
+            filter.limit, MAX_LIST_LIMIT,
+            "complete-set limit 0 page-walks the hop"
+        );
+        assert_eq!(filter.order_by, "updated");
+        assert!(filter.descending);
+        assert_eq!(
+            filter
+                .property_filters
+                .iter()
+                .map(|property| (
+                    property.key.as_str(),
+                    property.op.as_str(),
+                    property.value.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("task_class", "eq", "triage"), ("status", "eq", "active")]
+        );
     }
 
     #[test]
