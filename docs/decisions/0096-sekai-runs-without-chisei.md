@@ -95,7 +95,7 @@ that may only shrink.
   is never a substitute (ADR 0082).
 - Open question: whether a separate `chisei-plane` process is worth keeping.
   Without it, the Chisei-side traits over Sekai state become direct calls and
-  the remote lookup goes away. Decided in #1300.
+  the remote lookup goes away. To be decided in #1300.
 
 Follow-up work: require Sekai in Chisei and delete not-attached paths
 (#1296); move shared vocabulary into Sekai (#1297); add the Sekai-owned
