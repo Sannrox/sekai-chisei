@@ -118,3 +118,4 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0094: Scoped contexts author immutable definition drafts](0094-scoped-definition-draft-authoring.md)
 - [ADR 0095: Ship evidence and findings as a types-only domain package](0095-feedback-evidence-finding-package.md)
 - [ADR 0096: Sekai runs without Chisei; Chisei requires Sekai](0096-sekai-runs-without-chisei.md)
+- [ADR 0097: Sekai hosts in-process governed transform compute](0097-in-process-transform-host.md)

@@ -97,6 +97,7 @@ const STORE_CUTOVER_SCHEMA: &str = include_str!("postgres/0047_store_cutover.sql
 const STORE_CUTOVER_PAIRING_SCHEMA: &str = include_str!("postgres/0048_store_cutover_pairing.sql");
 const CHISEI_ROUTING_PROFILES_SCHEMA: &str =
     include_str!("postgres/0049_chisei_routing_profiles.sql");
+const GOVERNED_TRANSFORMS_SCHEMA: &str = include_str!("postgres/0050_governed_transforms.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -425,6 +426,12 @@ const MIGRATIONS: &[Migration] = &[
         CHISEI_ROUTING_PROFILES_SCHEMA,
         MigrationOwner::Chisei,
     ),
+    mig(
+        49,
+        "governed_transforms",
+        GOVERNED_TRANSFORMS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -453,6 +460,21 @@ pub(crate) fn advisory_lock_key(parts: &[&str]) -> String {
         .map(|part| format!("{}:{part}", part.len()))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Serializes dataset-row writers with incremental transform reads so a
+/// checkpoint cannot skip an identity allocated by an uncommitted append.
+pub(crate) fn lock_dataset_rows(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+) -> Result<(), String> {
+    let lock_key = advisory_lock_key(&["dataset_rows", dataset_id]);
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 467))",
+        &[&lock_key],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 /// Shared PostgreSQL connection pool used by the HA storage backend.
@@ -1231,6 +1253,16 @@ mod tests {
             );
         }
         assert!(WORKFLOW_ACTIONS_SCHEMA.contains("sekai_workflow_action_bindings_identity"));
+        for table in [
+            "sekai_governed_transform",
+            "sekai_governed_transform_run",
+            "sekai_governed_transform_checkpoint",
+        ] {
+            assert!(
+                GOVERNED_TRANSFORMS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL governed-transform table {table}"
+            );
+        }
         assert!(
             DEFINITION_PROPOSALS_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_definition_proposals")

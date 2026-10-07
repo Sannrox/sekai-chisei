@@ -441,9 +441,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_transform(transform, created_at_ms),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_governed_transform(transform, created_at_ms)
+            }),
         }
     }
 
@@ -454,9 +454,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::governed_transform::GovernedTransform>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_transform(namespace, transform_id),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_governed_transform(namespace, transform_id)
+            }),
         }
     }
 
@@ -471,9 +471,9 @@ impl RuntimeDb {
             Self::Sqlite(db) => {
                 db.run_governed_transform(namespace, transform_id, incremental, now_ms)
             }
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_governed_transform(namespace, transform_id, incremental, now_ms)
+            }),
         }
     }
 
@@ -483,9 +483,34 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::governed_transform::TransformRun>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_transform_run(run_id),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_governed_transform_run(run_id))
+            }
+        }
+    }
+
+    pub fn list_governed_transforms(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::governed_transform::GovernedTransform>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_transforms(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_governed_transforms(namespace))
+            }
+        }
+    }
+
+    pub fn list_governed_transform_runs(
+        &self,
+        namespace: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_transform_runs(namespace, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_governed_transform_runs(namespace, limit)
+            }),
         }
     }
 
