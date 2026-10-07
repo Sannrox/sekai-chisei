@@ -325,7 +325,7 @@
       "rpc": "PutGovernedTransform",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -334,7 +334,7 @@
       "rpc": "RunGovernedTransform",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -343,7 +343,7 @@
       "rpc": "GetGovernedTransformRun",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "experimental",
       "product_tier": "experimental"
     },

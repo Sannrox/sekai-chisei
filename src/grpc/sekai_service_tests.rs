@@ -10827,6 +10827,15 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
             .map(|limit| limit.value),
         Some(u64::from(enabled))
     );
+
+    let transform = core
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY)
+        .expect("core catalog reports the in-process transform host");
+    assert_eq!(transform.product_tier, "core");
+    assert_eq!(transform.lifecycle_state, "active");
+    assert!(transform.description.contains("dataset transform host"));
 }
 
 #[tokio::test]

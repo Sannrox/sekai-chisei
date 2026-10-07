@@ -462,7 +462,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs"
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -476,7 +477,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs"
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"
@@ -490,7 +492,8 @@
         "sekai.datasets"
       ],
       "evidence": [
-        "src/db/governed_transform.rs"
+        "src/db/governed_transform.rs",
+        "src/db/postgres_governed_transform.rs"
       ],
       "durable_dependencies": [
         "sekai.datasets"

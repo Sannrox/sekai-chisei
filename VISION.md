@@ -58,7 +58,7 @@ governed entry paths, and improve future decisions through verified outcomes.
 - typed objects and relations for actors, operations, attempts, actions,
   artifacts, verification, and outcomes
 - graph traversal, lineage, schema validation, derived properties, datasets,
-  and virtual tables
+  virtual tables, and in-process governed dataset transforms
 - audit trails for decisions and object changes
 - namespace-first access control around read and write behavior
 

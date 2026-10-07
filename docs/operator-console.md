@@ -41,7 +41,8 @@ The read-only shell is an operator convenience surface. Console mutations
 
 5. Select a namespace from the header switcher (or open
    `/console/n/{namespace}/ops` when authorized). Primary nav is keyboard
-   reachable (skip link → namespace control → Operations / Pressure / Policy).
+   reachable (skip link → namespace control → Operations / Transforms /
+   Pressure / Policy).
 
 Unauthenticated visits to `/console/` or any namespaced route redirect to
 `/console/login`. Unauthorized namespace paths return **403** without loading
@@ -85,6 +86,8 @@ server {
 | `POST /console/logout` | session | Clear session |
 | `GET /console/` | session | Shell home + namespace switcher |
 | `GET /console/n/{ns}/ops` | session + ns | Recent visible operations (7-day window) |
+| `GET /console/n/{ns}/transforms` | session + ns | Governed transform definitions and run receipts |
+| `GET /console/n/{ns}/transforms/{run_id}` | session + ns | Single transform run receipt |
 | `GET /console/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Causal operation workspace |
 | `GET /console/api/n/{ns}/ops/{operation_id}` | session + ns + receipt ACL | Authorized report + causal stages JSON |
 | `GET /console/n/{ns}/pressure` | session + ns | Governance pressure tiles |

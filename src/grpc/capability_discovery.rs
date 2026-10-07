@@ -50,6 +50,7 @@ impl SekaiServiceImpl {
         entries.push(experimental_rpc_capability(
             crate::rpc_maturity::experimental_rpcs_enabled(),
         ));
+        entries.push(hosted_transform_capability());
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -90,6 +91,7 @@ fn base_capability(
 fn capability_product_tier(name: &str) -> &'static str {
     match name {
         crate::rpc_maturity::EXPERIMENTAL_CAPABILITY => "core",
+        crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY => "core",
         semantic::CAPABILITY_EXPAND_RELATIONS
         | semantic::CAPABILITY_RETRIEVE_CONTEXT
         | semantic::CAPABILITY_EXPLAIN_DERIVATION => "core",
@@ -116,6 +118,19 @@ fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry 
         "object_acl".into(),
     ];
     entry.object_type = Some(to_proto_schema_type(object_type));
+    entry
+}
+
+fn hosted_transform_capability() -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY.into(),
+        "In-process governed dataset transform host. Put, run, and inspect a JobSpec; outputs are datasets.".into(),
+        "transform",
+        "sekai.PutGovernedTransformRequest",
+        "sekai.PutGovernedTransformResponse",
+    );
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
     entry
 }
 
