@@ -1,9 +1,10 @@
 # Two-plane processes
 
 Independently runnable `sekai-plane` and `chisei-plane` processes prove the
-stores are separate. Combined `sekai-chisei` remains the default local binary
-and still opens the typed two-store contract. The ontology CLI keeps the
-`sekai` binary name.
+stores are separate and that each plane can ship as its own product.
+Combined `sekai-chisei` remains the default local binary and still opens the
+typed two-store contract. The ontology CLI keeps the `sekai` binary name.
+Keeping `chisei-plane` is [ADR 0098](decisions/0098-keep-chisei-plane-process.md).
 
 ## What each process opens
 

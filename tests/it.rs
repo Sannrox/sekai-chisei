@@ -23,6 +23,7 @@ mod chisei_external_permit_backend_conformance;
 mod chisei_gateway_audit_backend_conformance;
 mod chisei_governed_subject_provenance_backend_conformance;
 mod chisei_kioku_backend_conformance;
+mod chisei_plane_process_adr;
 mod chisei_policy_backend_conformance;
 mod chisei_portfolio_backend_conformance;
 mod chisei_postgres_inventory_conformance;
@@ -164,6 +165,7 @@ const GROUPED_MODULES: &[&str] = &[
     "chisei_gateway_audit_backend_conformance",
     "chisei_governed_subject_provenance_backend_conformance",
     "chisei_kioku_backend_conformance",
+    "chisei_plane_process_adr",
     "chisei_policy_backend_conformance",
     "chisei_portfolio_backend_conformance",
     "chisei_postgres_inventory_conformance",
@@ -360,6 +362,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 112);
+    assert_eq!(GROUPED_MODULES.len(), 113);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }
