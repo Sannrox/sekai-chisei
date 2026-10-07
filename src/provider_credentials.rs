@@ -10,10 +10,11 @@
 //! Secret plaintext is never logged, serialized, or Debug-printed.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::RwLock;
 
 use crate::enterprise::{AuthenticatedContext, ExtensionError, SecretValue, TenantContext};
+
+pub use crate::enterprise::ResolvedProviderCredential;
 
 /// Contract version for tenant provider-credential resolution.
 pub const PROVIDER_CREDENTIAL_RESOLVER_VERSION: &str = "sekai.provider-credential-resolver/v1";
@@ -47,28 +48,6 @@ impl ProviderCredentialStatus {
             Self::Rotated => "rotated",
             Self::Revoked => "revoked",
         }
-    }
-}
-
-/// Resolved secret material for one provider call. Debug is always redacted.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ResolvedProviderCredential {
-    pub credential_id: String,
-    pub tenant_id: Option<String>,
-    pub provider: String,
-    pub generation: u64,
-    pub secret: SecretValue,
-}
-
-impl fmt::Debug for ResolvedProviderCredential {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResolvedProviderCredential")
-            .field("credential_id", &self.credential_id)
-            .field("tenant_id", &self.tenant_id)
-            .field("provider", &self.provider)
-            .field("generation", &self.generation)
-            .field("secret", &"[REDACTED]")
-            .finish()
     }
 }
 

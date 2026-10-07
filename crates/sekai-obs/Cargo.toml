@@ -1,0 +1,18 @@
+[package]
+name = "sekai-obs"
+version = "1.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared observability labels, metrics, logging, and OTLP export."
+
+[dependencies]
+http = "1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+tracing = "0.1"
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -119,7 +119,7 @@ pub struct Object {
 }
 
 impl Object {
-    pub(crate) fn persisted_state_matches(&self, other: &Self) -> bool {
+    pub fn persisted_state_matches(&self, other: &Self) -> bool {
         self.id == other.id
             && self.kind == other.kind
             && self.name == other.name

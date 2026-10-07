@@ -1,16 +1,17 @@
-//! Shared operability-signal vocabulary copied into the gateway crate.
+//! Control-plane operability signals.
 //!
-//! Gateway production callers emit provider-circuit, fallback, and cache
-//! events. Other helpers stay so label enums match the control-plane copy.
+//! Covers the signal families Issue #98 requires: control-plane overhead,
+//! saturation, database waits, queue depth, cache behavior, receipt and audit
+//! lag, fallback, and rejected work.
 //!
-//! Every label position takes a closed enum from [`crate::obs::labels`], so no
+//! Every label position takes a closed enum from [`crate::labels`], so no
 //! call site can attach an object id, namespace, or content digest to a time
 //! series. Durations are recorded in seconds to match Prometheus convention and
-//! the histogram buckets installed in [`crate::obs::metrics::handle`].
+//! the histogram buckets installed in [`crate::metrics::handle`].
 
-use crate::obs::labels::{
-    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, Outcome, RejectionReason,
-    Subsystem, WaitKind,
+use crate::labels::{
+    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, LookupFirstPath, Outcome,
+    PoolPlane, RejectionReason, Subsystem, WaitKind,
 };
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -20,6 +21,8 @@ use std::time::Duration;
 pub const CONTROL_PLANE_OVERHEAD: &str = "sekai_control_plane_overhead_seconds";
 pub const SATURATION_RATIO: &str = "sekai_saturation_ratio";
 pub const DB_WAIT: &str = "sekai_db_wait_seconds";
+pub const POOL_CHECKOUT: &str = "sekai_db_pool_checkout_seconds";
+pub const POOL_IN_USE_RATIO: &str = "sekai_db_pool_in_use_ratio";
 pub const QUEUE_DEPTH: &str = "sekai_queue_depth";
 pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
 pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
@@ -28,10 +31,13 @@ pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
 pub const PROVIDER_CIRCUIT_OPEN: &str = "sekai_provider_circuit_open";
 pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
 pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
+pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
+pub const EVALUATION_STEP_TOTAL: &str = "sekai_evaluation_step_total";
+pub const EVALUATION_STEP_DURATION: &str = "sekai_evaluation_step_duration_seconds";
 
 /// Register descriptions for every signal family.
 ///
-/// Called once from [`crate::obs::metrics::handle`] so that a scrape carries
+/// Called once from [`crate::metrics::handle`] so that a scrape carries
 /// HELP text even before any signal has been emitted.
 pub fn describe_all() {
     describe_histogram!(
@@ -47,6 +53,15 @@ pub fn describe_all() {
         DB_WAIT,
         Unit::Seconds,
         "Time waiting on database work before progress"
+    );
+    describe_histogram!(
+        POOL_CHECKOUT,
+        Unit::Seconds,
+        "Time waiting to check a connection out of a store plane's pool"
+    );
+    describe_gauge!(
+        POOL_IN_USE_RATIO,
+        "Share of a store plane's pool checked out at the last checkout, 0.0 to 1.0"
     );
     describe_gauge!(QUEUE_DEPTH, "Items currently admitted and awaiting work");
     describe_counter!(CACHE_EVENTS, "Cache lookups by outcome");
@@ -64,6 +79,19 @@ pub fn describe_all() {
     describe_counter!(
         DEDUPLICATION_TOTAL,
         "Deduplication and idempotency decisions"
+    );
+    describe_counter!(
+        LOOKUP_FIRST_TOTAL,
+        "Lookup-first answer path decisions (hit vs model)"
+    );
+    describe_counter!(
+        EVALUATION_STEP_TOTAL,
+        "Deterministic evaluation steps by compiled static evaluator label, version, and closed status"
+    );
+    describe_histogram!(
+        EVALUATION_STEP_DURATION,
+        Unit::Seconds,
+        "Deterministic evaluation step latency by compiled static evaluator label, version, and closed status"
     );
 }
 
@@ -99,6 +127,26 @@ pub fn record_db_wait(kind: WaitKind, outcome: Outcome, waited: Duration) {
         "outcome" => outcome.as_str(),
     )
     .record(waited.as_secs_f64());
+}
+
+/// Record one connection checkout from a store plane's pool and the share of
+/// that pool in use right after it. Split pools report per plane so a starved
+/// plane is visible against the Shared baseline.
+pub fn record_pool_checkout(plane: PoolPlane, outcome: Outcome, waited: Duration, in_use: f64) {
+    histogram!(
+        POOL_CHECKOUT,
+        "plane" => plane.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(waited.as_secs_f64());
+    if outcome == Outcome::Ok {
+        let clamped = if in_use.is_finite() {
+            in_use.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        gauge!(POOL_IN_USE_RATIO, "plane" => plane.as_str()).set(clamped);
+    }
 }
 
 /// Set current queue depth for a subsystem.
@@ -163,6 +211,42 @@ pub fn record_deduplication(subsystem: Subsystem, event: DeduplicationEvent) {
     .increment(1);
 }
 
+/// Record a lookup-first answer path decision (#281).
+pub fn record_lookup_first(path: LookupFirstPath) {
+    counter!(LOOKUP_FIRST_TOTAL, "path" => path.as_str()).increment(1);
+}
+
+pub fn record_evaluation_step(
+    evaluator: &'static str,
+    version: &'static str,
+    status: &str,
+    elapsed: Duration,
+) {
+    let status = match status {
+        "pass" => "pass",
+        "fail" => "fail",
+        "unknown" => "unknown",
+        "unavailable" => "unavailable",
+        "error" => "error",
+        "skipped" => "skipped",
+        _ => "invalid",
+    };
+    counter!(
+        EVALUATION_STEP_TOTAL,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .increment(1);
+    histogram!(
+        EVALUATION_STEP_DURATION,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +261,7 @@ mod tests {
             CONTROL_PLANE_OVERHEAD,
             SATURATION_RATIO,
             DB_WAIT,
+            POOL_CHECKOUT,
             QUEUE_DEPTH,
             CACHE_EVENTS,
             DURABILITY_LAG,
@@ -184,6 +269,9 @@ mod tests {
             PROVIDER_CIRCUIT_OPEN,
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
+            EVALUATION_STEP_DURATION,
         ] {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
@@ -201,6 +289,8 @@ mod tests {
             FALLBACK_TOTAL,
             REJECTED_WORK_TOTAL,
             DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
         ] {
             assert!(
                 name.ends_with("_total"),
@@ -211,7 +301,13 @@ mod tests {
 
     #[test]
     fn duration_families_end_in_seconds() {
-        for name in [CONTROL_PLANE_OVERHEAD, DB_WAIT, DURABILITY_LAG] {
+        for name in [
+            CONTROL_PLANE_OVERHEAD,
+            DB_WAIT,
+            POOL_CHECKOUT,
+            DURABILITY_LAG,
+            EVALUATION_STEP_DURATION,
+        ] {
             assert!(
                 name.ends_with("_seconds"),
                 "{name} records a duration but is not suffixed _seconds"
