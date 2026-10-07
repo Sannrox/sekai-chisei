@@ -569,6 +569,7 @@ impl ChiseiServiceImpl {
             }
             let authorized_ceiling = self
                 .db
+                .fact_runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .map_err(|_| {
                     Status::permission_denied(
@@ -620,6 +621,7 @@ impl ChiseiServiceImpl {
             };
             let authorized = self
                 .db
+                .fact_runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .is_ok_and(|ceiling| memory.classification <= ceiling);
             let eligible = memory_lifecycle_allows_execution(
@@ -688,7 +690,7 @@ impl ChiseiServiceImpl {
         let payload =
             payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
         let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload);
+            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload)?;
         if leak_findings
             .iter()
             .any(|finding| finding.action == LeakAction::Block)

@@ -833,48 +833,51 @@ fn erase_supported_subject_data(
             &[&subject, &subject_hash],
         )
         .map_err(err)? as i32;
-    let budget_rows = client
-        .query(
-            "SELECT scope_id,parent_scope_id FROM chisei_budget_limits FOR UPDATE",
-            &[],
-        )
-        .map_err(err)?
-        .into_iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
-        .collect::<Vec<_>>();
-    let mut budget_scopes = budget_rows
-        .iter()
-        .filter(|(scope, parent)| {
-            [scope, parent].into_iter().any(|value| {
-                value == subject || value_mentions_subject(value, &request.subject_kind, subject)
+    if postgres_relation_exists(client, "chisei_budget_limits")? {
+        let budget_rows = client
+            .query(
+                "SELECT scope_id,parent_scope_id FROM chisei_budget_limits FOR UPDATE",
+                &[],
+            )
+            .map_err(err)?
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>();
+        let mut budget_scopes = budget_rows
+            .iter()
+            .filter(|(scope, parent)| {
+                [scope, parent].into_iter().any(|value| {
+                    value == subject
+                        || value_mentions_subject(value, &request.subject_kind, subject)
+                })
             })
-        })
-        .map(|(scope, _)| scope.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    loop {
-        let before = budget_scopes.len();
-        for (scope, parent) in &budget_rows {
-            if budget_scopes.contains(parent) {
-                budget_scopes.insert(scope.clone());
+            .map(|(scope, _)| scope.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        loop {
+            let before = budget_scopes.len();
+            for (scope, parent) in &budget_rows {
+                if budget_scopes.contains(parent) {
+                    budget_scopes.insert(scope.clone());
+                }
+            }
+            if budget_scopes.len() == before {
+                break;
             }
         }
-        if budget_scopes.len() == before {
-            break;
+        for scope in budget_scopes {
+            result.budget_records_deleted += client
+                .execute(
+                    "DELETE FROM chisei_budget_usage WHERE scope_id=$1",
+                    &[&scope],
+                )
+                .map_err(err)? as i32;
+            result.budget_records_deleted += client
+                .execute(
+                    "DELETE FROM chisei_budget_limits WHERE scope_id=$1",
+                    &[&scope],
+                )
+                .map_err(err)? as i32;
         }
-    }
-    for scope in budget_scopes {
-        result.budget_records_deleted += client
-            .execute(
-                "DELETE FROM chisei_budget_usage WHERE scope_id=$1",
-                &[&scope],
-            )
-            .map_err(err)? as i32;
-        result.budget_records_deleted += client
-            .execute(
-                "DELETE FROM chisei_budget_limits WHERE scope_id=$1",
-                &[&scope],
-            )
-            .map_err(err)? as i32;
     }
 
     for row in client
@@ -1236,6 +1239,17 @@ fn row_policy(row: Row) -> RetentionPolicy {
         retention_days: row.get(3),
         updated: row.get(4),
     }
+}
+
+fn postgres_relation_exists(client: &mut impl GenericClient, table: &str) -> Result<bool, String> {
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM pg_tables
+             WHERE schemaname = current_schema() AND tablename = $1",
+            &[&table],
+        )
+        .map_err(err)?;
+    Ok(row.is_some())
 }
 
 fn err(error: impl std::fmt::Display) -> String {

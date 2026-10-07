@@ -140,14 +140,20 @@ fn open_owned_layout(
     let layout = match (backend, url) {
         (BackendIdentity::Postgres, Some(url)) => {
             let identity = crate::combined_stores::postgres_identity(url)?;
-            let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-                BackendIdentity::Postgres,
-                None,
-                "unused.db",
-                Some(url),
-                pool_size,
-                sources.postgres_ca_cert_path.as_deref(),
-            )?)?;
+            let backend = RuntimeBackend::initialize(
+                RuntimeBackendConfig::from_sources(
+                    BackendIdentity::Postgres,
+                    None,
+                    "unused.db",
+                    Some(url),
+                    pool_size,
+                    sources.postgres_ca_cert_path.as_deref(),
+                )?
+                .with_schema_plane(match role {
+                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
+                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
+                }),
+            )?;
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
@@ -167,14 +173,20 @@ fn open_owned_layout(
         }
         (BackendIdentity::Sqlite, _) => {
             let identity = crate::combined_stores::sqlite_identity(path)?;
-            let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(path),
-                path,
-                None,
-                pool_size,
-                sources.postgres_ca_cert_path.as_deref(),
-            )?)?;
+            let backend = RuntimeBackend::initialize(
+                RuntimeBackendConfig::from_sources(
+                    BackendIdentity::Sqlite,
+                    Some(path),
+                    path,
+                    None,
+                    pool_size,
+                    sources.postgres_ca_cert_path.as_deref(),
+                )?
+                .with_schema_plane(match role {
+                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
+                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
+                }),
+            )?;
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
@@ -318,7 +330,10 @@ mod tests {
             chisei_owned(sekai.to_str().unwrap()),
         )
         .unwrap_err();
-        assert!(err.contains("stamped for sekai"), "{err}");
+        assert!(
+            err.contains("stamped for sekai") || err.contains("missed relocation"),
+            "{err}"
+        );
     }
 
     #[test]

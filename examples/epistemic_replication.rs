@@ -1225,6 +1225,7 @@ fn fixture_chisei_service(db: &RuntimeDb) -> ChiseiServiceImpl {
     .with_sekai_facts(SekaiFacts::in_process(SekaiStore::from_shared_runtime(
         runtime,
     )))
+    .unwrap()
 }
 
 fn authenticated_request<T>(body: T) -> Request<T> {

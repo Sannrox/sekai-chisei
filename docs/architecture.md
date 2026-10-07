@@ -39,6 +39,9 @@ OpenAI / Anthropic clients        Native integrations
 Combined mode still opens both stores. Independently runnable `sekai-plane` and
 `chisei-plane` processes each open only their own store and reject wrong-plane
 RPCs; see [two-plane processes](two-plane-processes.md).
+Each store migrates only the tables its plane owns, plus the shared hash-chained
+decision ledger and the per-store `chisei_operation_receipts` table. Combined
+Split writes plane-local admission receipts onto the Sekai dest.
 See [ADR 0082](decisions/0082-separate-chisei-and-sekai-durable-stores.md) and
 [ADR 0083](decisions/0083-two-store-cutover-and-recovery.md).
 

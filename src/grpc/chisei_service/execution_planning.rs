@@ -388,7 +388,7 @@ impl ChiseiServiceImpl {
             &provider,
             data_class,
             &payload_for_leak_check(&input.system, &prepared_messages, &input.tools),
-        );
+        )?;
         if !leak_findings.is_empty() {
             egress_decisions.extend(leak_findings_to_decisions(
                 &provider,

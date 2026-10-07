@@ -18,6 +18,7 @@ use crate::chisei::external_permit::{
 use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::chisei::kioku::*;
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
+use crate::chisei::principal::PrincipalContext;
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
@@ -1217,24 +1218,14 @@ impl RuntimeDb {
                 let mut transaction = connection
                     .transaction()
                     .map_err(|error| map_db_error(error.to_string()))?;
-                // These are every mutable community table consulted by live
-                // resolution. SHARE blocks concurrent INSERT/UPDATE/DELETE
-                // while allowing the existing read APIs to use pooled
-                // connections. The manifest/request tables remain governed by
-                // their advisory idempotency locks.
-                transaction
-                    .batch_execute(
-                        "LOCK TABLE
-                            sekai_objects,
-                            sekai_links,
-                            sekai_grants,
-                            sekai_evidence_submissions,
-                            chisei_evaluator_definitions,
-                            chisei_evaluator_availability,
-                            chisei_evaluation_plans
-                         IN SHARE MODE",
-                    )
-                    .map_err(|error| map_db_error(error.to_string()))?;
+                // SHARE-lock every mutable community table consulted by live
+                // resolution that exists on this dest. Combined Split Chisei
+                // dests omit Sekai graph tables. SHARE blocks concurrent
+                // INSERT/UPDATE/DELETE while pooled readers stay usable. The
+                // manifest/request tables remain governed by their advisory
+                // idempotency locks.
+                crate::db::postgres::lock_existing_evaluation_resolution_tables(&mut transaction)
+                    .map_err(&map_db_error)?;
                 let (value, write) = operation()?;
                 let stored = write
                     .map(|write| {
@@ -3301,6 +3292,43 @@ impl RuntimeDb {
         }
     }
 
+    pub fn reassess_kioku_memory_after_graph_auth(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        match self {
+            Self::Sqlite(db) => db.reassess_kioku_memory_after_graph_auth(request),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.reassess_kioku_memory_after_graph_auth(request)
+            }),
+        }
+    }
+
+    pub fn authorize_kioku_retrieval(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<(), String> {
+        let actor = request.actor.trim();
+        let namespace = request.namespace.trim();
+        let authorized_ceiling = self.kioku_authorized_classification_ceiling(namespace, actor)?;
+        if request.classification_ceiling > authorized_ceiling {
+            return Err("requested memory classification exceeds actor grant".into());
+        }
+        let principal = PrincipalContext::from_credential(actor);
+        for object_id in &request.context_object_ids {
+            if self.get_object(object_id)?.is_none() {
+                return Err(format!("context object {object_id} not found"));
+            }
+            let grants = self.list_principal_grants(object_id)?;
+            if !grants.is_empty() && !principal.holds_grant(&grants) {
+                return Err(format!(
+                    "actor is not authorized for context object {object_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn authorize_kioku_evidence(
         &self,
         request: &KiokuEvidenceAuthorizationRequest,
@@ -5307,6 +5335,20 @@ impl RuntimeDb {
         }
     }
 
+    pub fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        match self {
+            Self::Sqlite(db) => db.review_kioku_candidate_after_graph_auth(id, version, review),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.review_kioku_candidate_after_graph_auth(id, version, review)
+            }),
+        }
+    }
+
     pub fn revoke_handoff(
         &self,
         id: &str,
@@ -7190,6 +7232,18 @@ impl RuntimeDb {
     ) -> Result<Vec<RetrievedMemory>, String> {
         match self {
             Self::Sqlite(db) => db.retrieve_kioku_memories(request),
+            Self::Postgres(_) => Err(
+                "retrieve_kioku_memories is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        match self {
+            Self::Sqlite(db) => db.retrieve_kioku_memories_after_graph_auth(request),
             Self::Postgres(_) => Err(
                 "retrieve_kioku_memories is unavailable on the PostgreSQL community runtime".into(),
             ),

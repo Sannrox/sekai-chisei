@@ -1351,20 +1351,22 @@ fn run_kioku_enrich(
         .into_iter()
         .map(|object| object.id)
         .collect();
-    let actor_ceiling =
-        match db.kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor) {
-            Ok(ceiling) => ceiling,
-            Err(error) => {
-                return StepDecision {
-                    step: String::new(),
-                    action: "skipped".into(),
-                    reasoning: format!("memory retrieval denied: {error}"),
-                    confidence: 1.0,
-                    suggestion: String::new(),
-                    value: String::new(),
-                };
-            }
-        };
+    let actor_ceiling = match db
+        .fact_runtime()
+        .kioku_authorized_classification_ceiling(&req.namespace, &req.memory_actor)
+    {
+        Ok(ceiling) => ceiling,
+        Err(error) => {
+            return StepDecision {
+                step: String::new(),
+                action: "skipped".into(),
+                reasoning: format!("memory retrieval denied: {error}"),
+                confidence: 1.0,
+                suggestion: String::new(),
+                value: String::new(),
+            };
+        }
+    };
     let classification_ceiling = if req.external_egress {
         actor_ceiling.min(EvidenceClassification::Public)
     } else {

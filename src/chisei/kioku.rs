@@ -1441,6 +1441,25 @@ impl SekaiDb {
         version: u32,
         review: HumanMemoryReview,
     ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, true)
+    }
+
+    pub(crate) fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, false)
+    }
+
+    fn review_kioku_candidate_inner(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+        authorize_graph: bool,
+    ) -> Result<KiokuMemory, String> {
         if review.reviewer.trim().is_empty() || review.rationale.trim().is_empty() {
             return Err("reviewer and rationale are required".into());
         }
@@ -1471,7 +1490,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        if review.action == HumanReviewAction::Promote {
+        if review.action == HumanReviewAction::Promote && authorize_graph {
             for basis in &memory.evidence_basis {
                 if basis.source_submission_id.is_empty() {
                     continue;
@@ -1686,7 +1705,36 @@ impl SekaiDb {
         if request.max_results == 0 {
             return Ok(Vec::new());
         }
-        self.authorize_kioku_retrieval(request)?;
+        self.retrieve_kioku_memories_inner(request, true)
+    }
+
+    pub(crate) fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if request.namespace.trim().is_empty()
+            || request.operation_class.trim().is_empty()
+            || request.actor.trim().is_empty()
+        {
+            return Err("retrieval namespace, operation class, and actor are required".into());
+        }
+        if request.min_confidence_bps > 10_000 {
+            return Err("min_confidence_bps must not exceed 10000".into());
+        }
+        if request.max_results == 0 {
+            return Ok(Vec::new());
+        }
+        self.retrieve_kioku_memories_inner(request, false)
+    }
+
+    fn retrieve_kioku_memories_inner(
+        &self,
+        request: &MemoryRetrievalRequest,
+        authorize_graph: bool,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if authorize_graph {
+            self.authorize_kioku_retrieval(request)?;
+        }
 
         let conn = self.conn();
         let mut statement = conn

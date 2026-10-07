@@ -126,7 +126,7 @@ impl ChiseiServiceImpl {
         }
         if existing.is_none() && has_kioku_context {
             reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                self.db.runtime(),
+                &self.db,
                 &receipt,
                 authenticated_principal,
                 now,
@@ -144,7 +144,7 @@ impl ChiseiServiceImpl {
         if existing.is_none()
             && has_kioku_context
             && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                self.db.runtime(),
+                &self.db,
                 &receipt,
                 authenticated_principal,
                 now,

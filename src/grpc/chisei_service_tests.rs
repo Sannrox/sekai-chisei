@@ -1251,7 +1251,9 @@ fn memory_service() -> ChiseiServiceImpl {
     )));
     let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
-    ChiseiServiceImpl::new(chisei, config(":memory:")).with_sekai_facts(facts)
+    ChiseiServiceImpl::new(chisei, config(":memory:"))
+        .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn gunshi_planning_service() -> ChiseiServiceImpl {
@@ -2297,6 +2299,7 @@ fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     ChiseiServiceImpl::new_with_evaluator_registry(chisei, config(":memory:"), registry)
         .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
@@ -3623,7 +3626,8 @@ async fn cancellation_is_durable_and_reduces_fail_closed() {
                 .evaluator_registry()
                 .clone(),
         )
-        .with_sekai_facts(svc.sekai_facts.clone()),
+        .with_sekai_facts(svc.sekai_facts.clone())
+        .unwrap(),
     );
     let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
     let execute_request = ExecuteEvaluationManifestRequest {
@@ -10058,7 +10062,9 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
     config.routing_credential_refs = vec!["ACME".into()];
     let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
-    let service = ChiseiServiceImpl::new(chisei, config.clone()).with_sekai_facts(facts);
+    let service = ChiseiServiceImpl::new(chisei, config.clone())
+        .with_sekai_facts(facts)
+        .unwrap();
     for (id, namespace, principal, role) in [
         ("support", "support", "alice", Role::Admin),
         ("support", "support", "bob", Role::Editor),
@@ -11048,7 +11054,8 @@ fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
     assert!(layout.is_split());
     let (sekai_store, _) = layout.handles();
     lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
-    let (_, chisei_svc) = crate::grpc::build_services(&crate::config::Config::from_env(), &layout);
+    let (_, chisei_svc) =
+        crate::grpc::build_services(&crate::config::Config::from_env(), &layout).unwrap();
 
     match evaluate_execute_lookup_first(
         chisei_svc.sekai_facts.reader(),
@@ -11066,7 +11073,12 @@ fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
     let chisei_as_facts = shared_sekai_store(&chisei_svc.db);
     match evaluate_execute_lookup_first(&chisei_as_facts, &resolve_lookup_root_input(), "alice") {
         ExecuteLookupFirst::ModelPath { lookup_refusal } => {
-            assert_eq!(lookup_refusal.as_deref(), Some("incomplete"));
+            let reason = lookup_refusal.as_deref().unwrap_or("");
+            assert!(
+                reason == "incomplete"
+                    || (reason.contains("storage_error") && reason.contains("sekai_objects")),
+                "expected incomplete or missing sekai_objects, got {lookup_refusal:?}"
+            );
         }
         other => panic!("expected the Chisei store to miss, got {other:?}"),
     }
@@ -11081,7 +11093,8 @@ fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
     let mut config = crate::config::Config::from_env();
     config.sekai_endpoint = None;
     let (_, chisei_svc) =
-        crate::grpc::build_services_for_plane(&config, &layout, crate::plane::ProcessPlane::Chisei);
+        crate::grpc::build_services_for_plane(&config, &layout, crate::plane::ProcessPlane::Chisei)
+            .unwrap();
 
     assert!(!chisei_svc.sekai_facts.reader().attached());
     match evaluate_execute_lookup_first(
@@ -11112,9 +11125,11 @@ fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>
         config(":memory:"),
     );
     if attach_sekai {
-        service = service.with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-            crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
-        ));
+        service = service
+            .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+                crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
+            ))
+            .unwrap();
     }
     sekai_db
         .ensure_team_namespace(

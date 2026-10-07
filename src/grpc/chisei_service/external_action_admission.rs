@@ -98,15 +98,14 @@ impl ChiseiServiceImpl {
                 "external-action permit replay requires a policy snapshot",
             ));
         }
-        let policy = self
-            .db
-            .runtime()
-            .resolve_action_policy(
-                actor,
-                &existing.request.namespace,
-                &existing.request.policy_project,
-            )
-            .map_err(Status::internal)?;
+        let policy = resolve_action_policy_from_graph(
+            self.sekai_facts.reader(),
+            self.db.fact_runtime(),
+            actor,
+            &existing.request.namespace,
+            &existing.request.policy_project,
+        )
+        .map_err(Status::internal)?;
         let Some(policy) = policy.as_ref() else {
             return Err(Status::failed_precondition(
                 "external-action permit replay requires a current action policy",
@@ -200,7 +199,9 @@ impl ChiseiServiceImpl {
             }
         }
 
-        let policy = match self.db.runtime().resolve_action_policy(
+        let policy = match resolve_action_policy_from_graph(
+            self.sekai_facts.reader(),
+            self.db.fact_runtime(),
             &actor,
             &request.namespace,
             &request.policy_project,
@@ -305,15 +306,14 @@ impl ChiseiServiceImpl {
                     .ok_or_else(|| Status::not_found("external-action authorization not found"))?;
                 let expected = record.clone();
                 let now = chrono::Utc::now().timestamp_millis();
-                let current_policy = self
-                    .db
-                    .runtime()
-                    .resolve_action_policy(
-                        &record.request.actor,
-                        &record.request.namespace,
-                        &record.request.policy_project,
-                    )
-                    .map_err(Status::internal)?;
+                let current_policy = resolve_action_policy_from_graph(
+                    self.sekai_facts.reader(),
+                    self.db.fact_runtime(),
+                    &record.request.actor,
+                    &record.request.namespace,
+                    &record.request.policy_project,
+                )
+                .map_err(Status::internal)?;
                 let access_revoked = require_namespace_write_access(
                     self.sekai_facts.reader(),
                     &record.request.actor,

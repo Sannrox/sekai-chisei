@@ -137,6 +137,7 @@ impl KiokuCandidateGovernance {
         let mut seen = HashSet::new();
         let classification_ceiling = self
             .db
+            .fact_runtime()
             .kioku_authorized_classification_ceiling(&namespace, &actor)
             .ok();
         let mut has_more = false;
@@ -186,6 +187,7 @@ impl KiokuCandidateGovernance {
                     basis.source_submission_id.is_empty()
                         || self
                             .db
+                            .fact_runtime()
                             .authorize_kioku_evidence(
                                 &crate::chisei::kioku::KiokuEvidenceAuthorizationRequest {
                                     source_submission_id: basis.source_submission_id.clone(),

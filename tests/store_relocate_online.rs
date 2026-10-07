@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::chisei::budget::{BudgetTracker, PeriodType};
+use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::db::store::ChiseiStore;
 use sekai_chisei::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
 use serde_json::Value;
@@ -39,6 +41,12 @@ fn tracker(path: &str) -> BudgetTracker {
     BudgetTracker::new(ChiseiStore::open_sqlite(path))
 }
 
+fn source_tracker(path: &str) -> BudgetTracker {
+    BudgetTracker::new(ChiseiStore::from_shared_runtime(Arc::new(
+        RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).expect("open shared sqlite"))),
+    )))
+}
+
 fn limit_for(index: i32) -> i32 {
     1_000 + index
 }
@@ -52,7 +60,7 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
     let chisei_s = chisei.to_str().expect("utf8").to_string();
     init_sqlite(&source_s);
     for index in 0..SEEDED_USERS {
-        tracker(&source_s)
+        source_tracker(&source_s)
             .set_limit(
                 &format!("seed-{index}"),
                 limit_for(index),
@@ -71,7 +79,7 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
             let mut fenced = 0usize;
             let mut index = 0;
             while !stop.load(Ordering::SeqCst) {
-                match tracker(&source_s).set_limit(
+                match source_tracker(&source_s).set_limit(
                     &format!("live-{index}"),
                     limit_for(index),
                     PeriodType::Daily,
@@ -125,7 +133,7 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
         );
     }
 
-    let late = tracker(&source_s)
+    let late = source_tracker(&source_s)
         .set_limit("after-fence", 1, PeriodType::Daily)
         .expect_err("the source database refuses Chisei writes after the fence")
         .to_string();

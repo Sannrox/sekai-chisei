@@ -321,8 +321,12 @@ impl ChiseiServiceImpl {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, &provider, data_class, &resolved_text);
+        let leak_findings = self.leak_findings_for_payload(
+            &input.namespace,
+            &provider,
+            data_class,
+            &resolved_text,
+        )?;
         if !leak_findings.is_empty() {
             self.record_leak_audit(
                 "content_leak_check",
