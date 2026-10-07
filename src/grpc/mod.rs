@@ -567,14 +567,17 @@ pub fn run_for_plane(
         let credential_store = Arc::new(PrincipalCredentialStore::new());
         credential_store.load(&active_credentials);
 
-        if let Some(socket_path) = config.sekai_socket.as_deref() {
+        if let Some(socket_path) = config.sekai_socket.as_deref()
+            && plane.serves_sekai()
+        {
             ensure_local_gateway_credential(socket_path, &db)?;
         }
         let assertion_authority = config
             .assertion_authority()
             .map_err(std::io::Error::other)?
             .map(Arc::new);
-        let services = build_services_for_plane(&config, &stores, plane);
+        let services =
+            build_services_for_plane(&config, &stores, plane).map_err(std::io::Error::other)?;
         Ok((
             db,
             chisei_db,
@@ -940,10 +943,13 @@ where
 pub fn build_services(
     config: &Config,
     stores: &CombinedStoreLayout,
-) -> (
-    Arc<sekai_service::SekaiServiceImpl>,
-    Arc<chisei_service::ChiseiServiceImpl>,
-) {
+) -> Result<
+    (
+        Arc<sekai_service::SekaiServiceImpl>,
+        Arc<chisei_service::ChiseiServiceImpl>,
+    ),
+    String,
+> {
     build_services_for_plane(config, stores, ProcessPlane::Combined)
 }
 
@@ -951,19 +957,26 @@ pub fn build_services_for_plane(
     config: &Config,
     stores: &CombinedStoreLayout,
     plane: ProcessPlane,
-) -> (
-    Arc<sekai_service::SekaiServiceImpl>,
-    Arc<chisei_service::ChiseiServiceImpl>,
-) {
+) -> Result<
+    (
+        Arc<sekai_service::SekaiServiceImpl>,
+        Arc<chisei_service::ChiseiServiceImpl>,
+    ),
+    String,
+> {
     let (sekai_store, chisei_store) = stores.handles();
     let budget = Arc::new(BudgetTracker::with_topology(
         chisei_store.clone(),
         config.budget_topology.clone(),
     ));
-    let mut sekai_svc = sekai_service::SekaiServiceImpl::new_with_gateway_schema_principals(
-        sekai_store.clone(),
-        config.gateway_receipt_principals.clone(),
-    )
+    let mut sekai_svc = if plane.serves_sekai() {
+        sekai_service::SekaiServiceImpl::new_with_gateway_schema_principals(
+            sekai_store.clone(),
+            config.gateway_receipt_principals.clone(),
+        )
+    } else {
+        sekai_service::SekaiServiceImpl::wrong_plane_placeholder(sekai_store.clone())
+    }
     .with_site_id(config.site_id.clone());
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
@@ -984,7 +997,7 @@ pub fn build_services_for_plane(
             chisei_svc = chisei_svc
                 .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
                     sekai_store.clone(),
-                ))
+                ))?
                 .with_sekai_commit_lookup(Arc::new(sekai_store));
         }
         ProcessPlane::Chisei => {
@@ -994,7 +1007,7 @@ pub fn build_services_for_plane(
                         crate::composition::remote_sekai::RemoteSekaiFactReader::from_env(
                             endpoint.clone(),
                         ),
-                    )))
+                    )))?
                     .with_sekai_commit_lookup(Arc::new(
                         crate::composition::remote_sekai::RemoteSekaiCommitLookup::from_env(
                             endpoint.clone(),
@@ -1005,7 +1018,7 @@ pub fn build_services_for_plane(
         ProcessPlane::Sekai => {}
     }
 
-    (Arc::new(sekai_svc), Arc::new(chisei_svc))
+    Ok((Arc::new(sekai_svc), Arc::new(chisei_svc)))
 }
 
 fn spawn_service_background_tasks(
@@ -1248,7 +1261,8 @@ mod tests {
         }
         .open()
         .unwrap();
-        let (sekai_svc, chisei_svc) = build_services(&crate::config::Config::from_env(), &layout);
+        let (sekai_svc, chisei_svc) =
+            build_services(&crate::config::Config::from_env(), &layout).unwrap();
         let clerk = sekai_svc
             .cross_store
             .as_ref()

@@ -34,11 +34,17 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
             .open_layout(&config.db_path)
             .map_err(std::io::Error::other)?,
     );
-    let credential_db = match plane {
-        ProcessPlane::Chisei => stores.chisei_runtime(),
-        ProcessPlane::Combined | ProcessPlane::Sekai => stores.sekai_runtime(),
+    // Principal credentials are Sekai-owned. A Chisei-only dest does not
+    // migrate that table; this process authenticates callers without a local
+    // credential catalog (insecure local, or a later hop to Sekai).
+    let (credential_db, active_credentials) = match plane {
+        ProcessPlane::Chisei => (stores.chisei_runtime(), Vec::new()),
+        ProcessPlane::Combined | ProcessPlane::Sekai => {
+            let db = stores.sekai_runtime();
+            let credentials = db.list_active_credentials()?;
+            (db, credentials)
+        }
     };
-    let active_credentials = credential_db.list_active_credentials()?;
     let external_credentials_active = active_credentials.iter().any(|credential| {
         !matches!(
             credential.principal.as_str(),

@@ -425,6 +425,36 @@ impl SekaiDb {
         Ok((object, grants))
     }
 
+    /// Shared hash-chained decision ledger. Both planes migrate this table.
+    /// Sekai/Shared leave lifecycle-column ALTER and evidence backfill to
+    /// [`Self::migrate_audit`] so `added_lifecycle_column` stays accurate.
+    /// Chisei-only dests do that ALTER here because they never run `migrate_audit`.
+    pub(crate) fn migrate_decision_ledger(
+        &self,
+        plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sekai_decisions (
+                id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, actor TEXT NOT NULL,
+                action TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '{}',
+                target_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT '',
+                namespace TEXT NOT NULL DEFAULT '', data_class TEXT NOT NULL DEFAULT 'unclassified'
+            );
+            CREATE INDEX IF NOT EXISTS idx_decisions_target ON sekai_decisions(target_id, timestamp);
+            CREATE TABLE IF NOT EXISTS sekai_schema_migrations (
+                name TEXT PRIMARY KEY
+            );",
+        )
+        .map_err(|e| e.to_string())?;
+        if !plane.includes_sekai() {
+            let added = Self::add_decision_lifecycle_columns(&conn)?;
+            Self::backfill_decision_lifecycle_from_evidence(&conn, added)?;
+        }
+        drop(conn);
+        self.migrate_ledger()
+    }
+
     pub(crate) fn migrate_audit(&self) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch(
@@ -446,20 +476,7 @@ impl SekaiDb {
             );"
         )
         .map_err(|e| e.to_string())?;
-        let mut added_lifecycle_column = false;
-        for column in [
-            "namespace TEXT NOT NULL DEFAULT ''",
-            "data_class TEXT NOT NULL DEFAULT 'unclassified'",
-        ] {
-            match conn.execute(
-                &format!("ALTER TABLE sekai_decisions ADD COLUMN {column}"),
-                [],
-            ) {
-                Ok(_) => added_lifecycle_column = true,
-                Err(error) if error.to_string().contains("duplicate column name") => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
+        let added_lifecycle_column = Self::add_decision_lifecycle_columns(&conn)?;
         conn.execute_batch(
             "INSERT OR IGNORE INTO sekai_object_changes
                  (id, object_id, field, old_value, new_value, changed_by, timestamp)
@@ -492,6 +509,31 @@ impl SekaiDb {
                );",
         )
         .map_err(|error| error.to_string())?;
+        Self::backfill_decision_lifecycle_from_evidence(&conn, added_lifecycle_column)
+    }
+
+    fn add_decision_lifecycle_columns(conn: &rusqlite::Connection) -> Result<bool, String> {
+        let mut added_lifecycle_column = false;
+        for column in [
+            "namespace TEXT NOT NULL DEFAULT ''",
+            "data_class TEXT NOT NULL DEFAULT 'unclassified'",
+        ] {
+            match conn.execute(
+                &format!("ALTER TABLE sekai_decisions ADD COLUMN {column}"),
+                [],
+            ) {
+                Ok(_) => added_lifecycle_column = true,
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(added_lifecycle_column)
+    }
+
+    fn backfill_decision_lifecycle_from_evidence(
+        conn: &rusqlite::Connection,
+        added_lifecycle_column: bool,
+    ) -> Result<(), String> {
         let tombstone_backfill_pending: bool = conn
             .query_row(
                 "SELECT NOT EXISTS(
@@ -1469,6 +1511,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn shared_open_backfills_legacy_decision_lifecycle_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-ledger.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sekai_decisions (
+                    id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, actor TEXT NOT NULL,
+                    action TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+                    evidence TEXT NOT NULL DEFAULT '{}',
+                    target_id TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT ''
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sekai_decisions
+                    (id, timestamp, actor, action, reason, evidence, target_id, outcome)
+                 VALUES ('classified', 1, 'actor', 'test', '', ?1, '', 'ok')",
+                params![
+                    serde_json::to_string(&HashMap::from([
+                        ("project".to_string(), "namespace-a".to_string()),
+                        ("data_class".to_string(), "sensitive".to_string()),
+                    ]))
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let stored: (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT namespace,data_class FROM sekai_decisions WHERE id='classified'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("namespace-a".into(), "sensitive".into()));
     }
 
     #[test]

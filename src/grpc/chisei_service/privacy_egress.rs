@@ -19,30 +19,39 @@ impl ChiseiServiceImpl {
         provider: &str,
         data_class: DataClass,
         payload: &str,
-    ) -> Vec<LeakFinding> {
+    ) -> Result<Vec<LeakFinding>, Status> {
         let safe = crate::chisei::privacy::safe_providers(&self.config);
         if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
-            return vec![];
+            return Ok(vec![]);
         }
-        let rules = self.leak_rules(namespace);
+        let rules = self.leak_rules(namespace)?;
         let entities = if data_class == DataClass::Sensitive {
-            self.sensitive_entities(namespace)
+            self.sensitive_entities(namespace)?
         } else {
             vec![]
         };
-        crate::chisei::privacy::check_payload(payload, &rules, &entities)
+        Ok(crate::chisei::privacy::check_payload(
+            payload, &rules, &entities,
+        ))
     }
 
-    pub(super) fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
+    fn list_graph_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        authoritative_graph_runtime(self.sekai_facts.reader(), self.db.fact_runtime())?
+            .list_all_objects(filter)
+    }
+
+    pub(super) fn leak_rules(&self, namespace: &str) -> Result<Vec<LeakRule>, Status> {
         let mut rules = Vec::new();
         for ns in ["", namespace] {
-            let Ok(objects) = self.db.runtime().list_all_objects(&ListFilter {
-                kind: Some("leak_rule".into()),
-                namespace: Some(ns.to_string()),
-                ..Default::default()
-            }) else {
-                continue;
-            };
+            let objects = self
+                .list_graph_objects(&ListFilter {
+                    kind: Some("leak_rule".into()),
+                    namespace: Some(ns.to_string()),
+                    ..Default::default()
+                })
+                .map_err(|error| {
+                    Status::failed_precondition(format!("leak-rule policy unavailable: {error}"))
+                })?;
             for obj in objects {
                 let Some(pattern) = obj.properties.get("pattern") else {
                     continue;
@@ -68,19 +77,19 @@ impl ChiseiServiceImpl {
                 });
             }
         }
-        rules
+        Ok(rules)
     }
 
-    pub(super) fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
+    pub(super) fn sensitive_entities(&self, namespace: &str) -> Result<Vec<String>, Status> {
         let objects = self
-            .db
-            .runtime()
-            .list_all_objects(&ListFilter {
+            .list_graph_objects(&ListFilter {
                 namespace: Some(namespace.to_string()),
                 ..Default::default()
             })
-            .unwrap_or_default();
-        crate::chisei::privacy::entity_scan_literals(&objects)
+            .map_err(|error| {
+                Status::failed_precondition(format!("sensitive-entity policy unavailable: {error}"))
+            })?;
+        Ok(crate::chisei::privacy::entity_scan_literals(&objects))
     }
 
     pub(super) fn record_egress_audit(

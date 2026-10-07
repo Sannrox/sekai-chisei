@@ -521,22 +521,28 @@ fn open_split_sqlite(
     let sekai_identity = sqlite_identity(sekai_path)?;
     let chisei_identity = sqlite_identity(chisei_path)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
-    let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Sqlite,
-        Some(sekai_path),
-        sekai_path,
-        None,
-        sekai_pool,
-        postgres_ca_cert_path,
-    )?)?;
-    let chisei = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Sqlite,
-        Some(chisei_path),
-        chisei_path,
-        None,
-        chisei_pool,
-        postgres_ca_cert_path,
-    )?)?;
+    let sekai = RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Sqlite,
+            Some(sekai_path),
+            sekai_path,
+            None,
+            sekai_pool,
+            postgres_ca_cert_path,
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Sekai),
+    )?;
+    let chisei = RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Sqlite,
+            Some(chisei_path),
+            chisei_path,
+            None,
+            chisei_pool,
+            postgres_ca_cert_path,
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+    )?;
     let sekai_identity = sqlite_identity(sekai_path)?;
     let chisei_identity = sqlite_identity(chisei_path)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
@@ -564,22 +570,28 @@ fn open_split_postgres(
     let sekai_identity = postgres_identity(sekai_url)?;
     let chisei_identity = postgres_identity(chisei_url)?;
     refuse_shared_identity(&sekai_identity, &chisei_identity)?;
-    let sekai = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Postgres,
-        None,
-        "unused.db",
-        Some(sekai_url),
-        sekai_pool,
-        postgres_ca_cert_path,
-    )?)?;
-    let chisei = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Postgres,
-        None,
-        "unused.db",
-        Some(chisei_url),
-        chisei_pool,
-        postgres_ca_cert_path,
-    )?)?;
+    let sekai = RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Postgres,
+            None,
+            "unused.db",
+            Some(sekai_url),
+            sekai_pool,
+            postgres_ca_cert_path,
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Sekai),
+    )?;
+    let chisei = RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Postgres,
+            None,
+            "unused.db",
+            Some(chisei_url),
+            chisei_pool,
+            postgres_ca_cert_path,
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+    )?;
     sekai
         .database()
         .set_pool_plane(crate::obs::labels::PoolPlane::Sekai);

@@ -57,7 +57,11 @@ impl SekaiStore {
 
     pub fn open_sqlite(path: &str) -> Self {
         Self::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
-            crate::db::sekai::SekaiDb::new(path).expect("open sqlite store"),
+            crate::db::sekai::SekaiDb::new_for_plane(
+                path,
+                crate::db::schema_plane::SchemaPlane::Sekai,
+            )
+            .expect("open sqlite store"),
         ))))
     }
 
@@ -179,7 +183,11 @@ impl ChiseiStore {
 
     pub fn open_sqlite(path: &str) -> Self {
         Self::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
-            crate::db::sekai::SekaiDb::new(path).expect("open sqlite store"),
+            crate::db::sekai::SekaiDb::new_for_plane(
+                path,
+                crate::db::schema_plane::SchemaPlane::Chisei,
+            )
+            .expect("open sqlite store"),
         ))))
     }
 
@@ -200,6 +208,19 @@ impl ChiseiStore {
 
     pub(crate) fn decision_runtime(&self) -> &RuntimeDb {
         &self.decisions
+    }
+
+    /// Graph facts Chisei persists (namespace policy objects). Combined Split
+    /// keeps those on the Sekai dest; Owned points at the same store as
+    /// [`Self::runtime`].
+    pub(crate) fn fact_runtime(&self) -> &RuntimeDb {
+        &self.decisions
+    }
+
+    /// True when Kioku memories and graph facts live on one physical store,
+    /// so promotion can authorize evidence inside the memory transaction.
+    pub(crate) fn shares_graph_with_memory(&self) -> bool {
+        Arc::ptr_eq(&self.inner, &self.decisions)
     }
 }
 
@@ -222,13 +243,72 @@ mod tests {
     fn shares_physical_store_only_for_the_shared_facade() {
         let (sekai, chisei) = split_shared_runtime(Arc::new(RuntimeDb::memory()));
         assert!(chisei.shares_physical_store_with(&sekai));
+        assert!(chisei.shares_graph_with_memory());
         assert!(!ChiseiStore::memory().shares_physical_store_with(&SekaiStore::memory()));
+        let split = ChiseiStore::from_split_runtimes(
+            Arc::new(RuntimeDb::memory()),
+            Arc::new(RuntimeDb::memory()),
+        );
+        assert!(!split.shares_graph_with_memory());
     }
 
     #[test]
     fn chisei_memory_does_not_require_naming_runtime_db_at_callers() {
         let store = ChiseiStore::memory();
         store.runtime().ping().expect("memory store pings");
+    }
+
+    #[test]
+    fn split_store_kioku_graph_auth_reads_sekai_dest() {
+        use crate::chisei::kioku::MemoryRetrievalRequest;
+        use crate::db::store::ChiseiKiokuStore;
+        use crate::domain::Object;
+        use crate::sekai::evidence::EvidenceClassification;
+        use std::collections::HashMap;
+
+        let sekai = SekaiStore::memory();
+        let chisei = ChiseiStore::from_split_runtimes(
+            ChiseiStore::memory().runtime_arc(),
+            sekai.runtime_arc(),
+        );
+        sekai
+            .create_object(&Object {
+                id: "namespace-payments".into(),
+                kind: "namespace".into(),
+                name: "payments".into(),
+                namespace: "payments".into(),
+                external_id: "namespace:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            chisei
+                .kioku_authorized_classification_ceiling("payments", "agent:planner")
+                .unwrap(),
+            EvidenceClassification::Public
+        );
+        assert!(
+            chisei
+                .runtime()
+                .kioku_authorized_classification_ceiling("payments", "agent:planner")
+                .unwrap_err()
+                .contains("not an authorized graph scope")
+        );
+        let retrieved = chisei
+            .retrieve_kioku_memories(&MemoryRetrievalRequest {
+                namespace: "payments".into(),
+                operation_class: "schema_change".into(),
+                context_object_ids: vec![],
+                classification_ceiling: EvidenceClassification::Public,
+                min_confidence_bps: 0,
+                max_results: 10,
+                actor: "agent:planner".into(),
+                now_ms: 150,
+            })
+            .unwrap();
+        assert!(retrieved.is_empty());
     }
 
     #[test]

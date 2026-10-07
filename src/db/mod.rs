@@ -100,6 +100,8 @@ mod postgres_routing_profile;
 mod postgres_schema;
 mod postgres_team_namespace;
 mod postgres_workflow_action;
+pub(crate) mod schema_plane;
+pub use schema_plane::SchemaPlane;
 pub mod replica_conformance;
 pub mod replica_safety;
 pub mod retention;

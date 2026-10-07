@@ -380,6 +380,18 @@ fn keyed_value_matches_subject(key: &str, value: &str, kind: &str, subject: &str
         && (value == subject || contains_subject_reference(value, kind, subject))
 }
 
+fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(exists.is_some())
+}
+
 fn principal_matches_subject(principal: &str, kind: &str, subject: &str) -> bool {
     principal == subject || contains_typed_subject(principal, kind, subject)
 }
@@ -1276,191 +1288,197 @@ impl SekaiDb {
             }
         }
 
-        let matching_budget_attributions = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT rowid, source_scope_id, applied_scope_id, metric,
+        if sqlite_table_exists(&tx, "chisei_budget_attributions")? {
+            let matching_budget_attributions = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT rowid, source_scope_id, applied_scope_id, metric,
                             period_start, amount_used
                      FROM chisei_budget_attributions",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|(_, source_scope_id, _, _, _, _)| {
-                principal_matches_subject(source_scope_id, &request.subject_kind, &request.subject)
-            })
-            .collect::<Vec<_>>()
-        };
-        for (_, _, applied_scope, metric, period_start, amount_used) in
-            &matching_budget_attributions
-        {
-            tx.execute(
-                "UPDATE chisei_budget_usage
-                 SET amount_used=MAX(0, amount_used-?1)
-                 WHERE scope_id=?2 AND metric=?3 AND period_start=?4",
-                params![amount_used, applied_scope, metric, period_start],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        for (rowid, _, _, _, _, _) in &matching_budget_attributions {
-            result.budget_records_deleted += tx
-                .execute(
-                    "DELETE FROM chisei_budget_attributions WHERE rowid=?1",
-                    params![rowid],
-                )
-                .map_err(|e| e.to_string())? as i32;
-        }
-
-        let matching_usage_rows = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT rowid, scope_id, metric, period_start, amount_used
-                     FROM chisei_budget_usage",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|(_, scope_id, _, _, _)| {
-                principal_matches_subject(scope_id, &request.subject_kind, &request.subject)
-            })
-            .collect::<Vec<_>>()
-        };
-        let legacy_usage_rows = matching_usage_rows
-            .iter()
-            .filter(|(_, _, _, _, amount_used)| *amount_used > 0)
-            .collect::<Vec<_>>();
-        for (_, scope_id, metric, period_start, amount_used) in &legacy_usage_rows {
-            let scoped_peer_total = legacy_usage_rows
-                .iter()
-                .filter(|(_, peer_scope, peer_metric, peer_period, _)| {
-                    peer_metric == metric
-                        && peer_period == period_start
-                        && peer_scope.contains('/')
-                        && crate::db::chisei_budget::scope_chain(peer_scope).contains(scope_id)
+                    )
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
                 })
-                .map(|(_, _, _, _, peer_amount)| *peer_amount)
-                .sum::<i64>();
-            let reconciled_amount = if scope_id.contains('/') {
-                *amount_used
-            } else {
-                (*amount_used - scoped_peer_total).max(0)
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|(_, source_scope_id, _, _, _, _)| {
+                    principal_matches_subject(
+                        source_scope_id,
+                        &request.subject_kind,
+                        &request.subject,
+                    )
+                })
+                .collect::<Vec<_>>()
             };
-            if reconciled_amount == 0 {
-                continue;
-            }
-            let has_matching_parent = legacy_usage_rows.iter().any(
-                |(_, parent_scope, parent_metric, parent_period, _)| {
-                    parent_metric == metric
-                        && parent_period == period_start
-                        && parent_scope != scope_id
-                        && scope_id.starts_with(&format!("{parent_scope}/"))
-                },
-            );
-            if has_matching_parent {
-                continue;
-            }
-            for ancestor in crate::db::chisei_budget::scope_chain(scope_id) {
-                if ancestor == *scope_id
-                    || matching_usage_rows
-                        .iter()
-                        .any(|(_, matching_scope, _, _, _)| matching_scope == &ancestor)
-                {
-                    continue;
-                }
+            for (_, _, applied_scope, metric, period_start, amount_used) in
+                &matching_budget_attributions
+            {
                 tx.execute(
                     "UPDATE chisei_budget_usage
+                 SET amount_used=MAX(0, amount_used-?1)
+                 WHERE scope_id=?2 AND metric=?3 AND period_start=?4",
+                    params![amount_used, applied_scope, metric, period_start],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for (rowid, _, _, _, _, _) in &matching_budget_attributions {
+                result.budget_records_deleted +=
+                    tx.execute(
+                        "DELETE FROM chisei_budget_attributions WHERE rowid=?1",
+                        params![rowid],
+                    )
+                    .map_err(|e| e.to_string())? as i32;
+            }
+
+            let matching_usage_rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT rowid, scope_id, metric, period_start, amount_used
+                     FROM chisei_budget_usage",
+                    )
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|(_, scope_id, _, _, _)| {
+                    principal_matches_subject(scope_id, &request.subject_kind, &request.subject)
+                })
+                .collect::<Vec<_>>()
+            };
+            let legacy_usage_rows = matching_usage_rows
+                .iter()
+                .filter(|(_, _, _, _, amount_used)| *amount_used > 0)
+                .collect::<Vec<_>>();
+            for (_, scope_id, metric, period_start, amount_used) in &legacy_usage_rows {
+                let scoped_peer_total = legacy_usage_rows
+                    .iter()
+                    .filter(|(_, peer_scope, peer_metric, peer_period, _)| {
+                        peer_metric == metric
+                            && peer_period == period_start
+                            && peer_scope.contains('/')
+                            && crate::db::chisei_budget::scope_chain(peer_scope).contains(scope_id)
+                    })
+                    .map(|(_, _, _, _, peer_amount)| *peer_amount)
+                    .sum::<i64>();
+                let reconciled_amount = if scope_id.contains('/') {
+                    *amount_used
+                } else {
+                    (*amount_used - scoped_peer_total).max(0)
+                };
+                if reconciled_amount == 0 {
+                    continue;
+                }
+                let has_matching_parent = legacy_usage_rows.iter().any(
+                    |(_, parent_scope, parent_metric, parent_period, _)| {
+                        parent_metric == metric
+                            && parent_period == period_start
+                            && parent_scope != scope_id
+                            && scope_id.starts_with(&format!("{parent_scope}/"))
+                    },
+                );
+                if has_matching_parent {
+                    continue;
+                }
+                for ancestor in crate::db::chisei_budget::scope_chain(scope_id) {
+                    if ancestor == *scope_id
+                        || matching_usage_rows
+                            .iter()
+                            .any(|(_, matching_scope, _, _, _)| matching_scope == &ancestor)
+                    {
+                        continue;
+                    }
+                    tx.execute(
+                        "UPDATE chisei_budget_usage
                      SET amount_used=MAX(0, amount_used-?1)
                      WHERE scope_id=?2 AND metric=?3 AND period_start=(
                        SELECT MAX(period_start) FROM chisei_budget_usage
                        WHERE scope_id=?2 AND metric=?3 AND period_start<=?4
                      )",
-                    params![reconciled_amount, ancestor, metric, period_start],
-                )
-                .map_err(|e| e.to_string())?;
+                        params![reconciled_amount, ancestor, metric, period_start],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
             }
-        }
-        for (rowid, _, _, _, _) in matching_usage_rows {
-            result.budget_records_deleted += tx
-                .execute(
-                    "DELETE FROM chisei_budget_usage WHERE rowid=?1",
-                    params![rowid],
-                )
-                .map_err(|e| e.to_string())? as i32;
-        }
+            for (rowid, _, _, _, _) in matching_usage_rows {
+                result.budget_records_deleted +=
+                    tx.execute(
+                        "DELETE FROM chisei_budget_usage WHERE rowid=?1",
+                        params![rowid],
+                    )
+                    .map_err(|e| e.to_string())? as i32;
+            }
 
-        let matching_usage_events = {
-            let mut stmt = tx
-                .prepare("SELECT rowid,scope_id FROM chisei_budget_usage_events")
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|(rowid, scope_id)| {
-                principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
-                    .then_some(rowid)
-            })
-            .collect::<Vec<_>>()
-        };
-        for rowid in matching_usage_events {
-            result.budget_records_deleted += tx
-                .execute(
-                    "DELETE FROM chisei_budget_usage_events WHERE rowid=?1",
-                    params![rowid],
-                )
-                .map_err(|e| e.to_string())? as i32;
-        }
+            let matching_usage_events = {
+                let mut stmt = tx
+                    .prepare("SELECT rowid,scope_id FROM chisei_budget_usage_events")
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|(rowid, scope_id)| {
+                    principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
+                        .then_some(rowid)
+                })
+                .collect::<Vec<_>>()
+            };
+            for rowid in matching_usage_events {
+                result.budget_records_deleted +=
+                    tx.execute(
+                        "DELETE FROM chisei_budget_usage_events WHERE rowid=?1",
+                        params![rowid],
+                    )
+                    .map_err(|e| e.to_string())? as i32;
+            }
 
-        let matching_limit_rows = {
-            let mut stmt = tx
-                .prepare("SELECT rowid, scope_id FROM chisei_budget_limits")
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|(rowid, scope_id)| {
-                principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
-                    .then_some(rowid)
-            })
-            .collect::<Vec<_>>()
-        };
-        for rowid in matching_limit_rows {
-            result.budget_records_deleted += tx
-                .execute(
-                    "DELETE FROM chisei_budget_limits WHERE rowid=?1",
-                    params![rowid],
-                )
-                .map_err(|e| e.to_string())? as i32;
+            let matching_limit_rows = {
+                let mut stmt = tx
+                    .prepare("SELECT rowid, scope_id FROM chisei_budget_limits")
+                    .map_err(|e| e.to_string())?;
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter_map(|(rowid, scope_id)| {
+                    principal_matches_subject(&scope_id, &request.subject_kind, &request.subject)
+                        .then_some(rowid)
+                })
+                .collect::<Vec<_>>()
+            };
+            for rowid in matching_limit_rows {
+                result.budget_records_deleted +=
+                    tx.execute(
+                        "DELETE FROM chisei_budget_limits WHERE rowid=?1",
+                        params![rowid],
+                    )
+                    .map_err(|e| e.to_string())? as i32;
+            }
         }
 
         let work_unit_text = {
@@ -4229,6 +4247,24 @@ mod tests {
         let remaining = db.list_virtual_tables().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, "unrelated");
+    }
+
+    #[test]
+    fn sekai_only_store_erases_subject_without_chisei_budget_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sekai.db");
+        let store = crate::db::store::SekaiStore::open_sqlite(path.to_str().unwrap());
+        let result = store
+            .runtime()
+            .erase_subject(&SubjectErasureRequest {
+                subject_kind: "agent".into(),
+                subject: "erase-agent".into(),
+                requested_by: "admin".into(),
+                reason: "privacy request".into(),
+                timestamp: 2,
+            })
+            .unwrap();
+        assert_eq!(result.budget_records_deleted, 0);
     }
 
     #[test]

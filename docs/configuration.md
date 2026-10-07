@@ -88,6 +88,13 @@ decision 7); an existing single store moves with
 [store relocation](store-relocation.md), which still takes the old file or
 URL as an explicit `--source`.
 
+Each dest migrates only the tables its plane owns, plus the shared decision
+ledger and the per-store `chisei_operation_receipts` table. Combined Split
+writes plane-local admission receipts onto the Sekai dest. Existing
+foreign-plane tables stay. A dest that still holds the other plane's rows
+refuses startup as a missed relocation, unless a relocate writer fence is
+already raised. See [store relocation](store-relocation.md).
+
 The `sekai-plane` and `chisei-plane` binaries each open only their own store. See
 [two-plane processes](two-plane-processes.md). Combined mode still uses the
 typed dest-pair. The gateway is a translator and does not own a third store.

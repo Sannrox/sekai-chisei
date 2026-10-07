@@ -10,12 +10,15 @@ and still opens the typed two-store contract. The ontology CLI keeps the
 | Process | Store | Credentials | Public service |
 | --- | --- | --- | --- |
 | `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`; with none set, `<SEKAI_DATA_DIR>/sekai.db`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store only | `SekaiService` |
-| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | Chisei store only | `ChiseiService` |
+| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | no local catalog (Sekai-owned); UDS uses the local principal | `ChiseiService` |
 | `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store (combined) | both |
 
 A Sekai process refuses `CHISEI_DB_PATH` / `CHISEI_DATABASE_URL`. A Chisei
 process refuses `SEKAI_DB_PATH` / `SEKAI_DATABASE_URL`. Each physical store is
-stamped on first open; the other process cannot open that file or URL.
+stamped on first open; the other process cannot open that file or URL. Each
+process migrates only the tables its plane owns, plus the shared decision
+ledger and the per-store `chisei_operation_receipts` table. Combined Split
+writes plane-local admission receipts onto the Sekai dest.
 
 ## Wrong-plane RPCs
 

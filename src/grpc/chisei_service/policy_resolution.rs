@@ -34,7 +34,7 @@ impl ChiseiServiceImpl {
             r.namespace.trim()
         };
         require_team_namespace_actor_access(
-            self.db.runtime(),
+            self.db.fact_runtime(),
             self.sekai_facts.reader(),
             actor,
             requested_namespace,
@@ -52,6 +52,19 @@ impl ChiseiServiceImpl {
             )
         };
         let scopes = policy_scopes(&r);
+        // Combined Split loads policies from the in-process Sekai graph.
+        // Remote ListObjects is authorization-filtered, so it cannot supply a
+        // complete policy set, and boot RPC cached the hop channel on a
+        // throwaway runtime. Remote-only Chisei-plane stays failed-closed
+        // until a dedicated policy-port exists; an empty PolicyResolver would
+        // apply the unrestricted fallback.
+        if self.sekai_facts.reader().attached()
+            && self.sekai_facts.reader().in_process_store().is_err()
+        {
+            return Err(Status::failed_precondition(
+                "namespace policy resolution requires in-process Sekai graph storage",
+            ));
+        }
         let (policy_scope, effective_policy) = self
             .policy
             .effective_policy_for_scopes(&scopes)

@@ -219,14 +219,17 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         16,
         None,
     )?)?;
-    RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Sqlite,
-        Some(chisei),
-        chisei,
-        None,
-        16,
-        None,
-    )?)?;
+    RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Sqlite,
+            Some(chisei),
+            chisei,
+            None,
+            16,
+            None,
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+    )?;
 
     relocate_sqlite_online(source, sekai, chisei, || Ok(()))
 }
@@ -450,14 +453,17 @@ pub fn relocate_postgres(
         16,
         ca.as_deref(),
     )?)?;
-    RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-        BackendIdentity::Postgres,
-        None,
-        "unused.db",
-        Some(chisei),
-        16,
-        ca.as_deref(),
-    )?)?;
+    RuntimeBackend::initialize(
+        RuntimeBackendConfig::from_sources(
+            BackendIdentity::Postgres,
+            None,
+            "unused.db",
+            Some(chisei),
+            16,
+            ca.as_deref(),
+        )?
+        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+    )?;
 
     relocate_postgres_online(source, sekai, chisei, || Ok(()))
 }
@@ -472,7 +478,8 @@ fn relocate_postgres_online(
 ) -> Result<RelocateReport, String> {
     let _lock = lock_relocate_destination(chisei)?;
     let source_db = connect_postgres(source)?;
-    let chisei_db = connect_postgres(chisei)?;
+    let chisei_db =
+        connect_postgres_for_plane(chisei, crate::db::schema_plane::SchemaPlane::Chisei)?;
     let captured = install_postgres_change_capture(&source_db)?;
     let snapshot_dir = relocate_postgres_snapshot_dir(chisei);
     snapshot_postgres(&source_db, &snapshot_dir, None)?;
@@ -629,12 +636,19 @@ fn postgres_ca_cert_path() -> Option<String> {
 }
 
 fn connect_postgres(url: &str) -> Result<PostgresDb, String> {
+    connect_postgres_for_plane(url, crate::db::schema_plane::SchemaPlane::Shared)
+}
+
+fn connect_postgres_for_plane(
+    url: &str,
+    plane: crate::db::schema_plane::SchemaPlane,
+) -> Result<PostgresDb, String> {
     match postgres_ca_cert_path() {
         Some(path) => {
             let pem = std::fs::read(&path).map_err(|error| error.to_string())?;
-            PostgresDb::connect_with_ca_certificate(url, 4, &pem)
+            PostgresDb::connect_with_ca_certificate_for_plane(url, 4, &pem, plane)
         }
-        None => PostgresDb::connect(url, 4),
+        None => PostgresDb::connect_for_plane(url, 4, plane),
     }
 }
 
@@ -1956,8 +1970,17 @@ pub fn open_layout_or_fence(default_sqlite_path: &str) -> Result<CombinedStoreLa
 mod tests {
     use super::*;
     use crate::chisei::budget::{BudgetTracker, PeriodType};
+    use crate::db::sekai::SekaiDb;
     use crate::db::store::ChiseiStore;
     use crate::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
+    use std::sync::Arc;
+
+    /// Historical source writer: Shared schema, not the Chisei-only dest constructor.
+    fn shared_chisei(path: &str) -> ChiseiStore {
+        ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(path).expect("open shared sqlite"),
+        ))))
+    }
 
     #[test]
     fn relocate_copies_budget_family_and_fences_the_source() {
@@ -1979,7 +2002,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        BudgetTracker::new(shared_chisei(source_s))
             .set_limit("relocate-user", 9_000, PeriodType::Daily)
             .unwrap();
 
@@ -2043,7 +2066,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        BudgetTracker::new(shared_chisei(source_s))
             .set_limit("restart-user", 4_000, PeriodType::Daily)
             .unwrap();
         relocate_sqlite(source_s, source_s, chisei_s).unwrap();
@@ -2079,6 +2102,22 @@ mod tests {
         .unwrap();
     }
 
+    fn init_chisei(path: &str) {
+        RuntimeBackend::initialize(
+            RuntimeBackendConfig::from_sources(
+                BackendIdentity::Sqlite,
+                Some(path),
+                path,
+                None,
+                16,
+                None,
+            )
+            .unwrap()
+            .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+        )
+        .unwrap();
+    }
+
     fn budget_limit(path: &str, user: &str) -> i32 {
         BudgetTracker::new(ChiseiStore::open_sqlite(path))
             .get_usage(user)
@@ -2093,14 +2132,14 @@ mod tests {
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
         init_sqlite(source_s);
-        init_sqlite(chisei_s);
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        init_chisei(chisei_s);
+        BudgetTracker::new(shared_chisei(source_s))
             .set_limit("before-copy", 3_000, PeriodType::Daily)
             .unwrap();
 
         let report = relocate_sqlite_online(source_s, source_s, chisei_s, || {
             // A live writer lands after the snapshot the bulk copy read.
-            BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+            BudgetTracker::new(shared_chisei(source_s))
                 .set_limit("during-copy", 5_000, PeriodType::Daily)
                 .map_err(|error| error.to_string())?;
             assert_eq!(budget_limit(chisei_s, "before-copy"), 3_000);
@@ -2127,7 +2166,7 @@ mod tests {
         let chisei = dir.path().join("chisei.db");
         let source_s = source.to_str().unwrap();
         init_sqlite(source_s);
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        BudgetTracker::new(shared_chisei(source_s))
             .set_limit("quiet-user", 2_000, PeriodType::Daily)
             .unwrap();
         let report = relocate_sqlite(source_s, source_s, chisei.to_str().unwrap()).unwrap();
@@ -2145,7 +2184,7 @@ mod tests {
         relocate_sqlite(source_s, source_s, chisei_s).unwrap();
 
         // A Shared writer that was already running when the fence rose.
-        let err = BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        let err = BudgetTracker::new(shared_chisei(source_s))
             .set_limit("late-writer", 1_000, PeriodType::Daily)
             .unwrap_err()
             .to_string();
@@ -2168,7 +2207,7 @@ mod tests {
         let source_s = source.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
         init_sqlite(source_s);
-        init_sqlite(chisei_s);
+        init_chisei(chisei_s);
         let err = relocate_sqlite_online(source_s, source_s, chisei_s, || {
             Connection::open(source_s)
                 .unwrap()
@@ -2178,7 +2217,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("chisei_budget_added_mid_copy"), "{err}");
         assert!(!writer_fence_raised(source_s).unwrap());
-        BudgetTracker::new(ChiseiStore::open_sqlite(source_s))
+        BudgetTracker::new(shared_chisei(source_s))
             .set_limit("still-unfenced", 1_000, PeriodType::Daily)
             .unwrap();
     }
@@ -2466,26 +2505,21 @@ mod tests {
         let chisei = dir.path().join("chisei.db");
         let sekai_s = sekai.to_str().unwrap();
         let chisei_s = chisei.to_str().unwrap();
-        let layout = open_dest_pair(sekai_s, chisei_s);
-        BudgetTracker::new(ChiseiStore::from_shared_runtime(layout.sekai_runtime()))
+        init_sqlite(sekai_s);
+        BudgetTracker::new(shared_chisei(sekai_s))
             .set_limit("stranded", 99, PeriodType::Daily)
             .unwrap();
-        wipe_cutover(&layout);
-
-        assert_eq!(
-            split_generation_state(&layout).unwrap(),
-            SplitGenerationState::Unattested
-        );
-        let err = refuse_mutating_if_generation_mismatch(&layout).unwrap_err();
-        assert!(err.contains("relocate"), "{err}");
-        assert!(err.contains("Chisei families"), "{err}");
-        assert!(
-            restamp_split_generation(&layout)
-                .unwrap_err()
-                .contains("relocate"),
-            "restamp must fail closed while Chisei families remain in the Sekai dest"
-        );
-        drop(layout);
+        let err = CombinedStoreSources {
+            backend: Some(BackendIdentity::Sqlite),
+            default_sqlite_path: sekai_s.into(),
+            sekai_sqlite_path: Some(sekai_s.into()),
+            chisei_sqlite_path: Some(chisei_s.into()),
+            postgres_max_connections: 16,
+            ..CombinedStoreSources::default()
+        }
+        .open()
+        .unwrap_err();
+        assert!(err.contains("missed relocation"), "{err}");
 
         relocate(sekai_s, sekai_s, chisei_s).unwrap();
         assert_eq!(budget_limit(chisei_s, "stranded"), 99);

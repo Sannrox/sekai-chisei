@@ -355,6 +355,25 @@ impl PostgresDb {
         version: u32,
         review: HumanMemoryReview,
     ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, true)
+    }
+
+    pub(crate) fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, false)
+    }
+
+    fn review_kioku_candidate_inner(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+        authorize_graph: bool,
+    ) -> Result<KiokuMemory, String> {
         if review.reviewer.trim().is_empty() || review.rationale.trim().is_empty() {
             return Err("reviewer and rationale are required".into());
         }
@@ -385,7 +404,7 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        if review.action == HumanReviewAction::Promote {
+        if review.action == HumanReviewAction::Promote && authorize_graph {
             for basis in &memory.evidence_basis {
                 if basis.source_submission_id.is_empty() {
                     continue;

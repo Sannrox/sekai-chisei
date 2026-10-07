@@ -340,12 +340,25 @@ pub(super) async fn set_namespace_policy(
             ));
         }
         persist_namespace_policy(
-            service.db.runtime(),
+            service
+                .sekai_facts
+                .reader()
+                .in_process_store()
+                .map(crate::db::store::SekaiStore::runtime)
+                .unwrap_or_else(|_| service.db.fact_runtime()),
             &r.namespace,
             &policy,
             context_admission_policy.as_ref(),
         )
-        .map_err(Status::internal)?;
+        .map_err(|error| {
+            if error.contains("no such table") && error.contains("sekai_objects") {
+                Status::failed_precondition(
+                    "namespace policy persistence requires in-process Sekai graph storage",
+                )
+            } else {
+                Status::internal(error)
+            }
+        })?;
         let default_runtime = policy.default_runtime.clone();
         let default_model = policy.default_model.clone();
         service.policy.set_namespace_policy(&r.namespace, policy);
@@ -430,18 +443,20 @@ pub(super) async fn get_effective_policy_summary(
     };
 
     let project_action_scope = format!("project:{namespace}");
-    let action_policy = match service
-        .db
-        .runtime()
-        .get_action_policy(&project_action_scope)
-        .map_err(Status::internal)?
+    let action_policy = match get_action_policy_from_graph(
+        service.sekai_facts.reader(),
+        service.db.fact_runtime(),
+        &project_action_scope,
+    )
+    .map_err(Status::internal)?
     {
         some @ Some(_) => some,
-        None => service
-            .db
-            .runtime()
-            .get_action_policy(&namespace)
-            .map_err(Status::internal)?,
+        None => get_action_policy_from_graph(
+            service.sekai_facts.reader(),
+            service.db.fact_runtime(),
+            &namespace,
+        )
+        .map_err(Status::internal)?,
     };
     let actions = action_policy.map_or_else(
         || EffectiveActionPolicySummary {

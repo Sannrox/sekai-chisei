@@ -1,10 +1,10 @@
 //! Admission lifecycle for externally reported canonical receipt events.
 
 use super::*;
-use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore};
+use crate::db::store::{ChiseiKiokuStore, ChiseiReceiptStore, ChiseiStore};
 
 pub(super) fn record_reported_memory_outcomes(
-    db: &RuntimeDb,
+    db: &ChiseiStore,
     receipt: &OperationReceipt,
     actor: &str,
     now_ms: i64,
@@ -679,7 +679,7 @@ async fn report_operation_event(
                 )));
     if should_preflight_attribution {
         reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            service.db.runtime(),
+            &service.db,
             &prospective_receipt,
             &actor,
             now,
@@ -715,7 +715,7 @@ async fn report_operation_event(
                 )));
     if should_attribute
         && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-            service.db.runtime(),
+            &service.db,
             &receipt,
             &actor,
             now,

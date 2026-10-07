@@ -199,6 +199,26 @@ impl SekaiServiceImpl {
         }
     }
 
+    /// Registered so wrong-plane Sekai RPCs can return FAILED_PRECONDITION
+    /// without requiring Sekai tables on a Chisei-only dest.
+    pub fn wrong_plane_placeholder(db: crate::db::store::SekaiStore) -> Self {
+        let schema_definitions = SchemaDefinitionLifecycle::empty(db.runtime_arc());
+        Self {
+            db,
+            security: Arc::new(SecurityChecker::new()),
+            schema_definitions,
+            gateway_schema_principals: Vec::new(),
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            object_query_cursor_key: [0u8; 32],
+            object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind::from_env(
+            ),
+            object_index_dual_read:
+                crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
+            object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
+            cross_store: None,
+        }
+    }
+
     pub fn with_cross_store_admission(
         mut self,
         clerk: std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,

@@ -182,7 +182,7 @@ impl ChiseiServiceImpl {
             .to_string();
         let continuation_started = !r.work_unit.trim().is_empty()
             && active_continuation_allocation(
-                self.db.runtime(),
+                self.db.fact_runtime(),
                 r.work_unit.trim(),
                 &[
                     actor.as_str(),
@@ -426,7 +426,7 @@ impl ChiseiServiceImpl {
         input: GatewayPipelineInput<'_>,
     ) -> Result<GatewayPipelineDecision, Status> {
         let context_actor = execution_context_actor(
-            self.db.runtime(),
+            self.db.fact_runtime(),
             self.sekai_facts.reader(),
             &self.config,
             input.actor,

@@ -280,7 +280,7 @@ pub(super) async fn list_kioku_candidates(
     req: Request<ListKiokuCandidatesRequest>,
 ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
     require_team_namespace_access(
-        service.db.runtime(),
+        service.db.fact_runtime(),
         service.sekai_facts.reader(),
         &service.config,
         &req,
@@ -707,9 +707,8 @@ pub(super) async fn get_quality_trend(
     let request = req.into_inner();
     let namespace = canonical_namespace(&request.namespace)?.to_string();
     require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
-    let report = crate::quality_trend::query_quality_trends(
+    let report = crate::quality_trend::query_quality_trends_after_access_check(
         service.db.runtime(),
-        &actor,
         &namespace,
         request.since_ms,
         request.until_ms,
