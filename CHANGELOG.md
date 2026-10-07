@@ -12,6 +12,7 @@
 - Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
 - Chisei persistence goes through per-family store traits. `src/chisei` no longer calls `ChiseiStore::runtime()`, and that method is crate-private. `sekaictl admin quality` opens the dest pair (or `SEKAI_DATA_DIR`) so evaluate/restart can read dataset facts from Sekai (#1237).
 - Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
+- Governed transforms are a Sekai in-process class on both community backends: put a JobSpec, run a `projection`, inspect the run receipt. `sekaictl admin transform` and Console `/transforms` are the operator path. RPCs stay experimental (ADR 0097, #1287).
 
 ## 1.1.0
 

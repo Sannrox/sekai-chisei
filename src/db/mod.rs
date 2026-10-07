@@ -84,6 +84,7 @@ mod postgres_external_permit;
 mod postgres_function;
 mod postgres_governed_action_type;
 mod postgres_governed_subject_provenance;
+mod postgres_governed_transform;
 mod postgres_grants;
 mod postgres_guarded_mutation;
 mod postgres_handoff;

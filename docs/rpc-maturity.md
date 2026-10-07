@@ -40,7 +40,8 @@ They stay out of the default RPC surface.
 `DiscoverCapabilities` always reports `sekai.rpc.experimental` on the core
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
-experimental RPC.
+experimental RPC. The core pack also reports `sekai.transforms.projection`
+as the in-process transform host; its put/run/get RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.
@@ -99,9 +100,9 @@ there cannot be decided on that runtime.
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |

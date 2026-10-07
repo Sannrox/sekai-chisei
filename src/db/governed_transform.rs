@@ -1,6 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::governed_transform::{
-    GovernedTransform, TransformRun, apply_steps, evaluate_quality, rows_digest,
+    GovernedTransform, TransformRun, bind_checkpoint, compute_run, rows_digest,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
@@ -40,6 +40,7 @@ impl SekaiDb {
                 CREATE TABLE IF NOT EXISTS sekai_governed_transform_checkpoint (
                     namespace TEXT NOT NULL,
                     transform_id TEXT NOT NULL,
+                    definition_digest TEXT NOT NULL DEFAULT '',
                     last_input_row_id INTEGER NOT NULL,
                     live_run_id TEXT NOT NULL,
                     live_output_digest TEXT NOT NULL,
@@ -47,7 +48,13 @@ impl SekaiDb {
                 );
                 ",
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_governed_transform_checkpoint
+             ADD COLUMN definition_digest TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        Ok(())
     }
 
     pub fn put_governed_transform(
@@ -103,47 +110,24 @@ impl SekaiDb {
         let transform = self
             .get_governed_transform(namespace, transform_id)?
             .ok_or("governed transform not found")?;
-        let checkpoint = self.transform_checkpoint(namespace, transform_id)?;
-        let after_id = if incremental {
-            checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.0)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        self.get_dataset(&transform.input_dataset_id)?
+            .ok_or("dataset not found")?;
+        self.get_dataset(&transform.output_dataset_id)?
+            .ok_or("dataset not found")?;
+        let stored = self.transform_checkpoint(namespace, transform_id)?;
+        let (incremental, checkpoint) =
+            bind_checkpoint(incremental, stored, &transform.definition_digest);
         let records = self.list_dataset_row_records(&transform.input_dataset_id)?;
-        let selected: Vec<(i64, HashMap<String, String>)> = records
-            .into_iter()
-            .filter(|(id, _)| *id > after_id)
-            .collect();
-        let last_input_row_id = selected.iter().map(|(id, _)| *id).max().unwrap_or(after_id);
-        let input_rows: Vec<HashMap<String, String>> =
-            selected.iter().map(|(_, row)| row.clone()).collect();
-        let output_rows = apply_steps(&input_rows, &transform.steps);
-        if let Err(error) = evaluate_quality(&output_rows, &transform.quality_rule) {
-            let run = TransformRun {
-                run_id: Uuid::new_v4().to_string(),
-                namespace: namespace.into(),
-                transform_id: transform_id.into(),
-                definition_digest: transform.definition_digest,
-                input_digest: rows_digest(&input_rows),
-                output_digest: checkpoint
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.2.clone())
-                    .unwrap_or_default(),
-                last_input_row_id: after_id,
-                incremental,
-                quarantined: true,
-                quality_rule: error.message(),
-                rows_in: input_rows.len() as i32,
-                rows_out: 0,
-                lineage_parent: checkpoint
-                    .as_ref()
-                    .map(|checkpoint| checkpoint.1.clone())
-                    .unwrap_or_default(),
-                created_at_ms: now_ms,
-            };
+        let (mut run, output_rows) = compute_run(
+            &transform,
+            checkpoint.as_ref(),
+            &records,
+            incremental,
+            now_ms,
+            Uuid::new_v4().to_string(),
+        );
+        if run.quarantined {
+            run.output_digest = self.live_output_digest(&transform.output_dataset_id)?;
             self.insert_transform_run(&run)?;
             return Ok(run);
         }
@@ -156,35 +140,18 @@ impl SekaiDb {
         let live_rows = self.list_dataset_row_records(&transform.output_dataset_id)?;
         let live: Vec<HashMap<String, String>> =
             live_rows.into_iter().map(|(_, row)| row).collect();
-        let run = TransformRun {
-            run_id: Uuid::new_v4().to_string(),
-            namespace: namespace.into(),
-            transform_id: transform_id.into(),
-            definition_digest: transform.definition_digest.clone(),
-            input_digest: rows_digest(&input_rows),
-            output_digest: rows_digest(&live),
-            last_input_row_id,
-            incremental,
-            quarantined: false,
-            quality_rule: transform.quality_rule.clone(),
-            rows_in: input_rows.len() as i32,
-            rows_out: output_rows.len() as i32,
-            lineage_parent: checkpoint
-                .as_ref()
-                .map(|checkpoint| checkpoint.1.clone())
-                .unwrap_or_default(),
-            created_at_ms: now_ms,
-        };
+        run.output_digest = rows_digest(&live);
         self.insert_transform_run(&run)?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_governed_transform_checkpoint
-                 (namespace, transform_id, last_input_row_id, live_run_id, live_output_digest)
-                 VALUES (?1,?2,?3,?4,?5)",
+                 (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
                     namespace,
                     transform_id,
-                    last_input_row_id,
+                    transform.definition_digest,
+                    run.last_input_row_id,
                     run.run_id,
                     run.output_digest
                 ],
@@ -224,18 +191,86 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn list_governed_transforms(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<GovernedTransform>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT definition_json FROM sekai_governed_transform
+                 WHERE namespace = ?1 ORDER BY transform_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let json = row.map_err(|error| error.to_string())?;
+            serde_json::from_str(&json).map_err(|error| error.to_string())
+        })
+        .collect()
+    }
+
+    pub fn list_governed_transform_runs(
+        &self,
+        namespace: &str,
+        limit: i64,
+    ) -> Result<Vec<TransformRun>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, namespace, transform_id, definition_digest, input_digest, output_digest,
+                        last_input_row_id, incremental, quarantined, quality_rule, rows_in, rows_out,
+                        lineage_parent, created_at_ms
+                 FROM sekai_governed_transform_run
+                 WHERE namespace = ?1
+                 ORDER BY created_at_ms DESC, run_id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace, limit], |row| {
+                Ok(TransformRun {
+                    run_id: row.get(0)?,
+                    namespace: row.get(1)?,
+                    transform_id: row.get(2)?,
+                    definition_digest: row.get(3)?,
+                    input_digest: row.get(4)?,
+                    output_digest: row.get(5)?,
+                    last_input_row_id: row.get(6)?,
+                    incremental: row.get::<_, i64>(7)? != 0,
+                    quarantined: row.get::<_, i64>(8)? != 0,
+                    quality_rule: row.get(9)?,
+                    rows_in: row.get(10)?,
+                    rows_out: row.get(11)?,
+                    lineage_parent: row.get(12)?,
+                    created_at_ms: row.get(13)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string()))
+            .collect()
+    }
+
     fn transform_checkpoint(
         &self,
         namespace: &str,
         transform_id: &str,
-    ) -> Result<Option<(i64, String, String)>, String> {
+    ) -> Result<
+        Option<(
+            crate::sekai::governed_transform::TransformCheckpoint,
+            String,
+        )>,
+        String,
+    > {
         self.conn()
             .query_row(
-                "SELECT last_input_row_id, live_run_id, live_output_digest
+                "SELECT last_input_row_id, live_run_id, live_output_digest, definition_digest
                  FROM sekai_governed_transform_checkpoint
                  WHERE namespace = ?1 AND transform_id = ?2",
                 params![namespace, transform_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok(((row.get(0)?, row.get(1)?, row.get(2)?), row.get(3)?)),
             )
             .optional()
             .map_err(|error| error.to_string())
@@ -268,6 +303,15 @@ impl SekaiDb {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    fn live_output_digest(&self, dataset_id: &str) -> Result<String, String> {
+        let live: Vec<HashMap<String, String>> = self
+            .list_dataset_row_records(dataset_id)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        Ok(rows_digest(&live))
     }
 
     fn clear_dataset_rows(&self, dataset_id: &str) -> Result<(), String> {
@@ -362,6 +406,9 @@ mod tests {
         let second = db.run_governed_transform("ops", "t1", true, 30).unwrap();
         assert_eq!(second.rows_in, 1);
         assert_eq!(second.lineage_parent, first.run_id);
+        let listed = db.list_governed_transform_runs("ops", 10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].run_id, second.run_id);
         assert_ne!(second.output_digest, first.output_digest);
         assert_eq!(
             db.query_rows("out", &Default::default()).unwrap().len(),
@@ -464,5 +511,175 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(db.query_rows("d5", &Default::default()).unwrap().len(), 202);
+    }
+
+    #[test]
+    fn missing_output_dataset_fails_closed() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "missing".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert_eq!(error, "dataset not found");
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn missing_input_dataset_fails_closed() {
+        let db = db();
+        db.create_dataset(&dataset("out")).unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "missing".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let error = db
+            .run_governed_transform("ops", "t1", false, 20)
+            .unwrap_err();
+        assert_eq!(error, "dataset not found");
+        assert!(
+            db.list_governed_transform_runs("ops", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replaced_definition_rebuilds_instead_of_incremental() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.create_dataset(&dataset("out2")).unwrap();
+        db.append_rows(
+            "in",
+            &[
+                HashMap::from([("id".into(), "1".into()), ("keep".into(), "yes".into())]),
+                HashMap::from([("id".into(), "2".into()), ("keep".into(), "yes".into())]),
+            ],
+        )
+        .unwrap();
+        let first = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&first, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert_eq!(run.rows_in, 2);
+        let replaced = GovernedTransform {
+            output_dataset_id: "out2".into(),
+            definition_digest: String::new(),
+            ..first
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&replaced, 30).unwrap();
+        let rebuilt = db.run_governed_transform("ops", "t1", true, 40).unwrap();
+        assert!(!rebuilt.incremental);
+        assert_eq!(rebuilt.rows_in, 2);
+        assert_eq!(rebuilt.lineage_parent, run.run_id);
+        assert_eq!(db.query_rows("out2", &Default::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn quarantined_replacement_receipt_uses_the_current_output() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.create_dataset(&dataset("out2")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let first = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&first, 10).unwrap();
+        let run = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        let replaced = GovernedTransform {
+            output_dataset_id: "out2".into(),
+            quality_rule: "min_rows:1".into(),
+            definition_digest: String::new(),
+            steps: vec![TransformStep {
+                kind: "filter".into(),
+                column: "keep".into(),
+                op: "eq".into(),
+                value: "no".into(),
+                columns: Vec::new(),
+            }],
+            ..first
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&replaced, 30).unwrap();
+        let failed = db.run_governed_transform("ops", "t1", true, 40).unwrap();
+        assert!(failed.quarantined);
+        assert_eq!(failed.lineage_parent, run.run_id);
+        assert_eq!(failed.output_digest, rows_digest(&[]));
+        assert_ne!(failed.output_digest, run.output_digest);
+        assert_eq!(db.query_rows("out", &Default::default()).unwrap().len(), 1);
+        assert!(
+            db.query_rows("out2", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -56,6 +56,16 @@ lock; the CAS predicates remain the commit rule. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test. See
 [ADR 0064](decisions/0064-event-stream-postgres-parity.md).
 
+The reusable `sekai.governed-transform/v1` class shares JobSpec, checkpoint,
+and run-receipt persistence across SQLite and PostgreSQL. Execution is the
+in-process `projection` host
+([ADR 0097](decisions/0097-in-process-transform-host.md),
+[governed-transforms.md](governed-transforms.md)). Normal CI runs SQLite;
+PostgreSQL conformance remains an ignored isolated-database test behind
+`SEKAI_TEST_POSTGRES_URL`. Dataset row `append_rows` / `query_rows` through
+the community `RuntimeDb` dispatcher stay SQLite-only; the transform path
+uses each backend's native dataset-row APIs.
+
 The product loop (ontology apply, seed, object reads, object-set evaluate,
 governed Action submit and read, operation receipt, and object-security
 activation with a denied read) runs on community PostgreSQL with SQLite
@@ -142,6 +152,7 @@ Evidence is checked in as:
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 | #666 | Governed definition branch and immutable revision foundation |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
+| #1287 | In-process governed transform JobSpec, checkpoint, and run receipt |
 
 ## Still outside this parent
 

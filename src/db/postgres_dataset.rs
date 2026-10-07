@@ -71,6 +71,7 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_dataset_rows(&mut transaction, dataset_id)?;
         if transaction
             .query_opt("SELECT 1 FROM sekai_datasets WHERE id=$1", &[&dataset_id])
             .map_err(|error| error.to_string())?

@@ -50,6 +50,8 @@ If you want to deploy or operate the control plane:
 
 - [Object and Action integration contract](integration-contract.md) —
   supported object reads, Action invocation, and receipt inspection.
+- [Governed transforms](governed-transforms.md) — in-process dataset JobSpec,
+  run receipt, Console, and `sekaictl admin transform`.
 - [Public RPC maturity](rpc-maturity.md) — stable, experimental, and
   remove-classified RPCs, and the default-off experimental gate.
 - [Architecture](architecture.md) — ownership, trust boundaries, data model,

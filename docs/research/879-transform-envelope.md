@@ -4,10 +4,11 @@ Issue: [#879](https://github.com/Sannrox/sekai-chisei/issues/879)
 Follow-up: [#880](https://github.com/Sannrox/sekai-chisei/issues/880)
 Date: 2026-09-15
 Status: **envelope published**
-Decision: [ADR 0074](../decisions/0074-plane-owned-transforms.md)
+Decision: [ADR 0074](../decisions/0074-plane-owned-transforms.md),
+[ADR 0097](../decisions/0097-in-process-transform-host.md)
 
 In-process `projection` over dataset rows. Not an engine, table format, or
-cluster pick. SQLite is the community measurement vehicle.
+cluster pick. Both community backends persist the class.
 
 ## Fixture
 
