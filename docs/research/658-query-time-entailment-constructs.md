@@ -141,7 +141,7 @@ documents cited above:
 ```bash
 cargo test --locked --lib sekai::retrieval
 cargo test --locked --lib sekai::ontology
-cargo test --locked --test epistemic_interop_conformance
+cargo test --locked --test it epistemic_interop_conformance
 ```
 
 This page records the research outcome. It does not change runtime behavior.

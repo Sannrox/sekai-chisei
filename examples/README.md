@@ -186,5 +186,5 @@ plane. The live `sekai-mcp` binary uses the same framing over stdio.
 
 ```bash
 cargo run --locked --example mcp_adapter
-cargo test --locked --test mcp_adapter
+cargo test --locked --test it mcp_adapter
 ```

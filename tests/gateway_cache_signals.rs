@@ -2,8 +2,8 @@
 //!
 //! The Prometheus recorder is process-global, so a sibling test emitting
 //! `sekai_cache_events_total` directly would satisfy these assertions with the
-//! production instrumentation deleted. Each `tests/*.rs` runs in its own
-//! process, so nothing here emits a cache event except the code under test.
+//! production instrumentation deleted. This file stays its own `[[test]]`
+//! binary so nothing here emits a cache event except the code under test.
 
 use sekai_chisei::obs::signals;
 

@@ -16,7 +16,7 @@ cargo test-all
 
 Aliases in `.cargo/config.toml`: `fmt-check` is `fmt --all -- --check`; `clippy-all` is `clippy --workspace --all-targets --locked -- -D warnings`; `test-all` is `test --workspace --locked`. Plain `cargo check` / `cargo test` stay the short developer loop.
 
-`SEKAI_INSECURE=1 cargo run` reads process environment only and does not load `.env` (`sekaictl launch` does). With no store variable it opens split `sekai.db`/`chisei.db` under `SEKAI_DATA_DIR` (default `./data`); dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` overrides. It binds `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default. Do not combine insecure mode with a non-loopback bind; the server does not reject that combination. `cargo test --test ollama_e2e -- --ignored` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
+`SEKAI_INSECURE=1 cargo run` reads process environment only and does not load `.env` (`sekaictl launch` does). With no store variable it opens split `sekai.db`/`chisei.db` under `SEKAI_DATA_DIR` (default `./data`); dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` overrides. It binds `127.0.0.1:50051` unless `SEKAI_BIND` explicitly overrides the loopback default. Do not combine insecure mode with a non-loopback bind; the server does not reject that combination. `cargo test --test it -- --ignored ollama_e2e` runs the ignored Ollama end-to-end test when a local compatible endpoint is available.
 
 Linux images: `./build/release-images.sh`. Push: `./build/release.sh` with
 `DOCKER_REGISTRY` set. Proto copies: `./scripts/update-proto.sh`.

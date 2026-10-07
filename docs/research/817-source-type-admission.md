@@ -77,6 +77,6 @@ ADR 0060 records the accepted answers:
 
 ```bash
 cargo test --locked source_type_descriptor --offline
-cargo test --locked --test source_type_descriptor_research --offline
-cargo test --locked --test source_type_descriptor_catalog --offline
+cargo test --locked --test it --offline source_type_descriptor_research
+cargo test --locked --test it --offline source_type_descriptor_catalog
 ```
