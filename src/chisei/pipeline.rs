@@ -14,6 +14,10 @@ use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAI
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
+/// Successful object-type lookups only. A hop `Err` is not stored, so a later
+/// implement/evaluable check can retry.
+type ObjectTypeCache = HashMap<String, Option<ObjectType>>;
+
 #[derive(Debug, Clone)]
 pub struct PipelineRequest {
     pub request_id: String,
@@ -588,22 +592,23 @@ pub fn applicable_evidence_classes(
 
 fn cached_object_type<'a>(
     facts: &dyn SekaiFactReader,
-    type_cache: &'a mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    type_cache: &'a mut ObjectTypeCache,
     kind: &str,
-) -> &'a Result<Option<ObjectType>, SekaiFactError> {
-    type_cache
-        .entry(kind.to_string())
-        .or_insert_with(|| facts.get_object_type(kind))
+) -> Result<&'a Option<ObjectType>, SekaiFactError> {
+    if !type_cache.contains_key(kind) {
+        let value = facts.get_object_type(kind)?;
+        type_cache.insert(kind.to_string(), value);
+    }
+    Ok(&type_cache[kind])
 }
 
 fn object_implements(
     facts: &dyn SekaiFactReader,
-    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    type_cache: &mut ObjectTypeCache,
     obj: &Object,
     interface_name: &str,
 ) -> bool {
     cached_object_type(facts, type_cache, &obj.kind)
-        .as_ref()
         .ok()
         .and_then(|object_type| object_type.as_ref())
         .is_some_and(|object_type| {
@@ -616,17 +621,27 @@ fn object_implements(
 
 fn is_evaluable_context(
     facts: &dyn SekaiFactReader,
-    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    type_cache: &mut ObjectTypeCache,
     obj: &Object,
 ) -> bool {
-    obj.kind == KIND_COMPONENT
-        || object_implements(facts, type_cache, obj, INTERFACE_EVALUABLE)
-        || object_implements(facts, type_cache, obj, INTERFACE_RISK_SCORED)
+    if obj.kind == KIND_COMPONENT {
+        return true;
+    }
+    // One hop answers both interfaces. A sequential Evaluable then RiskScored
+    // probe would spend a recovered lookup on the wrong interface.
+    cached_object_type(facts, type_cache, &obj.kind)
+        .ok()
+        .and_then(|object_type| object_type.as_ref())
+        .is_some_and(|object_type| {
+            object_type.implements.iter().any(|implemented| {
+                implemented == INTERFACE_EVALUABLE || implemented == INTERFACE_RISK_SCORED
+            })
+        })
 }
 
 fn is_degraded_evaluable(
     facts: &dyn SekaiFactReader,
-    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    type_cache: &mut ObjectTypeCache,
     obj: &Object,
     max_success_rate: i32,
 ) -> bool {
@@ -654,7 +669,7 @@ fn risk_score_value(obj: &Object) -> Option<f64> {
 
 fn filter_context_property(
     facts: &dyn SekaiFactReader,
-    type_cache: &mut HashMap<String, Result<Option<ObjectType>, SekaiFactError>>,
+    type_cache: &mut ObjectTypeCache,
     obj: &Object,
     field: &str,
     record: &mut egress::ContextEgressRecord,

@@ -1891,6 +1891,7 @@ fn test_review_policy_extracted() {
 struct CountingTypes {
     object_type: ObjectType,
     calls: std::sync::atomic::AtomicUsize,
+    fail_first: bool,
 }
 
 impl SekaiFactReader for CountingTypes {
@@ -1916,7 +1917,10 @@ impl SekaiFactReader for CountingTypes {
     }
 
     fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, SekaiFactError> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_first && call == 0 {
+            return Err(SekaiFactError::Read("transient hop".into()));
+        }
         if kind == self.object_type.kind {
             Ok(Some(self.object_type.clone()))
         } else {
@@ -1957,6 +1961,7 @@ fn object_implements_reuses_a_warm_type_cache() {
             implements: vec![INTERFACE_EVALUABLE.into()],
         },
         calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_first: false,
     };
     let obj = Object {
         id: "g1".into(),
@@ -1992,4 +1997,57 @@ fn object_implements_reuses_a_warm_type_cache() {
         INTERFACE_EVALUABLE
     ));
     assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+fn evaluable_only_gadget() -> (CountingTypes, Object) {
+    let facts = CountingTypes {
+        object_type: ObjectType {
+            kind: "gadget".into(),
+            description: String::new(),
+            properties: vec![],
+            is_builtin: false,
+            implements: vec![INTERFACE_EVALUABLE.into()],
+        },
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_first: true,
+    };
+    let obj = Object {
+        id: "g1".into(),
+        kind: "gadget".into(),
+        name: "g1".into(),
+        namespace: "ns".into(),
+        external_id: "gadget:g1".into(),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    };
+    (facts, obj)
+}
+
+#[test]
+fn object_implements_retries_after_a_transient_type_lookup_err() {
+    let (facts, obj) = evaluable_only_gadget();
+    let mut type_cache = HashMap::new();
+    assert!(!object_implements(
+        &facts,
+        &mut type_cache,
+        &obj,
+        INTERFACE_EVALUABLE
+    ));
+    assert!(object_implements(
+        &facts,
+        &mut type_cache,
+        &obj,
+        INTERFACE_EVALUABLE
+    ));
+    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[test]
+fn is_evaluable_context_retries_evaluable_only_after_a_transient_type_lookup_err() {
+    let (facts, obj) = evaluable_only_gadget();
+    let mut type_cache = HashMap::new();
+    assert!(!is_evaluable_context(&facts, &mut type_cache, &obj));
+    assert!(is_evaluable_context(&facts, &mut type_cache, &obj));
+    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
