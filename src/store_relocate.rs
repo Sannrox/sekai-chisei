@@ -3062,7 +3062,7 @@ mod tests {
     }
 
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL and SEKAI_TEST_POSTGRES_CHISEI_URL, two \
-                isolated TLS PostgreSQL databases simulating a Split pair"]
+                isolated TLS PostgreSQL databases whose public schema this test resets"]
     #[test]
     fn postgres_pairing_epoch_advance_is_never_one_sided_on_a_fresh_pair() {
         // #1104: advance_pairing_epoch writes both stores sequentially with
@@ -3095,20 +3095,23 @@ mod tests {
                 PostgresDb::connect(connection_url, 4).unwrap()
             }
         };
-        // Reset both sides to a truly greenfield state before opening the
-        // layout: no table on the sekai side, an existing table without a row
-        // on the chisei side, matching the scenario under test.
-        connect(&url)
-            .connection()
-            .unwrap()
-            .batch_execute("DROP TABLE IF EXISTS sekai_store_cutover;")
-            .unwrap();
-        connect(&chisei_url)
+        // Combined Split dests migrate only their owned families. Earlier
+        // ignored tests share these URLs as Shared databases, so leftover
+        // Chisei rows on the sekai dest look like a missed relocation.
+        let (sekai_reset, chisei_reset) = (connect(&url), connect(&chisei_url));
+        for db in [&sekai_reset, &chisei_reset] {
+            db.connection()
+                .unwrap()
+                .batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
+                .unwrap();
+        }
+        // Greenfield cutover: no table on the sekai dest, an existing table
+        // without a row on the chisei dest, matching the scenario under test.
+        chisei_reset
             .connection()
             .unwrap()
             .batch_execute(
-                "DROP TABLE IF EXISTS sekai_store_cutover;
-                 CREATE TABLE sekai_store_cutover (
+                "CREATE TABLE sekai_store_cutover (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     generation BIGINT NOT NULL,
                     fence_raised INTEGER NOT NULL,
@@ -3117,6 +3120,7 @@ mod tests {
                  );",
             )
             .unwrap();
+        drop((sekai_reset, chisei_reset));
 
         let layout = CombinedStoreSources {
             backend: Some(BackendIdentity::Postgres),

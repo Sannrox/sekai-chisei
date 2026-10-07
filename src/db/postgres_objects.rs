@@ -324,6 +324,12 @@ impl PostgresDb {
             .map(|result| result.0)
     }
 
+    pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        let mut effective_filter = filter.clone();
+        effective_filter.limit = i32::MAX;
+        self.list_objects(&effective_filter)
+    }
+
     pub fn list_objects_with_total_for_principals(
         &self,
         filter: &ListFilter,
