@@ -9,8 +9,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::obs::console::principal_can_access_namespace;
 use crate::sekai::audit::{Decision, DecisionFilter};
+use crate::sekai::namespace_access::{is_safe_namespace, principal_can_access_namespace};
 use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION, SourceBatchStatus,
     SourceBinding, SourceCheckpoint, SourceSyncGenerationStatus, SourceSyncState,
@@ -81,7 +81,7 @@ pub fn parse_source_health_query(
     required("namespace", namespace)?;
     required("source instance", source_instance)?;
     required("type digest", type_digest)?;
-    if !crate::obs::console::is_safe_namespace(namespace) {
+    if !is_safe_namespace(namespace) {
         return Err("source_health_invalid: namespace is invalid".into());
     }
     if identity_looks_secret(source_instance) || identity_looks_secret(type_digest) {

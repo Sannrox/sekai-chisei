@@ -1232,7 +1232,7 @@ mod tests {
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
     fn postgres_evaluate_object_set_matches_sqlite() {
-        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let scratch = crate::db::ScratchDatabase::create();
         // The last pool handle drops outside the runtime: closing a
         // synchronous client from an async worker panics.
         let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));

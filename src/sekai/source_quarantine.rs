@@ -10,9 +10,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::obs::console::principal_can_access_namespace;
-use crate::obs::console_pressure::principal_can_write_namespace;
 use crate::sekai::audit::{Decision, DecisionFilter};
+use crate::sekai::namespace_access::{
+    is_safe_namespace, principal_can_access_namespace, principal_can_write_namespace,
+};
 use crate::sekai::object_sync::{
     OperationOutcome, SourceBatch, SourceBatchResult, SourceBatchStatus, SourceRecordResult,
     SourceSyncState, SyncDecision, contains_secret_like_text,
@@ -114,7 +115,7 @@ pub fn parse_source_quarantine_query(
     required("namespace", namespace)?;
     required("source_instance", source_instance)?;
     required("type_digest", type_digest)?;
-    if !crate::obs::console::is_safe_namespace(namespace) {
+    if !is_safe_namespace(namespace) {
         return Err("source_quarantine_invalid: namespace is invalid".into());
     }
     if identity_looks_secret(namespace)

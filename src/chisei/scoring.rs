@@ -115,8 +115,8 @@ pub struct KnowledgeWriteRequest {
 }
 
 /// Terminal outcomes from the governed knowledge-write boundary. A policy denial is terminal for
-/// the observation because [`crate::grpc::sekai_service::SekaiServiceImpl`] audits the denial; it
-/// must not turn a deliberate governance decision into an infrastructure retry loop.
+/// the observation because the Sekai service audits the denial; it must not turn a deliberate
+/// governance decision into an infrastructure retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnowledgeWriteOutcome {
     Accepted,

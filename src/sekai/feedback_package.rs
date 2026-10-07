@@ -541,7 +541,6 @@ mod tests {
                 .iter()
                 .any(|record| record.subject == "Hypothesis" && !record.source.is_empty())
         );
-        crate::ontology_product_cli::parse_domain_document(DOMAIN_JSON).unwrap();
     }
 
     #[test]

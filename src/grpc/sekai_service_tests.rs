@@ -3526,7 +3526,7 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
         .with_sqlite_conn(|connection| {
             connection.execute(
                 "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
-                rusqlite::params!["corrupt-dataset", "not-json"],
+                ["corrupt-dataset", "not-json"],
             )
         })
         .unwrap()
@@ -8056,7 +8056,7 @@ async fn coordination_filters_paginates_and_dry_run_reconciles() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-f1"],
+            ["wu-f1"],
         )
         .unwrap();
 
@@ -8384,7 +8384,7 @@ async fn reconcile_requires_scope_ownership_for_target_scope() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-other"],
+            ["wu-other"],
         )
         .unwrap();
 
@@ -8500,7 +8500,7 @@ async fn reconcile_with_mismatched_scope_and_work_unit_returns_empty() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-mismatch"],
+            ["wu-mismatch"],
         )
         .unwrap();
 
@@ -10150,7 +10150,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
 fn postgres_semantic_discovery_is_honest_about_entailment() {
-    let scratch = crate::db::postgres::ScratchDatabase::create();
+    let scratch = crate::db::ScratchDatabase::create();
     let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -11300,8 +11300,14 @@ async fn agent_definition_member_read_crosses_server_transport() {
         definition_branch_domain::prepare_revision("foreign", "", Vec::new(), false, "author", 4)
             .unwrap(),
     ] {
-        sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
-            rusqlite::params![serde_json::to_string(&substituted).unwrap(), revision]).unwrap();
+        let body = serde_json::to_string(&substituted).unwrap();
+        sqlite
+            .conn()
+            .execute(
+                "UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+                [body.as_str(), revision.as_str()],
+            )
+            .unwrap();
         let corrupt = client
             .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
             .await
@@ -11309,8 +11315,13 @@ async fn agent_definition_member_read_crosses_server_transport() {
         assert_eq!(corrupt.code(), tonic::Code::Internal);
         assert_eq!(corrupt.message(), "definition member unavailable");
     }
-    sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
-        rusqlite::params![original_body, revision]).unwrap();
+    sqlite
+        .conn()
+        .execute(
+            "UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+            [original_body.as_str(), revision.as_str()],
+        )
+        .unwrap();
     sqlite
         .conn()
         .execute(

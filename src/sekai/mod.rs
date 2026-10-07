@@ -61,6 +61,7 @@ pub mod ledger;
 pub mod lineage;
 pub mod markings;
 pub mod model_platform;
+pub mod namespace_access;
 pub mod namespace_snapshot;
 pub mod object_change_subscription;
 pub mod object_index_engine;

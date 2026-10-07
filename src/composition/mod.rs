@@ -8,5 +8,4 @@
 pub mod capability;
 pub mod cross_store_admission;
 pub mod lookup_first;
-pub mod remote_sekai;
 pub mod sekai_facts;

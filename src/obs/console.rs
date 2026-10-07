@@ -29,8 +29,6 @@ pub const SESSION_COOKIE: &str = "sekai_console_sid";
 /// Default session lifetime (8 hours). Process-local; not shared across replicas.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 
-const MAX_NAMESPACE_LEN: usize = 128;
-
 #[derive(Clone)]
 pub struct ConsoleState {
     pub db: Arc<RuntimeDb>,
@@ -229,34 +227,16 @@ fn resolve_session(state: &ConsoleState, headers: &HeaderMap) -> Option<ConsoleS
 
 /// Namespace identifiers allowed in console URLs (fail closed on anything else).
 pub fn is_safe_namespace(namespace: &str) -> bool {
-    if namespace.is_empty() || namespace.len() > MAX_NAMESPACE_LEN {
-        return false;
-    }
-    namespace
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    crate::sekai::namespace_access::is_safe_namespace(namespace)
 }
 
 /// Whether the authenticated principal may open the given namespace context.
-///
-/// Bootstrap principals (`root`, `local`) may select any canonical namespace so
-/// local-first operators can navigate without pre-seeded memberships.
-/// Other principals require an explicit namespace grant/membership.
 pub fn principal_can_access_namespace(
     db: &RuntimeDb,
     principal: &str,
     namespace: &str,
 ) -> Result<bool, String> {
-    if !is_safe_namespace(namespace) {
-        return Ok(false);
-    }
-    if matches!(principal, "root" | "local") {
-        return Ok(true);
-    }
-    let memberships = db.list_namespace_roles_for_principal(principal)?;
-    Ok(memberships
-        .iter()
-        .any(|(member_namespace, _role)| member_namespace == namespace))
+    crate::sekai::namespace_access::principal_can_access_namespace(db, principal, namespace)
 }
 
 pub fn list_accessible_namespaces(

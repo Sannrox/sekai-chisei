@@ -8,6 +8,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::db::store::ChiseiStore;
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::operation_statistics::{self, OperationStatistics};
+#[cfg(test)]
 use crate::sekai::security::Role;
 use serde::Serialize;
 
@@ -110,16 +111,7 @@ pub fn principal_can_write_namespace(
     principal: &str,
     namespace: &str,
 ) -> Result<bool, String> {
-    if !is_safe_namespace(namespace) {
-        return Ok(false);
-    }
-    if matches!(principal, "root" | "local") {
-        return Ok(true);
-    }
-    let memberships = db.list_namespace_roles_for_principal(principal)?;
-    Ok(memberships
-        .iter()
-        .any(|(ns, role)| ns == namespace && matches!(role, Role::Editor | Role::Admin)))
+    crate::sekai::namespace_access::principal_can_write_namespace(db, principal, namespace)
 }
 
 pub fn load_pressure_snapshot(
