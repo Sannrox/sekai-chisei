@@ -1803,4 +1803,31 @@ mod tests {
         super::lock_existing_evaluation_resolution_tables(&mut transaction).unwrap();
         transaction.commit().unwrap();
     }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_list_all_objects_returns_matching_kind() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        let object = |id: &str, kind: &str| crate::domain::Object {
+            id: id.into(),
+            kind: kind.into(),
+            name: id.into(),
+            namespace: "demo".into(),
+            external_id: format!("{kind}:{id}"),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        db.create_object(&object("policy-a", "policy")).unwrap();
+        db.create_object(&object("policy-b", "policy")).unwrap();
+        db.create_object(&object("widget", "widget")).unwrap();
+        let objects = db
+            .list_all_objects(&crate::domain::ListFilter {
+                kind: Some("policy".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(objects.len(), 2);
+    }
 }

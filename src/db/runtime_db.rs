@@ -4189,9 +4189,7 @@ impl RuntimeDb {
     pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_objects(filter),
-            Self::Postgres(_) => {
-                Err("list_all_objects is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_all_objects(filter)),
         }
     }
 
