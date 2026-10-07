@@ -95,10 +95,10 @@ must not introduce a write path merely to make projections easier to consume.
 
 The decision is supported by the existing deterministic suites:
 
-- `cargo test --locked --test epistemic_metadata_conformance`
+- `cargo test --locked --test it epistemic_metadata_conformance`
 - `cargo test --locked --test epistemic_replication_example`
-- `cargo test --locked --test epistemic_federation_conformance`
-- `cargo test --locked --test epistemic_interop_conformance`
+- `cargo test --locked --test it epistemic_federation_conformance`
+- `cargo test --locked --test it epistemic_interop_conformance`
 - the SQLite/PostgreSQL Kioku and evaluation backend conformance fixtures
 
 The portable ontology already defines `ChiseiEpistemicDescriptor` as a

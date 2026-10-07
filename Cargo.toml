@@ -10,6 +10,7 @@ homepage = "https://github.com/Sannrox/sekai-chisei"
 documentation = "https://github.com/Sannrox/sekai-chisei/tree/main/docs"
 keywords = ["agents", "governance", "llm", "grpc", "local-first"]
 categories = ["development-tools", "web-programming"]
+autotests = false
 
 [workspace]
 members = [
@@ -119,3 +120,91 @@ path = "src/bin/sekai_mcp.rs"
 [[bench]]
 name = "control_plane"
 harness = false
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[[test]]
+name = "autonomous_envelope_adapters"
+path = "tests/autonomous_envelope_adapters.rs"
+
+[[test]]
+name = "batch_harness_conformance"
+path = "tests/batch_harness_conformance.rs"
+
+[[test]]
+name = "chisei_runtime_db_ratchet"
+path = "tests/chisei_runtime_db_ratchet.rs"
+
+[[test]]
+name = "emit_git_version"
+path = "tests/emit_git_version.rs"
+
+[[test]]
+name = "epistemic_replication_example"
+path = "tests/epistemic_replication_example.rs"
+
+[[test]]
+name = "evidence_adapters"
+path = "tests/evidence_adapters.rs"
+
+[[test]]
+name = "gateway_cache_signals"
+path = "tests/gateway_cache_signals.rs"
+
+[[test]]
+name = "lakehouse_snapshot_adapters"
+path = "tests/lakehouse_snapshot_adapters.rs"
+
+[[test]]
+name = "model_platform_adapters"
+path = "tests/model_platform_adapters.rs"
+
+[[test]]
+name = "object_sync_adapters"
+path = "tests/object_sync_adapters.rs"
+
+[[test]]
+name = "sekai_chisei_import_ratchet"
+path = "tests/sekai_chisei_import_ratchet.rs"
+
+[[test]]
+name = "source_writeback_example"
+path = "tests/source_writeback_example.rs"
+
+[[test]]
+name = "warehouse_projection_adapters"
+path = "tests/warehouse_projection_adapters.rs"
+
+[[test]]
+name = "warehouse_table_ingest"
+path = "tests/warehouse_table_ingest.rs"
+
+[[test]]
+name = "warehouse_table_writeback"
+path = "tests/warehouse_table_writeback.rs"
+
+[[test]]
+name = "workflow_action_adapters"
+path = "tests/workflow_action_adapters.rs"
+
+[[test]]
+name = "auth_signals"
+path = "tests/auth_signals.rs"
+
+[[test]]
+name = "db_signals"
+path = "tests/db_signals.rs"
+
+[[test]]
+name = "dedup_signals"
+path = "tests/dedup_signals.rs"
+
+[[test]]
+name = "resilience_load"
+path = "tests/resilience_load.rs"
+
+[[test]]
+name = "observability"
+path = "tests/observability.rs"

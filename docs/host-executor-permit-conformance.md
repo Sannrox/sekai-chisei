@@ -16,7 +16,7 @@ require network access.
 ## Run
 
 ```bash
-cargo test --test host_executor_permit_conformance
+cargo test --test it host_executor_permit_conformance
 ```
 
 CI already runs the full `cargo test` matrix; this binary has no ignored

@@ -18,9 +18,7 @@ use sekai_chisei::sekai::purpose_authorization::{
 };
 use sekai_chisei::sekai::query::{self, GraphQuery};
 
-#[path = "support/postgres_scratch.rs"]
-mod postgres_scratch;
-use postgres_scratch::ScratchDatabase;
+use crate::postgres_scratch::ScratchDatabase;
 
 fn policy(
     namespace: &str,

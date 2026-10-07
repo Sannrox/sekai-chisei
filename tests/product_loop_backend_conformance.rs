@@ -31,9 +31,7 @@ use sekai_chisei::grpc::pb::sekai::{
 };
 use tonic::{Code, Request};
 
-#[path = "support/postgres_scratch.rs"]
-mod postgres_scratch;
-use postgres_scratch::ScratchDatabase;
+use crate::postgres_scratch::ScratchDatabase;
 
 const WAIT_BUDGET: Duration = Duration::from_secs(30);
 

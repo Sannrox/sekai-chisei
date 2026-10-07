@@ -323,7 +323,7 @@ and SQLite backend conformance:
 
 ```sh
 cargo test --test object_sync_adapters
-cargo test --test object_sync_backend_conformance
+cargo test --test it object_sync_backend_conformance
 ```
 
 The versioned lifecycle fixture covers initial projection, refresh, explicit
@@ -347,7 +347,7 @@ conformance and concurrency tests require an isolated TLS database through
 
 ```sh
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test object_sync_backend_conformance -- --ignored
+  cargo test --test it object_sync_backend_conformance -- --ignored
 ```
 
 A partial unique graph index on `(namespace, external_id)` for `github:*`

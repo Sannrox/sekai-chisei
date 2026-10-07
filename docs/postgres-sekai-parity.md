@@ -176,13 +176,13 @@ database:
 
 ```sh
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test object_sync_backend_conformance -- --ignored
+  cargo test --test it object_sync_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test definition_branch_backend_conformance -- --ignored
+  cargo test --test it definition_branch_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test object_security_backend_conformance -- --ignored
+  cargo test --test it object_security_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test postgres_workflow_transition_matrix -- --ignored --nocapture
