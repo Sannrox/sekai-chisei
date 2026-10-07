@@ -98,6 +98,8 @@ const STORE_CUTOVER_PAIRING_SCHEMA: &str = include_str!("postgres/0048_store_cut
 const CHISEI_ROUTING_PROFILES_SCHEMA: &str =
     include_str!("postgres/0049_chisei_routing_profiles.sql");
 const GOVERNED_TRANSFORMS_SCHEMA: &str = include_str!("postgres/0050_governed_transforms.sql");
+const OBSERVATION_EXTERNAL_ID_SCHEMA: &str =
+    include_str!("postgres/0051_observation_external_id.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -430,6 +432,12 @@ const MIGRATIONS: &[Migration] = &[
         49,
         "governed_transforms",
         GOVERNED_TRANSFORMS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        50,
+        "observation_external_id",
+        OBSERVATION_EXTERNAL_ID_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
