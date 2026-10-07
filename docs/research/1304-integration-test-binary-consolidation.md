@@ -2,7 +2,7 @@
 
 Issue: [#1304](https://github.com/Sannrox/sekai-chisei/issues/1304)
 Date: 2026-10-07
-Status: **recommendation published**; spike discarded; follow-up [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308)
+Status: **landed** in [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308); spike discarded
 Command: `cargo test --workspace --locked --no-run --timings` after a one-line edit in `src/lib.rs`, warm debug cache.
 
 Each of the 133 files in `tests/*.rs` is its own binary linked against the root library. The question is whether merging them into one or a few binaries cuts that incremental compile.
@@ -35,6 +35,7 @@ The `it` debug binary is ~190 MiB. The root lib-test already warns `ld: __eh_fra
 | Test binary | Why a private process |
 | --- | --- |
 | `gateway_cache_signals` | Process-global Prometheus recorder plus `std::env::set_var`. The file already documents that a sibling test in the same process could satisfy cache-signal assertions without the production path. |
+| `auth_signals`, `db_signals`, `dedup_signals`, `resilience_load`, `observability` | Same recorder. Empty-before, sibling-pollution, and exact-value gauge asserts fail (or flake) in the grouped binary. The spike listed 373 tests and did not run them. |
 
 Port-binding tests use `127.0.0.1:0` or spawn a child with `Command.env`. They do not need a private rustc binary. `crate::`-coupled adapter tests need their own binary only until those paths move.
 
@@ -48,8 +49,8 @@ Port-binding tests use `127.0.0.1:0` or spawn a child with `Command.env`. They d
 Land the grouped layout in [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308), matching Palantir's one-task-per-source-set rule:
 
 - `autotests = false` on the root package.
-- One `tests/it.rs` (or `tests/it/main.rs`) that modules the 117 self-contained files.
-- Keep `gateway_cache_signals` as its own `[[test]]`.
+- One `tests/it.rs` that modules the self-contained files.
+- Keep process-global Prometheus recorder tests as their own `[[test]]` (`gateway_cache_signals`, `observability`, and `auth_signals` / `db_signals` / `dedup_signals` / `resilience_load` which the spike did not run).
 - Keep the 15 `crate::`-coupled adapter/example/ratchet binaries until those paths are rewritten; do not rewrite them in the grouping change.
 - Prove `cargo test --test it` and `cargo test --workspace --locked` on the landed layout. The spike did not run the 373 tests.
 - Do not merge examples or bins; they were out of scope and still show up on the incremental critical path.

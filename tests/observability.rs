@@ -1,3 +1,10 @@
+//! Ops and signal tests, isolated in their own test binary.
+//!
+//! Several cases exact-assert process-global Prometheus gauges (saturation
+//! clamp, empty-before families). Sibling `SekaiDb` opens in the grouped `it`
+//! process overwrite `sekai_saturation_ratio`. Palantir analog: isolate
+//! process-global recorder state.
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;

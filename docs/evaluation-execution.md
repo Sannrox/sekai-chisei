@@ -226,7 +226,7 @@ The provider-fake tests run in default CI. The ignored live path can be invoked
 when a local model is available:
 
 ```bash
-cargo test --test ollama_e2e \
+cargo test --test it \
   bounded_stochastic_evaluator_records_live_variance_evidence \
   -- --ignored
 ```

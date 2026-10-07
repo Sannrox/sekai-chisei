@@ -5,7 +5,7 @@
 //!
 //! ```bash
 //! cargo run --locked --example mcp_adapter
-//! cargo test --locked --test mcp_adapter
+//! cargo test --locked --test it mcp_adapter
 //! ```
 
 use sekai_chisei::mcp_adapter::run_synthetic_host;

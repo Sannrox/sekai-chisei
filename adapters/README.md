@@ -227,7 +227,7 @@ Offline adapter and SQLite backend conformance run through:
 
 ```sh
 cargo test --test object_sync_adapters
-cargo test --test object_sync_backend_conformance
+cargo test --test it object_sync_backend_conformance
 ```
 
 The adapter suite applies the versioned refresh, tombstone, reversal,
