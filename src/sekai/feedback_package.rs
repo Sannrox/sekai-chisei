@@ -301,9 +301,8 @@ fn validate_observation_evidence(
     if submission.target_kind != KIND_OBSERVATION {
         return Err("source evidence does not target an observation".into());
     }
-    // Same check-then-insert as object_id uniqueness. A unique index on
-    // (namespace, external_id) is a store-wide schema change because empty
-    // external_id is common on other kinds.
+    // Plan-time check for a precise error. Commit uniqueness is the partial
+    // unique index on observation (namespace, external_id).
     for existing in db.find_all_by_external_id(&submission.target_external_id)? {
         if existing.namespace == object.namespace && existing.id != object.id {
             return Err(format!(
@@ -390,6 +389,8 @@ fn validate_verification_subject(db: &RuntimeDb, object: &Object) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::sekai::SekaiDb;
+    use crate::domain::Object;
     use crate::sekai::action_instance_admission::{
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
     };
@@ -404,6 +405,8 @@ mod tests {
     use sekai_ontology::{Ontology, SqliteOntology};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     const NAMESPACE: &str = "ops";
     const ACTOR: &str = "reviewer";
@@ -418,6 +421,29 @@ mod tests {
         let runtime = db();
         install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
         runtime
+    }
+
+    fn installed_file() -> (tempfile::TempDir, RuntimeDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekai.db");
+        let runtime = RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(path.to_str().expect("utf-8 path")).expect("file sqlite"),
+        ));
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        (dir, runtime)
+    }
+
+    fn observation_object(id: &str, external_id: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: KIND_OBSERVATION.into(),
+            name: id.into(),
+            namespace: NAMESPACE.into(),
+            external_id: external_id.into(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        }
     }
 
     fn producer() -> EvidenceProducerCapability {
@@ -824,6 +850,98 @@ mod tests {
                 .external_id,
             "obs-1"
         );
+    }
+
+    #[test]
+    fn observation_store_rejects_duplicate_external_identity_without_plan_time() {
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&observation_object("obs-1", "obs-1"), ACTOR)
+            .unwrap();
+        let error = runtime
+            .create_object_with_audit(&observation_object("obs-2", "obs-1"), ACTOR)
+            .unwrap_err();
+        assert!(
+            error.contains("UNIQUE constraint failed")
+                || error.contains("duplicate key value violates unique constraint"),
+            "{error}"
+        );
+        assert!(runtime.get_object("obs-2").unwrap().is_none());
+        let mut other_ns = observation_object("obs-ns2", "obs-1");
+        other_ns.namespace = "other".into();
+        runtime.create_object_with_audit(&other_ns, ACTOR).unwrap();
+        let mut gadget = observation_object("gadget-1", "");
+        gadget.kind = "gadget".into();
+        runtime.create_object_with_audit(&gadget, ACTOR).unwrap();
+        let mut gadget_two = observation_object("gadget-2", "");
+        gadget_two.kind = "gadget".into();
+        runtime
+            .create_object_with_audit(&gadget_two, ACTOR)
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_observation_admits_keep_one_external_identity() {
+        let (_dir, runtime) = installed_file();
+        let runtime = Arc::new(runtime);
+        runtime
+            .upsert_evidence_producer(&producer(), 1_000)
+            .unwrap();
+        let admission = admit_source_evidence(&runtime, &observation_envelope(), 1_100);
+        assert!(admission.admitted);
+        let evidence_id = admission.submission.id.clone();
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = ["obs-a", "obs-b"]
+            .into_iter()
+            .map(|object_id| {
+                let runtime = Arc::clone(&runtime);
+                let evidence_id = evidence_id.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let parameters = json!({
+                        "object_id": object_id,
+                        "name": object_id,
+                        "source_evidence": evidence_id,
+                        "problem_signature": "sig:timeout",
+                        "occurrence_ids": "occ-1",
+                        "classification": "defect",
+                        "disposition": "open"
+                    });
+                    barrier.wait();
+                    ActionInstanceAdmission::new(runtime.as_ref(), None).admit(
+                        admit_request(
+                            ACTION_OBSERVATION,
+                            &parameters.to_string(),
+                            &format!("obs-admit-{object_id}"),
+                            vec![evidence_id],
+                        ),
+                        ACTOR,
+                        2_000,
+                    )
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect();
+        let wins = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let losses = outcomes.iter().filter(|outcome| outcome.is_err()).count();
+        assert_eq!(wins, 1, "{outcomes:?}");
+        assert_eq!(losses, 1, "{outcomes:?}");
+        assert!(
+            outcomes.iter().any(|outcome| matches!(
+                outcome,
+                Err(ActionInstanceAdmissionError::FailedPrecondition(_))
+            )),
+            "{outcomes:?}"
+        );
+        let stored: Vec<_> = ["obs-a", "obs-b"]
+            .into_iter()
+            .filter_map(|id| runtime.get_object(id).unwrap())
+            .collect();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].external_id, "obs-1");
     }
 
     #[test]

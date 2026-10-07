@@ -7,6 +7,7 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{KIND_CAPABILITY, KIND_EXTERNAL_EVIDENCE, Object, is_valid_property_key};
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
+use crate::sekai::feedback_package::KIND_OBSERVATION;
 use crate::sekai::governed_action_type::{
     GovernedActionType, OBJECT_MUTATION_CREATE, OBJECT_MUTATION_UPDATE,
 };
@@ -25,6 +26,11 @@ pub(crate) enum ActionObjectMutationError {
 const PARAM_OBJECT_ID: &str = "object_id";
 const PARAM_NAME: &str = "name";
 const PARAM_NOTIFY_DELIVERY: &str = "notify_delivery";
+
+fn unique_constraint_failed(error: &str) -> bool {
+    error.contains("UNIQUE constraint failed")
+        || error.contains("duplicate key value violates unique constraint")
+}
 
 const RESERVED_OBJECT_KINDS: &[&str] = &[
     "namespace",
@@ -212,10 +218,19 @@ pub(crate) fn apply(
     object.updated = now_ms;
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
+    let object_external_id = object.external_id.clone();
     let applied_updated = object.updated;
     let previous = if created {
         db.create_object_with_audit(&object, actor)
-            .map_err(ActionObjectMutationError::Internal)?;
+            .map_err(|error| {
+                if object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
+                    ActionObjectMutationError::FailedPrecondition(format!(
+                        "observation external identity {object_external_id} already exists"
+                    ))
+                } else {
+                    ActionObjectMutationError::Internal(error)
+                }
+            })?;
         None
     } else {
         Some(
