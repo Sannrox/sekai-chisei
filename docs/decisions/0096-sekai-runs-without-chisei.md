@@ -95,12 +95,12 @@ that may only shrink.
   is never a substitute (ADR 0082).
 - Open question: whether a separate `chisei-plane` process is worth keeping.
   Without it, the Chisei-side traits over Sekai state become direct calls and
-  the remote lookup goes away. Decide in a follow-up research Issue.
+  the remote lookup goes away. Decided in #1300.
 
-Follow-up work, each its own Issue: require Sekai in Chisei and delete
-not-attached paths; move shared vocabulary into Sekai; add the Sekai-owned
-budget, proposal, and receipt ports; move the adapters out of Sekai; decide
-on the separate `chisei-plane` process.
+Follow-up work: require Sekai in Chisei and delete not-attached paths
+(#1296); move shared vocabulary into Sekai (#1297); add the Sekai-owned
+budget, proposal, and receipt ports (#1298); move the adapters out of Sekai
+(#1299); decide on the separate `chisei-plane` process (#1300).
 
 ## Validation
 
