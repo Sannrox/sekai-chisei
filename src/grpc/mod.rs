@@ -1,6 +1,7 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
 mod provider_execution;
+pub mod remote_sekai;
 pub mod rpc_identity;
 pub mod sekai_service;
 mod visible_page;
@@ -434,7 +435,7 @@ impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareI
 impl<I: tonic::service::Interceptor> tonic::service::Interceptor for RestoreFenceInterceptor<I> {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         if request_is_mutating_rpc(&req) {
-            crate::db::postgres::off_runtime(|| {
+            crate::db::off_runtime(|| {
                 crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
             })
             .map_err(Status::failed_precondition)?;
@@ -1004,12 +1005,12 @@ pub fn build_services_for_plane(
             if let Some(endpoint) = &config.sekai_endpoint {
                 chisei_svc = chisei_svc
                     .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
-                        crate::composition::remote_sekai::RemoteSekaiFactReader::from_env(
+                        crate::grpc::remote_sekai::RemoteSekaiFactReader::from_env(
                             endpoint.clone(),
                         ),
                     )))?
                     .with_sekai_commit_lookup(Arc::new(
-                        crate::composition::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                        crate::grpc::remote_sekai::RemoteSekaiCommitLookup::from_env(
                             endpoint.clone(),
                         ),
                     ));
