@@ -309,6 +309,7 @@ impl SekaiDb {
         self.migrate_portfolio()?;
         self.migrate_routing_profiles()?;
         self.migrate_usage_ledger()?;
+        self.ensure_external_permit_tables()?;
         Ok(())
     }
 
