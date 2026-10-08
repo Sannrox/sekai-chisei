@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 pub const ENTITY_SCAN_OPT_OUT_KEY: &str = "chisei.egress.entity_scan";
 /// Bound on objects fetched for entity literals. Palantir analog: Object Search pageSize.
 pub const ENTITY_SCAN_LIMIT: i32 = 500;
+pub const ENTITY_LITERAL_LIMIT: usize = 500;
+pub const SCAN_TRUNCATED_LABEL: &str = "scan_truncated";
 const MIN_ENTITY_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +94,17 @@ struct CachedPrivacyScan {
     entity_fingerprint: String,
     rules: Arc<Vec<LeakRule>>,
     entities: Option<Arc<Vec<String>>>,
+    truncated: bool,
 }
 
 /// Compiled leak rules and entity literals reused while both object sets are unchanged.
 /// Palantir analog: function-backed actions reuse one ontology snapshot per run;
 /// the next invocation searches the current object set.
-type PrivacyScan = (Arc<Vec<LeakRule>>, Arc<Vec<String>>);
+pub struct PrivacyScan {
+    pub rules: Arc<Vec<LeakRule>>,
+    pub entities: Arc<Vec<String>>,
+    pub truncated: bool,
+}
 
 #[derive(Default)]
 pub struct PrivacyScanCache {
@@ -132,17 +139,35 @@ impl PrivacyScanCache {
                 && cached.leak_fingerprint == leak_fp
             {
                 if !need_entities {
-                    return Ok((cached.rules.clone(), Arc::new(Vec::new())));
+                    return Ok(PrivacyScan {
+                        rules: cached.rules.clone(),
+                        entities: Arc::new(Vec::new()),
+                        truncated: false,
+                    });
                 }
                 if cached.entity_fingerprint == entity_fp
                     && let Some(entities) = cached.entities.clone()
                 {
-                    return Ok((cached.rules.clone(), entities));
+                    return Ok(PrivacyScan {
+                        rules: cached.rules.clone(),
+                        entities,
+                        truncated: cached.truncated,
+                    });
                 }
             }
         }
         let rules = Arc::new(compile_leak_rules(&leaks));
-        let entities = entity_objs.map(|objects| Arc::new(entity_scan_literals(&objects)));
+        let (entities, truncated) = match entity_objs {
+            Some(objects) => {
+                let listed_full_page = objects.len() >= ENTITY_SCAN_LIMIT as usize;
+                let (literals, literal_truncated) = entity_scan_literals(&objects);
+                (
+                    Some(Arc::new(literals)),
+                    listed_full_page || literal_truncated,
+                )
+            }
+            None => (None, false),
+        };
         let returned_entities = entities.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         let mut guard = self
             .entries
@@ -155,9 +180,14 @@ impl PrivacyScanCache {
                 entity_fingerprint: entity_fp,
                 rules: rules.clone(),
                 entities,
+                truncated,
             },
         );
-        Ok((rules, returned_entities))
+        Ok(PrivacyScan {
+            rules,
+            entities: returned_entities,
+            truncated,
+        })
     }
 }
 
@@ -276,9 +306,10 @@ pub fn gate_reason(data_class: DataClass, task_class: TaskClass, provider: &str)
     )
 }
 
-pub fn entity_scan_literals(objects: &[Object]) -> Vec<String> {
+pub fn entity_scan_literals(objects: &[Object]) -> (Vec<String>, bool) {
     let mut seen = HashSet::new();
     let mut literals = Vec::new();
+    let mut truncated = false;
     for obj in objects {
         if obj
             .properties
@@ -294,18 +325,34 @@ pub fn entity_scan_literals(objects: &[Object]) -> Vec<String> {
             }
             let key = trimmed.to_ascii_lowercase();
             if seen.insert(key) {
+                if literals.len() >= ENTITY_LITERAL_LIMIT {
+                    truncated = true;
+                    break;
+                }
                 literals.push(trimmed.to_string());
             }
         }
-        if literals.len() >= 500 {
+        if truncated {
             break;
         }
     }
-    literals
+    (literals, truncated)
 }
 
-pub fn check_payload(payload: &str, rules: &[LeakRule], entities: &[String]) -> Vec<LeakFinding> {
+pub fn check_payload(
+    payload: &str,
+    rules: &[LeakRule],
+    entities: &[String],
+    truncated: bool,
+) -> Vec<LeakFinding> {
     let mut findings = Vec::new();
+    if truncated {
+        findings.push(LeakFinding {
+            rule_label: SCAN_TRUNCATED_LABEL.into(),
+            action: LeakAction::Block,
+            match_count: 0,
+        });
+    }
     for rule in rules {
         let count = rule.pattern.find_iter(payload).count();
         if count > 0 {
@@ -415,11 +462,46 @@ mod tests {
             "Review ACCT-123 and SecretCo.",
             &rules,
             &["SecretCo".into()],
+            false,
         );
         assert_eq!(findings.len(), 2);
         assert_eq!(findings[0].rule_label, "account_id");
         assert_eq!(findings[0].match_count, 1);
         assert_eq!(findings[1].rule_label, "known_entity:SecretCo");
+    }
+
+    #[test]
+    fn truncated_scan_fails_closed_even_when_payload_has_no_match() {
+        let findings = check_payload("harmless payload", &[], &[], true);
+        assert_eq!(
+            findings,
+            vec![LeakFinding {
+                rule_label: SCAN_TRUNCATED_LABEL.into(),
+                action: LeakAction::Block,
+                match_count: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn entity_scan_literals_flags_truncation_at_literal_cap() {
+        let objects: Vec<Object> = (0..=ENTITY_LITERAL_LIMIT)
+            .map(|index| Object {
+                id: format!("o{index}"),
+                kind: "asset".into(),
+                name: format!("Name{index:04}"),
+                namespace: "alpha".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .collect();
+        let (literals, truncated) = entity_scan_literals(&objects);
+        assert!(truncated);
+        assert_eq!(literals.len(), ENTITY_LITERAL_LIMIT);
+        assert_eq!(literals[0], "Name0000");
+        assert_eq!(literals.last().map(String::as_str), Some("Name0499"));
     }
 
     #[test]
@@ -446,7 +528,7 @@ mod tests {
                 updated: 0,
             },
         ];
-        assert_eq!(entity_scan_literals(&objects), vec!["asset:ABC"]);
+        assert_eq!(entity_scan_literals(&objects).0, vec!["asset:ABC"]);
     }
 
     #[test]
@@ -492,15 +574,43 @@ mod tests {
                 },
             )
         };
-        let (first_rules, first_entities) = load().unwrap();
-        let (second_rules, second_entities) = load().unwrap();
+        let first = load().unwrap();
+        let second = load().unwrap();
         assert_eq!(leak_calls.get(), 2);
         assert_eq!(entity_calls.get(), 2);
-        assert_eq!(first_rules.len(), 1);
-        assert_eq!(first_entities.as_slice(), ["SecretCo", "asset:SECRET"]);
-        assert_eq!(second_rules[0].id, first_rules[0].id);
-        assert_eq!(second_entities.as_slice(), first_entities.as_slice());
-        assert!(Arc::ptr_eq(&first_entities, &second_entities));
+        assert_eq!(first.rules.len(), 1);
+        assert_eq!(first.entities.as_slice(), ["SecretCo", "asset:SECRET"]);
+        assert_eq!(second.rules[0].id, first.rules[0].id);
+        assert_eq!(second.entities.as_slice(), first.entities.as_slice());
+        assert!(Arc::ptr_eq(&first.entities, &second.entities));
+        assert!(!first.truncated);
+    }
+
+    #[test]
+    fn privacy_scan_cache_marks_truncated_when_listed_page_is_full() {
+        let cache = PrivacyScanCache::default();
+        let objects: Vec<Object> = (0..ENTITY_SCAN_LIMIT)
+            .map(|index| Object {
+                id: format!("fill-{index:04}"),
+                kind: "asset".into(),
+                name: "x".into(),
+                namespace: "alpha".into(),
+                external_id: format!("{index:03}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .collect();
+        let scan = cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                || Ok(objects.clone()),
+            )
+            .unwrap();
+        assert!(scan.truncated);
+        assert!(scan.entities.is_empty());
     }
 
     #[test]
@@ -528,7 +638,7 @@ mod tests {
             updated: 1,
         });
         let entities = std::cell::RefCell::new(first_entities);
-        let (_, first) = cache
+        let first = cache
             .load(
                 "alpha",
                 true,
@@ -536,9 +646,9 @@ mod tests {
                 || Ok(entities.borrow().clone()),
             )
             .unwrap();
-        assert_eq!(first.as_slice(), ["SecretCo", "asset:SECRET"]);
+        assert_eq!(first.entities.as_slice(), ["SecretCo", "asset:SECRET"]);
         *entities.borrow_mut() = second_entities;
-        let (_, second) = cache
+        let second = cache
             .load(
                 "alpha",
                 true,
@@ -547,10 +657,19 @@ mod tests {
             )
             .unwrap();
         assert!(
-            second.iter().any(|literal| literal == "UniqueSecretCorp"),
-            "entity created after the first scan must be in the next snapshot: {second:?}"
+            second
+                .entities
+                .iter()
+                .any(|literal| literal == "UniqueSecretCorp"),
+            "entity created after the first scan must be in the next snapshot: {:?}",
+            second.entities
         );
-        let findings = check_payload("mention UniqueSecretCorp in the brief", &[], &second);
+        let findings = check_payload(
+            "mention UniqueSecretCorp in the brief",
+            &[],
+            &second.entities,
+            second.truncated,
+        );
         assert!(
             findings
                 .iter()
