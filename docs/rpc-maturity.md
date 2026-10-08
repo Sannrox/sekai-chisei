@@ -41,7 +41,9 @@ They stay out of the default RPC surface.
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
 experimental RPC. The core pack also reports `sekai.transforms.projection`
-as the in-process transform host; its put/run/get RPCs stay experimental.
+as the in-process transform host; its `lifecycle_state` is `disabled` unless
+the experimental RPC gate is on, matching `sekai.rpc.experimental`. Put/run/get
+RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.

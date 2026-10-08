@@ -47,10 +47,9 @@ impl SekaiServiceImpl {
         entries.push(retrieve_context_capability(entailment));
         entries.push(explain_derivation_capability(entailment));
         entries.push(kioku_candidates_capability());
-        entries.push(experimental_rpc_capability(
-            crate::rpc_maturity::experimental_rpcs_enabled(),
-        ));
-        entries.push(hosted_transform_capability());
+        let experimental = crate::rpc_maturity::experimental_rpcs_enabled();
+        entries.push(experimental_rpc_capability(experimental));
+        entries.push(hosted_transform_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -121,7 +120,9 @@ fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry 
     entry
 }
 
-fn hosted_transform_capability() -> CapabilityEntry {
+/// Palantir analog: experimental catalog entries stay visible and gated off
+/// so discovery does not advertise them as production-ready.
+fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY.into(),
         "In-process governed dataset transform host. Put, run, and inspect a JobSpec; outputs are datasets.".into(),
@@ -131,6 +132,7 @@ fn hosted_transform_capability() -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
     entry
 }
 
@@ -404,4 +406,22 @@ fn experimental_rpc_capability(enabled: bool) -> CapabilityEntry {
         value: u64::from(enabled),
     }];
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
+        let off = hosted_transform_capability(false);
+        assert_eq!(off.lifecycle_state, "disabled");
+        assert_eq!(
+            off.name,
+            crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY
+        );
+
+        let on = hosted_transform_capability(true);
+        assert_eq!(on.lifecycle_state, "active");
+    }
 }

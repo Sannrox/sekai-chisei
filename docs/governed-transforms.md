@@ -10,8 +10,9 @@ Action-written.
 The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
 `GetGovernedTransformRun`) are `experimental`: start the plane with
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature. See
-[rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities` always reports
-`sekai.transforms.projection` on the core pack.
+[rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities` reports
+`sekai.transforms.projection` on the core pack; `lifecycle_state` is
+`disabled` unless experimental RPCs are enabled.
 
 ## Operator path
 

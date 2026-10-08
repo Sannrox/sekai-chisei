@@ -151,9 +151,10 @@ provenance on the receipt (`reported_catalog_version`), not a grant.
 The graph retrieval capabilities advertise
 `epistemic_descriptor_projection` and bounded descriptor source-list limits.
 `DiscoverCapabilities` reports `sekai.transforms.projection` on the core pack
-as the in-process dataset transform host. Invocation of
+as the in-process dataset transform host. Its `lifecycle_state` is `disabled`
+unless the experimental RPC gate is on. Invocation of
 `PutGovernedTransform` / `RunGovernedTransform` / `GetGovernedTransformRun`
-still requires the experimental RPC gate. See
+still requires that gate. See
 [governed-transforms.md](governed-transforms.md) and
 [ADR 0097](decisions/0097-in-process-transform-host.md).
 
