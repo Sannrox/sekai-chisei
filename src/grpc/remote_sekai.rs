@@ -417,6 +417,7 @@ async fn find_by_external_id_on(
 async fn connect_channel(endpoint: &str) -> Result<Channel, String> {
     tonic::transport::Endpoint::from_shared(endpoint.to_string())
         .map_err(|error| format!("SEKAI_ENDPOINT: {error}"))?
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(5))
         .connect()
         .await

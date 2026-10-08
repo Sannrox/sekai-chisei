@@ -14,9 +14,15 @@ use crate::domain::{Direction, KIND_COMPONENT, KIND_LEARNING, Object, REL_CONTAI
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
-/// Successful object-type lookups only. A hop `Err` is not stored, so a later
-/// implement/evaluable check can retry.
-type ObjectTypeCache = HashMap<String, Option<ObjectType>>;
+/// Per-step object-type lookups, including hop failures.
+/// Palantir analog: OSDK caches query results; a failed lookup is not retried
+/// unbounded inside the same cache.
+enum CachedObjectType {
+    Found(Option<ObjectType>),
+    Failed(SekaiFactError),
+}
+
+type ObjectTypeCache = HashMap<String, CachedObjectType>;
 
 #[derive(Debug, Clone)]
 pub struct PipelineRequest {
@@ -596,10 +602,17 @@ fn cached_object_type<'a>(
     kind: &str,
 ) -> Result<&'a Option<ObjectType>, SekaiFactError> {
     if !type_cache.contains_key(kind) {
-        let value = facts.get_object_type(kind)?;
-        type_cache.insert(kind.to_string(), value);
+        let cached = match facts.get_object_type(kind) {
+            Ok(value) => CachedObjectType::Found(value),
+            Err(error) => CachedObjectType::Failed(error),
+        };
+        type_cache.insert(kind.to_string(), cached);
     }
-    Ok(&type_cache[kind])
+    match type_cache.get(kind) {
+        Some(CachedObjectType::Found(value)) => Ok(value),
+        Some(CachedObjectType::Failed(error)) => Err(error.clone()),
+        None => unreachable!("object type cache insert precedes get"),
+    }
 }
 
 fn object_implements(
