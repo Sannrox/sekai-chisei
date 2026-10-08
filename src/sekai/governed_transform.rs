@@ -14,6 +14,10 @@ pub const CONTRACT_VERSION: &str = "sekai.governed-transform/v1";
 pub const TRANSFORM_CLASS: &str = "projection";
 /// DiscoverCapabilities name for the in-process transform host.
 pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
+/// Order-independent 256-bit sum of per-row SHA-256 hashes.
+/// Palantir analog: Foundry incremental `semantic_version` / `v2_semantics`
+/// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
+pub const OUTPUT_DIGEST_PREFIX: &str = "sha256-sum-v1:";
 
 const FORBIDDEN_KEYS: &[&str] = &[
     "password",
@@ -193,15 +197,19 @@ pub fn evaluate_quality(
 /// Checkpoint of the last successful run for incremental selection.
 pub type TransformCheckpoint = (i64, String, String);
 
-/// Incremental selection requires the current JobSpec. The live receipt is
-/// kept so a later quarantine still names the retained output.
+/// Incremental selection requires the current JobSpec and a live output
+/// digest in the current encoding. An old or malformed digest forces a
+/// full rebuild (Foundry SNAPSHOT) instead of folding.
 pub fn bind_checkpoint(
     incremental: bool,
     checkpoint: Option<(TransformCheckpoint, String)>,
     definition_digest: &str,
 ) -> (bool, Option<TransformCheckpoint>) {
     match checkpoint {
-        Some((pin, digest)) => (incremental && digest == definition_digest, Some(pin)),
+        Some((pin, digest)) => (
+            incremental && digest == definition_digest && parse_output_digest(&pin.2).is_some(),
+            Some(pin),
+        ),
         None => (false, None),
     }
 }
@@ -285,9 +293,16 @@ pub fn rows_digest(rows: &[HashMap<String, String>]) -> String {
 
 /// Fold newly appended output rows into a stored digest. The digest is an
 /// order-independent 256-bit sum of per-row SHA-256 hashes, so this equals
-/// `rows_digest` of the combined live set.
-pub fn fold_output_digest(previous: &str, added_rows: &[HashMap<String, String>]) -> String {
-    encode_digest(fold_row_hashes(parse_digest(previous), added_rows))
+/// `rows_digest` of the combined live set. Returns `None` when `previous` is
+/// not the current encoding, so callers force a full rebuild.
+pub fn fold_output_digest(
+    previous: &str,
+    added_rows: &[HashMap<String, String>],
+) -> Option<String> {
+    Some(encode_digest(fold_row_hashes(
+        parse_output_digest(previous)?,
+        added_rows,
+    )))
 }
 
 fn row_canonical_hash(row: &HashMap<String, String>) -> [u8; 32] {
@@ -315,8 +330,8 @@ fn fold_row_hashes(mut acc: [u8; 32], rows: &[HashMap<String, String>]) -> [u8; 
 }
 
 fn encode_digest(bytes: [u8; 32]) -> String {
-    let mut hex = String::with_capacity(71);
-    hex.push_str("sha256:");
+    let mut hex = String::with_capacity(OUTPUT_DIGEST_PREFIX.len() + 64);
+    hex.push_str(OUTPUT_DIGEST_PREFIX);
     for byte in bytes {
         hex.push(HEX[(byte >> 4) as usize] as char);
         hex.push(HEX[(byte & 0x0f) as usize] as char);
@@ -324,24 +339,17 @@ fn encode_digest(bytes: [u8; 32]) -> String {
     hex
 }
 
-fn parse_digest(value: &str) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let Some(hex) = value.strip_prefix("sha256:") else {
-        return out;
-    };
+pub fn parse_output_digest(value: &str) -> Option<[u8; 32]> {
+    let hex = value.strip_prefix(OUTPUT_DIGEST_PREFIX)?;
     if hex.len() != 64 {
-        return out;
+        return None;
     }
+    let mut out = [0u8; 32];
     for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        let Ok(text) = std::str::from_utf8(chunk) else {
-            return [0u8; 32];
-        };
-        let Ok(byte) = u8::from_str_radix(text, 16) else {
-            return [0u8; 32];
-        };
-        out[index] = byte;
+        let text = std::str::from_utf8(chunk).ok()?;
+        out[index] = u8::from_str_radix(text, 16).ok()?;
     }
-    out
+    Some(out)
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -394,7 +402,7 @@ mod tests {
 
     #[test]
     fn bind_checkpoint_drops_a_pin_from_a_different_digest() {
-        let pin = (7, "run".into(), "out".into());
+        let pin = (7, "run".into(), rows_digest(&[]));
         let (incremental, checkpoint) =
             bind_checkpoint(true, Some((pin.clone(), "old".into())), "new");
         assert!(!incremental);
@@ -407,6 +415,23 @@ mod tests {
             bind_checkpoint(false, Some((pin.clone(), "same".into())), "same");
         assert!(!incremental);
         assert_eq!(checkpoint, Some(pin));
+    }
+
+    #[test]
+    fn bind_checkpoint_forces_rebuild_for_old_or_malformed_output_digest() {
+        let definition = "same";
+        let old = (7, "run".into(), format!("sha256:{}", "ab".repeat(32)));
+        let (incremental, checkpoint) =
+            bind_checkpoint(true, Some((old.clone(), definition.into())), definition);
+        assert!(!incremental);
+        assert_eq!(checkpoint.as_ref(), Some(&old));
+        let empty = (7, "run".into(), String::new());
+        let (incremental, _) = bind_checkpoint(true, Some((empty, definition.into())), definition);
+        assert!(!incremental);
+        let malformed = (7, "run".into(), "sha256-sum-v1:zzzz".into());
+        let (incremental, _) =
+            bind_checkpoint(true, Some((malformed, definition.into())), definition);
+        assert!(!incremental);
     }
 
     #[test]
@@ -475,10 +500,12 @@ mod tests {
             ("id".into(), "2".into()),
             ("keep".into(), "yes".into()),
         ])];
-        let folded = fold_output_digest(&rows_digest(&first), &second);
+        let folded = fold_output_digest(&rows_digest(&first), &second).expect("current encoding");
         let mut combined = first.clone();
         combined.extend(second.clone());
         assert_eq!(folded, rows_digest(&combined));
+        assert!(folded.starts_with(OUTPUT_DIGEST_PREFIX));
+        assert!(fold_output_digest(&format!("sha256:{}", "ab".repeat(32)), &second).is_none());
         let swapped = vec![second[0].clone(), first[0].clone()];
         assert_eq!(rows_digest(&combined), rows_digest(&swapped));
     }

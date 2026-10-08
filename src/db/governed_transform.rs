@@ -260,8 +260,8 @@ fn run_governed_transform_tx(
     run.output_digest = if incremental {
         checkpoint
             .as_ref()
-            .map(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
-            .unwrap_or_else(|| rows_digest(&output_rows))
+            .and_then(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
+            .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
     } else {
         rows_digest(&output_rows)
     };
@@ -720,6 +720,63 @@ mod tests {
         assert_eq!(rebuilt.rows_in, 2);
         assert_eq!(rebuilt.lineage_parent, run.run_id);
         assert_eq!(db.query_rows("out2", &Default::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn old_format_checkpoint_digest_forces_full_rebuild() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![step_filter()],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let first = db.run_governed_transform("ops", "t1", false, 20).unwrap();
+        assert!(!first.incremental);
+        db.conn()
+            .execute(
+                "UPDATE sekai_governed_transform_checkpoint
+                 SET live_output_digest = ?1
+                 WHERE namespace = 'ops' AND transform_id = 't1'",
+                params![format!("sha256:{}", "ab".repeat(32))],
+            )
+            .unwrap();
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), "2".into()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        let rebuilt = db.run_governed_transform("ops", "t1", true, 30).unwrap();
+        assert!(!rebuilt.incremental);
+        assert_eq!(rebuilt.rows_in, 2);
+        let live = db.query_rows("out", &Default::default()).unwrap();
+        assert_eq!(live.len(), 2);
+        assert_eq!(rebuilt.output_digest, rows_digest(&live));
+        assert!(
+            rebuilt
+                .output_digest
+                .starts_with(crate::sekai::governed_transform::OUTPUT_DIGEST_PREFIX)
+        );
     }
 
     #[test]
