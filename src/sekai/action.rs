@@ -1,3 +1,3 @@
-//! Risk vocabulary lives in Chisei, the base layer (ADR 0092 rule 3).
+//! Risk vocabulary lives in Sekai (ADR 0096 rule 5).
 
-pub use crate::chisei::risk_class::RiskClass;
+pub use crate::sekai::risk_class::RiskClass;

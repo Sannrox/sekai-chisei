@@ -3,7 +3,7 @@ use crate::domain::{Object, ObjectKind};
 use rusqlite::{OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
 
-pub use crate::chisei::object_schema::{
+pub use crate::sekai::object_schema::{
     InterfaceDef, ObjectType, PropertyDef, PropertyType, StructFieldDef,
     default_property_classification, is_restricted_property_classification,
     is_valid_property_classification, normalize_property_classification,

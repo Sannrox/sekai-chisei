@@ -180,13 +180,13 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ActionInstanceAdmissionError::Internal(error)
                 }
             })?;
-        crate::chisei::evaluation_plan::validate_parameter_schema(&type_def.parameter_schema_json)
+        crate::sekai::parameter_schema::validate_parameter_schema(&type_def.parameter_schema_json)
             .map_err(|error| {
                 ActionInstanceAdmissionError::FailedPrecondition(format!(
                     "governed action type parameter schema invalid: {error}"
                 ))
             })?;
-        crate::chisei::evaluation_plan::validate_parameters(
+        crate::sekai::parameter_schema::validate_parameters(
             &type_def.parameter_schema_json,
             &request.parameters_json,
         )
@@ -525,7 +525,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         {
             return self.finish_denied(instance, "stale_on_resume", &approval, now);
         }
-        if crate::chisei::evaluation_plan::validate_parameters(
+        if crate::sekai::parameter_schema::validate_parameters(
             &type_def.parameter_schema_json,
             &instance.parameters_json,
         )

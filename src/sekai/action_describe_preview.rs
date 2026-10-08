@@ -170,7 +170,7 @@ pub fn preview_object_action(
         ));
     }
     if let Err(error) =
-        crate::chisei::evaluation_plan::validate_parameter_schema(&type_def.parameter_schema_json)
+        crate::sekai::parameter_schema::validate_parameter_schema(&type_def.parameter_schema_json)
     {
         return Ok(invalid_preview(
             &type_def,
@@ -179,7 +179,7 @@ pub fn preview_object_action(
             format!("governed action type parameter schema invalid: {error}"),
         ));
     }
-    if let Err(error) = crate::chisei::evaluation_plan::validate_parameters(
+    if let Err(error) = crate::sekai::parameter_schema::validate_parameters(
         &type_def.parameter_schema_json,
         parameters_json,
     ) {

@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_EVIDENCE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_EVIDENCE_ENVELOPE_HEADROOM_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_RELATIONSHIPS: usize = 128;
 
-pub use crate::chisei::evidence_vocabulary::{
+pub use crate::sekai::evidence_vocabulary::{
     EvidenceClassification, EvidenceIntent, EvidenceLifecycleState,
 };
 

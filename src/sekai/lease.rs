@@ -10,7 +10,8 @@ use std::time::Instant;
 
 const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
-pub use crate::chisei::external_permit::DEFAULT_SITE_ID;
+/// Default single-region site pin (`SEKAI_SITE_ID` default).
+pub const DEFAULT_SITE_ID: &str = "local";
 pub(crate) const OBJECT_CHANGED_SINCE_AUTHORIZATION: &str = "object changed since authorization";
 
 fn default_site_id() -> String {
