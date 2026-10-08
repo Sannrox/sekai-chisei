@@ -8,7 +8,7 @@ use crate::db::sekai::SekaiDb;
 #[cfg(test)]
 use crate::db::store::ChiseiStore;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rusqlite::{OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -324,10 +324,8 @@ fn validate_delegation_chain_on(
     Ok(())
 }
 
-impl SekaiDb {
-    pub(crate) fn ensure_external_permit_tables(&self) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute_batch(
+fn ensure_external_permit_tables_on(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS chisei_external_action_permits (
                 permit_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL UNIQUE,
                 issuance_idempotency_key TEXT NOT NULL, permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
@@ -357,30 +355,31 @@ impl SekaiDb {
                 scope TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
              );"
         ).map_err(|error| error.to_string())?;
-        for (column, definition) in [
-            ("redemption_id", "TEXT"),
-            ("evidence_due_at_ms", "INTEGER NOT NULL DEFAULT 0"),
-        ] {
-            let exists = {
-                let mut statement = conn
-                    .prepare("PRAGMA table_info(chisei_external_action_redemptions)")
-                    .map_err(|error| error.to_string())?;
-                statement
-                    .query_map([], |row| row.get::<_, String>(1))
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?
-                    .iter()
-                    .any(|name| name == column)
-            };
-            if !exists {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE chisei_external_action_redemptions ADD COLUMN {column} {definition}"
-                )).map_err(|error| error.to_string())?;
-            }
+    for (column, definition) in [
+        ("redemption_id", "TEXT"),
+        ("evidence_due_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let exists = {
+            let mut statement = conn
+                .prepare("PRAGMA table_info(chisei_external_action_redemptions)")
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|name| name == column)
+        };
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE chisei_external_action_redemptions ADD COLUMN {column} {definition}"
+            ))
+            .map_err(|error| error.to_string())?;
         }
-        conn.execute_batch(
-            "UPDATE chisei_external_action_redemptions
+    }
+    conn.execute_batch(
+        "UPDATE chisei_external_action_redemptions
              SET redemption_id=COALESCE(
                      redemption_id,
                      json_extract(redemption_json,'$.redemption_id')
@@ -406,9 +405,14 @@ impl SekaiDb {
                    != evidence_due_at_ms;
              CREATE INDEX IF NOT EXISTS idx_external_action_redemptions_evidence_due
              ON chisei_external_action_redemptions(evidence_due_at_ms,redemption_id);",
-        )
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+impl SekaiDb {
+    pub(crate) fn ensure_external_permit_tables(&self) -> Result<(), String> {
+        ensure_external_permit_tables_on(&self.conn())
     }
 
     pub fn put_permit(
@@ -684,7 +688,6 @@ impl SekaiDb {
                 "permit is pinned to site '{permit_site}' (host site '{host_site_id}'); foreign pin fail closed"
             ));
         }
-        self.ensure_external_permit_tables()?;
         let offline_reconciliation = permit.redemption_mode == OFFLINE_REDEMPTION_MODE;
         if offline_reconciliation
             && (invoked_at_ms < permit.not_before_ms
@@ -700,6 +703,9 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        // Palantir analog: one Immediate writer; bootstrap on that connection
+        // so concurrent redeem cannot schema-lock against a second checkout.
+        ensure_external_permit_tables_on(&tx)?;
         validate_delegation_chain_on(&tx, permit)?;
         let stored_json: Option<String> = tx
             .query_row(
@@ -1009,7 +1015,8 @@ mod tests {
         ExternalActionRequest, REQUEST_VERSION,
     };
     use crate::db::store::{ChiseiExternalActionStore, ChiseiPermitStore};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::time::Duration;
 
     fn authorization(deadline_ms: i64, invocations: u32) -> AuthorizationRecord {
         let request = ExternalActionRequest {
@@ -1267,16 +1274,17 @@ mod tests {
         db.put_permit(&permit, "issue-1", "agent:test").unwrap();
         drop(db);
         let barrier = Arc::new(Barrier::new(2));
-        let mut joins = Vec::new();
+        let (tx, rx) = mpsc::channel();
         for ordinal in 0..2 {
             let barrier = barrier.clone();
             let path = path.clone();
             let permit = permit.clone();
             let key = key.clone();
-            joins.push(std::thread::spawn(move || {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
                 let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
                 barrier.wait();
-                db.redeem_permit(
+                let result = db.redeem_permit(
                     &permit,
                     &context(&permit),
                     &key.verifying_key(),
@@ -1284,14 +1292,19 @@ mod tests {
                     &format!("execution-{ordinal}"),
                     "local",
                     3_000,
-                )
-            }));
+                );
+                let _ = tx.send(result);
+            });
         }
-        let successes = joins
-            .into_iter()
-            .map(|join| join.join().unwrap())
-            .filter(Result::is_ok)
-            .count();
+        drop(tx);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(
+                rx.recv_timeout(Duration::from_secs(30))
+                    .expect("concurrent redeem did not finish within 30s"),
+            );
+        }
+        let successes = results.into_iter().filter(Result::is_ok).count();
         assert_eq!(successes, 1);
     }
 
