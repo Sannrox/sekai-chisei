@@ -1,6 +1,7 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::governed_transform::{
-    GovernedTransform, TransformRun, bind_checkpoint, compute_run, rows_digest,
+    GovernedTransform, TransformRun, bind_checkpoint, checkpoint_after_id, compute_run,
+    fold_output_digest, rows_digest,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::HashMap;
@@ -117,7 +118,8 @@ impl SekaiDb {
         let stored = self.transform_checkpoint(namespace, transform_id)?;
         let (incremental, checkpoint) =
             bind_checkpoint(incremental, stored, &transform.definition_digest);
-        let records = self.list_dataset_row_records(&transform.input_dataset_id)?;
+        let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
+        let records = self.list_dataset_row_records_after(&transform.input_dataset_id, after_id)?;
         let (mut run, output_rows) = compute_run(
             &transform,
             checkpoint.as_ref(),
@@ -127,7 +129,9 @@ impl SekaiDb {
             Uuid::new_v4().to_string(),
         );
         if run.quarantined {
-            run.output_digest = self.live_output_digest(&transform.output_dataset_id)?;
+            if !incremental {
+                run.output_digest = self.live_output_digest(&transform.output_dataset_id)?;
+            }
             self.insert_transform_run(&run)?;
             return Ok(run);
         }
@@ -137,10 +141,14 @@ impl SekaiDb {
         if !output_rows.is_empty() {
             self.append_rows(&transform.output_dataset_id, &output_rows)?;
         }
-        let live_rows = self.list_dataset_row_records(&transform.output_dataset_id)?;
-        let live: Vec<HashMap<String, String>> =
-            live_rows.into_iter().map(|(_, row)| row).collect();
-        run.output_digest = rows_digest(&live);
+        run.output_digest = if incremental {
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
+                .unwrap_or_else(|| rows_digest(&output_rows))
+        } else {
+            rows_digest(&output_rows)
+        };
         self.insert_transform_run(&run)?;
         self.conn()
             .execute(
@@ -410,10 +418,13 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].run_id, second.run_id);
         assert_ne!(second.output_digest, first.output_digest);
-        assert_eq!(
-            db.query_rows("out", &Default::default()).unwrap().len(),
-            101
-        );
+        let live = db.query_rows("out", &Default::default()).unwrap();
+        assert_eq!(live.len(), 101);
+        assert_eq!(second.output_digest, rows_digest(&live));
+        let after_first = db
+            .list_dataset_row_records_after("in", first.last_input_row_id)
+            .unwrap();
+        assert_eq!(after_first.len(), 1);
     }
 
     #[test]

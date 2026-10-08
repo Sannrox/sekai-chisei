@@ -206,8 +206,18 @@ pub fn bind_checkpoint(
     }
 }
 
+/// Row id exclusive lower bound for an incremental read. Full rebuilds start at 0.
+pub fn checkpoint_after_id(incremental: bool, checkpoint: Option<&TransformCheckpoint>) -> i64 {
+    if incremental {
+        checkpoint.map(|checkpoint| checkpoint.0).unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 /// Compute one run. The caller persists `output_rows` (unless quarantined),
-/// then fills `run.output_digest` from live output rows and writes the receipt.
+/// then fills `run.output_digest` with `fold_output_digest` (incremental) or
+/// `rows_digest(&output_rows)` (full rebuild) and writes the receipt.
 pub fn compute_run(
     transform: &GovernedTransform,
     checkpoint: Option<&TransformCheckpoint>,
@@ -216,11 +226,7 @@ pub fn compute_run(
     now_ms: i64,
     run_id: String,
 ) -> (TransformRun, Vec<HashMap<String, String>>) {
-    let after_id = if incremental {
-        checkpoint.map(|checkpoint| checkpoint.0).unwrap_or(0)
-    } else {
-        0
-    };
+    let after_id = checkpoint_after_id(incremental, checkpoint);
     let selected: Vec<&(i64, HashMap<String, String>)> = input_records
         .iter()
         .filter(|(id, _)| *id > after_id)
@@ -274,15 +280,71 @@ pub fn compute_run(
 }
 
 pub fn rows_digest(rows: &[HashMap<String, String>]) -> String {
-    let mut hasher = Sha256::new();
-    let mut ordered: Vec<BTreeMap<String, String>> = rows
-        .iter()
-        .map(|row| row.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .collect();
-    ordered.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
-    hasher.update(serde_json::to_vec(&ordered).unwrap_or_default());
-    format!("sha256:{:x}", hasher.finalize())
+    encode_digest(fold_row_hashes([0u8; 32], rows))
 }
+
+/// Fold newly appended output rows into a stored digest. The digest is an
+/// order-independent 256-bit sum of per-row SHA-256 hashes, so this equals
+/// `rows_digest` of the combined live set.
+pub fn fold_output_digest(previous: &str, added_rows: &[HashMap<String, String>]) -> String {
+    encode_digest(fold_row_hashes(parse_digest(previous), added_rows))
+}
+
+fn row_canonical_hash(row: &HashMap<String, String>) -> [u8; 32] {
+    let ordered: BTreeMap<&str, &str> = row
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    Sha256::digest(serde_json::to_vec(&ordered).unwrap_or_default()).into()
+}
+
+fn add_u256(acc: &mut [u8; 32], addend: &[u8; 32]) {
+    let mut carry = 0u16;
+    for index in (0..32).rev() {
+        let sum = u16::from(acc[index]) + u16::from(addend[index]) + carry;
+        acc[index] = sum as u8;
+        carry = sum >> 8;
+    }
+}
+
+fn fold_row_hashes(mut acc: [u8; 32], rows: &[HashMap<String, String>]) -> [u8; 32] {
+    for row in rows {
+        add_u256(&mut acc, &row_canonical_hash(row));
+    }
+    acc
+}
+
+fn encode_digest(bytes: [u8; 32]) -> String {
+    let mut hex = String::with_capacity(71);
+    hex.push_str("sha256:");
+    for byte in bytes {
+        hex.push(HEX[(byte >> 4) as usize] as char);
+        hex.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
+fn parse_digest(value: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return out;
+    };
+    if hex.len() != 64 {
+        return out;
+    }
+    for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let Ok(text) = std::str::from_utf8(chunk) else {
+            return [0u8; 32];
+        };
+        let Ok(byte) = u8::from_str_radix(text, 16) else {
+            return [0u8; 32];
+        };
+        out[index] = byte;
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 fn reject_secrets(transform: &GovernedTransform) -> Result<(), TransformError> {
     let blob = serde_json::to_string(transform)
@@ -401,5 +463,39 @@ mod tests {
         assert_eq!(run.lineage_parent, "live-run");
         assert_eq!(run.output_digest, "live-out");
         assert!(!run.incremental);
+    }
+
+    #[test]
+    fn incremental_output_digest_matches_full_recompute() {
+        let first = vec![HashMap::from([
+            ("id".into(), "1".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        let second = vec![HashMap::from([
+            ("id".into(), "2".into()),
+            ("keep".into(), "yes".into()),
+        ])];
+        let folded = fold_output_digest(&rows_digest(&first), &second);
+        let mut combined = first.clone();
+        combined.extend(second.clone());
+        assert_eq!(folded, rows_digest(&combined));
+        let swapped = vec![second[0].clone(), first[0].clone()];
+        assert_eq!(rows_digest(&combined), rows_digest(&swapped));
+    }
+
+    #[test]
+    fn output_digest_counts_duplicate_rows() {
+        let row = HashMap::from([("id".into(), "1".into())]);
+        let one = [row.clone()];
+        let two = [row.clone(), row];
+        assert_ne!(rows_digest(&one), rows_digest(&two));
+    }
+
+    #[test]
+    fn checkpoint_after_id_is_exclusive() {
+        let pin = (7, "run".into(), "out".into());
+        assert_eq!(checkpoint_after_id(true, Some(&pin)), 7);
+        assert_eq!(checkpoint_after_id(false, Some(&pin)), 0);
+        assert_eq!(checkpoint_after_id(true, None), 0);
     }
 }
