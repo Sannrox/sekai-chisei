@@ -1,6 +1,5 @@
 use crate::db::store::ChiseiEvolveStore;
 use base64::Engine as _;
-use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -33,7 +32,7 @@ use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
-use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
+use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, TaskClass};
 use crate::chisei::promotion::CandidateStore;
 use crate::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
@@ -120,6 +119,7 @@ pub struct ChiseiServiceImpl {
     pub(super) sekai_commit_lookup: Option<Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>>,
     /// Chisei-owned read port for Sekai facts (lookup-first, context injection).
     pub(super) sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
+    pub(super) privacy_scan: Arc<crate::chisei::privacy::PrivacyScanCache>,
 }
 
 #[derive(Clone)]
@@ -348,6 +348,7 @@ impl ChiseiServiceImpl {
             sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
                 crate::db::store::SekaiStore::memory(),
             ),
+            privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
         }
     }
 
@@ -433,6 +434,7 @@ impl ChiseiServiceImpl {
             sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
                 crate::db::store::SekaiStore::memory(),
             ),
+            privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
         }
     }
 

@@ -8506,6 +8506,170 @@ async fn template_only_plan_blocks_known_entity_leak() {
     }));
 }
 
+struct HopOnlyFacts;
+
+impl crate::chisei::sekai_facts::SekaiFactReader for HopOnlyFacts {
+    fn find_by_external_id(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn find_namespace_boundary(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_grants(
+        &self,
+        _: &str,
+    ) -> Result<
+        Vec<crate::chisei::principal::PrincipalGrant>,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(Vec::new())
+    }
+
+    fn marking_clearance(
+        &self,
+        _: &str,
+        _: &Object,
+        _: &str,
+    ) -> Result<
+        crate::chisei::principal::MarkingClearance,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(crate::chisei::principal::MarkingClearance::Unmarked)
+    }
+
+    fn get_object_type(
+        &self,
+        _: &str,
+    ) -> Result<
+        Option<crate::chisei::object_schema::ObjectType>,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(None)
+    }
+
+    fn get_object(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_objects(
+        &self,
+        _: &crate::domain::ListFilter,
+    ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn get_linked_objects(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::domain::Direction,
+    ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn in_process_store(
+        &self,
+    ) -> Result<&crate::db::store::SekaiStore, crate::chisei::sekai_facts::SekaiFactError> {
+        Err(crate::chisei::sekai_facts::SekaiFactError::Unsupported(
+            "graph retrieval over the Sekai hop",
+        ))
+    }
+}
+
+#[test]
+fn privacy_egress_fails_closed_when_sekai_is_hop_only() {
+    let mut svc = memory_service();
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "leak-rule-secretco".into(),
+            kind: "leak_rule".into(),
+            name: "company-name".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:secretco".into(),
+            properties: std::collections::HashMap::from([
+                ("pattern".into(), "SecretCo".into()),
+                ("label".into(), "company_name".into()),
+                ("action".into(), "block".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.sekai_facts = crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(HopOnlyFacts));
+    let error = svc
+        .leak_findings_for_payload("alpha", "openai", DataClass::Sensitive, "SecretCo")
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("leak-rule policy unavailable"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("in-process Sekai graph storage"),
+        "{}",
+        error.message()
+    );
+}
+
+#[test]
+fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
+    let svc = memory_service();
+    let limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+    for index in 0..limit {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("fill-{index:04}"),
+                kind: "asset".into(),
+                name: "x".into(),
+                namespace: "alpha".into(),
+                external_id: format!("{index:03}"),
+                properties: std::collections::HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "z-late".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: std::collections::HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let findings = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        findings.is_empty(),
+        "entity past ENTITY_SCAN_LIMIT must not be scanned: {findings:?}"
+    );
+}
+
 #[tokio::test]
 async fn execute_plan_rejects_after_policy_flips_sensitive() {
     let svc = memory_service();

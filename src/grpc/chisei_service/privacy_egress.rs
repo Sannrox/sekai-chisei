@@ -24,72 +24,52 @@ impl ChiseiServiceImpl {
         if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
             return Ok(vec![]);
         }
-        let rules = self.leak_rules(namespace)?;
-        let entities = if data_class == DataClass::Sensitive {
-            self.sensitive_entities(namespace)?
-        } else {
-            vec![]
-        };
+        let (rules, entities) = self
+            .privacy_scan
+            .load(
+                namespace,
+                data_class == DataClass::Sensitive,
+                || self.list_leak_rule_objects(namespace),
+                || self.list_entity_scan_objects(namespace),
+            )
+            .map_err(Status::failed_precondition)?;
         Ok(crate::chisei::privacy::check_payload(
             payload, &rules, &entities,
         ))
     }
 
-    fn list_graph_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+    fn list_fact_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        // Completeness from #1291: hop-only attachments cannot prove the
+        // leak-rule or entity set is complete, so refuse. Combined mode uses
+        // RuntimeDb::list_objects so ListFilter.limit is honored (SekaiStore::list_objects
+        // still routes to list_all_objects).
         authoritative_graph_runtime(self.sekai_facts.reader(), self.db.fact_runtime())?
-            .list_all_objects(filter)
+            .list_objects(filter)
     }
 
-    pub(super) fn leak_rules(&self, namespace: &str) -> Result<Vec<LeakRule>, Status> {
-        let mut rules = Vec::new();
+    fn list_leak_rule_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
+        let mut objects = Vec::new();
         for ns in ["", namespace] {
-            let objects = self
-                .list_graph_objects(&ListFilter {
+            objects.extend(
+                self.list_fact_objects(&ListFilter {
                     kind: Some("leak_rule".into()),
                     namespace: Some(ns.to_string()),
+                    limit: crate::domain::MAX_LIST_LIMIT,
                     ..Default::default()
                 })
-                .map_err(|error| {
-                    Status::failed_precondition(format!("leak-rule policy unavailable: {error}"))
-                })?;
-            for obj in objects {
-                let Some(pattern) = obj.properties.get("pattern") else {
-                    continue;
-                };
-                let Ok(pattern) = Regex::new(pattern) else {
-                    continue;
-                };
-                rules.push(LeakRule {
-                    id: obj.id,
-                    label: obj
-                        .properties
-                        .get("label")
-                        .cloned()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or(obj.name),
-                    pattern,
-                    action: LeakAction::parse(
-                        obj.properties
-                            .get("action")
-                            .map(String::as_str)
-                            .unwrap_or("block"),
-                    ),
-                });
-            }
+                .map_err(|error| format!("leak-rule policy unavailable: {error}"))?,
+            );
         }
-        Ok(rules)
+        Ok(objects)
     }
 
-    pub(super) fn sensitive_entities(&self, namespace: &str) -> Result<Vec<String>, Status> {
-        let objects = self
-            .list_graph_objects(&ListFilter {
-                namespace: Some(namespace.to_string()),
-                ..Default::default()
-            })
-            .map_err(|error| {
-                Status::failed_precondition(format!("sensitive-entity policy unavailable: {error}"))
-            })?;
-        Ok(crate::chisei::privacy::entity_scan_literals(&objects))
+    fn list_entity_scan_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
+        self.list_fact_objects(&ListFilter {
+            namespace: Some(namespace.to_string()),
+            limit: crate::chisei::privacy::ENTITY_SCAN_LIMIT,
+            ..Default::default()
+        })
+        .map_err(|error| format!("sensitive-entity policy unavailable: {error}"))
     }
 
     pub(super) fn record_egress_audit(
