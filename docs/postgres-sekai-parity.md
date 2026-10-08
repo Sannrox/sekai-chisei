@@ -87,6 +87,11 @@ Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
 [rpc-maturity.md](rpc-maturity.md),
 [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
 [capability catalog](capability-catalog.md)).
+Admin projections on that list still include governed images
+(`sekai.governed-image/v1`; see
+[ADR 0050](decisions/0050-governed-images.md)) and versioned client packages
+(`sekai.client-package/v1`; see
+[ADR 0051](decisions/0051-versioned-client-packages.md)).
 
 Evidence is checked in as:
 
