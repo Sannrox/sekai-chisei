@@ -703,9 +703,9 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        // Palantir analog: one Immediate writer; bootstrap on that connection
-        // so concurrent redeem cannot schema-lock against a second checkout.
-        ensure_external_permit_tables_on(&tx)?;
+        // Schema bootstrap and redemption backfill run at migrate, not per
+        // redeem. Palantir analog: Foundry incremental jobs do not re-run
+        // dataset schema migration inside the write transaction.
         validate_delegation_chain_on(&tx, permit)?;
         let stored_json: Option<String> = tx
             .query_row(
@@ -1261,6 +1261,45 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("validity window") || error.contains("revoked"));
+    }
+
+    #[test]
+    fn redeem_after_migrate_does_not_backfill_redemptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permit.db");
+        let record = authorization(10_000, 1);
+        let (permit, key) = signed(&record);
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        persist_authorization(&db, &record);
+        db.put_permit(&permit, "issue-1", "agent:test").unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO chisei_external_action_redemptions(
+                 permit_id, idempotency_key, execution_id, redemption_json,
+                 redeemed_at_ms, invocation_ordinal, redemption_id, evidence_due_at_ms
+             ) VALUES ('legacy-permit', 'legacy-key', 'legacy-exec', '{}', 1, 1, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER abort_redemption_backfill
+             BEFORE UPDATE ON chisei_external_action_redemptions
+             BEGIN
+               SELECT RAISE(ABORT, 'backfill update during redeem');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+        db.redeem_permit(
+            &permit,
+            &context(&permit),
+            &key.verifying_key(),
+            "redeem-1",
+            "execution-1",
+            "local",
+            3_000,
+        )
+        .expect("redeem after migrate must not run redemption backfill UPDATEs");
     }
 
     #[test]
