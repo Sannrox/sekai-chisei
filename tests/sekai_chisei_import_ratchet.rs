@@ -13,11 +13,7 @@ const NEEDLE: &str = "crate::chisei";
 
 /// `<file> <chisei module>` pairs still waiting to move (ADR 0096 disposition
 /// table). Remove an entry in the change that removes the edge.
-const ALLOWED: &[&str] = &[
-    "src/sekai/chisei_principal.rs principal",
-    "src/sekai/chisei_projection.rs epistemic_descriptor",
-    "src/sekai/chisei_projection.rs system_one_action",
-];
+const ALLOWED: &[&str] = &[];
 
 #[test]
 fn sekai_chisei_imports_only_shrink() {

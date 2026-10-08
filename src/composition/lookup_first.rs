@@ -1210,7 +1210,7 @@ fn explanation_json(explanation: &retrieval::Explanation) -> Value {
 
 fn descriptor_json(explanation: &retrieval::Explanation, source_rows_truncated: bool) -> Value {
     serde_json::to_value(
-        crate::sekai::chisei_projection::graph_explanation_descriptor(
+        crate::chisei::sekai_projection::graph_explanation_descriptor(
             explanation,
             source_rows_truncated,
         ),

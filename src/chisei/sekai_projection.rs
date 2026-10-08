@@ -1,7 +1,8 @@
-//! Sekai-side adapters into Chisei projections (ADR 0092 rule 5).
+//! Chisei-side adapters from Sekai Action types, evidence, and retrieval
+//! explanations (ADR 0096 rule 6).
 //!
-//! Chisei owns the System One fill and the epistemic descriptor; it reads only
-//! Chisei types. This module maps Sekai governed Action types, evidence
+//! Chisei owns the System One fill and the epistemic descriptor; it reads
+//! only Chisei types. This module maps Sekai governed Action types, evidence
 //! submissions, and retrieval explanations into them.
 
 use sekai_provider::system_one::SystemOneBind;
