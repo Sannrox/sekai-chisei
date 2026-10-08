@@ -54,7 +54,8 @@ Security review and SDK generation shrink to the stable set.
 
 A deterministic test compares the checked-in table and `docs/rpc-maturity.md`
 with both proto services, asserts at most 66 stable RPCs, and proves the
-default gate cannot reach an experimental RPC.
+default gate cannot reach an experimental RPC. Real backend cells must match
+the shrink-only SQLite-only list.
 
 ## Amendments
 
@@ -80,3 +81,8 @@ default gate cannot reach an experimental RPC.
   closed, and the integration contract says so rather than implying
   dual-backend support. Authorization, namespace, and object security are
   rechecked on every call, and computed properties stay query-time overlays.
+- 2026-10-08, Issue [#1316](https://github.com/Sannrox/sekai-chisei/issues/1316):
+  the Real backend column is a projection of RuntimeDb fail-closed evidence and
+  the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. `stable`
+  may be `yes` or `sqlite only`; `fixture only` cannot. PostgreSQL conformance
+  runs on every pull request.

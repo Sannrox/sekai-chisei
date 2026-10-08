@@ -10,18 +10,20 @@ persistence with shared SQLite/PostgreSQL conformance evidence, or are
 explicit computed/query paths with named durable dependencies.
 `GetEffectivePolicySummary` is also classified `experimental` and is rejected
 unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
-enabled. See [rpc-maturity.md](rpc-maturity.md).
+enabled. See [rpc-maturity.md](rpc-maturity.md). SQLite-only RPCs and admin
+projections are the shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| `chisei.budget` | Proven for reserve/usage; **`budget_limits_for_scope` / `GetEffectivePolicySummary` limit projection SQLite-only** | `tests/chisei_budget_backend_conformance.rs`; `RuntimeDb::budget_limits_for_scope` fails closed on Postgres |
+| `chisei.budget` | Proven for reserve/usage; limit projection SQLite-only | `tests/chisei_budget_backend_conformance.rs`; list entry `ChiseiService.GetEffectivePolicySummary` |
 | `chisei.execution` | Proven | `tests/chisei_execution_backend_conformance.rs` |
 | `chisei.evaluation` / samples | Proven | `tests/chisei_eval_backend_conformance.rs` |
 | `chisei.portfolio` | Proven | `tests/chisei_portfolio_backend_conformance.rs` |
 | `chisei.policy` | Proven (graph objects) | `tests/chisei_policy_backend_conformance.rs` |
-| `chisei.approvals` | Proven for issue/revoke/policy; **online redeem SQLite-only** | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs` (issue/revoke paths); `RuntimeDb::redeem_permit` fails closed on Postgres |
-| `chisei.learning` | Proven for Kioku lifecycle; **Gunshi allocation state SQLite-only** | `tests/chisei_kioku_backend_conformance.rs`; see [gunshi-auto-allocation.md](gunshi-auto-allocation.md) |
-| `chisei.data-quality-rule` | **SQLite-only**; PostgreSQL fails closed | `src/chisei/data_quality.rs`; see [data-quality-rules.md](data-quality-rules.md) |
+| `chisei.approvals` | Proven for issue/revoke/policy; online redeem SQLite-only | `tests/chisei_external_action_backend_conformance.rs`, `tests/chisei_external_permit_backend_conformance.rs`; list entry `ChiseiService.RedeemExternalActionPermit` |
+| `chisei.learning` | Proven for Kioku lifecycle; Gunshi allocation SQLite-only | `tests/chisei_kioku_backend_conformance.rs`; list entries `ChiseiService.*Gunshi*` |
+| `chisei.data-quality-rule` | SQLite-only | list entry `admin.data-quality`; see [data-quality-rules.md](data-quality-rules.md) |
 | `chisei.observations` | Proven | eval sample harness |
 | `gateway.governance` | Proven | receipt aliases + gateway audit harness |
 
@@ -36,8 +38,8 @@ enabled. See [rpc-maturity.md](rpc-maturity.md).
 
 `complete_chisei_surfaces` lists surfaces with dual-backend *storage* evidence
 for the track’s inventory. Operators still hit SQLite-only fail-closed methods
-for online permit redeem/reconcile/delegation validation and Gunshi allocation
-CAS (see table above).
+named in
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
 
 ## Delivery slices
 
@@ -54,9 +56,9 @@ CAS (see table above).
 - Tenant state, OIDC, and OAuth
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
-- Control-plane **online redeem**, offline reconcile, delegation-chain
-  validation, Gunshi allocation state, and `GetEffectivePolicySummary`
-  budget-limit projection (SQLite-only community runtime)
+- Control-plane online redeem, Gunshi allocation, and
+  `GetEffectivePolicySummary` budget-limit projection (see the shrink-only
+  list)
 
 ## Operator posture
 

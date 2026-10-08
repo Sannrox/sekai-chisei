@@ -72,7 +72,7 @@
       "service": "SekaiService",
       "rpc": "RegisterSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -81,7 +81,7 @@
       "service": "SekaiService",
       "rpc": "InspectSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -90,7 +90,7 @@
       "service": "SekaiService",
       "rpc": "RetireSourceTypeDescriptor",
       "storage_path": "sekai.object-sync",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "advanced"
@@ -396,7 +396,7 @@
       "service": "SekaiService",
       "rpc": "PutPurposeAuthorization",
       "storage_path": "sekai.object-security",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -405,7 +405,7 @@
       "service": "SekaiService",
       "rpc": "RevokePurposeAuthorization",
       "storage_path": "sekai.object-security",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -414,7 +414,7 @@
       "service": "SekaiService",
       "rpc": "PutClassificationLattice",
       "storage_path": "sekai.object-security",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -423,7 +423,7 @@
       "service": "SekaiService",
       "rpc": "GetClassificationLattice",
       "storage_path": "sekai.object-security",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -612,7 +612,7 @@
       "service": "SekaiService",
       "rpc": "DeleteOntologyClass",
       "storage_path": "sekai.ontology-definitions",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -648,7 +648,7 @@
       "service": "SekaiService",
       "rpc": "DeleteOntologyRelation",
       "storage_path": "sekai.ontology-definitions",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -711,7 +711,7 @@
       "service": "SekaiService",
       "rpc": "AppendRows",
       "storage_path": "sekai.datasets",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "host",
       "classification": "stable",
       "product_tier": "advanced"
@@ -720,7 +720,7 @@
       "service": "SekaiService",
       "rpc": "QueryRows",
       "storage_path": "sekai.datasets",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "host",
       "classification": "stable",
       "product_tier": "advanced"
@@ -1350,7 +1350,7 @@
       "service": "ChiseiService",
       "rpc": "RedeemExternalActionPermit",
       "storage_path": "chisei.approvals",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "example",
       "classification": "stable",
       "product_tier": "advanced"
@@ -1404,7 +1404,7 @@
       "service": "ChiseiService",
       "rpc": "GetEffectivePolicySummary",
       "storage_path": "chisei.policy",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "experimental",
       "product_tier": "core"
@@ -1521,7 +1521,7 @@
       "service": "ChiseiService",
       "rpc": "IssueGunshiRecommendations",
       "storage_path": "chisei.learning, chisei.execution",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"
@@ -1530,7 +1530,7 @@
       "service": "ChiseiService",
       "rpc": "SetGunshiAllocationPolicy",
       "storage_path": "chisei.learning",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"
@@ -1539,7 +1539,7 @@
       "service": "ChiseiService",
       "rpc": "GetGunshiAllocationStatus",
       "storage_path": "chisei.learning",
-      "real_backend": "yes",
+      "real_backend": "sqlite only",
       "consumer": "none",
       "classification": "remove",
       "product_tier": "experimental"

@@ -112,6 +112,7 @@ mod source_type_descriptor_catalog;
 mod source_type_descriptor_research;
 mod source_type_registered_batches;
 mod split_pool_budget;
+mod sqlite_only_surfaces;
 mod store_relocate_online;
 mod team_namespace_backend_conformance;
 mod tenant_isolation_conformance;

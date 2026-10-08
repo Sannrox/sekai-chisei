@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Public RPC Real backend is a projection of RuntimeDb fail-closed evidence and
+  the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. CI fails
+  on a mislabeled row, a new SQLite-only RPC missing from the list, or list
+  growth. PostgreSQL conformance runs on every pull request (#1316).
 - Versioned evidence and finding package (`pkg:feedback.evidence-finding/v1`) registers Observation, Finding, Investigation result, Hypothesis, External issue reference, and Verification record types plus governed Actions, an evidence schema, and an evaluation member. Hypotheses cannot be verification subjects. Invalid, stale, conflicting, or unauthorized evidence is rejected without creating observation objects (ADR 0095, #1230).
 - Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` with guidance toward `SEKAI_DATA_DIR`, dest-pair paths/URLs, and `sekaictl admin store relocate`. The server image sets `SEKAI_DATA_DIR=/data` (#1239).
 - Combined dest-pair evaluation apply/resolve reads governed invariants from the Sekai store. `sekaictl admin learning` opens the dest pair (or `SEKAI_DATA_DIR`) and writes change records to the Chisei dest (#1239).
