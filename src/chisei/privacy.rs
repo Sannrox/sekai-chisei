@@ -1,9 +1,12 @@
 use crate::config::Config;
 use crate::domain::Object;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 pub const ENTITY_SCAN_OPT_OUT_KEY: &str = "chisei.egress.entity_scan";
+/// Bound on objects fetched for entity literals. Palantir analog: Object Search pageSize.
+pub const ENTITY_SCAN_LIMIT: i32 = 500;
 const MIN_ENTITY_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,11 +79,130 @@ impl LeakAction {
     }
 }
 
+#[derive(Clone)]
 pub struct LeakRule {
     pub id: String,
     pub label: String,
     pub pattern: Regex,
     pub action: LeakAction,
+}
+
+struct CachedPrivacyScan {
+    leak_fingerprint: String,
+    rules: Arc<Vec<LeakRule>>,
+    entities: Option<Arc<Vec<String>>>,
+}
+
+/// Compiled leak rules and entity literals reused until leak-rule objects change.
+/// Palantir analog: function-backed actions reuse one ontology snapshot per run.
+type PrivacyScan = (Arc<Vec<LeakRule>>, Arc<Vec<String>>);
+
+#[derive(Default)]
+pub struct PrivacyScanCache {
+    entries: Mutex<HashMap<String, CachedPrivacyScan>>,
+}
+
+impl PrivacyScanCache {
+    pub fn load<E>(
+        &self,
+        namespace: &str,
+        need_entities: bool,
+        leak_objects: impl FnOnce() -> Result<Vec<Object>, E>,
+        entity_objects: impl FnOnce() -> Result<Vec<Object>, E>,
+    ) -> Result<PrivacyScan, E> {
+        let leaks = leak_objects()?;
+        let fingerprint = leak_fingerprint(&leaks);
+        {
+            let guard = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = guard.get(namespace)
+                && cached.leak_fingerprint == fingerprint
+            {
+                if !need_entities {
+                    return Ok((cached.rules.clone(), Arc::new(Vec::new())));
+                }
+                if let Some(entities) = cached.entities.clone() {
+                    return Ok((cached.rules.clone(), entities));
+                }
+            }
+        }
+        let rules = Arc::new(compile_leak_rules(&leaks));
+        let entities = if need_entities {
+            Some(Arc::new(entity_scan_literals(&entity_objects()?)))
+        } else {
+            None
+        };
+        let returned_entities = entities.clone().unwrap_or_else(|| Arc::new(Vec::new()));
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(
+            namespace.to_string(),
+            CachedPrivacyScan {
+                leak_fingerprint: fingerprint,
+                rules: rules.clone(),
+                entities,
+            },
+        );
+        Ok((rules, returned_entities))
+    }
+}
+
+fn leak_fingerprint(objects: &[Object]) -> String {
+    let mut parts: Vec<String> = objects
+        .iter()
+        .map(|object| {
+            format!(
+                "{}|{}|{}|{}",
+                object.namespace,
+                object.id,
+                object
+                    .properties
+                    .get("pattern")
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                object
+                    .properties
+                    .get("action")
+                    .map(String::as_str)
+                    .unwrap_or("block"),
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+pub fn compile_leak_rules(objects: &[Object]) -> Vec<LeakRule> {
+    let mut rules = Vec::new();
+    for obj in objects {
+        let Some(pattern) = obj.properties.get("pattern") else {
+            continue;
+        };
+        let Ok(pattern) = Regex::new(pattern) else {
+            continue;
+        };
+        rules.push(LeakRule {
+            id: obj.id.clone(),
+            label: obj
+                .properties
+                .get("label")
+                .cloned()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| obj.name.clone()),
+            pattern,
+            action: LeakAction::parse(
+                obj.properties
+                    .get("action")
+                    .map(String::as_str)
+                    .unwrap_or("block"),
+            ),
+        });
+    }
+    rules
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,5 +414,108 @@ mod tests {
             },
         ];
         assert_eq!(entity_scan_literals(&objects), vec!["asset:ABC"]);
+    }
+
+    #[test]
+    fn privacy_scan_cache_skips_entity_list_when_leak_rules_unchanged() {
+        let cache = PrivacyScanCache::default();
+        let leak = Object {
+            id: "leak-1".into(),
+            kind: "leak_rule".into(),
+            name: "company".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:company".into(),
+            properties: HashMap::from([
+                ("pattern".into(), "SecretCo".into()),
+                ("label".into(), "company_name".into()),
+                ("action".into(), "block".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        };
+        let asset = Object {
+            id: "asset-1".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        let leak_calls = std::cell::Cell::new(0);
+        let entity_calls = std::cell::Cell::new(0);
+        let load = || {
+            cache.load(
+                "alpha",
+                true,
+                || {
+                    leak_calls.set(leak_calls.get() + 1);
+                    Ok::<_, ()>(vec![leak.clone()])
+                },
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(vec![asset.clone()])
+                },
+            )
+        };
+        let (first_rules, first_entities) = load().unwrap();
+        let (second_rules, second_entities) = load().unwrap();
+        assert_eq!(leak_calls.get(), 2);
+        assert_eq!(entity_calls.get(), 1);
+        assert_eq!(first_rules.len(), 1);
+        assert_eq!(first_entities.as_slice(), ["SecretCo", "asset:SECRET"]);
+        assert_eq!(second_rules[0].id, first_rules[0].id);
+        assert_eq!(second_entities.as_slice(), first_entities.as_slice());
+    }
+
+    #[test]
+    fn privacy_scan_cache_reloads_entities_when_leak_rules_change() {
+        let cache = PrivacyScanCache::default();
+        let mut leak = Object {
+            id: "leak-1".into(),
+            kind: "leak_rule".into(),
+            name: "company".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:company".into(),
+            properties: HashMap::from([("pattern".into(), "SecretCo".into())]),
+            created: 0,
+            updated: 0,
+        };
+        let asset = Object {
+            id: "asset-1".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        let entity_calls = std::cell::Cell::new(0);
+        cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(vec![leak.clone()]),
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(vec![asset.clone()])
+                },
+            )
+            .unwrap();
+        leak.properties.insert("pattern".into(), "OtherCo".into());
+        cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(vec![leak.clone()]),
+                || {
+                    entity_calls.set(entity_calls.get() + 1);
+                    Ok(vec![asset.clone()])
+                },
+            )
+            .unwrap();
+        assert_eq!(entity_calls.get(), 2);
     }
 }
