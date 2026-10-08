@@ -124,8 +124,8 @@ impl PostgresDb {
         run.output_digest = if incremental {
             checkpoint
                 .as_ref()
-                .map(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
-                .unwrap_or_else(|| rows_digest(&output_rows))
+                .and_then(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
+                .ok_or_else(|| "checkpoint digest encoding is not current".to_string())?
         } else {
             rows_digest(&output_rows)
         };
