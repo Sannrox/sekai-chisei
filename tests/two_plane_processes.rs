@@ -191,6 +191,38 @@ fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request
 }
 
 #[test]
+fn chisei_plane_without_sekai_endpoint_refuses_to_boot() {
+    let dir = tempdir().unwrap();
+    let chisei_db = dir.path().join("chisei.db");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chisei-plane"));
+    command
+        .env("SEKAI_INSECURE", "1")
+        .env("SEKAI_BIND", "127.0.0.1")
+        .env("GRPC_PORT", free_port().to_string())
+        .env("SEKAI_SOCKET", "")
+        .env("OPS_PORT", "")
+        .env("SEKAI_HTTP_PORT", "")
+        .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap())
+        .env_remove("SEKAI_ENDPOINT")
+        .env_remove("SEKAI_DB_PATH")
+        .env_remove("SEKAI_DATABASE_URL")
+        .env_remove("CHISEI_DATABASE_URL")
+        .env_remove("DATABASE_URL")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "chisei-plane booted without SEKAI_ENDPOINT"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SEKAI_ENDPOINT"),
+        "expected actionable SEKAI_ENDPOINT error, got {stderr}"
+    );
+}
+
+#[test]
 fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
     let killer = ProcessKiller::default();
     run_async_with_deadline(

@@ -1864,16 +1864,6 @@ fn split_stores_resolve_context_objects_from_the_sekai_store() {
     let missed = pipeline.run(&mut chisei_only, &chisei);
     assert_eq!(missed.steps[0].action, "none");
     assert!(!missed.prepared_spec.contains("sekai-only context"));
-
-    let mut detached = request_with(SekaiFacts::not_attached());
-    let refused = pipeline.run(&mut detached, &chisei);
-    assert_eq!(refused.steps[0].action, "skipped");
-    assert!(
-        refused.steps[0]
-            .reasoning
-            .starts_with(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED)
-    );
-    assert!(!refused.prepared_spec.contains("sekai-only context"));
 }
 
 #[test]

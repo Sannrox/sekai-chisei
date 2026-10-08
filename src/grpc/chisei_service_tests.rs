@@ -4980,10 +4980,11 @@ async fn effective_policy_summary_reports_unconfigured_sections() {
 
 fn file_service(path: &str) -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
-    ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
-        config(path),
-    )
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    ChiseiServiceImpl::new(chisei, config(path))
+        .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn resolve_policy_request(
@@ -6434,12 +6435,14 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
     {
         let mut cfg = config(&path);
         cfg.gateway_provided_providers = vec!["openai".into()];
-        let svc = ChiseiServiceImpl::new(
-            crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
-                std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
-            ))),
-            cfg,
-        );
+        let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(
+            RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
+        ));
+        let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
+            .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+                shared_sekai_store(&chisei),
+            ))
+            .unwrap();
         svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
             namespace: "team-a".into(),
             allowed_runtimes: vec!["openai".into()],
@@ -6492,12 +6495,14 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
 
     let mut cfg = config(&path);
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
-            std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
-        ))),
-        cfg,
-    );
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+        std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
+    )));
+    let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
+        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+            shared_sekai_store(&chisei),
+        ))
+        .unwrap();
     assert!(
         svc.policy
             .context_admission_policy("team-a")
@@ -11085,52 +11090,40 @@ fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
 }
 
 #[test]
-fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
+fn chisei_plane_without_sekai_endpoint_refuses_to_build() {
     let dir = tempfile::tempdir().unwrap();
     let layout = split_layout(dir.path());
-    let (sekai_store, _) = layout.handles();
-    crate::composition::lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
     let mut config = crate::config::Config::from_env();
     config.sekai_endpoint = None;
-    let (_, chisei_svc) =
-        crate::grpc::build_services_for_plane(&config, &layout, crate::plane::ProcessPlane::Chisei)
-            .unwrap();
-
-    assert!(!chisei_svc.sekai_facts.reader().attached());
-    match evaluate_execute_lookup_first(
-        chisei_svc.sekai_facts.reader(),
-        &resolve_lookup_root_input(),
-        "alice",
+    let err = match crate::grpc::build_services_for_plane(
+        &config,
+        &layout,
+        crate::plane::ProcessPlane::Chisei,
     ) {
-        ExecuteLookupFirst::ModelPath { lookup_refusal } => assert_eq!(
-            lookup_refusal.as_deref(),
-            Some(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED)
-        ),
-        other => panic!("expected sekai_not_attached, got {other:?}"),
-    }
+        Ok(_) => panic!("chisei plane built without SEKAI_ENDPOINT"),
+        Err(err) => err,
+    };
+    assert!(err.contains("SEKAI_ENDPOINT"), "{err}");
 }
 
 /// Split stores: the namespace boundary and grants live only in the Sekai
 /// store, so Chisei authorization must read them through the Sekai fact port
 /// (#1269).
-fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
+fn split_store_service() -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
     let sekai_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
     let chisei_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let mut service = ChiseiServiceImpl::new(
+    let service = ChiseiServiceImpl::new(
         crate::db::store::ChiseiStore::from_shared_runtime(chisei_db),
         config(":memory:"),
-    );
-    if attach_sekai {
-        service = service
-            .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-                crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
-            ))
-            .unwrap();
-    }
+    )
+    .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+        crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
+    ))
+    .unwrap();
     sekai_db
         .ensure_team_namespace(
             "acme",
@@ -11144,7 +11137,7 @@ fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>
 
 #[test]
 fn split_store_namespace_authorization_reads_sekai_grants() {
-    let (svc, _sekai) = split_store_service(true);
+    let (svc, _sekai) = split_store_service();
     assert!(
         svc.db
             .runtime()
@@ -11160,26 +11153,4 @@ fn split_store_namespace_authorization_reads_sekai_grants() {
     ] {
         assert_eq!(denied.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
-}
-
-#[test]
-fn namespace_authorization_without_sekai_denies_with_an_explicit_reason() {
-    let (svc, _sekai) = split_store_service(false);
-    for denied in [
-        require_namespace_access(svc.sekai_facts.reader(), "alice", "acme"),
-        require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme"),
-        require_namespace_admin_access(svc.sekai_facts.reader(), "alice", None, "acme"),
-    ] {
-        let status = denied.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
-        assert!(
-            status
-                .message()
-                .ends_with(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED),
-            "{}",
-            status.message()
-        );
-    }
-    // Trusted local principals never depend on Sekai grants.
-    require_namespace_access(svc.sekai_facts.reader(), "local", "acme").unwrap();
 }

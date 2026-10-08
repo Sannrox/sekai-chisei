@@ -345,7 +345,9 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
-            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
+                crate::db::store::SekaiStore::memory(),
+            ),
         }
     }
 
@@ -428,7 +430,9 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
-            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
+                crate::db::store::SekaiStore::memory(),
+            ),
         }
     }
 
@@ -440,10 +444,9 @@ impl ChiseiServiceImpl {
         self
     }
 
-    /// Attach the Sekai fact reader. Without it, lookup-first and object
-    /// context injection refuse with `sekai_not_attached`. Combined Split
-    /// loads namespace policies from the in-process store. A remote hop is
-    /// not RPC'd here: the channel would be cached on a throwaway runtime.
+    /// Attach the Sekai fact reader. Combined Split loads namespace policies
+    /// from the in-process store. A remote hop is not RPC'd here: the channel
+    /// would be cached on a throwaway runtime.
     pub fn with_sekai_facts(
         mut self,
         facts: crate::chisei::sekai_facts::SekaiFacts,

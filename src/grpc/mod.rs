@@ -1002,19 +1002,19 @@ pub fn build_services_for_plane(
                 .with_sekai_commit_lookup(Arc::new(sekai_store));
         }
         ProcessPlane::Chisei => {
-            if let Some(endpoint) = &config.sekai_endpoint {
-                chisei_svc = chisei_svc
-                    .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
-                        crate::grpc::remote_sekai::RemoteSekaiFactReader::from_env(
-                            endpoint.clone(),
-                        ),
-                    )))?
-                    .with_sekai_commit_lookup(Arc::new(
-                        crate::grpc::remote_sekai::RemoteSekaiCommitLookup::from_env(
-                            endpoint.clone(),
-                        ),
-                    ));
-            }
+            let endpoint = config.sekai_endpoint.as_deref().unwrap_or("");
+            plane.require_sekai_endpoint(Some(endpoint))?;
+            chisei_svc = chisei_svc
+                .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
+                    crate::grpc::remote_sekai::RemoteSekaiFactReader::from_env(
+                        endpoint.to_string(),
+                    ),
+                )))?
+                .with_sekai_commit_lookup(Arc::new(
+                    crate::grpc::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                        endpoint.to_string(),
+                    ),
+                ));
         }
         ProcessPlane::Sekai => {}
     }

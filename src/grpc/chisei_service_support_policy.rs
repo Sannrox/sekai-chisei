@@ -55,19 +55,15 @@ pub(super) fn resolve_action_policy_from_graph(
 
 /// Combined Split reads Sekai graph objects from the in-process store.
 /// A remote hop is authorization-filtered, so completeness cannot be
-/// established; callers fail closed until a hop exists. Unattached Combined
-/// tests fall back to the Chisei fact runtime.
+/// established; callers fail closed until a hop exists.
 pub(super) fn authoritative_graph_runtime<'a>(
     facts: &'a dyn crate::chisei::sekai_facts::SekaiFactReader,
-    fallback: &'a RuntimeDb,
+    _fallback: &'a RuntimeDb,
 ) -> Result<&'a RuntimeDb, String> {
     if let Ok(store) = facts.in_process_store() {
         return Ok(store.runtime());
     }
-    if facts.attached() {
-        return Err("graph policy resolution requires in-process Sekai graph storage".into());
-    }
-    Ok(fallback)
+    Err("graph policy resolution requires in-process Sekai graph storage".into())
 }
 
 pub(super) fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver) {
