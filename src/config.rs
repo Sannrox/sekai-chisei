@@ -65,6 +65,7 @@ pub struct Config {
     pub assertion_audience: Option<String>,
     pub assertion_hmac_key: Option<String>,
     /// Authenticated hop target for a Chisei process (`http://127.0.0.1:50051`).
+    /// Required to boot `chisei-plane` (ADR 0096 rule 4). Combined mode ignores it.
     pub sekai_endpoint: Option<String>,
 }
 

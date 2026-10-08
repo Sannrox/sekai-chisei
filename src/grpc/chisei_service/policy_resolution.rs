@@ -58,9 +58,7 @@ impl ChiseiServiceImpl {
         // throwaway runtime. Remote-only Chisei-plane stays failed-closed
         // until a dedicated policy-port exists; an empty PolicyResolver would
         // apply the unrestricted fallback.
-        if self.sekai_facts.reader().attached()
-            && self.sekai_facts.reader().in_process_store().is_err()
-        {
+        if self.sekai_facts.reader().in_process_store().is_err() {
             return Err(Status::failed_precondition(
                 "namespace policy resolution requires in-process Sekai graph storage",
             ));

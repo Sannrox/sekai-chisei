@@ -245,13 +245,16 @@ async fn a_governed_action_writes_back_to_the_warehouse_and_the_next_snapshot_sh
         chrono::Utc::now().timestamp_millis(),
     )
     .unwrap();
-    let sekai = SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
-        db.clone(),
-    ));
+    let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
+    let sekai = SekaiServiceImpl::new(sekai_store.clone());
     let chisei = ChiseiServiceImpl::new(
         sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
         fixture_config(),
-    );
+    )
+    .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
+        sekai_store,
+    ))
+    .unwrap();
 
     // The executor's table, seeded with the first committed snapshot.
     let store = TableStore::new(snapshot("orders-snapshot-1.json")).unwrap();

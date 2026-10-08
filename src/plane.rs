@@ -48,6 +48,25 @@ impl ProcessPlane {
         }
     }
 
+    /// Chisei-plane requires a hop target (ADR 0096 rule 4). Combined and
+    /// Sekai planes ignore the value. Palantir analog: Foundry compute
+    /// modules that use OSDK require `FOUNDRY_URL` at process start.
+    pub fn require_sekai_endpoint(self, endpoint: Option<&str>) -> Result<(), String> {
+        match self {
+            Self::Chisei => {
+                let trimmed = endpoint.map(str::trim).filter(|value| !value.is_empty());
+                if trimmed.is_none() {
+                    return Err(
+                        "chisei process requires SEKAI_ENDPOINT; set it to the Sekai gRPC address (for example http://127.0.0.1:50051)"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Combined | Self::Sekai => Ok(()),
+        }
+    }
+
     pub fn open_layout(self, default_sqlite_path: &str) -> Result<CombinedStoreLayout, String> {
         match self {
             Self::Combined => {
@@ -270,6 +289,26 @@ mod tests {
             postgres_max_connections: 16,
             ..CombinedStoreSources::default()
         }
+    }
+
+    #[test]
+    fn chisei_process_requires_sekai_endpoint() {
+        let err = ProcessPlane::Chisei
+            .require_sekai_endpoint(None)
+            .unwrap_err();
+        assert!(err.contains("SEKAI_ENDPOINT"), "{err}");
+        assert!(
+            ProcessPlane::Chisei
+                .require_sekai_endpoint(Some("http://127.0.0.1:50051"))
+                .is_ok()
+        );
+        assert!(ProcessPlane::Combined.require_sekai_endpoint(None).is_ok());
+        assert!(ProcessPlane::Sekai.require_sekai_endpoint(None).is_ok());
+        assert!(
+            ProcessPlane::Chisei
+                .require_sekai_endpoint(Some("   "))
+                .is_err()
+        );
     }
 
     #[test]

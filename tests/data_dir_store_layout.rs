@@ -103,7 +103,10 @@ fn each_plane_derives_only_its_own_file_from_the_data_dir() {
     boot(
         env!("CARGO_BIN_EXE_chisei-plane"),
         cwd.path(),
-        &[("SEKAI_DATA_DIR", chisei_dir.to_str().unwrap())],
+        &[
+            ("SEKAI_DATA_DIR", chisei_dir.to_str().unwrap()),
+            ("SEKAI_ENDPOINT", "http://127.0.0.1:1"),
+        ],
     );
     assert!(chisei_dir.join("chisei.db").is_file());
     assert!(!chisei_dir.join("sekai.db").exists());

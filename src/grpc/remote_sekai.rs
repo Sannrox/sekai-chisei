@@ -612,7 +612,6 @@ mod tests {
             reader.find_namespace_boundary("unmanaged"),
             Err(SekaiFactError::Unsupported(_))
         ));
-        assert!(reader.attached());
         assert!(matches!(
             reader.in_process_store(),
             Err(SekaiFactError::Unsupported(_))

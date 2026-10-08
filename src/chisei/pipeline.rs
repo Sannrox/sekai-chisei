@@ -52,7 +52,7 @@ pub struct PipelineRequest {
     pub(crate) risk_signals: Vec<String>,
     pub(crate) operation_risk_override: Option<OperationRisk>,
     /// Read port for Sekai facts (context objects, grants, schemas, links).
-    /// Not attached means no object context, never Chisei-store reads.
+    /// Combined and Chisei processes always have an attached Sekai.
     pub sekai_facts: SekaiFacts,
 }
 
@@ -384,7 +384,7 @@ fn resolve_context_objects(req: &PipelineRequest) -> Vec<crate::domain::Object> 
 }
 
 /// Resolve context objects and keep the first Sekai read failure, so callers
-/// can report an unreachable or detached Sekai instead of "no context".
+/// can report an unreachable Sekai instead of "no context".
 fn resolve_context_objects_reporting(
     req: &PipelineRequest,
 ) -> (Vec<crate::domain::Object>, Option<SekaiFactError>) {

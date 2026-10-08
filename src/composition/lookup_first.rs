@@ -2172,31 +2172,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_without_attached_sekai_refuses_explicitly() {
-        let detached = crate::chisei::sekai_facts::SekaiNotAttached;
-        for capability in LOOKUP_FIRST_ALLOWLIST {
-            match try_lookup_first(
-                capability,
-                "acme",
-                "alice",
-                r#"{"external_id":"widget:lookup-root"}"#,
-                &detached,
-            )
-            .unwrap()
-            {
-                LookupDecision::Refusal { reason, .. } => {
-                    assert_eq!(reason, crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED);
-                }
-                other => panic!("expected sekai_not_attached refusal, got {other:?}"),
-            }
-        }
-        assert_eq!(
-            try_lookup_first("free_form", "acme", "alice", "{}", &detached).unwrap(),
-            LookupDecision::NotEligible
-        );
-    }
-
-    #[test]
     fn grant_reads_through_the_port_decide_like_the_standalone_context() {
         use crate::chisei::principal::PrincipalRole;
         let db = SekaiStore::memory();

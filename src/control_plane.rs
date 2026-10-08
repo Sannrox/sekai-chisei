@@ -13,6 +13,9 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
     // Refuse retired single-store variables before anything touches the data dir.
     crate::combined_stores::refuse_legacy_store_env().map_err(std::io::Error::other)?;
     let config = Config::from_env();
+    plane
+        .require_sekai_endpoint(config.sekai_endpoint.as_deref())
+        .map_err(std::io::Error::other)?;
     tracing::info!(
         version = crate::build_info::PKG_VERSION,
         git_version = crate::build_info::GIT_VERSION,

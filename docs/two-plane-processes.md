@@ -52,9 +52,8 @@ serves only to an admin credential. With a less privileged `SEKAI_CREDENTIAL`
 those reads are refused and object context is dropped, not leaked. A namespace
 boundary the hop credential cannot see is not treated as absent, so a namespace
 without a visible boundary yields no context for non-local actors over the hop.
-An unreachable Sekai skips object context with `sekai_read_failed`. Without
-`SEKAI_ENDPOINT`, lookup-first refuses with `sekai_not_attached` and object
-context injection is skipped with the same reason.
+An unreachable Sekai skips object context with `sekai_read_failed`.
+`chisei-plane` requires `SEKAI_ENDPOINT` at boot (ADR 0096 rule 4).
 
 ## Gateway
 
