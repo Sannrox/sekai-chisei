@@ -8771,6 +8771,66 @@ fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
 }
 
 #[test]
+fn privacy_entity_scan_allows_harmless_payload_when_namespace_has_many_leak_rules() {
+    let svc = memory_service();
+    let extra = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize + 100;
+    for index in 0..extra {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("leak-fill-{index:04}"),
+                kind: "leak_rule".into(),
+                name: format!("fill-{index}"),
+                namespace: "alpha".into(),
+                external_id: format!("leak_rule:fill-{index:04}"),
+                properties: std::collections::HashMap::from([
+                    ("pattern".into(), format!("^__fill_never_{index}$")),
+                    ("label".into(), format!("fill-{index}")),
+                    ("action".into(), "block".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let findings = svc
+        .leak_findings_for_payload("alpha", "openai", DataClass::Sensitive, "harmless payload")
+        .unwrap();
+    assert!(
+        findings.is_empty(),
+        "leak rules must not fill the entity scan: {findings:?}"
+    );
+}
+
+#[test]
+fn privacy_entity_scan_safe_provider_passes_when_scan_is_truncated() {
+    let svc = memory_service();
+    let limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+    for index in 0..=limit {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("fill-{index:04}"),
+                kind: "asset".into(),
+                name: format!("Name{index:04}"),
+                namespace: "alpha".into(),
+                external_id: format!("asset:{index:04}"),
+                properties: std::collections::HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let findings = svc
+        .leak_findings_for_payload("alpha", "ollama", DataClass::Sensitive, "harmless payload")
+        .unwrap();
+    assert!(
+        findings.is_empty(),
+        "safe provider must not be blocked by a truncated scan: {findings:?}"
+    );
+}
+
+#[test]
 fn privacy_leak_rules_page_past_max_list_limit() {
     let svc = memory_service();
     let page = crate::domain::MAX_LIST_LIMIT as usize;

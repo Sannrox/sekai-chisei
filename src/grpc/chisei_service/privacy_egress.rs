@@ -76,12 +76,37 @@ impl ChiseiServiceImpl {
     }
 
     fn list_entity_scan_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
-        self.list_fact_objects(&ListFilter {
-            namespace: Some(namespace.to_string()),
-            limit: crate::chisei::privacy::ENTITY_SCAN_LIMIT,
-            ..Default::default()
-        })
-        .map_err(|error| format!("sensitive-entity policy unavailable: {error}"))
+        // Palantir analog: Search Objects is per object type; leak_rule is
+        // policy, not the entity set. Probe one past ENTITY_SCAN_LIMIT so a
+        // complete page is not treated as truncated (nextPageToken analog).
+        let scan_limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+        let mut objects = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_fact_objects(&ListFilter {
+                    namespace: Some(namespace.to_string()),
+                    limit: crate::domain::MAX_LIST_LIMIT,
+                    offset,
+                    ..Default::default()
+                })
+                .map_err(|error| format!("sensitive-entity policy unavailable: {error}"))?;
+            let page_len = page.len() as i32;
+            for object in page {
+                if object.kind == "leak_rule" {
+                    continue;
+                }
+                objects.push(object);
+                if objects.len() > scan_limit {
+                    return Ok(objects);
+                }
+            }
+            if page_len < crate::domain::MAX_LIST_LIMIT {
+                break;
+            }
+            offset = offset.saturating_add(page_len);
+        }
+        Ok(objects)
     }
 
     pub(super) fn record_egress_audit(
