@@ -104,6 +104,7 @@ impl ChiseiServiceImpl {
         context: Option<crate::enterprise::AuthenticatedContext>,
         requested_plan: ExecutionPlan,
     ) -> Result<<Self as ChiseiService>::ExecutePlanStreamStream, Status> {
+        self.require_in_process_namespace_policy()?;
         let plan = {
             let mut plans = self
                 .planned_executions

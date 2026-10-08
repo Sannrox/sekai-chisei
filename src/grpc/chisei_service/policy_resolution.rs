@@ -9,6 +9,18 @@ use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
 impl ChiseiServiceImpl {
+    /// Palantir analog: a scoped token with no usable scope has no permissions.
+    /// Hop-only Chisei cannot load a complete namespace policy set, so every
+    /// reader refuses instead of applying the unrestricted fallback.
+    pub(super) fn require_in_process_namespace_policy(&self) -> Result<(), Status> {
+        if self.sekai_facts.reader().in_process_store().is_err() {
+            return Err(Status::failed_precondition(
+                "namespace policy resolution requires in-process Sekai graph storage",
+            ));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) async fn resolve_policy(
         &self,
@@ -58,11 +70,7 @@ impl ChiseiServiceImpl {
         // throwaway runtime. Remote-only Chisei-plane stays failed-closed
         // until a dedicated policy-port exists; an empty PolicyResolver would
         // apply the unrestricted fallback.
-        if self.sekai_facts.reader().in_process_store().is_err() {
-            return Err(Status::failed_precondition(
-                "namespace policy resolution requires in-process Sekai graph storage",
-            ));
-        }
+        self.require_in_process_namespace_policy()?;
         let (policy_scope, effective_policy) = self
             .policy
             .effective_policy_for_scopes(&scopes)

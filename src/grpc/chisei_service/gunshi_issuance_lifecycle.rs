@@ -47,6 +47,7 @@ impl ChiseiServiceImpl {
                 "server-issued recommendations require at least one operation",
             ));
         }
+        self.require_in_process_namespace_policy()?;
         let mut scopes = input
             .request
             .operations

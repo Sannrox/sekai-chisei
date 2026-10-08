@@ -20,6 +20,7 @@ impl ChiseiServiceImpl {
         input: ExecutionInput,
         authenticated_actor: &str,
     ) -> Result<ExecutionPlan, Status> {
+        self.require_in_process_namespace_policy()?;
         let plan_id = uuid::Uuid::new_v4().to_string();
         let mut context_projection_latency_ms = 0_u64;
         let normalized_user_id =

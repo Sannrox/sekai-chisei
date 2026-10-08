@@ -493,6 +493,7 @@ impl ChiseiServiceImpl {
                 "Gunshi allocation namespace does not match execution input",
             ));
         }
+        self.require_in_process_namespace_policy()?;
         let current_policy_version = self
             .policy
             .effective_policy(&allocation.namespace)
