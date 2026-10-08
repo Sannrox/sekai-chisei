@@ -2,7 +2,7 @@ use sekai_chisei::db::function::FunctionBackend;
 use sekai_chisei::db::graph::GraphBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::domain::Object;
-use sekai_chisei::sekai::function::{FuncParam, Function, PipelineStep};
+use sekai_chisei::sekai::function::{FuncParam, Function, OperatorStep, PipelineStep};
 use sekai_chisei::sekai::schema::{InterfaceDef, ObjectType, PropertyDef, PropertyType};
 use std::collections::HashMap;
 
@@ -20,7 +20,7 @@ fn function(name: &str) -> Function {
             required: true,
         }],
         pipeline: vec![
-            PipelineStep {
+            PipelineStep::Operator(OperatorStep {
                 op: "filter".into(),
                 kind: "component".into(),
                 property: String::new(),
@@ -30,8 +30,8 @@ fn function(name: &str) -> Function {
                 func: String::new(),
                 field: String::new(),
                 alias: String::new(),
-            },
-            PipelineStep {
+            }),
+            PipelineStep::Operator(OperatorStep {
                 op: "aggregate".into(),
                 kind: String::new(),
                 property: String::new(),
@@ -41,7 +41,7 @@ fn function(name: &str) -> Function {
                 func: "count".into(),
                 field: "id".into(),
                 alias: "n".into(),
-            },
+            }),
         ],
         created: 10,
     }

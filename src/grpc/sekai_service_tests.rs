@@ -2,6 +2,10 @@ use super::*;
 use std::collections::HashMap;
 use tonic::metadata::MetadataValue;
 
+fn operator_pipeline(op: &str, relation: &str, func: &str, alias: &str) -> PipelineStep {
+    proto_operator_step(op, "", relation, func, "", alias)
+}
+
 fn service() -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
@@ -3701,6 +3705,73 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
 }
 
 #[tokio::test]
+async fn create_function_rejects_an_empty_pipeline_step() {
+    let svc = service();
+    let error = svc
+        .create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "empty-step".into(),
+                pipeline: vec![PipelineStep { step: None }],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("pipeline step required"));
+}
+
+#[tokio::test]
+async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_host() {
+    let svc = service();
+    let schema =
+        r#"{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}"#;
+    svc.create_function(with_principal(CreateFunctionRequest {
+        function: Some(Function {
+            name: "classify".into(),
+            pipeline: vec![PipelineStep {
+                step: Some(pipeline_step::Step::Llm(LlmStep {
+                    prompt_revision: "classify/v1".into(),
+                    input_bindings: HashMap::from([("language".into(), "language".into())]),
+                    output_schema: schema.into(),
+                    model_route: "native/scripted".into(),
+                })),
+            }],
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_functions(with_principal(ListFunctionsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .functions;
+    let function = listed
+        .iter()
+        .find(|function| function.name == "classify")
+        .expect("classify function");
+    match function.pipeline[0].step.as_ref() {
+        Some(pipeline_step::Step::Llm(step)) => {
+            assert_eq!(step.prompt_revision, "classify/v1");
+            assert_eq!(step.model_route, "native/scripted");
+            assert_eq!(step.output_schema, schema);
+        }
+        other => panic!("expected llm step, got {other:?}"),
+    }
+    let error = svc
+        .invoke_function(with_principal(InvokeFunctionRequest {
+            name: "classify".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(error.message().contains("llm step requires a host"));
+}
+
+#[tokio::test]
 async fn computed_property_resolves_from_function_without_persisting() {
     let svc = service();
     grant_schema_admin(&svc);
@@ -3710,39 +3781,9 @@ async fn computed_property_resolves_from_function_without_persisting() {
             description: "".into(),
             params: vec![],
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "traverse".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "contains".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "child_count".into(),
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("traverse", "contains", "", ""),
+                operator_pipeline("aggregate", "", "count", "child_count"),
             ],
             created: 1,
         }),
@@ -3962,21 +4003,9 @@ async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
         function: Some(Function {
             name: "count_policy_children".into(),
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    ..Default::default()
-                },
-                PipelineStep {
-                    op: "traverse".into(),
-                    relation: "contains".into(),
-                    ..Default::default()
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    func: "count".into(),
-                    r#as: "child_count".into(),
-                    ..Default::default()
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("traverse", "contains", "", ""),
+                operator_pipeline("aggregate", "", "count", "child_count"),
             ],
             ..Default::default()
         }),
@@ -4137,21 +4166,9 @@ async fn computed_properties_respect_team_namespace_boundaries() {
             function: Some(Function {
                 name: "count_team_children".into(),
                 pipeline: vec![
-                    PipelineStep {
-                        op: "self".into(),
-                        ..Default::default()
-                    },
-                    PipelineStep {
-                        op: "traverse".into(),
-                        relation: "contains".into(),
-                        ..Default::default()
-                    },
-                    PipelineStep {
-                        op: "aggregate".into(),
-                        func: "count".into(),
-                        r#as: "child_count".into(),
-                        ..Default::default()
-                    },
+                    operator_pipeline("self", "", "", ""),
+                    operator_pipeline("traverse", "contains", "", ""),
+                    operator_pipeline("aggregate", "", "count", "child_count"),
                 ],
                 ..Default::default()
             }),
@@ -4272,39 +4289,9 @@ async fn unresolved_computed_property_hides_stored_value() {
             description: "".into(),
             params: vec![],
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "first".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "second".into(),
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("aggregate", "", "count", "first"),
+                operator_pipeline("aggregate", "", "count", "second"),
             ],
             created: 1,
         }),

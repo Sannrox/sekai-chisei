@@ -134,7 +134,7 @@ message FuncParam {
   bool required = 3;
 }
 
-message PipelineStep {
+message OperatorStep {
   string op = 1;
   string kind = 2;
   string property = 3;
@@ -144,6 +144,20 @@ message PipelineStep {
   string func = 7;
   string field = 8;
   string as = 9;
+}
+
+message LlmStep {
+  string prompt_revision = 1;
+  map<string, string> input_bindings = 2;
+  string output_schema = 3;
+  string model_route = 4;
+}
+
+message PipelineStep {
+  oneof step {
+    OperatorStep operator = 1;
+    LlmStep llm = 2;
+  }
 }
 
 message Dataset {
@@ -926,10 +940,15 @@ message FunctionReceipt {
   uint32 steps = 6;
   string budget_exceeded = 7;
   string output_digest = 8;
+  string prompt_digest = 9;
+  string model_route = 10;
+  string input_digest = 11;
+  string schema_error = 12;
 }
 message InvokeFunctionResponse {
   map<string, string> aggregates = 1;
   FunctionReceipt receipt = 2;
+  string structured_json = 3;
 }
 
 message CreateDatasetRequest { Dataset dataset = 1; }
