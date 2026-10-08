@@ -36,7 +36,8 @@ This ADR names the execution host.
 5. `sekaictl admin transform` is the mutation path. The operator console
    lists definitions and run receipts. Wire RPCs stay `experimental`
    (stable set is capped); DiscoverCapabilities reports
-   `sekai.transforms.projection` as an active core class.
+   `sekai.transforms.projection` on the core pack, with `lifecycle_state`
+   `disabled` unless the experimental RPC gate is on.
 
 ## Alternatives considered
 
