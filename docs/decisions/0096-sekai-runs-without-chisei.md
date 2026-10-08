@@ -93,14 +93,13 @@ that may only shrink.
   a deployment mode.
 - Sekai keeps rechecking current authorization on commit; a Chisei decision
   is never a substitute (ADR 0082).
-- Open question: whether a separate `chisei-plane` process is worth keeping.
-  Without it, the Chisei-side traits over Sekai state become direct calls and
-  the remote lookup goes away. Decide in a follow-up research Issue.
+- The separate `chisei-plane` process stays. Combined mode remains the default
+  local binary. Decided in [ADR 0098](0098-keep-chisei-plane-process.md).
 
 Follow-up work, each its own Issue: require Sekai in Chisei and delete
 not-attached paths; move shared vocabulary into Sekai; add the Sekai-owned
-budget, proposal, and receipt ports; move the adapters out of Sekai; decide
-on the separate `chisei-plane` process.
+budget, proposal, and receipt ports; move the adapters out of Sekai. The
+separate `chisei-plane` process is kept ([ADR 0098](0098-keep-chisei-plane-process.md)).
 
 ## Validation
 
