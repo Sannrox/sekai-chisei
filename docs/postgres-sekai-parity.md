@@ -79,59 +79,25 @@ case is ignored and needs `SEKAI_TEST_POSTGRES_URL` for a server the test may
 create a scratch database on.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
-treat inventory “complete” as dual-backend for these RPCs):
-
-- query-time ontology entailment (`RetrieveContext`, `ExpandRelations`, and
-  lookup-first expansion in `entailment` mode; those RPCs are classified
-  `experimental` and require `SEKAI_EXPERIMENTAL_RPCS=1` or the
-  `experimental-rpcs` feature; see [rpc-maturity.md](rpc-maturity.md),
-  [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
-  [capability catalog](capability-catalog.md));
-- dataset row `append_rows` / `query_rows` through the community `RuntimeDb`
-  dispatcher;
-- execution-evidence reject and record helpers used by evidence admission;
-- SQLite-named retention run/purge/`archive_retained_records` (Postgres uses
-  `archive_lifecycle_records` instead);
-- multi-control-plane federation site/peer tables (see
-  [federation-profile.md](federation-profile.md));
-- purpose authorizations for `required_purpose` reads (`sekai.purpose-authorization/v1`;
-  see [ADR 0031](decisions/0031-purpose-bound-reads.md));
-- classification lattice publication (`sekai.classification-lattice/v1`;
-  see [ADR 0032](decisions/0032-hierarchical-classifications.md)); PostgreSQL
-  get returns no lattice so the default ceiling remains;
-- signed namespace snapshots and imported assertion provenance
-  (`sekai.namespace-snapshot/v1`, `sekai.federation-provenance/v1`; see
-  [ADR 0029](decisions/0029-signed-namespace-snapshots.md) and
-  [ADR 0034](decisions/0034-cross-site-import-provenance.md));
-- source-webhook verifying-key pins (`sekai.source-webhook-delivery/v1`; see
-  [ADR 0035](decisions/0035-source-webhook-transport.md)); batch apply keeps its
-  existing dual-backend path;
-- registered source-type descriptors (`sekai.source-type-descriptor/v1`; see
-  [ADR 0060](decisions/0060-additive-source-type-descriptors.md)); GitHub
-  `ApplySourceBatch` keeps its existing dual-backend path;
-- registered Iceberg and Parquet snapshot projections
-  (`sekai.open-table-source/v1`; see
-  [ADR 0036](decisions/0036-open-table-projections.md));
-- governed documents and renditions
-  (`sekai.governed-document/v1`; see
-  [ADR 0039](decisions/0039-governed-documents.md));
-- governed images, renditions, and annotations
-  (`sekai.governed-image/v1`; see
-  [ADR 0050](decisions/0050-governed-images.md));
-- versioned client packages
-  (`sekai.client-package/v1`; see
-  [ADR 0051](decisions/0051-versioned-client-packages.md));
-- capability-package certifications
-  (`sekai.capability-package-certification/v1`; see
-  [ADR 0052](decisions/0052-capability-package-certification.md));
-- federation network contracts
-  (`sekai.federation-network-contract/v1`; see
-  [ADR 0053](decisions/0053-federation-network-contracts.md));
+treat inventory “complete” as dual-backend for these RPCs) live in the
+shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
+Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
+`ExpandRelations` (asserted-only on PostgreSQL; see
+[rpc-maturity.md](rpc-maturity.md),
+[ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
+[capability catalog](capability-catalog.md)).
+Admin projections on that list still include governed images
+(`sekai.governed-image/v1`; see
+[ADR 0050](decisions/0050-governed-images.md)) and versioned client packages
+(`sekai.client-package/v1`; see
+[ADR 0051](decisions/0051-versioned-client-packages.md)).
 
 Evidence is checked in as:
 
 | Artifact | Role |
 | --- | --- |
+| `tests/fixtures/sqlite_only_surfaces/v1.json` | Shrink-only SQLite-only RPCs and admin projections |
 | `tests/fixtures/sekai_rpc_inventory/v1.json` | Fail-closed map of every `SekaiService` RPC to evidence |
 | `tests/fixtures/runtime_backend/postgres-sekai-complete-v1.json` | Complete reusable Sekai capability advertisement |
 | `tests/*_backend_conformance.rs` and related harnesses | Shared SQLite/PostgreSQL surface fixtures |

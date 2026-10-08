@@ -1,0 +1,182 @@
+{
+  "version": "sekai.sqlite-only-surfaces/v1",
+  "issue": 1316,
+  "limit": 35,
+  "surfaces": [
+    {
+      "id": "SekaiService.PutPurposeAuthorization",
+      "kind": "rpc",
+      "methods": ["put_purpose_authorization"]
+    },
+    {
+      "id": "SekaiService.RevokePurposeAuthorization",
+      "kind": "rpc",
+      "methods": ["revoke_purpose_authorization"]
+    },
+    {
+      "id": "SekaiService.PutClassificationLattice",
+      "kind": "rpc",
+      "methods": ["put_classification_lattice"]
+    },
+    {
+      "id": "SekaiService.GetClassificationLattice",
+      "kind": "rpc",
+      "methods": ["get_classification_lattice"]
+    },
+    {
+      "id": "SekaiService.RegisterSourceTypeDescriptor",
+      "kind": "rpc",
+      "methods": ["put_source_type_descriptor"]
+    },
+    {
+      "id": "SekaiService.InspectSourceTypeDescriptor",
+      "kind": "rpc",
+      "methods": ["get_source_type_descriptor"]
+    },
+    {
+      "id": "SekaiService.RetireSourceTypeDescriptor",
+      "kind": "rpc",
+      "methods": ["cas_source_type_descriptor"]
+    },
+    {
+      "id": "SekaiService.DecideActionInstance",
+      "kind": "rpc",
+      "methods": ["decide_parked_action_instance"]
+    },
+    {
+      "id": "SekaiService.PutActionBinding",
+      "kind": "rpc",
+      "methods": ["put_action_binding"]
+    },
+    {
+      "id": "SekaiService.RunActionBinding",
+      "kind": "rpc",
+      "methods": ["get_action_binding", "advance_action_binding_cursor"]
+    },
+    {
+      "id": "SekaiService.AppendRows",
+      "kind": "rpc",
+      "methods": ["append_rows"]
+    },
+    {
+      "id": "SekaiService.QueryRows",
+      "kind": "rpc",
+      "methods": ["query_rows"]
+    },
+    {
+      "id": "SekaiService.DeleteOntologyClass",
+      "kind": "rpc",
+      "methods": ["delete_ontology_class_with_audit"]
+    },
+    {
+      "id": "SekaiService.DeleteOntologyRelation",
+      "kind": "rpc",
+      "methods": ["delete_ontology_relation_with_audit"]
+    },
+    {
+      "id": "ChiseiService.RedeemExternalActionPermit",
+      "kind": "rpc",
+      "methods": ["redeem_permit"]
+    },
+    {
+      "id": "ChiseiService.GetEffectivePolicySummary",
+      "kind": "rpc",
+      "methods": ["budget_limits_for_scope"]
+    },
+    {
+      "id": "ChiseiService.IssueGunshiRecommendations",
+      "kind": "rpc",
+      "methods": ["get_gunshi_allocation_state"]
+    },
+    {
+      "id": "ChiseiService.SetGunshiAllocationPolicy",
+      "kind": "rpc",
+      "methods": ["put_gunshi_allocation_state_cas"]
+    },
+    {
+      "id": "ChiseiService.GetGunshiAllocationStatus",
+      "kind": "rpc",
+      "methods": ["get_gunshi_allocation_state"]
+    },
+    {
+      "id": "admin.connector-certification",
+      "kind": "admin",
+      "methods": ["get_connector_certification", "commit_connector_certifications"]
+    },
+    {
+      "id": "admin.warehouse-projection",
+      "kind": "admin",
+      "methods": ["get_warehouse_projection", "put_warehouse_projection"]
+    },
+    {
+      "id": "admin.lakehouse-snapshot",
+      "kind": "admin",
+      "methods": ["get_lakehouse_snapshot", "put_lakehouse_snapshot"]
+    },
+    {
+      "id": "admin.model-platform",
+      "kind": "admin",
+      "methods": ["get_model_platform_certification", "put_model_platform_certification"]
+    },
+    {
+      "id": "admin.autonomous-envelope",
+      "kind": "admin",
+      "methods": ["get_autonomous_envelope", "put_autonomous_envelope"]
+    },
+    {
+      "id": "admin.capability-package",
+      "kind": "admin",
+      "methods": ["get_capability_package", "commit_capability_packages"]
+    },
+    {
+      "id": "admin.client-package",
+      "kind": "admin",
+      "methods": ["get_client_package", "commit_client_packages"]
+    },
+    {
+      "id": "admin.governed-image",
+      "kind": "admin",
+      "methods": ["put_governed_image", "get_governed_image"]
+    },
+    {
+      "id": "admin.governed-document",
+      "kind": "admin",
+      "methods": ["put_governed_document", "get_governed_document"]
+    },
+    {
+      "id": "admin.open-table",
+      "kind": "admin",
+      "methods": ["put_open_table_source", "get_open_table_source"]
+    },
+    {
+      "id": "admin.federation-network",
+      "kind": "admin",
+      "methods": ["get_network_contract", "put_network_contract"]
+    },
+    {
+      "id": "admin.federation-snapshot",
+      "kind": "admin",
+      "methods": ["put_federation_snapshot_export", "get_federation_snapshot_import"]
+    },
+    {
+      "id": "admin.source-webhook",
+      "kind": "admin",
+      "methods": ["put_source_webhook_key", "get_source_webhook_key"]
+    },
+    {
+      "id": "admin.data-quality",
+      "kind": "admin",
+      "methods": ["put_data_quality_rule", "get_data_quality_rule"]
+    },
+    {
+      "id": "admin.learning-change",
+      "kind": "admin",
+      "methods": ["put_learning_change", "get_learning_change"]
+    },
+    {
+      "id": "admin.retention",
+      "kind": "admin",
+      "methods": ["archive_retained_records"]
+    }
+  ]
+}

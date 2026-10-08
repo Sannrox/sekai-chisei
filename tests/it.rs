@@ -112,6 +112,7 @@ mod source_type_descriptor_catalog;
 mod source_type_descriptor_research;
 mod source_type_registered_batches;
 mod split_pool_budget;
+mod sqlite_only_surfaces;
 mod store_relocate_online;
 mod team_namespace_backend_conformance;
 mod tenant_isolation_conformance;
@@ -254,6 +255,7 @@ const GROUPED_MODULES: &[&str] = &[
     "source_type_descriptor_research",
     "source_type_registered_batches",
     "split_pool_budget",
+    "sqlite_only_surfaces",
     "store_relocate_online",
     "team_namespace_backend_conformance",
     "tenant_isolation_conformance",
@@ -362,6 +364,6 @@ fn grouped_it_target_discovers_former_self_contained_tests() {
             "{name} must remain a separate test executable"
         );
     }
-    assert_eq!(GROUPED_MODULES.len(), 113);
+    assert_eq!(GROUPED_MODULES.len(), 114);
     assert_eq!(SEPARATE_TARGETS.len(), 21);
 }

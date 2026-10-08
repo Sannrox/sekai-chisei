@@ -79,6 +79,7 @@ pub mod replay_cli;
 pub mod report_cli;
 pub mod rpc_maturity;
 pub mod runtime_backend;
+pub mod sqlite_only_surfaces;
 pub use sekai_domain::secrets;
 pub mod sekai;
 pub mod shomei;
