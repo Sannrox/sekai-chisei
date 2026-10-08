@@ -441,6 +441,12 @@ where
             })
             .await
         }
+        ("sekai.SekaiService", "DecideActionInstance") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::decide_action_instance(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "DescribeObjectAction") => {
             invoke_sekai(state, headers, body, |svc, req| async move {
                 SekaiService::describe_object_action(&*svc, req).await
@@ -456,6 +462,12 @@ where
         ("sekai.SekaiService", "GetActionInstance") => {
             invoke_sekai(state, headers, body, |svc, req| async move {
                 SekaiService::get_action_instance(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListActionInstances") => {
+            invoke_sekai(state, headers, body, |svc, req| async move {
+                SekaiService::list_action_instances(&*svc, req).await
             })
             .await
         }
@@ -1058,6 +1070,26 @@ mod tests {
         let (sekai, chisei, interceptor, token) = token_world();
         let app = router_for(sekai, chisei, interceptor);
         for rpc in ["RetrieveContext", "ExpandRelations", "ExplainDerivation"] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promoted_action_approval_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in ["DecideActionInstance", "ListActionInstances"] {
             let path = format!("/sekai.SekaiService/{rpc}");
             let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");

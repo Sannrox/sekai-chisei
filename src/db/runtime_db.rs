@@ -102,9 +102,6 @@ impl std::fmt::Debug for RuntimeDb {
 pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
     "action bindings are unavailable on the PostgreSQL community runtime";
 
-pub(crate) const DECIDE_ACTION_INSTANCE_UNAVAILABLE: &str =
-    "deciding a parked action instance is unavailable on the PostgreSQL community runtime";
-
 impl RuntimeDb {
     /// Labels this store's connection-pool signals with the plane it serves.
     pub(crate) fn set_pool_plane(&self, plane: crate::obs::labels::PoolPlane) {
@@ -3693,15 +3690,15 @@ impl RuntimeDb {
         }
     }
 
-    /// SQLite only: community PostgreSQL does not decide parked instances
-    /// yet and is not advertised for it (#1084).
     pub fn decide_parked_action_instance(
         &self,
         decided: &crate::sekai::action_instance::ActionInstance,
     ) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.decide_parked_action_instance(decided),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.decide_parked_action_instance(decided))
+            }
         }
     }
 
@@ -3721,7 +3718,15 @@ impl RuntimeDb {
                 write,
                 actor,
             ),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.grant_parked_action_instance(
+                    granted,
+                    target_object_id,
+                    parked_object_digest,
+                    write,
+                    actor,
+                )
+            }),
         }
     }
 
@@ -3734,7 +3739,12 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db
                 .transition_action_instance(crate::sekai::action_instance::STATUS_ADMITTED, parked),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transition_action_instance(
+                    crate::sekai::action_instance::STATUS_ADMITTED,
+                    parked,
+                )
+            }),
         }
     }
 

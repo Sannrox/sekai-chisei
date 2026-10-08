@@ -28,7 +28,7 @@ list grows. Port a surface, then remove it and lower `limit`.
 
 | Class | Meaning | Default build |
 | --- | --- | --- |
-| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 66 RPCs. | Invokable. |
+| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 68 RPCs. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
 | `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
 
@@ -64,10 +64,9 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 **Real backend** is `yes` when the RPC runs on both community runtimes,
 `sqlite only` when community PostgreSQL answers `UNAVAILABLE` before doing any
 work, and `fixture only` when no production backend exists. `stable` requires a
-real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. On
-community PostgreSQL a `require_approval` policy still parks an Action, but
-`DecideActionInstance` is `sqlite only`, so an instance parked there cannot be
-decided on that runtime.
+real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
+`require_approval` policy parks an Action on both community backends;
+`DecideActionInstance` grants or denies it on both.
 
 <!-- rpc-maturity-rows -->
 
@@ -171,13 +170,13 @@ decided on that runtime.
 | `SekaiService.ListGovernedActionTypes` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.DecideActionInstance` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.PutActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.RunActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
-| `SekaiService.ListActionInstances` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionEffects` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListClaimableActionWork` | `sekai.audit` | yes | none | `experimental` |

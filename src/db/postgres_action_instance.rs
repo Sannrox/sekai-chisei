@@ -1,7 +1,12 @@
 //! PostgreSQL ActionInstance store (#397).
 
 use crate::db::postgres::PostgresDb;
-use crate::sekai::action_instance::ActionInstance;
+use crate::db::postgres_audit::{
+    insert_created_object_in, lock_object_lifecycle, row_to_object, update_object_in,
+};
+use crate::sekai::action_instance::{
+    ActionInstance, ParkedGrantOutcome, ParkedGrantWrite, STATUS_PARKED, object_state_digest,
+};
 
 impl PostgresDb {
     pub fn get_action_instance_by_idempotency(
@@ -177,5 +182,115 @@ impl PostgresDb {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Moves a parked instance to its decided state. Returns false when the
+    /// instance is no longer parked, so the first decision wins.
+    pub fn decide_parked_action_instance(&self, decided: &ActionInstance) -> Result<bool, String> {
+        self.transition_action_instance(STATUS_PARKED, decided)
+    }
+
+    /// Replaces an instance only while it still has `expected_status`.
+    pub fn transition_action_instance(
+        &self,
+        expected_status: &str,
+        decided: &ActionInstance,
+    ) -> Result<bool, String> {
+        decided.validate_fields()?;
+        let body_json = serde_json::to_string(decided).map_err(|e| e.to_string())?;
+        self.connection()?
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
+                     decided_at_ms = $6, body_json = $7
+                 WHERE instance_id = $1 AND status = $8",
+                &[
+                    &decided.instance_id,
+                    &decided.status,
+                    &decided.deny_reason,
+                    &decided.policy_decision,
+                    &decided.budget_decision,
+                    &decided.decided_at_ms,
+                    &body_json,
+                    &expected_status,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Grants a parked instance and applies its object write in one
+    /// transaction, matching SQLite (#1139, #1314).
+    pub fn grant_parked_action_instance(
+        &self,
+        granted: &ActionInstance,
+        target_object_id: &str,
+        parked_object_digest: &str,
+        write: Option<&ParkedGrantWrite>,
+        actor: &str,
+    ) -> Result<ParkedGrantOutcome, String> {
+        granted.validate_fields()?;
+        let body_json = serde_json::to_string(granted).map_err(|e| e.to_string())?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let status: Option<String> = transaction
+            .query_opt(
+                "SELECT status FROM sekai_action_instances WHERE instance_id = $1 FOR UPDATE",
+                &[&granted.instance_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if status.as_deref() != Some(STATUS_PARKED) {
+            return Ok(ParkedGrantOutcome::NotParked);
+        }
+        if !target_object_id.is_empty() {
+            // Same order as postgres object update/delete: lifecycle lock, then row.
+            lock_object_lifecycle(&mut transaction, target_object_id)?;
+            let current = transaction
+                .query_opt(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                    &[&target_object_id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(row_to_object)
+                .transpose()?;
+            if object_state_digest(current.as_ref())? != parked_object_digest {
+                return Ok(ParkedGrantOutcome::Stale);
+            }
+        }
+        let previous = match write {
+            Some(ParkedGrantWrite::Create(object)) => {
+                insert_created_object_in(&mut transaction, object, actor, None)?;
+                None
+            }
+            Some(ParkedGrantWrite::Update(object)) => Some(
+                update_object_in(&mut transaction, object, None, actor, None)?
+                    .ok_or_else(|| format!("object {} not found", object.id))?,
+            ),
+            None => None,
+        };
+        transaction
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
+                     decided_at_ms = $6, body_json = $7
+                 WHERE instance_id = $1 AND status = $8",
+                &[
+                    &granted.instance_id,
+                    &granted.status,
+                    &granted.deny_reason,
+                    &granted.policy_decision,
+                    &granted.budget_decision,
+                    &granted.decided_at_ms,
+                    &body_json,
+                    &STATUS_PARKED,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(ParkedGrantOutcome::Granted { previous })
     }
 }

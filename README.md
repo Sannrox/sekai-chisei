@@ -126,8 +126,8 @@ network-accessible interface.
   RPCs; `SEKAI_EXPERIMENTAL_RPCS=1`);
 - policy resolution, context enrichment, budgets, model routing, and
   evaluation gates;
-- governed actions with dry runs, risk classes, and blast-radius limits (no
-  public Action approval RPC);
+- governed actions with dry runs, risk classes, blast-radius limits, and
+  public Action approval (`DecideActionInstance` / `ListActionInstances`);
 - OpenAI Responses and Chat Completions compatibility;
 - Anthropic Messages compatibility;
 - native governed execution and streaming gRPC APIs;
