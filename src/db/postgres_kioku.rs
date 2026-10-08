@@ -6,8 +6,8 @@ use crate::chisei::kioku::{
     MemoryLifecycleState, MemoryValidation, namespace_classification_ceiling,
 };
 use crate::chisei::principal::PrincipalContext;
+use crate::chisei::sekai_principal::principal_grants;
 use crate::db::postgres::PostgresDb;
-use crate::sekai::chisei_principal::principal_grants;
 use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 
 impl PostgresDb {

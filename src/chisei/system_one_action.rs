@@ -13,8 +13,8 @@ use sekai_provider::system_one::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-/// The parts of a governed Action type that System One reads. Sekai
-/// implements it for its governed Action types (ADR 0092 rule 5).
+/// The parts of a governed Action type that System One reads. Chisei
+/// implements it for Sekai governed Action types (ADR 0096 rule 6).
 pub trait SystemOneActionType {
     fn type_id(&self) -> &str;
     fn version(&self) -> &str;

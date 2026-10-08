@@ -38,6 +38,8 @@ pub mod kioku;
 pub mod learning_change;
 pub mod sekai_commit;
 pub mod sekai_facts;
+pub mod sekai_principal;
+pub mod sekai_projection;
 pub use sekai_provider::model_availability;
 pub mod model_routing;
 pub mod object_schema;
