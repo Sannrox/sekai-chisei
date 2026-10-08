@@ -63,7 +63,6 @@ Coverage:
 | Compatibility matrix (#873) | supported | Interface | `compatibility.json` via `sekaictl admin compatibility` | [sdk-packages.md](sdk-packages.md) | `src/compatibility_matrix.rs` |
 | Public RPC maturity (#871) | supported | Interface | `SekaiService.DiscoverCapabilities` | [rpc-maturity.md](rpc-maturity.md) | `src/rpc_maturity.rs` |
 | Provider-profile matrix | supported | Gateway | HTTP `chisei.provider-capabilities/v1` | [capability-catalog.md](capability-catalog.md) | `crates/chisei-gateway/src/gateway.rs` |
-| Action approval (park and decide) | experimental | Sekai | `SekaiService.DecideActionInstance` | [governed-action-instances.md](governed-action-instances.md) | `tests/native_server_smoke.rs` |
 | MCP adapter | supported | Interface | `sekai-mcp` stdio host | [capability-catalog.md](capability-catalog.md) | `tests/mcp_adapter.rs` |
 | HTTP/JSON ontology projection (#875) | supported | Interface | `POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
 | HTTP MCP projection (#875) | supported | Interface | `POST /mcp` | [rpc-maturity.md](rpc-maturity.md) | `src/http_projection.rs` |
@@ -127,5 +126,5 @@ advertised sekaictl/SDK loop on current `main`:
 - ObjectSet query as a typed sekaictl/SDK helper ([#835](https://github.com/Sannrox/sekai-chisei/issues/835)); `EvaluateObjectSet` stays MCP-allowlisted and stable on the wire;
 - application Action describe/preview as typed SDK helpers (`PreviewObjectAction` is MCP-allowlisted);
 - object-change subscription as a sekaictl/SDK loop step ([#838](https://github.com/Sannrox/sekai-chisei/issues/838));
-- a typed sekaictl/SDK helper for Action approval: `require_approval` now parks the instance and `DecideActionInstance` grants or denies it, but that RPC is experimental until a sekaictl or SDK consumer ships ([#1084](https://github.com/Sannrox/sekai-chisei/issues/1084)); preview still reports `require_approval` without granting it ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
+- a typed sekaictl/SDK helper for Action approval: `require_approval` parks the instance and `DecideActionInstance` grants or denies it on both community backends ([#1314](https://github.com/Sannrox/sekai-chisei/issues/1314)); `DecideActionInstance` / `ListActionInstances` stay stable on the wire with a host/example consumer; preview still reports `require_approval` without granting it ([#836](https://github.com/Sannrox/sekai-chisei/issues/836));
 - downloadable registry packages (publication records are not registry bytes).

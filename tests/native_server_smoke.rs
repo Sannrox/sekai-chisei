@@ -986,6 +986,22 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
         .expect("instance");
     assert_eq!(parked.status, "parked");
 
+    let inbox = sekai
+        .list_action_instances(bearer(
+            &approver,
+            ListActionInstancesRequest {
+                namespace: "demo".into(),
+                type_id: "incident.acknowledge".into(),
+                status: "parked".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("list parked: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(inbox.instances.len(), 1);
+    assert_eq!(inbox.instances[0].instance_id, parked.instance_id);
+
     // The operator socket's self-asserted identity cannot approve (#1140).
     let local = sekai
         .decide_action_instance(DecideActionInstanceRequest {

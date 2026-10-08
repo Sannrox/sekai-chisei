@@ -12,7 +12,7 @@ pub const SQLITE_ONLY_SURFACES_CONTRACT: &str = "sekai.sqlite-only-surfaces/v1";
 pub const SQLITE_ONLY_SURFACES_JSON: &str =
     include_str!("../tests/fixtures/sqlite_only_surfaces/v1.json");
 pub const RUNTIME_DB_SRC: &str = include_str!("db/runtime_db.rs");
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 35;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 34;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -326,7 +326,7 @@ mod tests {
         assert_eq!(list.surfaces.len(), SQLITE_ONLY_SURFACE_LIMIT);
         assert!(list.contains_rpc("SekaiService", "PutPurposeAuthorization"));
         assert!(list.contains_rpc("SekaiService", "RegisterSourceTypeDescriptor"));
-        assert!(list.contains_rpc("SekaiService", "DecideActionInstance"));
+        assert!(!list.contains_rpc("SekaiService", "DecideActionInstance"));
     }
 
     #[test]
@@ -374,7 +374,10 @@ mod tests {
         let closed = postgres_fail_closed_methods(RUNTIME_DB_SRC);
         assert!(closed.contains("put_purpose_authorization"));
         assert!(closed.contains("put_source_type_descriptor"));
-        assert!(closed.contains("decide_parked_action_instance"));
+        assert!(
+            !closed.contains("decide_parked_action_instance"),
+            "dual-backend decide must not look sqlite-only"
+        );
         assert!(
             !closed.contains("put_object_security_policy"),
             "dual-backend object security must not look sqlite-only"

@@ -292,23 +292,46 @@ fn advertised_loop_sources_exist() {
 
 #[test]
 fn action_approval_row_tracks_decide_maturity() {
-    // #1151: the park-and-decide surface is on the wire, so the contract
-    // must name it at its maturity rather than report it unavailable.
+    // #1151 named the park-and-decide surface while Decide was experimental
+    // so integrators would not treat it as unavailable. "supported" is the
+    // advertised sekaictl/SDK loop; a host/example consumer is not that loop.
     let row = rows()
         .into_iter()
-        .find(|row| row[0].starts_with("Action approval"))
-        .expect("action approval coverage row");
-    assert_eq!(contract_rpc_name(&row[3]), Some("DecideActionInstance"));
+        .find(|row| row[0].starts_with("Action approval"));
     let entry = RpcMaturityTable::load()
         .expect("maturity table")
         .entries
         .into_iter()
         .find(|entry| entry.rpc == "DecideActionInstance")
         .expect("DecideActionInstance maturity");
-    let expected = match entry.classification {
-        RpcClassification::Stable => "supported",
-        RpcClassification::Experimental => "experimental",
-        RpcClassification::Remove => "remove",
-    };
-    assert_eq!(row[1], expected);
+    match entry.classification {
+        RpcClassification::Experimental => {
+            let row = row.expect("experimental Decide must have a contract row");
+            assert_eq!(row[1], "experimental");
+            assert_eq!(contract_rpc_name(&row[3]), Some("DecideActionInstance"));
+        }
+        RpcClassification::Stable => {
+            if let Some(row) = row {
+                assert_ne!(
+                    row[1], "supported",
+                    "DecideActionInstance is not on the advertised sekaictl/SDK loop"
+                );
+                assert_ne!(
+                    row[1], "experimental",
+                    "stable DecideActionInstance must not require SEKAI_EXPERIMENTAL_RPCS"
+                );
+            }
+            assert!(
+                DOC.contains("DecideActionInstance"),
+                "gaps must still name the stable wire RPC"
+            );
+            assert!(
+                DOC.contains("typed sekaictl/SDK helper for Action approval"),
+                "gaps must still name the missing typed helper"
+            );
+        }
+        RpcClassification::Remove => {
+            panic!("DecideActionInstance is classified remove; update the contract")
+        }
+    }
 }

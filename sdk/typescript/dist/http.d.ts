@@ -112,6 +112,9 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "SubmitActionInstance";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "DecideActionInstance";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "DescribeObjectAction";
 }, {
     readonly service: "sekai.SekaiService";
@@ -119,6 +122,9 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "GetActionInstance";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListActionInstances";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "GetActionEffect";

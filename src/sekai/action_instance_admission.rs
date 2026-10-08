@@ -1304,6 +1304,24 @@ mod tests {
         db
     }
 
+    fn postgres_runtime() -> RuntimeDb {
+        use crate::db::postgres::PostgresDb;
+        use std::sync::Arc;
+
+        let database_url = std::env::var("SEKAI_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            panic!("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database")
+        });
+        let db = if let Ok(ca_certificate_path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        };
+        RuntimeDb::Postgres(Arc::new(db))
+    }
+
     const ONTOLOGY_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -2243,6 +2261,11 @@ mod tests {
         assert_eq!(parked.status, STATUS_PARKED);
         assert!(parked.deny_reason.is_empty());
         assert!(db.get_object("rec-9").unwrap().is_none());
+        let inbox = db
+            .list_action_instances("acme", None, Some(STATUS_PARKED), 10)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].instance_id, parked.instance_id);
         let open = db
             .get_operation_receipt("operation-record")
             .unwrap()
@@ -2302,6 +2325,81 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_require_approval_parks_lists_and_a_named_approver_grants() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("ns-1314-{suffix}");
+        let object_id = format!("rec-1314-{suffix}");
+        let type_id = format!("customer.record.create.{suffix}");
+        let db = postgres_runtime();
+        ensure_record_kind(&db);
+        let mut type_def = record_type("create");
+        type_def.namespace = namespace.clone();
+        type_def.type_id = type_id.clone();
+        type_def.approvers = vec!["bob".into()];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(&namespace);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            &type_id,
+            &format!(r#"{{"object_id":"{object_id}","title":"t"}}"#),
+        );
+        request.namespace = namespace.clone();
+        request.idempotency_key = format!("record-1314-{suffix}");
+        request.request_id = format!("operation-1314-{suffix}");
+        let parked = admission
+            .admit(request.clone(), "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        let inbox = db
+            .list_action_instances(&namespace, None, Some(STATUS_PARKED), 10)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].instance_id, parked.instance_id);
+        for principal in ["alice", "carol"] {
+            let error = admission
+                .decide(
+                    decision(&parked.instance_id, DECISION_GRANT, principal),
+                    principal,
+                    20,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ActionInstanceAdmissionError::PermissionDenied(DECISION_ACCESS_DENIED.into())
+            );
+        }
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                30,
+            )
+            .unwrap();
+        assert!(!granted.replay);
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+        assert_eq!(granted.instance.decided_by, "bob");
+        assert!(db.get_object(&object_id).unwrap().is_some());
+        let receipt = db
+            .get_operation_receipt(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(receipt.completed_at_ms.is_some());
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::ApprovalDecided && event.actor == "bob"
+        }));
+        assert!(
+            db.list_action_instances(&namespace, None, Some(STATUS_PARKED), 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

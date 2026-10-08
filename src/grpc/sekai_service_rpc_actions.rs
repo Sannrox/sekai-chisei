@@ -222,16 +222,6 @@ pub(super) async fn decide_action_instance(
 
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    // Before any lookup, so the answer never depends on whether an
-    // instance exists.
-    if matches!(
-        service.db.runtime(),
-        crate::db::runtime_db::RuntimeDb::Postgres(_)
-    ) {
-        return Err(Status::unavailable(
-            crate::db::runtime_db::DECIDE_ACTION_INSTANCE_UNAVAILABLE,
-        ));
-    }
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
     // An approval binds to one credentialed subject (#1140). Self-asserted

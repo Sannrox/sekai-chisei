@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `DecideActionInstance` and `ListActionInstances` are stable. Community
+  PostgreSQL grants or denies a parked instance with the same named-approver
+  rules as SQLite; `ListActionInstances.status` is the parked inbox. The
+  stable ceiling moves from 66 to 68 ([ADR 0071](docs/decisions/0071-rpc-maturity.md),
+  #1314).
 - Experimental function pipelines are a `oneof` of operator steps and `LlmStep`
   (prompt revision, input bindings, JSON Schema output, pinned model route).
   Invoke records prompt, input, and output digests on the receipt and fail-closes
