@@ -2015,7 +2015,7 @@ fn evaluable_only_gadget() -> (CountingTypes, Object) {
 }
 
 #[test]
-fn object_implements_retries_after_a_transient_type_lookup_err() {
+fn object_implements_does_not_retry_a_failed_type_lookup() {
     let (facts, obj) = evaluable_only_gadget();
     let mut type_cache = HashMap::new();
     assert!(!object_implements(
@@ -2024,20 +2024,32 @@ fn object_implements_retries_after_a_transient_type_lookup_err() {
         &obj,
         INTERFACE_EVALUABLE
     ));
-    assert!(object_implements(
+    assert!(!object_implements(
         &facts,
         &mut type_cache,
         &obj,
         INTERFACE_EVALUABLE
     ));
-    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
-fn is_evaluable_context_retries_evaluable_only_after_a_transient_type_lookup_err() {
+fn remaining_probes_after_a_failed_lookup_make_zero_further_hop_calls() {
     let (facts, obj) = evaluable_only_gadget();
     let mut type_cache = HashMap::new();
     assert!(!is_evaluable_context(&facts, &mut type_cache, &obj));
-    assert!(is_evaluable_context(&facts, &mut type_cache, &obj));
-    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(!object_implements(
+        &facts,
+        &mut type_cache,
+        &obj,
+        INTERFACE_EVALUABLE
+    ));
+    assert!(!is_degraded_evaluable(&facts, &mut type_cache, &obj, 30));
+    let other = Object {
+        id: "g2".into(),
+        name: "g2".into(),
+        ..obj.clone()
+    };
+    assert!(!is_evaluable_context(&facts, &mut type_cache, &other));
+    assert_eq!(facts.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
