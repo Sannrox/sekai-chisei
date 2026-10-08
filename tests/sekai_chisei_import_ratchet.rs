@@ -14,21 +14,9 @@ const NEEDLE: &str = "crate::chisei";
 /// `<file> <chisei module>` pairs still waiting to move (ADR 0096 disposition
 /// table). Remove an entry in the change that removes the edge.
 const ALLOWED: &[&str] = &[
-    "src/sekai/action_describe_preview.rs budget",
-    "src/sekai/action_describe_preview.rs system_one_action",
-    "src/sekai/action_instance_admission.rs budget",
-    "src/sekai/action_instance_admission.rs receipt",
-    "src/sekai/action_instance_admission.rs system_one_action",
-    "src/sekai/action_work_lifecycle.rs receipt",
     "src/sekai/chisei_principal.rs principal",
     "src/sekai/chisei_projection.rs epistemic_descriptor",
     "src/sekai/chisei_projection.rs system_one_action",
-    "src/sekai/execution_evidence.rs external_action",
-    "src/sekai/execution_evidence.rs external_permit",
-    "src/sekai/execution_evidence.rs receipt",
-    "src/sekai/peer_import.rs receipt",
-    "src/sekai/workflow_action.rs budget",
-    "src/sekai/workflow_action.rs receipt",
 ];
 
 #[test]

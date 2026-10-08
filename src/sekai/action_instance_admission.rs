@@ -6,10 +6,6 @@
 //! metering so their ordering is exercised through the same interface callers
 //! use.
 
-use crate::chisei::budget::BudgetTracker;
-use crate::chisei::receipt::{
-    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-};
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
@@ -20,11 +16,15 @@ use crate::sekai::action_instance::{
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
 };
+use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::sekai::action_type_criteria::{
     CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
+use sekai_provider::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+};
 use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
@@ -95,12 +95,22 @@ struct ApprovalRecord<'r> {
 
 pub(crate) struct ActionInstanceAdmission<'a> {
     db: &'a RuntimeDb,
-    budget: Option<&'a BudgetTracker>,
+    budget: Option<&'a dyn ActionBudgetPort>,
+    proposal: Option<&'a dyn ActionProposalPort>,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
-    pub(crate) fn new(db: &'a RuntimeDb, budget: Option<&'a BudgetTracker>) -> Self {
-        Self { db, budget }
+    pub(crate) fn new(db: &'a RuntimeDb, budget: Option<&'a dyn ActionBudgetPort>) -> Self {
+        Self {
+            db,
+            budget,
+            proposal: None,
+        }
+    }
+
+    pub(crate) fn with_proposal(mut self, proposal: Option<&'a dyn ActionProposalPort>) -> Self {
+        self.proposal = proposal;
+        self
     }
 
     pub(crate) fn admit(
@@ -293,11 +303,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision = "budget_exceeded".into();
         }
 
-        let system_one_fill_json = crate::chisei::system_one_action::fill_provenance_json(
-            &type_def,
-            &request.parameters_json,
-        )
-        .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let system_one_fill_json = match self.proposal {
+            Some(proposal) => proposal
+                .fill_provenance_json(&type_def, &request.parameters_json)
+                .map_err(ActionInstanceAdmissionError::InvalidArgument)?,
+            None => String::new(),
+        };
         let parked_object_digest = if status == STATUS_PARKED {
             target_object_digest(self.db, &request.parameters_json)?
         } else {
@@ -1312,47 +1323,95 @@ mod tests {
         }
     }
 
+    struct StampProposal(&'static str);
+
+    impl ActionProposalPort for StampProposal {
+        fn fill_provenance_json(
+            &self,
+            _type_def: &GovernedActionType,
+            _parameters_json: &str,
+        ) -> Result<String, String> {
+            Ok(self.0.into())
+        }
+    }
+
+    struct CountingBudget {
+        remaining: std::sync::atomic::AtomicI32,
+        recorded: std::sync::atomic::AtomicI32,
+    }
+
+    impl ActionBudgetPort for CountingBudget {
+        fn check(&self, _subject: &str, amount: i32) -> Result<(), String> {
+            if self.remaining.load(std::sync::atomic::Ordering::SeqCst) < amount {
+                Err("exhausted".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record(&self, _subject: &str, amount: i32) {
+            self.remaining
+                .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+            self.recorded
+                .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
-    fn admit_stamps_fill_provenance_for_a_bound_type() {
+    fn admit_without_proposal_port_leaves_fill_empty() {
         let db = setup();
-        let type_def = GovernedActionType {
-            namespace: "acme".into(),
-            type_id: "dispatch.bound".into(),
-            version: "1".into(),
-            description: "bound dispatch".into(),
-            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string","enum":["shikigami"]}},"required":["runtime"],"additionalProperties":false}"#.into(),
-            allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            system_one: Some(sekai_provider::system_one::SystemOneBind {
-                model: "jev-1.13.0".into(),
-                questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
-                    parameter: "runtime".into(),
-                    question_type: "choice".into(),
-                    instructions: "Which runtime".into(),
-                    criteria: serde_json::json!({"shikigami": null}),
-                }],
-            }),
-            enabled: true,
-            ..Default::default()
-        };
-        db.put_governed_action_type(type_def.clone(), "operator", 2)
-            .unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
-        let mut bound_request = request(r#"{"runtime":"shikigami"}"#);
-        bound_request.type_id = "dispatch.bound".into();
-        bound_request.idempotency_key = "idem-bound".into();
-        let admitted = admission.admit(bound_request, "alice", 10).unwrap();
-        let expected = crate::chisei::system_one_action::fill_provenance_json(
-            &type_def,
-            r#"{"runtime":"shikigami"}"#,
-        )
-        .unwrap();
-        assert_eq!(admitted.instance.system_one_fill_json, expected);
-        assert!(!expected.is_empty());
+        let admitted = admission
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert!(admitted.instance.system_one_fill_json.is_empty());
+        assert_eq!(admitted.instance.budget_decision, "not_configured");
+    }
+
+    #[test]
+    fn admit_stamps_fill_provenance_from_the_proposal_port() {
+        let db = setup();
+        let proposal = StampProposal(r#"{"model":"test"}"#);
+        let admission = ActionInstanceAdmission::new(&db, None).with_proposal(Some(&proposal));
+        let admitted = admission
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(admitted.instance.system_one_fill_json, proposal.0);
         let stored = db
             .get_action_instance(&admitted.instance.instance_id)
             .unwrap()
             .expect("stored");
-        assert_eq!(stored.system_one_fill_json, expected);
+        assert_eq!(stored.system_one_fill_json, proposal.0);
+    }
+
+    #[test]
+    fn admit_records_budget_when_the_port_allows() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(1),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let admitted = ActionInstanceAdmission::new(&db, Some(&budget))
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+        assert_eq!(admitted.instance.budget_decision, "allow");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admit_denies_when_the_budget_port_is_exhausted() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(0),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let denied = ActionInstanceAdmission::new(&db, Some(&budget))
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_eq!(denied.instance.budget_decision, "budget_exceeded");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1982,7 +2041,7 @@ mod tests {
         // succeeds; assert the structured log line actually fires with the
         // operation and object identity attached.
         use std::io::{self, Write};
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, OnceLock};
 
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -1995,6 +2054,27 @@ mod tests {
             }
         }
 
+        // #1200: callsite interest is process-wide. A thread-local
+        // `with_default` subscriber loses the race when a sibling test
+        // rebuilds the cache from a dispatcher that is uninterested.
+        // Pin a process-wide ERROR subscriber so rebuilds keep this
+        // event enabled. Unique request/object ids keep concurrent
+        // ERROR lines from other tests out of the assertion.
+        static CAPTURE: OnceLock<Buf> = OnceLock::new();
+        let buf = CAPTURE.get_or_init(|| {
+            let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+            let writer = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            buf
+        });
+        buf.0.lock().expect("log buffer").clear();
+
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
         let db = setup();
@@ -2002,14 +2082,6 @@ mod tests {
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
-
-        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
 
         crate::sekai::object_log::with_test_log_path(&log, || {
             crate::sekai::object_log::fail_next_ingest();
@@ -2019,12 +2091,8 @@ mod tests {
             );
             request.idempotency_key = "record-signal-log".into();
             request.request_id = "operation-signal-log".into();
-            tracing::subscriber::with_default(subscriber, || {
-                // #1200: re-evaluate callsites other test threads cached
-                // before this thread-local subscriber existed.
-                tracing::callsite::rebuild_interest_cache();
-                admission.admit(request, "alice", 10).unwrap();
-            });
+            tracing::callsite::rebuild_interest_cache();
+            admission.admit(request, "alice", 10).unwrap();
         });
 
         let logs = String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs");

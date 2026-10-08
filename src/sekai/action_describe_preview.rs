@@ -4,7 +4,6 @@
 //! permit, or become submit authority. `SubmitActionInstance` still owns
 //! admission.
 
-use crate::chisei::budget::BudgetTracker;
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
 use crate::sekai::action::RiskClass;
@@ -13,6 +12,7 @@ use crate::sekai::action_instance::{
 };
 use crate::sekai::action_object_mutation;
 use crate::sekai::action_policy::ActionDecision;
+use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::sekai::action_type_criteria::{
     ActionSubmissionCriterion, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
@@ -125,7 +125,7 @@ pub fn allows_function_fill(preview: &ObjectActionPreview) -> bool {
 
 pub fn preview_object_action_admission(
     db: &RuntimeDb,
-    budget: Option<&BudgetTracker>,
+    budget: Option<&dyn ActionBudgetPort>,
     request: ObjectActionPreviewRequest<'_>,
 ) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
     match admit_object_action(db, budget, &request)? {
@@ -136,7 +136,8 @@ pub fn preview_object_action_admission(
 
 pub fn preview_object_action(
     db: &RuntimeDb,
-    budget: Option<&BudgetTracker>,
+    budget: Option<&dyn ActionBudgetPort>,
+    proposal: Option<&dyn ActionProposalPort>,
     request: ObjectActionPreviewRequest<'_>,
 ) -> Result<ObjectActionPreview, ObjectActionProjectionError> {
     let ObjectActionPreviewRequest {
@@ -215,9 +216,12 @@ pub fn preview_object_action(
         ));
     }
 
-    let system_one_fill_json =
-        crate::chisei::system_one_action::fill_provenance_json(&type_def, parameters_json)
-            .map_err(ObjectActionProjectionError::InvalidArgument)?;
+    let system_one_fill_json = match proposal {
+        Some(proposal) => proposal
+            .fill_provenance_json(&type_def, parameters_json)
+            .map_err(ObjectActionProjectionError::InvalidArgument)?,
+        None => String::new(),
+    };
     Ok(ObjectActionPreview {
         outcome: PREVIEW_VALID.into(),
         reason_code: "valid".into(),
@@ -270,7 +274,7 @@ fn valid_admission_preview(allowed: &AdmissionAllowed, object: &Object) -> Objec
 
 fn admit_object_action(
     db: &RuntimeDb,
-    budget: Option<&BudgetTracker>,
+    budget: Option<&dyn ActionBudgetPort>,
     request: &ObjectActionPreviewRequest<'_>,
 ) -> Result<Admission, ObjectActionProjectionError> {
     let ObjectActionPreviewRequest {
@@ -630,6 +634,7 @@ mod tests {
         let preview = preview_object_action(
             &db,
             None,
+            None,
             ObjectActionPreviewRequest {
                 actor: "alice",
                 object: &object,
@@ -657,47 +662,48 @@ mod tests {
         );
     }
 
+    struct StampProposal(&'static str);
+
+    impl ActionProposalPort for StampProposal {
+        fn fill_provenance_json(
+            &self,
+            _type_def: &GovernedActionType,
+            _parameters_json: &str,
+        ) -> Result<String, String> {
+            Ok(self.0.into())
+        }
+    }
+
+    struct DenyBudget;
+
+    impl ActionBudgetPort for DenyBudget {
+        fn check(&self, _subject: &str, _amount: i32) -> Result<(), String> {
+            Err("exhausted".into())
+        }
+
+        fn record(&self, _subject: &str, _amount: i32) {}
+    }
+
     #[test]
     fn preview_accepts_function_filled_parameters_without_writing() {
         let (db, object) = setup();
         let mut type_def = update_type();
         type_def.type_id = "customer.record.triage".into();
         type_def.parameter_schema_json = r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","department"],"additionalProperties":false}"#.into();
-        type_def.system_one = Some(sekai_provider::system_one::SystemOneBind {
-            model: "jev-1.13.0".into(),
-            questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
-                parameter: "department".into(),
-                question_type: "choice".into(),
-                instructions: "Which team".into(),
-                criteria: serde_json::json!({"billing":null,"technical":null,"sales":null}),
-            }],
-        });
-        let filled = crate::chisei::system_one_action::proposed_parameters(
-            &type_def,
-            &object,
-            &sekai_provider::system_one::SystemOneResponse {
-                model: "jev-1.13.0".into(),
-                answers: [(
-                    "department".into(),
-                    serde_json::json!({"type":"choice","choice":"technical"}),
-                )]
-                .into_iter()
-                .collect(),
-                usage: None,
-            },
-        )
-        .unwrap();
-        db.put_governed_action_type(type_def.clone(), "operator", 2)
+        db.put_governed_action_type(type_def, "operator", 2)
             .unwrap();
+        let filled = r#"{"object_id":"cust-1","department":"technical"}"#;
+        let proposal = StampProposal(r#"{"model":"test"}"#);
         let preview = preview_object_action(
             &db,
             None,
+            Some(&proposal),
             ObjectActionPreviewRequest {
                 actor: "alice",
                 object: &object,
                 type_id: "customer.record.triage",
                 version: "1",
-                parameters_json: &filled,
+                parameters_json: filled,
                 expected_object_updated_ms: object.updated,
                 expected_object_revision: &object_revision(&object),
                 evidence_submission_ids: &[],
@@ -720,17 +726,13 @@ mod tests {
                 "acme",
                 "customer.record.triage",
                 "1",
-                &filled,
+                filled,
                 &[],
             )
             .unwrap()
         );
         assert_ne!(preview.request_digest, empty_digest);
-        assert_eq!(
-            preview.system_one_fill_json,
-            crate::chisei::system_one_action::fill_provenance_json(&type_def, &filled).unwrap()
-        );
-        assert!(!preview.system_one_fill_json.is_empty());
+        assert_eq!(preview.system_one_fill_json, proposal.0);
         assert_eq!(
             db.list_action_instances("acme", None, None, 10)
                 .unwrap()
@@ -740,10 +742,53 @@ mod tests {
     }
 
     #[test]
+    fn preview_reports_not_configured_without_a_budget_port_and_denies_when_exhausted() {
+        let (db, object) = setup();
+        let open = preview_object_action_admission(
+            &db,
+            None,
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.update",
+                version: "1",
+                parameters_json: r#"{"object_id":"cust-1"}"#,
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: "",
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(open.outcome, PREVIEW_VALID);
+        assert_eq!(open.budget_decision, "not_configured");
+
+        let denied = preview_object_action_admission(
+            &db,
+            Some(&DenyBudget),
+            ObjectActionPreviewRequest {
+                actor: "alice",
+                object: &object,
+                type_id: "customer.record.update",
+                version: "1",
+                parameters_json: r#"{"object_id":"cust-1"}"#,
+                expected_object_updated_ms: object.updated,
+                expected_object_revision: "",
+                evidence_submission_ids: &[],
+                policy_context: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(denied.outcome, PREVIEW_DENIED);
+        assert_eq!(denied.budget_decision, "budget_exceeded");
+    }
+
+    #[test]
     fn stale_and_changed_parameters_fail_closed() {
         let (db, object) = setup();
         let stale = preview_object_action(
             &db,
+            None,
             None,
             ObjectActionPreviewRequest {
                 actor: "alice",
@@ -762,6 +807,7 @@ mod tests {
         let invalid = preview_object_action(
             &db,
             None,
+            None,
             ObjectActionPreviewRequest {
                 actor: "alice",
                 object: &object,
@@ -778,6 +824,7 @@ mod tests {
         assert_eq!(invalid.outcome, PREVIEW_INVALID);
         let unknown = preview_object_action(
             &db,
+            None,
             None,
             ObjectActionPreviewRequest {
                 actor: "alice",
@@ -899,6 +946,7 @@ mod tests {
         let preview = preview_object_action(
             &db,
             None,
+            None,
             ObjectActionPreviewRequest {
                 actor: "alice",
                 object: &object,
@@ -968,6 +1016,7 @@ mod tests {
             .unwrap();
         let preview = preview_object_action(
             &db,
+            None,
             None,
             ObjectActionPreviewRequest {
                 actor: "alice",

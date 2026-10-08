@@ -4,14 +4,14 @@
 //! performed an effect or that an independently observed downstream outcome
 //! occurred.
 
-use crate::chisei::external_permit::{HostContext, Permit, Redemption};
-use crate::chisei::receipt::{
-    GovernedReference, OperationReceiptEvent, ReceiptEventKind, ReceiptSurface,
-};
 use crate::db::sekai::SekaiDb;
+use crate::sekai::external_permit::{HostContext, Permit, Redemption};
 use crate::shomei::{AttestationBundle, canonical_json};
 use ed25519_dalek::VerifyingKey;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use sekai_provider::receipt::{
+    GovernedReference, OperationReceiptEvent, ReceiptEventKind, ReceiptSurface,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -669,9 +669,6 @@ pub fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::external_action::PERMIT_VERSION;
-    use crate::chisei::external_permit::{REDEMPTION_MODE, SIGNATURE_ALGORITHM};
-    use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, UncoveredSurface};
     use crate::domain::Object;
     use crate::sekai::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
@@ -680,7 +677,9 @@ mod tests {
     use crate::sekai::evidence_store::{
         EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
     };
+    use crate::sekai::external_permit::{PERMIT_VERSION, REDEMPTION_MODE, SIGNATURE_ALGORITHM};
     use ed25519_dalek::SigningKey;
+    use sekai_provider::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt, UncoveredSurface};
 
     fn permit(executor: &str, capability: &str) -> (Permit, SigningKey) {
         let key = SigningKey::from_bytes(&[7; 32]);
