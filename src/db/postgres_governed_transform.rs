@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::db::postgres::{PostgresDb, advisory_lock_key, lock_dataset_rows};
 use crate::sekai::dataset::DatasetRowRecord;
 use crate::sekai::governed_transform::{
-    GovernedTransform, TransformRun, bind_checkpoint, compute_run, rows_digest,
+    GovernedTransform, TransformRun, bind_checkpoint, checkpoint_after_id, compute_run,
+    fold_output_digest, rows_digest,
 };
 
 impl PostgresDb {
@@ -89,7 +90,8 @@ impl PostgresDb {
         let stored = load_checkpoint(&mut tx, namespace, transform_id)?;
         let (incremental, checkpoint) =
             bind_checkpoint(incremental, stored, &transform.definition_digest);
-        let records = load_row_records(&mut tx, &transform.input_dataset_id)?;
+        let after_id = checkpoint_after_id(incremental, checkpoint.as_ref());
+        let records = load_row_records(&mut tx, &transform.input_dataset_id, after_id)?;
         let (mut run, output_rows) = compute_run(
             &transform,
             checkpoint.as_ref(),
@@ -99,12 +101,14 @@ impl PostgresDb {
             Uuid::new_v4().to_string(),
         );
         if run.quarantined {
-            let live: Vec<HashMap<String, String>> =
-                load_row_records(&mut tx, &transform.output_dataset_id)?
-                    .into_iter()
-                    .map(|(_, row)| row)
-                    .collect();
-            run.output_digest = rows_digest(&live);
+            if !incremental {
+                let live: Vec<HashMap<String, String>> =
+                    load_row_records(&mut tx, &transform.output_dataset_id, 0)?
+                        .into_iter()
+                        .map(|(_, row)| row)
+                        .collect();
+                run.output_digest = rows_digest(&live);
+            }
             insert_transform_run(&mut tx, &run)?;
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(run);
@@ -116,20 +120,15 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?;
         }
-        for row in &output_rows {
-            let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES ($1,$2)",
-                &[&transform.output_dataset_id, &data],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        let live: Vec<HashMap<String, String>> =
-            load_row_records(&mut tx, &transform.output_dataset_id)?
-                .into_iter()
-                .map(|(_, row)| row)
-                .collect();
-        run.output_digest = rows_digest(&live);
+        insert_output_rows(&mut tx, &transform.output_dataset_id, &output_rows)?;
+        run.output_digest = if incremental {
+            checkpoint
+                .as_ref()
+                .map(|checkpoint| fold_output_digest(&checkpoint.2, &output_rows))
+                .unwrap_or_else(|| rows_digest(&output_rows))
+        } else {
+            rows_digest(&output_rows)
+        };
         insert_transform_run(&mut tx, &run)?;
         tx.execute(
             "INSERT INTO sekai_governed_transform_checkpoint
@@ -275,13 +274,38 @@ fn load_checkpoint(
         .map(|row| ((row.get(0), row.get(1), row.get(2)), row.get(3))))
 }
 
+fn insert_output_rows(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    rows: &[HashMap<String, String>],
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let payloads: Vec<String> = rows
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_dataset_rows (dataset_id, data)
+         SELECT $1, unnest($2::text[])",
+        &[&dataset_id, &payloads],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 fn load_row_records(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
+    after_id: i64,
 ) -> Result<Vec<DatasetRowRecord>, String> {
     tx.query(
-        "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id=$1 ORDER BY id",
-        &[&dataset_id],
+        "SELECT id, data FROM sekai_dataset_rows
+         WHERE dataset_id=$1 AND id > $2
+         ORDER BY id",
+        &[&dataset_id, &after_id],
     )
     .map_err(|error| error.to_string())?
     .into_iter()
@@ -430,12 +454,9 @@ mod tests {
         assert_eq!(second.rows_in, 1);
         assert_eq!(second.lineage_parent, first.run_id);
         assert_ne!(second.output_digest, first.output_digest);
-        assert_eq!(
-            db.query_dataset_rows("out", &RowQuery::default())
-                .unwrap()
-                .len(),
-            101
-        );
+        let live = db.query_dataset_rows("out", &RowQuery::default()).unwrap();
+        assert_eq!(live.len(), 101);
+        assert_eq!(second.output_digest, rows_digest(&live));
         let listed = db.list_governed_transform_runs("ops", 10).unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].run_id, second.run_id);
