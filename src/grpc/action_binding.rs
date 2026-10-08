@@ -388,11 +388,9 @@ impl SekaiServiceImpl {
         let result = if let Some(clerk) = &self.cross_store {
             clerk.admit(request, &binding.run_as, now_millis())
         } else {
-            ActionInstanceAdmission::new(self.db.runtime(), None).admit(
-                request,
-                &binding.run_as,
-                now_millis(),
-            )
+            ActionInstanceAdmission::new(self.db.runtime(), None)
+                .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
+                .admit(request, &binding.run_as, now_millis())
         };
         match result {
             Ok(outcome) => {

@@ -12,6 +12,7 @@ use crate::chisei::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
 };
 use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
+use crate::chisei::system_one_action::SystemOneProposal;
 use crate::db::chisei_operation_reservation::{
     OperationReservation, RESERVATION_FINALIZED, RESERVATION_PENDING, RESERVATION_RELEASED,
 };
@@ -23,6 +24,7 @@ use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionOutcome,
     ActionInstanceAdmissionRequest,
 };
+use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 
 pub const DEFAULT_RESERVATION_TTL_MS: i64 = 15 * 60 * 1_000;
 
@@ -73,6 +75,16 @@ impl CrossStoreAdmission {
     #[cfg(test)]
     pub(crate) fn distinct_stores(&self) -> bool {
         self.distinct_stores
+    }
+
+    pub(crate) fn budget_port(&self) -> Option<&dyn ActionBudgetPort> {
+        self.budget
+            .as_ref()
+            .map(|budget| budget.as_ref() as &dyn ActionBudgetPort)
+    }
+
+    pub(crate) fn proposal_port(&self) -> &dyn ActionProposalPort {
+        &SystemOneProposal
     }
 
     pub(crate) fn reserve(
@@ -158,11 +170,9 @@ impl CrossStoreAdmission {
         now_ms: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         request.budget_already_reserved = self.budget.is_some();
-        ActionInstanceAdmission::new(
-            self.sekai.runtime(),
-            self.budget.as_ref().map(AsRef::as_ref),
-        )
-        .admit(request, actor, now_ms)
+        ActionInstanceAdmission::new(self.sekai.runtime(), self.budget_port())
+            .with_proposal(Some(self.proposal_port()))
+            .admit(request, actor, now_ms)
     }
 
     pub(crate) fn finalize(

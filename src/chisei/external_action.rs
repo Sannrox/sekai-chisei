@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 pub const REQUEST_VERSION: &str = "external-action.request/v1";
 pub const DECISION_VERSION: &str = "external-action.decision/v1";
-pub const PERMIT_VERSION: &str = "external-action.permit/v1";
+pub use crate::sekai::external_permit::PERMIT_VERSION;
 pub const REDEMPTION_VERSION: &str = "external-action.redemption/v1";
 pub const EVIDENCE_VERSION: &str = "external-action.evidence/v1";
 pub const ASSURANCE_VERSION: &str = "external-action.assurance/v1";

@@ -5,9 +5,6 @@
 //! ordering, receipt harvest, audit records, active continuation lookup, and
 //! storage-error classification behind one interface.
 
-use crate::chisei::receipt::{
-    OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
-};
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action_effect::{
     ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect, EFFECT_STATUS_COMPLETED,
@@ -15,6 +12,9 @@ use crate::sekai::action_effect::{
 };
 use crate::sekai::audit;
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
+use sekai_provider::receipt::{
+    OperationReceipt, OperationReceiptEvent, ReceiptArtifact, ReceiptEventKind,
+};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,15 +719,15 @@ fn classify_report_error(error: String) -> ActionWorkLifecycleError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::receipt::{
-        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
-        ReceiptSurface, UncoveredSurface,
-    };
     use crate::db::runtime_db::RuntimeDb;
     use crate::sekai::action_effect::{
         ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, plan_effects_for_admit,
     };
     use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
+    use sekai_provider::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptArtifact,
+        ReceiptSurface, UncoveredSurface,
+    };
 
     fn seed_effect(db: &RuntimeDb) -> ActionEffect {
         let effect = plan_effects_for_admit(

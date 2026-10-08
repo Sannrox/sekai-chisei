@@ -24,7 +24,7 @@ struct PlaneTransport {
 
 impl WorkflowTransport for PlaneTransport {
     fn submit(&mut self, envelope: &WorkflowStepEnvelope) -> Result<WorkflowActionBinding, String> {
-        submit_step(&self.db, &self.actor, envelope, self.now_ms, None)
+        submit_step(&self.db, &self.actor, envelope, self.now_ms, None, None)
     }
 
     fn park(&mut self, envelope: &WorkflowStepEnvelope) -> Result<WorkflowActionBinding, String> {

@@ -22,6 +22,20 @@ pub trait SystemOneActionType {
     fn system_one(&self) -> Option<&SystemOneBind>;
 }
 
+/// Chisei implementation of the Sekai-owned proposal port (ADR 0096 rule 2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemOneProposal;
+
+impl crate::sekai::action_ports::ActionProposalPort for SystemOneProposal {
+    fn fill_provenance_json(
+        &self,
+        type_def: &crate::sekai::governed_action_type::GovernedActionType,
+        parameters_json: &str,
+    ) -> Result<String, String> {
+        fill_provenance_json(type_def, parameters_json)
+    }
+}
+
 pub fn bind_of(type_def: &(impl SystemOneActionType + ?Sized)) -> Option<&SystemOneBind> {
     type_def.system_one().filter(|bind| !bind.is_empty())
 }

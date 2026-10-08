@@ -253,14 +253,14 @@ fn required(name: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::receipt::{
-        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-    };
     use crate::compliance_export::{
         ComplianceExportRequest, RedactionMode, build_compliance_export, sign_compliance_export,
     };
     use crate::db::runtime_db::RuntimeDb;
     use ed25519_dalek::SigningKey;
+    use sekai_provider::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    };
     use std::collections::BTreeMap;
 
     fn db() -> RuntimeDb {
