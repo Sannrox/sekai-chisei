@@ -24,7 +24,7 @@ impl ChiseiServiceImpl {
         if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
             return Ok(vec![]);
         }
-        let (rules, entities) = self
+        let scan = self
             .privacy_scan
             .load(
                 namespace,
@@ -34,7 +34,10 @@ impl ChiseiServiceImpl {
             )
             .map_err(Status::failed_precondition)?;
         Ok(crate::chisei::privacy::check_payload(
-            payload, &rules, &entities,
+            payload,
+            &scan.rules,
+            &scan.entities,
+            scan.truncated,
         ))
     }
 
@@ -50,15 +53,24 @@ impl ChiseiServiceImpl {
     fn list_leak_rule_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
         let mut objects = Vec::new();
         for ns in ["", namespace] {
-            objects.extend(
-                self.list_fact_objects(&ListFilter {
-                    kind: Some("leak_rule".into()),
-                    namespace: Some(ns.to_string()),
-                    limit: crate::domain::MAX_LIST_LIMIT,
-                    ..Default::default()
-                })
-                .map_err(|error| format!("leak-rule policy unavailable: {error}"))?,
-            );
+            let mut offset = 0;
+            loop {
+                let page = self
+                    .list_fact_objects(&ListFilter {
+                        kind: Some("leak_rule".into()),
+                        namespace: Some(ns.to_string()),
+                        limit: crate::domain::MAX_LIST_LIMIT,
+                        offset,
+                        ..Default::default()
+                    })
+                    .map_err(|error| format!("leak-rule policy unavailable: {error}"))?;
+                let page_len = page.len() as i32;
+                objects.extend(page);
+                if page_len < crate::domain::MAX_LIST_LIMIT {
+                    break;
+                }
+                offset = offset.saturating_add(page_len);
+            }
         }
         Ok(objects)
     }
@@ -159,6 +171,13 @@ impl ChiseiServiceImpl {
         let mut evidence = std::collections::HashMap::new();
         evidence.insert("provider".to_string(), provider.to_string());
         evidence.insert("finding_count".to_string(), findings.len().to_string());
+        evidence.insert(
+            "scan_truncated".to_string(),
+            findings
+                .iter()
+                .any(|finding| finding.rule_label == crate::chisei::privacy::SCAN_TRUNCATED_LABEL)
+                .to_string(),
+        );
         evidence.insert(
             "block_count".to_string(),
             findings

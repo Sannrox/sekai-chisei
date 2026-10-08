@@ -8762,8 +8762,101 @@ fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
         )
         .unwrap();
     assert!(
-        findings.is_empty(),
-        "entity past ENTITY_SCAN_LIMIT must not be scanned: {findings:?}"
+        findings.iter().any(|finding| {
+            finding.rule_label == crate::chisei::privacy::SCAN_TRUNCATED_LABEL
+                && finding.action == LeakAction::Block
+        }),
+        "truncated entity scan must fail closed: {findings:?}"
+    );
+}
+
+#[test]
+fn privacy_leak_rules_page_past_max_list_limit() {
+    let svc = memory_service();
+    let page = crate::domain::MAX_LIST_LIMIT as usize;
+    for index in 0..page {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("leak-fill-{index:04}"),
+                kind: "leak_rule".into(),
+                name: format!("fill-{index}"),
+                namespace: "alpha".into(),
+                external_id: format!("leak_rule:fill-{index:04}"),
+                properties: std::collections::HashMap::from([
+                    ("pattern".into(), format!("^__fill_never_{index}$")),
+                    ("label".into(), format!("fill-{index}")),
+                    ("action".into(), "block".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "leak-z-late".into(),
+            kind: "leak_rule".into(),
+            name: "late-company".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:late".into(),
+            properties: std::collections::HashMap::from([
+                ("pattern".into(), "UniqueSecretCorp".into()),
+                ("label".into(), "late_company".into()),
+                ("action".into(), "block".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let findings = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Open,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding.rule_label == "late_company" && finding.action == LeakAction::Block
+        }),
+        "leak rules past MAX_LIST_LIMIT must still be compiled: {findings:?}"
+    );
+}
+
+#[test]
+fn leak_audit_records_scan_truncated_evidence() {
+    let svc = memory_service();
+    svc.record_leak_audit(
+        "leak_check",
+        "task-truncated",
+        "openai",
+        &[LeakFinding {
+            rule_label: crate::chisei::privacy::SCAN_TRUNCATED_LABEL.into(),
+            action: LeakAction::Block,
+            match_count: 0,
+        }],
+    );
+    let decisions = svc
+        .db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            actor: Some("chisei.privacy".into()),
+            action: Some("leak_check".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.target_id == "task-truncated"
+                && decision.outcome == "leak_blocked"
+                && decision
+                    .evidence
+                    .get("scan_truncated")
+                    .is_some_and(|value| value == "true")
+        }),
+        "truncated leak audit must record scan_truncated=true: {decisions:?}"
     );
 }
 
