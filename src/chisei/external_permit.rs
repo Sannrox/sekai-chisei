@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// Default single-region site pin (`SEKAI_SITE_ID` default).
+/// Default single-region site pin (`SEKAI_SITE_ID` default). Same value as
+/// [`crate::sekai::lease::DEFAULT_SITE_ID`]. Inlined here because importing
+/// `sekai::lease` would cycle through `runtime_db`.
 pub const DEFAULT_SITE_ID: &str = "local";
 
 pub const SIGNATURE_ALGORITHM: &str = crate::shomei::SIGNATURE_ALGORITHM;

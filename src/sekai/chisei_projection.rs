@@ -67,7 +67,7 @@ pub fn graph_explanation_descriptor(
 mod tests {
     use super::*;
     use crate::chisei::epistemic_descriptor::{EvidenceStatus, OriginClass};
-    use crate::chisei::evidence_vocabulary::{
+    use crate::sekai::evidence_vocabulary::{
         EvidenceClassification, EvidenceIntent, EvidenceLifecycleState,
     };
 
