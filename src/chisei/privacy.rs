@@ -159,11 +159,18 @@ impl PrivacyScanCache {
         let rules = Arc::new(compile_leak_rules(&leaks));
         let (entities, truncated) = match entity_objs {
             Some(objects) => {
-                let listed_full_page = objects.len() >= ENTITY_SCAN_LIMIT as usize;
-                let (literals, literal_truncated) = entity_scan_literals(&objects);
+                // Palantir analog: Object Search pageSize is a maximum;
+                // more results exist only when a further page is non-empty.
+                let listed_overflow = objects.len() > ENTITY_SCAN_LIMIT as usize;
+                let scanned = if listed_overflow {
+                    &objects[..ENTITY_SCAN_LIMIT as usize]
+                } else {
+                    objects.as_slice()
+                };
+                let (literals, literal_truncated) = entity_scan_literals(scanned);
                 (
                     Some(Arc::new(literals)),
-                    listed_full_page || literal_truncated,
+                    listed_overflow || literal_truncated,
                 )
             }
             None => (None, false),
@@ -586,10 +593,8 @@ mod tests {
         assert!(!first.truncated);
     }
 
-    #[test]
-    fn privacy_scan_cache_marks_truncated_when_listed_page_is_full() {
-        let cache = PrivacyScanCache::default();
-        let objects: Vec<Object> = (0..ENTITY_SCAN_LIMIT)
+    fn fill_scan_objects(count: usize) -> Vec<Object> {
+        (0..count)
             .map(|index| Object {
                 id: format!("fill-{index:04}"),
                 kind: "asset".into(),
@@ -600,13 +605,33 @@ mod tests {
                 created: 0,
                 updated: 0,
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn privacy_scan_cache_does_not_truncate_an_exact_full_set() {
+        let cache = PrivacyScanCache::default();
         let scan = cache
             .load(
                 "alpha",
                 true,
                 || Ok::<_, ()>(Vec::new()),
-                || Ok(objects.clone()),
+                || Ok(fill_scan_objects(ENTITY_SCAN_LIMIT as usize)),
+            )
+            .unwrap();
+        assert!(!scan.truncated);
+        assert!(scan.entities.is_empty());
+    }
+
+    #[test]
+    fn privacy_scan_cache_marks_truncated_when_a_further_page_exists() {
+        let cache = PrivacyScanCache::default();
+        let scan = cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                || Ok(fill_scan_objects(ENTITY_SCAN_LIMIT as usize + 1)),
             )
             .unwrap();
         assert!(scan.truncated);
