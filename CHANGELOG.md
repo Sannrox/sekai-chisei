@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Experimental function pipelines are a `oneof` of operator steps and `LlmStep`
+  (prompt revision, input bindings, JSON Schema output, pinned model route).
+  Invoke records prompt, input, and output digests on the receipt and fail-closes
+  schema-invalid structured output with no fallback route (#1310).
 - Public RPC Real backend is a projection of RuntimeDb fail-closed evidence and
   the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. CI fails
   on a mislabeled row, a new SQLite-only RPC missing from the list, or list

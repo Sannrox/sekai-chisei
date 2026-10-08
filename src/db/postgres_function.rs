@@ -1,23 +1,14 @@
 use crate::db::postgres::PostgresDb;
-use crate::sekai::function::{FuncParam, Function, PipelineStep, validate_function};
-
-type PipelineRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
+use crate::sekai::function::{
+    FuncParam, Function, decode_pipeline, encode_pipeline, validate_function,
+};
 
 impl PostgresDb {
     pub fn create_function(&self, function: &Function) -> Result<(), String> {
         validate_function(function)?;
         let params_json = serialize_params(function)?;
-        let pipeline_json = serialize_pipeline(function)?;
+        let pipeline_json =
+            encode_pipeline(&function.pipeline).map_err(|error| error.to_string())?;
         self.connection()?
             .execute(
                 "INSERT INTO sekai_functions (name,description,params,pipeline,created)
@@ -78,36 +69,13 @@ fn serialize_params(function: &Function) -> Result<String, String> {
     .map_err(|error| error.to_string())
 }
 
-fn serialize_pipeline(function: &Function) -> Result<String, String> {
-    serde_json::to_string(
-        &function
-            .pipeline
-            .iter()
-            .map(|step| {
-                (
-                    &step.op,
-                    &step.kind,
-                    &step.property,
-                    &step.value,
-                    &step.relation,
-                    &step.dir,
-                    &step.func,
-                    &step.field,
-                    &step.alias,
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|error| error.to_string())
-}
-
 fn row_to_function(row: postgres::Row) -> Result<Function, String> {
     let name: String = row.get(0);
     let params_json: String = row.get(2);
     let pipeline_json: String = row.get(3);
     let params_vec: Vec<(String, String, bool)> = serde_json::from_str(&params_json)
         .map_err(|error| format!("corrupt function params for {name}: {error}"))?;
-    let pipeline_vec: Vec<PipelineRow> = serde_json::from_str(&pipeline_json)
+    let pipeline = decode_pipeline(&pipeline_json)
         .map_err(|error| format!("corrupt function pipeline for {name}: {error}"))?;
     Ok(Function {
         name,
@@ -120,22 +88,7 @@ fn row_to_function(row: postgres::Row) -> Result<Function, String> {
                 required,
             })
             .collect(),
-        pipeline: pipeline_vec
-            .into_iter()
-            .map(
-                |(op, kind, property, value, relation, dir, func, field, alias)| PipelineStep {
-                    op,
-                    kind,
-                    property,
-                    value,
-                    relation,
-                    dir,
-                    func,
-                    field,
-                    alias,
-                },
-            )
-            .collect(),
+        pipeline,
         created: row.get(4),
     })
 }

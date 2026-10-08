@@ -826,6 +826,85 @@ pub(super) fn from_proto_virtual_table(vt: &VirtualTable) -> dataset::VirtualTab
         created: vt.created,
     }
 }
+pub(super) fn to_proto_pipeline_step(step: &function::PipelineStep) -> PipelineStep {
+    match step {
+        function::PipelineStep::Operator(step) => PipelineStep {
+            step: Some(pipeline_step::Step::Operator(OperatorStep {
+                op: step.op.clone(),
+                kind: step.kind.clone(),
+                property: step.property.clone(),
+                value: step.value.clone(),
+                relation: step.relation.clone(),
+                dir: step.dir.clone(),
+                func: step.func.clone(),
+                field: step.field.clone(),
+                r#as: step.alias.clone(),
+            })),
+        },
+        function::PipelineStep::Llm(step) => PipelineStep {
+            step: Some(pipeline_step::Step::Llm(LlmStep {
+                prompt_revision: step.prompt_revision.clone(),
+                input_bindings: step.input_bindings.clone().into_iter().collect(),
+                output_schema: step.output_schema.clone(),
+                model_route: step.model_route.clone(),
+            })),
+        },
+    }
+}
+
+pub(super) fn from_proto_pipeline_step(
+    step: &PipelineStep,
+) -> Result<function::PipelineStep, Status> {
+    match step.step.as_ref() {
+        Some(pipeline_step::Step::Operator(step)) => {
+            Ok(function::PipelineStep::Operator(function::OperatorStep {
+                op: step.op.clone(),
+                kind: step.kind.clone(),
+                property: step.property.clone(),
+                value: step.value.clone(),
+                relation: step.relation.clone(),
+                dir: step.dir.clone(),
+                func: step.func.clone(),
+                field: step.field.clone(),
+                alias: step.r#as.clone(),
+            }))
+        }
+        Some(pipeline_step::Step::Llm(step)) => {
+            Ok(function::PipelineStep::Llm(function::LlmStep {
+                prompt_revision: step.prompt_revision.clone(),
+                input_bindings: step.input_bindings.clone().into_iter().collect(),
+                output_schema: step.output_schema.clone(),
+                model_route: step.model_route.clone(),
+            }))
+        }
+        None => Err(Status::invalid_argument("pipeline step required")),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn proto_operator_step(
+    op: &str,
+    kind: &str,
+    relation: &str,
+    func: &str,
+    field: &str,
+    alias: &str,
+) -> PipelineStep {
+    PipelineStep {
+        step: Some(pipeline_step::Step::Operator(OperatorStep {
+            op: op.into(),
+            kind: kind.into(),
+            property: String::new(),
+            value: String::new(),
+            relation: relation.into(),
+            dir: String::new(),
+            func: func.into(),
+            field: field.into(),
+            r#as: alias.into(),
+        })),
+    }
+}
+
 pub(super) fn to_proto_function(f: &function::Function) -> Function {
     Function {
         name: f.name.clone(),
@@ -839,26 +918,12 @@ pub(super) fn to_proto_function(f: &function::Function) -> Function {
                 required: p.required,
             })
             .collect(),
-        pipeline: f
-            .pipeline
-            .iter()
-            .map(|s| PipelineStep {
-                op: s.op.clone(),
-                kind: s.kind.clone(),
-                property: s.property.clone(),
-                value: s.value.clone(),
-                relation: s.relation.clone(),
-                dir: s.dir.clone(),
-                func: s.func.clone(),
-                field: s.field.clone(),
-                r#as: s.alias.clone(),
-            })
-            .collect(),
+        pipeline: f.pipeline.iter().map(to_proto_pipeline_step).collect(),
         created: f.created,
     }
 }
-pub(super) fn from_proto_function(f: &Function) -> function::Function {
-    function::Function {
+pub(super) fn from_proto_function(f: &Function) -> Result<function::Function, Status> {
+    Ok(function::Function {
         name: f.name.clone(),
         description: f.description.clone(),
         params: f
@@ -873,20 +938,10 @@ pub(super) fn from_proto_function(f: &Function) -> function::Function {
         pipeline: f
             .pipeline
             .iter()
-            .map(|s| function::PipelineStep {
-                op: s.op.clone(),
-                kind: s.kind.clone(),
-                property: s.property.clone(),
-                value: s.value.clone(),
-                relation: s.relation.clone(),
-                dir: s.dir.clone(),
-                func: s.func.clone(),
-                field: s.field.clone(),
-                alias: s.r#as.clone(),
-            })
-            .collect(),
+            .map(from_proto_pipeline_step)
+            .collect::<Result<_, _>>()?,
         created: f.created,
-    }
+    })
 }
 pub(super) fn to_proto_grant(g: &security::Grant) -> Grant {
     Grant {

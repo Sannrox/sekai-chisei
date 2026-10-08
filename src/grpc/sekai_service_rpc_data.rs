@@ -15,7 +15,7 @@ pub(super) async fn create_function(
         .into_inner()
         .function
         .ok_or(Status::invalid_argument("function required"))?;
-    let parsed = from_proto_function(&function);
+    let parsed = from_proto_function(&function)?;
     service
         .db
         .runtime()
@@ -110,6 +110,12 @@ pub(super) async fn invoke_function(
     .map_err(Status::internal)?;
     Ok(Response::new(InvokeFunctionResponse {
         aggregates: invocation.result.aggregates,
+        structured_json: invocation
+            .result
+            .structured
+            .as_ref()
+            .map(|value| serde_json::to_string(value).unwrap_or_else(|_| "{}".into()))
+            .unwrap_or_default(),
         receipt: Some(FunctionReceipt {
             function_name: invocation.receipt.function_name,
             function_digest: invocation.receipt.function_digest,
@@ -119,6 +125,10 @@ pub(super) async fn invoke_function(
             steps: invocation.receipt.steps,
             budget_exceeded: invocation.receipt.budget_exceeded,
             output_digest: invocation.receipt.output_digest,
+            prompt_digest: invocation.receipt.prompt_digest,
+            model_route: invocation.receipt.model_route,
+            input_digest: invocation.receipt.input_digest,
+            schema_error: invocation.receipt.schema_error,
         }),
     }))
 }
