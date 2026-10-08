@@ -8767,6 +8767,47 @@ fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
     );
 }
 
+#[test]
+fn privacy_entity_created_after_first_scan_is_blocked() {
+    let svc = memory_service();
+    let first = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(first.is_empty(), "no entity objects yet: {first:?}");
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "asset-late".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: std::collections::HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let second = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        second
+            .iter()
+            .any(|finding| finding.rule_label == "known_entity:UniqueSecretCorp"),
+        "entity created after the first scan must block on the next scan: {second:?}"
+    );
+}
+
 #[tokio::test]
 async fn execute_plan_rejects_after_policy_flips_sensitive() {
     let svc = memory_service();

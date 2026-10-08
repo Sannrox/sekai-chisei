@@ -89,12 +89,14 @@ pub struct LeakRule {
 
 struct CachedPrivacyScan {
     leak_fingerprint: String,
+    entity_fingerprint: String,
     rules: Arc<Vec<LeakRule>>,
     entities: Option<Arc<Vec<String>>>,
 }
 
-/// Compiled leak rules and entity literals reused until leak-rule objects change.
-/// Palantir analog: function-backed actions reuse one ontology snapshot per run.
+/// Compiled leak rules and entity literals reused while both object sets are unchanged.
+/// Palantir analog: function-backed actions reuse one ontology snapshot per run;
+/// the next invocation searches the current object set.
 type PrivacyScan = (Arc<Vec<LeakRule>>, Arc<Vec<String>>);
 
 #[derive(Default)]
@@ -111,29 +113,36 @@ impl PrivacyScanCache {
         entity_objects: impl FnOnce() -> Result<Vec<Object>, E>,
     ) -> Result<PrivacyScan, E> {
         let leaks = leak_objects()?;
-        let fingerprint = leak_fingerprint(&leaks);
+        let leak_fp = leak_fingerprint(&leaks);
+        let entity_objs = if need_entities {
+            Some(entity_objects()?)
+        } else {
+            None
+        };
+        let entity_fp = entity_objs
+            .as_deref()
+            .map(entity_fingerprint)
+            .unwrap_or_default();
         {
             let guard = self
                 .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(cached) = guard.get(namespace)
-                && cached.leak_fingerprint == fingerprint
+                && cached.leak_fingerprint == leak_fp
             {
                 if !need_entities {
                     return Ok((cached.rules.clone(), Arc::new(Vec::new())));
                 }
-                if let Some(entities) = cached.entities.clone() {
+                if cached.entity_fingerprint == entity_fp
+                    && let Some(entities) = cached.entities.clone()
+                {
                     return Ok((cached.rules.clone(), entities));
                 }
             }
         }
         let rules = Arc::new(compile_leak_rules(&leaks));
-        let entities = if need_entities {
-            Some(Arc::new(entity_scan_literals(&entity_objects()?)))
-        } else {
-            None
-        };
+        let entities = entity_objs.map(|objects| Arc::new(entity_scan_literals(&objects)));
         let returned_entities = entities.clone().unwrap_or_else(|| Arc::new(Vec::new()));
         let mut guard = self
             .entries
@@ -142,7 +151,8 @@ impl PrivacyScanCache {
         guard.insert(
             namespace.to_string(),
             CachedPrivacyScan {
-                leak_fingerprint: fingerprint,
+                leak_fingerprint: leak_fp,
+                entity_fingerprint: entity_fp,
                 rules: rules.clone(),
                 entities,
             },
@@ -169,6 +179,29 @@ fn leak_fingerprint(objects: &[Object]) -> String {
                     .get("action")
                     .map(String::as_str)
                     .unwrap_or("block"),
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
+}
+
+fn entity_fingerprint(objects: &[Object]) -> String {
+    let mut parts: Vec<String> = objects
+        .iter()
+        .map(|object| {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                object.namespace,
+                object.id,
+                object.name,
+                object.external_id,
+                object
+                    .properties
+                    .get(ENTITY_SCAN_OPT_OUT_KEY)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                object.updated,
             )
         })
         .collect();
@@ -417,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn privacy_scan_cache_skips_entity_list_when_leak_rules_unchanged() {
+    fn privacy_scan_cache_reuses_literals_when_entity_set_unchanged() {
         let cache = PrivacyScanCache::default();
         let leak = Object {
             id: "leak-1".into(),
@@ -462,11 +495,68 @@ mod tests {
         let (first_rules, first_entities) = load().unwrap();
         let (second_rules, second_entities) = load().unwrap();
         assert_eq!(leak_calls.get(), 2);
-        assert_eq!(entity_calls.get(), 1);
+        assert_eq!(entity_calls.get(), 2);
         assert_eq!(first_rules.len(), 1);
         assert_eq!(first_entities.as_slice(), ["SecretCo", "asset:SECRET"]);
         assert_eq!(second_rules[0].id, first_rules[0].id);
         assert_eq!(second_entities.as_slice(), first_entities.as_slice());
+        assert!(Arc::ptr_eq(&first_entities, &second_entities));
+    }
+
+    #[test]
+    fn privacy_scan_cache_includes_entity_created_after_first_scan() {
+        let cache = PrivacyScanCache::default();
+        let first_entities = vec![Object {
+            id: "asset-1".into(),
+            kind: "asset".into(),
+            name: "SecretCo".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:SECRET".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        }];
+        let mut second_entities = first_entities.clone();
+        second_entities.push(Object {
+            id: "asset-2".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        });
+        let entities = std::cell::RefCell::new(first_entities);
+        let (_, first) = cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                || Ok(entities.borrow().clone()),
+            )
+            .unwrap();
+        assert_eq!(first.as_slice(), ["SecretCo", "asset:SECRET"]);
+        *entities.borrow_mut() = second_entities;
+        let (_, second) = cache
+            .load(
+                "alpha",
+                true,
+                || Ok::<_, ()>(Vec::new()),
+                || Ok(entities.borrow().clone()),
+            )
+            .unwrap();
+        assert!(
+            second.iter().any(|literal| literal == "UniqueSecretCorp"),
+            "entity created after the first scan must be in the next snapshot: {second:?}"
+        );
+        let findings = check_payload("mention UniqueSecretCorp in the brief", &[], &second);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_label == "known_entity:UniqueSecretCorp"),
+            "new entity name must block on the next scan: {findings:?}"
+        );
     }
 
     #[test]
