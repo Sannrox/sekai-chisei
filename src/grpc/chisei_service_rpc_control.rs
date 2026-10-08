@@ -396,6 +396,7 @@ pub(super) async fn get_effective_policy_summary(
 ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
     let actor = required_authenticated_actor(&req)?;
     let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
+    service.require_in_process_namespace_policy()?;
     require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
 
     let routing = service.policy.effective_policy(&namespace).map_or_else(

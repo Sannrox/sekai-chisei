@@ -27,6 +27,7 @@ pub(super) async fn plan_execution(
         let mut input = request
             .input
             .ok_or(Status::invalid_argument("input required"))?;
+        service.require_in_process_namespace_policy()?;
         if context.is_some()
             && (!input.route_override.trim().is_empty() || request.gunshi_allocation.is_some())
         {
@@ -173,6 +174,7 @@ pub(super) async fn plan_content_execution(
             .execution
             .take()
             .ok_or_else(|| Status::invalid_argument("content execution input required"))?;
+        service.require_in_process_namespace_policy()?;
         if context.is_some()
             && (!execution.route_override.trim().is_empty() || request.gunshi_allocation.is_some())
         {

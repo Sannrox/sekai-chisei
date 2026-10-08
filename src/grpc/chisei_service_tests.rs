@@ -8624,6 +8624,103 @@ fn privacy_egress_fails_closed_when_sekai_is_hop_only() {
     );
 }
 
+fn hop_only_namespace_policy_unavailable(error: &tonic::Status) {
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("namespace policy resolution requires in-process Sekai graph storage"),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn hop_only_chisei_plane_refuses_plan_content_native_and_policy_summary() {
+    let mut svc = memory_service();
+    svc.sekai_facts = crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(HopOnlyFacts));
+
+    let plan_err = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "task-hop-policy".into(),
+                namespace: "alpha".into(),
+                spec: "plan a hop-only request".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&plan_err);
+
+    let native_err = svc
+        .execute_plan(Request::new(ExecutePlanRequest {
+            plan: Some(ExecutionPlan {
+                plan_id: "uncached".into(),
+                input: Some(ExecutionInput {
+                    namespace: "alpha".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&native_err);
+
+    let content_err = svc
+        .plan_content_execution(Request::new(PlanContentExecutionRequest {
+            input: Some(ContentExecutionInputV1 {
+                execution: Some(ExecutionInput {
+                    request_id: "task-hop-content".into(),
+                    namespace: "alpha".into(),
+                    spec: "summarize".into(),
+                    preferred_model: "native-default".into(),
+                    max_tokens: 32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&content_err);
+
+    let content_exec_err = match svc
+        .execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(ContentExecutionPlanV1 {
+                execution: Some(ExecutionPlan {
+                    plan_id: "uncached".into(),
+                    input: Some(ExecutionInput {
+                        namespace: "alpha".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            resolved_parts: vec![],
+        }))
+        .await
+    {
+        Ok(_) => panic!("expected hop-only content execute to fail"),
+        Err(error) => error,
+    };
+    hop_only_namespace_policy_unavailable(&content_exec_err);
+
+    let summary_err = svc
+        .get_effective_policy_summary(effective_summary_request("alpha", "local"))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&summary_err);
+}
+
 #[test]
 fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
     let svc = memory_service();
