@@ -102,7 +102,7 @@ impl SekaiDb {
             .transpose()
     }
 
-    /// Palantir analog: Foundry dataset writes are one transaction. SQLite
+    /// Reference-platform analog: governed dataset writes are one transaction. SQLite
     /// `BEGIN IMMEDIATE` serializes writers on the file the way PostgreSQL
     /// uses `pg_advisory_xact_lock` plus a transaction.
     pub fn run_governed_transform(

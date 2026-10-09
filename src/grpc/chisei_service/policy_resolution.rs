@@ -9,7 +9,7 @@ use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
 
 impl ChiseiServiceImpl {
-    /// Palantir analog: a scoped token with no usable scope has no permissions.
+    /// Reference-platform analog: a scoped token with no usable scope has no permissions.
     /// Hop-only Chisei cannot load a complete namespace policy set, so every
     /// reader refuses instead of applying the unrestricted fallback.
     pub(super) fn require_in_process_namespace_policy(&self) -> Result<(), Status> {

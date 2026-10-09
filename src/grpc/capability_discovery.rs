@@ -120,7 +120,7 @@ fn object_query_capability(object_type: &schema::ObjectType) -> CapabilityEntry 
     entry
 }
 
-/// Palantir analog: experimental catalog entries stay visible and gated off
+/// Reference-platform analog: experimental catalog entries stay visible and gated off
 /// so discovery does not advertise them as production-ready.
 fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(

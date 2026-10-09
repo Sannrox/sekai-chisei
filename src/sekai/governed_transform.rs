@@ -15,7 +15,7 @@ pub const TRANSFORM_CLASS: &str = "projection";
 /// DiscoverCapabilities name for the in-process transform host.
 pub const HOSTED_COMPUTE_CAPABILITY: &str = "sekai.transforms.projection";
 /// Order-independent 256-bit sum of per-row SHA-256 hashes.
-/// Palantir analog: Foundry incremental `semantic_version` / `v2_semantics`
+/// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
 /// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
 pub const OUTPUT_DIGEST_PREFIX: &str = "sha256-sum-v1:";
 
@@ -199,7 +199,7 @@ pub type TransformCheckpoint = (i64, String, String);
 
 /// Incremental selection requires the current JobSpec and a live output
 /// digest in the current encoding. An old or malformed digest forces a
-/// full rebuild (Foundry SNAPSHOT) instead of folding.
+/// full rebuild (reference-platform snapshot) instead of folding.
 pub fn bind_checkpoint(
     incremental: bool,
     checkpoint: Option<(TransformCheckpoint, String)>,

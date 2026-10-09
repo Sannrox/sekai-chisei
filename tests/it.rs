@@ -1,6 +1,6 @@
 //! Grouped integration-test source set (#1308).
 //!
-//! Palantir `gradle-baseline` analog: one Test task per source set. Each
+//! Reference build-system analog: one Test task per source set. Each
 //! self-contained `tests/*.rs` file is a module of this binary. Process-global
 //! Prometheus recorder tests and `crate::`-coupled adapter, example, and
 //! ratchet tests stay separate `[[test]]` targets.

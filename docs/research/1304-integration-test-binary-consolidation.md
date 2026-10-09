@@ -7,9 +7,9 @@ Command: `cargo test --workspace --locked --no-run --timings` after a one-line e
 
 Each of the 133 files in `tests/*.rs` is its own binary linked against the root library. The question is whether merging them into one or a few binaries cuts that incremental compile.
 
-## Palantir analog
+## Reference-platform analog
 
-Palantir `gradle-baseline` configures **one `Test` task per project**, not one JVM per test class. JUnit 5 runs methods in parallel by default; tests that need static or process-global state are marked non-parallel rather than forked. Plugin tests that mutate a workspace still get an isolated directory. `gradle-guide` says measure configuration work before changing it.
+The reference build baseline configures **one `Test` task per project**, not one JVM per test class. JUnit 5 runs methods in parallel by default; tests that need static or process-global state are marked non-parallel rather than forked. Plugin tests that mutate a workspace still get an isolated directory. `gradle-guide` says measure configuration work before changing it.
 
 Cargo's closest analog is one integration-test target (one rustc/link) for the bulk source set, with a separate binary only where process isolation is load-bearing.
 
@@ -46,7 +46,7 @@ Port-binding tests use `127.0.0.1:0` or spawn a child with `Command.env`. They d
 
 ## Recommendation
 
-Land the grouped layout in [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308), matching Palantir's one-task-per-source-set rule:
+Land the grouped layout in [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308), matching the one-task-per-source-set rule:
 
 - `autotests = false` on the root package.
 - One `tests/it.rs` that modules the self-contained files.

@@ -704,7 +704,7 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         // Schema bootstrap and redemption backfill run at migrate, not per
-        // redeem. Palantir analog: Foundry incremental jobs do not re-run
+        // redeem. Reference-platform analog: governed incremental jobs do not re-run
         // dataset schema migration inside the write transaction.
         validate_delegation_chain_on(&tx, permit)?;
         let stored_json: Option<String> = tx

@@ -1,6 +1,6 @@
 //! LLM functions over a governed document rendition (#1326).
 //!
-//! Palantir analog: AIP Document Intelligence / Functions on objects bind
+//! Reference-platform analog: AIP Document Intelligence / Functions on objects bind
 //! extracted text from a media reference (they do not re-OCR in the function).
 //! Lineage is the media reference (document id + item digest). AIP Logic
 //! Ontology edits apply automatically or are staged for human review via an

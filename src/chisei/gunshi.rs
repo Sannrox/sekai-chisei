@@ -622,7 +622,7 @@ pub fn recommend_advisory(
 /// metadata. Invalid legacy rows are ignored rather than trusted implicitly.
 ///
 /// The list is filtered to `task_class` and `active` status, ordered newest
-/// first, and capped at [`MAX_LIST_LIMIT`]. Palantir analog: Foundry Object
+/// first, and capped at [`MAX_LIST_LIMIT`]. Reference-platform analog: governed Object
 /// Search `pageSize` plus filter-early, and Functions `.take(N)` instead of
 /// `.all()`. An explicit positive limit keeps the split-mode hop to one RPC
 /// page instead of a complete-set walk.
