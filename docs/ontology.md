@@ -32,7 +32,11 @@ overlays and are not persisted onto a type revision. The function product is
 that in-process host API (`CreateFunction` and its read-time pipeline).
 `CreateFunction` is classified `experimental` and is rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
-enabled. See [rpc-maturity.md](rpc-maturity.md).
+enabled. See [rpc-maturity.md](rpc-maturity.md). An LLM function revision
+becomes live through the evaluation gate in
+[evaluation-execution.md](evaluation-execution.md): fixture outputs are
+retained as marked evidence and scored with the existing rubric before
+publish.
 Customer guest code, if added, runs behind the same host; it is not an agent
 run and does not pick an engine here. See
 [ADR 0072](decisions/0072-in-process-function-host.md).

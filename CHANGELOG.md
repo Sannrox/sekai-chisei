@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- LLM function revisions are a governed evaluation subject. A fixture set is
+  invoked, each output is retained as evidence at the union of input markings,
+  and the existing `stochastic_model/v1` rubric scores it. A score below the
+  manifest threshold denies publish (`#1312`).
 - Governed documents and renditions persist on community PostgreSQL with the
   same owner, purpose, classification, and hold rules as SQLite. Experimental
   RPCs admit, attach a rendition, get, hold, release hold, expire, and delete
