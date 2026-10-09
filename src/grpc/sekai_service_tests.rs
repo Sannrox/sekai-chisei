@@ -3738,6 +3738,7 @@ async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_hos
                     input_bindings: HashMap::from([("language".into(), "language".into())]),
                     output_schema: schema.into(),
                     model_route: "native/scripted".into(),
+                    minimum_confidence_micros: 800_000,
                 })),
                 ..Default::default()
             }],
@@ -3761,6 +3762,7 @@ async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_hos
             assert_eq!(step.prompt_revision, "classify/v1");
             assert_eq!(step.model_route, "native/scripted");
             assert_eq!(step.output_schema, schema);
+            assert_eq!(step.minimum_confidence_micros, 800_000);
         }
         other => panic!("expected llm step, got {other:?}"),
     }

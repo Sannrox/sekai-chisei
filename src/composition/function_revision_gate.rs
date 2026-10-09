@@ -562,6 +562,7 @@ mod tests {
                     input_bindings: BTreeMap::from([("language".into(), "language".into())]),
                     output_schema: LLM_OUTPUT_SCHEMA.into(),
                     model_route: "native/scripted".into(),
+                    minimum_confidence_micros: 0,
                 }),
             ],
         }

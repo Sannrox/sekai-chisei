@@ -151,6 +151,7 @@ message LlmStep {
   map<string, string> input_bindings = 2;
   string output_schema = 3;
   string model_route = 4;
+  uint32 minimum_confidence_micros = 5;
 }
 
 message PipelineStep {

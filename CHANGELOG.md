@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- An LLM function may bind a governed document `extracted_text` rendition.
+  Caller-held text must match the pinned digest. Produced objects inherit
+  the document classification and carry `derived_from` lineage to a
+  namespaced document stub. Confidence below
+  `LlmStep.minimum_confidence_micros` parks a `require_approval` Action
+  instead of writing the object. Scores and thresholds above 1_000_000 fail
+  closed. `LlmStep` gains additive field 5 for the threshold (#1326).
 - LLM function revisions are a governed evaluation subject. A fixture set is
   invoked, each output is retained as evidence at the union of input markings,
   and the existing `stochastic_model/v1` rubric scores it. A score below the

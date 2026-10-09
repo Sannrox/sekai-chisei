@@ -21,6 +21,14 @@ A rendition is a derived child. Closed classes are `extracted_text`,
 parent content digest, its own content reference, and extractor identity plus
 profile digest.
 
+An experimental LLM function may bind an `extracted_text` rendition. The
+plane still stores no bytes: invoke supplies the text and fail-closes unless
+its digest matches the rendition pin. Written objects keep `derived_from`
+lineage to the document id, parent content digest, and rendition digest. A
+score below the function's `minimum_confidence_micros` parks a
+`require_approval` Action instead of writing the object. Scores and
+thresholds above `1_000_000` fail closed.
+
 ## Operator workflow
 
 ```text

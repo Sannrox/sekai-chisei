@@ -32,6 +32,9 @@ pub struct LlmStep {
     pub input_bindings: BTreeMap<String, String>,
     pub output_schema: String,
     pub model_route: String,
+    /// Below this score, extraction parks a `require_approval` Action (#1326).
+    #[serde(default)]
+    pub minimum_confidence_micros: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -233,6 +236,11 @@ pub fn validate_function(f: &Function) -> Result<(), String> {
                 if step.model_route.is_empty() {
                     return Err(format!("step {}: llm requires model_route", i));
                 }
+                if step.minimum_confidence_micros > 1_000_000 {
+                    return Err(format!(
+                        "step {i}: llm minimum_confidence_micros must be at most 1000000"
+                    ));
+                }
                 validate_output_schema(&step.output_schema)
                     .map_err(|error| format!("step {i}: {error}"))?;
             }
@@ -324,7 +332,8 @@ pub fn function_digest(function: &Function) -> String {
                         step.prompt_revision,
                         step.model_route,
                         step.output_schema,
-                        step.input_bindings
+                        step.input_bindings,
+                        step.minimum_confidence_micros
                     ]),
                 })
                 .collect::<Vec<_>>(),
@@ -1740,6 +1749,7 @@ mod tests {
                     input_bindings: BTreeMap::from([("language".into(), "language".into())]),
                     output_schema: LLM_OUTPUT_SCHEMA.into(),
                     model_route: "native/scripted".into(),
+                    minimum_confidence_micros: 0,
                 }),
             ],
         }
@@ -1908,6 +1918,7 @@ mod tests {
             PipelineStep::Llm(step) => {
                 assert_eq!(step.prompt_revision, "classify/v1");
                 assert_eq!(step.model_route, "native/scripted");
+                assert_eq!(step.minimum_confidence_micros, 0);
             }
             PipelineStep::Operator(_) => panic!("expected llm step"),
         }
@@ -1943,11 +1954,25 @@ mod tests {
             input_bindings: BTreeMap::new(),
             output_schema: LLM_OUTPUT_SCHEMA.into(),
             model_route: "native/scripted".into(),
+            minimum_confidence_micros: 0,
         }));
         assert!(
             validate_function(&function)
                 .unwrap_err()
                 .contains("at most one llm step")
+        );
+    }
+
+    #[test]
+    fn llm_step_rejects_confidence_above_one_million() {
+        let mut function = classify_function();
+        if let PipelineStep::Llm(step) = &mut function.pipeline[1] {
+            step.minimum_confidence_micros = 1_000_001;
+        }
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("minimum_confidence_micros must be at most 1000000")
         );
     }
 

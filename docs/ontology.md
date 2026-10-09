@@ -36,7 +36,9 @@ enabled. See [rpc-maturity.md](rpc-maturity.md). An LLM function revision
 becomes live through the evaluation gate in
 [evaluation-execution.md](evaluation-execution.md): fixture outputs are
 retained as marked evidence and scored with the existing rubric before
-publish.
+publish. A function may bind a governed document `extracted_text` rendition
+and record lineage to the document digest; low confidence parks a
+`require_approval` Action. See [documents.md](documents.md).
 Customer guest code, if added, runs behind the same host; it is not an agent
 run and does not pick an engine here. See
 [ADR 0072](decisions/0072-in-process-function-host.md).
