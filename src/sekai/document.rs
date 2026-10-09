@@ -35,8 +35,6 @@ pub const DOCUMENT_UNAVAILABLE: &str = "governed document is unavailable";
 pub const DOCUMENT_HELD: &str = "governed document is held";
 pub const REVISION_UNSUPPORTED: &str = "governed document revision is unsupported";
 pub const FORMAT_UNSUPPORTED: &str = "governed document format is unsupported";
-pub const POSTGRES_UNAVAILABLE: &str =
-    "governed documents are unavailable on the PostgreSQL community runtime";
 
 const MEDIA_TEXT_PLAIN: &str = "text/plain";
 const MEDIA_PDF: &str = "application/pdf";
@@ -1090,11 +1088,215 @@ mod tests {
         );
     }
 
+    fn postgres_runtime() -> RuntimeDb {
+        use crate::db::postgres::PostgresDb;
+        use std::sync::Arc;
+
+        let database_url = std::env::var("SEKAI_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            panic!("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database")
+        });
+        let db = if let Ok(ca_certificate_path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        };
+        RuntimeDb::Postgres(Arc::new(db))
+    }
+
+    fn unique_case(suffix: &str) -> (String, GovernedDocument, DocumentRendition) {
+        let principal = format!("analyst-{suffix}");
+        let mut document = document();
+        document.owner = principal.clone();
+        document.namespace = format!("records-{suffix}");
+        document.document_id = format!("doc:brief-{suffix}");
+        let mut rendition = rendition();
+        rendition.namespace = document.namespace.clone();
+        rendition.document_id = document.document_id.clone();
+        (principal, document, rendition)
+    }
+
     #[test]
-    fn postgres_surface_is_explicitly_unavailable() {
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_documents_share_sqlite_lifecycle_and_failure_table() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let runtime = postgres_runtime();
+        let (principal, document, rendition) = unique_case(&suffix);
+        pin_ceiling(&runtime, &principal, "internal");
+        let admitted = admit_document(&runtime, &principal, &document, 1_000).unwrap();
+        let attached = attach_rendition(&runtime, &principal, &rendition, 1_500).unwrap();
+        let view = retrieve_document(
+            &runtime,
+            &principal,
+            &DocumentRetrieve {
+                namespace: document.namespace.clone(),
+                document_id: document.document_id.clone(),
+                purpose: Some("case-review".into()),
+                fields: vec![
+                    FIELD_CONTENT_REF.into(),
+                    FIELD_METADATA.into(),
+                    FIELD_RENDITIONS.into(),
+                ],
+                classification_ceiling: Some("internal".into()),
+            },
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(view.lifecycle, "admitted");
         assert_eq!(
-            POSTGRES_UNAVAILABLE,
-            "governed documents are unavailable on the PostgreSQL community runtime"
+            view.content_ref.unwrap().digest,
+            admitted.content_ref.digest
+        );
+        assert_eq!(view.renditions.unwrap(), vec![attached]);
+
+        assert_eq!(
+            retrieve_document(
+                &runtime,
+                &principal,
+                &DocumentRetrieve {
+                    namespace: document.namespace.clone(),
+                    document_id: "doc:missing".into(),
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: Some("internal".into()),
+                },
+                2_100,
+            )
+            .unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        assert_eq!(
+            retrieve_document(
+                &runtime,
+                "intruder",
+                &DocumentRetrieve {
+                    namespace: document.namespace.clone(),
+                    document_id: document.document_id.clone(),
+                    purpose: Some("case-review".into()),
+                    fields: vec![FIELD_CONTENT_REF.into()],
+                    classification_ceiling: Some("internal".into()),
+                },
+                2_200,
+            )
+            .unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        assert_eq!(
+            retrieve_document(
+                &runtime,
+                &principal,
+                &DocumentRetrieve {
+                    namespace: document.namespace.clone(),
+                    document_id: document.document_id.clone(),
+                    purpose: Some("other-purpose".into()),
+                    fields: vec![FIELD_CONTENT_REF.into()],
+                    classification_ceiling: Some("internal".into()),
+                },
+                2_300,
+            )
+            .unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        assert_eq!(
+            retrieve_document(
+                &runtime,
+                &principal,
+                &DocumentRetrieve {
+                    namespace: document.namespace.clone(),
+                    document_id: document.document_id.clone(),
+                    purpose: Some("case-review".into()),
+                    fields: vec!["secret".into()],
+                    classification_ceiling: Some("internal".into()),
+                },
+                2_400,
+            )
+            .unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+
+        let mut bad_media = document.clone();
+        bad_media.document_id = format!("doc:bad-media-{suffix}");
+        bad_media.content_ref.media_type = "application/x-unknown".into();
+        bad_media.content_digest.clear();
+        assert_eq!(
+            admit_document(&runtime, &principal, &bad_media, 3_000).unwrap_err(),
+            FORMAT_UNSUPPORTED
+        );
+        let mut bad_revision = document.clone();
+        bad_revision.document_id = format!("doc:bad-revision-{suffix}");
+        bad_revision.type_revision = "v2".into();
+        bad_revision.content_digest.clear();
+        assert_eq!(
+            admit_document(&runtime, &principal, &bad_revision, 3_100).unwrap_err(),
+            REVISION_UNSUPPORTED
+        );
+
+        place_hold(
+            &runtime,
+            &principal,
+            &document.namespace,
+            &document.document_id,
+            "hold:1",
+            "litigation",
+            4_000,
+        )
+        .unwrap();
+        assert_eq!(
+            expire_document(
+                &runtime,
+                &principal,
+                &document.namespace,
+                &document.document_id,
+                4_100,
+            )
+            .unwrap_err(),
+            DOCUMENT_HELD
+        );
+        assert_eq!(
+            delete_document(
+                &runtime,
+                &principal,
+                &document.namespace,
+                &document.document_id,
+                4_200,
+            )
+            .unwrap_err(),
+            DOCUMENT_HELD
+        );
+        release_hold(
+            &runtime,
+            &principal,
+            &document.namespace,
+            &document.document_id,
+            "hold:1",
+            4_300,
+        )
+        .unwrap();
+        delete_document(
+            &runtime,
+            &principal,
+            &document.namespace,
+            &document.document_id,
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(
+            retrieve_document(
+                &runtime,
+                &principal,
+                &DocumentRetrieve {
+                    namespace: document.namespace,
+                    document_id: document.document_id,
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: Some("internal".into()),
+                },
+                5_100,
+            )
+            .unwrap_err(),
+            DOCUMENT_UNAVAILABLE
         );
     }
 }

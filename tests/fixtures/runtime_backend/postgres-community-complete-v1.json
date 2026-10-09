@@ -22,6 +22,7 @@
     "sekai.definition-branch",
     "sekai.evidence",
     "sekai.function-definitions",
+    "sekai.governed-document",
     "sekai.graph",
     "sekai.guarded-mutations",
     "sekai.handoffs",

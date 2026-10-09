@@ -56,6 +56,16 @@ lock; the CAS predicates remain the commit rule. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test. See
 [ADR 0064](decisions/0064-event-stream-postgres-parity.md).
 
+The reusable `sekai.governed-document/v1` class shares document and rendition
+metadata across SQLite and PostgreSQL. Experimental RPCs admit, attach
+renditions, retrieve, hold, expire, and delete with the same owner, purpose,
+classification, and hold rules as `sekaictl admin documents`. The plane
+stores no bytes and runs no extractor
+([ADR 0039](decisions/0039-governed-documents.md),
+[documents.md](documents.md)). Normal CI runs SQLite; PostgreSQL
+conformance remains an ignored isolated-database test behind
+`SEKAI_TEST_POSTGRES_URL`.
+
 The reusable `sekai.governed-transform/v1` class shares JobSpec, checkpoint,
 and run-receipt persistence across SQLite and PostgreSQL. Execution is the
 in-process `projection` host

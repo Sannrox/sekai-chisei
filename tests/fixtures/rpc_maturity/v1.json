@@ -349,6 +349,69 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "AdmitGovernedDocument",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AttachGovernedDocumentRendition",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetGovernedDocument",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HoldGovernedDocument",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ReleaseGovernedDocumentHold",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ExpireGovernedDocument",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteGovernedDocument",
+      "storage_path": "sekai.governed-document",
+      "real_backend": "yes",
+      "consumer": "cli, host",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ReadObjectChangeSubscription",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",

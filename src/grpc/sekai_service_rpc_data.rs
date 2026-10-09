@@ -1453,3 +1453,312 @@ fn to_proto_transform_run(run: &crate::sekai::governed_transform::TransformRun) 
         created_at_ms: run.created_at_ms,
     }
 }
+
+fn map_document_error(error: String) -> Status {
+    use crate::sekai::document::{
+        DOCUMENT_HELD, DOCUMENT_UNAVAILABLE, FORMAT_UNSUPPORTED, REVISION_UNSUPPORTED,
+    };
+    if error == DOCUMENT_UNAVAILABLE {
+        Status::not_found(error)
+    } else if error == DOCUMENT_HELD || error == FORMAT_UNSUPPORTED || error == REVISION_UNSUPPORTED
+    {
+        Status::failed_precondition(error)
+    } else {
+        Status::invalid_argument(error)
+    }
+}
+
+fn caller_actor(principals: &[String]) -> Result<&str, Status> {
+    require_authenticated(principals)?;
+    principals
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| Status::unauthenticated("principal required"))
+}
+
+fn from_proto_content_ref(proto: ContentReference) -> crate::sekai::document::ContentReference {
+    crate::sekai::document::ContentReference {
+        scheme: proto.scheme,
+        digest: proto.digest,
+        media_type: proto.media_type,
+        byte_length: proto.byte_length,
+    }
+}
+
+fn to_proto_content_ref(reference: &crate::sekai::document::ContentReference) -> ContentReference {
+    ContentReference {
+        scheme: reference.scheme.clone(),
+        digest: reference.digest.clone(),
+        media_type: reference.media_type.clone(),
+        byte_length: reference.byte_length,
+    }
+}
+
+fn from_proto_document(
+    proto: GovernedDocument,
+) -> Result<crate::sekai::document::GovernedDocument, Status> {
+    let content_ref = proto
+        .content_ref
+        .map(from_proto_content_ref)
+        .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
+    Ok(crate::sekai::document::GovernedDocument {
+        contract_version: proto.contract_version,
+        document_id: proto.document_id,
+        namespace: proto.namespace,
+        owner: proto.owner,
+        type_revision: proto.type_revision,
+        purpose: proto.purpose,
+        classification: proto.classification,
+        title: proto.title,
+        metadata: proto.metadata.into_iter().collect(),
+        content_ref,
+        content_digest: proto.content_digest,
+        expires_at_ms: proto.expires_at_ms,
+        hold_id: proto.hold_id,
+        hold_reason: proto.hold_reason,
+        admitted_by: proto.admitted_by,
+        admitted_at_ms: proto.admitted_at_ms,
+        deleted_at_ms: proto.deleted_at_ms,
+    })
+}
+
+fn to_proto_document(document: &crate::sekai::document::GovernedDocument) -> GovernedDocument {
+    GovernedDocument {
+        contract_version: document.contract_version.clone(),
+        document_id: document.document_id.clone(),
+        namespace: document.namespace.clone(),
+        owner: document.owner.clone(),
+        type_revision: document.type_revision.clone(),
+        purpose: document.purpose.clone(),
+        classification: document.classification.clone(),
+        title: document.title.clone(),
+        metadata: document.metadata.clone().into_iter().collect(),
+        content_ref: Some(to_proto_content_ref(&document.content_ref)),
+        content_digest: document.content_digest.clone(),
+        expires_at_ms: document.expires_at_ms,
+        hold_id: document.hold_id.clone(),
+        hold_reason: document.hold_reason.clone(),
+        admitted_by: document.admitted_by.clone(),
+        admitted_at_ms: document.admitted_at_ms,
+        deleted_at_ms: document.deleted_at_ms,
+    }
+}
+
+fn from_proto_rendition(
+    proto: DocumentRendition,
+) -> Result<crate::sekai::document::DocumentRendition, Status> {
+    let content_ref = proto
+        .content_ref
+        .map(from_proto_content_ref)
+        .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
+    Ok(crate::sekai::document::DocumentRendition {
+        namespace: proto.namespace,
+        document_id: proto.document_id,
+        rendition_id: proto.rendition_id,
+        class: proto.class,
+        parent_content_digest: proto.parent_content_digest,
+        content_ref,
+        extractor_id: proto.extractor_id,
+        extractor_profile_digest: proto.extractor_profile_digest,
+        attached_by: proto.attached_by,
+        attached_at_ms: proto.attached_at_ms,
+    })
+}
+
+fn to_proto_rendition(rendition: &crate::sekai::document::DocumentRendition) -> DocumentRendition {
+    DocumentRendition {
+        namespace: rendition.namespace.clone(),
+        document_id: rendition.document_id.clone(),
+        rendition_id: rendition.rendition_id.clone(),
+        class: rendition.class.clone(),
+        parent_content_digest: rendition.parent_content_digest.clone(),
+        content_ref: Some(to_proto_content_ref(&rendition.content_ref)),
+        extractor_id: rendition.extractor_id.clone(),
+        extractor_profile_digest: rendition.extractor_profile_digest.clone(),
+        attached_by: rendition.attached_by.clone(),
+        attached_at_ms: rendition.attached_at_ms,
+    }
+}
+
+fn to_proto_document_view(view: crate::sekai::document::DocumentView) -> DocumentView {
+    let has_metadata = view.metadata.is_some();
+    let has_renditions = view.renditions.is_some();
+    DocumentView {
+        contract_version: view.contract_version,
+        document_id: view.document_id,
+        namespace: view.namespace,
+        type_revision: view.type_revision,
+        lifecycle: view.lifecycle,
+        definition_digest: view.definition_digest,
+        content_ref: view.content_ref.as_ref().map(to_proto_content_ref),
+        title: view.title,
+        metadata: view.metadata.unwrap_or_default().into_iter().collect(),
+        purpose: view.purpose,
+        classification: view.classification,
+        expires_at_ms: view.expires_at_ms,
+        hold_id: view.hold_id,
+        renditions: view
+            .renditions
+            .unwrap_or_default()
+            .iter()
+            .map(to_proto_rendition)
+            .collect(),
+        has_metadata,
+        has_renditions,
+    }
+}
+
+pub(super) async fn admit_governed_document(
+    service: &SekaiServiceImpl,
+    req: Request<AdmitGovernedDocumentRequest>,
+) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let proto = req
+        .into_inner()
+        .document
+        .ok_or_else(|| Status::invalid_argument("document required"))?;
+    let document = from_proto_document(proto)?;
+    let admitted = crate::sekai::document::admit_document(
+        service.db.runtime(),
+        actor,
+        &document,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(AdmitGovernedDocumentResponse {
+        document: Some(to_proto_document(&admitted)),
+    }))
+}
+
+pub(super) async fn attach_governed_document_rendition(
+    service: &SekaiServiceImpl,
+    req: Request<AttachGovernedDocumentRenditionRequest>,
+) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let proto = req
+        .into_inner()
+        .rendition
+        .ok_or_else(|| Status::invalid_argument("rendition required"))?;
+    let rendition = from_proto_rendition(proto)?;
+    let attached = crate::sekai::document::attach_rendition(
+        service.db.runtime(),
+        actor,
+        &rendition,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(AttachGovernedDocumentRenditionResponse {
+        rendition: Some(to_proto_rendition(&attached)),
+    }))
+}
+
+pub(super) async fn get_governed_document(
+    service: &SekaiServiceImpl,
+    req: Request<GetGovernedDocumentRequest>,
+) -> Result<Response<GetGovernedDocumentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let input = req.into_inner();
+    let view = crate::sekai::document::retrieve_document(
+        service.db.runtime(),
+        actor,
+        &crate::sekai::document::DocumentRetrieve {
+            namespace: input.namespace,
+            document_id: input.document_id,
+            purpose: (!input.purpose.is_empty()).then_some(input.purpose),
+            fields: input.fields,
+            classification_ceiling: (!input.classification_ceiling.is_empty())
+                .then_some(input.classification_ceiling),
+        },
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(GetGovernedDocumentResponse {
+        view: Some(to_proto_document_view(view)),
+    }))
+}
+
+pub(super) async fn hold_governed_document(
+    service: &SekaiServiceImpl,
+    req: Request<HoldGovernedDocumentRequest>,
+) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let input = req.into_inner();
+    let document = crate::sekai::document::place_hold(
+        service.db.runtime(),
+        actor,
+        &input.namespace,
+        &input.document_id,
+        &input.hold_id,
+        &input.reason,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(HoldGovernedDocumentResponse {
+        document: Some(to_proto_document(&document)),
+    }))
+}
+
+pub(super) async fn release_governed_document_hold(
+    service: &SekaiServiceImpl,
+    req: Request<ReleaseGovernedDocumentHoldRequest>,
+) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let input = req.into_inner();
+    let document = crate::sekai::document::release_hold(
+        service.db.runtime(),
+        actor,
+        &input.namespace,
+        &input.document_id,
+        &input.hold_id,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(ReleaseGovernedDocumentHoldResponse {
+        document: Some(to_proto_document(&document)),
+    }))
+}
+
+pub(super) async fn expire_governed_document(
+    service: &SekaiServiceImpl,
+    req: Request<ExpireGovernedDocumentRequest>,
+) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let input = req.into_inner();
+    let document = crate::sekai::document::expire_document(
+        service.db.runtime(),
+        actor,
+        &input.namespace,
+        &input.document_id,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(ExpireGovernedDocumentResponse {
+        document: Some(to_proto_document(&document)),
+    }))
+}
+
+pub(super) async fn delete_governed_document(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteGovernedDocumentRequest>,
+) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = caller_actor(&principals)?;
+    let input = req.into_inner();
+    let document = crate::sekai::document::delete_document(
+        service.db.runtime(),
+        actor,
+        &input.namespace,
+        &input.document_id,
+        now_millis(),
+    )
+    .map_err(map_document_error)?;
+    Ok(Response::new(DeleteGovernedDocumentResponse {
+        document: Some(to_proto_document(&document)),
+    }))
+}

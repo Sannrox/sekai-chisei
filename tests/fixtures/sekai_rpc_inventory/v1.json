@@ -501,6 +501,118 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "AdmitGovernedDocument",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AttachGovernedDocumentRendition",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetGovernedDocument",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "HoldGovernedDocument",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ReleaseGovernedDocumentHold",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ExpireGovernedDocument",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DeleteGovernedDocument",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.governed-document"
+      ],
+      "evidence": [
+        "src/sekai/document.rs",
+        "src/db/document_store.rs",
+        "src/db/postgres_document.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.governed-document"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ReadObjectChangeSubscription",
       "kind": "query",
       "surfaces": [],
@@ -1811,6 +1923,7 @@
     "sekai.definition-branch",
     "sekai.evidence",
     "sekai.function-definitions",
+    "sekai.governed-document",
     "sekai.graph",
     "sekai.guarded-mutations",
     "sekai.handoffs",

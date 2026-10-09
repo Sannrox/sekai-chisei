@@ -110,6 +110,13 @@ real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |
