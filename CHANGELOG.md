@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- LLM function revisions are a governed evaluation subject. A fixture set is
+  invoked, each output is retained as evidence at the union of input markings,
+  and the existing `stochastic_model/v1` rubric scores it. A score below the
+  manifest threshold denies publish (`#1312`).
 - Restore pre-#1368 `PipelineStep` wire fields 1–9 for operator clients.
   Operator responses include matching legacy and structured representations;
   conflicting inputs are rejected. Structured operator/LLM variants now use
