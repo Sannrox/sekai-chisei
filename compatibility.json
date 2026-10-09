@@ -1,12 +1,12 @@
 {
   "contract_version": "sekai.compatibility-matrix/v1",
-  "server_version": "1.1.0",
+  "server_version": "1.2.0",
   "proto_revision": "sha256:2395c06939316452fa70ab2664dfbc60a819c3dbdf6f228fb7e62b1779ff4134",
-  "minimum_compatible_server": "1.1.0",
+  "minimum_compatible_server": "1.2.0",
   "identity_assertion_contract": "sekai.identity-assertion/v1",
   "packages": {
-    "sekai-chisei": "1.1.0",
-    "sekai-proto": "1.1.0",
+    "sekai-chisei": "1.2.0",
+    "sekai-proto": "1.2.0",
     "sekai-client": "0.1.2",
     "typescript": "0.1.0",
     "python": "0.1.0"

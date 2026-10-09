@@ -1,6 +1,6 @@
 [package]
 name = "sekai-chisei"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
@@ -92,7 +92,7 @@ sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
 sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
 sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
-sekai-proto = { version = "1.1.0", path = "crates/sekai-proto" }
+sekai-proto = { version = "1.2.0", path = "crates/sekai-proto" }
 sekai-ontology = { version = "1.0.0", path = "crates/sekai-ontology" }
 mikura = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
