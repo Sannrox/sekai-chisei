@@ -3711,7 +3711,10 @@ async fn create_function_rejects_an_empty_pipeline_step() {
         .create_function(with_principal(CreateFunctionRequest {
             function: Some(Function {
                 name: "empty-step".into(),
-                pipeline: vec![PipelineStep { step: None }],
+                pipeline: vec![PipelineStep {
+                    step: None,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }),
         }))
@@ -3736,6 +3739,7 @@ async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_hos
                     output_schema: schema.into(),
                     model_route: "native/scripted".into(),
                 })),
+                ..Default::default()
             }],
             ..Default::default()
         }),
@@ -11660,4 +11664,85 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
     }
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_pipeline_round_trips_through_create_and_list() {
+    use prost::Message;
+    let svc = service();
+    // filter/customer, encoded by the old flat PipelineStep schema.
+    let bytes = b"\x0a\x06filter\x12\x08customer";
+    let step = PipelineStep::decode(bytes.as_slice()).unwrap();
+    let created = svc
+        .create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "legacy-filter".into(),
+                pipeline: vec![step],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .function
+        .unwrap();
+    let projected = &created.pipeline[0];
+    assert_eq!(projected.op, "filter");
+    assert_eq!(projected.kind, "customer");
+    assert!(matches!(
+        projected.step,
+        Some(pipeline_step::Step::Operator(_))
+    ));
+    svc.create_function(with_principal(CreateFunctionRequest {
+        function: Some(Function {
+            name: "legacy-round-trip".into(),
+            ..created.clone()
+        }),
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_functions(with_principal(ListFunctionsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed
+            .functions
+            .iter()
+            .find(|f| f.name == created.name)
+            .unwrap()
+            .pipeline,
+        created.pipeline
+    );
+}
+
+#[tokio::test]
+async fn create_function_rejects_conflicting_pipeline_representations() {
+    let svc = service();
+    for variant in [
+        pipeline_step::Step::Operator(OperatorStep {
+            op: "aggregate".into(),
+            func: "count".into(),
+            ..Default::default()
+        }),
+        pipeline_step::Step::Llm(LlmStep::default()),
+    ] {
+        let error = svc
+            .create_function(with_principal(CreateFunctionRequest {
+                function: Some(Function {
+                    name: "conflicting".into(),
+                    pipeline: vec![PipelineStep {
+                        op: "filter".into(),
+                        step: Some(variant),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("conflicting pipeline step"));
+    }
 }

@@ -154,9 +154,20 @@ message LlmStep {
 }
 
 message PipelineStep {
+  // Legacy operator fields remain wire-compatible with clients before #1368.
+  string op = 1;
+  string kind = 2;
+  string property = 3;
+  string value = 4;
+  string relation = 5;
+  string dir = 6;
+  string func = 7;
+  string field = 8;
+  string as = 9;
+
   oneof step {
-    OperatorStep operator = 1;
-    LlmStep llm = 2;
+    OperatorStep operator = 10;
+    LlmStep llm = 11;
   }
 }
 
