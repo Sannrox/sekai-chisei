@@ -6,6 +6,9 @@
 //! evidence at the union (most restrictive) of the input markings. The
 //! existing `stochastic_model/v1` rubric scores that evidence; a score below
 //! the manifest threshold is a deny gate on publish.
+//!
+//! This lives in composition because it invokes Sekai functions and persists
+//! them through the Sekai store, then scores with Chisei evaluation (ADR 0092).
 
 use crate::chisei::evaluation_execution::{
     self, EvaluationEvidenceInput, EvaluationExecutionProjection, EvaluationGateDecision,
