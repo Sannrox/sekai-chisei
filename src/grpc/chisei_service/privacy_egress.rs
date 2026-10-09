@@ -76,7 +76,7 @@ impl ChiseiServiceImpl {
     }
 
     fn list_entity_scan_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
-        // Palantir analog: Search Objects is per object type; leak_rule is
+        // Reference-platform analog: Search Objects is per object type; leak_rule is
         // policy, not the entity set. Probe one past ENTITY_SCAN_LIMIT so a
         // complete page is not treated as truncated (nextPageToken analog).
         let scan_limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;

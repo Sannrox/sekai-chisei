@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 /// Per-step object-type lookups, including hop failures.
-/// Palantir analog: OSDK caches query results; a failed lookup is not retried
+/// Reference-platform analog: OSDK caches query results; a failed lookup is not retried
 /// unbounded inside the same cache.
 enum CachedObjectType {
     Found(Option<ObjectType>),

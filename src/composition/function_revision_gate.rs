@@ -1,6 +1,6 @@
 //! Evaluation gates for LLM function revisions (#1312).
 //!
-//! Palantir analog: Foundry markings inherit along data dependencies, and AIP
+//! Reference-platform analog: governed markings inherit along data dependencies, and AIP
 //! Evals execute a function over test cases, retain outputs, and fail the
 //! suite when scores miss the threshold. Sekai retains each fixture output as
 //! evidence at the union (most restrictive) of the input markings. The

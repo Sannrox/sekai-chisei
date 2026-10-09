@@ -49,8 +49,8 @@ impl ProcessPlane {
     }
 
     /// Chisei-plane requires a hop target (ADR 0096 rule 4). Combined and
-    /// Sekai planes ignore the value. Palantir analog: Foundry compute
-    /// modules that use OSDK require `FOUNDRY_URL` at process start.
+    /// Sekai planes ignore the value. Reference-platform analog: governed compute
+    /// modules that use OSDK require the platform endpoint variable at process start.
     pub fn require_sekai_endpoint(self, endpoint: Option<&str>) -> Result<(), String> {
         match self {
             Self::Chisei => {

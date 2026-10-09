@@ -118,7 +118,7 @@ fn spawn_plane(
 /// Wait until this child binds `port`. Fail immediately if the child exits
 /// (bind TOCTOU, boot error) and include stderr. A pre-existing occupant of
 /// a stolen `free_port()` is not this child: require an observed closed-to-
-/// open transition while the process is still alive. Palantir analog:
+/// open transition while the process is still alive. Reference-platform analog:
 /// go-java-launcher ProcessMonitor identifies the service by child PID.
 fn wait_ready(child: &mut ChildGuard, port: u16, label: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);

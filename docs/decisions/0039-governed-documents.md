@@ -44,7 +44,7 @@ and runs no extractor.
 
 #1325 ports admit, rendition, retrieve, hold, expire, and delete onto
 community PostgreSQL and exposes those operations as experimental
-`SekaiService` RPCs. Foundry Media Sets keep bytes and extractors in the
+`SekaiService` RPCs. managed media sets keep bytes and extractors in the
 platform; this plane records digest-addressed references only.
 
 ## Alternatives considered

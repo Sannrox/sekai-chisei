@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 pub const ENTITY_SCAN_OPT_OUT_KEY: &str = "chisei.egress.entity_scan";
-/// Bound on objects fetched for entity literals. Palantir analog: Object Search pageSize.
+/// Bound on objects fetched for entity literals. Reference-platform analog: Object Search pageSize.
 pub const ENTITY_SCAN_LIMIT: i32 = 500;
 pub const ENTITY_LITERAL_LIMIT: usize = 500;
 pub const SCAN_TRUNCATED_LABEL: &str = "scan_truncated";
@@ -98,7 +98,7 @@ struct CachedPrivacyScan {
 }
 
 /// Compiled leak rules and entity literals reused while both object sets are unchanged.
-/// Palantir analog: function-backed actions reuse one ontology snapshot per run;
+/// Reference-platform analog: function-backed actions reuse one ontology snapshot per run;
 /// the next invocation searches the current object set.
 pub struct PrivacyScan {
     pub rules: Arc<Vec<LeakRule>>,
@@ -159,7 +159,7 @@ impl PrivacyScanCache {
         let rules = Arc::new(compile_leak_rules(&leaks));
         let (entities, truncated) = match entity_objs {
             Some(objects) => {
-                // Palantir analog: Object Search pageSize is a maximum;
+                // Reference-platform analog: Object Search pageSize is a maximum;
                 // more results exist only when a further page is non-empty.
                 let listed_overflow = objects.len() > ENTITY_SCAN_LIMIT as usize;
                 let scanned = if listed_overflow {

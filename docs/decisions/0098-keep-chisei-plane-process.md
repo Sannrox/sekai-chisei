@@ -33,8 +33,8 @@ boot without Sekai. The inventory:
 - Deployment manifests in this repository do not start `chisei-plane`. Combined
   remains the supported local and image default.
 
-Palantir packages each product as its own SLS distribution
-([`sls-packaging`](https://github.com/palantir/sls-packaging)) and records
+Reference platforms package each product as its own SLS distribution
+(the standard service packaging tool) and records
 required `productDependency` on other products. Ontology, object storage, and
 functions stay separate services with authenticated calls; they are not folded
 into one process because one product requires another.
@@ -58,7 +58,7 @@ into one process because one product requires another.
 
 - **Delete `chisei-plane` and keep only combined.** Rejected: it removes the
   only in-repo proof that Chisei can run as a separate product with an
-  authenticated Sekai hop, which is the Palantir product-dependency shape
+  authenticated Sekai hop, which is the reference product-dependency shape
   ADR 0096 already chose (Chisei requires Sekai; Sekai does not require
   Chisei).
 - **Keep the hop traits but drop the bin.** Rejected: an unused hop is not a
