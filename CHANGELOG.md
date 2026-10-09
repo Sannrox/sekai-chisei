@@ -6,6 +6,12 @@
   invoked, each output is retained as evidence at the union of input markings,
   and the existing `stochastic_model/v1` rubric scores it. A score below the
   manifest threshold denies publish (`#1312`).
+- Restore pre-#1368 `PipelineStep` wire fields 1–9 for operator clients.
+  Operator responses include matching legacy and structured representations;
+  conflicting inputs are rejected. Structured operator/LLM variants now use
+  fields 10/11. Regenerate clients built from the unreleased #1368 protocol
+  before upgrading; its incompatible fields 1/2 are not supported (#1371).
+
 - Governed documents and renditions persist on community PostgreSQL with the
   same owner, purpose, classification, and hold rules as SQLite. Experimental
   RPCs admit, attach a rendition, get, hold, release hold, expire, and delete

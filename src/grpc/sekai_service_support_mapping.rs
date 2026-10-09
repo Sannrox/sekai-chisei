@@ -829,6 +829,15 @@ pub(super) fn from_proto_virtual_table(vt: &VirtualTable) -> dataset::VirtualTab
 pub(super) fn to_proto_pipeline_step(step: &function::PipelineStep) -> PipelineStep {
     match step {
         function::PipelineStep::Operator(step) => PipelineStep {
+            op: step.op.clone(),
+            kind: step.kind.clone(),
+            property: step.property.clone(),
+            value: step.value.clone(),
+            relation: step.relation.clone(),
+            dir: step.dir.clone(),
+            func: step.func.clone(),
+            field: step.field.clone(),
+            r#as: step.alias.clone(),
             step: Some(pipeline_step::Step::Operator(OperatorStep {
                 op: step.op.clone(),
                 kind: step.kind.clone(),
@@ -848,6 +857,7 @@ pub(super) fn to_proto_pipeline_step(step: &function::PipelineStep) -> PipelineS
                 output_schema: step.output_schema.clone(),
                 model_route: step.model_route.clone(),
             })),
+            ..Default::default()
         },
     }
 }
@@ -855,6 +865,43 @@ pub(super) fn to_proto_pipeline_step(step: &function::PipelineStep) -> PipelineS
 pub(super) fn from_proto_pipeline_step(
     step: &PipelineStep,
 ) -> Result<function::PipelineStep, Status> {
+    let legacy = [
+        &step.op,
+        &step.kind,
+        &step.property,
+        &step.value,
+        &step.relation,
+        &step.dir,
+        &step.func,
+        &step.field,
+        &step.r#as,
+    ];
+    if legacy.iter().any(|value| !value.is_empty()) {
+        let matches = match step.step.as_ref() {
+            Some(pipeline_step::Step::Operator(operator)) => {
+                legacy
+                    == [
+                        &operator.op,
+                        &operator.kind,
+                        &operator.property,
+                        &operator.value,
+                        &operator.relation,
+                        &operator.dir,
+                        &operator.func,
+                        &operator.field,
+                        &operator.r#as,
+                    ]
+            }
+            Some(pipeline_step::Step::Llm(_)) => false,
+            None => true,
+        };
+        // Responses include both operator representations for old and new clients.
+        if !matches {
+            return Err(Status::invalid_argument(
+                "conflicting pipeline step representations",
+            ));
+        }
+    }
     match step.step.as_ref() {
         Some(pipeline_step::Step::Operator(step)) => {
             Ok(function::PipelineStep::Operator(function::OperatorStep {
@@ -875,6 +922,19 @@ pub(super) fn from_proto_pipeline_step(
                 input_bindings: step.input_bindings.clone().into_iter().collect(),
                 output_schema: step.output_schema.clone(),
                 model_route: step.model_route.clone(),
+            }))
+        }
+        None if !step.op.is_empty() => {
+            Ok(function::PipelineStep::Operator(function::OperatorStep {
+                op: step.op.clone(),
+                kind: step.kind.clone(),
+                property: step.property.clone(),
+                value: step.value.clone(),
+                relation: step.relation.clone(),
+                dir: step.dir.clone(),
+                func: step.func.clone(),
+                field: step.field.clone(),
+                alias: step.r#as.clone(),
             }))
         }
         None => Err(Status::invalid_argument("pipeline step required")),
@@ -902,6 +962,7 @@ pub(super) fn proto_operator_step(
             field: field.into(),
             r#as: alias.into(),
         })),
+        ..Default::default()
     }
 }
 
