@@ -48,6 +48,21 @@
 - Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
 - Governed transforms are a Sekai in-process class on both community backends: put a JobSpec, run a `projection`, inspect the run receipt. `sekaictl admin transform` and Console `/transforms` are the operator path. RPCs stay experimental (ADR 0097, #1287).
 
+## 1.2.0
+
+Upgrade notes:
+
+- Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE`. Unset them and use `SEKAI_DATA_DIR` (default `./data`) or destination-pair settings.
+- The server image sets `SEKAI_DATA_DIR=/data` instead of `DB_PATH=/data/sekai.db`; relocate an existing single store before upgrading.
+- `chisei-plane` refuses remote-only namespace policy resolution during boot and RPC handling (#1291).
+- Observation `external_id` is deduplicated by a unique index; existing duplicates refuse startup (#1330).
+- The `sekai-domain` and `sekai-obs` crate split changes `obs::logging::init()` to require a default service name (#1306).
+- The `remote_sekai` module moved without a protocol change (#1315).
+- Governed-transform digest encoding changed; incremental runs require a full rebuild after upgrade (#1307, #1346).
+- Both planes require `SEKAI_ENDPOINT`; unattached paths were removed (#1343).
+- Policy and execution paths fail closed when namespace policy cannot load, including Gunshi (#1349).
+- Hosted transform catalog discovery is experimental and gated through `DiscoverCapabilities` (#1350).
+
 ## 1.1.0
 
 Upgrade notes:
