@@ -22,6 +22,7 @@ pub mod external_action;
 pub mod external_action_lifecycle;
 pub mod external_permit;
 pub mod federation;
+pub mod function_revision_gate;
 pub mod gate;
 pub mod gateway_decide;
 pub mod governed_subject;
