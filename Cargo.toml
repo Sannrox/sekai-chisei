@@ -10,12 +10,15 @@ homepage = "https://github.com/Sannrox/sekai-chisei"
 documentation = "https://github.com/Sannrox/sekai-chisei/tree/main/docs"
 keywords = ["agents", "governance", "llm", "grpc", "local-first"]
 categories = ["development-tools", "web-programming"]
+autotests = false
 
 [workspace]
 members = [
     "crates/chisei-gateway",
     "crates/sekai-admin-client",
     "crates/sekai-client",
+    "crates/sekai-domain",
+    "crates/sekai-obs",
     "crates/sekai-ontology",
     "crates/sekai-proto",
     "crates/sekai-provider",
@@ -24,7 +27,7 @@ resolver = "2"
 
 [features]
 default = []
-secret-command = []
+secret-command = ["sekai-domain/secret-command"]
 gateway-test-support = []
 experimental-rpcs = []
 
@@ -85,6 +88,8 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 tracing-opentelemetry = { version = "0.33", default-features = false }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
+sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
 sekai-provider = { version = "1.0.0", path = "crates/sekai-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
 sekai-proto = { version = "1.2.0", path = "crates/sekai-proto" }
@@ -94,6 +99,7 @@ mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
 fs2 = "0.4.3"
 
 [dev-dependencies]
+rusqlite = { version = "0.40", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.2.0" }
@@ -114,3 +120,91 @@ path = "src/bin/sekai_mcp.rs"
 [[bench]]
 name = "control_plane"
 harness = false
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[[test]]
+name = "autonomous_envelope_adapters"
+path = "tests/autonomous_envelope_adapters.rs"
+
+[[test]]
+name = "batch_harness_conformance"
+path = "tests/batch_harness_conformance.rs"
+
+[[test]]
+name = "chisei_runtime_db_ratchet"
+path = "tests/chisei_runtime_db_ratchet.rs"
+
+[[test]]
+name = "emit_git_version"
+path = "tests/emit_git_version.rs"
+
+[[test]]
+name = "epistemic_replication_example"
+path = "tests/epistemic_replication_example.rs"
+
+[[test]]
+name = "evidence_adapters"
+path = "tests/evidence_adapters.rs"
+
+[[test]]
+name = "gateway_cache_signals"
+path = "tests/gateway_cache_signals.rs"
+
+[[test]]
+name = "lakehouse_snapshot_adapters"
+path = "tests/lakehouse_snapshot_adapters.rs"
+
+[[test]]
+name = "model_platform_adapters"
+path = "tests/model_platform_adapters.rs"
+
+[[test]]
+name = "object_sync_adapters"
+path = "tests/object_sync_adapters.rs"
+
+[[test]]
+name = "sekai_chisei_import_ratchet"
+path = "tests/sekai_chisei_import_ratchet.rs"
+
+[[test]]
+name = "source_writeback_example"
+path = "tests/source_writeback_example.rs"
+
+[[test]]
+name = "warehouse_projection_adapters"
+path = "tests/warehouse_projection_adapters.rs"
+
+[[test]]
+name = "warehouse_table_ingest"
+path = "tests/warehouse_table_ingest.rs"
+
+[[test]]
+name = "warehouse_table_writeback"
+path = "tests/warehouse_table_writeback.rs"
+
+[[test]]
+name = "workflow_action_adapters"
+path = "tests/workflow_action_adapters.rs"
+
+[[test]]
+name = "auth_signals"
+path = "tests/auth_signals.rs"
+
+[[test]]
+name = "db_signals"
+path = "tests/db_signals.rs"
+
+[[test]]
+name = "dedup_signals"
+path = "tests/dedup_signals.rs"
+
+[[test]]
+name = "resilience_load"
+path = "tests/resilience_load.rs"
+
+[[test]]
+name = "observability"
+path = "tests/observability.rs"

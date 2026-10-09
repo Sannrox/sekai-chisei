@@ -1,0 +1,6 @@
+{
+  "schema_id": "feedback.observation",
+  "schema_version": "1.0.0",
+  "evidence_type": "feedback.observation",
+  "compatible_versions": []
+}

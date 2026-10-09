@@ -30,7 +30,7 @@ product delivery over cross-cutting storage, compute, networking, security,
 governance, and workspace capabilities. Deployment and continuous delivery are
 treated as a separate substrate that hosts the other capabilities. This is a
 capability and ownership model, not a prescription that every capability must
-be a separate process. [Official architecture overview](https://www.palantir.com/docs/foundry/architecture-center/platforms)
+be a separate process. Official architecture overview
 
 For sekai-chisei, the correct translation is:
 
@@ -57,12 +57,12 @@ governed decisions while making the process boundary real.
 The reference platform's foundational data representation is a dataset: a
 logical wrapper around files with permissions, schema management, version
 control, and updates over time. Dataset changes use explicit transactions with
-open, commit, and abort states. [Dataset concepts and transactions](https://www.palantir.com/docs/foundry/data-integration/datasets)
+open, commit, and abort states. Dataset concepts and transactions
 
 Data is not treated as an undifferentiated application cache. The platform
 records which inputs produced an output and which transformation logic was
 used. Lineage is exposed as a first-class view over sources, datasets,
-transformations, and downstream artifacts. [Introductory data and object concepts](https://www.palantir.com/docs/foundry/getting-started/introductory-concepts), [data lineage overview](https://www.palantir.com/docs/foundry/data-lineage/overview)
+transformations, and downstream artifacts. Introductory data and object concepts, data lineage overview
 
 **Boundary implication.** The durable data plane should own bytes, canonical
 records, schema/type revisions, transaction state, lineage, and recovery. A
@@ -76,11 +76,11 @@ real-world concepts. It contains objects, properties, and links, but also the
 action and function definitions that describe how those concepts can change.
 The source documentation explicitly presents data, logic, action, and security
 as a combined operational model rather than as a thin catalog over data.
-[Semantic/operational layer overview](https://www.palantir.com/docs/foundry/ontology/overview), [semantic system architecture](https://www.palantir.com/docs/foundry/architecture-center/ontology-system)
+Semantic/operational layer overview, semantic system architecture
 
 The documentation distinguishes schema-like resources from their instances:
 object types, link types, and action types define the model; objects and links
-carry primary keys and actual property values. [Resource versus instance permissioning](https://www.palantir.com/docs/foundry/object-permissioning/overview)
+carry primary keys and actual property values. Resource versus instance permissioning
 
 **Boundary implication.** Semantic definitions are authoritative resources, not
 DTOs reconstructed independently by each process. sekai should own the
@@ -94,17 +94,17 @@ sekai.
 The reference platform separates discretionary role grants from mandatory
 controls. Projects organize work and act as the primary boundary for role
 grants, while markings, classifications, and organization constraints continue
-to apply across projects and derivations. [Projects, roles, and mandatory controls](https://www.palantir.com/docs/foundry/security/projects-and-roles)
+to apply across projects and derivations. Projects, roles, and mandatory controls
 
 Authorization is applied at more than one level. Resource visibility and
 instance visibility are different checks; an action requires permission on the
 action definition and on all semantic resources it edits. Action application
 also depends on visibility of the affected data and submission criteria.
-[Semantic resource permissions](https://www.palantir.com/docs/foundry/object-permissioning/ontology-permissions), [action application permissions](https://www.palantir.com/docs/foundry/action-types/permissions)
+Semantic resource permissions, action application permissions
 
 New object types are documented as favoring action-only edits, so an application
 can receive a meaningful, permissioned write operation without being granted
-broad direct edit access to the backing data. [Action-only edit guidance](https://www.palantir.com/docs/foundry/action-types/permissions)
+broad direct edit access to the backing data. Action-only edit guidance
 
 **Boundary implication.** Authorization is not a gateway-only concern and it
 cannot be reduced to "the caller authenticated." The authoritative data and
@@ -116,25 +116,25 @@ resource authorization or turn a forwarded principal header into identity.
 
 Actions are reusable, named operation boundaries for creating, modifying,
 deleting, and linking semantic objects. Their parameters form an interface
-between the operation and consuming applications. [Action building blocks](https://www.palantir.com/docs/foundry/workshop/actions-overview), [action parameters](https://www.palantir.com/docs/foundry/action-types/parameter-overview)
+between the operation and consuming applications. Action building blocks, action parameters
 
 Declarative action rules can be extended by function-backed actions for complex
 multi-object edits. The action definition remains the governed entry point;
-the function supplies execution logic behind it. [Action rules and function-backed actions](https://www.palantir.com/docs/foundry/action-types/explore-action-types), [server-side functions](https://www.palantir.com/docs/foundry/functions/overview)
+the function supplies execution logic behind it. Action rules and function-backed actions, server-side functions
 
 External effects are explicitly distinguished from local object edits. A
 webhook can run before edits, in which case failure prevents the edits, or after
 edits, in which case the local success may already be visible when the external
-call fails. [Action side effects](https://www.palantir.com/docs/foundry/action-types/explore-action-types), [side-effect overview](https://www.palantir.com/docs/foundry/action-types/side-effects-overview)
+call fails. Action side effects, side-effect overview
 
 Automation is a scheduler/trigger layer over these primitives: conditions can
 be time-based or data-based, and effects can submit actions, call functions,
-invoke AI logic, or send notifications. [Automation conditions and effects](https://www.palantir.com/docs/foundry/automate)
+invoke AI logic, or send notifications. Automation conditions and effects
 
 The public documentation also describes staged edits being merged as a single
 transaction. That is the relevant pattern for sekai: stage or validate the
 full mutation set, then commit the durable local change as one unit.
-[Single-transaction scenario merge](https://www.palantir.com/docs/foundry/action-types/explore-action-types)
+Single-transaction scenario merge
 
 **Boundary implication.** chisei should produce an intent/decision/plan and
 durably hold any budget reservation in its own store; sekai should execute the
@@ -150,25 +150,25 @@ successful local commit must not be reported as proof of a remote effect.
 The AI architecture is built on the same semantic, action, governance, and
 developer foundations. It includes secure model connectivity, context
 integration, agent lifecycle, observability, evaluation, automation, and
-packaging/deployment. [AI architecture overview](https://www.palantir.com/docs/foundry/architecture-center/aip-architecture)
+packaging/deployment. AI architecture overview
 
 An agent is described as application logic with a semantic SDK client, tool
 configuration, and agent logic. Published agents are callable functions and
 can be triggered from applications, automation, SDKs, or semantic actions.
-[Pro-code agent model](https://www.palantir.com/docs/foundry/agents/overview)
+Pro-code agent model
 
 AI logic can query semantic data and compose edits, but the documentation
 separates read-time authorization from downstream output and edits. AI logic
 uses user/function permissions for the read path; the composed edit still needs
-to pass through the governed action path. [AI logic security and edits](https://www.palantir.com/docs/foundry/logic)
+to pass through the governed action path. AI logic security and edits
 
 Evaluation is a lifecycle capability, not an authorization result. Evaluation
 suites compare test cases, evaluators, model/function versions, and run
-variance to build confidence before production changes. [AI evaluation lifecycle](https://www.palantir.com/docs/foundry/aip-evals/overview)
+variance to build confidence before production changes. AI evaluation lifecycle
 
 External agent access uses scoped OAuth clients and either user-delegated or
 service-to-service credentials. The same application restrictions and
-underlying resource permissions apply to the exposed tools. [Agent authentication and authorization](https://www.palantir.com/docs/foundry/ontology-mcp/authentication-and-authorization), [application restrictions and scope intersection](https://www.palantir.com/docs/foundry/developer-console/application-restrictions)
+underlying resource permissions apply to the exposed tools. Agent authentication and authorization, application restrictions and scope intersection
 
 **Boundary implication.** Treat model output as an untrusted proposal. The
 agent may select a typed read or action tool, but the tool service must enforce
@@ -180,18 +180,18 @@ arbitrary mutation maps, or a privileged database credential.
 
 The application layer reads through the semantic object model, uses actions for
 writeback, and uses functions for business logic. It does not define a second
-write protocol for each screen. [Application builder boundary](https://www.palantir.com/docs/foundry/workshop/overview)
+write protocol for each screen. Application builder boundary
 
 The developer SDK is generated from a selected subset of semantic resources and
 uses scoped tokens in addition to the user's data permissions. The documentation
 explicitly recommends treating the platform as the application backend and
 notes that read-time controls do not automatically protect data after it has
-been returned to the application. [Semantic SDK application model](https://www.palantir.com/docs/foundry/ontology-sdk/overview)
+been returned to the application. Semantic SDK application model
 
 Custom applications, containerized code, APIs, and built-in applications are
 therefore different frontends over shared semantic/data contracts. The
 developer toolchain exposes object reads, actions, functions, and AI logic
-through generated SDKs and APIs. [Developer toolchain contracts](https://www.palantir.com/docs/foundry/dev-toolchain/overview), [containerized application execution](https://www.palantir.com/docs/foundry/compute-modules/overview)
+through generated SDKs and APIs. Developer toolchain contracts, containerized application execution
 
 **Boundary implication.** ChiseiService is an application/decision surface,
 not an alternate database façade. Its remote client should be the same typed
@@ -204,7 +204,7 @@ The public material does not establish that the AI-side implementation is
 database-free. It describes server-side logic running in an isolated
 environment, reading and proposing edits through platform APIs, while
 evaluation sets, execution logs, traces, sessions, projects, and audit remain
-durable platform resources. [Server-side functions](https://www.palantir.com/docs/foundry/functions/overview), [evaluation records](https://www.palantir.com/docs/foundry/integrate-models/evaluations-overview), [observability](https://www.palantir.com/docs/foundry/observability/overview), [session and audit controls](https://www.palantir.com/docs/foundry/ai-fde/security-and-governance)
+durable platform resources. Server-side functions, evaluation records, observability, session and audit controls
 
 Therefore, “database-free” in this repository was too broad. The accepted
 boundary is database isolation, not statelessness:
@@ -224,22 +224,22 @@ boundary is database isolation, not statelessness:
 
 The reference architecture assigns continuous delivery and infrastructure
 management to a hosting substrate, while the data/semantic/AI capabilities
-run above it. [Integrated deployment architecture](https://www.palantir.com/docs/foundry/architecture-center/platforms)
+run above it. Integrated deployment architecture
 
 For self-hosted deployments, the official guidance calls for encryption at
 rest and in transit, TLS 1.2 or newer, zero-trust access, network segmentation,
 default-deny inbound traffic, controlled egress, hardened hosts, restricted
-privileged access, and backups. [Self-hosted security guidance](https://www.palantir.com/docs/foundry/security/protect-foundry-installation)
+privileged access, and backups. Self-hosted security guidance
 
 The shared-responsibility model assigns infrastructure, storage, compute,
 database, networking, patching, and platform monitoring to the platform
 operator, while customer-built applications, identity/access configuration,
 resource permissions, data, and application monitoring remain customer
-responsibilities. [Shared security responsibilities](https://www.palantir.com/docs/foundry/security/shared-security-responsibility-model)
+responsibilities. Shared security responsibilities
 
 Audit records are a separate, structured security surface that identifies who
 performed an action, what happened, when it happened, and which resources were
-involved. [Audit log model](https://www.palantir.com/docs/foundry/security/audit-logs-overview)
+involved. Audit log model
 
 **Boundary implication.** A two-process deployment needs plane-specific
 readiness and security contracts: the decision process can be alive while its

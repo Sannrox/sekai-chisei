@@ -6,6 +6,7 @@
 //! preflight, durable put, post-commit attribution audit, and sample persist.
 
 use super::*;
+use crate::db::store::{ChiseiKiokuStore, ChiseiObservationStore, ChiseiReceiptStore};
 
 const GATEWAY_RECEIPT_ACTION: &str = "operation.receipt.upsert";
 
@@ -47,7 +48,6 @@ impl ChiseiServiceImpl {
             }
             if self.config.scoring_enabled {
                 self.db
-                    .runtime()
                     .put_sample_observation(&crate::chisei::scoring::SampleObservation {
                         request_id: observation.request_id,
                         namespace: observation.namespace,
@@ -109,13 +109,11 @@ impl ChiseiServiceImpl {
                     .any(|reference| reference.kind == "kioku_memory" && !reference.omitted)
         }) || !self
             .db
-            .runtime()
             .list_kioku_outcome_assignments(&receipt.operation_id)
             .map_err(Status::internal)?
             .is_empty();
         let existing = self
             .db
-            .runtime()
             .get_operation_receipt(&receipt.operation_id)
             .map_err(Status::internal)?;
         if existing
@@ -128,7 +126,7 @@ impl ChiseiServiceImpl {
         }
         if existing.is_none() && has_kioku_context {
             reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                self.db.runtime(),
+                &self.db,
                 &receipt,
                 authenticated_principal,
                 now,
@@ -141,13 +139,12 @@ impl ChiseiServiceImpl {
             })?;
         }
         self.db
-            .runtime()
             .put_operation_receipt(&receipt)
             .map_err(Status::internal)?;
         if existing.is_none()
             && has_kioku_context
             && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                self.db.runtime(),
+                &self.db,
                 &receipt,
                 authenticated_principal,
                 now,

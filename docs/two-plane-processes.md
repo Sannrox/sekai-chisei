@@ -1,21 +1,25 @@
 # Two-plane processes
 
 Independently runnable `sekai-plane` and `chisei-plane` processes prove the
-stores are separate. Combined `sekai-chisei` remains the default local binary
-and still opens the typed two-store contract. The ontology CLI keeps the
-`sekai` binary name.
+stores are separate and that each plane can ship as its own product.
+Combined `sekai-chisei` remains the default local binary and still opens the
+typed two-store contract. The ontology CLI keeps the `sekai` binary name.
+Keeping `chisei-plane` is [ADR 0098](decisions/0098-keep-chisei-plane-process.md).
 
 ## What each process opens
 
 | Process | Store | Credentials | Public service |
 | --- | --- | --- | --- |
 | `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`; with none set, `<SEKAI_DATA_DIR>/sekai.db`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store only | `SekaiService` |
-| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | Chisei store only | `ChiseiService` |
+| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | no local catalog (Sekai-owned); UDS uses the local principal | `ChiseiService` |
 | `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store (combined) | both |
 
 A Sekai process refuses `CHISEI_DB_PATH` / `CHISEI_DATABASE_URL`. A Chisei
 process refuses `SEKAI_DB_PATH` / `SEKAI_DATABASE_URL`. Each physical store is
-stamped on first open; the other process cannot open that file or URL.
+stamped on first open; the other process cannot open that file or URL. Each
+process migrates only the tables its plane owns, plus the shared decision
+ledger and the per-store `chisei_operation_receipts` table. Combined Split
+writes plane-local admission receipts onto the Sekai dest.
 
 ## Wrong-plane RPCs
 
@@ -48,9 +52,8 @@ serves only to an admin credential. With a less privileged `SEKAI_CREDENTIAL`
 those reads are refused and object context is dropped, not leaked. A namespace
 boundary the hop credential cannot see is not treated as absent, so a namespace
 without a visible boundary yields no context for non-local actors over the hop.
-An unreachable Sekai skips object context with `sekai_read_failed`. Without
-`SEKAI_ENDPOINT`, lookup-first refuses with `sekai_not_attached` and object
-context injection is skipped with the same reason.
+An unreachable Sekai skips object context with `sekai_read_failed`.
+`chisei-plane` requires `SEKAI_ENDPOINT` at boot (ADR 0096 rule 4).
 
 ## Gateway
 

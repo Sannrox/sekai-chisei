@@ -1,7 +1,7 @@
 //! Namespace-authorized reporting for realized lookup-first and model paths.
 
-use crate::chisei::lookup_first::{self, ANSWER_PATH_LOOKUP_HIT, ANSWER_PATH_MODEL};
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
+use crate::composition::lookup_first::{self, ANSWER_PATH_LOOKUP_HIT, ANSWER_PATH_MODEL};
 use crate::db::runtime_db::RuntimeDb;
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use serde::Serialize;

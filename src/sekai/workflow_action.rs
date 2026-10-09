@@ -5,14 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::chisei::budget::BudgetTracker;
-use crate::chisei::receipt::OperationReceipt;
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action_instance::STATUS_ADMITTED;
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
 };
+use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::shomei;
+use sekai_provider::receipt::OperationReceipt;
 
 pub const BRIDGE_CONTRACT: &str = "sekai.workflow-action-bridge/v1";
 pub const PROFILE_JOB_STEP: &str = "adapter.workflow.job_step";
@@ -229,17 +229,17 @@ pub fn binding_digest_for(binding: &WorkflowActionBinding) -> Result<String, Str
 
 /// Admit a workflow step through ActionInstance admission.
 ///
-/// `budget` is a caller-owned Chisei handle. Combined callers pass a
-/// `BudgetTracker` over the Chisei store. Sekai-only callers (and the
-/// workflow CLI, which opens only the Sekai store) pass `None` so budget
-/// is `not_configured` / deferred. This function never wraps the Sekai
-/// runtime as a `ChiseiStore`.
+/// `budget` and `proposal` are caller-owned Sekai ports. Combined callers
+/// pass the Chisei implementations. Sekai-only callers (and the workflow
+/// CLI, which opens only the Sekai store) pass `None` so budget is
+/// `not_configured` / deferred and fill provenance stays empty.
 pub fn submit_step(
     db: &RuntimeDb,
     actor: &str,
     envelope: &WorkflowStepEnvelope,
     now_ms: i64,
-    budget: Option<&BudgetTracker>,
+    budget: Option<&dyn ActionBudgetPort>,
+    proposal: Option<&dyn ActionProposalPort>,
 ) -> Result<WorkflowActionBinding, String> {
     required("actor", actor)?;
     require_positive_timestamp("submit", now_ms)?;
@@ -251,6 +251,7 @@ pub fn submit_step(
         return Err(WORKFLOW_UNAVAILABLE.into());
     }
     let admitted = ActionInstanceAdmission::new(db, budget)
+        .with_proposal(proposal)
         .admit(
             ActionInstanceAdmissionRequest {
                 namespace: prepared.envelope.namespace.clone(),
@@ -911,11 +912,11 @@ mod tests {
     }
 
     fn lifecycle(runtime: &RuntimeDb, mut envelope: WorkflowStepEnvelope) {
-        let submitted = submit_step(runtime, "integrator", &envelope, 1_000, None).unwrap();
+        let submitted = submit_step(runtime, "integrator", &envelope, 1_000, None, None).unwrap();
         assert_eq!(submitted.status, STATUS_SUBMITTED);
         assert_eq!(submitted.instance_status, STATUS_ADMITTED);
         assert_eq!(
-            submit_step(runtime, "integrator", &envelope, 1_100, None).unwrap(),
+            submit_step(runtime, "integrator", &envelope, 1_100, None, None).unwrap(),
             submitted
         );
         let mut conflicting = envelope.clone();
@@ -925,7 +926,7 @@ mod tests {
             conflicting.parameters_json = r#"{"decision":"other"}"#.into();
         }
         assert_eq!(
-            submit_step(runtime, "integrator", &conflicting, 1_200, None).unwrap_err(),
+            submit_step(runtime, "integrator", &conflicting, 1_200, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         envelope.cursor = 0;
@@ -1049,32 +1050,33 @@ mod tests {
         let mut unknown = job_envelope();
         unknown.contract_version = "sekai.workflow-action-bridge/v0".into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &unknown, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &unknown, 1_000, None, None).unwrap_err(),
             PROTOCOL_UNSUPPORTED
         );
         let mut usage = job_envelope();
         usage.usage_units = 0;
         assert_eq!(
-            submit_step(&runtime, "integrator", &usage, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &usage, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         let mut mismatched = job_envelope();
         mismatched.usage_kind = USAGE_APPROVAL.into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &mismatched, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &mismatched, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         let mut padded = job_envelope();
         padded.namespace = " ops ".into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &padded, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &padded, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
-        let submitted = submit_step(&runtime, "integrator", &job_envelope(), 500, None).unwrap();
+        let submitted =
+            submit_step(&runtime, "integrator", &job_envelope(), 500, None, None).unwrap();
         let mut usage = job_envelope();
         usage.usage_units = 2;
         assert_eq!(
-            submit_step(&runtime, "integrator", &usage, 600, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &usage, 600, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         assert_eq!(
@@ -1093,13 +1095,13 @@ mod tests {
         hijack.step_id = "job:nightly/other".into();
         hijack.callback_id = "cb:job:nightly:other".into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &hijack, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &hijack, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         let mut wrong_type = job_envelope();
         wrong_type.type_id = APPROVAL_TYPE_ID.into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &wrong_type, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &wrong_type, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         let mut first = job_envelope();
@@ -1110,14 +1112,14 @@ mod tests {
         second.source_instance = "a".into();
         second.step_id = "b:c".into();
         second.callback_id = "cb:a-bc".into();
-        let left = submit_step(&runtime, "integrator", &first, 1_000, None).unwrap();
-        let right = submit_step(&runtime, "integrator", &second, 1_100, None).unwrap();
+        let left = submit_step(&runtime, "integrator", &first, 1_000, None, None).unwrap();
+        let right = submit_step(&runtime, "integrator", &second, 1_100, None, None).unwrap();
         assert_ne!(left.binding_id, right.binding_id);
         assert_ne!(left.idempotency_key, right.idempotency_key);
         let mut foreign = job_envelope();
         foreign.owner = "intruder".into();
         assert_eq!(
-            submit_step(&runtime, "integrator", &foreign, 1_000, None).unwrap_err(),
+            submit_step(&runtime, "integrator", &foreign, 1_000, None, None).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
         assert_eq!(
@@ -1126,18 +1128,26 @@ mod tests {
         );
     }
 
-    fn sqlite_runtime(path: &std::path::Path) -> RuntimeDb {
-        RuntimeDb::Sqlite(std::sync::Arc::new(
-            crate::db::sekai::SekaiDb::new(path.to_str().expect("utf-8 sqlite path")).unwrap(),
-        ))
+    struct CountingBudget {
+        remaining: std::sync::atomic::AtomicI32,
+        recorded: std::sync::atomic::AtomicI32,
     }
 
-    fn tracker_over(runtime: &RuntimeDb) -> crate::chisei::budget::BudgetTracker {
-        crate::chisei::budget::BudgetTracker::new(
-            crate::db::store::ChiseiStore::from_shared_runtime(std::sync::Arc::new(
-                runtime.clone(),
-            )),
-        )
+    impl ActionBudgetPort for CountingBudget {
+        fn check(&self, _subject: &str, amount: i32) -> Result<(), String> {
+            if self.remaining.load(std::sync::atomic::Ordering::SeqCst) < amount {
+                Err("exhausted".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record(&self, _subject: &str, amount: i32) {
+            self.remaining
+                .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+            self.recorded
+                .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     fn budgeted_envelope(step: &str) -> WorkflowStepEnvelope {
@@ -1149,82 +1159,107 @@ mod tests {
     }
 
     #[test]
-    fn workflow_step_budget_uses_caller_chisei_handle_never_the_sekai_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let sekai = sqlite_runtime(&dir.path().join("sekai.db"));
-        let chisei = sqlite_runtime(&dir.path().join("chisei.db"));
-        sekai
-            .put_governed_action_type(job_type(), "operator", 1)
-            .unwrap();
-        let subject = crate::sekai::action_instance::submit_budget_subject("ops", "integrator", "");
-        let sekai_budget = tracker_over(&sekai);
-        let chisei_budget = tracker_over(&chisei);
-        sekai_budget
-            .set_limit(&subject, 0, crate::chisei::budget::PeriodType::Daily)
-            .unwrap();
-        chisei_budget
-            .set_limit(&subject, 1, crate::chisei::budget::PeriodType::Daily)
-            .unwrap();
+    fn workflow_step_budget_uses_caller_port_and_defers_when_absent() {
+        let runtime = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(1),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
 
         let deferred = submit_step(
-            &sekai,
+            &runtime,
             "integrator",
             &budgeted_envelope("deferred"),
             1_000,
+            None,
             None,
         )
         .unwrap();
         assert_eq!(deferred.status, STATUS_SUBMITTED);
         assert_eq!(
-            sekai
+            runtime
                 .get_action_instance(&deferred.instance_id)
                 .unwrap()
                 .unwrap()
                 .budget_decision,
             "not_configured"
         );
-        assert_eq!(sekai_budget.get_usage(&subject).tokens_used, 0);
-        assert_eq!(chisei_budget.get_usage(&subject).tokens_used, 0);
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let reserved = submit_step(
-            &sekai,
+            &runtime,
             "integrator",
             &budgeted_envelope("reserved"),
             2_000,
-            Some(&chisei_budget),
+            Some(&budget),
+            None,
         )
         .unwrap();
         assert_eq!(reserved.status, STATUS_SUBMITTED);
         assert_eq!(
-            sekai
+            runtime
                 .get_action_instance(&reserved.instance_id)
                 .unwrap()
                 .unwrap()
                 .budget_decision,
             "allow"
         );
-        assert_eq!(sekai_budget.get_usage(&subject).tokens_used, 0);
-        assert_eq!(chisei_budget.get_usage(&subject).tokens_used, 1);
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let exhausted = submit_step(
-            &sekai,
+            &runtime,
             "integrator",
             &budgeted_envelope("exhausted"),
             3_000,
-            Some(&chisei_budget),
+            Some(&budget),
+            None,
         )
         .unwrap();
         assert_eq!(exhausted.status, STATUS_DENIED);
         assert_eq!(
-            sekai
+            runtime
                 .get_action_instance(&exhausted.instance_id)
                 .unwrap()
                 .unwrap()
                 .budget_decision,
             "budget_exceeded"
         );
-        assert_eq!(sekai_budget.get_usage(&subject).tokens_used, 0);
-        assert_eq!(chisei_budget.get_usage(&subject).tokens_used, 1);
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct StampProposal(&'static str);
+
+    impl ActionProposalPort for StampProposal {
+        fn fill_provenance_json(
+            &self,
+            _type_def: &GovernedActionType,
+            _parameters_json: &str,
+        ) -> Result<String, String> {
+            Ok(self.0.into())
+        }
+    }
+
+    #[test]
+    fn workflow_step_stamps_fill_from_the_proposal_port() {
+        let runtime = setup();
+        let proposal = StampProposal(r#"{"model":"test"}"#);
+        let submitted = submit_step(
+            &runtime,
+            "integrator",
+            &budgeted_envelope("fill"),
+            1_000,
+            None,
+            Some(&proposal),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime
+                .get_action_instance(&submitted.instance_id)
+                .unwrap()
+                .unwrap()
+                .system_one_fill_json,
+            proposal.0
+        );
     }
 
     #[test]

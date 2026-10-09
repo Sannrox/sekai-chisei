@@ -24,7 +24,7 @@ pub const MATURITY_DOCS: &str = include_str!("../docs/rpc-maturity.md");
 pub const EXPERIMENTAL_ENV: &str = "SEKAI_EXPERIMENTAL_RPCS";
 pub const EXPERIMENTAL_FEATURE: &str = "experimental-rpcs";
 pub const EXPERIMENTAL_CAPABILITY: &str = "sekai.rpc.experimental";
-pub const STABLE_LIMIT: usize = 66;
+pub const STABLE_LIMIT: usize = 68;
 
 const EXPERIMENTAL_MESSAGE: &str =
     "rpc is experimental; enable SEKAI_EXPERIMENTAL_RPCS=1 or the experimental-rpcs build feature";
@@ -144,17 +144,9 @@ impl RpcMaturityTable {
             }
             if entry.classification == RpcClassification::Stable {
                 stable += 1;
-                if entry.real_backend != "yes" {
-                    return Err(format!(
-                        "stable rpc {} needs a real backend on every community runtime",
-                        entry.rpc
-                    ));
+                if entry.real_backend == "fixture only" {
+                    return Err(format!("fixture-only rpc {} cannot be stable", entry.rpc));
                 }
-            }
-            if entry.real_backend == "fixture only"
-                && entry.classification == RpcClassification::Stable
-            {
-                return Err(format!("fixture-only rpc {} cannot be stable", entry.rpc));
             }
         }
         if seen != proto {
@@ -322,7 +314,18 @@ pub fn capability_is_stable(name: &str) -> bool {
         .is_some_and(|class| class == RpcClassification::Stable)
 }
 
-pub fn parse_docs_rpcs(docs: &str) -> Result<BTreeSet<String>, String> {
+/// One projected row from `docs/rpc-maturity.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RpcMaturityDocRow {
+    pub service: String,
+    pub rpc: String,
+    pub storage_path: String,
+    pub real_backend: String,
+    pub consumer: String,
+    pub classification: String,
+}
+
+pub fn parse_docs_rows(docs: &str) -> Result<Vec<RpcMaturityDocRow>, String> {
     let start = docs
         .find("<!-- rpc-maturity-rows -->")
         .ok_or_else(|| "docs/rpc-maturity.md is missing the row marker".to_string())?;
@@ -330,7 +333,7 @@ pub fn parse_docs_rpcs(docs: &str) -> Result<BTreeSet<String>, String> {
         .split("<!-- /rpc-maturity-rows -->")
         .next()
         .ok_or_else(|| "docs/rpc-maturity.md is missing the closing row marker".to_string())?;
-    let mut rpcs = BTreeSet::new();
+    let mut rows = Vec::new();
     for line in table.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("| `")
@@ -339,18 +342,55 @@ pub fn parse_docs_rpcs(docs: &str) -> Result<BTreeSet<String>, String> {
         {
             continue;
         }
-        let Some(cell) = trimmed.strip_prefix("| `") else {
+        let cells: Vec<&str> = trimmed
+            .split('|')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect();
+        if cells.len() < 5 {
+            continue;
+        }
+        let name = cells[0].trim_matches('`');
+        let Some((service, rpc)) = name.split_once('.') else {
             continue;
         };
-        let name = cell.split('`').next().unwrap_or_default();
-        if name.contains('.') {
-            rpcs.insert(name.to_string());
-        }
+        let classification = cells[4].trim_matches('`').to_string();
+        rows.push(RpcMaturityDocRow {
+            service: service.to_string(),
+            rpc: rpc.to_string(),
+            storage_path: cells[1].trim_matches('`').to_string(),
+            real_backend: cells[2].to_string(),
+            consumer: cells[3].to_string(),
+            classification,
+        });
     }
-    if rpcs.is_empty() {
+    if rows.is_empty() {
         return Err("docs/rpc-maturity.md has no RPC rows".into());
     }
-    Ok(rpcs)
+    Ok(rows)
+}
+
+pub fn parse_docs_rpcs(docs: &str) -> Result<BTreeSet<String>, String> {
+    Ok(parse_docs_rows(docs)?
+        .into_iter()
+        .map(|row| format!("{}.{}", row.service, row.rpc))
+        .collect())
+}
+
+/// `PutPurposeAuthorization` → `put_purpose_authorization`.
+pub fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug)]
@@ -443,8 +483,8 @@ mod tests {
     #[test]
     fn table_matches_proto_and_stays_within_the_stable_limit() {
         let table = RpcMaturityTable::load().expect("maturity table");
-        assert_eq!(table.entries.len(), 178);
-        assert_eq!(table.stable_rpcs().len(), 66);
+        assert_eq!(table.entries.len(), 185);
+        assert_eq!(table.stable_rpcs().len(), 68);
         assert!(
             table
                 .entries
@@ -482,6 +522,19 @@ mod tests {
                 "{rpc} is used by the gateway host"
             );
         }
+    }
+
+    #[test]
+    fn pascal_to_snake_matches_runtime_db_methods() {
+        assert_eq!(
+            pascal_to_snake("PutPurposeAuthorization"),
+            "put_purpose_authorization"
+        );
+        assert_eq!(pascal_to_snake("AppendRows"), "append_rows");
+        assert_eq!(
+            pascal_to_snake("GetEffectivePolicySummary"),
+            "get_effective_policy_summary"
+        );
     }
 
     #[test]

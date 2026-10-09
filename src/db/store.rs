@@ -16,8 +16,10 @@ mod chisei_ports;
 
 pub use chisei_ports::{
     ChiseiBudgetStore, ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiEvalStore,
-    ChiseiExternalActionStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
+    ChiseiEvaluationStore, ChiseiEvolveStore, ChiseiExternalActionStore, ChiseiGatewayStore,
+    ChiseiGovernedSubjectStore, ChiseiGunshiStore, ChiseiKiokuStore, ChiseiLearningChangeStore,
     ChiseiObservationStore, ChiseiPermitStore, ChiseiPortfolioStore, ChiseiReceiptStore,
+    ChiseiRoutingProfileStore,
 };
 
 /// Sekai-owned facts and commits. Chisei code must not construct or hold this.
@@ -55,7 +57,11 @@ impl SekaiStore {
 
     pub fn open_sqlite(path: &str) -> Self {
         Self::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
-            crate::db::sekai::SekaiDb::new(path).expect("open sqlite store"),
+            crate::db::sekai::SekaiDb::new_for_plane(
+                path,
+                crate::db::schema_plane::SchemaPlane::Sekai,
+            )
+            .expect("open sqlite store"),
         ))))
     }
 
@@ -74,6 +80,85 @@ impl SekaiStore {
     pub fn update_object(&self, object: &crate::domain::Object) -> Result<(), String> {
         self.inner.update_object(object)
     }
+
+    pub fn create_object(&self, object: &crate::domain::Object) -> Result<(), String> {
+        self.inner.create_object(object)
+    }
+
+    pub fn create_link(&self, link: &crate::domain::Link) -> Result<(), String> {
+        self.inner.create_link(link)
+    }
+
+    pub fn find_by_external_id(
+        &self,
+        external_id: &str,
+    ) -> Result<Option<crate::domain::Object>, String> {
+        self.inner.find_by_external_id(external_id)
+    }
+
+    pub fn get_linked_objects(
+        &self,
+        object_id: &str,
+        relation: &str,
+        direction: &crate::domain::Direction,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        self.inner
+            .get_linked_objects(object_id, relation, direction)
+    }
+
+    pub fn list_objects(
+        &self,
+        filter: &crate::domain::ListFilter,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        self.inner.list_all_objects(filter)
+    }
+
+    #[cfg(test)]
+    pub fn create_principal_grant(
+        &self,
+        grant_id: &str,
+        object_id: &str,
+        grant: &crate::chisei::principal::PrincipalGrant,
+        created: i64,
+    ) -> Result<(), String> {
+        self.inner
+            .create_principal_grant(grant_id, object_id, grant, created)
+    }
+
+    #[cfg(test)]
+    pub fn delete_grant(&self, grant_id: &str) -> Result<(), String> {
+        self.inner.delete_grant(grant_id).map(|_| ())
+    }
+
+    pub fn list_usable_evidence_for_targets(
+        &self,
+        target_object_ids: &[String],
+        allowed_evidence_classes: &[(String, String)],
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::evidence_store::UsableEvidenceContext>, String> {
+        self.inner.list_usable_evidence_for_targets(
+            target_object_ids,
+            allowed_evidence_classes,
+            now_ms,
+            limit,
+        )
+    }
+
+    pub fn list_usable_evidence_classes_for_targets(
+        &self,
+        target_object_ids: &[String],
+        now_ms: i64,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.inner
+            .list_usable_evidence_classes_for_targets(target_object_ids, now_ms)
+    }
+}
+
+/// In-process fixture: one physical store behind both typed handles.
+#[cfg(test)]
+pub fn paired_memory() -> (SekaiStore, ChiseiStore) {
+    split_shared_runtime(Arc::new(RuntimeDb::memory()))
 }
 
 impl ChiseiStore {
@@ -98,7 +183,11 @@ impl ChiseiStore {
 
     pub fn open_sqlite(path: &str) -> Self {
         Self::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
-            crate::db::sekai::SekaiDb::new(path).expect("open sqlite store"),
+            crate::db::sekai::SekaiDb::new_for_plane(
+                path,
+                crate::db::schema_plane::SchemaPlane::Chisei,
+            )
+            .expect("open sqlite store"),
         ))))
     }
 
@@ -108,16 +197,30 @@ impl ChiseiStore {
         Arc::ptr_eq(&self.inner, &sekai.inner)
     }
 
-    pub fn runtime(&self) -> &RuntimeDb {
+    pub(crate) fn runtime(&self) -> &RuntimeDb {
         &self.inner
     }
 
-    pub fn runtime_arc(&self) -> Arc<RuntimeDb> {
+    #[cfg(test)]
+    pub(crate) fn runtime_arc(&self) -> Arc<RuntimeDb> {
         self.inner.clone()
     }
 
-    pub fn decision_runtime(&self) -> &RuntimeDb {
+    pub(crate) fn decision_runtime(&self) -> &RuntimeDb {
         &self.decisions
+    }
+
+    /// Graph facts Chisei persists (namespace policy objects). Combined Split
+    /// keeps those on the Sekai dest; Owned points at the same store as
+    /// [`Self::runtime`].
+    pub(crate) fn fact_runtime(&self) -> &RuntimeDb {
+        &self.decisions
+    }
+
+    /// True when Kioku memories and graph facts live on one physical store,
+    /// so promotion can authorize evidence inside the memory transaction.
+    pub(crate) fn shares_graph_with_memory(&self) -> bool {
+        Arc::ptr_eq(&self.inner, &self.decisions)
     }
 }
 
@@ -140,13 +243,72 @@ mod tests {
     fn shares_physical_store_only_for_the_shared_facade() {
         let (sekai, chisei) = split_shared_runtime(Arc::new(RuntimeDb::memory()));
         assert!(chisei.shares_physical_store_with(&sekai));
+        assert!(chisei.shares_graph_with_memory());
         assert!(!ChiseiStore::memory().shares_physical_store_with(&SekaiStore::memory()));
+        let split = ChiseiStore::from_split_runtimes(
+            Arc::new(RuntimeDb::memory()),
+            Arc::new(RuntimeDb::memory()),
+        );
+        assert!(!split.shares_graph_with_memory());
     }
 
     #[test]
     fn chisei_memory_does_not_require_naming_runtime_db_at_callers() {
         let store = ChiseiStore::memory();
         store.runtime().ping().expect("memory store pings");
+    }
+
+    #[test]
+    fn split_store_kioku_graph_auth_reads_sekai_dest() {
+        use crate::chisei::kioku::MemoryRetrievalRequest;
+        use crate::db::store::ChiseiKiokuStore;
+        use crate::domain::Object;
+        use crate::sekai::evidence::EvidenceClassification;
+        use std::collections::HashMap;
+
+        let sekai = SekaiStore::memory();
+        let chisei = ChiseiStore::from_split_runtimes(
+            ChiseiStore::memory().runtime_arc(),
+            sekai.runtime_arc(),
+        );
+        sekai
+            .create_object(&Object {
+                id: "namespace-payments".into(),
+                kind: "namespace".into(),
+                name: "payments".into(),
+                namespace: "payments".into(),
+                external_id: "namespace:payments".into(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            chisei
+                .kioku_authorized_classification_ceiling("payments", "agent:planner")
+                .unwrap(),
+            EvidenceClassification::Public
+        );
+        assert!(
+            chisei
+                .runtime()
+                .kioku_authorized_classification_ceiling("payments", "agent:planner")
+                .unwrap_err()
+                .contains("not an authorized graph scope")
+        );
+        let retrieved = chisei
+            .retrieve_kioku_memories(&MemoryRetrievalRequest {
+                namespace: "payments".into(),
+                operation_class: "schema_change".into(),
+                context_object_ids: vec![],
+                classification_ceiling: EvidenceClassification::Public,
+                min_confidence_bps: 0,
+                max_results: 10,
+                actor: "agent:planner".into(),
+                now_ms: 150,
+            })
+            .unwrap();
+        assert!(retrieved.is_empty());
     }
 
     #[test]
@@ -189,12 +351,24 @@ mod tests {
     #[test]
     fn typed_handles_do_not_coerce_to_runtime_db() {
         let production = include_str!("store.rs")
-            .split("#[cfg(test)]")
+            .split("#[cfg(test)]\nmod tests {")
             .next()
             .expect("production handle module");
         assert!(
             !production.contains("impl std::ops::Deref"),
             "typed handles must not Deref to RuntimeDb"
+        );
+        let chisei_impl = production
+            .split("impl ChiseiStore {")
+            .nth(1)
+            .expect("ChiseiStore impl");
+        assert!(
+            !chisei_impl.contains("pub fn runtime("),
+            "ChiseiStore must not expose RuntimeDb on its public surface"
+        );
+        assert!(
+            !chisei_impl.contains("pub fn runtime_arc("),
+            "ChiseiStore must not expose RuntimeDb on its public surface"
         );
         assert!(
             !production.contains("impl From<"),

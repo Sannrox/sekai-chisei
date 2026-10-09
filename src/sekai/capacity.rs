@@ -1,3 +1,6 @@
+//! Capacity snapshot vocabulary, recording, and listing over the Sekai object
+//! store (ADR 0096 rule 5).
+
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
@@ -18,20 +21,8 @@ pub struct CapacityMetrics {
     pub utilization: i32,
 }
 
-pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), String> {
-    // Queue depth is emitted through the labeled operability signal so the
-    // family carries one consistent label set. Emitting it here unlabeled as
-    // well would render two series under one family with different dimensions,
-    // which a scraper would sum across unrelated meanings.
-    crate::obs::signals::set_queue_depth(
-        crate::obs::labels::Subsystem::Sekai,
-        metrics.queue_depth.max(0) as u64,
-    );
-    gauge!("sekai_running_tasks").set(metrics.running_tasks as f64);
-    gauge!("sekai_agent_count").set(metrics.agent_count as f64);
-    gauge!("sekai_utilization").set(metrics.utilization as f64);
-    gauge!("sekai_failure_rate").set(metrics.failure_rate as f64);
-
+/// The stored object for one snapshot.
+pub fn snapshot_object(metrics: &CapacityMetrics) -> Object {
     let id = format!("cap:{}", metrics.timestamp);
     let props = HashMap::from([
         ("queue_depth".into(), metrics.queue_depth.to_string()),
@@ -44,7 +35,7 @@ pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), 
         ("failure_rate".into(), metrics.failure_rate.to_string()),
         ("utilization".into(), metrics.utilization.to_string()),
     ]);
-    let obj = Object {
+    Object {
         id: id.clone(),
         kind: KIND_CAPACITY_SNAPSHOT.into(),
         name: format!("snapshot-{}", metrics.timestamp),
@@ -53,19 +44,15 @@ pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), 
         properties: props,
         created: metrics.timestamp,
         updated: metrics.timestamp,
-    };
-    db.create_object(&obj)
+    }
 }
 
-pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
-    let objs = db.list_all_objects(&crate::domain::ListFilter {
-        kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
-        ..Default::default()
-    })?;
+/// The newest `limit` snapshots, most recent first, from stored snapshot objects.
+pub fn snapshots_from_objects(objs: Vec<Object>, limit: usize) -> Vec<CapacityMetrics> {
     let mut sorted = objs;
     sorted.sort_by_key(|o| std::cmp::Reverse(o.created));
     sorted.truncate(limit);
-    Ok(sorted
+    sorted
         .into_iter()
         .map(|o| CapacityMetrics {
             timestamp: o.created,
@@ -100,7 +87,32 @@ pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetr
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
         })
-        .collect())
+        .collect()
+}
+
+pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), String> {
+    // Queue depth is emitted through the labeled operability signal so the
+    // family carries one consistent label set. Emitting it here unlabeled as
+    // well would render two series under one family with different dimensions,
+    // which a scraper would sum across unrelated meanings.
+    crate::obs::signals::set_queue_depth(
+        crate::obs::labels::Subsystem::Sekai,
+        metrics.queue_depth.max(0) as u64,
+    );
+    gauge!("sekai_running_tasks").set(metrics.running_tasks as f64);
+    gauge!("sekai_agent_count").set(metrics.agent_count as f64);
+    gauge!("sekai_utilization").set(metrics.utilization as f64);
+    gauge!("sekai_failure_rate").set(metrics.failure_rate as f64);
+
+    db.create_object(&snapshot_object(metrics))
+}
+
+pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
+    let objs = db.list_all_objects(&crate::domain::ListFilter {
+        kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
+        ..Default::default()
+    })?;
+    Ok(snapshots_from_objects(objs, limit))
 }
 
 #[cfg(test)]

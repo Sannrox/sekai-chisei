@@ -111,14 +111,12 @@ base="postgresql://sekai:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}"
 export SEKAI_TEST_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt"
 export SEKAI_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt"
 
-suites=()
-for suite in tests/*backend_conformance.rs tests/*postgres*.rs; do
-  suites+=(--test "$(basename "$suite" .rs)")
-done
-
+# Self-contained conformance files compile in the grouped `it` target (#1308).
+# Filters match the former binary names so ignored postgres cases still run.
 status=0
 SEKAI_TEST_POSTGRES_URL="$base/sekai_conformance" \
-  cargo test --locked --no-fail-fast "${suites[@]}" -- --ignored --test-threads=1 || status=$?
+  cargo test --locked --no-fail-fast --test it -- --ignored --test-threads=1 \
+    backend_conformance postgres || status=$?
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked --lib -- --ignored --test-threads=1 postgres || status=$?

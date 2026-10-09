@@ -9,10 +9,13 @@ use crate::config::Config;
 use crate::plane::{ProcessPlane, plane_registry_anchor, plane_store_identity};
 
 pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
-    let mut telemetry = crate::obs::logging::init();
+    let mut telemetry = crate::obs::logging::init("sekai-chisei");
     // Refuse retired single-store variables before anything touches the data dir.
     crate::combined_stores::refuse_legacy_store_env().map_err(std::io::Error::other)?;
     let config = Config::from_env();
+    plane
+        .require_sekai_endpoint(config.sekai_endpoint.as_deref())
+        .map_err(std::io::Error::other)?;
     tracing::info!(
         version = crate::build_info::PKG_VERSION,
         git_version = crate::build_info::GIT_VERSION,
@@ -34,11 +37,17 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
             .open_layout(&config.db_path)
             .map_err(std::io::Error::other)?,
     );
-    let credential_db = match plane {
-        ProcessPlane::Chisei => stores.chisei_runtime(),
-        ProcessPlane::Combined | ProcessPlane::Sekai => stores.sekai_runtime(),
+    // Principal credentials are Sekai-owned. A Chisei-only dest does not
+    // migrate that table; this process authenticates callers without a local
+    // credential catalog (insecure local, or a later hop to Sekai).
+    let (credential_db, active_credentials) = match plane {
+        ProcessPlane::Chisei => (stores.chisei_runtime(), Vec::new()),
+        ProcessPlane::Combined | ProcessPlane::Sekai => {
+            let db = stores.sekai_runtime();
+            let credentials = db.list_active_credentials()?;
+            (db, credentials)
+        }
     };
-    let active_credentials = credential_db.list_active_credentials()?;
     let external_credentials_active = active_credentials.iter().any(|credential| {
         !matches!(
             credential.principal.as_str(),

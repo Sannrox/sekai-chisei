@@ -150,6 +150,14 @@ provenance on the receipt (`reported_catalog_version`), not a grant.
 
 The graph retrieval capabilities advertise
 `epistemic_descriptor_projection` and bounded descriptor source-list limits.
+`DiscoverCapabilities` reports `sekai.transforms.projection` on the core pack
+as the in-process dataset transform host. Its `lifecycle_state` is `disabled`
+unless the experimental RPC gate is on. Invocation of
+`PutGovernedTransform` / `RunGovernedTransform` / `GetGovernedTransformRun`
+still requires that gate. See
+[governed-transforms.md](governed-transforms.md) and
+[ADR 0097](decisions/0097-in-process-transform-host.md).
+
 Asserted graph retrieval is available on both reusable community backends.
 Query-time ontology entailment is currently SQLite-only; PostgreSQL advertises
 the unsupported backend value and the RPC fails closed with
@@ -174,8 +182,8 @@ short-circuit **after** namespace authorization and **before** provider routing:
 Fail closed: incomplete graph state, ACL miss, cross-namespace object, or
 schema miss records `lookup_refusal` on the operation receipt and continues on
 the normal model path (`answer_path=model_path`). Lookup reads the Sekai store,
-not the Chisei store; a Chisei process with no Sekai attached records
-`sekai_not_attached`, and one reaching Sekai only over the gRPC hop records
+not the Chisei store. `chisei-plane` requires `SEKAI_ENDPOINT` at boot; a
+process that reaches Sekai only over the gRPC hop records
 `sekai_read_unsupported`. The S2 traversal path also
 refuses PostgreSQL entailment because the native community runtime has no
 authorization-filtered ontology snapshot there; callers may use asserted-only

@@ -511,15 +511,18 @@ impl ControlPlane {
         )?;
         let mut config = fixture_config();
         config.db_path = db_path.display().to_string();
+        let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
         Ok(Self {
             db_path,
-            sekai: SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
-                db.clone(),
-            )),
+            sekai: SekaiServiceImpl::new(sekai_store.clone()),
             chisei: ChiseiServiceImpl::new(
                 sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
                 config,
-            ),
+            )
+            .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
+                sekai_store,
+            ))
+            .map_err(|error| error.to_string())?,
         })
     }
 
@@ -533,15 +536,18 @@ impl ControlPlane {
         )?)));
         let mut config = fixture_config();
         config.db_path = db_path.display().to_string();
+        let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
         Ok(Self {
             db_path,
-            sekai: SekaiServiceImpl::new(sekai_chisei::db::store::SekaiStore::from_shared_runtime(
-                db.clone(),
-            )),
+            sekai: SekaiServiceImpl::new(sekai_store.clone()),
             chisei: ChiseiServiceImpl::new(
                 sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db),
                 config,
-            ),
+            )
+            .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
+                sekai_store,
+            ))
+            .map_err(|error| error.to_string())?,
         })
     }
 }

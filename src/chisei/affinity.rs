@@ -1,4 +1,4 @@
-use crate::db::store::ChiseiStore;
+use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::domain::{Direction, KIND_COMPONENT, KIND_MODEL, REL_CONTAINS, REL_TOUCHES};
 
 pub struct AffinityResult {
@@ -7,20 +7,20 @@ pub struct AffinityResult {
     pub low_success: bool,
 }
 
-fn namespace_object(db: &ChiseiStore, namespace: &str) -> Option<crate::domain::Object> {
+fn namespace_object(facts: &dyn SekaiFactReader, namespace: &str) -> Option<crate::domain::Object> {
     if namespace.is_empty() {
         return None;
     }
 
-    db.runtime()
+    facts
         .find_by_external_id(&format!("namespace:{namespace}"))
         .ok()
         .flatten()
 }
 
-pub fn get_affinity(db: &ChiseiStore, namespace: &str) -> AffinityResult {
-    let best_model = model_for_namespace(db, namespace);
-    let low_success = low_success_namespace(db, namespace);
+pub fn get_affinity(facts: &dyn SekaiFactReader, namespace: &str) -> AffinityResult {
+    let best_model = model_for_namespace(facts, namespace);
+    let low_success = low_success_namespace(facts, namespace);
     AffinityResult {
         namespaces: Vec::new(),
         best_model,
@@ -28,12 +28,11 @@ pub fn get_affinity(db: &ChiseiStore, namespace: &str) -> AffinityResult {
     }
 }
 
-fn model_for_namespace(db: &ChiseiStore, namespace: &str) -> String {
-    let Some(namespace_obj) = namespace_object(db, namespace) else {
+fn model_for_namespace(facts: &dyn SekaiFactReader, namespace: &str) -> String {
+    let Some(namespace_obj) = namespace_object(facts, namespace) else {
         return String::new();
     };
-    let comps = db
-        .runtime()
+    let comps = facts
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     let mut best = String::new();
@@ -42,8 +41,7 @@ fn model_for_namespace(db: &ChiseiStore, namespace: &str) -> String {
         if comp.kind != KIND_COMPONENT {
             continue;
         }
-        let models = db
-            .runtime()
+        let models = facts
             .get_linked_objects(&comp.id, REL_TOUCHES, &Direction::Incoming)
             .unwrap_or_default();
         for m in &models {
@@ -77,12 +75,11 @@ fn model_for_namespace(db: &ChiseiStore, namespace: &str) -> String {
     best
 }
 
-fn low_success_namespace(db: &ChiseiStore, namespace: &str) -> bool {
-    let Some(namespace_obj) = namespace_object(db, namespace) else {
+fn low_success_namespace(facts: &dyn SekaiFactReader, namespace: &str) -> bool {
+    let Some(namespace_obj) = namespace_object(facts, namespace) else {
         return false;
     };
-    let comps = db
-        .runtime()
+    let comps = facts
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
     comps.iter().any(|c| {
@@ -111,8 +108,11 @@ mod tests {
 
     #[test]
     fn test_low_success_namespace() {
-        let db = ChiseiStore::memory();
-        db.runtime()
+        use crate::chisei::sekai_facts::SekaiFacts;
+        use crate::db::store::SekaiStore;
+
+        let sekai = SekaiStore::memory();
+        sekai
             .create_object(&Object {
                 id: "r1".into(),
                 kind: "namespace".into(),
@@ -124,7 +124,7 @@ mod tests {
                 updated: 0,
             })
             .unwrap();
-        db.runtime()
+        sekai
             .create_object(&Object {
                 id: "c1".into(),
                 kind: KIND_COMPONENT.into(),
@@ -139,7 +139,7 @@ mod tests {
                 updated: 0,
             })
             .unwrap();
-        db.runtime()
+        sekai
             .create_link(&Link {
                 id: "l1".into(),
                 from_id: "r1".into(),
@@ -148,6 +148,7 @@ mod tests {
                 created: 0,
             })
             .unwrap();
-        assert!(low_success_namespace(&db, "namespace"));
+        let facts = SekaiFacts::in_process(sekai);
+        assert!(low_success_namespace(facts.reader(), "namespace"));
     }
 }

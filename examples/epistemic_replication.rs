@@ -1225,6 +1225,7 @@ fn fixture_chisei_service(db: &RuntimeDb) -> ChiseiServiceImpl {
     .with_sekai_facts(SekaiFacts::in_process(SekaiStore::from_shared_runtime(
         runtime,
     )))
+    .unwrap()
 }
 
 fn authenticated_request<T>(body: T) -> Request<T> {
@@ -1749,8 +1750,8 @@ pub fn run() -> Result<Report, String> {
     let candidate_evidence = db.list_kioku_evidence(&candidate.id, candidate.version)?;
     let candidate_descriptor = EpistemicDescriptor::from_kioku(&candidate, &candidate_evidence);
     let insufficient_candidate_descriptor = EpistemicDescriptor::from_kioku(&candidate, &[]);
-    let stale_descriptor = EpistemicDescriptor::from_external_evidence(&stale_original);
-    let retracted_descriptor = EpistemicDescriptor::from_external_evidence(&retracted_original);
+    let stale_descriptor = stale_original.epistemic_descriptor();
+    let retracted_descriptor = retracted_original.epistemic_descriptor();
     if candidate_descriptor.evidence_status != EvidenceStatus::Contested
         || insufficient_candidate_descriptor.evidence_status != EvidenceStatus::Insufficient
         || stale_descriptor.lifecycle_status != LifecycleStatus::Stale

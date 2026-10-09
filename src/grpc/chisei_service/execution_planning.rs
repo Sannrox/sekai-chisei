@@ -10,6 +10,7 @@
 
 use super::live_model::{final_runtime_for_model, route_override_allowed};
 use super::*;
+use crate::db::store::ChiseiKiokuStore;
 
 const LEARNING_PIN_UNAVAILABLE: &str = "learning pin is unavailable";
 
@@ -19,6 +20,7 @@ impl ChiseiServiceImpl {
         input: ExecutionInput,
         authenticated_actor: &str,
     ) -> Result<ExecutionPlan, Status> {
+        self.require_in_process_namespace_policy()?;
         let plan_id = uuid::Uuid::new_v4().to_string();
         let mut context_projection_latency_ms = 0_u64;
         let normalized_user_id =
@@ -71,7 +73,10 @@ impl ChiseiServiceImpl {
             operation_risk_override: None,
             sekai_facts: self.sekai_facts.clone(),
         };
-        let affinity = crate::chisei::affinity::get_affinity(&self.db, namespace_hint.as_str());
+        let affinity = crate::chisei::affinity::get_affinity(
+            self.sekai_facts.reader(),
+            namespace_hint.as_str(),
+        );
         let context_expansion_gate = self.pipeline_context_expansion_gate(&input.namespace);
         let evidence_context_gates =
             self.applicable_evidence_context_gates(&pipeline_req, context_expansion_gate.allowed)?;
@@ -384,7 +389,7 @@ impl ChiseiServiceImpl {
             &provider,
             data_class,
             &payload_for_leak_check(&input.system, &prepared_messages, &input.tools),
-        );
+        )?;
         if !leak_findings.is_empty() {
             egress_decisions.extend(leak_findings_to_decisions(
                 &provider,
@@ -979,7 +984,6 @@ impl ChiseiServiceImpl {
             .map(|holdout| (holdout.memory_id.clone(), holdout.memory_version))
             .collect::<Vec<_>>();
         self.db
-            .runtime()
             .put_operation_receipt_with_kioku_holdouts(&receipt, &holdouts, actor, started)?;
         Ok(())
     }

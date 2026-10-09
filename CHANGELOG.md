@@ -2,21 +2,66 @@
 
 ## Unreleased
 
-## 1.2.0
+- An LLM function may bind a governed document `extracted_text` rendition.
+  Caller-held text must match the pinned digest. Produced objects inherit
+  the document classification and carry `derived_from` lineage to a
+  namespaced document stub. Confidence below
+  `LlmStep.minimum_confidence_micros` parks a `require_approval` Action
+  instead of writing the object. Scores and thresholds above 1_000_000 fail
+  closed. `LlmStep` gains additive field 5 for the threshold (#1326).
+- LLM function revisions are a governed evaluation subject. A fixture set is
+  invoked, each output is retained as evidence at the union of input markings,
+  and the existing `stochastic_model/v1` rubric scores it. A score below the
+  manifest threshold denies publish (`#1312`).
+- Restore pre-#1368 `PipelineStep` wire fields 1–9 for operator clients.
+  Operator responses include matching legacy and structured representations;
+  conflicting inputs are rejected. Structured operator/LLM variants now use
+  fields 10/11. Regenerate clients built from the unreleased #1368 protocol
+  before upgrading; its incompatible fields 1/2 are not supported (#1371).
 
-Upgrade notes:
-
-- Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE`. Unset them and use `SEKAI_DATA_DIR` (default `./data`) or dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` (SQLite) or `SEKAI_DATABASE_URL`/`CHISEI_DATABASE_URL` with `SEKAI_DB_BACKEND=postgres`.
-- The server image sets `ENV SEKAI_DATA_DIR=/data` instead of `DB_PATH=/data/sekai.db`, so a bare image opens split `/data/sekai.db` and `/data/chisei.db`.
-- Relocate an existing single store before upgrading: `sekaictl admin store relocate --source <old> --sekai <old> --chisei <new>`.
-
+- Governed documents and renditions persist on community PostgreSQL with the
+  same owner, purpose, classification, and hold rules as SQLite. Experimental
+  RPCs admit, attach a rendition, get, hold, release hold, expire, and delete
+  (`SEKAI_EXPERIMENTAL_RPCS=1`). The plane still stores no bytes (#1325).
+- `DecideActionInstance` and `ListActionInstances` are stable. Community
+  PostgreSQL grants or denies a parked instance with the same named-approver
+  rules as SQLite; `ListActionInstances.status` is the parked inbox. The
+  stable ceiling moves from 66 to 68 ([ADR 0071](docs/decisions/0071-rpc-maturity.md),
+  #1314).
+- Experimental function pipelines are a `oneof` of operator steps and `LlmStep`
+  (prompt revision, input bindings, JSON Schema output, pinned model route).
+  Invoke records prompt, input, and output digests on the receipt and fail-closes
+  schema-invalid structured output with no fallback route (#1310).
+- Public RPC Real backend is a projection of RuntimeDb fail-closed evidence and
+  the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. CI fails
+  on a mislabeled row, a new SQLite-only RPC missing from the list, or list
+  growth. PostgreSQL conformance runs on every pull request (#1316).
+- Versioned evidence and finding package (`pkg:feedback.evidence-finding/v1`) registers Observation, Finding, Investigation result, Hypothesis, External issue reference, and Verification record types plus governed Actions, an evidence schema, and an evaluation member. Hypotheses cannot be verification subjects. Invalid, stale, conflicting, or unauthorized evidence is rejected without creating observation objects (ADR 0095, #1230).
 - Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` with guidance toward `SEKAI_DATA_DIR`, dest-pair paths/URLs, and `sekaictl admin store relocate`. The server image sets `SEKAI_DATA_DIR=/data` (#1239).
 - Combined dest-pair evaluation apply/resolve reads governed invariants from the Sekai store. `sekaictl admin learning` opens the dest pair (or `SEKAI_DATA_DIR`) and writes change records to the Chisei dest (#1239).
 - Compliance export, `sekaictl report quality`, and `sekaictl report substitution` refuse Combined Split instead of a Sekai-only bundle and name the gRPC report RPCs (#1264).
 - Combined Split records Chisei `RecordDecision` rows on the Sekai dest so `verify_ledger` covers them; relocate leaves that table with Sekai (ADR 0083, #1265).
 - Unattested Split with Chisei families still in the Sekai dest refuses restamp and names `sekaictl admin store relocate` (#1263).
-- `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.2.0`, matching crate version and compose (#1268).
+- `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.1.0`, matching crate version and compose (#1268).
 - Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
+- Chisei persistence goes through per-family store traits. `src/chisei` no longer calls `ChiseiStore::runtime()`, and that method is crate-private. `sekaictl admin quality` opens the dest pair (or `SEKAI_DATA_DIR`) so evaluate/restart can read dataset facts from Sekai (#1237).
+- Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
+- Governed transforms are a Sekai in-process class on both community backends: put a JobSpec, run a `projection`, inspect the run receipt. `sekaictl admin transform` and Console `/transforms` are the operator path. RPCs stay experimental (ADR 0097, #1287).
+
+## 1.2.0
+
+Upgrade notes:
+
+- Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE`. Unset them and use `SEKAI_DATA_DIR` (default `./data`) or destination-pair settings.
+- The server image sets `SEKAI_DATA_DIR=/data` instead of `DB_PATH=/data/sekai.db`; relocate an existing single store before upgrading.
+- `chisei-plane` refuses remote-only namespace policy resolution during boot and RPC handling (#1291).
+- Observation `external_id` is deduplicated by a unique index; existing duplicates refuse startup (#1330).
+- The `sekai-domain` and `sekai-obs` crate split changes `obs::logging::init()` to require a default service name (#1306).
+- The `remote_sekai` module moved without a protocol change (#1315).
+- Governed-transform digest encoding changed; incremental runs require a full rebuild after upgrade (#1307, #1346).
+- Both planes require `SEKAI_ENDPOINT`; unattached paths were removed (#1343).
+- Policy and execution paths fail closed when namespace policy cannot load, including Gunshi (#1349).
+- Hosted transform catalog discovery is experimental and gated through `DiscoverCapabilities` (#1350).
 
 ## 1.1.0
 

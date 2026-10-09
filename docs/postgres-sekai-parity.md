@@ -56,6 +56,26 @@ lock; the CAS predicates remain the commit rule. Normal CI runs SQLite;
 PostgreSQL conformance remains an ignored isolated-database test. See
 [ADR 0064](decisions/0064-event-stream-postgres-parity.md).
 
+The reusable `sekai.governed-document/v1` class shares document and rendition
+metadata across SQLite and PostgreSQL. Experimental RPCs admit, attach
+renditions, retrieve, hold, expire, and delete with the same owner, purpose,
+classification, and hold rules as `sekaictl admin documents`. The plane
+stores no bytes and runs no extractor
+([ADR 0039](decisions/0039-governed-documents.md),
+[documents.md](documents.md)). Normal CI runs SQLite; PostgreSQL
+conformance remains an ignored isolated-database test behind
+`SEKAI_TEST_POSTGRES_URL`.
+
+The reusable `sekai.governed-transform/v1` class shares JobSpec, checkpoint,
+and run-receipt persistence across SQLite and PostgreSQL. Execution is the
+in-process `projection` host
+([ADR 0097](decisions/0097-in-process-transform-host.md),
+[governed-transforms.md](governed-transforms.md)). Normal CI runs SQLite;
+PostgreSQL conformance remains an ignored isolated-database test behind
+`SEKAI_TEST_POSTGRES_URL`. Dataset row `append_rows` / `query_rows` through
+the community `RuntimeDb` dispatcher stay SQLite-only; the transform path
+uses each backend's native dataset-row APIs.
+
 The product loop (ontology apply, seed, object reads, object-set evaluate,
 governed Action submit and read, operation receipt, and object-security
 activation with a denied read) runs on community PostgreSQL with SQLite
@@ -69,59 +89,25 @@ case is ignored and needs `SEKAI_TEST_POSTGRES_URL` for a server the test may
 create a scratch database on.
 
 **Known SQLite-only public paths** (community Postgres fails closed; do not
-treat inventory “complete” as dual-backend for these RPCs):
-
-- query-time ontology entailment (`RetrieveContext`, `ExpandRelations`, and
-  lookup-first expansion in `entailment` mode; those RPCs are classified
-  `experimental` and require `SEKAI_EXPERIMENTAL_RPCS=1` or the
-  `experimental-rpcs` feature; see [rpc-maturity.md](rpc-maturity.md),
-  [ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
-  [capability catalog](capability-catalog.md));
-- dataset row `append_rows` / `query_rows` through the community `RuntimeDb`
-  dispatcher;
-- execution-evidence reject and record helpers used by evidence admission;
-- SQLite-named retention run/purge/`archive_retained_records` (Postgres uses
-  `archive_lifecycle_records` instead);
-- multi-control-plane federation site/peer tables (see
-  [federation-profile.md](federation-profile.md));
-- purpose authorizations for `required_purpose` reads (`sekai.purpose-authorization/v1`;
-  see [ADR 0031](decisions/0031-purpose-bound-reads.md));
-- classification lattice publication (`sekai.classification-lattice/v1`;
-  see [ADR 0032](decisions/0032-hierarchical-classifications.md)); PostgreSQL
-  get returns no lattice so the default ceiling remains;
-- signed namespace snapshots and imported assertion provenance
-  (`sekai.namespace-snapshot/v1`, `sekai.federation-provenance/v1`; see
-  [ADR 0029](decisions/0029-signed-namespace-snapshots.md) and
-  [ADR 0034](decisions/0034-cross-site-import-provenance.md));
-- source-webhook verifying-key pins (`sekai.source-webhook-delivery/v1`; see
-  [ADR 0035](decisions/0035-source-webhook-transport.md)); batch apply keeps its
-  existing dual-backend path;
-- registered source-type descriptors (`sekai.source-type-descriptor/v1`; see
-  [ADR 0060](decisions/0060-additive-source-type-descriptors.md)); GitHub
-  `ApplySourceBatch` keeps its existing dual-backend path;
-- registered Iceberg and Parquet snapshot projections
-  (`sekai.open-table-source/v1`; see
-  [ADR 0036](decisions/0036-open-table-projections.md));
-- governed documents and renditions
-  (`sekai.governed-document/v1`; see
-  [ADR 0039](decisions/0039-governed-documents.md));
-- governed images, renditions, and annotations
-  (`sekai.governed-image/v1`; see
-  [ADR 0050](decisions/0050-governed-images.md));
-- versioned client packages
-  (`sekai.client-package/v1`; see
-  [ADR 0051](decisions/0051-versioned-client-packages.md));
-- capability-package certifications
-  (`sekai.capability-package-certification/v1`; see
-  [ADR 0052](decisions/0052-capability-package-certification.md));
-- federation network contracts
-  (`sekai.federation-network-contract/v1`; see
-  [ADR 0053](decisions/0053-federation-network-contracts.md));
+treat inventory “complete” as dual-backend for these RPCs) live in the
+shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json).
+Query-time ontology entailment stays backend-scoped on `RetrieveContext` /
+`ExpandRelations` (asserted-only on PostgreSQL; see
+[rpc-maturity.md](rpc-maturity.md),
+[ADR 0001](decisions/0001-query-time-ontology-entailment.md), and
+[capability catalog](capability-catalog.md)).
+Admin projections on that list still include governed images
+(`sekai.governed-image/v1`; see
+[ADR 0050](decisions/0050-governed-images.md)) and versioned client packages
+(`sekai.client-package/v1`; see
+[ADR 0051](decisions/0051-versioned-client-packages.md)).
 
 Evidence is checked in as:
 
 | Artifact | Role |
 | --- | --- |
+| `tests/fixtures/sqlite_only_surfaces/v1.json` | Shrink-only SQLite-only RPCs and admin projections |
 | `tests/fixtures/sekai_rpc_inventory/v1.json` | Fail-closed map of every `SekaiService` RPC to evidence |
 | `tests/fixtures/runtime_backend/postgres-sekai-complete-v1.json` | Complete reusable Sekai capability advertisement |
 | `tests/*_backend_conformance.rs` and related harnesses | Shared SQLite/PostgreSQL surface fixtures |
@@ -142,6 +128,7 @@ Evidence is checked in as:
 | #665, #671, #672 | Bounded source-batch transactions, checkpointed snapshot paging, and generation-fenced ordered feeds |
 | #666 | Governed definition branch and immutable revision foundation |
 | #667 (first slice) | Activated object-security revisions and direct read/list enforcement |
+| #1287 | In-process governed transform JobSpec, checkpoint, and run receipt |
 
 ## Still outside this parent
 
@@ -165,13 +152,13 @@ database:
 
 ```sh
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test object_sync_backend_conformance -- --ignored
+  cargo test --test it object_sync_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test definition_branch_backend_conformance -- --ignored
+  cargo test --test it definition_branch_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
-  cargo test --test object_security_backend_conformance -- --ignored
+  cargo test --test it object_security_backend_conformance -- --ignored
 
 SEKAI_TEST_POSTGRES_URL=... \
   cargo test postgres_workflow_transition_matrix -- --ignored --nocapture

@@ -78,24 +78,49 @@ impl SekaiDb {
     }
 
     pub fn new(path: &str) -> Result<Self, String> {
-        Self::new_with_pool_max(path, DEFAULT_SQLITE_POOL_MAX)
+        Self::new_for_plane(path, crate::db::schema_plane::SchemaPlane::Shared)
+    }
+
+    pub fn new_for_plane(
+        path: &str,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<Self, String> {
+        Self::new_with_pool_max_for_plane(path, DEFAULT_SQLITE_POOL_MAX, schema_plane)
     }
 
     pub fn new_with_pool_max(path: &str, pool_max: u32) -> Result<Self, String> {
-        Self::open(path, pool_max, None)
+        Self::new_with_pool_max_for_plane(
+            path,
+            pool_max,
+            crate::db::schema_plane::SchemaPlane::Shared,
+        )
+    }
+
+    pub fn new_with_pool_max_for_plane(
+        path: &str,
+        pool_max: u32,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<Self, String> {
+        Self::open(path, pool_max, None, schema_plane)
     }
 
     pub fn new_with_enterprise_extension(
         path: &str,
         enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
     ) -> Result<Self, String> {
-        Self::open(path, DEFAULT_SQLITE_POOL_MAX, enterprise_extension)
+        Self::open(
+            path,
+            DEFAULT_SQLITE_POOL_MAX,
+            enterprise_extension,
+            crate::db::schema_plane::SchemaPlane::Shared,
+        )
     }
 
     fn open(
         path: &str,
         pool_max: u32,
         enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
+        schema_plane: crate::db::schema_plane::SchemaPlane,
     ) -> Result<Self, String> {
         let persistent = path != ":memory:";
         if persistent && pool_max == 0 {
@@ -137,7 +162,7 @@ impl SekaiDb {
             persistent,
             plane: std::sync::OnceLock::new(),
         };
-        db.migrate_all()?;
+        db.migrate_for_plane(schema_plane)?;
         Ok(db)
     }
 
@@ -226,6 +251,22 @@ impl SekaiDb {
     }
 
     pub(crate) fn migrate_all(&self) -> Result<(), String> {
+        self.migrate_for_plane(crate::db::schema_plane::SchemaPlane::Shared)
+    }
+
+    fn migrate_for_plane(&self, plane: crate::db::schema_plane::SchemaPlane) -> Result<(), String> {
+        self.migrate_decision_ledger(plane)?;
+        self.migrate_operation_receipts()?;
+        if plane.includes_sekai() {
+            self.migrate_sekai_families()?;
+        }
+        if plane.includes_chisei() {
+            self.migrate_chisei_families()?;
+        }
+        crate::db::schema_plane::reject_populated_foreign_sqlite(self, plane)
+    }
+
+    fn migrate_sekai_families(&self) -> Result<(), String> {
         self.migrate()?;
         self.migrate_grants()?;
         self.migrate_principal_credentials()?;
@@ -248,6 +289,14 @@ impl SekaiDb {
         self.migrate_governed_transforms()?;
         self.migrate_functions()?;
         self.migrate_handoffs()?;
+        self.drop_legacy_action_types()?;
+        self.migrate_governed_action_types()?;
+        self.migrate_action_instances()?;
+        self.migrate_action_effects()?;
+        Ok(())
+    }
+
+    fn migrate_chisei_families(&self) -> Result<(), String> {
         self.migrate_chisei()?;
         self.migrate_evaluation_plans()?;
         self.migrate_evaluation_manifests()?;
@@ -256,14 +305,11 @@ impl SekaiDb {
         self.migrate_data_quality_rules()?;
         self.migrate_governed_subject_provenance()?;
         self.migrate_kioku()?;
-        self.drop_legacy_action_types()?;
-        self.migrate_governed_action_types()?;
-        self.migrate_action_instances()?;
-        self.migrate_action_effects()?;
         self.migrate_budget()?;
         self.migrate_portfolio()?;
         self.migrate_routing_profiles()?;
         self.migrate_usage_ledger()?;
+        self.ensure_external_permit_tables()?;
         Ok(())
     }
 
@@ -282,6 +328,9 @@ impl SekaiDb {
             );
             CREATE INDEX IF NOT EXISTS idx_objects_kind ON sekai_objects(kind);
             CREATE INDEX IF NOT EXISTS idx_objects_external_id ON sekai_objects(external_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_objects_observation_external_id
+                ON sekai_objects(namespace, external_id)
+                WHERE kind = 'feedback_observation' AND external_id <> '';
             CREATE TABLE IF NOT EXISTS sekai_links (
                 id TEXT PRIMARY KEY,
                 from_id TEXT NOT NULL,
@@ -3339,6 +3388,312 @@ mod tests {
             .unwrap();
         assert_ne!(journal_mode, "wal");
         drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn user_tables(db: &SekaiDb) -> Vec<String> {
+        let conn = db.conn();
+        crate::db::schema_plane::sqlite_user_tables(&conn).unwrap()
+    }
+
+    #[test]
+    fn fresh_sekai_store_omits_chisei_tables() {
+        let path = temp_db_path("plane-sekai");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let tables = user_tables(&db);
+        assert!(tables.iter().any(|table| table == "sekai_objects"));
+        assert!(tables.iter().any(|table| table == "sekai_decisions"));
+        assert!(
+            tables
+                .iter()
+                .any(|table| table == "chisei_operation_receipts")
+        );
+        assert!(
+            tables
+                .iter()
+                .all(|table| !table.starts_with("chisei_") || table == "chisei_operation_receipts"),
+            "{tables:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fresh_chisei_store_omits_sekai_fact_tables() {
+        let path = temp_db_path("plane-chisei");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let tables = user_tables(&db);
+        assert!(tables.iter().any(|table| table == "sekai_decisions"));
+        assert!(tables.iter().any(|table| table == "chisei_budget_limits"));
+        assert!(
+            !tables.iter().any(|table| table == "sekai_objects"),
+            "{tables:?}"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sekai_dest_reopens_with_plane_local_receipts() {
+        let path = temp_db_path("sekai-receipts");
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_operation_receipts
+                 (operation_id, namespace, receipt_json, updated_at)
+                 VALUES ('admit-1', 'governed_action_instance', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sekai_dest_upgrades_legacy_receipt_columns_before_indexes() {
+        let path = temp_db_path("legacy-receipts");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE chisei_operation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO chisei_operation_receipts
+                (operation_id, namespace, receipt_json, updated_at)
+                VALUES ('legacy-1', 'governed_action_instance', '{}', 1);",
+            )
+            .unwrap();
+        }
+        let db = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let columns = table_columns(&db, "chisei_operation_receipts");
+        for required in [
+            "request_id",
+            "lookup_request_id",
+            "initiating_actor",
+            "caller_scope",
+            "alias_retired",
+        ] {
+            assert!(
+                columns.iter().any(|column| column == required),
+                "missing {required} in {columns:?}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_when_foreign_tables_are_empty() {
+        let path = temp_db_path("dual-empty");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        drop(db);
+        // Shared migrate seeds Sekai retention policies. Chisei families stay
+        // empty, so a Sekai-only open of that dual file is the empty-foreign case.
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_as_chisei_when_only_retention_seeds_exist() {
+        let path = temp_db_path("dual-chisei-seeds");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        drop(db);
+        // Pre-split Chisei dests ran Shared migrate and still carry the three
+        // default retention rows. Those are not operator data.
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_custom_retention_policy_exists() {
+        let path = temp_db_path("dual-chisei-custom-retention");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_retention_policies
+                 (dataset, namespace, data_class, retention_days, updated)
+                 VALUES ('audit', 'legal', '', 30, 1)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("custom retention policies must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_retention_days_were_changed() {
+        let path = temp_db_path("dual-chisei-retention-days");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_retention_policies SET retention_days = 30 WHERE dataset = 'audit'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("modified global retention days must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_as_chisei_with_historical_startup_artifacts() {
+        let path = temp_db_path("dual-chisei-startup");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO sekai_object_security_runtime_secrets (name, secret_value)
+                 VALUES ('object_query_cursor_hmac', 'historical-hmac');
+                 INSERT INTO sekai_principal_credentials
+                 (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ('cred-gateway', 'chisei-gateway', 'hash', 'active', 1, 1, 0);",
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_other_runtime_secret_exists() {
+        let path = temp_db_path("dual-chisei-other-secret");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_object_security_runtime_secrets (name, secret_value)
+                 VALUES ('operator-secret', 'value')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("operator secrets must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_as_chisei_when_other_principal_credential_exists() {
+        let path = temp_db_path("dual-chisei-other-cred");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_principal_credentials
+                 (id, principal, token_hash, status, created, rotated_at, revoked_at)
+                 VALUES ('cred-alice', 'alice', 'hash', 'active', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Chisei,
+        )
+        .err()
+        .expect("operator credentials must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_refuses_when_foreign_tables_hold_rows() {
+        let path = temp_db_path("dual-populated");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:missed', 1, 'daily')",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let error = SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .err()
+        .expect("populated foreign tables must refuse");
+        assert!(error.contains("missed relocation"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dual_schema_file_opens_after_relocate_fence() {
+        let path = temp_db_path("dual-fenced");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:leftover', 1, 'daily');
+                 CREATE TABLE IF NOT EXISTS sekai_store_cutover (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL,
+                    fence_raised INTEGER NOT NULL,
+                    raised_at_ms INTEGER NOT NULL,
+                    pairing_epoch INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
+                 VALUES (1, 1, 1, 0);",
+            )
+            .unwrap();
+        drop(db);
+        SekaiDb::new_for_plane(
+            path.to_str().unwrap(),
+            crate::db::schema_plane::SchemaPlane::Sekai,
+        )
+        .unwrap();
         let _ = std::fs::remove_file(path);
     }
 }

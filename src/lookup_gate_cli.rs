@@ -6,7 +6,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 use tonic::{Code, Request, Status};
 
-use crate::chisei::lookup_first::{
+use crate::composition::lookup_first::{
     LOOKUP_FIRST_GATE_CONTRACT_VERSION, parse_lookup_promotion_gate_suite,
 };
 use crate::grpc::client::connect_sekai;

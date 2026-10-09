@@ -1,5 +1,5 @@
+use crate::chisei::object_schema::{self as schema, ObjectType};
 use crate::domain::Object;
-use crate::sekai::schema::{self, ObjectType};
 use std::collections::HashSet;
 
 pub const EXTERNAL_PROPERTIES_KEY: &str = "chisei.egress.external_properties";
@@ -113,7 +113,7 @@ pub fn new_record(obj: &Object) -> ContextEgressRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::schema::{ObjectType, PropertyDef, PropertyType};
+    use crate::chisei::object_schema::{ObjectType, PropertyDef, PropertyType};
     use std::collections::HashMap;
 
     fn object(properties: HashMap<String, String>) -> Object {

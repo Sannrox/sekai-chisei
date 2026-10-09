@@ -18,6 +18,7 @@ use crate::chisei::external_permit::{
 use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::chisei::kioku::*;
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
+use crate::chisei::principal::PrincipalContext;
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use crate::chisei::scoring::SampleObservation;
 use crate::db::chisei_kioku::ChiseiKiokuBackend;
@@ -100,9 +101,6 @@ impl std::fmt::Debug for RuntimeDb {
 
 pub(crate) const ACTION_BINDINGS_UNAVAILABLE: &str =
     "action bindings are unavailable on the PostgreSQL community runtime";
-
-pub(crate) const DECIDE_ACTION_INSTANCE_UNAVAILABLE: &str =
-    "deciding a parked action instance is unavailable on the PostgreSQL community runtime";
 
 impl RuntimeDb {
     /// Labels this store's connection-pool signals with the plane it serves.
@@ -440,9 +438,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_transform(transform, created_at_ms),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_governed_transform(transform, created_at_ms)
+            }),
         }
     }
 
@@ -453,9 +451,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::governed_transform::GovernedTransform>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_transform(namespace, transform_id),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_governed_transform(namespace, transform_id)
+            }),
         }
     }
 
@@ -470,9 +468,9 @@ impl RuntimeDb {
             Self::Sqlite(db) => {
                 db.run_governed_transform(namespace, transform_id, incremental, now_ms)
             }
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_governed_transform(namespace, transform_id, incremental, now_ms)
+            }),
         }
     }
 
@@ -482,9 +480,34 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::governed_transform::TransformRun>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_transform_run(run_id),
-            Self::Postgres(_) => Err(
-                "governed transforms are unavailable on the PostgreSQL community runtime".into(),
-            ),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_governed_transform_run(run_id))
+            }
+        }
+    }
+
+    pub fn list_governed_transforms(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::governed_transform::GovernedTransform>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_transforms(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_governed_transforms(namespace))
+            }
+        }
+    }
+
+    pub fn list_governed_transform_runs(
+        &self,
+        namespace: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_governed_transform_runs(namespace, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_governed_transform_runs(namespace, limit)
+            }),
         }
     }
 
@@ -827,6 +850,33 @@ impl RuntimeDb {
                     db.as_ref(),
                     namespace,
                     revision_digest,
+                )
+            }),
+        }
+    }
+
+    pub fn get_definition_member(
+        &self,
+        namespace: &str,
+        revision_digest: &str,
+        member_kind: &str,
+        member_id: &str,
+    ) -> Result<Option<DefinitionMember>, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::get_definition_member(
+                db.as_ref(),
+                namespace,
+                revision_digest,
+                member_kind,
+                member_id,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::get_definition_member(
+                    db.as_ref(),
+                    namespace,
+                    revision_digest,
+                    member_kind,
+                    member_id,
                 )
             }),
         }
@@ -1190,24 +1240,14 @@ impl RuntimeDb {
                 let mut transaction = connection
                     .transaction()
                     .map_err(|error| map_db_error(error.to_string()))?;
-                // These are every mutable community table consulted by live
-                // resolution. SHARE blocks concurrent INSERT/UPDATE/DELETE
-                // while allowing the existing read APIs to use pooled
-                // connections. The manifest/request tables remain governed by
-                // their advisory idempotency locks.
-                transaction
-                    .batch_execute(
-                        "LOCK TABLE
-                            sekai_objects,
-                            sekai_links,
-                            sekai_grants,
-                            sekai_evidence_submissions,
-                            chisei_evaluator_definitions,
-                            chisei_evaluator_availability,
-                            chisei_evaluation_plans
-                         IN SHARE MODE",
-                    )
-                    .map_err(|error| map_db_error(error.to_string()))?;
+                // SHARE-lock every mutable community table consulted by live
+                // resolution that exists on this dest. Combined Split Chisei
+                // dests omit Sekai graph tables. SHARE blocks concurrent
+                // INSERT/UPDATE/DELETE while pooled readers stay usable. The
+                // manifest/request tables remain governed by their advisory
+                // idempotency locks.
+                crate::db::postgres::lock_existing_evaluation_resolution_tables(&mut transaction)
+                    .map_err(&map_db_error)?;
                 let (value, write) = operation()?;
                 let stored = write
                     .map(|write| {
@@ -3274,6 +3314,43 @@ impl RuntimeDb {
         }
     }
 
+    pub fn reassess_kioku_memory_after_graph_auth(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        match self {
+            Self::Sqlite(db) => db.reassess_kioku_memory_after_graph_auth(request),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.reassess_kioku_memory_after_graph_auth(request)
+            }),
+        }
+    }
+
+    pub fn authorize_kioku_retrieval(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<(), String> {
+        let actor = request.actor.trim();
+        let namespace = request.namespace.trim();
+        let authorized_ceiling = self.kioku_authorized_classification_ceiling(namespace, actor)?;
+        if request.classification_ceiling > authorized_ceiling {
+            return Err("requested memory classification exceeds actor grant".into());
+        }
+        let principal = PrincipalContext::from_credential(actor);
+        for object_id in &request.context_object_ids {
+            if self.get_object(object_id)?.is_none() {
+                return Err(format!("context object {object_id} not found"));
+            }
+            let grants = self.list_principal_grants(object_id)?;
+            if !grants.is_empty() && !principal.holds_grant(&grants) {
+                return Err(format!(
+                    "actor is not authorized for context object {object_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn authorize_kioku_evidence(
         &self,
         request: &KiokuEvidenceAuthorizationRequest,
@@ -3613,15 +3690,15 @@ impl RuntimeDb {
         }
     }
 
-    /// SQLite only: community PostgreSQL does not decide parked instances
-    /// yet and is not advertised for it (#1084).
     pub fn decide_parked_action_instance(
         &self,
         decided: &crate::sekai::action_instance::ActionInstance,
     ) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.decide_parked_action_instance(decided),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.decide_parked_action_instance(decided))
+            }
         }
     }
 
@@ -3641,7 +3718,15 @@ impl RuntimeDb {
                 write,
                 actor,
             ),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.grant_parked_action_instance(
+                    granted,
+                    target_object_id,
+                    parked_object_digest,
+                    write,
+                    actor,
+                )
+            }),
         }
     }
 
@@ -3654,7 +3739,12 @@ impl RuntimeDb {
         match self {
             Self::Sqlite(db) => db
                 .transition_action_instance(crate::sekai::action_instance::STATUS_ADMITTED, parked),
-            Self::Postgres(_) => Err(DECIDE_ACTION_INSTANCE_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transition_action_instance(
+                    crate::sekai::action_instance::STATUS_ADMITTED,
+                    parked,
+                )
+            }),
         }
     }
 
@@ -4134,9 +4224,7 @@ impl RuntimeDb {
     pub fn list_all_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
         match self {
             Self::Sqlite(db) => db.list_all_objects(filter),
-            Self::Postgres(_) => {
-                Err("list_all_objects is unavailable on the PostgreSQL community runtime".into())
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_all_objects(filter)),
         }
     }
 
@@ -5277,6 +5365,20 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.review_kioku_candidate(id, version, review))
             }
+        }
+    }
+
+    pub fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        match self {
+            Self::Sqlite(db) => db.review_kioku_candidate_after_graph_auth(id, version, review),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.review_kioku_candidate_after_graph_auth(id, version, review)
+            }),
         }
     }
 
@@ -6664,7 +6766,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_document(document),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_governed_document(document))
+            }
         }
     }
 
@@ -6675,7 +6779,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::document::GovernedDocument>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_document(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_governed_document(namespace, document_id)
+            }),
         }
     }
 
@@ -6685,7 +6791,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_rendition(rendition),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_governed_rendition(rendition))
+            }
         }
     }
 
@@ -6696,7 +6804,9 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::document::DocumentRendition>, String> {
         match self {
             Self::Sqlite(db) => db.list_governed_renditions(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_governed_renditions(namespace, document_id)
+            }),
         }
     }
 
@@ -6707,7 +6817,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.delete_governed_renditions(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_governed_renditions(namespace, document_id)
+            }),
         }
     }
 
@@ -7163,6 +7275,18 @@ impl RuntimeDb {
     ) -> Result<Vec<RetrievedMemory>, String> {
         match self {
             Self::Sqlite(db) => db.retrieve_kioku_memories(request),
+            Self::Postgres(_) => Err(
+                "retrieve_kioku_memories is unavailable on the PostgreSQL community runtime".into(),
+            ),
+        }
+    }
+
+    pub fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        match self {
+            Self::Sqlite(db) => db.retrieve_kioku_memories_after_graph_auth(request),
             Self::Postgres(_) => Err(
                 "retrieve_kioku_memories is unavailable on the PostgreSQL community runtime".into(),
             ),

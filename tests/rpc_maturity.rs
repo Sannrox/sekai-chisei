@@ -16,7 +16,7 @@ fn classification_table_matches_proto_services() {
         table.entries.len(),
         "docs table must list every classified RPC"
     );
-    assert_eq!(table.stable_rpcs().len(), 66);
+    assert_eq!(table.stable_rpcs().len(), 68);
     assert!(
         table
             .entries
@@ -69,7 +69,6 @@ fn postgres_unavailable_rpcs_are_classified_sqlite_only() {
     const RUNTIME_DB: &str = include_str!("../src/db/runtime_db.rs");
     let table = RpcMaturityTable::load().expect("maturity table");
     for (rpc, constant) in [
-        ("DecideActionInstance", "DECIDE_ACTION_INSTANCE_UNAVAILABLE"),
         ("PutActionBinding", "ACTION_BINDINGS_UNAVAILABLE"),
         ("RunActionBinding", "ACTION_BINDINGS_UNAVAILABLE"),
     ] {

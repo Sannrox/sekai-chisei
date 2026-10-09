@@ -1,0 +1,127 @@
+{
+  "version": "1",
+  "actions": [
+    {
+      "type_id": "feedback.observation.record",
+      "description": "Create one observation from accepted source evidence.",
+      "object_kind": "feedback_observation",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "source_evidence": { "type": "string" },
+          "problem_signature": { "type": "string" },
+          "occurrence_ids": { "type": "string" },
+          "classification": { "type": "string" },
+          "disposition": { "type": "string" }
+        },
+        "required": [
+          "object_id",
+          "source_evidence",
+          "problem_signature",
+          "occurrence_ids",
+          "classification",
+          "disposition"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type_id": "feedback.finding.record",
+      "description": "Create one finding based on an observation.",
+      "object_kind": "feedback_finding",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "observation_id": { "type": "string" },
+          "statement": { "type": "string" },
+          "classification": { "type": "string" }
+        },
+        "required": ["object_id", "observation_id", "statement", "classification"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type_id": "feedback.investigation.record",
+      "description": "Create one measured investigation result.",
+      "object_kind": "feedback_investigation_result",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "observation_id": { "type": "string" },
+          "outcome": { "type": "string" },
+          "measured": { "type": "boolean" }
+        },
+        "required": ["object_id", "observation_id", "outcome", "measured"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type_id": "feedback.hypothesis.record",
+      "description": "Create one hypothesis. Hypotheses are not investigation results.",
+      "object_kind": "feedback_hypothesis",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "observation_id": { "type": "string" },
+          "statement": { "type": "string" }
+        },
+        "required": ["object_id", "observation_id", "statement"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type_id": "feedback.external_issue.record",
+      "description": "Create one external issue reference. Tracker adapters are outside this package.",
+      "object_kind": "feedback_external_issue",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "finding_id": { "type": "string" },
+          "tracker": { "type": "string" },
+          "remote_id": { "type": "string" }
+        },
+        "required": ["object_id", "finding_id", "tracker", "remote_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type_id": "feedback.verification.record",
+      "description": "Create one verification of a measured investigation result.",
+      "object_kind": "feedback_verification",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": { "type": "string" },
+          "name": { "type": "string" },
+          "subject_id": { "type": "string" },
+          "subject_kind": {
+            "type": "string",
+            "enum": ["feedback_investigation_result"]
+          },
+          "result": {
+            "type": "string",
+            "enum": ["confirmed", "refuted"]
+          }
+        },
+        "required": ["object_id", "subject_id", "subject_kind", "result"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

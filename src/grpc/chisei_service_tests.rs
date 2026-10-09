@@ -2,6 +2,10 @@ use super::*;
 use crate::chisei::evaluation_execution::{
     DeterministicEvaluator, DeterministicEvaluatorOutput, EVALUATOR_RESULT_CONTRACT, STATUS_PASS,
 };
+use crate::db::store::{
+    ChiseiBudgetStore, ChiseiDecisionStore, ChiseiEvaluationStore, ChiseiKiokuStore,
+    ChiseiObservationStore, ChiseiReceiptStore,
+};
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
 use axum::body::Body;
@@ -145,7 +149,6 @@ async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     assert!(
         svc.db
-            .runtime()
             .list_decisions(&Default::default())
             .unwrap()
             .is_empty()
@@ -811,7 +814,6 @@ async fn resolve_policy_reverts_only_the_regressed_task_class_to_capable() {
     let now = chrono::Utc::now().timestamp_millis();
     for (task_class, delta, regressed) in [("background", -80.0, true), ("bulk", 0.0, false)] {
         svc.db
-            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{task_class}"),
                 timestamp: now,
@@ -885,7 +887,6 @@ async fn request_namespace_regression_is_not_masked_by_stable_policy_scope() {
     let now = chrono::Utc::now().timestamp_millis();
     for (scope, delta, regressed) in [("project-scope", 0.0, false), ("request-ns", -80.0, true)] {
         svc.db
-            .runtime()
             .record_decision(&crate::sekai::audit::Decision {
                 id: format!("class-signal-{scope}"),
                 timestamp: now,
@@ -1250,7 +1251,9 @@ fn memory_service() -> ChiseiServiceImpl {
     )));
     let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
-    ChiseiServiceImpl::new(chisei, config(":memory:")).with_sekai_facts(facts)
+    ChiseiServiceImpl::new(chisei, config(":memory:"))
+        .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn gunshi_planning_service() -> ChiseiServiceImpl {
@@ -1398,7 +1401,6 @@ async fn issued_gunshi_allocation_feeds_native_planning_before_kioku_enrichment(
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -1719,7 +1721,6 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
     ] {
         let receipts_before = service
             .db
-            .runtime()
             .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100)
             .unwrap()
             .len();
@@ -1732,7 +1733,6 @@ async fn managed_machine_context_owns_plan_identity_and_namespace_authority() {
         assert_eq!(
             service
                 .db
-                .runtime()
                 .list_operation_receipts_in_window("managed-conformance", 0, i64::MAX, 100,)
                 .unwrap()
                 .len(),
@@ -1934,7 +1934,6 @@ async fn managed_stream_preserves_tool_calls_usage_and_receipt_without_route_ove
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("operation receipt");
@@ -2040,7 +2039,6 @@ async fn managed_unary_execution_accepts_machine_context_and_normalizes_receipt(
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("completed unary receipt");
@@ -2127,7 +2125,6 @@ async fn managed_provider_failure_records_failed_receipt_without_route_switch() 
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed operation receipt");
@@ -2188,7 +2185,6 @@ async fn managed_stream_read_failure_records_failed_receipt_without_route_switch
 
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan_id)
         .unwrap()
         .expect("failed stream receipt");
@@ -2237,7 +2233,6 @@ async fn managed_explicit_retry_creates_distinct_correlated_attempts() {
             .unwrap();
         let receipt = service
             .db
-            .runtime()
             .get_operation_receipt(&plan.plan_id)
             .unwrap()
             .expect("planned retry receipt");
@@ -2304,6 +2299,7 @@ fn evaluation_execution_service(delay_ms: u64) -> ChiseiServiceImpl {
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
     ChiseiServiceImpl::new_with_evaluator_registry(chisei, config(":memory:"), registry)
         .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn evaluator_definition_request(namespace: &str) -> PutEvaluatorDefinitionRequest {
@@ -3155,7 +3151,6 @@ async fn deterministic_manifest_execution_is_receipt_authoritative_and_idempoten
     assert_eq!(tighter.code(), tonic::Code::FailedPrecondition);
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&first.operation_id)
         .unwrap()
         .unwrap();
@@ -3545,7 +3540,6 @@ async fn evaluation_comparison_refuses_an_unfinished_execution() {
     let manifest = resolved_execution_fixture(&svc, "compare-unfinished-resolve").await;
     let stored = svc
         .db
-        .runtime()
         .get_evaluation_manifest(&manifest.manifest_digest)
         .unwrap()
         .unwrap();
@@ -3572,7 +3566,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
     let manifest = resolved_execution_fixture(&svc, "cancel-race-resolve").await;
     let manifest = svc
         .db
-        .runtime()
         .get_evaluation_manifest(&manifest.manifest_digest)
         .unwrap()
         .unwrap();
@@ -3582,7 +3575,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
         .unwrap();
     let stale_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3596,7 +3588,6 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&index.operation_id)
         .unwrap()
         .unwrap();
@@ -3635,7 +3626,8 @@ async fn cancellation_is_durable_and_reduces_fail_closed() {
                 .evaluator_registry()
                 .clone(),
         )
-        .with_sekai_facts(svc.sekai_facts.clone()),
+        .with_sekai_facts(svc.sekai_facts.clone())
+        .unwrap(),
     );
     let manifest = resolved_execution_fixture(&svc, "cancel-resolve").await;
     let execute_request = ExecuteEvaluationManifestRequest {
@@ -3685,7 +3677,6 @@ async fn cancellation_is_durable_and_reduces_fail_closed() {
     );
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&cancelled.operation_id)
         .unwrap()
         .unwrap();
@@ -4236,7 +4227,6 @@ async fn governed_subject_profiles_share_receipt_and_idempotency_contract() {
         );
         let receipt = svc
             .db
-            .runtime()
             .get_operation_receipt(&first.operation_id)
             .unwrap()
             .unwrap();
@@ -4892,15 +4882,12 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
-        .runtime()
         .budget_set_limit("global", METRIC_REQUESTS, 100, "daily")
         .unwrap();
     svc.db
-        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 1_000, "weekly")
         .unwrap();
     svc.db
-        .runtime()
         .budget_adjust_chain("project:acme", METRIC_TOKENS, 37, 1)
         .unwrap();
     let mut action_policy = ActionPolicy::allow_all("project:acme");
@@ -4949,7 +4936,6 @@ async fn effective_policy_summary_is_authorized_bounded_and_live() {
         },
     );
     svc.db
-        .runtime()
         .budget_set_limit("project:acme", METRIC_TOKENS, 2_000, "weekly")
         .unwrap();
     let changed = svc
@@ -4994,10 +4980,11 @@ async fn effective_policy_summary_reports_unconfigured_sections() {
 
 fn file_service(path: &str) -> ChiseiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(Arc::new(SekaiDb::new(path).unwrap())));
-    ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(db),
-        config(path),
-    )
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    ChiseiServiceImpl::new(chisei, config(path))
+        .with_sekai_facts(facts)
+        .unwrap()
 }
 
 fn resolve_policy_request(
@@ -5706,7 +5693,6 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.context_expansion".into()),
             ..Default::default()
@@ -5720,7 +5706,6 @@ async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate
     }));
     let evidence_decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.evidence_context_admission".into()),
             ..Default::default()
@@ -6050,10 +6035,7 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
 
     svc.record_usage(Request::new(usage.clone())).await.unwrap();
     assert_eq!(
-        svc.db
-            .runtime()
-            .get_operation_receipt(operation_id)
-            .unwrap(),
+        svc.db.get_operation_receipt(operation_id).unwrap(),
         Some(receipt)
     );
 
@@ -6365,7 +6347,6 @@ async fn portfolio_route_is_audited_and_eval_regression_reverts_it() {
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("chisei.portfolio_route_shift".into()),
             ..Default::default()
@@ -6454,12 +6435,14 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
     {
         let mut cfg = config(&path);
         cfg.gateway_provided_providers = vec!["openai".into()];
-        let svc = ChiseiServiceImpl::new(
-            crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
-                std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
-            ))),
-            cfg,
-        );
+        let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(
+            RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
+        ));
+        let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
+            .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+                shared_sekai_store(&chisei),
+            ))
+            .unwrap();
         svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
             namespace: "team-a".into(),
             allowed_runtimes: vec!["openai".into()],
@@ -6512,12 +6495,14 @@ async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy(
 
     let mut cfg = config(&path);
     cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(
-        crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
-            std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
-        ))),
-        cfg,
-    );
+    let chisei = crate::db::store::ChiseiStore::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(
+        std::sync::Arc::new(SekaiDb::new(&path).unwrap()),
+    )));
+    let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
+        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+            shared_sekai_store(&chisei),
+        ))
+        .unwrap();
     assert!(
         svc.policy
             .context_admission_policy("team-a")
@@ -6572,7 +6557,6 @@ async fn internal_eval_run_tracking_is_visible_to_gateway_reads() {
 async fn restored_read_contracts_return_bounded_projections() {
     let svc = memory_service();
     svc.db
-        .runtime()
         .put_sample_observation(&crate::chisei::scoring::SampleObservation {
             request_id: "observation-1".into(),
             namespace: "context-a".into(),
@@ -6830,7 +6814,6 @@ async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
     assert!(!report.audit_decision_id.is_empty());
     let decision = svc
         .db
-        .runtime()
         .get_decision(&report.audit_decision_id)
         .unwrap()
         .unwrap();
@@ -7115,7 +7098,6 @@ async fn sqlite_reload_restores_iterations_and_regression_gate() {
     );
     let denied_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -7353,7 +7335,6 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     svc.record_planned_operation(&plan, "agent:test").unwrap();
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -7426,7 +7407,6 @@ fn planned_receipt_pins_external_evidence_and_memory_provenance() {
     assert_eq!(memory.disclosed_fields, ["claim"]);
     assert!(
         svc.db
-            .runtime()
             .list_kioku_lifecycle_events("memory-7", 3)
             .unwrap()
             .is_empty(),
@@ -7456,7 +7436,6 @@ fn execution_memory_injection_revalidates_cached_versions() {
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(
         svc.db
-            .runtime()
             .list_kioku_lifecycle_events("purged-memory", 4)
             .unwrap()
             .is_empty()
@@ -7625,7 +7604,6 @@ async fn eval_regressed_context_is_force_sampled_and_audited() {
     // A matching audit decision was recorded.
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             action: Some("sample".into()),
             ..Default::default()
@@ -7735,7 +7713,6 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
         .unwrap();
     let first_receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&first.plan_id)
         .unwrap()
         .unwrap();
@@ -7822,7 +7799,6 @@ async fn a_pinned_learning_enriches_context_only_and_is_cited_on_the_receipt() {
     // Receipt lineage: operation -> verification -> learning -> plan.
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&second.plan_id)
         .unwrap()
         .unwrap();
@@ -8140,7 +8116,6 @@ async fn plan_execution_exposes_and_audits_egress_decisions() {
 
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -8176,7 +8151,6 @@ fn egress_audit_serializes_epistemic_descriptor_fields() {
 
     let decision = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.egress".into()),
             action: Some("prepare_context".into()),
@@ -8516,7 +8490,6 @@ async fn template_only_plan_blocks_known_entity_leak() {
     }));
     let decisions = svc
         .db
-        .runtime()
         .list_decisions(&crate::sekai::audit::DecisionFilter {
             actor: Some("chisei.privacy".into()),
             action: Some("leak_check".into()),
@@ -8531,6 +8504,461 @@ async fn template_only_plan_blocks_known_entity_leak() {
                 .get("labels")
                 .is_some_and(|labels| labels.contains("company_name"))
     }));
+}
+
+struct HopOnlyFacts;
+
+impl crate::chisei::sekai_facts::SekaiFactReader for HopOnlyFacts {
+    fn find_by_external_id(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn find_namespace_boundary(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_grants(
+        &self,
+        _: &str,
+    ) -> Result<
+        Vec<crate::chisei::principal::PrincipalGrant>,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(Vec::new())
+    }
+
+    fn marking_clearance(
+        &self,
+        _: &str,
+        _: &Object,
+        _: &str,
+    ) -> Result<
+        crate::chisei::principal::MarkingClearance,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(crate::chisei::principal::MarkingClearance::Unmarked)
+    }
+
+    fn get_object_type(
+        &self,
+        _: &str,
+    ) -> Result<
+        Option<crate::chisei::object_schema::ObjectType>,
+        crate::chisei::sekai_facts::SekaiFactError,
+    > {
+        Ok(None)
+    }
+
+    fn get_object(
+        &self,
+        _: &str,
+    ) -> Result<Option<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(None)
+    }
+
+    fn list_objects(
+        &self,
+        _: &crate::domain::ListFilter,
+    ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn get_linked_objects(
+        &self,
+        _: &str,
+        _: &str,
+        _: &crate::domain::Direction,
+    ) -> Result<Vec<Object>, crate::chisei::sekai_facts::SekaiFactError> {
+        Ok(Vec::new())
+    }
+
+    fn in_process_store(
+        &self,
+    ) -> Result<&crate::db::store::SekaiStore, crate::chisei::sekai_facts::SekaiFactError> {
+        Err(crate::chisei::sekai_facts::SekaiFactError::Unsupported(
+            "graph retrieval over the Sekai hop",
+        ))
+    }
+}
+
+#[test]
+fn privacy_egress_fails_closed_when_sekai_is_hop_only() {
+    let mut svc = memory_service();
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "leak-rule-secretco".into(),
+            kind: "leak_rule".into(),
+            name: "company-name".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:secretco".into(),
+            properties: std::collections::HashMap::from([
+                ("pattern".into(), "SecretCo".into()),
+                ("label".into(), "company_name".into()),
+                ("action".into(), "block".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.sekai_facts = crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(HopOnlyFacts));
+    let error = svc
+        .leak_findings_for_payload("alpha", "openai", DataClass::Sensitive, "SecretCo")
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("leak-rule policy unavailable"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("in-process Sekai graph storage"),
+        "{}",
+        error.message()
+    );
+}
+
+fn hop_only_namespace_policy_unavailable(error: &tonic::Status) {
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("namespace policy resolution requires in-process Sekai graph storage"),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn hop_only_chisei_plane_refuses_plan_content_native_and_policy_summary() {
+    let mut svc = memory_service();
+    svc.sekai_facts = crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(HopOnlyFacts));
+
+    let plan_err = svc
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(ExecutionInput {
+                request_id: "task-hop-policy".into(),
+                namespace: "alpha".into(),
+                spec: "plan a hop-only request".into(),
+                preferred_model: "native-default".into(),
+                preferred_runtime: "kiro".into(),
+                max_tokens: 32,
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&plan_err);
+
+    let native_err = svc
+        .execute_plan(Request::new(ExecutePlanRequest {
+            plan: Some(ExecutionPlan {
+                plan_id: "uncached".into(),
+                input: Some(ExecutionInput {
+                    namespace: "alpha".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&native_err);
+
+    let content_err = svc
+        .plan_content_execution(Request::new(PlanContentExecutionRequest {
+            input: Some(ContentExecutionInputV1 {
+                execution: Some(ExecutionInput {
+                    request_id: "task-hop-content".into(),
+                    namespace: "alpha".into(),
+                    spec: "summarize".into(),
+                    preferred_model: "native-default".into(),
+                    max_tokens: 32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            gunshi_allocation: None,
+        }))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&content_err);
+
+    let content_exec_err = match svc
+        .execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(ContentExecutionPlanV1 {
+                execution: Some(ExecutionPlan {
+                    plan_id: "uncached".into(),
+                    input: Some(ExecutionInput {
+                        namespace: "alpha".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            resolved_parts: vec![],
+        }))
+        .await
+    {
+        Ok(_) => panic!("expected hop-only content execute to fail"),
+        Err(error) => error,
+    };
+    hop_only_namespace_policy_unavailable(&content_exec_err);
+
+    let summary_err = svc
+        .get_effective_policy_summary(effective_summary_request("alpha", "local"))
+        .await
+        .unwrap_err();
+    hop_only_namespace_policy_unavailable(&summary_err);
+}
+
+#[test]
+fn privacy_entity_scan_does_not_list_past_entity_scan_limit() {
+    let svc = memory_service();
+    let limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+    for index in 0..limit {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("fill-{index:04}"),
+                kind: "asset".into(),
+                name: "x".into(),
+                namespace: "alpha".into(),
+                external_id: format!("{index:03}"),
+                properties: std::collections::HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "z-late".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: std::collections::HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let findings = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding.rule_label == crate::chisei::privacy::SCAN_TRUNCATED_LABEL
+                && finding.action == LeakAction::Block
+        }),
+        "truncated entity scan must fail closed: {findings:?}"
+    );
+}
+
+#[test]
+fn privacy_entity_scan_allows_harmless_payload_when_namespace_has_many_leak_rules() {
+    let svc = memory_service();
+    let extra = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize + 100;
+    for index in 0..extra {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("leak-fill-{index:04}"),
+                kind: "leak_rule".into(),
+                name: format!("fill-{index}"),
+                namespace: "alpha".into(),
+                external_id: format!("leak_rule:fill-{index:04}"),
+                properties: std::collections::HashMap::from([
+                    ("pattern".into(), format!("^__fill_never_{index}$")),
+                    ("label".into(), format!("fill-{index}")),
+                    ("action".into(), "block".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let findings = svc
+        .leak_findings_for_payload("alpha", "openai", DataClass::Sensitive, "harmless payload")
+        .unwrap();
+    assert!(
+        findings.is_empty(),
+        "leak rules must not fill the entity scan: {findings:?}"
+    );
+}
+
+#[test]
+fn privacy_entity_scan_safe_provider_passes_when_scan_is_truncated() {
+    let svc = memory_service();
+    let limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+    for index in 0..=limit {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("fill-{index:04}"),
+                kind: "asset".into(),
+                name: format!("Name{index:04}"),
+                namespace: "alpha".into(),
+                external_id: format!("asset:{index:04}"),
+                properties: std::collections::HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let findings = svc
+        .leak_findings_for_payload("alpha", "ollama", DataClass::Sensitive, "harmless payload")
+        .unwrap();
+    assert!(
+        findings.is_empty(),
+        "safe provider must not be blocked by a truncated scan: {findings:?}"
+    );
+}
+
+#[test]
+fn privacy_leak_rules_page_past_max_list_limit() {
+    let svc = memory_service();
+    let page = crate::domain::MAX_LIST_LIMIT as usize;
+    for index in 0..page {
+        svc.db
+            .runtime()
+            .create_object(&Object {
+                id: format!("leak-fill-{index:04}"),
+                kind: "leak_rule".into(),
+                name: format!("fill-{index}"),
+                namespace: "alpha".into(),
+                external_id: format!("leak_rule:fill-{index:04}"),
+                properties: std::collections::HashMap::from([
+                    ("pattern".into(), format!("^__fill_never_{index}$")),
+                    ("label".into(), format!("fill-{index}")),
+                    ("action".into(), "block".into()),
+                ]),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "leak-z-late".into(),
+            kind: "leak_rule".into(),
+            name: "late-company".into(),
+            namespace: "alpha".into(),
+            external_id: "leak_rule:late".into(),
+            properties: std::collections::HashMap::from([
+                ("pattern".into(), "UniqueSecretCorp".into()),
+                ("label".into(), "late_company".into()),
+                ("action".into(), "block".into()),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let findings = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Open,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding.rule_label == "late_company" && finding.action == LeakAction::Block
+        }),
+        "leak rules past MAX_LIST_LIMIT must still be compiled: {findings:?}"
+    );
+}
+
+#[test]
+fn leak_audit_records_scan_truncated_evidence() {
+    let svc = memory_service();
+    svc.record_leak_audit(
+        "leak_check",
+        "task-truncated",
+        "openai",
+        &[LeakFinding {
+            rule_label: crate::chisei::privacy::SCAN_TRUNCATED_LABEL.into(),
+            action: LeakAction::Block,
+            match_count: 0,
+        }],
+    );
+    let decisions = svc
+        .db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            actor: Some("chisei.privacy".into()),
+            action: Some("leak_check".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        decisions.iter().any(|decision| {
+            decision.target_id == "task-truncated"
+                && decision.outcome == "leak_blocked"
+                && decision
+                    .evidence
+                    .get("scan_truncated")
+                    .is_some_and(|value| value == "true")
+        }),
+        "truncated leak audit must record scan_truncated=true: {decisions:?}"
+    );
+}
+
+#[test]
+fn privacy_entity_created_after_first_scan_is_blocked() {
+    let svc = memory_service();
+    let first = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(first.is_empty(), "no entity objects yet: {first:?}");
+    svc.db
+        .runtime()
+        .create_object(&Object {
+            id: "asset-late".into(),
+            kind: "asset".into(),
+            name: "UniqueSecretCorp".into(),
+            namespace: "alpha".into(),
+            external_id: "asset:LATE".into(),
+            properties: std::collections::HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let second = svc
+        .leak_findings_for_payload(
+            "alpha",
+            "openai",
+            DataClass::Sensitive,
+            "mention UniqueSecretCorp in the brief",
+        )
+        .unwrap();
+    assert!(
+        second
+            .iter()
+            .any(|finding| finding.rule_label == "known_entity:UniqueSecretCorp"),
+        "entity created after the first scan must block on the next scan: {second:?}"
+    );
 }
 
 #[tokio::test]
@@ -8587,7 +9015,6 @@ async fn execute_plan_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected execution receipt");
@@ -8653,7 +9080,6 @@ async fn execute_plan_stream_rejects_after_policy_flips_sensitive() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .expect("rejected streamed execution receipt");
@@ -9718,7 +10144,7 @@ async fn decide_gateway_execution_requires_authenticated_principal() {
 
 #[tokio::test]
 async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     let svc = memory_service();
@@ -9822,7 +10248,6 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 
     let receipt = svc
         .db
-        .runtime()
         .get_operation_receipt("lookup-hit-plan")
         .unwrap()
         .unwrap();
@@ -9901,7 +10326,7 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 
 #[tokio::test]
 async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     // Only evaluate the decision path here — full model execute needs a live
@@ -9939,7 +10364,7 @@ async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path(
 
 #[test]
 fn execute_lookup_first_s2_hits_have_zero_provider_fields() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
     use crate::sekai::semantic;
 
     let db = crate::db::store::SekaiStore::memory();
@@ -10053,7 +10478,6 @@ async fn routing_profiles_list_pin_and_record_the_route_mode() {
     assert_eq!(plan.resolved_runtime, "openai");
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -10098,7 +10522,9 @@ async fn customer_hosted_routing_profiles_are_namespace_scoped_and_fail_closed()
     config.routing_credential_refs = vec!["ACME".into()];
     let chisei = crate::db::store::ChiseiStore::from_shared_runtime(db);
     let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
-    let service = ChiseiServiceImpl::new(chisei, config.clone()).with_sekai_facts(facts);
+    let service = ChiseiServiceImpl::new(chisei, config.clone())
+        .with_sekai_facts(facts)
+        .unwrap();
     for (id, namespace, principal, role) in [
         ("support", "support", "alice", Role::Admin),
         ("support", "support", "bob", Role::Editor),
@@ -10491,7 +10917,6 @@ async fn customer_hosted_routes_plan_execute_and_fail_closed_from_live_state() {
     assert_eq!(plan.resolved_model, "hosted.acme-llm/acme-1");
     let receipt = service
         .db
-        .runtime()
         .get_operation_receipt(&plan.plan_id)
         .unwrap()
         .unwrap();
@@ -11082,14 +11507,15 @@ fn resolve_lookup_root_input() -> ExecutionInput {
 
 #[test]
 fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
-    use crate::chisei::lookup_first;
+    use crate::composition::lookup_first;
 
     let dir = tempfile::tempdir().unwrap();
     let layout = split_layout(dir.path());
     assert!(layout.is_split());
     let (sekai_store, _) = layout.handles();
     lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
-    let (_, chisei_svc) = crate::grpc::build_services(&crate::config::Config::from_env(), &layout);
+    let (_, chisei_svc) =
+        crate::grpc::build_services(&crate::config::Config::from_env(), &layout).unwrap();
 
     match evaluate_execute_lookup_first(
         chisei_svc.sekai_facts.reader(),
@@ -11107,56 +11533,52 @@ fn split_store_lookup_first_hits_sekai_facts_through_the_chisei_service() {
     let chisei_as_facts = shared_sekai_store(&chisei_svc.db);
     match evaluate_execute_lookup_first(&chisei_as_facts, &resolve_lookup_root_input(), "alice") {
         ExecuteLookupFirst::ModelPath { lookup_refusal } => {
-            assert_eq!(lookup_refusal.as_deref(), Some("incomplete"));
+            let reason = lookup_refusal.as_deref().unwrap_or("");
+            assert!(
+                reason == "incomplete"
+                    || (reason.contains("storage_error") && reason.contains("sekai_objects")),
+                "expected incomplete or missing sekai_objects, got {lookup_refusal:?}"
+            );
         }
         other => panic!("expected the Chisei store to miss, got {other:?}"),
     }
 }
 
 #[test]
-fn chisei_plane_without_sekai_refuses_lookup_first_explicitly() {
+fn chisei_plane_without_sekai_endpoint_refuses_to_build() {
     let dir = tempfile::tempdir().unwrap();
     let layout = split_layout(dir.path());
-    let (sekai_store, _) = layout.handles();
-    crate::chisei::lookup_first::seed_s1_fixture_graph(&sekai_store).unwrap();
     let mut config = crate::config::Config::from_env();
     config.sekai_endpoint = None;
-    let (_, chisei_svc) =
-        crate::grpc::build_services_for_plane(&config, &layout, crate::plane::ProcessPlane::Chisei);
-
-    assert!(!chisei_svc.sekai_facts.reader().attached());
-    match evaluate_execute_lookup_first(
-        chisei_svc.sekai_facts.reader(),
-        &resolve_lookup_root_input(),
-        "alice",
+    let err = match crate::grpc::build_services_for_plane(
+        &config,
+        &layout,
+        crate::plane::ProcessPlane::Chisei,
     ) {
-        ExecuteLookupFirst::ModelPath { lookup_refusal } => assert_eq!(
-            lookup_refusal.as_deref(),
-            Some(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED)
-        ),
-        other => panic!("expected sekai_not_attached, got {other:?}"),
-    }
+        Ok(_) => panic!("chisei plane built without SEKAI_ENDPOINT"),
+        Err(err) => err,
+    };
+    assert!(err.contains("SEKAI_ENDPOINT"), "{err}");
 }
 
 /// Split stores: the namespace boundary and grants live only in the Sekai
 /// store, so Chisei authorization must read them through the Sekai fact port
 /// (#1269).
-fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
+fn split_store_service() -> (ChiseiServiceImpl, Arc<RuntimeDb>) {
     let sekai_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
     let chisei_db = Arc::new(RuntimeDb::Sqlite(Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
-    let mut service = ChiseiServiceImpl::new(
+    let service = ChiseiServiceImpl::new(
         crate::db::store::ChiseiStore::from_shared_runtime(chisei_db),
         config(":memory:"),
-    );
-    if attach_sekai {
-        service = service.with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-            crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
-        ));
-    }
+    )
+    .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+        crate::db::store::SekaiStore::from_shared_runtime(Arc::clone(&sekai_db)),
+    ))
+    .unwrap();
     sekai_db
         .ensure_team_namespace(
             "acme",
@@ -11170,7 +11592,7 @@ fn split_store_service(attach_sekai: bool) -> (ChiseiServiceImpl, Arc<RuntimeDb>
 
 #[test]
 fn split_store_namespace_authorization_reads_sekai_grants() {
-    let (svc, _sekai) = split_store_service(true);
+    let (svc, _sekai) = split_store_service();
     assert!(
         svc.db
             .runtime()
@@ -11186,26 +11608,4 @@ fn split_store_namespace_authorization_reads_sekai_grants() {
     ] {
         assert_eq!(denied.unwrap_err().code(), tonic::Code::PermissionDenied);
     }
-}
-
-#[test]
-fn namespace_authorization_without_sekai_denies_with_an_explicit_reason() {
-    let (svc, _sekai) = split_store_service(false);
-    for denied in [
-        require_namespace_access(svc.sekai_facts.reader(), "alice", "acme"),
-        require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme"),
-        require_namespace_admin_access(svc.sekai_facts.reader(), "alice", None, "acme"),
-    ] {
-        let status = denied.unwrap_err();
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
-        assert!(
-            status
-                .message()
-                .ends_with(crate::chisei::sekai_facts::SEKAI_NOT_ATTACHED),
-            "{}",
-            status.message()
-        );
-    }
-    // Trusted local principals never depend on Sekai grants.
-    require_namespace_access(svc.sekai_facts.reader(), "local", "acme").unwrap();
 }

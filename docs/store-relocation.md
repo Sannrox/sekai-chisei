@@ -88,6 +88,9 @@ explicit `--source` instead. Stop the historical process, set
 `SEKAI_DB_PATH` and `CHISEI_DB_PATH` (or two PostgreSQL URLs), and start
 Combined against the destination pair. The capture triggers stay on the
 source's Chisei tables, which remain as rollback data and refuse writes.
+Combined then opens `--sekai` as a Sekai-only dest: leftover Chisei rows are
+allowed because the writer fence is raised. An unfenced dest that still holds
+the other plane's rows refuses startup as a missed relocation.
 
 Rollback after the fence is restore-both from the pre-fence snapshot, not a
 mixed pair.

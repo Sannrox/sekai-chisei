@@ -1,6 +1,7 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
 mod provider_execution;
+pub mod remote_sekai;
 pub mod rpc_identity;
 pub mod sekai_service;
 mod visible_page;
@@ -434,7 +435,7 @@ impl<I: tonic::service::Interceptor> tonic::service::Interceptor for PlaneAwareI
 impl<I: tonic::service::Interceptor> tonic::service::Interceptor for RestoreFenceInterceptor<I> {
     fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
         if request_is_mutating_rpc(&req) {
-            crate::db::postgres::off_runtime(|| {
+            crate::db::off_runtime(|| {
                 crate::store_relocate::refuse_mutating_if_generation_mismatch(&self.stores)
             })
             .map_err(Status::failed_precondition)?;
@@ -567,14 +568,17 @@ pub fn run_for_plane(
         let credential_store = Arc::new(PrincipalCredentialStore::new());
         credential_store.load(&active_credentials);
 
-        if let Some(socket_path) = config.sekai_socket.as_deref() {
+        if let Some(socket_path) = config.sekai_socket.as_deref()
+            && plane.serves_sekai()
+        {
             ensure_local_gateway_credential(socket_path, &db)?;
         }
         let assertion_authority = config
             .assertion_authority()
             .map_err(std::io::Error::other)?
             .map(Arc::new);
-        let services = build_services_for_plane(&config, &stores, plane);
+        let services =
+            build_services_for_plane(&config, &stores, plane).map_err(std::io::Error::other)?;
         Ok((
             db,
             chisei_db,
@@ -940,10 +944,13 @@ where
 pub fn build_services(
     config: &Config,
     stores: &CombinedStoreLayout,
-) -> (
-    Arc<sekai_service::SekaiServiceImpl>,
-    Arc<chisei_service::ChiseiServiceImpl>,
-) {
+) -> Result<
+    (
+        Arc<sekai_service::SekaiServiceImpl>,
+        Arc<chisei_service::ChiseiServiceImpl>,
+    ),
+    String,
+> {
     build_services_for_plane(config, stores, ProcessPlane::Combined)
 }
 
@@ -951,23 +958,30 @@ pub fn build_services_for_plane(
     config: &Config,
     stores: &CombinedStoreLayout,
     plane: ProcessPlane,
-) -> (
-    Arc<sekai_service::SekaiServiceImpl>,
-    Arc<chisei_service::ChiseiServiceImpl>,
-) {
+) -> Result<
+    (
+        Arc<sekai_service::SekaiServiceImpl>,
+        Arc<chisei_service::ChiseiServiceImpl>,
+    ),
+    String,
+> {
     let (sekai_store, chisei_store) = stores.handles();
     let budget = Arc::new(BudgetTracker::with_topology(
         chisei_store.clone(),
         config.budget_topology.clone(),
     ));
-    let mut sekai_svc = sekai_service::SekaiServiceImpl::new_with_gateway_schema_principals(
-        sekai_store.clone(),
-        config.gateway_receipt_principals.clone(),
-    )
+    let mut sekai_svc = if plane.serves_sekai() {
+        sekai_service::SekaiServiceImpl::new_with_gateway_schema_principals(
+            sekai_store.clone(),
+            config.gateway_receipt_principals.clone(),
+        )
+    } else {
+        sekai_service::SekaiServiceImpl::wrong_plane_placeholder(sekai_store.clone())
+    }
     .with_site_id(config.site_id.clone());
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
-            crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+            crate::composition::cross_store_admission::CrossStoreAdmission::new(
                 chisei_store.clone(),
                 sekai_store.clone(),
                 Some(budget.clone()),
@@ -984,28 +998,28 @@ pub fn build_services_for_plane(
             chisei_svc = chisei_svc
                 .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
                     sekai_store.clone(),
-                ))
+                ))?
                 .with_sekai_commit_lookup(Arc::new(sekai_store));
         }
         ProcessPlane::Chisei => {
-            if let Some(endpoint) = &config.sekai_endpoint {
-                chisei_svc = chisei_svc
-                    .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
-                        crate::chisei::remote_sekai::RemoteSekaiFactReader::from_env(
-                            endpoint.clone(),
-                        ),
-                    )))
-                    .with_sekai_commit_lookup(Arc::new(
-                        crate::chisei::remote_sekai::RemoteSekaiCommitLookup::from_env(
-                            endpoint.clone(),
-                        ),
-                    ));
-            }
+            let endpoint = config.sekai_endpoint.as_deref().unwrap_or("");
+            plane.require_sekai_endpoint(Some(endpoint))?;
+            chisei_svc = chisei_svc
+                .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::new(Arc::new(
+                    crate::grpc::remote_sekai::RemoteSekaiFactReader::from_env(
+                        endpoint.to_string(),
+                    ),
+                )))?
+                .with_sekai_commit_lookup(Arc::new(
+                    crate::grpc::remote_sekai::RemoteSekaiCommitLookup::from_env(
+                        endpoint.to_string(),
+                    ),
+                ));
         }
         ProcessPlane::Sekai => {}
     }
 
-    (Arc::new(sekai_svc), Arc::new(chisei_svc))
+    Ok((Arc::new(sekai_svc), Arc::new(chisei_svc)))
 }
 
 fn spawn_service_background_tasks(
@@ -1040,7 +1054,7 @@ fn spawn_service_background_tasks(
 }
 
 fn spawn_admission_reconciler(
-    clerk: Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+    clerk: Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -1248,7 +1262,8 @@ mod tests {
         }
         .open()
         .unwrap();
-        let (sekai_svc, chisei_svc) = build_services(&crate::config::Config::from_env(), &layout);
+        let (sekai_svc, chisei_svc) =
+            build_services(&crate::config::Config::from_env(), &layout).unwrap();
         let clerk = sekai_svc
             .cross_store
             .as_ref()

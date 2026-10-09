@@ -5,27 +5,15 @@
 //! Chisei store traits in `crate::db::store`; Sekai fact reads go through the
 //! Chisei-owned Sekai read port. A file whose count rises fails, and so does a
 //! file whose count fell without lowering `ALLOWED`, so the totals only shrink.
-//! `ChiseiStore::runtime()` leaves the public surface once no caller needs it.
+//! `ChiseiStore::runtime()` is crate-private; this ratchet stays at zero.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-/// Remaining backend-facade calls, as `(file, count)`.
-const ALLOWED: &[(&str, usize)] = &[
-    ("src/chisei/affinity.rs", 7),
-    ("src/chisei/capability.rs", 4),
-    ("src/chisei/cross_store_admission.rs", 6),
-    ("src/chisei/data_quality.rs", 4),
-    ("src/chisei/gunshi.rs", 2),
-    ("src/chisei/gunshi_dispatch.rs", 1),
-    ("src/chisei/kioku.rs", 6),
-    ("src/chisei/learning_change.rs", 11),
-    ("src/chisei/lookup_first.rs", 28),
-    ("src/chisei/pipeline.rs", 65),
-    ("src/chisei/remote_sekai.rs", 2),
-    ("src/chisei/sekai_facts.rs", 6),
-];
+/// Remaining backend-facade calls, as `(file, count)`. Empty once Chisei
+/// tables and Sekai fact reads no longer go through `ChiseiStore::runtime()`.
+const ALLOWED: &[(&str, usize)] = &[];
 
 const NEEDLES: &[&str] = &[".runtime()", ".runtime_arc()"];
 

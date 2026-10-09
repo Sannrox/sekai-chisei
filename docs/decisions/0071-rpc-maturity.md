@@ -22,7 +22,7 @@ backend and consumer evidence. The table in [rpc-maturity.md](../rpc-maturity.md
 is a projection, not a second authority.
 
 - `stable` requires a real (non-fixture) backend. The default public loop and
-  its required siblings stay at most 66 RPCs (see Amendments).
+  its required siblings stay at most 68 RPCs (see Amendments).
 - `experimental` RPCs keep their wire contract, authorization, and receipts.
   Invocation requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
   Cargo feature. Both are off by default.
@@ -53,8 +53,9 @@ Security review and SDK generation shrink to the stable set.
 ## Validation
 
 A deterministic test compares the checked-in table and `docs/rpc-maturity.md`
-with both proto services, asserts at most 66 stable RPCs, and proves the
-default gate cannot reach an experimental RPC.
+with both proto services, asserts at most 68 stable RPCs, and proves the
+default gate cannot reach an experimental RPC. Real backend cells must match
+the shrink-only SQLite-only list.
 
 ## Amendments
 
@@ -80,3 +81,14 @@ default gate cannot reach an experimental RPC.
   closed, and the integration contract says so rather than implying
   dual-backend support. Authorization, namespace, and object security are
   rechecked on every call, and computed properties stay query-time overlays.
+- 2026-10-08, Issue [#1316](https://github.com/Sannrox/sekai-chisei/issues/1316):
+  the Real backend column is a projection of RuntimeDb fail-closed evidence and
+  the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. `stable`
+  may be `yes` or `sqlite only`; `fixture only` cannot. PostgreSQL conformance
+  runs on every pull request.
+- 2026-10-09, Issue [#1314](https://github.com/Sannrox/sekai-chisei/issues/1314):
+  the stable ceiling moves from 66 to 68. `DecideActionInstance` and
+  `ListActionInstances` become `stable` because community PostgreSQL now
+  grants or denies a parked instance with the same named-approver rules as
+  SQLite, `ListActionInstances.status` is the parked inbox, and
+  `native_server_smoke` plus the generated HTTP facades consume both RPCs.

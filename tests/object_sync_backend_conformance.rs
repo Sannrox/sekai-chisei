@@ -18,9 +18,7 @@ use sekai_chisei::sekai::object_sync::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-#[path = "support/postgres_scratch.rs"]
-mod postgres_scratch;
-use postgres_scratch::ScratchDatabase;
+use crate::postgres_scratch::ScratchDatabase;
 
 const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;
 const SOURCE_INSTANCE: &str = "sekai-project/sekai-chisei";

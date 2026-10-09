@@ -1,5 +1,5 @@
+use crate::db::store::ChiseiEvolveStore;
 use base64::Engine as _;
-use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -29,16 +29,16 @@ use crate::chisei::external_action_lifecycle as external_lifecycle;
 use crate::chisei::external_permit as permit;
 use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
-use crate::chisei::lookup_first;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
 use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
-use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, LeakRule, TaskClass};
+use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, TaskClass};
 use crate::chisei::promotion::CandidateStore;
 use crate::chisei::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, ReceiptSurface, UncoveredSurface,
 };
+use crate::composition::lookup_first;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
@@ -116,10 +116,10 @@ pub struct ChiseiServiceImpl {
     pub(super) db: crate::db::store::ChiseiStore,
     pub(super) config: Config,
     pub(super) provider_registry_state_path: Option<PathBuf>,
-    pub(super) sekai_commit_lookup:
-        Option<Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>>,
+    pub(super) sekai_commit_lookup: Option<Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>>,
     /// Chisei-owned read port for Sekai facts (lookup-first, context injection).
     pub(super) sekai_facts: crate::chisei::sekai_facts::SekaiFacts,
+    pub(super) privacy_scan: Arc<crate::chisei::privacy::PrivacyScanCache>,
 }
 
 #[derive(Clone)]
@@ -309,18 +309,17 @@ impl ChiseiServiceImpl {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.runtime(), &policy);
+        load_namespace_policies(db.fact_runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.runtime()
-                .list_evolve_task_records()
+            db.list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.runtime(), &policy);
+        load_namespace_policies(db.fact_runtime(), &policy);
         let budget = Arc::new(BudgetTracker::new(db.clone()));
         let evaluation_execution_lifecycle =
             evaluation_execution_lifecycle::EvaluationExecutionLifecycle::new(
@@ -346,7 +345,10 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
-            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
+                crate::db::store::SekaiStore::memory(),
+            ),
+            privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
         }
     }
 
@@ -384,18 +386,17 @@ impl ChiseiServiceImpl {
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.runtime(), &policy);
+        load_namespace_policies(db.fact_runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
-            db.runtime()
-                .list_evolve_task_records()
+            db.list_evolve_task_records()
                 .unwrap_or_default()
                 .into_iter()
                 .map(|task| (task.id.clone(), task))
                 .collect(),
         ));
         let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.runtime(), &policy);
+        load_namespace_policies(db.fact_runtime(), &policy);
         let evaluator_registry = Arc::new(
             evaluation_execution_domain::production_evaluator_registry()
                 .expect("compiled production evaluator registry must be valid"),
@@ -430,23 +431,31 @@ impl ChiseiServiceImpl {
             config,
             provider_registry_state_path,
             sekai_commit_lookup: None,
-            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::not_attached(),
+            sekai_facts: crate::chisei::sekai_facts::SekaiFacts::in_process(
+                crate::db::store::SekaiStore::memory(),
+            ),
+            privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
         }
     }
 
     pub fn with_sekai_commit_lookup(
         mut self,
-        lookup: Arc<dyn crate::chisei::cross_store_admission::SekaiCommitLookup>,
+        lookup: Arc<dyn crate::chisei::sekai_commit::SekaiCommitLookup>,
     ) -> Self {
         self.sekai_commit_lookup = Some(lookup);
         self
     }
 
-    /// Attach the Sekai fact reader. Without it, lookup-first and object
-    /// context injection refuse with `sekai_not_attached`.
-    pub fn with_sekai_facts(mut self, facts: crate::chisei::sekai_facts::SekaiFacts) -> Self {
+    /// Attach the Sekai fact reader. Combined Split loads namespace policies
+    /// from the in-process store. A remote hop is not RPC'd here: the channel
+    /// would be cached on a throwaway runtime.
+    pub fn with_sekai_facts(
+        mut self,
+        facts: crate::chisei::sekai_facts::SekaiFacts,
+    ) -> Result<Self, String> {
+        load_namespace_policies_from_facts(facts.reader(), &self.policy)?;
         self.sekai_facts = facts;
-        self
+        Ok(self)
     }
 
     fn bind_gunshi_allocation(
@@ -484,6 +493,7 @@ impl ChiseiServiceImpl {
                 "Gunshi allocation namespace does not match execution input",
             ));
         }
+        self.require_in_process_namespace_policy()?;
         let current_policy_version = self
             .policy
             .effective_policy(&allocation.namespace)

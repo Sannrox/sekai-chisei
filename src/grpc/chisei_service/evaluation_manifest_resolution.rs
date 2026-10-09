@@ -5,6 +5,7 @@
 //! fail-closed manifest construction, snapshot consistency, and persistence.
 
 use super::*;
+use crate::db::store::ChiseiEvaluationStore;
 
 /// Governed objects live on Sekai. Combined reads them in process; a Chisei
 /// plane without that store fails closed.
@@ -965,7 +966,6 @@ impl EvaluationManifestResolutionLifecycle {
                 )?;
                 if let Some(replay) = self
                     .db
-                    .runtime()
                     .get_evaluation_manifest_for_request(
                         &prepared.request.namespace,
                         &prepared.actor,

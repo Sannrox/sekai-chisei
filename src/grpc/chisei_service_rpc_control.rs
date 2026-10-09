@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::store::{ChiseiBudgetStore, ChiseiPermitStore};
 
 pub(super) async fn evaluate_governed_subject(
     service: &ChiseiServiceImpl,
@@ -103,7 +104,6 @@ pub(super) async fn redeem_external_action_permit(
     }
     if let Some(redemption) = service
         .db
-        .runtime()
         .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
         .map_err(Status::failed_precondition)?
     {
@@ -134,7 +134,6 @@ pub(super) async fn redeem_external_action_permit(
         .map_err(Status::failed_precondition)?;
     let redemption = service
         .db
-        .runtime()
         .redeem_or_reconcile_permit(
             &value,
             &context,
@@ -183,7 +182,6 @@ pub(super) async fn set_external_action_policy(
             };
             service
                 .db
-                .runtime()
                 .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
                 .map_err(Status::invalid_argument)?;
             Ok(Response::new(SetExternalActionPolicyResponse {
@@ -198,7 +196,6 @@ pub(super) async fn set_external_action_policy(
             let now = chrono::Utc::now().timestamp_millis();
             let changed = service
                 .db
-                .runtime()
                 .set_permit_kill_switch(
                     &input.scope_kind,
                     &input.scope_value,
@@ -343,12 +340,25 @@ pub(super) async fn set_namespace_policy(
             ));
         }
         persist_namespace_policy(
-            service.db.runtime(),
+            service
+                .sekai_facts
+                .reader()
+                .in_process_store()
+                .map(crate::db::store::SekaiStore::runtime)
+                .unwrap_or_else(|_| service.db.fact_runtime()),
             &r.namespace,
             &policy,
             context_admission_policy.as_ref(),
         )
-        .map_err(Status::internal)?;
+        .map_err(|error| {
+            if error.contains("no such table") && error.contains("sekai_objects") {
+                Status::failed_precondition(
+                    "namespace policy persistence requires in-process Sekai graph storage",
+                )
+            } else {
+                Status::internal(error)
+            }
+        })?;
         let default_runtime = policy.default_runtime.clone();
         let default_model = policy.default_model.clone();
         service.policy.set_namespace_policy(&r.namespace, policy);
@@ -386,6 +396,7 @@ pub(super) async fn get_effective_policy_summary(
 ) -> Result<Response<GetEffectivePolicySummaryResponse>, Status> {
     let actor = required_authenticated_actor(&req)?;
     let namespace = canonical_namespace(&req.get_ref().namespace)?.to_string();
+    service.require_in_process_namespace_policy()?;
     require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?;
 
     let routing = service.policy.effective_policy(&namespace).map_or_else(
@@ -406,7 +417,6 @@ pub(super) async fn get_effective_policy_summary(
 
     let raw_limits = service
         .db
-        .runtime()
         .budget_limits_for_scope(&format!("project:{namespace}"))
         .map_err(Status::internal)?;
     let budget_version = content_version(&raw_limits);
@@ -434,18 +444,20 @@ pub(super) async fn get_effective_policy_summary(
     };
 
     let project_action_scope = format!("project:{namespace}");
-    let action_policy = match service
-        .db
-        .runtime()
-        .get_action_policy(&project_action_scope)
-        .map_err(Status::internal)?
+    let action_policy = match get_action_policy_from_graph(
+        service.sekai_facts.reader(),
+        service.db.fact_runtime(),
+        &project_action_scope,
+    )
+    .map_err(Status::internal)?
     {
         some @ Some(_) => some,
-        None => service
-            .db
-            .runtime()
-            .get_action_policy(&namespace)
-            .map_err(Status::internal)?,
+        None => get_action_policy_from_graph(
+            service.sekai_facts.reader(),
+            service.db.fact_runtime(),
+            &namespace,
+        )
+        .map_err(Status::internal)?,
     };
     let actions = action_policy.map_or_else(
         || EffectiveActionPolicySummary {

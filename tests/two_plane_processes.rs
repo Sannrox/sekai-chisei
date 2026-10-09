@@ -1,8 +1,9 @@
 //! Black-box process isolation for the Sekai and Chisei binaries.
 
+use std::fs;
 use std::future::Future;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -33,12 +34,21 @@ impl ProcessKiller {
     }
 }
 
-struct ChildGuard(Child);
+struct ChildGuard {
+    child: Child,
+    stderr_path: PathBuf,
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl ChildGuard {
+    fn stderr_text(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
     }
 }
 
@@ -79,7 +89,9 @@ fn spawn_plane(
     port: u16,
     extras: &[(&str, &str)],
     killer: &ProcessKiller,
+    stderr_path: PathBuf,
 ) -> ChildGuard {
+    let stderr = fs::File::create(&stderr_path).expect("child stderr file");
     let mut command = Command::new(bin);
     command
         .env("SEKAI_INSECURE", "1")
@@ -94,25 +106,67 @@ fn spawn_plane(
         .env_remove("CHISEI_DATABASE_URL")
         .env_remove("DATABASE_URL")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     for (key, value) in extras {
         command.env(key, value);
     }
     let child = command.spawn().unwrap();
     killer.register(child.id());
-    ChildGuard(child)
+    ChildGuard { child, stderr_path }
 }
 
-fn wait_ready(port: u16) {
+/// Wait until this child binds `port`. Fail immediately if the child exits
+/// (bind TOCTOU, boot error) and include stderr. A pre-existing occupant of
+/// a stolen `free_port()` is not this child: require an observed closed-to-
+/// open transition while the process is still alive. Reference-platform analog:
+/// go-java-launcher ProcessMonitor identifies the service by child PID.
+fn wait_ready(child: &mut ChildGuard, port: u16, label: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let addr = format!("127.0.0.1:{port}");
-    while Instant::now() < deadline {
+    let mut saw_closed = false;
+    loop {
+        if let Some(status) = child.child.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!(
+                "{label} on {addr} exited {status}: {}",
+                child.stderr_text()
+            ));
+        }
         if std::net::TcpStream::connect(&addr).is_ok() {
-            return;
+            if saw_closed {
+                return Ok(());
+            }
+        } else {
+            saw_closed = true;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{label} on {addr} did not become ready: {}",
+                child.stderr_text()
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("process on {addr} did not become ready");
+}
+
+fn spawn_listening_plane(
+    bin: &str,
+    extras: &[(&str, &str)],
+    killer: &ProcessKiller,
+    log_dir: &Path,
+    label: &str,
+) -> (ChildGuard, u16) {
+    let mut last_error = String::new();
+    for attempt in 0..5 {
+        let port = free_port();
+        let stderr_path = log_dir.join(format!("{label}-{attempt}.stderr"));
+        let mut child = spawn_plane(bin, port, extras, killer, stderr_path);
+        match wait_ready(&mut child, port, label) {
+            Ok(()) => return (child, port),
+            Err(error) if error.contains("exited") => last_error = error,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("{label} did not become ready after retries: {last_error}");
 }
 
 fn run_until_exit(mut command: Command, timeout: Duration) -> std::process::ExitStatus {
@@ -191,6 +245,79 @@ fn with_bearer<T>(mut request: tonic::Request<T>, token: &str) -> tonic::Request
 }
 
 #[test]
+fn wait_ready_fails_fast_when_child_exits() {
+    let dir = tempdir().unwrap();
+    let stderr_path = dir.path().join("dead.stderr");
+    fs::write(&stderr_path, "bind failed\n").unwrap();
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "exit 7"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.spawn().unwrap();
+    let mut guard = ChildGuard { child, stderr_path };
+    let error = wait_ready(&mut guard, 1, "dead-plane").unwrap_err();
+    assert!(
+        error.contains("exited") && error.contains("bind failed"),
+        "{error}"
+    );
+}
+
+#[test]
+fn wait_ready_rejects_foreign_listener_when_child_exits() {
+    let dir = tempdir().unwrap();
+    let stderr_path = dir.path().join("stolen.stderr");
+    fs::write(&stderr_path, "Address already in use\n").unwrap();
+    let occupant = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = occupant.local_addr().unwrap().port();
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", "sleep 3; exit 1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.spawn().unwrap();
+    let mut guard = ChildGuard { child, stderr_path };
+    let error = wait_ready(&mut guard, port, "stolen-port").unwrap_err();
+    assert!(
+        error.contains("exited") && error.contains("Address already in use"),
+        "{error}"
+    );
+    drop(occupant);
+}
+
+#[test]
+fn chisei_plane_without_sekai_endpoint_refuses_to_boot() {
+    let dir = tempdir().unwrap();
+    let chisei_db = dir.path().join("chisei.db");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chisei-plane"));
+    command
+        .env("SEKAI_INSECURE", "1")
+        .env("SEKAI_BIND", "127.0.0.1")
+        .env("GRPC_PORT", free_port().to_string())
+        .env("SEKAI_SOCKET", "")
+        .env("OPS_PORT", "")
+        .env("SEKAI_HTTP_PORT", "")
+        .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap())
+        .env_remove("SEKAI_ENDPOINT")
+        .env_remove("SEKAI_DB_PATH")
+        .env_remove("SEKAI_DATABASE_URL")
+        .env_remove("CHISEI_DATABASE_URL")
+        .env_remove("DATABASE_URL")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "chisei-plane booted without SEKAI_ENDPOINT"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SEKAI_ENDPOINT"),
+        "expected actionable SEKAI_ENDPOINT error, got {stderr}"
+    );
+}
+
+#[test]
 fn two_plane_processes_submit_receipt_and_reject_wrong_plane() {
     let killer = ProcessKiller::default();
     run_async_with_deadline(
@@ -206,29 +333,29 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
     let chisei_db = dir.path().join("chisei.db");
     seed_sekai(&sekai_db);
 
-    let sekai_port = free_port();
-    let chisei_port = free_port();
     let sekai_bin = env!("CARGO_BIN_EXE_sekai-plane");
     let chisei_bin = env!("CARGO_BIN_EXE_chisei-plane");
+    let logs = dir.path();
 
-    let _sekai = spawn_plane(
+    let (_sekai, sekai_port) = spawn_listening_plane(
         sekai_bin,
-        sekai_port,
         &[("SEKAI_DB_PATH", sekai_db.to_str().unwrap())],
         &killer,
+        logs,
+        "sekai-plane",
     );
-    let _chisei = spawn_plane(
+    let endpoint = format!("http://127.0.0.1:{sekai_port}");
+    let (_chisei, chisei_port) = spawn_listening_plane(
         chisei_bin,
-        chisei_port,
         &[
             ("CHISEI_DB_PATH", chisei_db.to_str().unwrap()),
-            ("SEKAI_ENDPOINT", &format!("http://127.0.0.1:{sekai_port}")),
+            ("SEKAI_ENDPOINT", endpoint.as_str()),
             ("SEKAI_CREDENTIAL", TOKEN),
         ],
         &killer,
+        logs,
+        "chisei-plane",
     );
-    wait_ready(sekai_port);
-    wait_ready(chisei_port);
 
     let mut sekai = sekai_client(sekai_port).await;
     let mut chisei = chisei_client(chisei_port).await;

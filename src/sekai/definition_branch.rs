@@ -223,6 +223,57 @@ impl DefinitionMember {
         }
         Ok(())
     }
+
+    /// Read-path check: stored bytes must match `member_digest`.
+    /// Writes and repair still call [`Self::verify`], which re-canonicalizes.
+    pub fn verify_stored_digest(&self) -> Result<(), String> {
+        if self.contract_version != MEMBER_CONTRACT_VERSION {
+            return Err("definition member contract version is unsupported".into());
+        }
+        validate_namespace(&self.namespace)?;
+        validate_member_identity(&self.member_kind, &self.member_id)?;
+        if self.definition_json.len() > MAX_DEFINITION_MEMBER_BYTES {
+            return Err("definition_json exceeds the supported size".into());
+        }
+        validate_digest("member_digest", &self.member_digest)?;
+        let digest = member_digest(
+            &self.namespace,
+            &self.member_kind,
+            &self.member_id,
+            self.definition_json.as_bytes(),
+        );
+        if digest != self.member_digest {
+            return Err("definition member digest does not match stored content".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_stored_body(
+        body: &str,
+        revision: &DefinitionRevision,
+        reference: &DefinitionRevisionMember,
+    ) -> Result<Self, String> {
+        let member: Self = serde_json::from_str(body)
+            .map_err(|error| format!("corrupt definition member: {error}"))?;
+        member.bind_to_revision(revision, reference)?;
+        Ok(member)
+    }
+
+    fn bind_to_revision(
+        &self,
+        revision: &DefinitionRevision,
+        reference: &DefinitionRevisionMember,
+    ) -> Result<(), String> {
+        self.verify_stored_digest()?;
+        if self.namespace != revision.namespace
+            || self.member_digest != reference.member_digest
+            || self.member_kind != reference.member_kind
+            || self.member_id != reference.member_id
+        {
+            return Err("corrupt definition revision: member identity mismatch".into());
+        }
+        Ok(())
+    }
 }
 
 impl CreateDefinitionBranch {
@@ -606,6 +657,38 @@ mod tests {
                 .prepare("team-a")
                 .unwrap_err()
                 .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn stored_digest_check_rejects_tampered_body() {
+        let mut member = input(r#"{"name":"Ticket"}"#).prepare("team-a").unwrap();
+        member.definition_json = r#"{"name":"Forged"}"#.into();
+        assert!(
+            member
+                .verify_stored_digest()
+                .unwrap_err()
+                .contains("digest does not match stored content")
+        );
+    }
+
+    #[test]
+    fn stored_digest_check_does_not_recanonicalize() {
+        let json = r#"{"b":2,"a":1}"#;
+        let member = DefinitionMember {
+            contract_version: MEMBER_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            member_kind: "object_type".into(),
+            member_id: "Ticket".into(),
+            definition_json: json.into(),
+            member_digest: member_digest("team-a", "object_type", "Ticket", json.as_bytes()),
+        };
+        member.verify_stored_digest().unwrap();
+        assert!(
+            member
+                .verify()
+                .unwrap_err()
+                .contains("does not match canonical definition content")
         );
     }
 

@@ -1,3 +1,6 @@
+//! Duplicate object-key detection for JSON inputs, shared by Sekai and Chisei
+//! (ADR 0096 rule 5).
+
 use serde::de::{DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::{collections::HashSet, fmt};
 
@@ -99,7 +102,7 @@ impl<'de> Visitor<'de> for DuplicateObjectKeyDetector {
     }
 }
 
-pub(crate) fn contains_duplicate_object_keys(input: &str) -> Result<bool, String> {
+pub fn contains_duplicate_object_keys(input: &str) -> Result<bool, String> {
     let mut deserializer = serde_json::Deserializer::from_str(input);
     let duplicate = deserializer
         .deserialize_any(DuplicateObjectKeyDetector)

@@ -23,6 +23,20 @@ pub(crate) struct SchemaDefinitionLifecycle {
 }
 
 impl SchemaDefinitionLifecycle {
+    pub(super) fn empty(db: Arc<RuntimeDb>) -> Self {
+        Self {
+            db,
+            registry: Arc::new(RwLock::new(SchemaRegistry::from_types_and_interfaces(
+                Vec::new(),
+                Vec::new(),
+            ))),
+            unavailable_error: Arc::new(RwLock::new(Some(
+                "this process does not serve Sekai".into(),
+            ))),
+            kind_errors: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
     pub(super) fn load(db: Arc<RuntimeDb>) -> Self {
         let (types, interfaces, unavailable_error, kind_errors) =
             match (db.list_object_types_with_errors(), db.list_interfaces()) {

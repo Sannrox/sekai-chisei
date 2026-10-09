@@ -68,13 +68,13 @@ container exec "$container_name" pg_isready -U sekai -d sekai_test >/dev/null
 
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
-  cargo test --locked --test reusable_sekai_backend_conformance -- --ignored --nocapture
+  cargo test --locked --test it -- --ignored --nocapture reusable_sekai_backend_conformance
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
-  cargo test --locked --test definition_branch_backend_conformance -- --ignored --nocapture
+  cargo test --locked --test it -- --ignored --nocapture definition_branch_backend_conformance
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
-  cargo test --locked --test retention_dedup_backend_conformance -- --ignored --nocapture
+  cargo test --locked --test it -- --ignored --nocapture retention_dedup_backend_conformance
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
   cargo test --locked db::postgres_retention::tests::postgres_corrupt_archives_and_blobs_fail_closed \

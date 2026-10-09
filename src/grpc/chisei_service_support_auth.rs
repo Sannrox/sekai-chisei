@@ -539,11 +539,11 @@ pub(super) fn quality_trend_report_to_proto(
     }
 }
 /// Map a refused or failed Sekai fact read to an authorization status.
-/// A Chisei process without Sekai denies with an explicit reason; it never
-/// treats the missing grant store as "no grants needed".
+/// An unreachable or unauthorized hop denies with an explicit reason; it
+/// never treats a failed grant store as "no grants needed".
 fn sekai_fact_status(error: SekaiFactError, denied: &str) -> Status {
     match error {
-        SekaiFactError::NotAttached | SekaiFactError::Unsupported(_) => {
+        SekaiFactError::Unsupported(_) => {
             Status::permission_denied(format!("{denied}: {}", error.reason()))
         }
         SekaiFactError::Read(error) => Status::internal(error),
@@ -710,7 +710,7 @@ pub(super) fn require_team_namespace_actor_access(
             .get("team_managed")
             .is_some_and(|value| value == "true")
     });
-    if team_managed_namespace || db.is_team_principal(actor).map_err(Status::internal)? {
+    if team_managed_namespace || team_principal_status(facts, db, actor)?.unwrap_or(true) {
         require_namespace_access(facts, actor, namespace)?;
     }
     Ok(())
@@ -834,12 +834,40 @@ pub(super) fn execution_context_actor(
             "delegated execution identity requires a gateway service principal",
         ));
     }
-    if db.is_team_principal(delegated).map_err(Status::internal)? {
+    if team_principal_status(facts, db, delegated)?.unwrap_or(false) {
         require_namespace_access(facts, delegated, namespace)?;
         Ok(delegated.to_string())
     } else {
         Ok(actor.to_string())
     }
+}
+
+/// Combined Split reads `sekai_team_principals` from in-process Sekai.
+/// A remote hop has no team-principal RPC; `None` lets callers fail closed
+/// (require membership, or refuse delegation) instead of querying a Chisei dest
+/// that no longer owns the table.
+fn team_principal_status(
+    facts: &dyn SekaiFactReader,
+    _fallback: &RuntimeDb,
+    principal: &str,
+) -> Result<Option<bool>, Status> {
+    let result = if let Ok(store) = facts.in_process_store() {
+        store.runtime().is_team_principal(principal)
+    } else {
+        return Ok(None);
+    };
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if missing_team_principal_table(&error) => Ok(None),
+        Err(error) => Err(Status::internal(error)),
+    }
+}
+
+fn missing_team_principal_table(error: &str) -> bool {
+    error.contains("sekai_team_principals")
+        && (error.contains("no such table")
+            || error.contains("does not exist")
+            || error.contains("undefined"))
 }
 pub(super) fn auth_source<T>(request: &Request<T>) -> Option<String> {
     request

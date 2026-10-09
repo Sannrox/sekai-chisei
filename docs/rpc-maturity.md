@@ -17,13 +17,18 @@ seed steps run on both community backends.
 
 Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures/rpc_maturity/v1.json)
 (`sekai.rpc-maturity/v1`). A test compares this page and that fixture with
-`proto/sekai.proto` and `proto/chisei.proto`.
+`proto/sekai.proto` and `proto/chisei.proto`. The **Real backend** column is a
+projection of RuntimeDb fail-closed evidence and the shrink-only list
+[`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
+(`sekai.sqlite-only-surfaces/v1`). CI fails when a row disagrees with that
+evidence, when a new SQLite-only RPC is missing from the list, or when the
+list grows. Port a surface, then remove it and lower `limit`.
 
 ## Classification
 
 | Class | Meaning | Default build |
 | --- | --- | --- |
-| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 66 RPCs. | Invokable. |
+| `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. At most 68 RPCs. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
 | `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
 
@@ -40,7 +45,10 @@ They stay out of the default RPC surface.
 `DiscoverCapabilities` always reports `sekai.rpc.experimental` on the core
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
-experimental RPC.
+experimental RPC. The core pack also reports `sekai.transforms.projection`
+as the in-process transform host; its `lifecycle_state` is `disabled` unless
+the experimental RPC gate is on, matching `sekai.rpc.experimental`. Put/run/get
+RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 and `remove` RPCs are omitted automatically.
@@ -55,10 +63,10 @@ Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 
 **Real backend** is `yes` when the RPC runs on both community runtimes,
 `sqlite only` when community PostgreSQL answers `UNAVAILABLE` before doing any
-work, and `fixture only` when no production backend exists. Only `yes` may be
-`stable`. On community PostgreSQL a `require_approval` policy still parks an
-Action, but `DecideActionInstance` is `sqlite only`, so an instance parked
-there cannot be decided on that runtime.
+work, and `fixture only` when no production backend exists. `stable` requires a
+real backend (`yes` or `sqlite only`); `fixture only` cannot be `stable`. A
+`require_approval` policy parks an Action on both community backends;
+`DecideActionInstance` grants or denies it on both.
 
 <!-- rpc-maturity-rows -->
 
@@ -71,9 +79,9 @@ there cannot be decided on that runtime.
 | `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | none | `experimental` |
 | `SekaiService.ApplySourceBatch` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.GetSourceSyncState` | `sekai.object-sync` | yes | example | `stable` |
-| `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
-| `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
-| `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
+| `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
+| `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | sqlite only | none | `experimental` |
 | `SekaiService.CreateDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ApplyDefinitionBranchEdit` | `sekai.definition-branch` | yes | none | `experimental` |
@@ -99,18 +107,25 @@ there cannot be decided on that runtime.
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.ActivateObjectSecurityPolicies` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityActivation` | `sekai.object-security` | yes | none | `stable` |
-| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
-| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | yes | none | `experimental` |
-| `SekaiService.PutClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
-| `SekaiService.GetClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.PutPurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.RevokePurposeAuthorization` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.PutClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
+| `SekaiService.GetClassificationLattice` | `sekai.object-security` | sqlite only | none | `experimental` |
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
@@ -131,19 +146,19 @@ there cannot be decided on that runtime.
 | `SekaiService.ListOntologyClasses` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateOntologyClass` | `sekai.ontology-definitions` | yes | cli | `stable` |
-| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | sqlite only | none | `experimental` |
 | `SekaiService.ListOntologyRelations` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.GetOntologyRelation` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateOntologyRelation` | `sekai.ontology-definitions` | yes | cli | `stable` |
-| `SekaiService.DeleteOntologyRelation` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.DeleteOntologyRelation` | `sekai.ontology-definitions` | sqlite only | none | `experimental` |
 | `SekaiService.CreateFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.ListFunctions` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListDatasets` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.AppendRows` | `sekai.datasets` | yes | host | `stable` |
-| `SekaiService.QueryRows` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.AppendRows` | `sekai.datasets` | sqlite only | host | `stable` |
+| `SekaiService.QueryRows` | `sekai.datasets` | sqlite only | host | `stable` |
 | `SekaiService.CreateVirtualTable` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListVirtualTables` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateGrant` | `sekai.authorization` | yes | host | `stable` |
@@ -162,13 +177,13 @@ there cannot be decided on that runtime.
 | `SekaiService.ListGovernedActionTypes` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.DecideActionInstance` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.PutActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.RunActionBinding` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
-| `SekaiService.ListActionInstances` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionEffects` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListClaimableActionWork` | `sekai.audit` | yes | none | `experimental` |
@@ -213,13 +228,13 @@ there cannot be decided on that runtime.
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |
-| `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | yes | example | `stable` |
+| `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | sqlite only | example | `stable` |
 | `ChiseiService.SetExternalActionPolicy` | `chisei.approvals` | yes | none | `experimental` |
 | `ChiseiService.RecordUsage` | `chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
 | `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
-| `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
+| `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | sqlite only | none | `experimental` |
 | `ChiseiService.ListRoutingProfiles` | `chisei.provider_registry` | yes | none | `experimental` |
 | `ChiseiService.PutRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.RevokeRoutingProfile` | `chisei.policy` | yes | none | `experimental` |
@@ -232,9 +247,9 @@ there cannot be decided on that runtime.
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.ListKiokuCandidates` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ReviewKiokuMemory` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.IssueGunshiRecommendations` | `chisei.learning, chisei.execution` | yes | none | `remove` |
-| `ChiseiService.SetGunshiAllocationPolicy` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | yes | none | `remove` |
+| `ChiseiService.IssueGunshiRecommendations` | `chisei.learning, chisei.execution` | sqlite only | none | `remove` |
+| `ChiseiService.SetGunshiAllocationPolicy` | `chisei.learning` | sqlite only | none | `remove` |
+| `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | sqlite only | none | `remove` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |

@@ -7,6 +7,7 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{KIND_CAPABILITY, KIND_EXTERNAL_EVIDENCE, Object, is_valid_property_key};
 use crate::sekai::action_policy::{ACTION_POLICY_KIND, BLAST_RADIUS_KIND};
+use crate::sekai::feedback_package::KIND_OBSERVATION;
 use crate::sekai::governed_action_type::{
     GovernedActionType, OBJECT_MUTATION_CREATE, OBJECT_MUTATION_UPDATE,
 };
@@ -25,6 +26,11 @@ pub(crate) enum ActionObjectMutationError {
 const PARAM_OBJECT_ID: &str = "object_id";
 const PARAM_NAME: &str = "name";
 const PARAM_NOTIFY_DELIVERY: &str = "notify_delivery";
+
+fn unique_constraint_failed(error: &str) -> bool {
+    error.contains("UNIQUE constraint failed")
+        || error.contains("duplicate key value violates unique constraint")
+}
 
 const RESERVED_OBJECT_KINDS: &[&str] = &[
     "namespace",
@@ -70,6 +76,7 @@ pub(crate) fn plan(
     type_def: &GovernedActionType,
     namespace: &str,
     parameters_json: &str,
+    now_ms: i64,
 ) -> Result<Option<PlannedObjectMutation>, ActionObjectMutationError> {
     let object_kind = type_def.object_kind.trim();
     let mutation = type_def.object_mutation.trim();
@@ -134,7 +141,7 @@ pub(crate) fn plan(
                     "object {object_id} already exists"
                 )));
             }
-            let planned = Object {
+            let mut planned = Object {
                 id: object_id.to_string(),
                 kind: object_kind.to_string(),
                 name,
@@ -145,6 +152,8 @@ pub(crate) fn plan(
                 updated: 0,
             };
             validate_object_schema(db, &planned)?;
+            crate::sekai::feedback_package::validate_object_write(db, &mut planned, now_ms)
+                .map_err(ActionObjectMutationError::FailedPrecondition)?;
             Ok(Some(PlannedObjectMutation::Create(planned)))
         }
         OBJECT_MUTATION_UPDATE => {
@@ -166,7 +175,7 @@ pub(crate) fn plan(
             }
             let mut merged = existing.properties;
             merged.extend(properties);
-            let planned = Object {
+            let mut planned = Object {
                 id: existing.id,
                 kind: existing.kind,
                 name: if parameters.get(PARAM_NAME).is_some() {
@@ -181,6 +190,8 @@ pub(crate) fn plan(
                 updated: existing.updated,
             };
             validate_object_schema(db, &planned)?;
+            crate::sekai::feedback_package::validate_object_write(db, &mut planned, now_ms)
+                .map_err(ActionObjectMutationError::FailedPrecondition)?;
             Ok(Some(PlannedObjectMutation::Update(planned)))
         }
         other => Err(ActionObjectMutationError::FailedPrecondition(format!(
@@ -207,10 +218,19 @@ pub(crate) fn apply(
     object.updated = now_ms;
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
+    let object_external_id = object.external_id.clone();
     let applied_updated = object.updated;
     let previous = if created {
         db.create_object_with_audit(&object, actor)
-            .map_err(ActionObjectMutationError::Internal)?;
+            .map_err(|error| {
+                if object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
+                    ActionObjectMutationError::FailedPrecondition(format!(
+                        "observation external identity {object_external_id} already exists"
+                    ))
+                } else {
+                    ActionObjectMutationError::Internal(error)
+                }
+            })?;
         None
     } else {
         Some(
@@ -420,7 +440,7 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":" rec-1 "}"#).unwrap_err();
+        let error = plan(&db, &type_def, "acme", r#"{"object_id":" rec-1 "}"#, 10).unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::InvalidArgument(_)
@@ -467,7 +487,7 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let error = plan(&db, &type_def, "acme", r#"{"object_id":"rec-schema"}"#).unwrap_err();
+        let error = plan(&db, &type_def, "acme", r#"{"object_id":"rec-schema"}"#, 10).unwrap_err();
         assert!(matches!(
             error,
             ActionObjectMutationError::FailedPrecondition(_)
@@ -504,12 +524,12 @@ mod tests {
             disabled_at_ms: 0,
             ..Default::default()
         };
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#)
+        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#, 10)
             .unwrap()
             .expect("planned");
         let applied = apply(&db, planned, "alice", 10).unwrap();
         compensate(&db, &applied, "alice");
-        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#)
+        let planned = plan(&db, &type_def, "acme", r#"{"object_id":"rec-abort"}"#, 20)
             .unwrap()
             .expect("planned after abort");
         apply(&db, planned, "alice", 20).unwrap();
@@ -553,6 +573,7 @@ mod tests {
             &create,
             "acme",
             r#"{"object_id":"rec-restore","city":"oslo"}"#,
+            10,
         )
         .unwrap()
         .expect("planned");
@@ -567,6 +588,7 @@ mod tests {
             &update,
             "acme",
             r#"{"object_id":"rec-restore","city":"bergen"}"#,
+            20,
         )
         .unwrap()
         .expect("planned");

@@ -6,10 +6,6 @@
 //! metering so their ordering is exercised through the same interface callers
 //! use.
 
-use crate::chisei::budget::BudgetTracker;
-use crate::chisei::receipt::{
-    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
-};
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
@@ -20,11 +16,15 @@ use crate::sekai::action_instance::{
 use crate::sekai::action_object_mutation::{
     ActionObjectMutationError, AppliedObjectMutation, plan as plan_object_mutation,
 };
+use crate::sekai::action_ports::{ActionBudgetPort, ActionProposalPort};
 use crate::sekai::action_type_criteria::{
     CRITERION_UNAVAILABLE, CriterionDecision, evaluate_submission_criteria, invoker_context,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
+use sekai_provider::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+};
 use std::collections::{BTreeMap, HashMap};
 
 #[cfg(test)]
@@ -95,12 +95,22 @@ struct ApprovalRecord<'r> {
 
 pub(crate) struct ActionInstanceAdmission<'a> {
     db: &'a RuntimeDb,
-    budget: Option<&'a BudgetTracker>,
+    budget: Option<&'a dyn ActionBudgetPort>,
+    proposal: Option<&'a dyn ActionProposalPort>,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
-    pub(crate) fn new(db: &'a RuntimeDb, budget: Option<&'a BudgetTracker>) -> Self {
-        Self { db, budget }
+    pub(crate) fn new(db: &'a RuntimeDb, budget: Option<&'a dyn ActionBudgetPort>) -> Self {
+        Self {
+            db,
+            budget,
+            proposal: None,
+        }
+    }
+
+    pub(crate) fn with_proposal(mut self, proposal: Option<&'a dyn ActionProposalPort>) -> Self {
+        self.proposal = proposal;
+        self
     }
 
     pub(crate) fn admit(
@@ -154,7 +164,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                     "idempotency key conflict: same key with different request digest".into(),
                 ));
             }
-            return self.completed_replay(existing);
+            return self.completed_replay(existing, now);
         }
 
         // New admissions consume a live signed envelope. Replay of an already
@@ -180,13 +190,13 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ActionInstanceAdmissionError::Internal(error)
                 }
             })?;
-        crate::chisei::evaluation_plan::validate_parameter_schema(&type_def.parameter_schema_json)
+        crate::sekai::parameter_schema::validate_parameter_schema(&type_def.parameter_schema_json)
             .map_err(|error| {
                 ActionInstanceAdmissionError::FailedPrecondition(format!(
                     "governed action type parameter schema invalid: {error}"
                 ))
             })?;
-        crate::chisei::evaluation_plan::validate_parameters(
+        crate::sekai::parameter_schema::validate_parameters(
             &type_def.parameter_schema_json,
             &request.parameters_json,
         )
@@ -293,11 +303,12 @@ impl<'a> ActionInstanceAdmission<'a> {
             budget_decision = "budget_exceeded".into();
         }
 
-        let system_one_fill_json = crate::chisei::system_one_action::fill_provenance_json(
-            &type_def,
-            &request.parameters_json,
-        )
-        .map_err(ActionInstanceAdmissionError::InvalidArgument)?;
+        let system_one_fill_json = match self.proposal {
+            Some(proposal) => proposal
+                .fill_provenance_json(&type_def, &request.parameters_json)
+                .map_err(ActionInstanceAdmissionError::InvalidArgument)?,
+            None => String::new(),
+        };
         let parked_object_digest = if status == STATUS_PARKED {
             target_object_digest(self.db, &request.parameters_json)?
         } else {
@@ -366,7 +377,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         })?;
         let replay = stored.instance_id != instance_id;
         if replay {
-            return self.completed_replay(stored);
+            return self.completed_replay(stored, now);
         }
 
         // Same-key replay already returned above. Plan only a fresh admit so a
@@ -379,6 +390,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
+                now,
             ) {
                 Ok(None) => None,
                 Ok(Some(planned)) => {
@@ -424,6 +436,9 @@ impl<'a> ActionInstanceAdmission<'a> {
                 let _ = self.db.delete_action_instance(&stored.instance_id);
             }
             return Err(error);
+        }
+        if let Some(applied) = &applied_object {
+            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: stored,
@@ -521,7 +536,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         {
             return self.finish_denied(instance, "stale_on_resume", &approval, now);
         }
-        if crate::chisei::evaluation_plan::validate_parameters(
+        if crate::sekai::parameter_schema::validate_parameters(
             &type_def.parameter_schema_json,
             &instance.parameters_json,
         )
@@ -614,6 +629,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
+            now,
         )
         .map_err(map_object_mutation_error)?;
         let mut granted = instance.clone();
@@ -645,7 +661,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 applied.map(|applied| *applied)
             }
             action_object_mutation::ParkedGrant::NotParked => {
-                return self.replay_decided(&instance.instance_id, decision);
+                return self.replay_decided(&instance.instance_id, decision, now);
             }
             action_object_mutation::ParkedGrant::Stale => {
                 return self.finish_denied(instance, "stale_on_resume", &approval, now);
@@ -691,6 +707,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             return Err(error);
         }
+        if let Some(applied) = &applied_object {
+            crate::sekai::feedback_package::complete_object_write(self.db, &applied.object, now);
+        }
         Ok(ActionInstanceAdmissionOutcome {
             instance: granted,
             replay: false,
@@ -718,7 +737,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             .decide_parked_action_instance(&denied)
             .map_err(ActionInstanceAdmissionError::Internal)?
         {
-            return self.replay_decided(&denied.instance_id, approval.decision);
+            return self.replay_decided(&denied.instance_id, approval.decision, now);
         }
         let ontology_digest = self
             .db
@@ -749,6 +768,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         &self,
         instance_id: &str,
         decision: &str,
+        now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         let current = self
             .db
@@ -758,6 +778,11 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ActionInstanceAdmissionError::Internal("decided instance vanished".into())
             })?;
         if current.approval_decision == decision {
+            if current.status == STATUS_ADMITTED
+                && let Some(object) = object_for_admitted_instance(self.db, &current)?
+            {
+                crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
+            }
             Ok(ActionInstanceAdmissionOutcome {
                 instance: current,
                 replay: true,
@@ -772,6 +797,7 @@ impl<'a> ActionInstanceAdmission<'a> {
     fn completed_replay(
         &self,
         existing: ActionInstance,
+        now: i64,
     ) -> Result<ActionInstanceAdmissionOutcome, ActionInstanceAdmissionError> {
         if self
             .db
@@ -789,6 +815,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             // Clerk admission is already durable. Log catch-up is best-effort so
             // a transient object-log error cannot fail an idempotent replay.
             catch_up_object_log(&existing.operation_id, &object.id, &object.kind, &object);
+            crate::sekai::feedback_package::complete_object_write(self.db, &object, now);
         }
         Ok(ActionInstanceAdmissionOutcome {
             instance: existing,
@@ -1277,6 +1304,24 @@ mod tests {
         db
     }
 
+    fn postgres_runtime() -> RuntimeDb {
+        use crate::db::postgres::PostgresDb;
+        use std::sync::Arc;
+
+        let database_url = std::env::var("SEKAI_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            panic!("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database")
+        });
+        let db = if let Ok(ca_certificate_path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
+                panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
+            });
+            PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
+        } else {
+            PostgresDb::connect(&database_url, 4).unwrap()
+        };
+        RuntimeDb::Postgres(Arc::new(db))
+    }
+
     const ONTOLOGY_DIGEST: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -1296,47 +1341,95 @@ mod tests {
         }
     }
 
+    struct StampProposal(&'static str);
+
+    impl ActionProposalPort for StampProposal {
+        fn fill_provenance_json(
+            &self,
+            _type_def: &GovernedActionType,
+            _parameters_json: &str,
+        ) -> Result<String, String> {
+            Ok(self.0.into())
+        }
+    }
+
+    struct CountingBudget {
+        remaining: std::sync::atomic::AtomicI32,
+        recorded: std::sync::atomic::AtomicI32,
+    }
+
+    impl ActionBudgetPort for CountingBudget {
+        fn check(&self, _subject: &str, amount: i32) -> Result<(), String> {
+            if self.remaining.load(std::sync::atomic::Ordering::SeqCst) < amount {
+                Err("exhausted".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn record(&self, _subject: &str, amount: i32) {
+            self.remaining
+                .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+            self.recorded
+                .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[test]
-    fn admit_stamps_fill_provenance_for_a_bound_type() {
+    fn admit_without_proposal_port_leaves_fill_empty() {
         let db = setup();
-        let type_def = GovernedActionType {
-            namespace: "acme".into(),
-            type_id: "dispatch.bound".into(),
-            version: "1".into(),
-            description: "bound dispatch".into(),
-            parameter_schema_json: r#"{"type":"object","properties":{"runtime":{"type":"string","enum":["shikigami"]}},"required":["runtime"],"additionalProperties":false}"#.into(),
-            allowed_effect_kinds: vec![EFFECT_KIND_RUNTIME_DISPATCH.into()],
-            system_one: Some(sekai_provider::system_one::SystemOneBind {
-                model: "jev-1.13.0".into(),
-                questions: vec![sekai_provider::system_one::SystemOneQuestionBind {
-                    parameter: "runtime".into(),
-                    question_type: "choice".into(),
-                    instructions: "Which runtime".into(),
-                    criteria: serde_json::json!({"shikigami": null}),
-                }],
-            }),
-            enabled: true,
-            ..Default::default()
-        };
-        db.put_governed_action_type(type_def.clone(), "operator", 2)
-            .unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
-        let mut bound_request = request(r#"{"runtime":"shikigami"}"#);
-        bound_request.type_id = "dispatch.bound".into();
-        bound_request.idempotency_key = "idem-bound".into();
-        let admitted = admission.admit(bound_request, "alice", 10).unwrap();
-        let expected = crate::chisei::system_one_action::fill_provenance_json(
-            &type_def,
-            r#"{"runtime":"shikigami"}"#,
-        )
-        .unwrap();
-        assert_eq!(admitted.instance.system_one_fill_json, expected);
-        assert!(!expected.is_empty());
+        let admitted = admission
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert!(admitted.instance.system_one_fill_json.is_empty());
+        assert_eq!(admitted.instance.budget_decision, "not_configured");
+    }
+
+    #[test]
+    fn admit_stamps_fill_provenance_from_the_proposal_port() {
+        let db = setup();
+        let proposal = StampProposal(r#"{"model":"test"}"#);
+        let admission = ActionInstanceAdmission::new(&db, None).with_proposal(Some(&proposal));
+        let admitted = admission
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(admitted.instance.system_one_fill_json, proposal.0);
         let stored = db
             .get_action_instance(&admitted.instance.instance_id)
             .unwrap()
             .expect("stored");
-        assert_eq!(stored.system_one_fill_json, expected);
+        assert_eq!(stored.system_one_fill_json, proposal.0);
+    }
+
+    #[test]
+    fn admit_records_budget_when_the_port_allows() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(1),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let admitted = ActionInstanceAdmission::new(&db, Some(&budget))
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(admitted.instance.status, STATUS_ADMITTED);
+        assert_eq!(admitted.instance.budget_decision, "allow");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admit_denies_when_the_budget_port_is_exhausted() {
+        let db = setup();
+        let budget = CountingBudget {
+            remaining: std::sync::atomic::AtomicI32::new(0),
+            recorded: std::sync::atomic::AtomicI32::new(0),
+        };
+        let denied = ActionInstanceAdmission::new(&db, Some(&budget))
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap();
+        assert_eq!(denied.instance.status, STATUS_DENIED);
+        assert_eq!(denied.instance.budget_decision, "budget_exceeded");
+        assert_eq!(budget.recorded.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1966,7 +2059,7 @@ mod tests {
         // succeeds; assert the structured log line actually fires with the
         // operation and object identity attached.
         use std::io::{self, Write};
-        use std::sync::{Arc, Mutex};
+        use std::sync::{Arc, Mutex, OnceLock};
 
         #[derive(Clone)]
         struct Buf(Arc<Mutex<Vec<u8>>>);
@@ -1979,6 +2072,27 @@ mod tests {
             }
         }
 
+        // #1200: callsite interest is process-wide. A thread-local
+        // `with_default` subscriber loses the race when a sibling test
+        // rebuilds the cache from a dispatcher that is uninterested.
+        // Pin a process-wide ERROR subscriber so rebuilds keep this
+        // event enabled. Unique request/object ids keep concurrent
+        // ERROR lines from other tests out of the assertion.
+        static CAPTURE: OnceLock<Buf> = OnceLock::new();
+        let buf = CAPTURE.get_or_init(|| {
+            let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+            let writer = buf.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
+            buf
+        });
+        buf.0.lock().expect("log buffer").clear();
+
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
         let db = setup();
@@ -1986,14 +2100,6 @@ mod tests {
         db.put_governed_action_type(record_type("create"), "operator", 1)
             .unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
-
-        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::ERROR)
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
 
         crate::sekai::object_log::with_test_log_path(&log, || {
             crate::sekai::object_log::fail_next_ingest();
@@ -2003,12 +2109,8 @@ mod tests {
             );
             request.idempotency_key = "record-signal-log".into();
             request.request_id = "operation-signal-log".into();
-            tracing::subscriber::with_default(subscriber, || {
-                // #1200: re-evaluate callsites other test threads cached
-                // before this thread-local subscriber existed.
-                tracing::callsite::rebuild_interest_cache();
-                admission.admit(request, "alice", 10).unwrap();
-            });
+            tracing::callsite::rebuild_interest_cache();
+            admission.admit(request, "alice", 10).unwrap();
         });
 
         let logs = String::from_utf8(buf.0.lock().expect("log buffer").clone()).expect("utf8 logs");
@@ -2159,6 +2261,11 @@ mod tests {
         assert_eq!(parked.status, STATUS_PARKED);
         assert!(parked.deny_reason.is_empty());
         assert!(db.get_object("rec-9").unwrap().is_none());
+        let inbox = db
+            .list_action_instances("acme", None, Some(STATUS_PARKED), 10)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].instance_id, parked.instance_id);
         let open = db
             .get_operation_receipt("operation-record")
             .unwrap()
@@ -2218,6 +2325,81 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_require_approval_parks_lists_and_a_named_approver_grants() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("ns-1314-{suffix}");
+        let object_id = format!("rec-1314-{suffix}");
+        let type_id = format!("customer.record.create.{suffix}");
+        let db = postgres_runtime();
+        ensure_record_kind(&db);
+        let mut type_def = record_type("create");
+        type_def.namespace = namespace.clone();
+        type_def.type_id = type_id.clone();
+        type_def.approvers = vec!["bob".into()];
+        db.put_governed_action_type(type_def, "operator", 1)
+            .unwrap();
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(&namespace);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let mut request = record_request(
+            &type_id,
+            &format!(r#"{{"object_id":"{object_id}","title":"t"}}"#),
+        );
+        request.namespace = namespace.clone();
+        request.idempotency_key = format!("record-1314-{suffix}");
+        request.request_id = format!("operation-1314-{suffix}");
+        let parked = admission
+            .admit(request.clone(), "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        let inbox = db
+            .list_action_instances(&namespace, None, Some(STATUS_PARKED), 10)
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].instance_id, parked.instance_id);
+        for principal in ["alice", "carol"] {
+            let error = admission
+                .decide(
+                    decision(&parked.instance_id, DECISION_GRANT, principal),
+                    principal,
+                    20,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                ActionInstanceAdmissionError::PermissionDenied(DECISION_ACCESS_DENIED.into())
+            );
+        }
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                30,
+            )
+            .unwrap();
+        assert!(!granted.replay);
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+        assert_eq!(granted.instance.decided_by, "bob");
+        assert!(db.get_object(&object_id).unwrap().is_some());
+        let receipt = db
+            .get_operation_receipt(&request.request_id)
+            .unwrap()
+            .unwrap();
+        assert!(receipt.completed_at_ms.is_some());
+        assert!(receipt.events.iter().any(|event| {
+            event.kind == ReceiptEventKind::ApprovalDecided && event.actor == "bob"
+        }));
+        assert!(
+            db.list_action_instances(&namespace, None, Some(STATUS_PARKED), 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

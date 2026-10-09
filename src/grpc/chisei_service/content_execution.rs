@@ -217,6 +217,7 @@ impl ChiseiServiceImpl {
         requested_plan: ContentExecutionPlanV1,
         resolved_parts: Vec<ResolvedContentPartV1>,
     ) -> Result<<Self as ChiseiService>::ExecuteContentPlanStreamStream, Status> {
+        self.require_in_process_namespace_policy()?;
         let requested_plan_id = requested_plan
             .execution
             .as_ref()
@@ -321,8 +322,12 @@ impl ChiseiServiceImpl {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, &provider, data_class, &resolved_text);
+        let leak_findings = self.leak_findings_for_payload(
+            &input.namespace,
+            &provider,
+            data_class,
+            &resolved_text,
+        )?;
         if !leak_findings.is_empty() {
             self.record_leak_audit(
                 "content_leak_check",

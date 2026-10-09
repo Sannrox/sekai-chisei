@@ -1,0 +1,317 @@
+//! Control-plane operability signals.
+//!
+//! Covers the signal families Issue #98 requires: control-plane overhead,
+//! saturation, database waits, queue depth, cache behavior, receipt and audit
+//! lag, fallback, and rejected work.
+//!
+//! Every label position takes a closed enum from [`crate::labels`], so no
+//! call site can attach an object id, namespace, or content digest to a time
+//! series. Durations are recorded in seconds to match Prometheus convention and
+//! the histogram buckets installed in [`crate::metrics::handle`].
+
+use crate::labels::{
+    Cache, CacheOutcome, DeduplicationEvent, FallbackTrigger, LagSurface, LookupFirstPath, Outcome,
+    PoolPlane, RejectionReason, Subsystem, WaitKind,
+};
+use metrics::{
+    Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
+};
+use std::time::Duration;
+
+pub const CONTROL_PLANE_OVERHEAD: &str = "sekai_control_plane_overhead_seconds";
+pub const SATURATION_RATIO: &str = "sekai_saturation_ratio";
+pub const DB_WAIT: &str = "sekai_db_wait_seconds";
+pub const POOL_CHECKOUT: &str = "sekai_db_pool_checkout_seconds";
+pub const POOL_IN_USE_RATIO: &str = "sekai_db_pool_in_use_ratio";
+pub const QUEUE_DEPTH: &str = "sekai_queue_depth";
+pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
+pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
+pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
+/// 1 when a named upstream provider circuit is open, else 0.
+pub const PROVIDER_CIRCUIT_OPEN: &str = "sekai_provider_circuit_open";
+pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
+pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
+pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
+pub const EVALUATION_STEP_TOTAL: &str = "sekai_evaluation_step_total";
+pub const EVALUATION_STEP_DURATION: &str = "sekai_evaluation_step_duration_seconds";
+
+/// Register descriptions for every signal family.
+///
+/// Called once from [`crate::metrics::handle`] so that a scrape carries
+/// HELP text even before any signal has been emitted.
+pub fn describe_all() {
+    describe_histogram!(
+        CONTROL_PLANE_OVERHEAD,
+        Unit::Seconds,
+        "Control-plane time spent outside provider execution"
+    );
+    describe_gauge!(
+        SATURATION_RATIO,
+        "Utilization of a bounded resource, 0.0 to 1.0"
+    );
+    describe_histogram!(
+        DB_WAIT,
+        Unit::Seconds,
+        "Time waiting on database work before progress"
+    );
+    describe_histogram!(
+        POOL_CHECKOUT,
+        Unit::Seconds,
+        "Time waiting to check a connection out of a store plane's pool"
+    );
+    describe_gauge!(
+        POOL_IN_USE_RATIO,
+        "Share of a store plane's pool checked out at the last checkout, 0.0 to 1.0"
+    );
+    describe_gauge!(QUEUE_DEPTH, "Items currently admitted and awaiting work");
+    describe_counter!(CACHE_EVENTS, "Cache lookups by outcome");
+    describe_histogram!(
+        DURABILITY_LAG,
+        Unit::Seconds,
+        "Delay between producing a record and its durable visibility"
+    );
+    describe_counter!(FALLBACK_TOTAL, "Requests that left their preferred path");
+    describe_gauge!(
+        PROVIDER_CIRCUIT_OPEN,
+        "1 when a named upstream provider circuit is open"
+    );
+    describe_counter!(REJECTED_WORK_TOTAL, "Work refused, by coarse reason");
+    describe_counter!(
+        DEDUPLICATION_TOTAL,
+        "Deduplication and idempotency decisions"
+    );
+    describe_counter!(
+        LOOKUP_FIRST_TOTAL,
+        "Lookup-first answer path decisions (hit vs model)"
+    );
+    describe_counter!(
+        EVALUATION_STEP_TOTAL,
+        "Deterministic evaluation steps by compiled static evaluator label, version, and closed status"
+    );
+    describe_histogram!(
+        EVALUATION_STEP_DURATION,
+        Unit::Seconds,
+        "Deterministic evaluation step latency by compiled static evaluator label, version, and closed status"
+    );
+}
+
+/// Record control-plane overhead attributable to a subsystem.
+pub fn record_control_plane_overhead(subsystem: Subsystem, outcome: Outcome, elapsed: Duration) {
+    histogram!(
+        CONTROL_PLANE_OVERHEAD,
+        "subsystem" => subsystem.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// Set utilization of a bounded resource.
+///
+/// The ratio is clamped to `0.0..=1.0`: a saturation gauge above one is not
+/// meaningful and usually signals a miscounted denominator, which would be
+/// worse to display than to clamp.
+pub fn set_saturation(subsystem: Subsystem, ratio: f64) {
+    let clamped = if ratio.is_finite() {
+        ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    gauge!(SATURATION_RATIO, "subsystem" => subsystem.as_str()).set(clamped);
+}
+
+/// Record a wait observed before database progress.
+pub fn record_db_wait(kind: WaitKind, outcome: Outcome, waited: Duration) {
+    histogram!(
+        DB_WAIT,
+        "wait_kind" => kind.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(waited.as_secs_f64());
+}
+
+/// Record one connection checkout from a store plane's pool and the share of
+/// that pool in use right after it. Split pools report per plane so a starved
+/// plane is visible against the Shared baseline.
+pub fn record_pool_checkout(plane: PoolPlane, outcome: Outcome, waited: Duration, in_use: f64) {
+    histogram!(
+        POOL_CHECKOUT,
+        "plane" => plane.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .record(waited.as_secs_f64());
+    if outcome == Outcome::Ok {
+        let clamped = if in_use.is_finite() {
+            in_use.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        gauge!(POOL_IN_USE_RATIO, "plane" => plane.as_str()).set(clamped);
+    }
+}
+
+/// Set current queue depth for a subsystem.
+pub fn set_queue_depth(subsystem: Subsystem, depth: u64) {
+    gauge!(QUEUE_DEPTH, "subsystem" => subsystem.as_str()).set(depth as f64);
+}
+
+/// Record a cache lookup outcome.
+pub fn record_cache_event(cache: Cache, outcome: CacheOutcome) {
+    counter!(
+        CACHE_EVENTS,
+        "cache" => cache.as_str(),
+        "outcome" => outcome.as_str(),
+    )
+    .increment(1);
+}
+
+/// Record delay between producing a record and its durable visibility.
+pub fn record_durability_lag(surface: LagSurface, lag: Duration) {
+    histogram!(DURABILITY_LAG, "surface" => surface.as_str()).record(lag.as_secs_f64());
+}
+
+/// Record that a request left its preferred execution path.
+pub fn record_fallback(subsystem: Subsystem, trigger: FallbackTrigger) {
+    counter!(
+        FALLBACK_TOTAL,
+        "subsystem" => subsystem.as_str(),
+        "trigger" => trigger.as_str(),
+    )
+    .increment(1);
+}
+
+/// Publish whether a bounded provider circuit is currently open.
+///
+/// `provider` must be a short runtime id (openai, anthropic, ollama, …), not a
+/// free-form model name, to keep Prometheus cardinality bounded.
+pub fn set_provider_circuit_open(provider: &str, open: bool) {
+    gauge!(
+        PROVIDER_CIRCUIT_OPEN,
+        "provider" => provider.to_string(),
+    )
+    .set(if open { 1.0 } else { 0.0 });
+}
+
+/// Record refused work.
+pub fn record_rejected_work(subsystem: Subsystem, reason: RejectionReason) {
+    counter!(
+        REJECTED_WORK_TOTAL,
+        "subsystem" => subsystem.as_str(),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
+}
+
+/// Record a deduplication or idempotency decision.
+pub fn record_deduplication(subsystem: Subsystem, event: DeduplicationEvent) {
+    counter!(
+        DEDUPLICATION_TOTAL,
+        "subsystem" => subsystem.as_str(),
+        "event" => event.as_str(),
+    )
+    .increment(1);
+}
+
+/// Record a lookup-first answer path decision (#281).
+pub fn record_lookup_first(path: LookupFirstPath) {
+    counter!(LOOKUP_FIRST_TOTAL, "path" => path.as_str()).increment(1);
+}
+
+pub fn record_evaluation_step(
+    evaluator: &'static str,
+    version: &'static str,
+    status: &str,
+    elapsed: Duration,
+) {
+    let status = match status {
+        "pass" => "pass",
+        "fail" => "fail",
+        "unknown" => "unknown",
+        "unavailable" => "unavailable",
+        "error" => "error",
+        "skipped" => "skipped",
+        _ => "invalid",
+    };
+    counter!(
+        EVALUATION_STEP_TOTAL,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .increment(1);
+    histogram!(
+        EVALUATION_STEP_DURATION,
+        "evaluator" => evaluator,
+        "version" => version,
+        "status" => status,
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Clamping and label rendering are asserted end-to-end against real
+    // scraped output in `tests/observability.rs`, not against a reimplemented
+    // copy of the logic here.
+
+    #[test]
+    fn signal_names_are_prometheus_compatible() {
+        for name in [
+            CONTROL_PLANE_OVERHEAD,
+            SATURATION_RATIO,
+            DB_WAIT,
+            POOL_CHECKOUT,
+            QUEUE_DEPTH,
+            CACHE_EVENTS,
+            DURABILITY_LAG,
+            FALLBACK_TOTAL,
+            PROVIDER_CIRCUIT_OPEN,
+            REJECTED_WORK_TOTAL,
+            DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
+            EVALUATION_STEP_DURATION,
+        ] {
+            assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "{name} is not a valid Prometheus metric name"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_families_end_in_total() {
+        for name in [
+            CACHE_EVENTS,
+            FALLBACK_TOTAL,
+            REJECTED_WORK_TOTAL,
+            DEDUPLICATION_TOTAL,
+            LOOKUP_FIRST_TOTAL,
+            EVALUATION_STEP_TOTAL,
+        ] {
+            assert!(
+                name.ends_with("_total"),
+                "{name} is a counter without _total"
+            );
+        }
+    }
+
+    #[test]
+    fn duration_families_end_in_seconds() {
+        for name in [
+            CONTROL_PLANE_OVERHEAD,
+            DB_WAIT,
+            POOL_CHECKOUT,
+            DURABILITY_LAG,
+            EVALUATION_STEP_DURATION,
+        ] {
+            assert!(
+                name.ends_with("_seconds"),
+                "{name} records a duration but is not suffixed _seconds"
+            );
+        }
+    }
+}

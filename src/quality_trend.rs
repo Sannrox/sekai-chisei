@@ -161,11 +161,36 @@ pub fn query_quality_trends(
     since_ms: i64,
     until_ms: i64,
 ) -> Result<QualityTrendReport, String> {
+    query_quality_trends_with_access(db, principal, namespace, since_ms, until_ms, true)
+}
+
+/// Receipt and evaluation scan after the caller already authorized namespace
+/// access through the Sekai fact port. Combined Split keeps those receipts on
+/// the Chisei dest, which does not hold namespace memberships.
+pub fn query_quality_trends_after_access_check(
+    db: &RuntimeDb,
+    namespace: &str,
+    since_ms: i64,
+    until_ms: i64,
+) -> Result<QualityTrendReport, String> {
+    query_quality_trends_with_access(db, "", namespace, since_ms, until_ms, false)
+}
+
+fn query_quality_trends_with_access(
+    db: &RuntimeDb,
+    principal: &str,
+    namespace: &str,
+    since_ms: i64,
+    until_ms: i64,
+    authorize: bool,
+) -> Result<QualityTrendReport, String> {
     let namespace = namespace.trim();
     if !is_safe_namespace(namespace) {
         return Err("invalid namespace".into());
     }
-    if !principal_can_access_namespace(db, principal.trim(), namespace).unwrap_or(false) {
+    if authorize
+        && !principal_can_access_namespace(db, principal.trim(), namespace).unwrap_or(false)
+    {
         return Err("namespace access denied".into());
     }
     if until_ms <= since_ms {

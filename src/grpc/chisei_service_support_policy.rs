@@ -30,10 +30,43 @@ pub(super) fn prune_excess_plans(
         plans.remove(&oldest_id);
     }
 }
+/// Action policies are Sekai graph objects (`action_policy:{scope}`).
+/// Combined Split reads them from the in-process Sekai store. A remote hop
+/// has no authoritative existence check (`find_by_external_id` is
+/// authorization-filtered), so resolution fails closed until a hop exists.
+/// Unattached Combined tests fall back to the Chisei fact runtime.
+pub(super) fn get_action_policy_from_graph(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+    fallback: &RuntimeDb,
+    scope: &str,
+) -> Result<Option<crate::chisei::action_policy::ActionPolicy>, String> {
+    authoritative_graph_runtime(facts, fallback)?.get_action_policy(scope)
+}
+
+pub(super) fn resolve_action_policy_from_graph(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+    fallback: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    project: &str,
+) -> Result<Option<crate::chisei::action_policy::ActionPolicy>, String> {
+    authoritative_graph_runtime(facts, fallback)?.resolve_action_policy(actor, namespace, project)
+}
+
+/// Combined Split reads Sekai graph objects from the in-process store.
+/// A remote hop is authorization-filtered, so completeness cannot be
+/// established; callers fail closed until a hop exists.
+pub(super) fn authoritative_graph_runtime<'a>(
+    facts: &'a dyn crate::chisei::sekai_facts::SekaiFactReader,
+    _fallback: &'a RuntimeDb,
+) -> Result<&'a RuntimeDb, String> {
+    if let Ok(store) = facts.in_process_store() {
+        return Ok(store.runtime());
+    }
+    Err("graph policy resolution requires in-process Sekai graph storage".into())
+}
+
 pub(super) fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver) {
-    // Canonical `policy:` objects must win. Leftover `namespace_policy` rows
-    // still exist in older stores; applying them last restored a JSON-null
-    // context-admission clear (and any later canonical revision) on restart.
     for kind in ["namespace_policy", "policy"] {
         let Ok(objects) = db.list_all_objects(&ListFilter {
             kind: Some(kind.into()),
@@ -41,22 +74,49 @@ pub(super) fn load_namespace_policies(db: &RuntimeDb, resolver: &PolicyResolver)
         }) else {
             continue;
         };
-        for obj in objects {
-            let namespace = policy_namespace(&obj);
-            if namespace.is_empty() {
-                continue;
+        apply_namespace_policy_objects(resolver, objects);
+    }
+}
+
+pub(super) fn load_namespace_policies_from_facts(
+    facts: &dyn crate::chisei::sekai_facts::SekaiFactReader,
+    resolver: &PolicyResolver,
+) -> Result<(), String> {
+    let Ok(store) = facts.in_process_store() else {
+        return Ok(());
+    };
+    for kind in ["namespace_policy", "policy"] {
+        let objects = store
+            .runtime()
+            .list_all_objects(&ListFilter {
+                kind: Some(kind.into()),
+                ..Default::default()
+            })
+            .map_err(|error| format!("namespace policy load failed: {error}"))?;
+        apply_namespace_policy_objects(resolver, objects);
+    }
+    Ok(())
+}
+
+fn apply_namespace_policy_objects(resolver: &PolicyResolver, objects: Vec<crate::domain::Object>) {
+    // Canonical `policy:` objects must win. Leftover `namespace_policy` rows
+    // still exist in older stores; applying them last restored a JSON-null
+    // context-admission clear (and any later canonical revision) on restart.
+    for obj in objects {
+        let namespace = policy_namespace(&obj);
+        if namespace.is_empty() {
+            continue;
+        }
+        resolver.set_namespace_policy(
+            &namespace,
+            normalize_persisted_legacy_policy(policy_from_properties(&obj.properties)),
+        );
+        match context_admission_policy_from_properties(&obj.properties) {
+            Ok(Some(policy)) => {
+                let _ = resolver.set_context_admission_policy(&namespace, policy);
             }
-            resolver.set_namespace_policy(
-                &namespace,
-                normalize_persisted_legacy_policy(policy_from_properties(&obj.properties)),
-            );
-            match context_admission_policy_from_properties(&obj.properties) {
-                Ok(Some(policy)) => {
-                    let _ = resolver.set_context_admission_policy(&namespace, policy);
-                }
-                Ok(None) => resolver.clear_context_admission_policy(&namespace),
-                Err(error) => resolver.set_context_admission_error(&namespace, error),
-            }
+            Ok(None) => resolver.clear_context_admission_policy(&namespace),
+            Err(error) => resolver.set_context_admission_error(&namespace, error),
         }
     }
 }
@@ -555,4 +615,87 @@ pub(super) fn subject_provenance_response(
             public_key: record.public_key.clone(),
         }),
     })
+}
+
+#[cfg(test)]
+mod action_policy_graph_tests {
+    use super::*;
+    use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
+    use crate::domain::{Direction, ListFilter, Object};
+    use std::sync::Arc;
+
+    struct AttachedHop;
+
+    impl SekaiFactReader for AttachedHop {
+        fn find_by_external_id(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+            Ok(None)
+        }
+
+        fn find_namespace_boundary(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+            Ok(None)
+        }
+
+        fn list_grants(
+            &self,
+            _: &str,
+        ) -> Result<Vec<crate::chisei::principal::PrincipalGrant>, SekaiFactError> {
+            Ok(Vec::new())
+        }
+
+        fn marking_clearance(
+            &self,
+            _: &str,
+            _: &Object,
+            _: &str,
+        ) -> Result<crate::chisei::principal::MarkingClearance, SekaiFactError> {
+            Ok(crate::chisei::principal::MarkingClearance::Unmarked)
+        }
+
+        fn get_object_type(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::chisei::object_schema::ObjectType>, SekaiFactError> {
+            Ok(None)
+        }
+
+        fn get_object(&self, _: &str) -> Result<Option<Object>, SekaiFactError> {
+            Ok(None)
+        }
+
+        fn list_objects(&self, _: &ListFilter) -> Result<Vec<Object>, SekaiFactError> {
+            Ok(Vec::new())
+        }
+
+        fn get_linked_objects(
+            &self,
+            _: &str,
+            _: &str,
+            _: &Direction,
+        ) -> Result<Vec<Object>, SekaiFactError> {
+            Ok(Vec::new())
+        }
+
+        fn in_process_store(&self) -> Result<&crate::db::store::SekaiStore, SekaiFactError> {
+            Err(SekaiFactError::Unsupported(
+                "graph retrieval over the Sekai hop",
+            ))
+        }
+    }
+
+    #[test]
+    fn attached_remote_action_policy_resolution_fails_closed() {
+        let fallback = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fallback
+            .upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+                "agent:alice",
+            ))
+            .unwrap();
+        let error =
+            resolve_action_policy_from_graph(&AttachedHop, &fallback, "alice", "acme", "acme")
+                .unwrap_err();
+        assert!(error.contains("in-process Sekai graph storage"), "{error}");
+        let error =
+            get_action_policy_from_graph(&AttachedHop, &fallback, "agent:alice").unwrap_err();
+        assert!(error.contains("in-process Sekai graph storage"), "{error}");
+    }
 }

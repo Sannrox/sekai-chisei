@@ -6,6 +6,7 @@
 //! streaming, evolve/scoring bookkeeping, and terminal receipt completion.
 
 use super::*;
+use crate::db::store::{ChiseiKiokuStore, ChiseiRoutingProfileStore};
 
 /// Result of the post-authz lookup-first attempt on ExecutePlanStream.
 #[derive(Debug)]
@@ -50,7 +51,6 @@ impl ChiseiServiceImpl {
             crate::provider_profile::resolve_provider_id(model).map_err(|_| unavailable())?;
         let stored = self
             .db
-            .runtime()
             .list_hosted_routing_profiles(namespace)
             .map_err(|_| Status::internal("routing profiles unavailable"))?;
         let profile =
@@ -104,6 +104,7 @@ impl ChiseiServiceImpl {
         context: Option<crate::enterprise::AuthenticatedContext>,
         requested_plan: ExecutionPlan,
     ) -> Result<<Self as ChiseiService>::ExecutePlanStreamStream, Status> {
+        self.require_in_process_namespace_policy()?;
         let plan = {
             let mut plans = self
                 .planned_executions
@@ -442,7 +443,7 @@ impl ChiseiServiceImpl {
                     let completed_at_ms = chrono::Utc::now().timestamp_millis();
                     let answer_path = lookup_refusal
                         .as_ref()
-                        .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                        .map(|_| crate::composition::lookup_first::ANSWER_PATH_MODEL);
                     if let Err(error) = record_completed_operation_on_with_path(
                         db.runtime(),
                         &receipt_plan,
@@ -519,7 +520,7 @@ impl ChiseiServiceImpl {
                 let completed_at_ms = chrono::Utc::now().timestamp_millis();
                 let answer_path = lookup_refusal
                     .as_ref()
-                    .map(|_| crate::chisei::lookup_first::ANSWER_PATH_MODEL);
+                    .map(|_| crate::composition::lookup_first::ANSWER_PATH_MODEL);
                 if let Err(error) = record_completed_operation_on_with_path(
                     db.runtime(),
                     &receipt_plan,
@@ -554,7 +555,6 @@ impl ChiseiServiceImpl {
         for reference in references {
             let memory = self
                 .db
-                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
                 .ok_or_else(|| Status::failed_precondition("planned memory version not found"))?;
@@ -570,7 +570,7 @@ impl ChiseiServiceImpl {
             }
             let authorized_ceiling = self
                 .db
-                .runtime()
+                .fact_runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .map_err(|_| {
                     Status::permission_denied(
@@ -590,7 +590,6 @@ impl ChiseiServiceImpl {
         }
         for reference in references {
             self.db
-                .runtime()
                 .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                     memory_id: reference.memory_id.clone(),
                     memory_version: reference.memory_version,
@@ -616,7 +615,6 @@ impl ChiseiServiceImpl {
         for reference in references {
             let Some(memory) = self
                 .db
-                .runtime()
                 .get_kioku_memory(&reference.memory_id, reference.memory_version)
                 .map_err(Status::internal)?
             else {
@@ -624,7 +622,7 @@ impl ChiseiServiceImpl {
             };
             let authorized = self
                 .db
-                .runtime()
+                .fact_runtime()
                 .kioku_authorized_classification_ceiling(&memory.namespace, actor)
                 .is_ok_and(|ceiling| memory.classification <= ceiling);
             let eligible = memory_lifecycle_allows_execution(
@@ -637,7 +635,6 @@ impl ChiseiServiceImpl {
                 && crate::chisei::kioku::memory_claim_digest(&memory) == reference.content_digest;
             if !eligible {
                 self.db
-                    .runtime()
                     .record_kioku_lifecycle_event(&crate::chisei::kioku::MemoryLifecycleEvent {
                         memory_id: reference.memory_id.clone(),
                         memory_version: reference.memory_version,
@@ -694,7 +691,7 @@ impl ChiseiServiceImpl {
         let payload =
             payload_for_leak_check(&plan.prepared_system, &plan.prepared_messages, &plan.tools);
         let leak_findings =
-            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload);
+            self.leak_findings_for_payload(&input.namespace, provider, data_class, &payload)?;
         if leak_findings
             .iter()
             .any(|finding| finding.action == LeakAction::Block)
@@ -771,13 +768,13 @@ pub(super) fn record_completed_lookup_operation_on(
             ("content_hash".into(), planned_response_hash(response)),
             ("content_stored".into(), "false".into()),
             (
-                crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+                crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
+                crate::composition::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
             ),
             ("capability".into(), capability.into()),
             (
                 "provider".into(),
-                crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+                crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
             ),
             ("input_tokens".into(), "0".into()),
             ("output_tokens".into(), "0".into()),
@@ -824,11 +821,11 @@ pub(super) fn record_completed_lookup_operation_on(
                     ("status".into(), "succeeded".into()),
                     (
                         "completion_reason".into(),
-                        crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                        crate::composition::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
                     ),
                     (
-                        crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
-                        crate::chisei::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
+                        crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
+                        crate::composition::lookup_first::ANSWER_PATH_LOOKUP_HIT.into(),
                     ),
                     ("provider_tokens".into(), "0".into()),
                     (
@@ -906,13 +903,13 @@ pub(super) fn record_completed_operation_on_with_path(
                     }
                     if let Some(path) = answer_path {
                         attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
                             path.into(),
                         );
                     }
                     if let Some(reason) = lookup_refusal {
                         attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            crate::composition::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
                             reason.into(),
                         );
                     }
@@ -961,13 +958,13 @@ pub(super) fn record_completed_operation_on_with_path(
                     ]);
                     if let Some(path) = answer_path {
                         attributes.insert(
-                            crate::chisei::lookup_first::ANSWER_PATH_ATTR.into(),
+                            crate::composition::lookup_first::ANSWER_PATH_ATTR.into(),
                             path.into(),
                         );
                     }
                     if let Some(reason) = lookup_refusal {
                         attributes.insert(
-                            crate::chisei::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
+                            crate::composition::lookup_first::LOOKUP_REFUSAL_ATTR.into(),
                             reason.into(),
                         );
                     }
@@ -988,32 +985,32 @@ pub(super) fn evaluate_execute_lookup_first(
     input: &ExecutionInput,
     actor: &str,
 ) -> ExecuteLookupFirst {
-    if !crate::chisei::lookup_first::is_lookup_first_capability(&input.task_type) {
+    if !crate::composition::lookup_first::is_lookup_first_capability(&input.task_type) {
         return ExecuteLookupFirst::ModelPath {
             lookup_refusal: None,
         };
     }
-    match crate::chisei::lookup_first::try_lookup_first(
+    match crate::composition::lookup_first::try_lookup_first(
         &input.task_type,
         &input.namespace,
         actor,
         &input.spec,
         facts,
     ) {
-        Ok(crate::chisei::lookup_first::LookupDecision::Hit {
+        Ok(crate::composition::lookup_first::LookupDecision::Hit {
             answer_json,
             capability,
             provenance,
         }) => {
-            crate::chisei::lookup_first::record_lookup_hit();
+            crate::composition::lookup_first::record_lookup_hit();
             ExecuteLookupFirst::Hit {
                 response: PlannedChatResponse {
                     content: answer_json,
                     tool_calls: Vec::new(),
                     input_tokens: 0,
                     output_tokens: 0,
-                    stop_reason: crate::chisei::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
-                    provider: crate::chisei::lookup_first::LOOKUP_PROVIDER.into(),
+                    stop_reason: crate::composition::lookup_first::LOOKUP_HIT_STOP_REASON.into(),
+                    provider: crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 },
@@ -1021,19 +1018,19 @@ pub(super) fn evaluate_execute_lookup_first(
                 provenance,
             }
         }
-        Ok(crate::chisei::lookup_first::LookupDecision::Refusal { reason, .. }) => {
-            crate::chisei::lookup_first::record_model_path(true);
+        Ok(crate::composition::lookup_first::LookupDecision::Refusal { reason, .. }) => {
+            crate::composition::lookup_first::record_model_path(true);
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: Some(reason),
             }
         }
-        Ok(crate::chisei::lookup_first::LookupDecision::NotEligible) => {
+        Ok(crate::composition::lookup_first::LookupDecision::NotEligible) => {
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: None,
             }
         }
         Err(error) => {
-            crate::chisei::lookup_first::record_model_path(true);
+            crate::composition::lookup_first::record_model_path(true);
             ExecuteLookupFirst::ModelPath {
                 lookup_refusal: Some(format!("storage_error:{error}")),
             }

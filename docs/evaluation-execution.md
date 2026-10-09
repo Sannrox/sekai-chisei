@@ -77,6 +77,22 @@ code, exact input/parameter/evaluator/evidence/dependency digests, the result
 digest, and the step-receipt digest. Evidence or result content is not
 returned.
 
+## Function revision gates
+
+An LLM function revision is a governed evaluation subject
+(`chisei.function-revision/v1`). The gate invokes the revision over a fixed
+fixture set, retains each structured output as evidence, and scores that
+evidence with the existing `stochastic_model/v1` rubric
+(`chisei.bounded-rubric-score/v1`). A mean score below the manifest threshold
+is a `deny` on publish.
+
+Retained outputs inherit the fixture inputs' markings (the most restrictive
+union of the lattice). The evaluator route sees those retained evidence
+objects only when its classification ceiling covers the inherited marking;
+otherwise the node is `unknown` / `evidence_unavailable` and publish stays
+denied. The evaluator still receives only subject identity, content digest,
+and retained evidence, never a live function payload.
+
 ## Fixed stochastic populations
 
 Each stochastic step executes the frozen two-to-32 trial population in stable
@@ -226,7 +242,7 @@ The provider-fake tests run in default CI. The ignored live path can be invoked
 when a local model is available:
 
 ```bash
-cargo test --test ollama_e2e \
+cargo test --test it \
   bounded_stochastic_evaluator_records_live_variance_evidence \
   -- --ignored
 ```

@@ -67,6 +67,21 @@ fn seed(db: &dyn DefinitionBranchBackend, namespace: &str) -> (String, CreateDef
 
 fn exercise_backend(db: &dyn DefinitionBranchBackend, namespace: &str) {
     let (parent_digest, create) = seed(db, namespace);
+    let parent_members = db
+        .get_definition_members(namespace, &parent_digest)
+        .unwrap();
+    assert_eq!(parent_members.len(), 1);
+    assert_eq!(
+        db.get_definition_member(namespace, &parent_digest, "object_type", "Ticket")
+            .unwrap()
+            .as_ref(),
+        parent_members.first()
+    );
+    assert!(
+        db.get_definition_member(namespace, &parent_digest, "object_type", "absent")
+            .unwrap()
+            .is_none()
+    );
     let first = db.create_definition_branch(&create, "author", 2).unwrap();
     assert_eq!(
         first,

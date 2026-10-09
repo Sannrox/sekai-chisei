@@ -30,7 +30,7 @@ template.
 | `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |
-| `SEKAI_ENDPOINT` | unset | Chisei-process hop target for live Sekai commit lookup and Sekai fact reads (`http://127.0.0.1:50051`); unset means lookup-first refuses with `sekai_not_attached` |
+| `SEKAI_ENDPOINT` | required for `chisei-plane` | Chisei-process hop target for live Sekai commit lookup and Sekai fact reads (`http://127.0.0.1:50051`). Combined mode ignores it. `chisei-plane` refuses to boot when unset. |
 | `SEKAI_CREDENTIAL` | unset | Client-side bearer for `sekaictl`, examples, `sekai-mcp`, the gateway, and the Chisei→Sekai hop; never bootstraps server authority |
 | `SEKAI_ASSERTION_ISSUER` | unset | Audience-bound assertion issuer (#888). All three assertion variables must be set together; partial config is refused |
 | `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |
@@ -87,6 +87,13 @@ unaffected. Combined never opens one shared store. The retired `DB_PATH`,
 decision 7); an existing single store moves with
 [store relocation](store-relocation.md), which still takes the old file or
 URL as an explicit `--source`.
+
+Each dest migrates only the tables its plane owns, plus the shared decision
+ledger and the per-store `chisei_operation_receipts` table. Combined Split
+writes plane-local admission receipts onto the Sekai dest. Existing
+foreign-plane tables stay. A dest that still holds the other plane's rows
+refuses startup as a missed relocation, unless a relocate writer fence is
+already raised. See [store relocation](store-relocation.md).
 
 The `sekai-plane` and `chisei-plane` binaries each open only their own store. See
 [two-plane processes](two-plane-processes.md). Combined mode still uses the

@@ -193,6 +193,16 @@ pub struct BudgetTracker {
     topology: BudgetTopologyConfig,
 }
 
+impl crate::sekai::action_ports::ActionBudgetPort for BudgetTracker {
+    fn check(&self, subject: &str, amount: i32) -> Result<(), String> {
+        BudgetTracker::check(self, subject, amount)
+    }
+
+    fn record(&self, subject: &str, amount: i32) {
+        BudgetTracker::record(self, subject, amount)
+    }
+}
+
 impl BudgetTracker {
     pub fn new(db: ChiseiStore) -> Self {
         Self {

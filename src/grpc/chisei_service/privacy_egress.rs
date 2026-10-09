@@ -19,68 +19,94 @@ impl ChiseiServiceImpl {
         provider: &str,
         data_class: DataClass,
         payload: &str,
-    ) -> Vec<LeakFinding> {
+    ) -> Result<Vec<LeakFinding>, Status> {
         let safe = crate::chisei::privacy::safe_providers(&self.config);
         if crate::chisei::privacy::provider_safe_to_send(provider, &safe) {
-            return vec![];
+            return Ok(vec![]);
         }
-        let rules = self.leak_rules(namespace);
-        let entities = if data_class == DataClass::Sensitive {
-            self.sensitive_entities(namespace)
-        } else {
-            vec![]
-        };
-        crate::chisei::privacy::check_payload(payload, &rules, &entities)
+        let scan = self
+            .privacy_scan
+            .load(
+                namespace,
+                data_class == DataClass::Sensitive,
+                || self.list_leak_rule_objects(namespace),
+                || self.list_entity_scan_objects(namespace),
+            )
+            .map_err(Status::failed_precondition)?;
+        Ok(crate::chisei::privacy::check_payload(
+            payload,
+            &scan.rules,
+            &scan.entities,
+            scan.truncated,
+        ))
     }
 
-    pub(super) fn leak_rules(&self, namespace: &str) -> Vec<LeakRule> {
-        let mut rules = Vec::new();
+    fn list_fact_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, String> {
+        // Completeness from #1291: hop-only attachments cannot prove the
+        // leak-rule or entity set is complete, so refuse. Combined mode uses
+        // RuntimeDb::list_objects so ListFilter.limit is honored (SekaiStore::list_objects
+        // still routes to list_all_objects).
+        authoritative_graph_runtime(self.sekai_facts.reader(), self.db.fact_runtime())?
+            .list_objects(filter)
+    }
+
+    fn list_leak_rule_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
+        let mut objects = Vec::new();
         for ns in ["", namespace] {
-            let Ok(objects) = self.db.runtime().list_all_objects(&ListFilter {
-                kind: Some("leak_rule".into()),
-                namespace: Some(ns.to_string()),
-                ..Default::default()
-            }) else {
-                continue;
-            };
-            for obj in objects {
-                let Some(pattern) = obj.properties.get("pattern") else {
-                    continue;
-                };
-                let Ok(pattern) = Regex::new(pattern) else {
-                    continue;
-                };
-                rules.push(LeakRule {
-                    id: obj.id,
-                    label: obj
-                        .properties
-                        .get("label")
-                        .cloned()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or(obj.name),
-                    pattern,
-                    action: LeakAction::parse(
-                        obj.properties
-                            .get("action")
-                            .map(String::as_str)
-                            .unwrap_or("block"),
-                    ),
-                });
+            let mut offset = 0;
+            loop {
+                let page = self
+                    .list_fact_objects(&ListFilter {
+                        kind: Some("leak_rule".into()),
+                        namespace: Some(ns.to_string()),
+                        limit: crate::domain::MAX_LIST_LIMIT,
+                        offset,
+                        ..Default::default()
+                    })
+                    .map_err(|error| format!("leak-rule policy unavailable: {error}"))?;
+                let page_len = page.len() as i32;
+                objects.extend(page);
+                if page_len < crate::domain::MAX_LIST_LIMIT {
+                    break;
+                }
+                offset = offset.saturating_add(page_len);
             }
         }
-        rules
+        Ok(objects)
     }
 
-    pub(super) fn sensitive_entities(&self, namespace: &str) -> Vec<String> {
-        let objects = self
-            .db
-            .runtime()
-            .list_all_objects(&ListFilter {
-                namespace: Some(namespace.to_string()),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        crate::chisei::privacy::entity_scan_literals(&objects)
+    fn list_entity_scan_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
+        // Reference-platform analog: Search Objects is per object type; leak_rule is
+        // policy, not the entity set. Probe one past ENTITY_SCAN_LIMIT so a
+        // complete page is not treated as truncated (nextPageToken analog).
+        let scan_limit = crate::chisei::privacy::ENTITY_SCAN_LIMIT as usize;
+        let mut objects = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .list_fact_objects(&ListFilter {
+                    namespace: Some(namespace.to_string()),
+                    limit: crate::domain::MAX_LIST_LIMIT,
+                    offset,
+                    ..Default::default()
+                })
+                .map_err(|error| format!("sensitive-entity policy unavailable: {error}"))?;
+            let page_len = page.len() as i32;
+            for object in page {
+                if object.kind == "leak_rule" {
+                    continue;
+                }
+                objects.push(object);
+                if objects.len() > scan_limit {
+                    return Ok(objects);
+                }
+            }
+            if page_len < crate::domain::MAX_LIST_LIMIT {
+                break;
+            }
+            offset = offset.saturating_add(page_len);
+        }
+        Ok(objects)
     }
 
     pub(super) fn record_egress_audit(
@@ -170,6 +196,13 @@ impl ChiseiServiceImpl {
         let mut evidence = std::collections::HashMap::new();
         evidence.insert("provider".to_string(), provider.to_string());
         evidence.insert("finding_count".to_string(), findings.len().to_string());
+        evidence.insert(
+            "scan_truncated".to_string(),
+            findings
+                .iter()
+                .any(|finding| finding.rule_label == crate::chisei::privacy::SCAN_TRUNCATED_LABEL)
+                .to_string(),
+        );
         evidence.insert(
             "block_count".to_string(),
             findings

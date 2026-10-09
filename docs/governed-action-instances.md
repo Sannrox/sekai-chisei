@@ -20,7 +20,7 @@ receipt / harvest spine.
 | Object-bound describe | `DescribeObjectAction` |
 | Object-bound preview | `PreviewObjectAction` |
 | Read by id or key | `GetActionInstance` |
-| List | `ListActionInstances` (classified `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature; see [rpc-maturity.md](rpc-maturity.md)) |
+| List | `ListActionInstances` |
 
 ## Describe and preview
 
@@ -91,7 +91,7 @@ already stores a supported contract.
    Routing is recorded as `route_selected` with `route=not_applicable` so
    completeness does not leave `routing` uncovered. A pending
    `runtime_dispatch` leaves `completed_at_ms` unset and omits outcome so
-   `AckActionWork` can finish the harvest spine. Windowed receipt lists treat
+   `AckActionWork` (experimental; `SEKAI_EXPERIMENTAL_RPCS=1`) can finish the harvest spine. Windowed receipt lists treat
    an open receipt as overlapping only while `started_at_ms` is within 24h
    (max claim TTL) of the window start, so abandoned generates cannot fill
    every later stats, export, console, or dry-run list. GET and ack still
@@ -140,8 +140,9 @@ admission. Parameter values stay out of audit and receipt evidence. See
 ## Approval
 
 A parked instance waits for one decision through `DecideActionInstance`
-(experimental, gated by `SEKAI_EXPERIMENTAL_RPCS=1`; [ADR 0089](decisions/0089-park-and-decide-action-instances.md)).
-Describe and preview still never grant.
+([ADR 0089](decisions/0089-park-and-decide-action-instances.md)).
+Describe and preview still never grant. `ListActionInstances` with
+`status=parked` is the inbox.
 
 - **Who decides.** A principal listed in the type's `approvers`, or, when the
   type declares none, a namespace administrator. The submitter never decides
@@ -163,8 +164,8 @@ Describe and preview still never grant.
 - Combined Split reserves one budget unit at submit. A grant does not charge
   again, and a denied approval keeps the unit, as submit-time denials do.
 
-Community PostgreSQL parks but does not decide yet: `DecideActionInstance`
-answers `UNAVAILABLE` there and is not advertised.
+Community PostgreSQL parks and decides with the same named-approver rules as
+SQLite.
 
 **Migrating consumers.** Before ADR 0089, `require_approval` returned
 `status=denied` with a "requires approval" deny reason. It now returns

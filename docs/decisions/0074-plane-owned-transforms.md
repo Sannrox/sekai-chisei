@@ -10,7 +10,8 @@
 - Related: [ADR 0020](0020-shared-type-revisions-and-object-sync.md),
   [ADR 0036](0036-open-table-projections.md),
   [ADR 0037](0037-event-stream-projections.md),
-  [ADR 0073](0073-source-and-action-objects.md)
+  [ADR 0073](0073-source-and-action-objects.md),
+  [ADR 0097](0097-in-process-transform-host.md)
 
 ## Context
 

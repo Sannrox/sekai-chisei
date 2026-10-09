@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use sekai_chisei::chisei::budget::BudgetTracker;
 use sekai_chisei::combined_stores::CombinedStoreSources;
 use sekai_chisei::config::Config;
+use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::db::store::{ChiseiStore, SekaiStore};
 use sekai_chisei::grpc::build_services;
 use sekai_chisei::grpc::client::connect_sekai;
@@ -68,23 +70,35 @@ fn create_object_request() -> CreateObjectRequest {
     }
 }
 
+/// Inspect without the owning-plane constructors: those refuse a dest that
+/// still holds the other plane's rows, and would migrate the missing family.
+fn inspect_shared(path: &Path) -> (SekaiStore, ChiseiStore) {
+    let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(path.to_str().unwrap()).expect("inspect sqlite"),
+    )));
+    (
+        SekaiStore::from_shared_runtime(db.clone()),
+        ChiseiStore::from_shared_runtime(db),
+    )
+}
+
 fn assert_plane_isolation(sekai_path: &Path, chisei_path: &Path) {
-    let sekai = SekaiStore::open_sqlite(sekai_path.to_str().unwrap());
+    let (sekai, chisei_on_sekai) = inspect_shared(sekai_path);
     assert!(
-        sekai.runtime().get_object(OBJECT_ID).unwrap().is_some(),
+        sekai.get_object(OBJECT_ID).unwrap().is_some(),
         "Sekai fact must persist on the Sekai file"
     );
     assert_eq!(
-        BudgetTracker::new(ChiseiStore::open_sqlite(sekai_path.to_str().unwrap()))
+        BudgetTracker::new(chisei_on_sekai)
             .get_usage(BUDGET_USER)
             .max_tokens,
         0,
         "Chisei budget must not persist on the Sekai file"
     );
 
-    let chisei = ChiseiStore::open_sqlite(chisei_path.to_str().unwrap());
+    let (sekai_on_chisei, chisei) = inspect_shared(chisei_path);
     assert!(
-        chisei.runtime().get_object(OBJECT_ID).unwrap().is_none(),
+        sekai_on_chisei.get_object(OBJECT_ID).unwrap().is_none(),
         "Sekai fact must not persist on the Chisei file"
     );
     assert_eq!(
@@ -105,7 +119,7 @@ async fn combined_two_store_public_api_isolates_plane_writes() {
     assert!(layout.is_split());
     assert_ne!(layout.sekai_identity(), layout.chisei_identity());
 
-    let (sekai, chisei) = build_services(&test_config(), &layout);
+    let (sekai, chisei) = build_services(&test_config(), &layout).expect("build services");
     sekai
         .create_object(Request::new(create_object_request()))
         .await

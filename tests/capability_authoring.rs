@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
-use sekai_chisei::chisei::capability::{
+use sekai_chisei::chisei::eval::{CaseResult, EvalStore, Run};
+use sekai_chisei::chisei::evolve::TaskRecord;
+use sekai_chisei::composition::capability::{
     CapabilityGateError, CapabilityObservation, CapabilityRegistryError,
     author_capability_proposals, gate_capability_proposal, list_capability_versions,
     register_capability, review_capability_proposal,
 };
-use sekai_chisei::chisei::eval::{CaseResult, EvalStore, Run};
-use sekai_chisei::chisei::evolve::TaskRecord;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::db::store::ChiseiStore;
@@ -34,7 +34,7 @@ fn observation(
     }
 }
 
-fn passing_run(proposal: &sekai_chisei::chisei::capability::CapabilityProposal) -> Run {
+fn passing_run(proposal: &sekai_chisei::composition::capability::CapabilityProposal) -> Run {
     Run {
         id: "capability-integration-run".to_string(),
         suite_id: proposal.eval_suite.id.clone(),

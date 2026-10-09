@@ -17,6 +17,7 @@ pub const POSTGRES_FOUNDATION_SURFACES: &[&str] = &[
     POSTGRES_DEFINITION_BRANCH_SURFACE,
     "sekai.evidence",
     "sekai.function-definitions",
+    "sekai.governed-document",
     "sekai.guarded-mutations",
     "sekai.handoffs",
     "sekai.leases",

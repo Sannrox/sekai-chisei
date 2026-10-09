@@ -12,20 +12,23 @@ use ed25519_dalek::VerifyingKey;
 
 use super::ChiseiStore;
 use crate::chisei::eval;
+use crate::chisei::evaluation_execution::EvaluationExecutionIndex;
 use crate::chisei::external_action::{
     AuthorizationClaim, AuthorizationRecord, ExternalActionRequest,
 };
 use crate::chisei::external_permit::{
     ExternalPermitPolicy, HostContext, Permit, Redemption, RedemptionTiming,
 };
+use crate::chisei::governed_subject_provenance::ExportRecord;
 use crate::chisei::kioku::{
-    CandidateDerivation, HumanMemoryReview, KiokuEvidenceLink, KiokuEvidenceReassessmentRequest,
+    CandidateDerivation, HumanMemoryReview, HumanReviewAction, KiokuCandidateCursor,
+    KiokuEvidenceAuthorizationRequest, KiokuEvidenceLink, KiokuEvidenceReassessmentRequest,
     KiokuEvidenceReassessmentResult, KiokuMemory, MemoryImpactEvaluation, MemoryLifecycleEvent,
     MemoryLifecycleSweep, MemoryOutcomeAssignment, MemoryOutcomeObservation,
     MemoryRetrievalRequest, MemoryValidation, RetrievedMemory,
 };
 use crate::chisei::portfolio::{FrontierPoint, Objective, Observation, RouteSelection};
-use crate::chisei::receipt::OperationReceipt;
+use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent};
 use crate::db::chisei_operation_reservation::OperationReservation;
 use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::evidence::EvidenceClassification;
@@ -118,6 +121,9 @@ chisei_store_trait! {
         fn budget_get_transfer(&self, transfer_id: &str) -> Result<Option<crate::db::chisei_budget::BudgetTransferRecord>, String>;
         fn budget_transfer_capacity(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, now_ms: i64) -> Result<crate::db::chisei_budget::BudgetTransferRecord, String>;
         fn budget_record_transfer_refused(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, reason: &str, now_ms: i64) -> Result<crate::db::chisei_budget::BudgetTransferRecord, String>;
+        fn budget_limits_for_scope(&self, scope_id: &str) -> Result<Vec<(String, String, i64, String)>, String>;
+        fn budget_set_limit(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str) -> Result<(), String>;
+        fn budget_adjust_chain(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64) -> Result<(), String>;
     }
 }
 
@@ -130,32 +136,362 @@ chisei_store_trait! {
         fn put_operation_reservation(&self, reservation: &OperationReservation) -> Result<OperationReservation, String>;
         fn get_operation_reservation(&self, namespace: &str, operation_id: &str) -> Result<Option<OperationReservation>, String>;
         fn list_pending_operation_reservations(&self, limit: usize) -> Result<Vec<OperationReservation>, String>;
+        fn append_operation_receipt_event(&self, operation_id: &str, event: OperationReceiptEvent) -> Result<(OperationReceipt, bool), String>;
+        fn find_operation_receipt_by_lookup_request_id(&self, request_id: &str, caller_scope: Option<&str>, initiating_actor: Option<&str>) -> Result<Option<OperationReceipt>, String>;
+        fn list_operation_receipts_in_window(&self, namespace: &str, start_timestamp_ms: i64, end_timestamp_ms: i64, limit: usize) -> Result<Vec<OperationReceipt>, String>;
+        fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
     }
 }
 
-chisei_store_trait! {
-    /// Kioku memories, evidence links, lifecycle, and outcomes.
-    pub trait ChiseiKiokuStore {
-        fn insert_kioku_memory(&self, memory: &KiokuMemory, evidence: &[KiokuEvidenceLink]) -> Result<(), String>;
-        fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
-        fn list_kioku_candidates(&self, namespace: &str, operation_class: Option<&str>, limit: usize) -> Result<Vec<KiokuMemory>, String>;
-        fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String>;
-        fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
-        fn review_kioku_candidate(&self, id: &str, version: u32, review: HumanMemoryReview) -> Result<KiokuMemory, String>;
-        fn disable_kioku_memory(&self, id: &str, version: u32, actor: &str, rationale: &str, recorded_at_ms: i64) -> Result<KiokuMemory, String>;
-        fn reassess_kioku_memory(&self, request: KiokuEvidenceReassessmentRequest) -> Result<KiokuEvidenceReassessmentResult, String>;
-        fn list_kioku_evidence(&self, id: &str, version: u32) -> Result<Vec<KiokuEvidenceLink>, String>;
-        fn list_kioku_lifecycle_events(&self, id: &str, version: u32) -> Result<Vec<MemoryLifecycleEvent>, String>;
-        fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
-        fn sweep_kioku_lifecycle(&self, actor: &str, now_ms: i64) -> Result<MemoryLifecycleSweep, String>;
-        fn retrieve_kioku_memories(&self, request: &MemoryRetrievalRequest) -> Result<Vec<RetrievedMemory>, String>;
-        fn kioku_authorized_classification_ceiling(&self, namespace: &str, actor: &str) -> Result<EvidenceClassification, String>;
-        fn record_kioku_holdout(&self, id: &str, version: u32, operation_id: &str, actor: &str, now_ms: i64) -> Result<(), String>;
-        fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String>;
-        fn list_kioku_outcome_assignments(&self, operation_id: &str) -> Result<Vec<MemoryOutcomeAssignment>, String>;
-        fn evaluate_kioku_impact_if_ready(&self, id: &str, version: u32, minimum_samples_per_arm: usize, regression_threshold: f64, actor: &str, now_ms: i64) -> Result<Option<MemoryImpactEvaluation>, String>;
-        fn put_operation_receipt_with_kioku_holdouts(&self, receipt: &OperationReceipt, holdouts: &[(String, u32)], actor: &str, recorded_at_ms: i64) -> Result<(), String>;
+/// Kioku memories, evidence links, lifecycle, and outcomes.
+///
+/// Combined Split keeps memory rows on the Chisei dest and graph
+/// authorization (namespace objects, grants, evidence submissions) on the
+/// Sekai dest. Callers go through this trait so that split never queries
+/// `sekai_objects` on `chisei.db`.
+pub trait ChiseiKiokuStore {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String>;
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String>;
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String>;
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String>;
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String>;
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String>;
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String>;
+    fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String>;
+    fn list_kioku_evidence(&self, id: &str, version: u32)
+    -> Result<Vec<KiokuEvidenceLink>, String>;
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String>;
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String>;
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String>;
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String>;
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String>;
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String>;
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String>;
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String>;
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String>;
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String>;
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String>;
+    fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String>;
+}
+
+impl ChiseiKiokuStore for ChiseiStore {
+    fn insert_kioku_memory(
+        &self,
+        memory: &KiokuMemory,
+        evidence: &[KiokuEvidenceLink],
+    ) -> Result<(), String> {
+        self.inner.insert_kioku_memory(memory, evidence)
     }
+    fn get_kioku_memory(&self, id: &str, version: u32) -> Result<Option<KiokuMemory>, String> {
+        self.inner.get_kioku_memory(id, version)
+    }
+    fn list_kioku_candidates(
+        &self,
+        namespace: &str,
+        operation_class: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        self.inner
+            .list_kioku_candidates(namespace, operation_class, limit)
+    }
+    fn produce_kioku_candidate(&self, input: CandidateDerivation) -> Result<KiokuMemory, String> {
+        self.inner.produce_kioku_candidate(input)
+    }
+    fn validate_kioku_candidate(&self, id: &str, version: u32) -> Result<MemoryValidation, String> {
+        self.inner.validate_kioku_candidate(id, version)
+    }
+    fn review_kioku_candidate(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        if self.shares_graph_with_memory() {
+            return self.inner.review_kioku_candidate(id, version, review);
+        }
+        // Split dests cannot share one Immediate snapshot across files.
+        // Pre-authorize on the Sekai dest, then skip in-tx graph checks.
+        // A two-dest revision protocol is follow-up; shared stores keep
+        // the original in-tx path above.
+        if review.action == HumanReviewAction::Promote
+            && let Some(memory) = self.inner.get_kioku_memory(id, version)?
+        {
+            for basis in &memory.evidence_basis {
+                if basis.source_submission_id.is_empty() {
+                    continue;
+                }
+                self.fact_runtime().authorize_kioku_evidence(
+                    &KiokuEvidenceAuthorizationRequest {
+                        source_submission_id: basis.source_submission_id.clone(),
+                        namespace: memory.namespace.clone(),
+                        memory_classification: memory.classification,
+                        evidence_digest: basis.evidence_digest.clone(),
+                        lifecycle_state: basis.lifecycle_state,
+                        observed_at_ms: basis.observed_at_ms,
+                        actor: review.reviewer.trim().into(),
+                        now_ms: review.reviewed_at_ms,
+                    },
+                )?;
+            }
+        }
+        self.inner
+            .review_kioku_candidate_after_graph_auth(id, version, review)
+    }
+    fn disable_kioku_memory(
+        &self,
+        id: &str,
+        version: u32,
+        actor: &str,
+        rationale: &str,
+        recorded_at_ms: i64,
+    ) -> Result<KiokuMemory, String> {
+        self.inner
+            .disable_kioku_memory(id, version, actor, rationale, recorded_at_ms)
+    }
+    fn reassess_kioku_memory(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        authorize_reassessment_on_graph(self, &request)?;
+        self.inner.reassess_kioku_memory_after_graph_auth(request)
+    }
+    fn list_kioku_evidence(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<KiokuEvidenceLink>, String> {
+        self.inner.list_kioku_evidence(id, version)
+    }
+    fn list_kioku_lifecycle_events(
+        &self,
+        id: &str,
+        version: u32,
+    ) -> Result<Vec<MemoryLifecycleEvent>, String> {
+        self.inner.list_kioku_lifecycle_events(id, version)
+    }
+    fn record_kioku_lifecycle_event(&self, event: &MemoryLifecycleEvent) -> Result<(), String> {
+        self.inner.record_kioku_lifecycle_event(event)
+    }
+    fn sweep_kioku_lifecycle(
+        &self,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<MemoryLifecycleSweep, String> {
+        self.inner.sweep_kioku_lifecycle(actor, now_ms)
+    }
+    fn retrieve_kioku_memories(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if request.max_results == 0 {
+            return Ok(Vec::new());
+        }
+        self.fact_runtime().authorize_kioku_retrieval(request)?;
+        self.inner.retrieve_kioku_memories_after_graph_auth(request)
+    }
+    fn kioku_authorized_classification_ceiling(
+        &self,
+        namespace: &str,
+        actor: &str,
+    ) -> Result<EvidenceClassification, String> {
+        self.fact_runtime()
+            .kioku_authorized_classification_ceiling(namespace, actor)
+    }
+    fn record_kioku_holdout(
+        &self,
+        id: &str,
+        version: u32,
+        operation_id: &str,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.inner
+            .record_kioku_holdout(id, version, operation_id, actor, now_ms)
+    }
+    fn record_kioku_outcome(&self, observation: &MemoryOutcomeObservation) -> Result<bool, String> {
+        self.inner.record_kioku_outcome(observation)
+    }
+    fn list_kioku_outcome_assignments(
+        &self,
+        operation_id: &str,
+    ) -> Result<Vec<MemoryOutcomeAssignment>, String> {
+        self.inner.list_kioku_outcome_assignments(operation_id)
+    }
+    fn evaluate_kioku_impact_if_ready(
+        &self,
+        id: &str,
+        version: u32,
+        minimum_samples_per_arm: usize,
+        regression_threshold: f64,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<Option<MemoryImpactEvaluation>, String> {
+        self.inner.evaluate_kioku_impact_if_ready(
+            id,
+            version,
+            minimum_samples_per_arm,
+            regression_threshold,
+            actor,
+            now_ms,
+        )
+    }
+    fn put_operation_receipt_with_kioku_holdouts(
+        &self,
+        receipt: &OperationReceipt,
+        holdouts: &[(String, u32)],
+        actor: &str,
+        recorded_at_ms: i64,
+    ) -> Result<(), String> {
+        self.inner.put_operation_receipt_with_kioku_holdouts(
+            receipt,
+            holdouts,
+            actor,
+            recorded_at_ms,
+        )
+    }
+    fn list_kioku_candidate_page(
+        &self,
+        namespace: &str,
+        limit: usize,
+        cursor: Option<&KiokuCandidateCursor>,
+    ) -> Result<Vec<KiokuMemory>, String> {
+        self.inner
+            .list_kioku_candidate_page(namespace, limit, cursor)
+    }
+    fn authorize_kioku_evidence(
+        &self,
+        request: &KiokuEvidenceAuthorizationRequest,
+    ) -> Result<(), String> {
+        self.fact_runtime().authorize_kioku_evidence(request)
+    }
+}
+
+fn authorize_reassessment_on_graph(
+    store: &ChiseiStore,
+    request: &KiokuEvidenceReassessmentRequest,
+) -> Result<(), String> {
+    let Some(prior) = store
+        .inner
+        .get_kioku_memory(&request.memory_id, request.memory_version)?
+    else {
+        return Ok(());
+    };
+    let prior_evidence = store.inner.list_kioku_evidence(&prior.id, prior.version)?;
+    let baseline_basis = if prior.evidence_basis.is_empty() {
+        prior_evidence
+            .iter()
+            .map(|link| crate::chisei::kioku::KiokuEvidenceBasis {
+                evidence_reference: link.evidence_reference.clone(),
+                evidence_digest: link.evidence_digest.clone(),
+                source_submission_id: String::new(),
+                stance: link.stance,
+                lifecycle_state: crate::sekai::evidence::EvidenceLifecycleState::Available,
+                observed_at_ms: link.observed_at_ms,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        prior.evidence_basis.clone()
+    };
+    let merged_basis = crate::chisei::kioku::merge_evidence_basis(
+        &baseline_basis,
+        &request.evidence_basis,
+        request.now_ms,
+    )?;
+    let ceiling = store
+        .fact_runtime()
+        .kioku_authorized_classification_ceiling(&prior.namespace, &request.actor)?;
+    if prior.classification > ceiling {
+        return Err("memory classification exceeds actor grant".into());
+    }
+    for basis in &merged_basis {
+        if basis.source_submission_id.is_empty() {
+            continue;
+        }
+        store
+            .fact_runtime()
+            .authorize_kioku_evidence(&KiokuEvidenceAuthorizationRequest {
+                source_submission_id: basis.source_submission_id.clone(),
+                namespace: prior.namespace.clone(),
+                memory_classification: prior.classification,
+                evidence_digest: basis.evidence_digest.clone(),
+                lifecycle_state: basis.lifecycle_state,
+                observed_at_ms: basis.observed_at_ms,
+                actor: request.actor.clone(),
+                now_ms: request.now_ms,
+            })?;
+    }
+    Ok(())
 }
 
 chisei_store_trait! {
@@ -171,6 +507,9 @@ chisei_store_trait! {
         fn validate_delegation_chain(&self, permit: &Permit) -> Result<(), String>;
         fn set_permit_kill_switch(&self, kind: &str, value: &str, enabled: bool, reason: &str, now_ms: i64) -> Result<bool, String>;
         fn set_external_permit_policy(&self, policy: &ExternalPermitPolicy, now_ms: i64) -> Result<(), String>;
+        fn replay_permit(&self, authorization_id: &str, idempotency_key: &str) -> Result<Option<Permit>, String>;
+        fn validate_permit_for_delegation(&self, permit: &Permit) -> Result<(), String>;
+        fn get_external_permit_policy(&self, scope: &str) -> Result<ExternalPermitPolicy, String>;
     }
 }
 
@@ -182,6 +521,9 @@ chisei_store_trait! {
         fn compare_and_swap_external_action_authorization(&self, expected: &AuthorizationRecord, next: &AuthorizationRecord) -> Result<bool, String>;
         fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
         fn release_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest) -> Result<(), String>;
+        fn abandon_external_action_claim(&self, request: &ExternalActionRequest, request_digest: &str) -> Result<(), String>;
+        fn get_external_action_authorization_by_id(&self, authorization_id: &str) -> Result<Option<AuthorizationRecord>, String>;
+        fn reserve_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest, max_mutations: Option<u32>, max_deletes: Option<u32>) -> Result<(), String>;
     }
 }
 
@@ -212,6 +554,7 @@ chisei_store_trait! {
         fn list_unscored_observations(&self, limit: i32) -> Result<Vec<crate::chisei::scoring::SampleObservation>, String>;
         fn bump_observation_attempts(&self, request_id: &str) -> Result<i64, String>;
         fn delete_observation(&self, request_id: &str) -> Result<(), String>;
+        fn get_sample_observation_in_namespace(&self, request_id: &str, namespace: &str) -> Result<Option<crate::chisei::scoring::SampleObservation>, String>;
     }
 }
 
@@ -252,5 +595,53 @@ chisei_store_trait! {
     pub trait ChiseiGunshiStore {
         fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String>;
         fn put_gunshi_allocation_state_cas(&self, namespace: &str, revision_id: &str, changed_at_ms: i64, state_json: &str, expected_revision: Option<&str>) -> Result<bool, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Evaluation manifests, evaluator definitions, plans, and executions.
+    pub trait ChiseiEvaluationStore {
+        fn get_evaluation_manifest(&self, manifest_digest: &str) -> Result<Option<crate::chisei::evaluation_manifest::ResolvedEvaluationManifest>, String>;
+        fn get_evaluation_manifest_for_request(&self, namespace: &str, actor: &str, request_id: &str) -> Result<Option<crate::chisei::evaluation_manifest::EvaluationManifestReplay>, String>;
+        fn get_evaluator_definition(&self, definition_id: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluatorDefinition>, String>;
+        fn put_evaluator_definition(&self, definition: crate::chisei::evaluation_plan::EvaluatorDefinition, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorDefinition, String>;
+        fn set_evaluator_availability(&self, definition_id: &str, state: &str, superseded_by_definition_id: &str, reason: &str, request_id: &str, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorAvailability, String>;
+        fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+        fn put_evaluation_plan(&self, plan: crate::chisei::evaluation_plan::EvaluationPlan, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluationPlan, String>;
+        fn get_evaluation_execution_index(&self, manifest_digest: &str) -> Result<Option<EvaluationExecutionIndex>, String>;
+        fn create_evaluation_execution(&self, index: &EvaluationExecutionIndex, receipt: &OperationReceipt) -> Result<EvaluationExecutionIndex, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Hosted routing profiles.
+    pub trait ChiseiRoutingProfileStore {
+        fn list_hosted_routing_profiles(&self, namespace: &str) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String>;
+        fn put_hosted_routing_profile(&self, profile: &crate::chisei::routing_profiles::HostedRoutingProfile) -> Result<(), String>;
+        fn revoke_hosted_routing_profile(&self, namespace: &str, profile_id: &str, now_ms: i64) -> Result<bool, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Gateway request aliases and gateway receipts.
+    pub trait ChiseiGatewayStore {
+        fn reserve_gateway_request_alias(&self, caller_scope: &str, request_alias: &str, request_id: &str, operation_id: &str) -> Result<bool, String>;
+        fn claim_gateway_request_alias_dispatch(&self, caller_scope: &str, request_alias: &str, request_id: &str, operation_id: &str, dispatch_token: &str) -> Result<bool, String>;
+        fn find_gateway_receipt_by_logical_operation_id(&self, operation_id: &str, attempt: Option<u32>) -> Result<Option<OperationReceipt>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Evolve task records.
+    pub trait ChiseiEvolveStore {
+        fn list_evolve_task_records(&self) -> Result<Vec<crate::chisei::evolve::TaskRecord>, String>;
+    }
+}
+
+chisei_store_trait! {
+    /// Governed-subject provenance exports.
+    pub trait ChiseiGovernedSubjectStore {
+        fn get_governed_subject_provenance_export(&self, actor: &str, export_id: &str) -> Result<Option<ExportRecord>, String>;
+        fn put_governed_subject_provenance_export(&self, actor: &str, export_id: &str, record: &ExportRecord) -> Result<(ExportRecord, bool), String>;
     }
 }

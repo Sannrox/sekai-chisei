@@ -29,8 +29,6 @@ pub const SESSION_COOKIE: &str = "sekai_console_sid";
 /// Default session lifetime (8 hours). Process-local; not shared across replicas.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
 
-const MAX_NAMESPACE_LEN: usize = 128;
-
 #[derive(Clone)]
 pub struct ConsoleState {
     pub db: Arc<RuntimeDb>,
@@ -106,6 +104,11 @@ pub fn router(state: ConsoleState) -> Router {
             "/console/n/{namespace}/pressure/kill-switch",
             post(pressure_kill_switch),
         )
+        .route("/console/n/{namespace}/transforms", get(screen_transforms))
+        .route(
+            "/console/n/{namespace}/transforms/{run_id}",
+            get(screen_transform_run),
+        )
         .route("/console/n/{namespace}/policy", get(screen_policy))
         .route(
             "/console/n/{namespace}/policy/dry-run",
@@ -126,6 +129,7 @@ pub fn router(state: ConsoleState) -> Router {
 enum Screen {
     Home,
     Operations,
+    Transforms,
     Pressure,
     Policy,
 }
@@ -135,6 +139,7 @@ impl Screen {
         match self {
             Self::Home => "Home",
             Self::Operations => "Operations",
+            Self::Transforms => "Transforms",
             Self::Pressure => "Pressure",
             Self::Policy => "Policy",
         }
@@ -144,6 +149,7 @@ impl Screen {
         match self {
             Self::Home => "",
             Self::Operations => "/ops",
+            Self::Transforms => "/transforms",
             Self::Pressure => "/pressure",
             Self::Policy => "/policy",
         }
@@ -221,34 +227,16 @@ fn resolve_session(state: &ConsoleState, headers: &HeaderMap) -> Option<ConsoleS
 
 /// Namespace identifiers allowed in console URLs (fail closed on anything else).
 pub fn is_safe_namespace(namespace: &str) -> bool {
-    if namespace.is_empty() || namespace.len() > MAX_NAMESPACE_LEN {
-        return false;
-    }
-    namespace
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    crate::sekai::namespace_access::is_safe_namespace(namespace)
 }
 
 /// Whether the authenticated principal may open the given namespace context.
-///
-/// Bootstrap principals (`root`, `local`) may select any canonical namespace so
-/// local-first operators can navigate without pre-seeded memberships.
-/// Other principals require an explicit namespace grant/membership.
 pub fn principal_can_access_namespace(
     db: &RuntimeDb,
     principal: &str,
     namespace: &str,
 ) -> Result<bool, String> {
-    if !is_safe_namespace(namespace) {
-        return Ok(false);
-    }
-    if matches!(principal, "root" | "local") {
-        return Ok(true);
-    }
-    let memberships = db.list_namespace_roles_for_principal(principal)?;
-    Ok(memberships
-        .iter()
-        .any(|(member_namespace, _role)| member_namespace == namespace))
+    crate::sekai::namespace_access::principal_can_access_namespace(db, principal, namespace)
 }
 
 pub fn list_accessible_namespaces(
@@ -542,14 +530,15 @@ fn shell_chrome(
         };
         format!(
             r#"<nav class="nav" aria-label="Primary">
-  {ops}{pressure}{policy}
+  {ops}{transforms}{pressure}{policy}
 </nav>"#,
             ops = link(Screen::Operations),
+            transforms = link(Screen::Transforms),
             pressure = link(Screen::Pressure),
             policy = link(Screen::Policy),
         )
     } else {
-        r#"<nav class="nav" aria-label="Primary"><span class="meta">Select a namespace to open Operations, Pressure, or Policy.</span></nav>"#
+        r#"<nav class="nav" aria-label="Primary"><span class="meta">Select a namespace to open Operations, Transforms, Pressure, or Policy.</span></nav>"#
             .to_string()
     };
 
@@ -774,6 +763,87 @@ async fn screen_operations(
             )
                 .into_response()
         }
+    }
+}
+
+async fn screen_transforms(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path(namespace): Path<String>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    match crate::obs::console_transforms::load_home(&state.db, &session.principal, &namespace) {
+        Ok(home) => {
+            let main = crate::obs::console_transforms::render_home(&home);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Transforms,
+                &main,
+            )
+            .into_response()
+        }
+        Err(err) => (
+            err.status(),
+            shell_chrome(
+                &session.principal,
+                None,
+                &namespaces,
+                Screen::Home,
+                &format!(
+                    r#"<section><h1>Transforms</h1><p class="error" role="alert">{}</p></section>"#,
+                    escape_html(err.message())
+                ),
+            ),
+        )
+            .into_response(),
+    }
+}
+
+async fn screen_transform_run(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Path((namespace, run_id)): Path<(String, String)>,
+) -> Response {
+    let Some(session) = resolve_session(&state, &headers) else {
+        return Redirect::to("/console/login").into_response();
+    };
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    match crate::obs::console_transforms::load_run(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &run_id,
+    ) {
+        Ok(run) => {
+            let main = crate::obs::console_transforms::render_run(&namespace, &run);
+            shell_chrome(
+                &session.principal,
+                Some(&namespace),
+                &namespaces,
+                Screen::Transforms,
+                &main,
+            )
+            .into_response()
+        }
+        Err(err) => (
+            err.status(),
+            shell_chrome(
+                &session.principal,
+                None,
+                &namespaces,
+                Screen::Home,
+                &format!(
+                    r#"<section><h1>Transform run</h1><p class="error" role="alert">{}</p></section>"#,
+                    escape_html(err.message())
+                ),
+            ),
+        )
+            .into_response(),
     }
 }
 

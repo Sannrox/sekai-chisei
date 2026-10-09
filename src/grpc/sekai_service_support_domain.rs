@@ -698,15 +698,8 @@ pub(super) fn authorize_definition_revision(
         .map_err(|_| Status::internal("definition revision unavailable"))?
         .filter(|revision| !require_published || revision.published)
         .ok_or_else(|| Status::not_found("definition revision unavailable"))?;
-    let members = service
-        .db
-        .runtime()
-        .get_definition_members(namespace, &revision.revision_digest)
-        .map_err(|_| Status::internal("definition revision unavailable"))?;
-    if members.len() != revision.members.len() {
-        return Err(Status::internal("definition revision unavailable"));
-    }
-    for member in members {
+    // Grant checks use revision member identity; bodies are loaded on demand.
+    for member in &revision.members {
         authorize_definition_member_read(
             service,
             principals,

@@ -264,7 +264,7 @@ impl SekaiServiceImpl {
                         derived: candidate.explanation.derived,
                     }),
                     descriptor: Some(to_proto_epistemic_descriptor(
-                        &DomainEpistemicDescriptor::from_graph_explanation(
+                        &crate::chisei::sekai_projection::graph_explanation_descriptor(
                             &candidate.explanation,
                             result
                                 .truncation_reasons

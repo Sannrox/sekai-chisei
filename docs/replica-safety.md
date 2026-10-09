@@ -75,12 +75,12 @@ two `PostgresDb` pools against one `SEKAI_TEST_POSTGRES_URL` when available
 Run the full replica-safety suite:
 
 ```bash
-cargo test --test replica_safety_harness
-cargo test --test replica_safety_budget
-cargo test --test replica_safety_leases
-cargo test --test replica_safety_credentials
-cargo test --test replica_safety_eval
-cargo test --test replica_safety_closeout
+cargo test --test it replica_safety_harness
+cargo test --test it replica_safety_budget
+cargo test --test it replica_safety_leases
+cargo test --test it replica_safety_credentials
+cargo test --test it replica_safety_eval
+cargo test --test it replica_safety_closeout
 ```
 
 `replica_safety_closeout` re-checks inventory completeness and a single

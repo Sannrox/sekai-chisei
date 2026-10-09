@@ -184,7 +184,7 @@
         "chisei.evaluation"
       ],
       "evidence": [
-        "src/chisei/lookup_first.rs",
+        "src/composition/lookup_first.rs",
         "src/grpc/chisei_service.rs",
         "tests/fixtures/lookup_first/promotion-gate-v1.json",
         "docs/lookup-first-promotion-gate.md"

@@ -1,6 +1,7 @@
 //! Content-bound data-quality rules and results (#681).
 
 use crate::chisei::decision_ledger::Decision;
+use crate::chisei::sekai_facts::SekaiFactReader;
 use crate::db::store::{ChiseiDataQualityStore, ChiseiDecisionStore, ChiseiStore};
 use crate::domain::Object;
 use serde::{Deserialize, Serialize};
@@ -177,6 +178,7 @@ pub fn publish_rule(
 
 pub fn start_evaluation(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     rule_id: &str,
@@ -184,7 +186,7 @@ pub fn start_evaluation(
     now_ms: i64,
 ) -> Result<DataQualityResult, String> {
     let (rule, dataset, revision) =
-        prepare_evaluation(db, actor, namespace, rule_id, pinned_rule_digest)?;
+        prepare_evaluation(db, facts, actor, namespace, rule_id, pinned_rule_digest)?;
     let result_id = result_id_for(namespace, &rule.rule_digest, &revision);
     if let Some(existing) = db.get_data_quality_result(&result_id)? {
         return Ok(existing);
@@ -220,17 +222,26 @@ pub fn start_evaluation(
 
 pub fn evaluate_rule(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     rule_id: &str,
     pinned_rule_digest: Option<&str>,
     now_ms: i64,
 ) -> Result<DataQualityResult, String> {
-    let started = start_evaluation(db, actor, namespace, rule_id, pinned_rule_digest, now_ms)?;
+    let started = start_evaluation(
+        db,
+        facts,
+        actor,
+        namespace,
+        rule_id,
+        pinned_rule_digest,
+        now_ms,
+    )?;
     if is_closed(&started.status) {
         return Ok(started);
     }
-    finish_evaluation(db, actor, &started.result_id, now_ms)
+    finish_evaluation(db, facts, actor, &started.result_id, now_ms)
 }
 
 pub fn cancel_evaluation(
@@ -267,6 +278,7 @@ pub fn cancel_evaluation(
 
 pub fn restart_evaluation(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     result_id: &str,
     now_ms: i64,
@@ -279,7 +291,7 @@ pub fn restart_evaluation(
     if is_closed(&existing.status) {
         return Err("closed data quality receipt is immutable".into());
     }
-    finish_evaluation(db, actor, result_id, now_ms)
+    finish_evaluation(db, facts, actor, result_id, now_ms)
 }
 
 pub fn show_rule(
@@ -315,6 +327,7 @@ pub fn list_results(
 
 fn finish_evaluation(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     result_id: &str,
     now_ms: i64,
@@ -337,7 +350,7 @@ fn finish_evaluation(
         record.status = STATUS_UNKNOWN.into();
         record.population = POPULATION_MISSING.into();
     } else {
-        let dataset = authorized_dataset(db, actor, &rule.namespace, &rule.dataset_id)?;
+        let dataset = authorized_dataset(facts, actor, &rule.namespace, &rule.dataset_id)?;
         apply_evaluator(&rule, dataset.as_ref(), &mut record);
     }
     record.prior_receipt_digest = prior;
@@ -360,6 +373,7 @@ fn finish_evaluation(
 
 fn prepare_evaluation(
     db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     rule_id: &str,
@@ -377,7 +391,7 @@ fn prepare_evaluation(
             return Err(STATUS_UNKNOWN.into());
         }
     }
-    let dataset = authorized_dataset(db, actor, namespace, &rule.dataset_id)?;
+    let dataset = authorized_dataset(facts, actor, namespace, &rule.dataset_id)?;
     let revision = match &dataset {
         Some(object) => dataset_revision_digest(object)?,
         None => missing_revision_digest(namespace, &rule.dataset_id),
@@ -473,13 +487,16 @@ fn apply_evaluator(
 }
 
 fn authorized_dataset(
-    db: &ChiseiStore,
+    facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
     dataset_id: &str,
 ) -> Result<Option<Object>, String> {
     let object_id = dataset_object_id(namespace, dataset_id);
-    match db.runtime().get_object(&object_id)? {
+    match facts
+        .get_object(&object_id)
+        .map_err(|error| error.to_string())?
+    {
         Some(object)
             if object.namespace == namespace
                 && object.kind == KIND_DATASET
@@ -625,20 +642,26 @@ fn audit(
 mod tests {
     use super::*;
 
-    fn db() -> ChiseiStore {
-        ChiseiStore::memory()
+    fn fixture() -> (
+        crate::db::store::SekaiStore,
+        ChiseiStore,
+        crate::chisei::sekai_facts::SekaiFacts,
+    ) {
+        let (sekai, db) = crate::db::store::paired_memory();
+        let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(sekai.clone());
+        (sekai, db, facts)
     }
 
     fn expected() -> String {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
     }
 
-    fn put_dataset(db: &ChiseiStore, rows: &str, extra: &[(&str, &str)]) {
+    fn put_dataset(sekai: &crate::db::store::SekaiStore, rows: &str, extra: &[(&str, &str)]) {
         let mut properties = HashMap::from([("row_count".into(), rows.into())]);
         for (key, value) in extra {
             properties.insert((*key).into(), (*value).into());
         }
-        db.runtime()
+        sekai
             .create_object(&Object {
                 id: dataset_object_id("quality", "orders"),
                 kind: KIND_DATASET.into(),
@@ -652,9 +675,8 @@ mod tests {
             .unwrap();
     }
 
-    fn publish_pin(db: &ChiseiStore) -> DataQualityRule {
-        let dataset = db
-            .runtime()
+    fn publish_pin(sekai: &crate::db::store::SekaiStore, db: &ChiseiStore) -> DataQualityRule {
+        let dataset = sekai
             .get_object(&dataset_object_id("quality", "orders"))
             .unwrap()
             .unwrap();
@@ -679,14 +701,32 @@ mod tests {
 
     #[test]
     fn authorized_pass_fail_missing_and_invalid_stay_distinct() {
-        let db = db();
-        put_dataset(&db, "4", &[("owner", "alice")]);
-        let rule = publish_pin(&db);
-        let passed = evaluate_rule(&db, "analyst", "quality", "orders-pin", None, 20).unwrap();
+        let (sekai, db, facts) = fixture();
+        put_dataset(&sekai, "4", &[("owner", "alice")]);
+        let rule = publish_pin(&sekai, &db);
+        let passed = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-pin",
+            None,
+            20,
+        )
+        .unwrap();
         assert_eq!(passed.status, STATUS_PASS);
         assert_eq!(passed.population, POPULATION_COMPLETE);
         assert!(!passed.evidence_receipt_digest.is_empty());
-        let replay = evaluate_rule(&db, "analyst", "quality", "orders-pin", None, 21).unwrap();
+        let replay = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-pin",
+            None,
+            21,
+        )
+        .unwrap();
         assert_eq!(replay.result_id, passed.result_id);
         assert_eq!(
             replay.evidence_receipt_digest,
@@ -711,7 +751,16 @@ mod tests {
             22,
         )
         .unwrap();
-        let failed = evaluate_rule(&db, "analyst", "quality", "orders-count", None, 23).unwrap();
+        let failed = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-count",
+            None,
+            23,
+        )
+        .unwrap();
         assert_eq!(failed.status, STATUS_FAIL);
 
         publish_rule(
@@ -731,11 +780,20 @@ mod tests {
             24,
         )
         .unwrap();
-        let missing = evaluate_rule(&db, "analyst", "quality", "ghost-pin", None, 25).unwrap();
+        let missing = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "ghost-pin",
+            None,
+            25,
+        )
+        .unwrap();
         assert_eq!(missing.status, STATUS_MISSING);
         assert_eq!(missing.population, POPULATION_MISSING);
 
-        db.runtime()
+        sekai
             .create_object(&Object {
                 id: dataset_object_id("quality", "broken"),
                 kind: KIND_DATASET.into(),
@@ -764,7 +822,16 @@ mod tests {
             26,
         )
         .unwrap();
-        let invalid = evaluate_rule(&db, "analyst", "quality", "broken-count", None, 27).unwrap();
+        let invalid = evaluate_rule(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "broken-count",
+            None,
+            27,
+        )
+        .unwrap();
         assert_eq!(invalid.status, STATUS_INVALID);
         assert_ne!(invalid.status, STATUS_PASS);
         assert_eq!(rule.evaluator, EVALUATOR_DIGEST_PIN);
@@ -772,15 +839,16 @@ mod tests {
 
     #[test]
     fn unknown_versions_and_hidden_identities_never_become_pass() {
-        let db = db();
-        put_dataset(&db, "2", &[]);
-        publish_pin(&db);
+        let (sekai, db, facts) = fixture();
+        put_dataset(&sekai, "2", &[]);
+        publish_pin(&sekai, &db);
         let unknown_rule = show_rule(&db, "quality", "missing-rule").unwrap_err();
         let unknown_ns = show_rule(&db, "hidden", "orders-pin").unwrap_err();
         assert_eq!(unknown_rule, unknown_ns);
         assert_eq!(unknown_rule, UNAVAILABLE);
         let stale = evaluate_rule(
             &db,
+            facts.reader(),
             "analyst",
             "quality",
             "orders-pin",
@@ -813,8 +881,8 @@ mod tests {
 
     #[test]
     fn cancel_is_durable_and_restart_does_not_rewrite_a_closed_receipt() {
-        let db = db();
-        put_dataset(&db, "3", &[("region", "eu")]);
+        let (sekai, db, facts) = fixture();
+        put_dataset(&sekai, "3", &[("region", "eu")]);
         publish_rule(
             &db,
             "analyst",
@@ -832,8 +900,16 @@ mod tests {
             40,
         )
         .unwrap();
-        let running =
-            start_evaluation(&db, "analyst", "quality", "orders-complete", None, 41).unwrap();
+        let running = start_evaluation(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-complete",
+            None,
+            41,
+        )
+        .unwrap();
         assert_eq!(running.status, STATUS_RUNNING);
         let cancelled = cancel_evaluation(&db, "analyst", &running.result_id, 42).unwrap();
         assert_eq!(cancelled.status, STATUS_CANCELLED);
@@ -844,7 +920,8 @@ mod tests {
             replay.evidence_receipt_digest,
             cancelled.evidence_receipt_digest
         );
-        let restarted = restart_evaluation(&db, "analyst", &running.result_id, 43).unwrap();
+        let restarted =
+            restart_evaluation(&db, facts.reader(), "analyst", &running.result_id, 43).unwrap();
         assert_eq!(restarted.status, STATUS_PASS);
         assert_eq!(
             restarted.prior_receipt_digest.as_deref(),
@@ -855,7 +932,7 @@ mod tests {
             cancelled.evidence_receipt_digest
         );
         assert_eq!(
-            restart_evaluation(&db, "analyst", &running.result_id, 44).unwrap_err(),
+            restart_evaluation(&db, facts.reader(), "analyst", &running.result_id, 44).unwrap_err(),
             "closed data quality receipt is immutable"
         );
         assert!(POSTGRES_UNAVAILABLE.contains("PostgreSQL"));

@@ -1106,13 +1106,16 @@ mod tests {
             SekaiDb::new(":memory:").unwrap(),
         )));
 
-        let sekai_svc = SekaiServiceImpl::new(
-            sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone()),
-        );
+        let sekai_store = sekai_chisei::db::store::SekaiStore::from_shared_runtime(db.clone());
+        let sekai_svc = SekaiServiceImpl::new(sekai_store.clone());
         let chisei_svc = ChiseiServiceImpl::new(
             sekai_chisei::db::store::ChiseiStore::from_shared_runtime(db.clone()),
             test_config(),
-        );
+        )
+        .with_sekai_facts(sekai_chisei::chisei::sekai_facts::SekaiFacts::in_process(
+            sekai_store,
+        ))
+        .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

@@ -1,11 +1,11 @@
 //! Governed institutional memory derived from verifiable operation outcomes.
 
+use crate::chisei::evidence_vocabulary::{EvidenceClassification, EvidenceLifecycleState};
 use crate::chisei::principal::{PrincipalContext, PrincipalGrant, PrincipalRole};
 use crate::chisei::receipt::{OperationReceipt, ReceiptEventKind};
 use crate::db::sekai::SekaiDb;
 #[cfg(test)]
 use crate::db::store::ChiseiStore;
-use crate::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1441,6 +1441,25 @@ impl SekaiDb {
         version: u32,
         review: HumanMemoryReview,
     ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, true)
+    }
+
+    pub(crate) fn review_kioku_candidate_after_graph_auth(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+    ) -> Result<KiokuMemory, String> {
+        self.review_kioku_candidate_inner(id, version, review, false)
+    }
+
+    fn review_kioku_candidate_inner(
+        &self,
+        id: &str,
+        version: u32,
+        review: HumanMemoryReview,
+        authorize_graph: bool,
+    ) -> Result<KiokuMemory, String> {
         if review.reviewer.trim().is_empty() || review.rationale.trim().is_empty() {
             return Err("reviewer and rationale are required".into());
         }
@@ -1471,7 +1490,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        if review.action == HumanReviewAction::Promote {
+        if review.action == HumanReviewAction::Promote && authorize_graph {
             for basis in &memory.evidence_basis {
                 if basis.source_submission_id.is_empty() {
                     continue;
@@ -1686,7 +1705,36 @@ impl SekaiDb {
         if request.max_results == 0 {
             return Ok(Vec::new());
         }
-        self.authorize_kioku_retrieval(request)?;
+        self.retrieve_kioku_memories_inner(request, true)
+    }
+
+    pub(crate) fn retrieve_kioku_memories_after_graph_auth(
+        &self,
+        request: &MemoryRetrievalRequest,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if request.namespace.trim().is_empty()
+            || request.operation_class.trim().is_empty()
+            || request.actor.trim().is_empty()
+        {
+            return Err("retrieval namespace, operation class, and actor are required".into());
+        }
+        if request.min_confidence_bps > 10_000 {
+            return Err("min_confidence_bps must not exceed 10000".into());
+        }
+        if request.max_results == 0 {
+            return Ok(Vec::new());
+        }
+        self.retrieve_kioku_memories_inner(request, false)
+    }
+
+    fn retrieve_kioku_memories_inner(
+        &self,
+        request: &MemoryRetrievalRequest,
+        authorize_graph: bool,
+    ) -> Result<Vec<RetrievedMemory>, String> {
+        if authorize_graph {
+            self.authorize_kioku_retrieval(request)?;
+        }
 
         let conn = self.conn();
         let mut statement = conn
@@ -3136,8 +3184,8 @@ mod tests {
 
     #[test]
     fn evidence_reassessment_is_idempotent_and_preserves_active_lineage() {
-        let db = ChiseiStore::memory();
-        db.runtime()
+        let (sekai, db) = crate::db::store::paired_memory();
+        sekai
             .create_object(&Object {
                 id: "namespace-payments".into(),
                 kind: "namespace".into(),
@@ -3149,7 +3197,7 @@ mod tests {
                 updated: 1,
             })
             .unwrap();
-        db.runtime()
+        sekai
             .create_principal_grant(
                 "grant-payments",
                 "namespace-payments",
@@ -3218,10 +3266,10 @@ mod tests {
         assert!(replay.idempotent);
         assert_eq!(replay.candidate, first.candidate);
 
-        db.runtime().delete_grant("grant-payments").unwrap();
+        sekai.delete_grant("grant-payments").unwrap();
         let denied_replay = db.reassess_kioku_memory(request.clone()).unwrap_err();
         assert!(denied_replay.contains("classification"));
-        db.runtime()
+        sekai
             .create_principal_grant(
                 "grant-payments-restored",
                 "namespace-payments",
@@ -3524,7 +3572,7 @@ mod tests {
 
     #[test]
     fn retrieves_active_memories_by_scope_affinity_and_classification() {
-        let db = ChiseiStore::memory();
+        let (sekai, db) = crate::db::store::paired_memory();
         for object in [
             Object {
                 id: "namespace-payments".into(),
@@ -3557,14 +3605,14 @@ mod tests {
                 updated: 1,
             },
         ] {
-            db.runtime().create_object(&object).unwrap();
+            sekai.create_object(&object).unwrap();
         }
         for (grant_id, object_id, principal) in [
             ("grant-payments", "namespace-payments", "agent:planner"),
             ("grant-other", "namespace-other", "agent:other"),
             ("grant-component", "component:migrations", "agent:planner"),
         ] {
-            db.runtime()
+            sekai
                 .create_principal_grant(
                     grant_id,
                     object_id,

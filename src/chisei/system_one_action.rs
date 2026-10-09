@@ -4,9 +4,8 @@
 //! Action parameters. It does not persist an instance or write the object.
 
 use crate::chisei::egress::{self, ContextEgressRecord};
+use crate::chisei::object_schema::ObjectType;
 use crate::domain::Object;
-use crate::sekai::governed_action_type::GovernedActionType;
-use crate::sekai::schema::ObjectType;
 use sekai_provider::system_one::{
     SystemOneBind, SystemOneRequest, SystemOneResponse, TypeSafeClient, parameters_from_answers,
     request_from_bind,
@@ -14,8 +13,31 @@ use sekai_provider::system_one::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-pub fn bind_of(type_def: &GovernedActionType) -> Option<&SystemOneBind> {
-    type_def.system_one.as_ref().filter(|bind| !bind.is_empty())
+/// The parts of a governed Action type that System One reads. Chisei
+/// implements it for Sekai governed Action types (ADR 0096 rule 6).
+pub trait SystemOneActionType {
+    fn type_id(&self) -> &str;
+    fn version(&self) -> &str;
+    fn parameter_schema_json(&self) -> &str;
+    fn system_one(&self) -> Option<&SystemOneBind>;
+}
+
+/// Chisei implementation of the Sekai-owned proposal port (ADR 0096 rule 2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemOneProposal;
+
+impl crate::sekai::action_ports::ActionProposalPort for SystemOneProposal {
+    fn fill_provenance_json(
+        &self,
+        type_def: &crate::sekai::governed_action_type::GovernedActionType,
+        parameters_json: &str,
+    ) -> Result<String, String> {
+        fill_provenance_json(type_def, parameters_json)
+    }
+}
+
+pub fn bind_of(type_def: &(impl SystemOneActionType + ?Sized)) -> Option<&SystemOneBind> {
+    type_def.system_one().filter(|bind| !bind.is_empty())
 }
 
 /// Empty caller parameters: a blank string, JSON `null`, or `{}`.
@@ -34,7 +56,7 @@ pub fn parameters_are_empty(parameters_json: &str) -> bool {
     }
 }
 
-pub fn should_fill(type_def: &GovernedActionType, parameters_json: &str) -> bool {
+pub fn should_fill(type_def: &(impl SystemOneActionType + ?Sized), parameters_json: &str) -> bool {
     parameters_are_empty(parameters_json) && bind_of(type_def).is_some()
 }
 
@@ -43,7 +65,7 @@ pub fn should_fill(type_def: &GovernedActionType, parameters_json: &str) -> bool
 /// Empty when the type has no bind. Submit does not re-invoke the Function;
 /// admit attributes the type version's pinned bind to the admitted body.
 pub fn fill_provenance_json(
-    type_def: &GovernedActionType,
+    type_def: &(impl SystemOneActionType + ?Sized),
     parameters_json: &str,
 ) -> Result<String, String> {
     let Some(bind) = bind_of(type_def) else {
@@ -65,8 +87,8 @@ pub fn fill_provenance_json(
     );
     serde_json::to_string(&serde_json::json!({
         "model": bind.model,
-        "type_id": type_def.type_id,
-        "version": type_def.version,
+        "type_id": type_def.type_id(),
+        "version": type_def.version(),
         "bind_digest": bind_digest,
         "parameter_digest": parameter_digest,
     }))
@@ -104,7 +126,7 @@ pub fn project_object_state(
 }
 
 pub fn request_for_object(
-    type_def: &GovernedActionType,
+    type_def: &(impl SystemOneActionType + ?Sized),
     object: &Object,
     object_type: Option<&ObjectType>,
 ) -> Result<(SystemOneRequest, ContextEgressRecord), String> {
@@ -114,14 +136,14 @@ pub fn request_for_object(
 }
 
 pub fn proposed_parameters(
-    type_def: &GovernedActionType,
+    type_def: &(impl SystemOneActionType + ?Sized),
     object: &Object,
     response: &SystemOneResponse,
 ) -> Result<String, String> {
     let bind = bind_of(type_def).ok_or_else(|| "action type has no system_one bind".to_string())?;
     let parameters = parameters_from_answers(bind, response, &object.id)?;
     crate::chisei::evaluation_plan::validate_parameters(
-        &type_def.parameter_schema_json,
+        type_def.parameter_schema_json(),
         &parameters,
     )
     .map_err(|error| format!("system_one parameters invalid: {error}"))?;
@@ -129,7 +151,7 @@ pub fn proposed_parameters(
 }
 
 pub async fn fill_proposed_parameters(
-    type_def: &GovernedActionType,
+    type_def: &(impl SystemOneActionType + ?Sized),
     object: &Object,
     object_type: Option<&ObjectType>,
     client: &TypeSafeClient,
@@ -142,21 +164,37 @@ pub async fn fill_proposed_parameters(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sekai::governed_action_type::{GovernedActionType, OBJECT_MUTATION_UPDATE};
     use sekai_provider::system_one::SystemOneQuestionBind;
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn type_def() -> GovernedActionType {
-        GovernedActionType {
-            namespace: "acme".into(),
+    struct TestActionType {
+        type_id: String,
+        version: String,
+        parameter_schema_json: String,
+        system_one: Option<SystemOneBind>,
+    }
+
+    impl SystemOneActionType for TestActionType {
+        fn type_id(&self) -> &str {
+            &self.type_id
+        }
+        fn version(&self) -> &str {
+            &self.version
+        }
+        fn parameter_schema_json(&self) -> &str {
+            &self.parameter_schema_json
+        }
+        fn system_one(&self) -> Option<&SystemOneBind> {
+            self.system_one.as_ref()
+        }
+    }
+
+    fn type_def() -> TestActionType {
+        TestActionType {
             type_id: "support.triage".into(),
             version: "1".into(),
-            description: "Triage a support ticket".into(),
             parameter_schema_json: r#"{"type":"object","properties":{"object_id":{"type":"string"},"department":{"type":"string","enum":["billing","technical","sales"]}},"required":["object_id","department"],"additionalProperties":false}"#.into(),
-            allowed_effect_kinds: vec!["notify".into()],
-            object_kind: "support_ticket".into(),
-            object_mutation: OBJECT_MUTATION_UPDATE.into(),
             system_one: Some(SystemOneBind {
                 model: "jev-1.13.0".into(),
                 questions: vec![SystemOneQuestionBind {
@@ -166,8 +204,6 @@ mod tests {
                     criteria: json!({"billing": null, "technical": null, "sales": null}),
                 }],
             }),
-            enabled: true,
-            ..Default::default()
         }
     }
 

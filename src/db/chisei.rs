@@ -44,6 +44,56 @@ fn outcome_evidence(event: &OperationReceiptEvent) -> Result<Option<(&str, f64, 
 }
 
 impl SekaiDb {
+    /// Per-store receipt table, including Combined Split admission receipts
+    /// on the Sekai dest. Legacy files may lack later columns; add those
+    /// before creating indexes that name them.
+    pub(crate) fn migrate_operation_receipts(&self) -> Result<(), String> {
+        let conn = self.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chisei_operation_receipts (
+                    operation_id TEXT PRIMARY KEY,
+                    request_id TEXT,
+                    lookup_request_id TEXT,
+                    initiating_actor TEXT,
+                    caller_scope TEXT,
+                    alias_retired INTEGER NOT NULL DEFAULT 0,
+                    namespace TEXT NOT NULL,
+                    receipt_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );",
+        )
+        .map_err(|e| e.to_string())?;
+        Self::ensure_operation_receipt_columns(&conn)?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chisei_operation_receipts_namespace
+                    ON chisei_operation_receipts(namespace, updated_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_request
+                    ON chisei_operation_receipts(request_id) WHERE request_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_lookup
+                    ON chisei_operation_receipts(caller_scope, lookup_request_id)
+                    WHERE caller_scope IS NOT NULL AND lookup_request_id IS NOT NULL;",
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn ensure_operation_receipt_columns(conn: &Connection) -> Result<(), String> {
+        for statement in [
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN request_id TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN lookup_request_id TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN initiating_actor TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN caller_scope TEXT",
+            "ALTER TABLE chisei_operation_receipts ADD COLUMN alias_retired INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match conn.execute(statement, []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                    if message.contains("duplicate column name") => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn migrate_chisei(&self) -> Result<(), String> {
         let conn = self.conn();
         conn.execute_batch(
@@ -146,20 +196,8 @@ impl SekaiDb {
                 ON chisei_operation_reservations(status, expires_at_ms);",
         )
         .map_err(|e| e.to_string())?;
-        match conn.execute(
-            "ALTER TABLE chisei_operation_receipts ADD COLUMN request_id TEXT",
-            [],
-        ) {
-            Ok(_) => {}
-            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
-                if message.contains("duplicate column name") => {}
-            Err(err) => return Err(err.to_string()),
-        }
+        Self::ensure_operation_receipt_columns(&conn)?;
         for statement in [
-            "ALTER TABLE chisei_operation_receipts ADD COLUMN lookup_request_id TEXT",
-            "ALTER TABLE chisei_operation_receipts ADD COLUMN initiating_actor TEXT",
-            "ALTER TABLE chisei_operation_receipts ADD COLUMN caller_scope TEXT",
-            "ALTER TABLE chisei_operation_receipts ADD COLUMN alias_retired INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chisei_gateway_request_aliases ADD COLUMN dispatch_token TEXT",
         ] {

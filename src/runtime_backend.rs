@@ -8,6 +8,7 @@ use crate::db::chisei_rpc_inventory::postgres_complete_chisei_capabilities;
 use crate::db::postgres::PostgresDb;
 use crate::db::reusable::postgres_reusable_capabilities;
 use crate::db::runtime_db::RuntimeDb;
+use crate::db::schema_plane::SchemaPlane;
 use crate::db::sekai::SekaiDb;
 use crate::db::sekai_rpc_inventory::postgres_complete_sekai_capabilities;
 use serde::{Deserialize, Serialize};
@@ -120,13 +121,17 @@ pub struct RuntimeBackendConfig {
     /// operator budget across the two stores so topology does not double FDs.
     pub postgres_max_connections: u32,
     pub postgres_ca_cert_path: Option<String>,
+    pub schema_plane: SchemaPlane,
 }
 
 impl RuntimeBackendConfig {
-    /// Single-store callers (sekaictl subcommands, reports) open the Sekai
-    /// store: `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`, else
-    /// `default_sqlite_path`. Retired `DB_PATH` / `DATABASE_URL` /
-    /// `SEKAI_SHARED_STORE` refuse with guidance.
+    /// Single-store callers (sekaictl subcommands, reports) open
+    /// `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`, else `default_sqlite_path`.
+    /// A historical dual-schema SQLite file stays Shared so quality-report
+    /// and compliance-export still read it; a missing or Sekai-only file
+    /// stays Sekai-owned. Community PostgreSQL is one database (Shared).
+    /// Retired `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse
+    /// with guidance.
     pub fn from_env(default_sqlite_path: &str) -> Result<Self, String> {
         crate::combined_stores::refuse_legacy_store_env()?;
         let backend = BackendIdentity::parse(
@@ -152,14 +157,23 @@ impl RuntimeBackendConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
 
-        Self::from_sources(
+        Ok(Self::from_sources(
             backend,
             explicit_sqlite_path.as_deref(),
             default_sqlite_path,
             postgres_url.as_deref(),
             postgres_max_connections,
             postgres_ca_cert_path.as_deref(),
-        )
+        )?
+        .with_schema_plane(if postgres_url.is_some() {
+            SchemaPlane::Shared
+        } else {
+            SchemaPlane::for_existing_sqlite(
+                explicit_sqlite_path
+                    .as_deref()
+                    .unwrap_or(default_sqlite_path),
+            )
+        }))
     }
 
     pub fn from_sources(
@@ -195,6 +209,7 @@ impl RuntimeBackendConfig {
                     postgres_url: None,
                     postgres_max_connections,
                     postgres_ca_cert_path: None,
+                    schema_plane: SchemaPlane::Shared,
                 })
             }
             BackendIdentity::Postgres => {
@@ -212,9 +227,15 @@ impl RuntimeBackendConfig {
                     postgres_url: Some(postgres_url.to_string()),
                     postgres_max_connections,
                     postgres_ca_cert_path: postgres_ca_cert_path.map(str::to_string),
+                    schema_plane: SchemaPlane::Shared,
                 })
             }
         }
+    }
+
+    pub fn with_schema_plane(mut self, schema_plane: SchemaPlane) -> Self {
+        self.schema_plane = schema_plane;
+        self
     }
 }
 
@@ -228,12 +249,13 @@ impl RuntimeBackend {
     pub fn initialize(config: RuntimeBackendConfig) -> Result<Self, String> {
         match config.backend {
             BackendIdentity::Sqlite => {
-                let sqlite = Arc::new(SekaiDb::new_with_pool_max(
+                let sqlite = Arc::new(SekaiDb::new_with_pool_max_for_plane(
                     config
                         .sqlite_path
                         .as_deref()
                         .ok_or("SQLite backend requires a database path")?,
                     config.postgres_max_connections,
+                    config.schema_plane,
                 )?);
                 let capabilities = BackendCapabilities {
                     contract_version: RUNTIME_BACKEND_CONTRACT_VERSION.into(),
@@ -259,13 +281,18 @@ impl RuntimeBackend {
                 let postgres = if let Some(ca_path) = config.postgres_ca_cert_path.as_deref() {
                     let certificate = std::fs::read(ca_path)
                         .map_err(|error| format!("read SEKAI_POSTGRES_CA_CERT: {error}"))?;
-                    PostgresDb::connect_with_ca_certificate(
+                    PostgresDb::connect_with_ca_certificate_for_plane(
                         url,
                         config.postgres_max_connections,
                         &certificate,
+                        config.schema_plane,
                     )?
                 } else {
-                    PostgresDb::connect(url, config.postgres_max_connections)?
+                    PostgresDb::connect_for_plane(
+                        url,
+                        config.postgres_max_connections,
+                        config.schema_plane,
+                    )?
                 };
                 let migration_version = postgres.latest_migration_version()?;
                 let capabilities = community_postgres_capabilities(Some(migration_version))?;

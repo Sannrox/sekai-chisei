@@ -45,6 +45,7 @@ async fn submit(config: EnvelopeActor) -> Result<(), BoxErr> {
         &envelope,
         Utc::now().timestamp_millis(),
         None,
+        None,
     )
     .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&binding)?);

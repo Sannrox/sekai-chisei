@@ -68,17 +68,19 @@ The build vendors `protoc`; a system installation is not required.
 - Add deterministic unit tests beside the module for pure policy, parsing,
   validation, and persistence behavior.
 - Add integration tests under `tests/` for public service or multi-component
-  behavior.
+  behavior. Self-contained files are modules of the grouped `it` target
+  (`mod foo;` in `tests/it.rs`). Process-global or `crate::`-coupled adapter
+  tests keep a `[[test]]` entry in the root `Cargo.toml`.
 - Use deterministic fixtures for provider wire formats and streaming events.
 - Keep tests that require real provider services ignored, following
   `tests/ollama_e2e.rs`, and document their prerequisites.
 - Run `scripts/chisei_gateway_smoke.sh` for gateway changes. It uses fake
   upstreams and does not require provider credentials.
-- Run `cargo test --test native_server_smoke --locked` for native control-plane
+- Run `cargo test --test it --locked native_server_smoke` for native control-plane
   process smoke. It spawns the compiled `sekai-chisei` binary, a loopback
   OpenAI-compatible fake for Ollama, and drives `sekaictl` plus public gRPC
   over a temp Unix socket. It does not require live provider credentials.
-- Run `cargo test --test gateway_http_smoke --locked` for gateway HTTP process
+- Run `cargo test --test it --locked gateway_http_smoke` for gateway HTTP process
   smoke. It spawns `sekai-chisei`, `chisei-gateway`, and a loopback OpenAI/
   Anthropic fake, then hits health/readiness, missing and wrong keys,
   disallowed models, `/v1/responses`, `/v1/chat/completions`, `/v1/messages`
@@ -88,7 +90,7 @@ The build vendors `protoc`; a system installation is not required.
 The ignored Ollama test requires a local compatible endpoint and model:
 
 ```bash
-cargo test --test ollama_e2e -- --ignored
+cargo test --test it -- --ignored ollama_e2e
 ```
 
 Changes to provider routing, LLM calls, authentication, authorization,

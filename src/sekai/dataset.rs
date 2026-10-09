@@ -129,6 +129,7 @@ impl SekaiDb {
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dataset_rows ON sekai_dataset_rows(dataset_id);
+            CREATE INDEX IF NOT EXISTS idx_dataset_rows_id ON sekai_dataset_rows(dataset_id, id);
             CREATE TABLE IF NOT EXISTS sekai_virtual_tables (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, dataset_id TEXT NOT NULL,
                 filters TEXT NOT NULL DEFAULT '[]', columns TEXT NOT NULL DEFAULT '[]',
@@ -296,29 +297,48 @@ impl SekaiDb {
         dataset_id: &str,
         rows: &[HashMap<String, String>],
     ) -> Result<i32, String> {
-        let conn = self.conn();
-        let mut count = 0;
-        for row in rows {
-            let data = serde_json::to_string(row).unwrap();
-            conn.execute(
-                "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
-                params![dataset_id, data],
-            )
-            .map_err(|e| e.to_string())?;
-            count += 1;
+        if rows.is_empty() {
+            return Ok(0);
         }
-        Ok(count)
+        let payloads: Vec<String> = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data)
+                 SELECT ?1, value FROM json_each(?2)",
+                params![dataset_id, json],
+            )
+            .map_err(|error| error.to_string())?;
+        i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
     }
 
     pub fn list_dataset_row_records(
         &self,
         dataset_id: &str,
     ) -> Result<Vec<DatasetRowRecord>, String> {
+        self.list_dataset_row_records_after(dataset_id, 0)
+    }
+
+    pub fn list_dataset_row_records_after(
+        &self,
+        dataset_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<DatasetRowRecord>, String> {
         let conn = self.conn();
         let mut stmt = conn
-            .prepare("SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = ?1 ORDER BY id")
+            .prepare(
+                "SELECT id, data FROM sekai_dataset_rows
+                 WHERE dataset_id = ?1 AND id > ?2
+                 ORDER BY id",
+            )
             .map_err(|e| e.to_string())?;
-        let mut rows_iter = stmt.query(params![dataset_id]).map_err(|e| e.to_string())?;
+        let mut rows_iter = stmt
+            .query(params![dataset_id, after_id])
+            .map_err(|e| e.to_string())?;
         let mut results = Vec::new();
         while let Some(row) = rows_iter.next().map_err(|e| e.to_string())? {
             let id: i64 = row.get(0).map_err(|e| e.to_string())?;
@@ -573,6 +593,16 @@ mod tests {
             HashMap::from([("ts".into(), "3".into()), ("val".into(), "5.0".into())]),
         ];
         db.append_rows("ds1", &rows).unwrap();
+
+        let records = db.list_dataset_row_records("ds1").unwrap();
+        assert_eq!(records.len(), 3);
+        let after_first = db
+            .list_dataset_row_records_after("ds1", records[0].0)
+            .unwrap();
+        assert_eq!(
+            after_first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![records[1].0, records[2].0]
+        );
 
         let all = db.query_rows("ds1", &RowQuery::default()).unwrap();
         assert_eq!(all.len(), 3);

@@ -3,30 +3,18 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::{Direction, Object};
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
-type PipelineRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FuncParam {
     pub name: String,
     pub param_type: String,
     pub required: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct PipelineStep {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OperatorStep {
     pub op: String,
     pub kind: String,
     pub property: String,
@@ -36,6 +24,74 @@ pub struct PipelineStep {
     pub func: String,
     pub field: String,
     pub alias: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LlmStep {
+    pub prompt_revision: String,
+    pub input_bindings: BTreeMap<String, String>,
+    pub output_schema: String,
+    pub model_route: String,
+    /// Below this score, extraction parks a `require_approval` Action (#1326).
+    #[serde(default)]
+    pub minimum_confidence_micros: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum PipelineStep {
+    Operator(OperatorStep),
+    Llm(LlmStep),
+}
+
+impl PipelineStep {
+    pub fn operator(
+        op: impl Into<String>,
+        kind: impl Into<String>,
+        relation: impl Into<String>,
+        func: impl Into<String>,
+        field: impl Into<String>,
+    ) -> Self {
+        Self::Operator(OperatorStep {
+            op: op.into(),
+            kind: kind.into(),
+            property: String::new(),
+            value: String::new(),
+            relation: relation.into(),
+            dir: String::new(),
+            func: func.into(),
+            field: field.into(),
+            alias: String::new(),
+        })
+    }
+}
+
+/// Scripted or governed LLM completion for one function step (#1310).
+///
+/// Production hosts must use the same policy, budget, and egress path as
+/// native chat (`provider_execution`). The default host fail-closes.
+pub trait LlmStepHost {
+    fn complete(
+        &self,
+        prompt_revision: &str,
+        model_route: &str,
+        bound_inputs: &serde_json::Value,
+        output_schema: &str,
+    ) -> Result<serde_json::Value, String>;
+}
+
+pub struct RejectLlmHost;
+
+impl LlmStepHost for RejectLlmHost {
+    fn complete(
+        &self,
+        _prompt_revision: &str,
+        _model_route: &str,
+        _bound_inputs: &serde_json::Value,
+        _output_schema: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("llm step requires a host".into())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +107,11 @@ pub struct Function {
 pub struct FunctionResult {
     pub objects: Vec<Object>,
     pub aggregates: HashMap<String, String>,
+    pub structured: Option<serde_json::Value>,
+    pub schema_error: String,
+    pub llm_prompt_digest: String,
+    pub llm_model_route: String,
+    pub llm_input_digest: String,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +147,10 @@ pub struct FunctionReceipt {
     pub steps: u32,
     pub budget_exceeded: String,
     pub output_digest: String,
+    pub prompt_digest: String,
+    pub model_route: String,
+    pub input_digest: String,
+    pub schema_error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +171,10 @@ impl BudgetChecker {
         if self.steps > self.budget.max_steps {
             return Err("function budget exceeded: max_steps".into());
         }
+        self.check_time()
+    }
+
+    fn check_time(&self) -> Result<(), String> {
         if self.started.elapsed().as_millis() as u64 > self.budget.max_time_ms {
             return Err("function budget exceeded: max_time_ms".into());
         }
@@ -120,32 +189,60 @@ pub fn validate_function(f: &Function) -> Result<(), String> {
     if f.pipeline.is_empty() {
         return Err("pipeline must have at least one step".into());
     }
+    if f.pipeline
+        .iter()
+        .filter(|step| matches!(step, PipelineStep::Llm(_)))
+        .count()
+        > 1
+    {
+        return Err("pipeline may contain at most one llm step".into());
+    }
     for (i, step) in f.pipeline.iter().enumerate() {
-        match step.op.as_str() {
-            "filter" => {
-                if step.kind.is_empty() {
-                    return Err(format!("step {}: filter requires kind", i));
+        match step {
+            PipelineStep::Operator(step) => match step.op.as_str() {
+                "filter" => {
+                    if step.kind.is_empty() {
+                        return Err(format!("step {}: filter requires kind", i));
+                    }
                 }
-            }
-            "traverse" => {
-                if step.relation.is_empty() {
-                    return Err(format!("step {}: traverse requires relation", i));
+                "traverse" => {
+                    if step.relation.is_empty() {
+                        return Err(format!("step {}: traverse requires relation", i));
+                    }
                 }
-            }
-            "aggregate" => {
-                if step.func.is_empty() {
-                    return Err(format!("step {}: aggregate requires func", i));
+                "aggregate" => {
+                    if step.func.is_empty() {
+                        return Err(format!("step {}: aggregate requires func", i));
+                    }
                 }
-            }
-            "self" => {}
-            "transform" => {
-                if step.field.is_empty() {
-                    return Err(format!("step {}: transform requires field", i));
+                "self" => {}
+                "transform" => {
+                    if step.field.is_empty() {
+                        return Err(format!("step {}: transform requires field", i));
+                    }
                 }
-            }
-            "repeat" => {}
-            other => {
-                return Err(format!("step {}: unknown op {:?}", i, other));
+                "repeat" => {}
+                other => {
+                    return Err(format!("step {}: unknown op {:?}", i, other));
+                }
+            },
+            PipelineStep::Llm(step) => {
+                if step.prompt_revision.is_empty() {
+                    return Err(format!("step {}: llm requires prompt_revision", i));
+                }
+                if step.output_schema.is_empty() {
+                    return Err(format!("step {}: llm requires output_schema", i));
+                }
+                if step.model_route.is_empty() {
+                    return Err(format!("step {}: llm requires model_route", i));
+                }
+                if step.minimum_confidence_micros > 1_000_000 {
+                    return Err(format!(
+                        "step {i}: llm minimum_confidence_micros must be at most 1000000"
+                    ));
+                }
+                validate_output_schema(&step.output_schema)
+                    .map_err(|error| format!("step {i}: {error}"))?;
             }
         }
     }
@@ -194,7 +291,7 @@ pub fn execute_with_result_filter<F>(
 where
     F: Fn(&Object) -> Result<bool, String>,
 {
-    execute_with_source_and_result_filter(db, f, params, None, allow, None)
+    execute_with_source_and_result_filter(db, f, params, None, allow, None, &RejectLlmHost)
 }
 
 pub fn execute_for_object_with_result_filter<F>(
@@ -207,7 +304,7 @@ pub fn execute_for_object_with_result_filter<F>(
 where
     F: Fn(&Object) -> Result<bool, String>,
 {
-    execute_with_source_and_result_filter(db, f, params, Some(source), allow, None)
+    execute_with_source_and_result_filter(db, f, params, Some(source), allow, None, &RejectLlmHost)
 }
 
 pub fn function_digest(function: &Function) -> String {
@@ -218,17 +315,26 @@ pub fn function_digest(function: &Function) -> String {
             &function
                 .pipeline
                 .iter()
-                .map(|step| {
-                    (
-                        step.op.as_str(),
-                        step.kind.as_str(),
-                        step.property.as_str(),
-                        step.value.as_str(),
-                        step.relation.as_str(),
-                        step.func.as_str(),
-                        step.field.as_str(),
-                        step.alias.as_str(),
-                    )
+                .map(|step| match step {
+                    PipelineStep::Operator(step) => serde_json::json!([
+                        "operator",
+                        step.op,
+                        step.kind,
+                        step.property,
+                        step.value,
+                        step.relation,
+                        step.func,
+                        step.field,
+                        step.alias
+                    ]),
+                    PipelineStep::Llm(step) => serde_json::json!([
+                        "llm",
+                        step.prompt_revision,
+                        step.model_route,
+                        step.output_schema,
+                        step.input_bindings,
+                        step.minimum_confidence_micros
+                    ]),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -249,7 +355,197 @@ pub fn result_digest(result: &FunctionResult) -> String {
     let mut aggregates: Vec<_> = result.aggregates.iter().collect();
     aggregates.sort_by(|left, right| left.0.cmp(right.0));
     hasher.update(serde_json::to_vec(&aggregates).unwrap_or_default());
+    if let Some(structured) = &result.structured {
+        hasher.update(serde_json::to_vec(structured).unwrap_or_default());
+    }
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+const OUTPUT_SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "description",
+];
+
+/// Fail closed unless the schema is the supported object subset (#1310).
+pub fn validate_output_schema(schema_json: &str) -> Result<(), String> {
+    let schema: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|error| format!("llm output_schema is not JSON: {error}"))?;
+    validate_output_schema_value(&schema)
+}
+
+fn validate_output_schema_value(schema: &serde_json::Value) -> Result<(), String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| "llm output_schema must be an object".to_string())?;
+    for key in object.keys() {
+        if !OUTPUT_SCHEMA_KEYS.contains(&key.as_str()) {
+            return Err(format!("unsupported output schema keyword {key}"));
+        }
+    }
+    let expected = schema_type(object)?;
+    if expected != "object" {
+        return Err(format!("unsupported output schema type {expected}"));
+    }
+    if let Some(flag) = object.get("additionalProperties")
+        && !flag.is_boolean()
+    {
+        return Err("additionalProperties must be a boolean".into());
+    }
+    if let Some(required) = object.get("required") {
+        let required = required
+            .as_array()
+            .ok_or_else(|| "schema required is not an array".to_string())?;
+        for key in required {
+            if !key.is_string() {
+                return Err("schema required is not a string".into());
+            }
+        }
+    }
+    if let Some(properties) = object.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| "schema properties is not an object".to_string())?;
+        for nested in properties.values() {
+            validate_property_schema(nested)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_property_schema(schema: &serde_json::Value) -> Result<(), String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| "property schema must be an object".to_string())?;
+    for key in object.keys() {
+        if !OUTPUT_SCHEMA_KEYS.contains(&key.as_str()) {
+            return Err(format!("unsupported output schema keyword {key}"));
+        }
+    }
+    let expected = schema_type(object)?;
+    match expected {
+        "object" => validate_output_schema_value(schema),
+        "string" | "integer" | "number" | "boolean" => {
+            if object.contains_key("properties")
+                || object.contains_key("required")
+                || object.contains_key("additionalProperties")
+            {
+                return Err(format!(
+                    "unsupported keywords on {expected} property schema"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("unsupported output schema type {other}")),
+    }
+}
+
+/// Fail closed when JSON does not match a simple object schema (#1310).
+pub fn validate_structured_output(
+    schema_json: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let schema: serde_json::Value = serde_json::from_str(schema_json)
+        .map_err(|error| format!("output schema is not JSON: {error}"))?;
+    validate_output_schema_value(&schema)?;
+    validate_against_schema(&schema, value)
+}
+
+fn schema_type(object: &serde_json::Map<String, serde_json::Value>) -> Result<&str, String> {
+    match object.get("type") {
+        None => Ok("object"),
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| "schema type must be a string".into()),
+    }
+}
+
+fn validate_against_schema(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let object = schema
+        .as_object()
+        .ok_or_else(|| "output schema must be an object".to_string())?;
+    let expected = schema_type(object)?;
+    match expected {
+        "object" => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "output is not an object".to_string())?;
+            if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+                for key in required {
+                    let name = key
+                        .as_str()
+                        .ok_or_else(|| "schema required is not a string".to_string())?;
+                    if !object.contains_key(name) {
+                        return Err(format!("missing required property {name}"));
+                    }
+                }
+            }
+            if schema
+                .get("additionalProperties")
+                .and_then(|flag| flag.as_bool())
+                == Some(false)
+            {
+                let allowed: BTreeSet<&str> = schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|p| p.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                for key in object.keys() {
+                    if !allowed.contains(key.as_str()) {
+                        return Err(format!("unexpected property {key}"));
+                    }
+                }
+            }
+            if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, nested) in properties {
+                    if let Some(child) = object.get(name) {
+                        validate_against_schema(nested, child)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        "string" => {
+            if value.is_string() {
+                Ok(())
+            } else {
+                Err("output is not a string".into())
+            }
+        }
+        "integer" => {
+            if value.is_i64() || value.is_u64() {
+                Ok(())
+            } else {
+                Err("output is not an integer".into())
+            }
+        }
+        "number" => {
+            if value.is_number() {
+                Ok(())
+            } else {
+                Err("output is not a number".into())
+            }
+        }
+        "boolean" => {
+            if value.is_boolean() {
+                Ok(())
+            } else {
+                Err("output is not a boolean".into())
+            }
+        }
+        other => Err(format!("unsupported schema type {other}")),
+    }
 }
 
 /// Invoke a function on the in-process host (#882 / ADR 0072).
@@ -282,10 +578,115 @@ pub fn invoke_with_source<F>(
 where
     F: Fn(&Object) -> Result<bool, String>,
 {
+    invoke_with_source_and_llm(
+        db,
+        function,
+        params,
+        source,
+        allow,
+        InvokeOpts {
+            host,
+            budget,
+            llm_host: &RejectLlmHost,
+        },
+    )
+}
+
+fn bind_llm_inputs(
+    step: &LlmStep,
+    objects: &[Object],
+    params: &HashMap<String, String>,
+) -> serde_json::Value {
+    let mut bound = serde_json::Map::new();
+    if step.input_bindings.is_empty() {
+        bound.insert(
+            "objects".into(),
+            serde_json::Value::Array(
+                objects
+                    .iter()
+                    .map(|object| {
+                        let properties: BTreeMap<_, _> = object.properties.iter().collect();
+                        serde_json::json!({
+                            "id": object.id,
+                            "kind": object.kind,
+                            "properties": properties,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        let params: BTreeMap<_, _> = params.iter().collect();
+        bound.insert(
+            "params".into(),
+            serde_json::to_value(params).unwrap_or_default(),
+        );
+        return serde_json::Value::Object(bound);
+    }
+    for (name, source) in &step.input_bindings {
+        if let Some(param) = params.get(source) {
+            bound.insert(name.clone(), serde_json::Value::String(param.clone()));
+            continue;
+        }
+        let value = objects.iter().find_map(|object| {
+            object
+                .properties
+                .get(source)
+                .cloned()
+                .map(serde_json::Value::String)
+        });
+        bound.insert(name.clone(), value.unwrap_or(serde_json::Value::Null));
+    }
+    serde_json::Value::Object(bound)
+}
+
+/// Invoke with a governed or scripted LLM host (#1310).
+pub fn invoke_with_llm<F>(
+    db: &RuntimeDb,
+    function: &Function,
+    params: &HashMap<String, String>,
+    allow: F,
+    host: FunctionHost,
+    budget: FunctionBudget,
+    llm_host: &dyn LlmStepHost,
+) -> Result<FunctionInvocation, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
+    invoke_with_source_and_llm(
+        db,
+        function,
+        params,
+        None,
+        allow,
+        InvokeOpts {
+            host,
+            budget,
+            llm_host,
+        },
+    )
+}
+
+struct InvokeOpts<'a> {
+    host: FunctionHost,
+    budget: FunctionBudget,
+    llm_host: &'a dyn LlmStepHost,
+}
+
+fn invoke_with_source_and_llm<F>(
+    db: &RuntimeDb,
+    function: &Function,
+    params: &HashMap<String, String>,
+    source: Option<&Object>,
+    allow: F,
+    opts: InvokeOpts<'_>,
+) -> Result<FunctionInvocation, String>
+where
+    F: Fn(&Object) -> Result<bool, String>,
+{
     let mut checker = BudgetChecker {
         started: Instant::now(),
         steps: 0,
-        budget: budget.clone(),
+        budget: opts.budget.clone(),
     };
     let executed = execute_with_source_and_result_filter(
         db,
@@ -294,6 +695,7 @@ where
         source,
         allow,
         Some(&mut checker),
+        opts.llm_host,
     );
     let elapsed_ms = checker.started.elapsed().as_millis() as u64;
     let (result, budget_exceeded) = match executed {
@@ -301,8 +703,13 @@ where
             let encoded = serde_json::to_vec(&result.aggregates)
                 .unwrap_or_default()
                 .len()
-                + result.objects.len() * 64;
-            if encoded > budget.max_output_bytes {
+                + result.objects.len() * 64
+                + result
+                    .structured
+                    .as_ref()
+                    .map(|value| serde_json::to_vec(value).unwrap_or_default().len())
+                    .unwrap_or(0);
+            if encoded > opts.budget.max_output_bytes {
                 (
                     FunctionResult::default(),
                     "function budget exceeded: max_output_bytes".into(),
@@ -320,12 +727,16 @@ where
         receipt: FunctionReceipt {
             function_name: function.name.clone(),
             function_digest: function_digest(function),
-            now_ms: host.now_ms,
-            rng_seed: host.rng_seed,
+            now_ms: opts.host.now_ms,
+            rng_seed: opts.host.rng_seed,
             elapsed_ms,
             steps: checker.steps,
-            budget_exceeded: budget_exceeded.clone(),
+            budget_exceeded,
             output_digest: result_digest(&result),
+            prompt_digest: result.llm_prompt_digest.clone(),
+            model_route: result.llm_model_route.clone(),
+            input_digest: result.llm_input_digest.clone(),
+            schema_error: result.schema_error.clone(),
         },
         result,
     })
@@ -338,6 +749,7 @@ fn execute_with_source_and_result_filter<F>(
     source: Option<&Object>,
     allow: F,
     mut budget: Option<&mut BudgetChecker>,
+    llm_host: &dyn LlmStepHost,
 ) -> Result<FunctionResult, String>
 where
     F: Fn(&Object) -> Result<bool, String>,
@@ -350,6 +762,33 @@ where
         if let Some(checker) = budget.as_mut() {
             checker.tick()?;
         }
+        let step = match step {
+            PipelineStep::Llm(llm) => {
+                let bound = bind_llm_inputs(llm, &objects, params);
+                let bound_bytes = serde_json::to_vec(&bound).unwrap_or_default();
+                result.llm_prompt_digest = digest_bytes(llm.prompt_revision.as_bytes());
+                result.llm_model_route = llm.model_route.clone();
+                result.llm_input_digest = digest_bytes(&bound_bytes);
+                let value = llm_host.complete(
+                    &llm.prompt_revision,
+                    &llm.model_route,
+                    &bound,
+                    &llm.output_schema,
+                )?;
+                if let Some(checker) = budget.as_mut() {
+                    checker.check_time()?;
+                }
+                match validate_structured_output(&llm.output_schema, &value) {
+                    Ok(()) => result.structured = Some(value),
+                    Err(error) => {
+                        result.schema_error = error;
+                        result.structured = None;
+                    }
+                }
+                continue;
+            }
+            PipelineStep::Operator(step) => step,
+        };
         match step.op.as_str() {
             "self" => {
                 objects = match source {
@@ -548,6 +987,48 @@ fn reject_pipeline_field(
     )
 }
 
+pub(crate) fn encode_pipeline(pipeline: &[PipelineStep]) -> Result<String, serde_json::Error> {
+    serde_json::to_string(pipeline)
+}
+
+type LegacyOperatorTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+pub(crate) fn decode_pipeline(pipeline_json: &str) -> Result<Vec<PipelineStep>, String> {
+    if let Ok(steps) = serde_json::from_str::<Vec<PipelineStep>>(pipeline_json) {
+        return Ok(steps);
+    }
+    let tuples: Vec<LegacyOperatorTuple> =
+        serde_json::from_str(pipeline_json).map_err(|error| error.to_string())?;
+    Ok(tuples
+        .into_iter()
+        .map(
+            |(op, kind, property, value, relation, dir, func, field, alias)| {
+                PipelineStep::Operator(OperatorStep {
+                    op,
+                    kind,
+                    property,
+                    value,
+                    relation,
+                    dir,
+                    func,
+                    field,
+                    alias,
+                })
+            },
+        )
+        .collect())
+}
+
 fn reject_named_property_for_objects(
     db: &RuntimeDb,
     objects: &[Object],
@@ -610,25 +1091,7 @@ impl SekaiDb {
                 .collect::<Vec<_>>(),
         )
         .map_err(|e| e.to_string())?;
-        let pipeline_json = serde_json::to_string(
-            &f.pipeline
-                .iter()
-                .map(|s| {
-                    (
-                        &s.op,
-                        &s.kind,
-                        &s.property,
-                        &s.value,
-                        &s.relation,
-                        &s.dir,
-                        &s.func,
-                        &s.field,
-                        &s.alias,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|e| e.to_string())?;
+        let pipeline_json = encode_pipeline(&f.pipeline).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sekai_functions (name,description,params,pipeline,created) VALUES (?1,?2,?3,?4,?5)",
             params![f.name, f.description, params_json, pipeline_json, f.created],
@@ -646,9 +1109,8 @@ impl SekaiDb {
                 let params_json: String = row.get(2)?;
                 let pipeline_json: String = row.get(3)?;
                 let params_vec: Vec<(String, String, bool)> =
-                    serde_json::from_str(&params_json).unwrap_or_default();
-                let pipeline_vec: Vec<PipelineRow> =
-                    serde_json::from_str(&pipeline_json).unwrap_or_default();
+                    serde_json::from_str(&params_json).map_err(sqlite_json_error)?;
+                let pipeline = decode_pipeline(&pipeline_json).map_err(sqlite_json_error)?;
                 Ok(Function {
                     name: row.get(0)?,
                     description: row.get(1)?,
@@ -660,24 +1122,7 @@ impl SekaiDb {
                             required,
                         })
                         .collect(),
-                    pipeline: pipeline_vec
-                        .into_iter()
-                        .map(
-                            |(op, kind, property, value, relation, dir, func, field, alias)| {
-                                PipelineStep {
-                                    op,
-                                    kind,
-                                    property,
-                                    value,
-                                    relation,
-                                    dir,
-                                    func,
-                                    field,
-                                    alias,
-                                }
-                            },
-                        )
-                        .collect(),
+                    pipeline,
                     created: row.get(4)?,
                 })
             },
@@ -696,9 +1141,8 @@ impl SekaiDb {
                 let params_json: String = row.get(2)?;
                 let pipeline_json: String = row.get(3)?;
                 let params_vec: Vec<(String, String, bool)> =
-                    serde_json::from_str(&params_json).unwrap_or_default();
-                let pipeline_vec: Vec<PipelineRow> =
-                    serde_json::from_str(&pipeline_json).unwrap_or_default();
+                    serde_json::from_str(&params_json).map_err(sqlite_json_error)?;
+                let pipeline = decode_pipeline(&pipeline_json).map_err(sqlite_json_error)?;
                 Ok(Function {
                     name: row.get(0)?,
                     description: row.get(1)?,
@@ -710,30 +1154,25 @@ impl SekaiDb {
                             required,
                         })
                         .collect(),
-                    pipeline: pipeline_vec
-                        .into_iter()
-                        .map(
-                            |(op, kind, property, value, relation, dir, func, field, alias)| {
-                                PipelineStep {
-                                    op,
-                                    kind,
-                                    property,
-                                    value,
-                                    relation,
-                                    dir,
-                                    func,
-                                    field,
-                                    alias,
-                                }
-                            },
-                        )
-                        .collect(),
+                    pipeline,
                     created: row.get(4)?,
                 })
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
+}
+
+fn sqlite_json_error(error: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        3,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
 }
 
 #[cfg(test)]
@@ -742,16 +1181,20 @@ mod tests {
     use crate::domain::{KIND_COMPONENT, Link};
 
     fn step(op: &str, kind: &str, relation: &str, func: &str, field: &str) -> PipelineStep {
-        PipelineStep {
+        PipelineStep::operator(op, kind, relation, func, field)
+    }
+
+    fn op_fields(op: &str, kind: &str, relation: &str, func: &str, field: &str) -> OperatorStep {
+        OperatorStep {
             op: op.into(),
             kind: kind.into(),
-            property: "".into(),
-            value: "".into(),
+            property: String::new(),
+            value: String::new(),
             relation: relation.into(),
-            dir: "".into(),
+            dir: String::new(),
             func: func.into(),
             field: field.into(),
-            alias: "".into(),
+            alias: String::new(),
         }
     }
 
@@ -854,10 +1297,10 @@ mod tests {
             pipeline: vec![
                 step("self", "", "", "", ""),
                 step("traverse", "", "contains", "", ""),
-                PipelineStep {
+                PipelineStep::Operator(OperatorStep {
                     alias: "component_count".into(),
-                    ..step("aggregate", "", "", "count", "")
-                },
+                    ..op_fields("aggregate", "", "", "count", "")
+                }),
             ],
         };
         let source = db.get_object("r1").unwrap().unwrap();
@@ -914,7 +1357,7 @@ mod tests {
             }],
             created: 0,
             pipeline: vec![
-                PipelineStep {
+                PipelineStep::Operator(OperatorStep {
                     op: "filter".into(),
                     kind: KIND_COMPONENT.into(),
                     property: "language".into(),
@@ -924,8 +1367,8 @@ mod tests {
                     func: "".into(),
                     field: "".into(),
                     alias: "".into(),
-                },
-                PipelineStep {
+                }),
+                PipelineStep::Operator(OperatorStep {
                     op: "aggregate".into(),
                     kind: "".into(),
                     property: "".into(),
@@ -935,7 +1378,7 @@ mod tests {
                     func: "sum".into(),
                     field: "task_total".into(),
                     alias: "total".into(),
-                },
+                }),
             ],
         };
         let params = HashMap::from([("lang".into(), "rust".into())]);
@@ -954,7 +1397,7 @@ mod tests {
                 param_type: "string".into(),
                 required: true,
             }],
-            pipeline: vec![PipelineStep {
+            pipeline: vec![PipelineStep::Operator(OperatorStep {
                 op: "filter".into(),
                 kind: KIND_COMPONENT.into(),
                 property: "language".into(),
@@ -964,7 +1407,7 @@ mod tests {
                 func: "".into(),
                 field: "".into(),
                 alias: "".into(),
-            }],
+            })],
             created: 42,
         };
         db.create_function(&f).unwrap();
@@ -1030,7 +1473,7 @@ mod tests {
             description: "".into(),
             params: vec![],
             created: 0,
-            pipeline: vec![PipelineStep {
+            pipeline: vec![PipelineStep::Operator(OperatorStep {
                 op: "filter".into(),
                 kind: "document".into(),
                 property: "salary".into(),
@@ -1040,7 +1483,7 @@ mod tests {
                 func: "".into(),
                 field: "".into(),
                 alias: "".into(),
-            }],
+            })],
         };
         assert!(
             execute(&db, &hidden_filter, &HashMap::new())
@@ -1055,7 +1498,7 @@ mod tests {
             created: 0,
             pipeline: vec![
                 step("filter", "document", "", "", ""),
-                PipelineStep {
+                PipelineStep::Operator(OperatorStep {
                     op: "aggregate".into(),
                     kind: "".into(),
                     property: "".into(),
@@ -1065,7 +1508,7 @@ mod tests {
                     func: "sum".into(),
                     field: "salary".into(),
                     alias: "total".into(),
-                },
+                }),
             ],
         };
         assert!(
@@ -1080,7 +1523,7 @@ mod tests {
             params: vec![],
             created: 0,
             pipeline: vec![
-                PipelineStep {
+                PipelineStep::Operator(OperatorStep {
                     op: "filter".into(),
                     kind: "document".into(),
                     property: "owner".into(),
@@ -1090,8 +1533,8 @@ mod tests {
                     func: "".into(),
                     field: "".into(),
                     alias: "".into(),
-                },
-                PipelineStep {
+                }),
+                PipelineStep::Operator(OperatorStep {
                     op: "aggregate".into(),
                     kind: "".into(),
                     property: "".into(),
@@ -1101,7 +1544,7 @@ mod tests {
                     func: "sum".into(),
                     field: "salary".into(),
                     alias: "total".into(),
-                },
+                }),
             ],
         };
         assert!(
@@ -1140,11 +1583,11 @@ mod tests {
             params: vec![],
             created: 0,
             pipeline: vec![
-                PipelineStep {
+                PipelineStep::Operator(OperatorStep {
                     property: "language".into(),
                     value: "rust".into(),
-                    ..step("filter", KIND_COMPONENT, "", "", "")
-                },
+                    ..op_fields("filter", KIND_COMPONENT, "", "", "")
+                }),
                 step("aggregate", "", "", "count", ""),
             ],
         };
@@ -1190,11 +1633,11 @@ mod tests {
             description: "".into(),
             params: vec![],
             created: 0,
-            pipeline: vec![PipelineStep {
+            pipeline: vec![PipelineStep::Operator(OperatorStep {
                 op: "repeat".into(),
                 value: "1000000".into(),
-                ..step("repeat", "", "", "", "")
-            }],
+                ..op_fields("repeat", "", "", "", "")
+            })],
         };
         let invocation = invoke(
             &db,
@@ -1255,5 +1698,337 @@ mod tests {
         )
         .unwrap();
         assert_eq!(invocation.result.aggregates["count"], "0");
+    }
+
+    const LLM_OUTPUT_SCHEMA: &str = r#"{"type":"object","properties":{"label":{"type":"string"}},"required":["label"],"additionalProperties":false}"#;
+
+    struct ScriptedHost {
+        output: serde_json::Value,
+    }
+
+    impl LlmStepHost for ScriptedHost {
+        fn complete(
+            &self,
+            _prompt_revision: &str,
+            _model_route: &str,
+            _bound_inputs: &serde_json::Value,
+            _output_schema: &str,
+        ) -> Result<serde_json::Value, String> {
+            Ok(self.output.clone())
+        }
+    }
+
+    fn fixture_component(db: &RuntimeDb) {
+        db.create_object(&Object {
+            id: "c1".into(),
+            kind: KIND_COMPONENT.into(),
+            name: "a".into(),
+            namespace: "".into(),
+            external_id: "".into(),
+            properties: HashMap::from([("language".into(), "rust".into())]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    }
+
+    fn classify_function() -> Function {
+        Function {
+            name: "classify".into(),
+            description: "".into(),
+            params: vec![],
+            created: 0,
+            pipeline: vec![
+                PipelineStep::Operator(OperatorStep {
+                    property: "language".into(),
+                    value: "rust".into(),
+                    ..op_fields("filter", KIND_COMPONENT, "", "", "")
+                }),
+                PipelineStep::Llm(LlmStep {
+                    prompt_revision: "classify/v1".into(),
+                    input_bindings: BTreeMap::from([("language".into(), "language".into())]),
+                    output_schema: LLM_OUTPUT_SCHEMA.into(),
+                    model_route: "native/scripted".into(),
+                    minimum_confidence_micros: 0,
+                }),
+            ],
+        }
+    }
+
+    fn invoke_host() -> FunctionHost {
+        FunctionHost {
+            now_ms: 1_700_000_000_000,
+            rng_seed: 7,
+        }
+    }
+
+    #[test]
+    fn llm_step_returns_schema_valid_structured_output() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fixture_component(&db);
+        let function = classify_function();
+        assert!(validate_function(&function).is_ok());
+        let host = ScriptedHost {
+            output: serde_json::json!({"label": "systems"}),
+        };
+        let invocation = invoke_with_llm(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget::default(),
+            &host,
+        )
+        .unwrap();
+        assert!(invocation.receipt.schema_error.is_empty());
+        assert_eq!(
+            invocation.result.structured,
+            Some(serde_json::json!({"label": "systems"}))
+        );
+        assert_eq!(invocation.receipt.model_route, "native/scripted");
+        assert!(invocation.receipt.prompt_digest.starts_with("sha256:"));
+        assert!(invocation.receipt.input_digest.starts_with("sha256:"));
+        assert!(invocation.receipt.output_digest.starts_with("sha256:"));
+        assert!(invocation.receipt.function_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn llm_step_receipt_is_stable_for_the_same_scripted_response() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fixture_component(&db);
+        let function = classify_function();
+        let host = ScriptedHost {
+            output: serde_json::json!({"label": "systems"}),
+        };
+        let first = invoke_with_llm(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget::default(),
+            &host,
+        )
+        .unwrap();
+        let second = invoke_with_llm(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget::default(),
+            &host,
+        )
+        .unwrap();
+        assert_eq!(
+            first.receipt.function_digest,
+            second.receipt.function_digest
+        );
+        assert_eq!(first.receipt.prompt_digest, second.receipt.prompt_digest);
+        assert_eq!(first.receipt.model_route, second.receipt.model_route);
+        assert_eq!(first.receipt.input_digest, second.receipt.input_digest);
+        assert_eq!(first.receipt.output_digest, second.receipt.output_digest);
+        assert_eq!(first.receipt.schema_error, second.receipt.schema_error);
+        assert_eq!(first.receipt.now_ms, second.receipt.now_ms);
+        assert_eq!(first.receipt.rng_seed, second.receipt.rng_seed);
+    }
+
+    #[test]
+    fn llm_step_schema_invalid_output_records_an_error_on_the_receipt() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fixture_component(&db);
+        let function = classify_function();
+        let host = ScriptedHost {
+            output: serde_json::json!({"score": 1}),
+        };
+        let invocation = invoke_with_llm(
+            &db,
+            &function,
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget::default(),
+            &host,
+        )
+        .unwrap();
+        assert!(invocation.result.structured.is_none());
+        assert_eq!(
+            invocation.receipt.schema_error,
+            "missing required property label"
+        );
+        assert_eq!(
+            invocation.result.schema_error,
+            invocation.receipt.schema_error
+        );
+        assert_eq!(invocation.receipt.model_route, "native/scripted");
+        assert!(invocation.receipt.prompt_digest.starts_with("sha256:"));
+        assert!(invocation.receipt.output_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn llm_step_without_a_host_fails_closed() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fixture_component(&db);
+        let error = invoke(
+            &db,
+            &classify_function(),
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "llm step requires a host");
+    }
+
+    #[test]
+    fn llm_step_requires_prompt_schema_and_pinned_route() {
+        let mut function = classify_function();
+        if let PipelineStep::Llm(step) = &mut function.pipeline[1] {
+            step.model_route.clear();
+        }
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("llm requires model_route")
+        );
+    }
+
+    #[test]
+    fn decode_pipeline_reads_legacy_operator_tuples() {
+        let pipeline = decode_pipeline(r#"[["filter","component","","","","","","",""]]"#).unwrap();
+        match &pipeline[0] {
+            PipelineStep::Operator(step) => {
+                assert_eq!(step.op, "filter");
+                assert_eq!(step.kind, "component");
+            }
+            PipelineStep::Llm(_) => panic!("expected operator step"),
+        }
+    }
+
+    #[test]
+    fn encode_pipeline_roundtrips_an_llm_step() {
+        let pipeline = classify_function().pipeline;
+        let encoded = encode_pipeline(&pipeline).unwrap();
+        assert!(encoded.contains("\"step\":\"llm\""));
+        let decoded = decode_pipeline(&encoded).unwrap();
+        assert_eq!(decoded.len(), 2);
+        match &decoded[1] {
+            PipelineStep::Llm(step) => {
+                assert_eq!(step.prompt_revision, "classify/v1");
+                assert_eq!(step.model_route, "native/scripted");
+                assert_eq!(step.minimum_confidence_micros, 0);
+            }
+            PipelineStep::Operator(_) => panic!("expected llm step"),
+        }
+    }
+
+    #[test]
+    fn get_function_reads_legacy_tuple_pipeline() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_functions (name,description,params,pipeline,created) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    "legacy",
+                    "",
+                    "[]",
+                    r#"[["filter","component","","","","","","",""]]"#,
+                    0
+                ],
+            )
+            .unwrap();
+        let stored = db.get_function("legacy").unwrap().unwrap();
+        match &stored.pipeline[0] {
+            PipelineStep::Operator(step) => assert_eq!(step.op, "filter"),
+            PipelineStep::Llm(_) => panic!("expected operator step"),
+        }
+    }
+
+    #[test]
+    fn llm_step_rejects_a_second_llm_step() {
+        let mut function = classify_function();
+        function.pipeline.push(PipelineStep::Llm(LlmStep {
+            prompt_revision: "classify/v2".into(),
+            input_bindings: BTreeMap::new(),
+            output_schema: LLM_OUTPUT_SCHEMA.into(),
+            model_route: "native/scripted".into(),
+            minimum_confidence_micros: 0,
+        }));
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("at most one llm step")
+        );
+    }
+
+    #[test]
+    fn llm_step_rejects_confidence_above_one_million() {
+        let mut function = classify_function();
+        if let PipelineStep::Llm(step) = &mut function.pipeline[1] {
+            step.minimum_confidence_micros = 1_000_001;
+        }
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("minimum_confidence_micros must be at most 1000000")
+        );
+    }
+
+    #[test]
+    fn llm_step_rejects_non_string_schema_type() {
+        let mut function = classify_function();
+        if let PipelineStep::Llm(step) = &mut function.pipeline[1] {
+            step.output_schema = r#"{"type":1,"properties":{"label":{"type":"string"}}}"#.into();
+        }
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("schema type must be a string")
+        );
+    }
+
+    #[test]
+    fn llm_step_rejects_unsupported_output_schema_keywords() {
+        let mut function = classify_function();
+        if let PipelineStep::Llm(step) = &mut function.pipeline[1] {
+            step.output_schema =
+                r#"{"type":"object","properties":{"label":{"type":"string","enum":["a"]}},"required":["label"]}"#
+                    .into();
+        }
+        assert!(
+            validate_function(&function)
+                .unwrap_err()
+                .contains("unsupported output schema keyword enum")
+        );
+    }
+
+    #[test]
+    fn llm_step_structured_output_counts_toward_output_budget() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        fixture_component(&db);
+        let host = ScriptedHost {
+            output: serde_json::json!({"label": "this-label-is-too-long-for-the-budget"}),
+        };
+        let invocation = invoke_with_llm(
+            &db,
+            &classify_function(),
+            &HashMap::new(),
+            |_| Ok(true),
+            invoke_host(),
+            FunctionBudget {
+                max_time_ms: 50,
+                max_output_bytes: 8,
+                max_steps: 32,
+            },
+            &host,
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.receipt.budget_exceeded,
+            "function budget exceeded: max_output_bytes"
+        );
+        assert!(invocation.result.structured.is_none());
     }
 }

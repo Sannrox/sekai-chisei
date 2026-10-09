@@ -2,6 +2,10 @@ use super::*;
 use std::collections::HashMap;
 use tonic::metadata::MetadataValue;
 
+fn operator_pipeline(op: &str, relation: &str, func: &str, alias: &str) -> PipelineStep {
+    proto_operator_step(op, "", relation, func, "", alias)
+}
+
 fn service() -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
@@ -3526,7 +3530,7 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
         .with_sqlite_conn(|connection| {
             connection.execute(
                 "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
-                rusqlite::params!["corrupt-dataset", "not-json"],
+                ["corrupt-dataset", "not-json"],
             )
         })
         .unwrap()
@@ -3701,6 +3705,79 @@ async fn update_unbound_dataset_requires_gateway_service_principal() {
 }
 
 #[tokio::test]
+async fn create_function_rejects_an_empty_pipeline_step() {
+    let svc = service();
+    let error = svc
+        .create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "empty-step".into(),
+                pipeline: vec![PipelineStep {
+                    step: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("pipeline step required"));
+}
+
+#[tokio::test]
+async fn create_and_list_function_with_llm_step_fail_closes_invoke_without_a_host() {
+    let svc = service();
+    let schema =
+        r#"{"type":"object","properties":{"label":{"type":"string"}},"required":["label"]}"#;
+    svc.create_function(with_principal(CreateFunctionRequest {
+        function: Some(Function {
+            name: "classify".into(),
+            pipeline: vec![PipelineStep {
+                step: Some(pipeline_step::Step::Llm(LlmStep {
+                    prompt_revision: "classify/v1".into(),
+                    input_bindings: HashMap::from([("language".into(), "language".into())]),
+                    output_schema: schema.into(),
+                    model_route: "native/scripted".into(),
+                    minimum_confidence_micros: 800_000,
+                })),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_functions(with_principal(ListFunctionsRequest {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .functions;
+    let function = listed
+        .iter()
+        .find(|function| function.name == "classify")
+        .expect("classify function");
+    match function.pipeline[0].step.as_ref() {
+        Some(pipeline_step::Step::Llm(step)) => {
+            assert_eq!(step.prompt_revision, "classify/v1");
+            assert_eq!(step.model_route, "native/scripted");
+            assert_eq!(step.output_schema, schema);
+            assert_eq!(step.minimum_confidence_micros, 800_000);
+        }
+        other => panic!("expected llm step, got {other:?}"),
+    }
+    let error = svc
+        .invoke_function(with_principal(InvokeFunctionRequest {
+            name: "classify".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(error.message().contains("llm step requires a host"));
+}
+
+#[tokio::test]
 async fn computed_property_resolves_from_function_without_persisting() {
     let svc = service();
     grant_schema_admin(&svc);
@@ -3710,39 +3787,9 @@ async fn computed_property_resolves_from_function_without_persisting() {
             description: "".into(),
             params: vec![],
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "traverse".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "contains".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "child_count".into(),
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("traverse", "contains", "", ""),
+                operator_pipeline("aggregate", "", "count", "child_count"),
             ],
             created: 1,
         }),
@@ -3962,21 +4009,9 @@ async fn computed_aggregates_exclude_objects_denied_by_active_policy() {
         function: Some(Function {
             name: "count_policy_children".into(),
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    ..Default::default()
-                },
-                PipelineStep {
-                    op: "traverse".into(),
-                    relation: "contains".into(),
-                    ..Default::default()
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    func: "count".into(),
-                    r#as: "child_count".into(),
-                    ..Default::default()
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("traverse", "contains", "", ""),
+                operator_pipeline("aggregate", "", "count", "child_count"),
             ],
             ..Default::default()
         }),
@@ -4137,21 +4172,9 @@ async fn computed_properties_respect_team_namespace_boundaries() {
             function: Some(Function {
                 name: "count_team_children".into(),
                 pipeline: vec![
-                    PipelineStep {
-                        op: "self".into(),
-                        ..Default::default()
-                    },
-                    PipelineStep {
-                        op: "traverse".into(),
-                        relation: "contains".into(),
-                        ..Default::default()
-                    },
-                    PipelineStep {
-                        op: "aggregate".into(),
-                        func: "count".into(),
-                        r#as: "child_count".into(),
-                        ..Default::default()
-                    },
+                    operator_pipeline("self", "", "", ""),
+                    operator_pipeline("traverse", "contains", "", ""),
+                    operator_pipeline("aggregate", "", "count", "child_count"),
                 ],
                 ..Default::default()
             }),
@@ -4272,39 +4295,9 @@ async fn unresolved_computed_property_hides_stored_value() {
             description: "".into(),
             params: vec![],
             pipeline: vec![
-                PipelineStep {
-                    op: "self".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "".into(),
-                    field: "".into(),
-                    r#as: "".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "first".into(),
-                },
-                PipelineStep {
-                    op: "aggregate".into(),
-                    kind: "".into(),
-                    property: "".into(),
-                    value: "".into(),
-                    relation: "".into(),
-                    dir: "".into(),
-                    func: "count".into(),
-                    field: "".into(),
-                    r#as: "second".into(),
-                },
+                operator_pipeline("self", "", "", ""),
+                operator_pipeline("aggregate", "", "count", "first"),
+                operator_pipeline("aggregate", "", "count", "second"),
             ],
             created: 1,
         }),
@@ -5297,7 +5290,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
     budget
         .set_limit("action:governed", 1, PeriodType::Daily)
         .unwrap();
-    let clerk = crate::chisei::cross_store_admission::CrossStoreAdmission::new(
+    let clerk = crate::composition::cross_store_admission::CrossStoreAdmission::new(
         chisei_store,
         sekai_store.clone(),
         Some(budget.clone()),
@@ -8056,7 +8049,7 @@ async fn coordination_filters_paginates_and_dry_run_reconciles() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-f1"],
+            ["wu-f1"],
         )
         .unwrap();
 
@@ -8384,7 +8377,7 @@ async fn reconcile_requires_scope_ownership_for_target_scope() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-other"],
+            ["wu-other"],
         )
         .unwrap();
 
@@ -8500,7 +8493,7 @@ async fn reconcile_with_mismatched_scope_and_work_unit_returns_empty() {
         .conn()
         .execute(
             "UPDATE sekai_reservations SET expires_at = 1 WHERE work_unit_id = ?1",
-            rusqlite::params!["wu-mismatch"],
+            ["wu-mismatch"],
         )
         .unwrap();
 
@@ -10150,7 +10143,7 @@ async fn seed_semantic_catalog_graph(svc: &SekaiServiceImpl) {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
 fn postgres_semantic_discovery_is_honest_about_entailment() {
-    let scratch = crate::db::postgres::ScratchDatabase::create();
+    let scratch = crate::db::ScratchDatabase::create();
     let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -10827,6 +10820,18 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
             .map(|limit| limit.value),
         Some(u64::from(enabled))
     );
+
+    let transform = core
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY)
+        .expect("core catalog reports the in-process transform host");
+    assert_eq!(transform.product_tier, "core");
+    assert_eq!(
+        transform.lifecycle_state,
+        if enabled { "active" } else { "disabled" }
+    );
+    assert!(transform.description.contains("dataset transform host"));
 }
 
 #[tokio::test]
@@ -11291,8 +11296,14 @@ async fn agent_definition_member_read_crosses_server_transport() {
         definition_branch_domain::prepare_revision("foreign", "", Vec::new(), false, "author", 4)
             .unwrap(),
     ] {
-        sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
-            rusqlite::params![serde_json::to_string(&substituted).unwrap(), revision]).unwrap();
+        let body = serde_json::to_string(&substituted).unwrap();
+        sqlite
+            .conn()
+            .execute(
+                "UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+                [body.as_str(), revision.as_str()],
+            )
+            .unwrap();
         let corrupt = client
             .get_definition_member(request(&claims(), "allowed", &revision, "triage"))
             .await
@@ -11300,8 +11311,13 @@ async fn agent_definition_member_read_crosses_server_transport() {
         assert_eq!(corrupt.code(), tonic::Code::Internal);
         assert_eq!(corrupt.message(), "definition member unavailable");
     }
-    sqlite.conn().execute("UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
-        rusqlite::params![original_body, revision]).unwrap();
+    sqlite
+        .conn()
+        .execute(
+            "UPDATE sekai_definition_revisions SET body_json = ?1 WHERE namespace = 'allowed' AND revision_digest = ?2",
+            [original_body.as_str(), revision.as_str()],
+        )
+        .unwrap();
     sqlite
         .conn()
         .execute(
@@ -11650,4 +11666,85 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
     }
     stop.send(()).unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_pipeline_round_trips_through_create_and_list() {
+    use prost::Message;
+    let svc = service();
+    // filter/customer, encoded by the old flat PipelineStep schema.
+    let bytes = b"\x0a\x06filter\x12\x08customer";
+    let step = PipelineStep::decode(bytes.as_slice()).unwrap();
+    let created = svc
+        .create_function(with_principal(CreateFunctionRequest {
+            function: Some(Function {
+                name: "legacy-filter".into(),
+                pipeline: vec![step],
+                ..Default::default()
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .function
+        .unwrap();
+    let projected = &created.pipeline[0];
+    assert_eq!(projected.op, "filter");
+    assert_eq!(projected.kind, "customer");
+    assert!(matches!(
+        projected.step,
+        Some(pipeline_step::Step::Operator(_))
+    ));
+    svc.create_function(with_principal(CreateFunctionRequest {
+        function: Some(Function {
+            name: "legacy-round-trip".into(),
+            ..created.clone()
+        }),
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_functions(with_principal(ListFunctionsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        listed
+            .functions
+            .iter()
+            .find(|f| f.name == created.name)
+            .unwrap()
+            .pipeline,
+        created.pipeline
+    );
+}
+
+#[tokio::test]
+async fn create_function_rejects_conflicting_pipeline_representations() {
+    let svc = service();
+    for variant in [
+        pipeline_step::Step::Operator(OperatorStep {
+            op: "aggregate".into(),
+            func: "count".into(),
+            ..Default::default()
+        }),
+        pipeline_step::Step::Llm(LlmStep::default()),
+    ] {
+        let error = svc
+            .create_function(with_principal(CreateFunctionRequest {
+                function: Some(Function {
+                    name: "conflicting".into(),
+                    pipeline: vec![PipelineStep {
+                        op: "filter".into(),
+                        step: Some(variant),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("conflicting pipeline step"));
+    }
 }

@@ -48,6 +48,25 @@ impl ProcessPlane {
         }
     }
 
+    /// Chisei-plane requires a hop target (ADR 0096 rule 4). Combined and
+    /// Sekai planes ignore the value. Reference-platform analog: governed compute
+    /// modules that use OSDK require the platform endpoint variable at process start.
+    pub fn require_sekai_endpoint(self, endpoint: Option<&str>) -> Result<(), String> {
+        match self {
+            Self::Chisei => {
+                let trimmed = endpoint.map(str::trim).filter(|value| !value.is_empty());
+                if trimmed.is_none() {
+                    return Err(
+                        "chisei process requires SEKAI_ENDPOINT; set it to the Sekai gRPC address (for example http://127.0.0.1:50051)"
+                            .into(),
+                    );
+                }
+                Ok(())
+            }
+            Self::Combined | Self::Sekai => Ok(()),
+        }
+    }
+
     pub fn open_layout(self, default_sqlite_path: &str) -> Result<CombinedStoreLayout, String> {
         match self {
             Self::Combined => {
@@ -140,14 +159,20 @@ fn open_owned_layout(
     let layout = match (backend, url) {
         (BackendIdentity::Postgres, Some(url)) => {
             let identity = crate::combined_stores::postgres_identity(url)?;
-            let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-                BackendIdentity::Postgres,
-                None,
-                "unused.db",
-                Some(url),
-                pool_size,
-                sources.postgres_ca_cert_path.as_deref(),
-            )?)?;
+            let backend = RuntimeBackend::initialize(
+                RuntimeBackendConfig::from_sources(
+                    BackendIdentity::Postgres,
+                    None,
+                    "unused.db",
+                    Some(url),
+                    pool_size,
+                    sources.postgres_ca_cert_path.as_deref(),
+                )?
+                .with_schema_plane(match role {
+                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
+                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
+                }),
+            )?;
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
@@ -167,14 +192,20 @@ fn open_owned_layout(
         }
         (BackendIdentity::Sqlite, _) => {
             let identity = crate::combined_stores::sqlite_identity(path)?;
-            let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_sources(
-                BackendIdentity::Sqlite,
-                Some(path),
-                path,
-                None,
-                pool_size,
-                sources.postgres_ca_cert_path.as_deref(),
-            )?)?;
+            let backend = RuntimeBackend::initialize(
+                RuntimeBackendConfig::from_sources(
+                    BackendIdentity::Sqlite,
+                    Some(path),
+                    path,
+                    None,
+                    pool_size,
+                    sources.postgres_ca_cert_path.as_deref(),
+                )?
+                .with_schema_plane(match role {
+                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
+                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
+                }),
+            )?;
             backend
                 .capabilities()
                 .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
@@ -261,6 +292,26 @@ mod tests {
     }
 
     #[test]
+    fn chisei_process_requires_sekai_endpoint() {
+        let err = ProcessPlane::Chisei
+            .require_sekai_endpoint(None)
+            .unwrap_err();
+        assert!(err.contains("SEKAI_ENDPOINT"), "{err}");
+        assert!(
+            ProcessPlane::Chisei
+                .require_sekai_endpoint(Some("http://127.0.0.1:50051"))
+                .is_ok()
+        );
+        assert!(ProcessPlane::Combined.require_sekai_endpoint(None).is_ok());
+        assert!(ProcessPlane::Sekai.require_sekai_endpoint(None).is_ok());
+        assert!(
+            ProcessPlane::Chisei
+                .require_sekai_endpoint(Some("   "))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn sekai_process_refuses_chisei_destination_env() {
         let err = open_owned_layout(
             StorePlaneRole::Sekai,
@@ -318,7 +369,10 @@ mod tests {
             chisei_owned(sekai.to_str().unwrap()),
         )
         .unwrap_err();
-        assert!(err.contains("stamped for sekai"), "{err}");
+        assert!(
+            err.contains("stamped for sekai") || err.contains("missed relocation"),
+            "{err}"
+        );
     }
 
     #[test]

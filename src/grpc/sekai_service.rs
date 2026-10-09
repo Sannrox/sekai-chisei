@@ -163,7 +163,7 @@ pub struct SekaiServiceImpl {
     pub(super) object_index_dual_read: bool,
     pub(super) object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead,
     pub(super) cross_store:
-        Option<std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>>,
+        Option<std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>>,
 }
 
 impl SekaiServiceImpl {
@@ -199,9 +199,29 @@ impl SekaiServiceImpl {
         }
     }
 
+    /// Registered so wrong-plane Sekai RPCs can return FAILED_PRECONDITION
+    /// without requiring Sekai tables on a Chisei-only dest.
+    pub fn wrong_plane_placeholder(db: crate::db::store::SekaiStore) -> Self {
+        let schema_definitions = SchemaDefinitionLifecycle::empty(db.runtime_arc());
+        Self {
+            db,
+            security: Arc::new(SecurityChecker::new()),
+            schema_definitions,
+            gateway_schema_principals: Vec::new(),
+            site_id: crate::sekai::lease::DEFAULT_SITE_ID.into(),
+            object_query_cursor_key: [0u8; 32],
+            object_index_engine: crate::sekai::object_index_engine::ObjectIndexEngineKind::from_env(
+            ),
+            object_index_dual_read:
+                crate::sekai::object_index_engine::ObjectIndexEngineKind::dual_read_from_env(),
+            object_log_dual_read: crate::sekai::object_log::ObjectLogDualRead::from_env(),
+            cross_store: None,
+        }
+    }
+
     pub fn with_cross_store_admission(
         mut self,
-        clerk: std::sync::Arc<crate::chisei::cross_store_admission::CrossStoreAdmission>,
+        clerk: std::sync::Arc<crate::composition::cross_store_admission::CrossStoreAdmission>,
     ) -> Self {
         self.cross_store = Some(clerk);
         self
@@ -1092,6 +1112,48 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetGovernedTransformRunRequest>,
     ) -> Result<Response<GetGovernedTransformRunResponse>, Status> {
         rpc_data::get_governed_transform_run(self, req).await
+    }
+    async fn admit_governed_document(
+        &self,
+        req: Request<AdmitGovernedDocumentRequest>,
+    ) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
+        rpc_data::admit_governed_document(self, req).await
+    }
+    async fn attach_governed_document_rendition(
+        &self,
+        req: Request<AttachGovernedDocumentRenditionRequest>,
+    ) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
+        rpc_data::attach_governed_document_rendition(self, req).await
+    }
+    async fn get_governed_document(
+        &self,
+        req: Request<GetGovernedDocumentRequest>,
+    ) -> Result<Response<GetGovernedDocumentResponse>, Status> {
+        rpc_data::get_governed_document(self, req).await
+    }
+    async fn hold_governed_document(
+        &self,
+        req: Request<HoldGovernedDocumentRequest>,
+    ) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
+        rpc_data::hold_governed_document(self, req).await
+    }
+    async fn release_governed_document_hold(
+        &self,
+        req: Request<ReleaseGovernedDocumentHoldRequest>,
+    ) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
+        rpc_data::release_governed_document_hold(self, req).await
+    }
+    async fn expire_governed_document(
+        &self,
+        req: Request<ExpireGovernedDocumentRequest>,
+    ) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
+        rpc_data::expire_governed_document(self, req).await
+    }
+    async fn delete_governed_document(
+        &self,
+        req: Request<DeleteGovernedDocumentRequest>,
+    ) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
+        rpc_data::delete_governed_document(self, req).await
     }
     async fn update_dataset(
         &self,

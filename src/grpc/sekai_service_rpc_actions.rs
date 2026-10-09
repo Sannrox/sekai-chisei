@@ -185,11 +185,9 @@ pub(super) async fn submit_action_instance(
         let result = if let Some(clerk) = &service.cross_store {
             clerk.admit(admission_request, &actor, now_millis())
         } else {
-            ActionInstanceAdmission::new(service.db.runtime(), None).admit(
-                admission_request,
-                &actor,
-                now_millis(),
-            )
+            ActionInstanceAdmission::new(service.db.runtime(), None)
+                .with_proposal(Some(&crate::chisei::system_one_action::SystemOneProposal))
+                .admit(admission_request, &actor, now_millis())
         };
         result.map_err(|error| match error {
             ActionInstanceAdmissionError::InvalidArgument(message) => {
@@ -224,16 +222,6 @@ pub(super) async fn decide_action_instance(
 
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
-    // Before any lookup, so the answer never depends on whether an
-    // instance exists.
-    if matches!(
-        service.db.runtime(),
-        crate::db::runtime_db::RuntimeDb::Postgres(_)
-    ) {
-        return Err(Status::unavailable(
-            crate::db::runtime_db::DECIDE_ACTION_INSTANCE_UNAVAILABLE,
-        ));
-    }
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let access_denied = || Status::permission_denied(DECISION_ACCESS_DENIED);
     // An approval binds to one credentialed subject (#1140). Self-asserted
@@ -352,9 +340,16 @@ pub(super) async fn preview_object_action(
             ),
         ) => return Err(Status::invalid_argument(error)),
     };
+    let clerk = service.cross_store.as_ref();
+    let budget = clerk.and_then(|clerk| clerk.budget_port());
+    let fallback_proposal = crate::chisei::system_one_action::SystemOneProposal;
+    let proposal: &dyn crate::sekai::action_ports::ActionProposalPort = match clerk {
+        Some(clerk) => clerk.proposal_port(),
+        None => &fallback_proposal,
+    };
     let admission = crate::sekai::action_describe_preview::preview_object_action_admission(
         service.db.runtime(),
-        None,
+        budget,
         crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
             actor: &actor,
             object: &object,
@@ -413,7 +408,8 @@ pub(super) async fn preview_object_action(
     }
     let preview = crate::sekai::action_describe_preview::preview_object_action(
         service.db.runtime(),
-        None,
+        budget,
+        Some(proposal),
         crate::sekai::action_describe_preview::ObjectActionPreviewRequest {
             actor: &actor,
             object: &object,

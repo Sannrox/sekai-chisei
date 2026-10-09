@@ -64,6 +64,21 @@ pub trait ChiseiKiokuBackend: Send + Sync {
         &self,
         request: KiokuEvidenceReassessmentRequest,
     ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        self.reassess_kioku_memory_inner(request, true)
+    }
+
+    fn reassess_kioku_memory_after_graph_auth(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
+        self.reassess_kioku_memory_inner(request, false)
+    }
+
+    fn reassess_kioku_memory_inner(
+        &self,
+        request: KiokuEvidenceReassessmentRequest,
+        authorize_graph: bool,
+    ) -> Result<KiokuEvidenceReassessmentResult, String> {
         if request.memory_id.trim().is_empty() || request.memory_version == 0 {
             return Err("reassessment memory reference is required".into());
         }
@@ -149,15 +164,18 @@ pub trait ChiseiKiokuBackend: Send + Sync {
             request.memory_version,
             &request.reassessment_key,
         );
-        let ceiling =
-            self.kioku_authorized_classification_ceiling(&prior.namespace, &request.actor)?;
-        if prior.classification > ceiling {
-            return Err("memory classification exceeds actor grant".into());
+        if authorize_graph {
+            let ceiling =
+                self.kioku_authorized_classification_ceiling(&prior.namespace, &request.actor)?;
+            if prior.classification > ceiling {
+                return Err("memory classification exceeds actor grant".into());
+            }
         }
         // Reauthorize every entry in the merged basis, including entries that
         // were carried forward unchanged. Governed evidence may have changed
         // lifecycle, retention, classification, or projection grants since
-        // the prior memory version was admitted.
+        // the prior memory version was admitted. Graph authorization runs on
+        // the Sekai dest for Combined Split; unbound identity checks stay here.
         for basis in &merged_basis {
             if basis.source_submission_id.is_empty() {
                 let prior_basis = baseline_basis
@@ -177,7 +195,7 @@ pub trait ChiseiKiokuBackend: Send + Sync {
                             .into(),
                     );
                 }
-            } else {
+            } else if authorize_graph {
                 self.authorize_kioku_evidence(&KiokuEvidenceAuthorizationRequest {
                     source_submission_id: basis.source_submission_id.clone(),
                     namespace: prior.namespace.clone(),
