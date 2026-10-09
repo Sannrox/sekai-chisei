@@ -856,6 +856,7 @@ pub(super) fn to_proto_pipeline_step(step: &function::PipelineStep) -> PipelineS
                 input_bindings: step.input_bindings.clone().into_iter().collect(),
                 output_schema: step.output_schema.clone(),
                 model_route: step.model_route.clone(),
+                minimum_confidence_micros: step.minimum_confidence_micros,
             })),
             ..Default::default()
         },
@@ -922,6 +923,7 @@ pub(super) fn from_proto_pipeline_step(
                 input_bindings: step.input_bindings.clone().into_iter().collect(),
                 output_schema: step.output_schema.clone(),
                 model_route: step.model_route.clone(),
+                minimum_confidence_micros: step.minimum_confidence_micros,
             }))
         }
         None if !step.op.is_empty() => {
