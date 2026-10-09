@@ -36,7 +36,16 @@ caller ceiling, a mismatched purpose, a foreign owner, or an unknown field
 fails before disclosure. Re-admission of the same live document and content
 digest is idempotent.
 
-SQLite is the reference store. PostgreSQL stays unavailable.
+SQLite is the reference store. Community PostgreSQL shares the same
+persistence and experimental RPCs (#1325). The plane still stores no bytes
+and runs no extractor.
+
+## Amendment 2026-10-09
+
+#1325 ports admit, rendition, retrieve, hold, expire, and delete onto
+community PostgreSQL and exposes those operations as experimental
+`SekaiService` RPCs. Foundry Media Sets keep bytes and extractors in the
+platform; this plane records digest-addressed references only.
 
 ## Alternatives considered
 

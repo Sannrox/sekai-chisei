@@ -100,6 +100,7 @@ const CHISEI_ROUTING_PROFILES_SCHEMA: &str =
 const GOVERNED_TRANSFORMS_SCHEMA: &str = include_str!("postgres/0050_governed_transforms.sql");
 const OBSERVATION_EXTERNAL_ID_SCHEMA: &str =
     include_str!("postgres/0051_observation_external_id.sql");
+const GOVERNED_DOCUMENTS_SCHEMA: &str = include_str!("postgres/0052_governed_documents.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -438,6 +439,12 @@ const MIGRATIONS: &[Migration] = &[
         50,
         "observation_external_id",
         OBSERVATION_EXTERNAL_ID_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        51,
+        "governed_documents",
+        GOVERNED_DOCUMENTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -1269,6 +1276,12 @@ mod tests {
             assert!(
                 GOVERNED_TRANSFORMS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
                 "missing PostgreSQL governed-transform table {table}"
+            );
+        }
+        for table in ["sekai_governed_documents", "sekai_governed_renditions"] {
+            assert!(
+                GOVERNED_DOCUMENTS_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
+                "missing PostgreSQL governed-document table {table}"
             );
         }
         assert!(

@@ -60,4 +60,9 @@ Unrequested classified fields are omitted. Requesting them fails before any
 disclosure. Re-admission of the same live document and content digest is
 idempotent. Partial output is discarded.
 
-SQLite stores documents and renditions. PostgreSQL surfaces stay unavailable.
+SQLite and community PostgreSQL store documents and renditions. Experimental
+RPCs (`AdmitGovernedDocument`, `AttachGovernedDocumentRendition`,
+`GetGovernedDocument`, `HoldGovernedDocument`, `ReleaseGovernedDocumentHold`,
+`ExpireGovernedDocument`, `DeleteGovernedDocument`) mirror the CLI. Enable
+them with `SEKAI_EXPERIMENTAL_RPCS=1`. The plane still stores no bytes and
+runs no extractor.

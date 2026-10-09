@@ -76,6 +76,7 @@ mod postgres_dataset;
 pub(crate) mod postgres_decision;
 mod postgres_deduplication;
 mod postgres_definition_branch;
+mod postgres_document;
 mod postgres_eval;
 mod postgres_evaluation_execution;
 mod postgres_evaluation_manifest;

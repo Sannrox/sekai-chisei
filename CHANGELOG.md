@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Governed documents and renditions persist on community PostgreSQL with the
+  same owner, purpose, classification, and hold rules as SQLite. Experimental
+  RPCs admit, attach a rendition, get, hold, release hold, expire, and delete
+  (`SEKAI_EXPERIMENTAL_RPCS=1`). The plane still stores no bytes (#1325).
 - `DecideActionInstance` and `ListActionInstances` are stable. Community
   PostgreSQL grants or denies a parked instance with the same named-approver
   rules as SQLite; `ListActionInstances.status` is the parked inbox. The

@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 34,
+  "limit": 33,
   "surfaces": [
     {
       "id": "SekaiService.PutPurposeAuthorization",
@@ -132,11 +132,6 @@
       "id": "admin.governed-image",
       "kind": "admin",
       "methods": ["put_governed_image", "get_governed_image"]
-    },
-    {
-      "id": "admin.governed-document",
-      "kind": "admin",
-      "methods": ["put_governed_document", "get_governed_document"]
     },
     {
       "id": "admin.open-table",

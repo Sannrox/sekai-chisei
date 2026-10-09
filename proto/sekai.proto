@@ -556,6 +556,114 @@ message GetGovernedTransformRunRequest {
 message GetGovernedTransformRunResponse {
   TransformRun run = 1;
 }
+message ContentReference {
+  string scheme = 1;
+  string digest = 2;
+  string media_type = 3;
+  uint64 byte_length = 4;
+}
+message GovernedDocument {
+  string contract_version = 1;
+  string document_id = 2;
+  string namespace = 3;
+  string owner = 4;
+  string type_revision = 5;
+  string purpose = 6;
+  string classification = 7;
+  string title = 8;
+  map<string, string> metadata = 9;
+  ContentReference content_ref = 10;
+  string content_digest = 11;
+  int64 expires_at_ms = 12;
+  string hold_id = 13;
+  string hold_reason = 14;
+  string admitted_by = 15;
+  int64 admitted_at_ms = 16;
+  int64 deleted_at_ms = 17;
+}
+message DocumentRendition {
+  string namespace = 1;
+  string document_id = 2;
+  string rendition_id = 3;
+  string class = 4;
+  string parent_content_digest = 5;
+  ContentReference content_ref = 6;
+  string extractor_id = 7;
+  string extractor_profile_digest = 8;
+  string attached_by = 9;
+  int64 attached_at_ms = 10;
+}
+message DocumentView {
+  string contract_version = 1;
+  string document_id = 2;
+  string namespace = 3;
+  string type_revision = 4;
+  string lifecycle = 5;
+  string definition_digest = 6;
+  optional ContentReference content_ref = 7;
+  optional string title = 8;
+  map<string, string> metadata = 9;
+  optional string purpose = 10;
+  optional string classification = 11;
+  optional int64 expires_at_ms = 12;
+  optional string hold_id = 13;
+  repeated DocumentRendition renditions = 14;
+  bool has_metadata = 15;
+  bool has_renditions = 16;
+}
+message AdmitGovernedDocumentRequest {
+  GovernedDocument document = 1;
+}
+message AdmitGovernedDocumentResponse {
+  GovernedDocument document = 1;
+}
+message AttachGovernedDocumentRenditionRequest {
+  DocumentRendition rendition = 1;
+}
+message AttachGovernedDocumentRenditionResponse {
+  DocumentRendition rendition = 1;
+}
+message GetGovernedDocumentRequest {
+  string namespace = 1;
+  string document_id = 2;
+  string purpose = 3;
+  repeated string fields = 4;
+  string classification_ceiling = 5;
+}
+message GetGovernedDocumentResponse {
+  DocumentView view = 1;
+}
+message HoldGovernedDocumentRequest {
+  string namespace = 1;
+  string document_id = 2;
+  string hold_id = 3;
+  string reason = 4;
+}
+message HoldGovernedDocumentResponse {
+  GovernedDocument document = 1;
+}
+message ReleaseGovernedDocumentHoldRequest {
+  string namespace = 1;
+  string document_id = 2;
+  string hold_id = 3;
+}
+message ReleaseGovernedDocumentHoldResponse {
+  GovernedDocument document = 1;
+}
+message ExpireGovernedDocumentRequest {
+  string namespace = 1;
+  string document_id = 2;
+}
+message ExpireGovernedDocumentResponse {
+  GovernedDocument document = 1;
+}
+message DeleteGovernedDocumentRequest {
+  string namespace = 1;
+  string document_id = 2;
+}
+message DeleteGovernedDocumentResponse {
+  GovernedDocument document = 1;
+}
 message EvaluateObjectSetResponse {
   string contract_version = 1;
   string definition_digest = 2;
@@ -2389,6 +2497,13 @@ service SekaiService {
   rpc PutGovernedTransform(PutGovernedTransformRequest) returns (PutGovernedTransformResponse);
   rpc RunGovernedTransform(RunGovernedTransformRequest) returns (RunGovernedTransformResponse);
   rpc GetGovernedTransformRun(GetGovernedTransformRunRequest) returns (GetGovernedTransformRunResponse);
+  rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
+  rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
+  rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);
+  rpc HoldGovernedDocument(HoldGovernedDocumentRequest) returns (HoldGovernedDocumentResponse);
+  rpc ReleaseGovernedDocumentHold(ReleaseGovernedDocumentHoldRequest) returns (ReleaseGovernedDocumentHoldResponse);
+  rpc ExpireGovernedDocument(ExpireGovernedDocumentRequest) returns (ExpireGovernedDocumentResponse);
+  rpc DeleteGovernedDocument(DeleteGovernedDocumentRequest) returns (DeleteGovernedDocumentResponse);
   rpc ReadObjectChangeSubscription(ReadObjectChangeSubscriptionRequest) returns (ReadObjectChangeSubscriptionResponse);
   rpc PutObjectSecurityPolicyRevision(PutObjectSecurityPolicyRevisionRequest) returns (PutObjectSecurityPolicyRevisionResponse);
   rpc GetObjectSecurityPolicyRevision(GetObjectSecurityPolicyRevisionRequest) returns (GetObjectSecurityPolicyRevisionResponse);

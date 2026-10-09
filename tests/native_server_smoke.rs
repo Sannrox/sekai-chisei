@@ -33,12 +33,15 @@ use sekai_chisei::grpc::pb::chisei::{
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    AcquireLeaseRequest, CreateObjectRequest, DecideActionInstanceRequest,
-    EnsureTeamNamespaceRequest, GetActionInstanceRequest, GetLeaseRequest, GetLinkedObjectsRequest,
-    GetObjectRequest, GovernedActionType, GraphQuery, ListActionInstancesRequest, ListFilter,
-    ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
-    ReleaseLeaseRequest, RunActionBindingRequest, SubmitActionInstanceRequest, TraverseRequest,
-    UpdateObjectRequest,
+    AcquireLeaseRequest, AdmitGovernedDocumentRequest, AttachGovernedDocumentRenditionRequest,
+    ContentReference, CreateObjectRequest, DecideActionInstanceRequest,
+    DeleteGovernedDocumentRequest, DocumentRendition, EnsureTeamNamespaceRequest,
+    ExpireGovernedDocumentRequest, GetActionInstanceRequest, GetGovernedDocumentRequest,
+    GetLeaseRequest, GetLinkedObjectsRequest, GetObjectRequest, GovernedActionType,
+    GovernedDocument, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
+    ListFilter, ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
+    ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, RunActionBindingRequest,
+    SubmitActionInstanceRequest, TraverseRequest, UpdateObjectRequest,
 };
 use sekai_chisei::sekai::semantic::CAPABILITY_RESOLVE_REF;
 use serde_json::{Value, json};
@@ -1868,4 +1871,296 @@ async fn spawned_binary_lists_and_pins_routing_profiles() {
         .expect("route event names the pinned profile");
     assert_eq!(route["attributes"]["routing_mode"], "local");
     assert_eq!(route["attributes"]["routing_profile_pinned"], "true");
+}
+
+fn document_digest(tag: u8) -> String {
+    format!("sha256:{tag:02x}{}", "ab".repeat(31))
+}
+
+fn smoke_content_ref(tag: u8, media: &str, bytes: u64) -> ContentReference {
+    ContentReference {
+        scheme: "digest".into(),
+        digest: document_digest(tag),
+        media_type: media.into(),
+        byte_length: bytes,
+    }
+}
+
+fn smoke_document(namespace: &str, document_id: &str) -> GovernedDocument {
+    GovernedDocument {
+        contract_version: "sekai.governed-document/v1".into(),
+        document_id: document_id.into(),
+        namespace: namespace.into(),
+        owner: "local".into(),
+        type_revision: "v1".into(),
+        purpose: "case-review".into(),
+        classification: "internal".into(),
+        title: "Brief".into(),
+        metadata: HashMap::from([("source".into(), "intake".into())]),
+        content_ref: Some(smoke_content_ref(1, "application/pdf", 128)),
+        content_digest: String::new(),
+        expires_at_ms: 0,
+        ..Default::default()
+    }
+}
+
+fn assert_document_status(error: &tonic::Status, code: Code, message: &str, label: &str) {
+    assert_eq!(error.code(), code, "{label} expected {code:?}, got {error}");
+    assert_eq!(
+        error.message(),
+        message,
+        "{label} expected {message}, got {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
+    // #1325: experimental document RPCs share the CLI failure table.
+    let mut server = NativeServer::spawn();
+    let mut sekai = server.sekai().await;
+    let foreign = server.create_principal_token("document-intruder");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let namespace = format!("records-{suffix}");
+    let document_id = format!("doc:brief-{suffix}");
+    let document = smoke_document(&namespace, &document_id);
+
+    let unknown = sekai
+        .get_governed_document(GetGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            purpose: "case-review".into(),
+            fields: vec!["content_ref".into()],
+            classification_ceiling: "internal".into(),
+        })
+        .await
+        .expect_err("missing document is unavailable");
+    assert_document_status(
+        &unknown,
+        Code::NotFound,
+        "governed document is unavailable",
+        "unknown document",
+    );
+
+    let mut bad_media = document.clone();
+    bad_media.document_id = format!("doc:bad-media-{suffix}");
+    bad_media.content_ref = Some(smoke_content_ref(1, "application/x-unknown", 128));
+    let format = sekai
+        .admit_governed_document(AdmitGovernedDocumentRequest {
+            document: Some(bad_media),
+        })
+        .await
+        .expect_err("unknown media type");
+    assert_document_status(
+        &format,
+        Code::FailedPrecondition,
+        "governed document format is unsupported",
+        "unknown media type",
+    );
+
+    let mut bad_revision = document.clone();
+    bad_revision.document_id = format!("doc:bad-revision-{suffix}");
+    bad_revision.type_revision = "v2".into();
+    let revision = sekai
+        .admit_governed_document(AdmitGovernedDocumentRequest {
+            document: Some(bad_revision),
+        })
+        .await
+        .expect_err("unknown type revision");
+    assert_document_status(
+        &revision,
+        Code::FailedPrecondition,
+        "governed document revision is unsupported",
+        "unknown type revision",
+    );
+
+    let admitted = sekai
+        .admit_governed_document(AdmitGovernedDocumentRequest {
+            document: Some(document.clone()),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("admit: {error}\n{}", server.logs()))
+        .into_inner()
+        .document
+        .expect("admitted document");
+    let parent_digest = admitted.content_digest.clone();
+
+    let foreign_owner = sekai
+        .get_governed_document(bearer(
+            &foreign,
+            GetGovernedDocumentRequest {
+                namespace: namespace.clone(),
+                document_id: document_id.clone(),
+                purpose: "case-review".into(),
+                fields: vec!["content_ref".into()],
+                classification_ceiling: "internal".into(),
+            },
+        ))
+        .await
+        .expect_err("foreign owner is unavailable");
+    assert_document_status(
+        &foreign_owner,
+        Code::NotFound,
+        "governed document is unavailable",
+        "foreign owner",
+    );
+
+    let mismatched_purpose = sekai
+        .get_governed_document(GetGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            purpose: "other-purpose".into(),
+            fields: vec!["content_ref".into()],
+            classification_ceiling: "internal".into(),
+        })
+        .await
+        .expect_err("mismatched purpose is unavailable");
+    assert_document_status(
+        &mismatched_purpose,
+        Code::NotFound,
+        "governed document is unavailable",
+        "mismatched purpose",
+    );
+
+    let hidden_field = sekai
+        .get_governed_document(GetGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            purpose: "case-review".into(),
+            fields: vec!["secret".into()],
+            classification_ceiling: "internal".into(),
+        })
+        .await
+        .expect_err("unauthorized field is unavailable");
+    assert_document_status(
+        &hidden_field,
+        Code::NotFound,
+        "governed document is unavailable",
+        "unauthorized field",
+    );
+
+    let attached = sekai
+        .attach_governed_document_rendition(AttachGovernedDocumentRenditionRequest {
+            rendition: Some(DocumentRendition {
+                namespace: namespace.clone(),
+                document_id: document_id.clone(),
+                rendition_id: format!("rend:text-{suffix}"),
+                class: "extracted_text".into(),
+                parent_content_digest: parent_digest,
+                content_ref: Some(smoke_content_ref(2, "text/plain", 32)),
+                extractor_id: "extractor:text".into(),
+                extractor_profile_digest: document_digest(3),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("attach: {error}\n{}", server.logs()))
+        .into_inner()
+        .rendition
+        .expect("attached rendition");
+    assert_eq!(attached.class, "extracted_text");
+
+    let mut bad_class = attached.clone();
+    bad_class.rendition_id = format!("rend:ocr-{suffix}");
+    bad_class.class = "ocr-box".into();
+    let rendition_class = sekai
+        .attach_governed_document_rendition(AttachGovernedDocumentRenditionRequest {
+            rendition: Some(bad_class),
+        })
+        .await
+        .expect_err("unknown rendition class");
+    assert_document_status(
+        &rendition_class,
+        Code::FailedPrecondition,
+        "governed document revision is unsupported",
+        "unknown rendition class",
+    );
+
+    let view = sekai
+        .get_governed_document(GetGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            purpose: "case-review".into(),
+            fields: vec!["content_ref".into(), "metadata".into(), "renditions".into()],
+            classification_ceiling: "internal".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("get: {error}\n{}", server.logs()))
+        .into_inner()
+        .view
+        .expect("view");
+    assert_eq!(view.lifecycle, "admitted");
+    assert!(view.has_metadata);
+    assert!(view.has_renditions);
+    assert_eq!(view.renditions.len(), 1);
+
+    sekai
+        .hold_governed_document(HoldGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            hold_id: "hold:1".into(),
+            reason: "litigation".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("hold: {error}\n{}", server.logs()));
+
+    let expire_held = sekai
+        .expire_governed_document(ExpireGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+        })
+        .await
+        .expect_err("hold blocks expire");
+    assert_document_status(
+        &expire_held,
+        Code::FailedPrecondition,
+        "governed document is held",
+        "expire while held",
+    );
+
+    let delete_held = sekai
+        .delete_governed_document(DeleteGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+        })
+        .await
+        .expect_err("hold blocks delete");
+    assert_document_status(
+        &delete_held,
+        Code::FailedPrecondition,
+        "governed document is held",
+        "delete while held",
+    );
+
+    sekai
+        .release_governed_document_hold(ReleaseGovernedDocumentHoldRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+            hold_id: "hold:1".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("release: {error}\n{}", server.logs()));
+    sekai
+        .delete_governed_document(DeleteGovernedDocumentRequest {
+            namespace: namespace.clone(),
+            document_id: document_id.clone(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("delete: {error}\n{}", server.logs()));
+
+    let deleted = sekai
+        .get_governed_document(GetGovernedDocumentRequest {
+            namespace,
+            document_id,
+            purpose: "case-review".into(),
+            fields: Vec::new(),
+            classification_ceiling: "internal".into(),
+        })
+        .await
+        .expect_err("deleted document is unavailable");
+    assert_document_status(
+        &deleted,
+        Code::NotFound,
+        "governed document is unavailable",
+        "deleted document",
+    );
 }

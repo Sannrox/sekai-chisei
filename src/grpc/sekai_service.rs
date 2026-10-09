@@ -1113,6 +1113,48 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetGovernedTransformRunResponse>, Status> {
         rpc_data::get_governed_transform_run(self, req).await
     }
+    async fn admit_governed_document(
+        &self,
+        req: Request<AdmitGovernedDocumentRequest>,
+    ) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
+        rpc_data::admit_governed_document(self, req).await
+    }
+    async fn attach_governed_document_rendition(
+        &self,
+        req: Request<AttachGovernedDocumentRenditionRequest>,
+    ) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
+        rpc_data::attach_governed_document_rendition(self, req).await
+    }
+    async fn get_governed_document(
+        &self,
+        req: Request<GetGovernedDocumentRequest>,
+    ) -> Result<Response<GetGovernedDocumentResponse>, Status> {
+        rpc_data::get_governed_document(self, req).await
+    }
+    async fn hold_governed_document(
+        &self,
+        req: Request<HoldGovernedDocumentRequest>,
+    ) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
+        rpc_data::hold_governed_document(self, req).await
+    }
+    async fn release_governed_document_hold(
+        &self,
+        req: Request<ReleaseGovernedDocumentHoldRequest>,
+    ) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
+        rpc_data::release_governed_document_hold(self, req).await
+    }
+    async fn expire_governed_document(
+        &self,
+        req: Request<ExpireGovernedDocumentRequest>,
+    ) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
+        rpc_data::expire_governed_document(self, req).await
+    }
+    async fn delete_governed_document(
+        &self,
+        req: Request<DeleteGovernedDocumentRequest>,
+    ) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
+        rpc_data::delete_governed_document(self, req).await
+    }
     async fn update_dataset(
         &self,
         req: Request<UpdateDatasetRequest>,

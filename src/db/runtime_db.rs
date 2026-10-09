@@ -6766,7 +6766,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_document(document),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_governed_document(document))
+            }
         }
     }
 
@@ -6777,7 +6779,9 @@ impl RuntimeDb {
     ) -> Result<Option<crate::sekai::document::GovernedDocument>, String> {
         match self {
             Self::Sqlite(db) => db.get_governed_document(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_governed_document(namespace, document_id)
+            }),
         }
     }
 
@@ -6787,7 +6791,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_governed_rendition(rendition),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_governed_rendition(rendition))
+            }
         }
     }
 
@@ -6798,7 +6804,9 @@ impl RuntimeDb {
     ) -> Result<Vec<crate::sekai::document::DocumentRendition>, String> {
         match self {
             Self::Sqlite(db) => db.list_governed_renditions(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_governed_renditions(namespace, document_id)
+            }),
         }
     }
 
@@ -6809,7 +6817,9 @@ impl RuntimeDb {
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.delete_governed_renditions(namespace, document_id),
-            Self::Postgres(_) => Err(crate::sekai::document::POSTGRES_UNAVAILABLE.into()),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_governed_renditions(namespace, document_id)
+            }),
         }
     }
 
