@@ -266,7 +266,7 @@ pub enum AuthorizationClaim {
 }
 
 impl SekaiDb {
-    fn ensure_external_action_tables(&self) -> Result<(), String> {
+    pub(crate) fn ensure_external_action_tables(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS chisei_external_action_reservations (

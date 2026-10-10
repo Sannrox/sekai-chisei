@@ -2028,6 +2028,68 @@ mod tests {
     }
 
     #[test]
+    fn relocate_preserves_all_external_action_rows_from_historical_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("legacy.db");
+        let destination = dir.path().join("chisei.db");
+        let source_s = source.to_str().unwrap();
+        let destination_s = destination.to_str().unwrap();
+        let db = SekaiDb::new(source_s).unwrap();
+        db.list_external_action_authorizations().unwrap();
+        drop(db);
+        let source_conn = Connection::open(&source).unwrap();
+        source_conn.execute_batch(
+            r#"INSERT INTO chisei_external_action_reservations VALUES ('actor', 'scope', 'operation', 2, 1);
+            INSERT INTO chisei_external_action_authorizations VALUES
+                ('actor', 'operation', 'idempotency', 'sha256:fixture', 'authorization', '{"fixture":true}', 100);
+            INSERT INTO chisei_external_action_releases VALUES ('released-authorization', 200);
+            INSERT INTO chisei_external_action_blast_claims VALUES ('authorization', 'actor', 'scope', 'operation', 2, 1);"#,
+        ).unwrap();
+        let tables = [
+            "chisei_external_action_reservations",
+            "chisei_external_action_authorizations",
+            "chisei_external_action_releases",
+            "chisei_external_action_blast_claims",
+        ];
+        let rows = |conn: &Connection, table: &str| {
+            let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = statement.column_count();
+            statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let expected: Vec<_> = tables
+            .iter()
+            .map(|table| rows(&source_conn, table))
+            .collect();
+        drop(source_conn);
+        let report = relocate_sqlite(source_s, source_s, destination_s).unwrap();
+        assert!(report.fence_raised);
+        let destination_conn = Connection::open(&destination).unwrap();
+        for (table, expected) in tables.iter().zip(&expected) {
+            assert_eq!(expected.len(), 1);
+            assert_eq!(&rows(&destination_conn, table), expected, "{table}");
+        }
+        drop(destination_conn);
+        let second = relocate_sqlite(source_s, source_s, destination_s).unwrap();
+        assert!(second.families.iter().all(|family| family.skipped));
+        let destination_conn = Connection::open(&destination).unwrap();
+        for (table, expected) in tables.iter().zip(&expected) {
+            assert_eq!(
+                &rows(&destination_conn, table),
+                expected,
+                "{table} after resume"
+            );
+        }
+    }
+
+    #[test]
     fn relocate_refuses_the_same_sekai_and_chisei_destination() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("legacy.db");
