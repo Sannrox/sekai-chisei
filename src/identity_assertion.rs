@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn valid_assertion_fills_authenticated_context() {
         let authority = authority();
-        let mut claims = claims("n1", 100);
+        let mut claims = claims(&uuid::Uuid::new_v4().to_string(), 100);
         claims.space = Some("space-a".into());
         claims.space_role = Some(SpaceRole::Approver);
         claims.act = Some("origin-user".into());

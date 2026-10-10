@@ -1418,8 +1418,10 @@ mod tests {
             (SpaceRole::Administrator, "CreateObject", true),
         ] {
             let authority = test_assertion_authority();
-            let mut claims =
-                test_assertion_claims("space-role", chrono::Utc::now().timestamp() + 60);
+            let mut claims = test_assertion_claims(
+                &uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now().timestamp() + 60,
+            );
             claims.tenant_id = Some("tenant-test".into());
             claims.space = Some("space-a".into());
             claims.space_role = Some(role);
